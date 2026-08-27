@@ -422,7 +422,7 @@ fn graph_snapshot_keeps_terminal_realpath_and_names_missing_package_evidence() {
             .contains(&ProgramGraphMissingEvidence::PackageIdentities)
     );
     assert!(
-        graph
+        !graph
             .missing_evidence
             .contains(&ProgramGraphMissingEvidence::SourcePackageScopes)
     );

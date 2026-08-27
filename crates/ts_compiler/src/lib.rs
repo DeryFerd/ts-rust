@@ -3,10 +3,12 @@
 mod project_graph;
 
 pub use project_graph::{
-    ProgramGraphConfig, ProgramGraphMissingEvidence, ProgramGraphReference,
-    ProgramGraphReferenceKind, ProgramGraphReferenceTarget, ProgramGraphResolution,
-    ProgramGraphResolutionKind, ProgramGraphResolutionRequest, ProgramGraphRoot,
-    ProgramGraphSnapshot, ProgramGraphSource, ProgramGraphTarget,
+    ProgramGraphConfig, ProgramGraphMissingEvidence, ProgramGraphPackageScopeDecision,
+    ProgramGraphPackageScopeEvent, ProgramGraphPackageScopeObservation,
+    ProgramGraphPackageScopeReadError, ProgramGraphReference, ProgramGraphReferenceKind,
+    ProgramGraphReferenceTarget, ProgramGraphResolution, ProgramGraphResolutionKind,
+    ProgramGraphResolutionRequest, ProgramGraphRoot, ProgramGraphSnapshot, ProgramGraphSource,
+    ProgramGraphTarget,
 };
 
 use std::{
@@ -1447,6 +1449,7 @@ pub struct Program {
     graph_references: Vec<ProgramGraphReference>,
     graph_config: Option<ProgramGraphConfig>,
     graph_config_resolution_observation: Option<ConfigResolutionObservation>,
+    graph_package_scope_recorder: project_graph::PackageScopeObservationRecorder,
     module_resolution_diagnostics: Vec<ProgramDiagnostic>,
     package_export_specifiers: BTreeMap<String, Vec<String>>,
     package_display_specifiers: BTreeMap<(FileId, String), String>,
@@ -5973,7 +5976,12 @@ impl Program {
         let index = self.source_files.len();
         let file_id =
             FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
-        let implied_node_format = implied_node_format(file_system, file_name);
+        let implied_node_format = implied_node_format(
+            file_system,
+            file_name,
+            file_id,
+            &mut self.graph_package_scope_recorder,
+        );
         // SourceFile retains this compatibility binding for existing Program
         // consumers. Canonical mode never publishes its diagnostics or passes
         // it to the canonical checker.
@@ -6373,31 +6381,68 @@ fn resolve_reference_path(
         .find(|candidate| file_system.file_exists(candidate))
 }
 
-fn implied_node_format(file_system: &dyn FileSystem, file_name: &str) -> ModuleKind {
+fn implied_node_format(
+    file_system: &dyn FileSystem,
+    file_name: &str,
+    file_id: FileId,
+    observation: &mut project_graph::PackageScopeObservationRecorder,
+) -> ModuleKind {
     let extension = Path::new(file_name)
         .extension()
         .and_then(|value| value.to_str());
     if extension.is_some_and(|extension| {
         extension.eq_ignore_ascii_case("mts") || extension.eq_ignore_ascii_case("mjs")
     }) {
+        observation.decision(
+            file_id,
+            ModuleKind::EsNext,
+            ProgramGraphPackageScopeDecision::FixedExtension,
+        );
         return ModuleKind::EsNext;
     }
     if extension.is_some_and(|extension| {
         extension.eq_ignore_ascii_case("cts") || extension.eq_ignore_ascii_case("cjs")
     }) {
+        observation.decision(
+            file_id,
+            ModuleKind::CommonJs,
+            ProgramGraphPackageScopeDecision::FixedExtension,
+        );
         return ModuleKind::CommonJs;
     }
     let mut directory = directory_path(file_name);
     loop {
         let package_json = resolve_path(&directory, &["package.json"]);
-        if file_system.file_exists(&package_json) {
-            return file_system
-                .read_file(&package_json)
-                .ok()
-                .and_then(|contents| parse_package_json(&contents).ok())
-                .and_then(|package| package.package_type)
-                .filter(|package_type| package_type == "module")
-                .map_or(ModuleKind::CommonJs, |_| ModuleKind::EsNext);
+        let exists = file_system.file_exists(&package_json);
+        observation.file_exists(file_id, &package_json, exists);
+        if exists {
+            let (format, reason) = match file_system.read_file(&package_json) {
+                Ok(contents) => {
+                    observation.read_text(file_id, &package_json, &contents);
+                    match parse_package_json(&contents) {
+                        Ok(package) => (
+                            package
+                                .package_type
+                                .filter(|package_type| package_type == "module")
+                                .map_or(ModuleKind::CommonJs, |_| ModuleKind::EsNext),
+                            ProgramGraphPackageScopeDecision::PackageJson,
+                        ),
+                        Err(_) => (
+                            ModuleKind::CommonJs,
+                            ProgramGraphPackageScopeDecision::InvalidPackageJson,
+                        ),
+                    }
+                }
+                Err(error) => {
+                    observation.read_error(file_id, &package_json, &error);
+                    (
+                        ModuleKind::CommonJs,
+                        ProgramGraphPackageScopeDecision::ReadFailure,
+                    )
+                }
+            };
+            observation.decision(file_id, format, reason);
+            return format;
         }
         let parent = directory_path(&directory);
         if parent == directory {
@@ -6405,6 +6450,11 @@ fn implied_node_format(file_system: &dyn FileSystem, file_name: &str) -> ModuleK
         }
         directory = parent;
     }
+    observation.decision(
+        file_id,
+        ModuleKind::CommonJs,
+        ProgramGraphPackageScopeDecision::NoPackage,
+    );
     ModuleKind::CommonJs
 }
 

@@ -3,11 +3,16 @@ use serde_json::{Value, json};
 use ts_ast::NodeRef;
 use ts_checker::semantic::{CanonicalModuleResolutionInput, CanonicalModuleResolutionMode};
 use ts_compiler::{
-    CanonicalProgramCheckError, Program, ProgramGraphMissingEvidence, ProgramGraphReferenceKind,
-    ProgramGraphResolutionKind,
+    CanonicalProgramCheckError, Program, ProgramGraphMissingEvidence,
+    ProgramGraphPackageScopeDecision, ProgramGraphPackageScopeEvent,
+    ProgramGraphPackageScopeObservation, ProgramGraphReferenceKind, ProgramGraphResolutionKind,
+    ProgramGraphSnapshot,
 };
 use ts_config::{ConfigInputKind, ConfigResolutionEvent, ConfigResolutionObservation};
-use ts_module::{FailedLookupKind, ModuleFormat, ResolutionMode};
+use ts_module::{
+    FailedLookupKind, ModuleFormat, PackageJsonInputEvent, PackageJsonInputPurpose,
+    PackageJsonInputs, ResolutionMode,
+};
 use ts_options::ModuleResolutionKind;
 
 use super::{
@@ -52,6 +57,16 @@ const fn format_name(mode: ModuleFormat) -> &'static str {
     }
 }
 
+fn parser_input_text_report(text: &str) -> Value {
+    json!({
+        "status": "read",
+        "parserInputText": text,
+        "parserInputTextUtf8ByteCount": text.len(),
+        "parserInputTextDigest": stable_digest(text.as_bytes()),
+        "digestAlgorithm": SCORECARD_DIGEST_ALGORITHM,
+    })
+}
+
 fn config_observation_report(observation: &ConfigResolutionObservation) -> Value {
     let events = observation
         .events
@@ -69,13 +84,7 @@ fn config_observation_report(observation: &ConfigResolutionObservation) -> Value
             }),
             ConfigResolutionEvent::ReadFile { path, kind, result } => {
                 let result = match result {
-                    Ok(text) => json!({
-                        "status": "read",
-                        "parserInputText": text,
-                        "parserInputTextUtf8ByteCount": text.len(),
-                        "parserInputTextDigest": stable_digest(text.as_bytes()),
-                        "digestAlgorithm": SCORECARD_DIGEST_ALGORITHM,
-                    }),
+                    Ok(text) => parser_input_text_report(text),
                     Err(error) => json!({
                         "status": "error",
                         "errorKind": format!("{:?}", error.kind),
@@ -115,6 +124,158 @@ fn config_observation_report(observation: &ConfigResolutionObservation) -> Value
         "textRepresentation": "vfs_parser_input",
         "events": events,
     })
+}
+
+// Cache hits retain the original worker's inputs, not a new set of reads.
+fn package_json_inputs_report(inputs: Option<&PackageJsonInputs>) -> Value {
+    let Some(inputs) = inputs else {
+        return Value::Null;
+    };
+    let events = inputs
+        .events
+        .iter()
+        .map(|event| match event {
+            PackageJsonInputEvent::FileExists { path, exists } => json!({
+                "kind": "file_exists",
+                "path": path_identity(path),
+                "exists": exists,
+            }),
+            PackageJsonInputEvent::ReadFile {
+                path,
+                purpose,
+                result,
+            } => {
+                let result = match result {
+                    Ok(text) => parser_input_text_report(text),
+                    Err(error) => json!({
+                        "status": "error",
+                        "errorKind": format!("{:?}", error.kind),
+                        "message": error.message,
+                    }),
+                };
+                json!({
+                    "kind": "read_file",
+                    "path": path_identity(path),
+                    "purpose": match purpose {
+                        PackageJsonInputPurpose::DefaultMode => "default_mode",
+                        PackageJsonInputPurpose::PackageResolution => "package_resolution",
+                    },
+                    "result": result,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "inputOrigin": "resolver_worker",
+        "retentionComplete": inputs.is_complete(),
+        "omittedEvents": inputs.omitted_events,
+        "textRepresentation": "vfs_parser_input",
+        "events": events,
+    })
+}
+
+fn source_package_scope_observation_report(
+    program: &Program,
+    observation: &ProgramGraphPackageScopeObservation,
+) -> Value {
+    let events = observation
+        .events
+        .iter()
+        .map(|event| {
+            let (file_id, mut report) = match event {
+                ProgramGraphPackageScopeEvent::FileExists {
+                    file_id,
+                    path,
+                    exists,
+                } => (
+                    file_id,
+                    json!({"kind": "file_exists", "path": path_identity(path), "exists": exists}),
+                ),
+                ProgramGraphPackageScopeEvent::ReadFile {
+                    file_id,
+                    path,
+                    result,
+                } => {
+                    let result = match result {
+                        Ok(text) => parser_input_text_report(text),
+                        Err(error) => json!({
+                            "status": "error",
+                            "errorKind": format!("{:?}", error.kind),
+                            "message": error.message,
+                        }),
+                    };
+                    (
+                        file_id,
+                        json!({"kind": "read_file", "path": path_identity(path), "result": result}),
+                    )
+                }
+                ProgramGraphPackageScopeEvent::Decision {
+                    file_id,
+                    implied_node_format,
+                    reason,
+                } => (
+                    file_id,
+                    json!({
+                        "kind": "decision",
+                        "impliedNodeFormat": module_name(*implied_node_format),
+                        "reason": match reason {
+                            ProgramGraphPackageScopeDecision::FixedExtension => "fixed_extension",
+                            ProgramGraphPackageScopeDecision::PackageJson => "package_json",
+                            ProgramGraphPackageScopeDecision::InvalidPackageJson => "invalid_package_json",
+                            ProgramGraphPackageScopeDecision::ReadFailure => "read_failure",
+                            ProgramGraphPackageScopeDecision::NoPackage => "no_package",
+                        },
+                    }),
+                ),
+            };
+            let source = program
+                .source_file_by_id(*file_id)
+                .expect("the retained package-scope source belongs to this Program");
+            report["sourceFile"] = json!(path_identity(&source.file_name));
+            report
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "retentionComplete": observation.is_complete(),
+        "omittedEvents": observation.omitted_events,
+        "textRepresentation": "vfs_parser_input",
+        "events": events,
+    })
+}
+
+fn missing_evidence_report(graph: &ProgramGraphSnapshot) -> Vec<String> {
+    let mut missing = graph
+        .missing_evidence
+        .iter()
+        .map(|missing| {
+            match missing {
+                ProgramGraphMissingEvidence::ConfigSourceText => "config_source_text",
+                ProgramGraphMissingEvidence::ConfigParseInputs => "config_parse_inputs",
+                ProgramGraphMissingEvidence::ConfigExtendsInputs => "config_extends_inputs",
+                ProgramGraphMissingEvidence::SourceRealPaths => "source_real_paths",
+                ProgramGraphMissingEvidence::ResolutionOriginalPaths => "resolution_original_paths",
+                ProgramGraphMissingEvidence::ResolutionDefaultModes => "resolution_default_modes",
+                ProgramGraphMissingEvidence::PackageIdentities => "package_identities",
+                ProgramGraphMissingEvidence::SourcePackageScopes => "source_package_scopes",
+            }
+            .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if graph.resolutions.iter().any(|resolution| {
+        resolution
+            .result
+            .package_json_inputs
+            .as_ref()
+            .is_none_or(|inputs| !inputs.is_complete())
+    }) {
+        missing.push("resolution_package_json_inputs".to_owned());
+    }
+    if !graph.options.skips_type_checking(true, true)
+        && graph.sources.iter().any(|source| source.is_default_library)
+    {
+        missing.push("default_library_semantic_diagnostics".to_owned());
+    }
+    missing
 }
 
 fn manifest_node_location(program: &Program, reference: NodeRef) -> Value {
@@ -298,6 +459,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
             "ambientTarget": resolution.ambient_target.as_deref().map(path_identity),
             "loadedTarget": target,
             "failedLookups": failed,
+            "packageJsonInputs": package_json_inputs_report(resolution.result.package_json_inputs.as_ref()),
         })
     }).collect::<Vec<_>>();
     let references = graph.references.iter().map(|reference| json!({
@@ -327,6 +489,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
             "resolvePackageJsonExports": options.resolve_package_json_exports,
             "resolvePackageJsonImports": options.resolve_package_json_imports,
             "preferTypes": options.prefer_types,
+            "preserveSymlinks": options.preserve_symlinks,
             "customConditions": options.custom_conditions,
             "moduleSuffixes": options.module_suffixes,
             "baseUrl": options.base_url,
@@ -388,6 +551,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         "configFilePath": graph.config_file_path,
         "config": config,
         "configResolutionObservation": graph.config_resolution_observation.as_ref().map(config_observation_report),
+        "sourcePackageScopeObservation": source_package_scope_observation_report(program, &graph.source_package_scope_observation),
         "resolutionOptions": resolution_options,
         "resolutions": resolutions,
         "references": references,
@@ -430,28 +594,7 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
             )
         }
     };
-    let mut missing_evidence = graph
-        .missing_evidence
-        .iter()
-        .map(|missing| {
-            match missing {
-                ProgramGraphMissingEvidence::ConfigSourceText => "config_source_text",
-                ProgramGraphMissingEvidence::ConfigParseInputs => "config_parse_inputs",
-                ProgramGraphMissingEvidence::ConfigExtendsInputs => "config_extends_inputs",
-                ProgramGraphMissingEvidence::SourceRealPaths => "source_real_paths",
-                ProgramGraphMissingEvidence::ResolutionOriginalPaths => "resolution_original_paths",
-                ProgramGraphMissingEvidence::ResolutionDefaultModes => "resolution_default_modes",
-                ProgramGraphMissingEvidence::PackageIdentities => "package_identities",
-                ProgramGraphMissingEvidence::SourcePackageScopes => "source_package_scopes",
-            }
-            .to_owned()
-        })
-        .collect::<Vec<_>>();
-    if !graph.options.skips_type_checking(true, true)
-        && graph.sources.iter().any(|source| source.is_default_library)
-    {
-        missing_evidence.push("default_library_semantic_diagnostics".to_owned());
-    }
+    let missing_evidence = missing_evidence_report(&graph);
     let bytes = serde_json::to_vec(&(&evidence, &module_resolution_manifest, &missing_evidence))
         .expect("graph evidence contains only JSON values");
     ProjectGraphReport {
@@ -462,6 +605,9 @@ pub(super) fn snapshot_report(program: &Program) -> ProjectGraphReport {
         digest_algorithm: SCORECARD_DIGEST_ALGORITHM,
     }
 }
+
+#[cfg(test)]
+mod input_evidence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -684,14 +830,18 @@ mod tests {
             graph.evidence["config"]["diagnosticSourceTextDigest"],
             stable_digest(leaf.as_bytes()),
         );
-        for gap in [
-            "source_real_paths",
-            "package_identities",
-            "source_package_scopes",
-        ] {
+        for gap in ["source_real_paths", "package_identities"] {
             assert!(graph.missing_evidence.iter().any(|missing| missing == gap));
         }
-        for gap in ["config_parse_inputs", "config_extends_inputs"] {
+        assert_eq!(
+            graph.evidence["sourcePackageScopeObservation"]["retentionComplete"],
+            true
+        );
+        for gap in [
+            "config_parse_inputs",
+            "config_extends_inputs",
+            "source_package_scopes",
+        ] {
             assert!(!graph.missing_evidence.iter().any(|missing| missing == gap));
         }
     }

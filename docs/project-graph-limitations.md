@@ -44,12 +44,60 @@ separate. The compiler still performs its later diagnostic read in the same
 place. `ProgramGraphConfig::source_text` and the report's
 `diagnosticSourceTextDigest` describe that later text, which can differ.
 
-Resolved module records now retain the original candidate passed to
-`realpath`. Every resolution attempt retains the effective import or require
+Resolved module records retain the lookup candidate before optional realpath
+handling. Every resolution attempt retains the effective import or require
 mode, including default-mode and failed attempts. Config parse and extends
 gaps remain when observations are incomplete. A missing leaf text remains a
 separate gap.
 
-Package identities and package-scope inputs are still incomplete. Root and
-path-reference loads do not record filesystem realpaths. These gaps remain
-explicit in the snapshot.
+## Resolver package inputs
+
+Each resolver worker retains an ordered prefix of its package JSON probes and
+reads. The default limit is 256 events and 256 KiB of UTF-8 string data per
+worker. Limits do not change resolution choices or cache keys. Repeated reads
+stay separate, including changes to the text or read result.
+
+`resolutions[].packageJsonInputs` contains those original worker inputs. Its
+`inputOrigin` is `resolver_worker`. A cache hit shares the original inputs and
+does not perform fresh reads. The report does not infer whether a request was a
+cache hit. A synthetic result has `null` inputs. An observed worker with no
+package accesses has an empty event list with complete retention. Missing or
+incomplete inputs keep the report's `resolution_package_json_inputs` gap.
+
+These events exclude `file_module_facts` and automatic type discovery. Complete
+retention does not prove a package name, version, peer context, or full graph
+identity. Package identities remain missing evidence.
+
+## Source package scopes
+
+The source loader retains its existing package-scope probes, reads, and final
+implied-format decisions. Its limit is 16,384 events and 16 MiB of UTF-8 string
+data per Program. An omitted event stops further retention. The observation
+keeps the prefix and counts all later omissions. Fixed extensions and searches
+without a package still have a final decision. Bundled libraries do not make
+these package-scope calls.
+
+`sourcePackageScopeObservation` serializes every retained event in order. The
+report resolves each event's program-local `FileId` to its loaded source path
+in `sourceFile`. It does not infer a source from the package JSON path or
+publish a `FileId` as a persistent identity. Read text uses the same VFS parser
+input fields as config and resolver inputs. It is not raw disk-byte evidence.
+The graph digest includes both package-input reports and their omission counts.
+
+The `source_package_scopes` gap clears only when all observed events and a
+matching final format decision for every source that is not a default library
+were retained. Other missing-evidence fields remain unchanged. Root and
+path-reference loads still do not record filesystem realpaths.
+
+## Selected paths
+
+The report includes `preserveSymlinks` in its explicit resolution options.
+Resolved file names are selected lookup paths, not a guarantee that realpath
+was called. Original file names remain the lookup candidates before optional
+realpath handling. These fields do not close the `source_real_paths` gap.
+
+A known mismatch remains for nested package imports such as `"#dep": "pkg"`
+through a symlink outside `node_modules`. Rust retains `externalLibraryImport`
+as true where the pinned Go outer result is false. This mismatch predates the
+symlink change and is separate from this input-evidence work. These reports do
+not certify full module-resolution parity.

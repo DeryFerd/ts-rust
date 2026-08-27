@@ -196,6 +196,68 @@ fn project_report_keeps_dependency_declarations_in_file_order_and_input_digests(
 }
 
 #[test]
+fn project_report_keeps_package_parser_text_separate_from_disk_bom_bytes() {
+    let project = TestProject::new();
+    project.write(
+        "index.ts",
+        "import { value } from 'pkg'; export { value };\n",
+    );
+    project.write("package.json", r#"{"type":"module"}"#);
+    fs::create_dir_all(project.0.join("node_modules/pkg")).unwrap();
+    let target = project.write(
+        "node_modules/pkg/index.d.ts",
+        "export declare const value: number;\n",
+    );
+    let text = "{\r\n\"type\":\"module\",\"types\":\"index.d.ts\",\"unused\":\"\u{00e9}\"}\r\n";
+    let package = project.write("node_modules/pkg/package.json", &format!("\u{feff}{text}"));
+    let config = r#"{
+        "compilerOptions": {
+            "noLib": true, "noCheck": true, "noEmit": true, "types": [],
+            "module": "ESNext", "moduleResolution": "Bundler"
+        },
+        "files": ["index.ts"]
+    }"#;
+    let ProjectStage::Complete { value: graph } = project.run(config).graph else {
+        panic!("missing graph");
+    };
+    let resolution = &graph.evidence["resolutions"][0];
+    let inputs = &resolution["packageJsonInputs"];
+    assert_eq!(inputs["inputOrigin"], "resolver_worker");
+    assert_eq!(inputs["textRepresentation"], "vfs_parser_input");
+    let reads = inputs["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "read_file")
+        .filter(|event| event["path"].as_str() == package.to_str())
+        .collect::<Vec<_>>();
+    assert!(!reads.is_empty());
+    for read in reads {
+        assert_eq!(read["path"].as_str(), package.to_str());
+        assert_eq!(read["result"]["parserInputText"], text);
+        assert_eq!(read["result"]["parserInputTextUtf8ByteCount"], text.len());
+    }
+    let scopes = &graph.evidence["sourcePackageScopeObservation"];
+    assert_eq!(scopes["retentionComplete"], true);
+    assert!(scopes["events"].as_array().unwrap().iter().any(|event| {
+        event["sourceFile"].as_str() == target.to_str()
+            && event["path"].as_str() == package.to_str()
+            && event["result"]["parserInputText"] == text
+    }));
+    for gap in ["source_package_scopes", "resolution_package_json_inputs"] {
+        assert!(!graph.missing_evidence.iter().any(|value| value == gap));
+    }
+    for gap in ["source_real_paths", "package_identities"] {
+        assert!(graph.missing_evidence.iter().any(|value| value == gap));
+    }
+    fs::write(package, text).unwrap();
+    let ProjectStage::Complete { value: without_bom } = project.run(config).graph else {
+        panic!("missing graph");
+    };
+    assert_eq!(graph, without_bom);
+}
+
+#[test]
 fn project_report_rejects_relative_config_paths() {
     let error = run_project(std::path::Path::new("tsconfig.json"), None, "relative").unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);

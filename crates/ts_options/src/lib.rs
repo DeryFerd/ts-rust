@@ -836,6 +836,7 @@ impl CompilerOptions {
             resolve_package_json_exports: self.resolve_package_json_exports,
             resolve_package_json_imports: self.resolve_package_json_imports,
             prefer_types: true,
+            preserve_symlinks: self.preserve_symlinks,
             custom_conditions: self.custom_conditions.clone().unwrap_or_default(),
             module_suffixes: self.module_suffixes.clone().unwrap_or_default(),
             base_url: self.base_url.clone(),
@@ -3424,7 +3425,7 @@ mod tests {
     fn parses_project_config_and_converts_resolution_settings() {
         let config = parse_config_text(
             "/repo/tsconfig.json",
-            r#"{"compilerOptions":{"allowArbitraryExtensions":true,"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"],"typeRoots":["types","/shared/types"],"types":["node","jest"]}}"#,
+            r#"{"compilerOptions":{"allowArbitraryExtensions":true,"allowJs":true,"resolveJsonModule":true,"preserveSymlinks":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"],"typeRoots":["types","/shared/types"],"types":["node","jest"]}}"#,
         )
         .value
         .unwrap();
@@ -3436,6 +3437,7 @@ mod tests {
                 allow_arbitrary_extensions: true,
                 allow_javascript: true,
                 resolve_json: true,
+                preserve_symlinks: true,
                 base_url: Some("/repo".into()),
                 paths: BTreeMap::from([("@app/*".into(), vec!["src/*".into()])]),
                 root_dirs: vec!["/repo/src".into(), "/repo/generated".into()],
