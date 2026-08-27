@@ -17459,7 +17459,11 @@ pub(super) fn publish_object_literal(
     plan: &PropertyObjectPlan,
     property_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
-    debug_assert_eq!(plan.kind, PropertyObjectKind::ObjectLiteral);
+    if plan.kind != PropertyObjectKind::ObjectLiteral
+        || store.source_node_kind(plan.node) != Some(SyntaxKind::ObjectLiteralExpression)
+    {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
     if is_javascript_expando_object_plan(store, plan) {
         return publish_javascript_expando_object_literal(store, plan, property_types);
     }
@@ -21842,6 +21846,87 @@ mod generic_publication_tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn object_literal_publication_rejects_wrong_owner_and_plan_kinds_before_writes() {
+        for kind in [
+            PropertyObjectKind::ObjectLiteral,
+            PropertyObjectKind::TypeLiteral,
+            PropertyObjectKind::Interface,
+        ] {
+            let (mut fixture, object) = object_fixture("const holder = { first: 1 }; { first; }");
+            let host = host(&fixture.parsed, &fixture.bound);
+            let mut plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+            plan.kind = kind;
+            if kind == PropertyObjectKind::ObjectLiteral {
+                let child = |kind, parent: Option<ts_ast::NodeId>| {
+                    fixture
+                        .parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == kind
+                                && parent.is_none_or(|parent| record.parent == Some(parent)))
+                            .then_some(NodeRef::new(object.arena, object.file, node))
+                        })
+                        .unwrap()
+                };
+                let block = child(SyntaxKind::Block, None);
+                let statement = child(SyntaxKind::ExpressionStatement, Some(block.node));
+                let identifier = child(SyntaxKind::Identifier, Some(statement.node));
+                plan.node = block;
+                plan.declarations = vec![block];
+                plan.properties[0].declaration = statement;
+                plan.properties[0].name_node = identifier;
+                plan.properties[0].type_node = identifier;
+                assert!(fixture.store.set_symbol_declarations(
+                    plan.symbol,
+                    Some(vec![block]),
+                    Some(block),
+                ));
+                assert!(fixture.store.set_symbol_declarations(
+                    plan.properties[0].symbol,
+                    Some(vec![statement]),
+                    Some(statement),
+                ));
+            }
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store
+                        .symbol_store()
+                        .symbols()
+                        .map(|(symbol, record)| {
+                            (
+                                symbol,
+                                record.clone(),
+                                store.value_symbol_links(symbol).cloned(),
+                                store.object_literal_property_clone_origin(symbol).copied(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    store.type_node_links(object).cloned(),
+                    store.type_node_links(plan.node).cloned(),
+                    plan.members
+                        .and_then(|members| store.symbol_table(members))
+                        .cloned(),
+                )
+            };
+            let before = state(&fixture.store);
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                publish_object_literal(&mut fixture.store, &plan, &[number]),
+                Err(PropertyObjectError::InvalidObjectLiteral(plan.node)),
+            );
+            assert_eq!(state(&fixture.store), before);
+        }
     }
 
     #[test]
