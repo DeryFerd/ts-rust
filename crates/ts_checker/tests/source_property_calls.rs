@@ -604,6 +604,87 @@ fn nongeneric_property_type_arguments_report_ts2558_and_preserve_public_links() 
 }
 
 #[test]
+fn method_signature_calls_check_arguments_and_keep_warm_identities() {
+    let parsed = parse_source_file(concat!(
+        "type API = { fn(value: number): string }; ",
+        "function good(api: API): string { return api.fn(1); } ",
+        "function wrong(api: API): string { return api.fn('wrong'); } ",
+        "function tooFew(api: API): string { return api.fn(); }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(43);
+    let methods = nodes_of_kind(&parsed, file, SyntaxKind::MethodSignature);
+    let [method] = methods.as_slice() else {
+        panic!("expected one method signature")
+    };
+    let calls = nodes_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let accesses = nodes_of_kind(&parsed, file, SyntaxKind::PropertyAccessExpression);
+    let arguments = nodes_of_kind(&parsed, file, SyntaxKind::StringLiteral);
+    let [wrong_argument] = arguments.as_slice() else {
+        panic!("expected one string argument")
+    };
+    assert_eq!(calls.len(), 3);
+    assert_eq!(accesses.len(), 3);
+    let mut context = context(&parsed, file);
+    let method_symbol = context.file(file).unwrap().1.symbol(*method).unwrap();
+    let mut expected_signature = None;
+    let mut expected_counts = None;
+
+    for warm in [false, true] {
+        if warm {
+            context.recheck_source_file(file).unwrap();
+        } else {
+            context.check_source_file(file).unwrap();
+        }
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].diagnostic.code(), 2345);
+        assert_eq!(diagnostics[0].node, Some(*wrong_argument));
+        assert_eq!(diagnostics[1].diagnostic.code(), 2554);
+        assert_eq!(
+            diagnostics[1].node,
+            Some(property_name(&parsed, file, accesses[2]))
+        );
+        let store = context.store();
+        let signature = store
+            .signature_links(*method)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("the method must retain its declared signature");
+        if let Some(expected) = expected_signature {
+            assert_eq!(signature, expected);
+        }
+        expected_signature = Some(signature);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        for (call, access) in calls.iter().zip(&accesses) {
+            assert_eq!(
+                store.type_node_links(*call).unwrap().resolved_type,
+                Some(string)
+            );
+            assert_eq!(
+                store
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(signature)
+            );
+            assert_eq!(
+                store.symbol_node_links(*access).unwrap().resolved_symbol,
+                Some(method_symbol)
+            );
+        }
+        let counts = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.mapper_len(),
+        );
+        if let Some(expected) = expected_counts {
+            assert_eq!(counts, expected);
+        }
+        expected_counts = Some(counts);
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // All unsupported call families share one publication check.
 fn unsupported_property_call_families_fail_closed_without_call_publication() {
     let fixtures = [
@@ -625,13 +706,6 @@ fn unsupported_property_call_families_fail_closed_without_call_publication() {
             "explicit this",
             concat!(
                 "type API = { fn: (this: API, value: number) => string }; ",
-                "function use(api: API): string { return api.fn(1); }",
-            ),
-        ),
-        (
-            "method signature",
-            concat!(
-                "type API = { fn(value: number): string }; ",
                 "function use(api: API): string { return api.fn(1); }",
             ),
         ),
