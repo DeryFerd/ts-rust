@@ -1203,7 +1203,7 @@ impl CanonicalBinder {
         let order = bound.traversal_order.clone();
         if let Some(node) = order.iter().copied().find(|node| {
             !declaration_family_supported(arena, *node, &facts)
-                || declaration_name_shape_unsupported(arena, *node)
+                || declaration_name_shape_unsupported(arena, *node, &facts)
                 || (facts.is_javascript_file()
                     && assignment_name_requires_javascript_file_kind(arena, *node)
                     && javascript_assignment_kind(arena, *node).is_none())
@@ -1238,12 +1238,8 @@ impl CanonicalBinder {
             .iter()
             .copied()
             .filter(|node| {
-                if facts.is_javascript_file() {
-                    javascript_assignment_kind(arena, *node)
-                        == Some(JavaScriptAssignmentKind::ExpandoProperty)
-                } else {
-                    is_typescript_expando_property_assignment(arena, *node)
-                }
+                assignment_declaration_kind(arena, *node, facts.is_javascript_file())
+                    == Some(JavaScriptAssignmentKind::ExpandoProperty)
             })
             .map(|node| {
                 let binding = self
@@ -1662,7 +1658,7 @@ impl CanonicalBinder {
             has_export_modifier || container_has_export_context(arena, container, facts);
         if !is_ambient_module(arena, node) && implicitly_exported {
             let unnamed_default = has_syntactic_modifier(arena, node, SyntaxKind::DefaultKeyword)
-                && get_name_of_declaration(arena, node).is_none();
+                && get_name_of_declaration(arena, node, facts.is_javascript_file()).is_none();
             if !container_flags(arena, container).contains(ContainerFlags::HAS_LOCALS)
                 || unnamed_default
             {
@@ -1836,7 +1832,7 @@ impl CanonicalBinder {
                     arena,
                     file,
                     node,
-                    get_name_of_declaration(arena, node),
+                    get_name_of_declaration(arena, node, facts.is_javascript_file()),
                     facts,
                 );
                 self.bind_block_scoped_declaration(
@@ -2358,7 +2354,7 @@ impl CanonicalBinder {
         } else {
             self.ensure_symbol_members(parent)
         };
-        let is_computed_name = has_dynamic_name(arena, node);
+        let is_computed_name = has_dynamic_name(arena, node, self.is_javascript_file(file));
         let includes = if is_computed_name {
             SymbolFlags::PROPERTY
         } else {
@@ -2584,7 +2580,15 @@ impl CanonicalBinder {
             });
     }
 
+    fn is_javascript_file(&self, file: FileId) -> bool {
+        self.files
+            .get(&file)
+            .and_then(BoundFile::source_facts)
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+    }
+
     fn declaration_facts_for(
+        &self,
         arena: &NodeArena,
         node: NodeRef,
         name: &EscapedName,
@@ -2592,8 +2596,9 @@ impl CanonicalBinder {
         let declaration = arena
             .get(node.node)
             .expect("anonymous declarations are reachable");
-        let diagnostic_node = get_name_of_declaration(arena, node.node)
-            .map_or(node, |name| NodeRef::new(node.arena, node.file, name));
+        let diagnostic_node =
+            get_name_of_declaration(arena, node.node, self.is_javascript_file(node.file))
+                .map_or(node, |name| NodeRef::new(node.arena, node.file, name));
         DeclarationFacts {
             kind: declaration.kind,
             diagnostic_node,
@@ -2614,7 +2619,7 @@ impl CanonicalBinder {
         name: EscapedName,
     ) -> SemanticSymbolId {
         let node_ref = NodeRef::new(arena.id(), file, node);
-        let declaration_facts = Self::declaration_facts_for(arena, node_ref, &name);
+        let declaration_facts = self.declaration_facts_for(arena, node_ref, &name);
         let symbol = self.new_symbol(file, name);
         if includes.intersects(SymbolFlags::ENUM_MEMBER | SymbolFlags::CLASS_MEMBER) {
             let container = self
@@ -2685,7 +2690,7 @@ impl CanonicalBinder {
             return;
         };
 
-        if has_dynamic_name(arena, assignment.node) {
+        if has_dynamic_name(arena, assignment.node, self.is_javascript_file(file)) {
             self.bind_anonymous_declaration(
                 arena,
                 file,
@@ -2856,11 +2861,7 @@ impl CanonicalBinder {
             return None;
         }
         let declaration_node = arena.get(declaration.node)?;
-        let javascript = self
-            .files
-            .get(&file)
-            .and_then(|bound| bound.source_facts.as_ref())
-            .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
+        let javascript = self.is_javascript_file(file);
         if declaration_node.kind == SyntaxKind::FunctionDeclaration
             || javascript && declaration_node.kind == SyntaxKind::ClassDeclaration
         {
@@ -2906,7 +2907,7 @@ impl CanonicalBinder {
         excludes: SymbolFlags,
         facts: &CanonicalSourceFileFacts,
     ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
-        if has_dynamic_name(arena, node) {
+        if has_dynamic_name(arena, node, facts.is_javascript_file()) {
             Ok(self.bind_anonymous_declaration(
                 arena,
                 file,
@@ -2930,7 +2931,7 @@ impl CanonicalBinder {
         let node_ref = NodeRef::new(arena.id(), file, node);
         let name = self.get_declaration_name(arena, node_ref)?;
         let signature = self.new_symbol(file, name.clone());
-        let signature_facts = Self::declaration_facts_for(arena, node_ref, &name);
+        let signature_facts = self.declaration_facts_for(arena, node_ref, &name);
         self.add_declaration_to_symbol(
             signature,
             node_ref,
@@ -2939,7 +2940,7 @@ impl CanonicalBinder {
         );
         let type_name = EscapedName::internal(InternalSymbolName::Type);
         let type_literal = self.new_symbol(file, type_name.clone());
-        let type_facts = Self::declaration_facts_for(arena, node_ref, &type_name);
+        let type_facts = self.declaration_facts_for(arena, node_ref, &type_name);
         self.add_declaration_to_symbol(
             type_literal,
             node_ref,
@@ -3160,7 +3161,7 @@ impl CanonicalBinder {
         node: NodeId,
         facts: &CanonicalSourceFileFacts,
     ) -> Result<(), CanonicalDeclarationError> {
-        let Some(name) = get_name_of_declaration(arena, node) else {
+        let Some(name) = get_name_of_declaration(arena, node, facts.is_javascript_file()) else {
             return Ok(());
         };
         self.check_strict_mode_eval_or_arguments(arena, file, node, Some(name), facts);
@@ -3257,13 +3258,14 @@ impl CanonicalBinder {
         is_computed_name: bool,
         has_known_typescript_file_kind: bool,
     ) -> Result<PreparedDeclaration, CanonicalDeclarationError> {
+        let is_javascript_file = self.is_javascript_file(node.file);
         if !is_computed_name
             && !has_known_typescript_file_kind
             && assignment_name_requires_javascript_file_kind(arena, node.node)
         {
             return Err(CanonicalDeclarationError::JavaScriptFileKindRequired(node));
         }
-        if !is_computed_name && has_dynamic_name(arena, node.node) {
+        if !is_computed_name && has_dynamic_name(arena, node.node, is_javascript_file) {
             return Err(CanonicalDeclarationError::DynamicNameRequiresComputed(node));
         }
         let declaration = arena
@@ -3283,7 +3285,7 @@ impl CanonicalBinder {
         } else {
             self.get_declaration_name(arena, node)?
         };
-        let diagnostic_node = get_name_of_declaration(arena, node.node)
+        let diagnostic_node = get_name_of_declaration(arena, node.node, is_javascript_file)
             .map_or(node, |name| NodeRef::new(node.arena, node.file, name));
         let display_name = schema_declaration_name(&declaration.data).map_or_else(
             || {
@@ -3328,18 +3330,16 @@ impl CanonicalBinder {
                 InternalSymbolName::Default
             }));
         }
-        if self
-            .files
-            .get(&declaration.file)
-            .and_then(|bound| bound.source_facts.as_ref())
-            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+        let is_javascript_file = self.is_javascript_file(declaration.file);
+        if is_javascript_file
             && javascript_assignment_kind(arena, declaration.node)
                 == Some(JavaScriptAssignmentKind::ModuleExports)
         {
             return Ok(EscapedName::internal(InternalSymbolName::ExportEquals));
         }
 
-        if let Some(name_id) = get_name_of_declaration(arena, declaration.node) {
+        if let Some(name_id) = get_name_of_declaration(arena, declaration.node, is_javascript_file)
+        {
             let name = arena
                 .get(name_id)
                 .expect("bound declaration names are reachable");
@@ -3955,7 +3955,7 @@ fn statement_list(arena: &NodeArena, node: NodeId) -> Option<&[NodeId]> {
 }
 
 fn node_has_name(arena: &NodeArena, node: NodeId, expected: &str) -> bool {
-    if let Some(name) = get_name_of_declaration(arena, node) {
+    if let Some(name) = get_name_of_declaration(arena, node, false) {
         return arena
             .get(name)
             .is_some_and(|name| name.kind == SyntaxKind::Identifier)
@@ -3976,24 +3976,40 @@ fn node_has_name(arena: &NodeArena, node: NodeId, expected: &str) -> bool {
         .any(|declaration| node_has_name(arena, *declaration, expected))
 }
 
-fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
+fn declaration_name_shape_unsupported(
+    arena: &NodeArena,
+    node: NodeId,
+    facts: &CanonicalSourceFileFacts,
+) -> bool {
     let Some(declaration) = arena.get(node) else {
         return true;
     };
-    let dynamic_is_handled = matches!(
+    // Anonymous expression symbols use their own name, not the assigned
+    // property name returned by GetNameOfDeclaration.
+    let anonymous_expression = matches!(
         declaration.kind,
-        SyntaxKind::PropertyDeclaration
-            | SyntaxKind::PropertySignature
-            | SyntaxKind::PropertyAssignment
-            | SyntaxKind::ShorthandPropertyAssignment
-            | SyntaxKind::EnumMember
-            | SyntaxKind::MethodDeclaration
-            | SyntaxKind::MethodSignature
-            | SyntaxKind::GetAccessor
-            | SyntaxKind::SetAccessor
-    ) || is_typescript_expando_property_assignment(arena, node)
-        || javascript_assignment_kind(arena, node) == Some(JavaScriptAssignmentKind::ThisProperty);
-    if has_dynamic_name(arena, node) && !dynamic_is_handled {
+        SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression | SyntaxKind::ClassExpression
+    ) && schema_declaration_name(&declaration.data).is_none();
+    let dynamic_is_handled = anonymous_expression
+        || matches!(
+            declaration.kind,
+            SyntaxKind::PropertyDeclaration
+                | SyntaxKind::PropertySignature
+                | SyntaxKind::PropertyAssignment
+                | SyntaxKind::ShorthandPropertyAssignment
+                | SyntaxKind::EnumMember
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::MethodSignature
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+        )
+        || matches!(
+            assignment_declaration_kind(arena, node, facts.is_javascript_file()),
+            Some(
+                JavaScriptAssignmentKind::ExpandoProperty | JavaScriptAssignmentKind::ThisProperty
+            )
+        );
+    if has_dynamic_name(arena, node, facts.is_javascript_file()) && !dynamic_is_handled {
         return true;
     }
     false
@@ -4436,11 +4452,15 @@ fn schema_declaration_name(data: &NodeData) -> Option<NodeId> {
     }
 }
 
-fn get_name_of_declaration(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+fn get_name_of_declaration(
+    arena: &NodeArena,
+    declaration: NodeId,
+    is_javascript_file: bool,
+) -> Option<NodeId> {
     let node = arena.get(declaration)?;
     let non_assigned = match &node.data {
         NodeData::BinaryExpression(_) | NodeData::CallExpression(_) => {
-            assignment_declaration_name(arena, declaration)
+            assignment_declaration_name(arena, declaration, is_javascript_file)
         }
         NodeData::ExportAssignment(assignment) => arena
             .get(assignment.expression)
@@ -4488,43 +4508,37 @@ fn get_assigned_name(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
     }
 }
 
-fn assignment_declaration_name(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+fn assignment_declaration_name(
+    arena: &NodeArena,
+    declaration: NodeId,
+    is_javascript_file: bool,
+) -> Option<NodeId> {
+    let kind = assignment_declaration_kind(arena, declaration, is_javascript_file)?;
+    if kind == JavaScriptAssignmentKind::ModuleExports {
+        return None;
+    }
     let node = arena.get(declaration)?;
     match &node.data {
-        NodeData::BinaryExpression(binary)
-            if arena
-                .get(binary.operator_token)
-                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
-        {
-            let left = arena.get(binary.left)?;
-            match &left.data {
-                NodeData::PropertyAccessExpression(access)
-                    if is_entity_name_expression_ex(arena, access.expression, true)
-                        && arena
-                            .get(access.name)
-                            .is_some_and(|name| name.kind == SyntaxKind::Identifier) =>
-                {
-                    Some(access.name)
-                }
-                NodeData::ElementAccessExpression(access)
-                    if is_entity_name_expression_ex(arena, access.expression, true) =>
-                {
-                    let argument = skip_parentheses(arena, access.argument_expression)?;
-                    arena
-                        .get(argument)
-                        .is_some_and(|argument| is_string_or_numeric_literal_like(argument.kind))
-                        .then_some(argument)
-                        .or(Some(binary.left))
-                }
-                _ => None,
-            }
+        NodeData::BinaryExpression(binary) => {
+            element_or_property_access_name(arena, binary.left).or(Some(binary.left))
         }
-        NodeData::CallExpression(call)
-            if is_bindable_object_define_property_call(arena, declaration) =>
-        {
-            call.arguments.nodes.get(1).copied()
-        }
+        NodeData::CallExpression(call) => call.arguments.nodes.get(1).copied(),
         _ => None,
+    }
+}
+
+fn assignment_declaration_kind(
+    arena: &NodeArena,
+    declaration: NodeId,
+    is_javascript_file: bool,
+) -> Option<JavaScriptAssignmentKind> {
+    // Use the same classification for preflight, names, and deferred binding.
+    // TS writes through nested element accesses are not expando declarations.
+    if is_javascript_file {
+        javascript_assignment_kind(arena, declaration)
+    } else {
+        is_typescript_expando_property_assignment(arena, declaration)
+            .then_some(JavaScriptAssignmentKind::ExpandoProperty)
     }
 }
 
@@ -4921,8 +4935,8 @@ fn skip_parentheses(arena: &NodeArena, mut node: NodeId) -> Option<NodeId> {
     Some(node)
 }
 
-fn has_dynamic_name(arena: &NodeArena, declaration: NodeId) -> bool {
-    let Some(name) = get_name_of_declaration(arena, declaration) else {
+fn has_dynamic_name(arena: &NodeArena, declaration: NodeId, is_javascript_file: bool) -> bool {
+    let Some(name) = get_name_of_declaration(arena, declaration, is_javascript_file) else {
         return false;
     };
     let Some(name_node) = arena.get(name) else {
@@ -7496,7 +7510,7 @@ mod tests {
                 .filter_map(|(id, node)| {
                     (node.kind == kind
                         && super::source_text_of_node(&parsed.arena, node) == Some(source)
-                        && super::get_name_of_declaration(&parsed.arena, id)
+                        && super::get_name_of_declaration(&parsed.arena, id, false)
                             .and_then(|name| super::node_text(&parsed.arena, name))
                             .as_deref()
                             == Some(key))
@@ -8093,7 +8107,8 @@ try {} catch (arguments) {}
 
     #[test]
     fn declaration_slice_preflight_rejects_atomically_and_retry_is_stable() {
-        let mut parsed = parse_source_file("type Deferred = string;");
+        let mut parsed =
+            parse_source_file("const registry = { [key]: () => {} }; type Deferred = string;");
         let file = FileId::new(43);
         let facts = CanonicalSourceFileFacts::new(
             EscapedName::source("\"/project/deferred\""),
@@ -9484,6 +9499,241 @@ const object = {};
         assert_eq!(dynamic_record.parent(), Some(owner));
         let spread = nodes_of_kind(&parsed.arena, SyntaxKind::SpreadAssignment)[0];
         assert_eq!(bound.symbol(node_ref(&parsed.arena, file, spread)), None);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn computed_property_initializers_keep_anonymous_symbols_and_file_identity() {
+        let source = "export const registry = { [key]: () => {}, [other]: function () {}, [third]: class {} };";
+        let typescript = parse_source_file(source);
+        let javascript = parse_javascript_source_file(source);
+        let mut binder = CanonicalBinder::new();
+        let mut initializer_symbols = Vec::new();
+        for (parsed, foreign_arena, file, language) in [
+            (
+                &typescript,
+                javascript.arena.id(),
+                FileId::new(112),
+                CanonicalSourceLanguage::TypeScript,
+            ),
+            (
+                &javascript,
+                typescript.arena.id(),
+                FileId::new(113),
+                CanonicalSourceLanguage::JavaScript,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/registry-{}\"", file.index())),
+                        language,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            if language == CanonicalSourceLanguage::JavaScript {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            } else {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+
+            let bound = binder.file(file).unwrap();
+            assert_eq!(bound.phase(), BindingPhase::Declarations);
+            assert!(bound.diagnostics().is_empty());
+            let object = variable_initializers_named(&parsed.arena, "registry")[0];
+            let owner = bound.symbol(node_ref(&parsed.arena, file, object)).unwrap();
+            assert_eq!(binder.symbol_store().symbol(owner).unwrap().members(), None);
+            let properties = nodes_of_kind(&parsed.arena, SyntaxKind::PropertyAssignment);
+            assert_eq!(properties.len(), 3);
+            for property in properties {
+                let NodeData::PropertyAssignment(data) = &parsed.arena.get(property).unwrap().data
+                else {
+                    unreachable!()
+                };
+                let property_ref = node_ref(&parsed.arena, file, property);
+                let property_symbol = bound.symbol(property_ref).unwrap();
+                let property_record = binder.symbol_store().symbol(property_symbol).unwrap();
+                assert_eq!(property_record.flags(), SymbolFlags::PROPERTY);
+                assert_eq!(
+                    property_record.name(),
+                    InternalSymbolName::Computed.as_ref()
+                );
+                assert_eq!(property_record.parent(), Some(owner));
+                assert_eq!(
+                    property_record.declarations(),
+                    Some([property_ref].as_slice())
+                );
+
+                let initializer_ref = node_ref(&parsed.arena, file, data.initializer);
+                let initializer = bound.symbol(initializer_ref).unwrap();
+                let record = binder.symbol_store().symbol(initializer).unwrap();
+                let (flags, name) = if parsed.arena.get(data.initializer).unwrap().kind
+                    == SyntaxKind::ClassExpression
+                {
+                    (SymbolFlags::CLASS, InternalSymbolName::Class)
+                } else {
+                    (SymbolFlags::FUNCTION, InternalSymbolName::Function)
+                };
+                assert_eq!(record.flags(), flags);
+                assert_eq!(record.name(), name.as_ref());
+                assert_eq!(record.parent(), None);
+                assert_eq!(record.declarations(), Some([initializer_ref].as_slice()));
+                assert_eq!(record.value_declaration(), Some(initializer_ref));
+                assert!(binder.symbol_store().contains_node_ref(initializer_ref));
+                assert_eq!(
+                    bound.symbol(NodeRef::new(foreign_arena, file, data.initializer)),
+                    None
+                );
+                assert_ne!(initializer, property_symbol);
+                assert!(!initializer_symbols.contains(&initializer));
+                initializer_symbols.push(initializer);
+            }
+        }
+        let program = binder.finish();
+        let store_id = program.symbol_store().id();
+        assert!(program.declarations_complete());
+        let (symbols, files) = program.try_into_parts().unwrap();
+        assert_eq!(symbols.id(), store_id);
+        assert_eq!(files.len(), 2);
+        assert_eq!(initializer_symbols.len(), 6);
+        assert!(
+            initializer_symbols
+                .into_iter()
+                .all(|symbol| symbols.contains_symbol(symbol))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn indexed_assignment_names_follow_program_source_language() {
+        let parsed = parse_source_file(
+            r#"
+function Factory() {}
+Factory["slot"] = function () {};
+Factory["slot"][key] = 1;
+Factory["slot"].named = 2;
+"#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let dynamic = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Factory[\"slot\"][key] = 1",
+        );
+        let named = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "Factory[\"slot\"].named = 2",
+        );
+        let initializer = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionExpression)[0];
+        // The Program fact, not a filename or reconstructed parser context,
+        // selects assignment declaration rules for this identical AST.
+        for language in [
+            CanonicalSourceLanguage::TypeScript,
+            CanonicalSourceLanguage::JavaScript,
+        ] {
+            let file = FileId::new(114);
+            let is_javascript = language == CanonicalSourceLanguage::JavaScript;
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/assignments\""),
+                        language,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            if is_javascript {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            } else {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let bound = binder.file(file).unwrap();
+            assert_eq!(bound.phase(), BindingPhase::Declarations);
+            assert!(bound.diagnostics().is_empty());
+            for assignment in [dynamic, named] {
+                assert_eq!(
+                    super::get_name_of_declaration(&parsed.arena, assignment, is_javascript)
+                        .is_some(),
+                    is_javascript
+                );
+                assert_eq!(
+                    bound
+                        .symbol(node_ref(&parsed.arena, file, assignment))
+                        .is_some(),
+                    is_javascript
+                );
+            }
+
+            if is_javascript {
+                let initializer_symbol = bound
+                    .symbol(node_ref(&parsed.arena, file, initializer))
+                    .unwrap();
+                let exports = binder
+                    .symbol_store()
+                    .symbol_table(
+                        binder
+                            .symbol_store()
+                            .symbol(initializer_symbol)
+                            .unwrap()
+                            .exports()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let named_symbol = exports.get_source("named").unwrap();
+                assert_eq!(
+                    bound.symbol(node_ref(&parsed.arena, file, named)),
+                    Some(named_symbol)
+                );
+                assert_eq!(
+                    binder.symbol_store().symbol(named_symbol).unwrap().parent(),
+                    Some(initializer_symbol)
+                );
+                let computed = bound
+                    .symbol(node_ref(&parsed.arena, file, dynamic))
+                    .unwrap();
+                let record = binder.symbol_store().symbol(computed).unwrap();
+                assert_eq!(record.name(), InternalSymbolName::Computed.as_ref());
+                assert_eq!(
+                    record.flags(),
+                    SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+                );
+                assert_eq!(
+                    record.declarations(),
+                    Some([node_ref(&parsed.arena, file, dynamic)].as_slice())
+                );
+                let assignments = exports
+                    .get(InternalSymbolName::AssignmentDeclaration.as_ref())
+                    .unwrap();
+                assert_eq!(
+                    binder
+                        .symbol_store()
+                        .symbol(assignments)
+                        .unwrap()
+                        .declarations(),
+                    Some([node_ref(&parsed.arena, file, dynamic)].as_slice())
+                );
+            }
+        }
     }
 
     #[test]
