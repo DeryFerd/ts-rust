@@ -18,7 +18,7 @@ import (
 	"github.com/microsoft/typescript-go/internal/checker"
 )
 
-const objectPhaseProviderCommit = "b650cedf78cccd0e20782bc5df482cd6103059de"
+const objectPhaseProviderCommit = "5251b6ba8695702a670862c0d4f2b44dba39bf5e"
 
 type objectPhaseReceipt struct {
 	Sequence  uint64           `json:"receipt_sequence"`

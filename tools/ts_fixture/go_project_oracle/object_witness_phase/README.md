@@ -1,8 +1,11 @@
 # Object witnesses in artifact phases
 
-This adapter composes the approved provider at `b650cedf` with the reviewed
+This adapter composes the approved provider at `5251b6ba` with the reviewed
 phase producer at `c0c72945`. Provider source files remain unchanged.
 The Hono display probes and proposed formatting fixes are not included.
+
+The saved phase reports and historical handoff notes predate this provider
+update. They are unchanged and are not evidence of an adapter run with it.
 
 ## API and order
 
