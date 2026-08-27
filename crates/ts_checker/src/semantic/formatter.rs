@@ -1828,15 +1828,26 @@ fn display_validated_module_namespace(
                         false,
                     )
                     .map_err(|_| invalid())?;
-            let symbol = if visible.and_then(|symbol| store.get_merged_symbol(symbol))
+            let name = if visible.and_then(|symbol| store.get_merged_symbol(symbol))
                 == Some(wrapper.source.alias)
             {
-                wrapper.source.alias
+                display_location_symbol_name(
+                    store,
+                    host,
+                    wrapper.source.alias,
+                    SymbolFlags::VALUE,
+                    state,
+                )?
             } else {
-                wrapper.source.module
+                // An alias for the bare module does not name its wrapped view.
+                let name = display_module_import_name(
+                    location,
+                    wrapper.source.module,
+                    state.format_flags,
+                )?;
+                state.add(name.len().saturating_add(1).saturating_mul(2));
+                name
             };
-            let name =
-                display_location_symbol_name(store, host, symbol, SymbolFlags::VALUE, state)?;
             state.add(7);
             return Ok(Some(format!("typeof {name}")));
         }
@@ -5555,6 +5566,26 @@ fn display_symbol_name(
     Ok(name.to_owned())
 }
 
+fn display_module_import_name(
+    location: &SymbolDisplayContext,
+    symbol: SemanticSymbolId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, TypeDisplayUnavailable> {
+    let specifier = location
+        .module_specifier(symbol)
+        .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
+    let quote =
+        if flags.contains(CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE) {
+            '\''
+        } else {
+            '"'
+        };
+    Ok(format!(
+        "import({})",
+        quote_string_literal(specifier, quote)
+    ))
+}
+
 fn display_location_symbol_name(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -5583,19 +5614,11 @@ fn display_location_symbol_name(
             && symbol_display::is_external_module(store, host, symbol)
                 .map_err(TypeDisplayUnavailable::SymbolDisplay)?
         {
-            let specifier = location
-                .module_specifier(symbol)
-                .map_err(TypeDisplayUnavailable::SymbolDisplay)?;
-            let quote = if state
-                .format_flags
-                .contains(CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE)
-            {
-                '\''
-            } else {
-                '"'
-            };
-            write!(result, "import({})", quote_string_literal(specifier, quote))
-                .expect("writing a String cannot fail");
+            result.push_str(&display_module_import_name(
+                location,
+                symbol,
+                state.format_flags,
+            )?);
             continue;
         }
         let record = store
@@ -11533,6 +11556,57 @@ mod tests {
                 assert_eq!(state(context.store()), before);
                 assert!(context.diagnostics().is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn namespace_wrapper_cross_source_display_preserves_quote_flags() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let target = parse_source_file("export const value: number = 1;");
+        let wrapped = parse_source_file(
+            "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
+        );
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        let (mut context, queries) =
+            namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+        let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+        assert_ne!(types[0], types[1]);
+        for query in queries {
+            context.check_source_file(query.file).unwrap();
+        }
+        for replay in [false, true] {
+            if replay {
+                for query in queries {
+                    context.recheck_source_file(query.file).unwrap();
+                }
+            }
+            for (flags, expected) in [
+                (
+                    CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    "typeof import(\"./producer.cjs\")",
+                ),
+                (
+                    CanonicalTypeFormatFlags::NO_TRUNCATION
+                        | CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE,
+                    "typeof import('./producer.cjs')",
+                ),
+            ] {
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(types[0], queries[1], flags)
+                        .unwrap(),
+                    expected,
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(types[1], queries[1], flags)
+                        .unwrap(),
+                    "typeof bare",
+                );
+            }
+            assert!(context.diagnostics().is_empty());
         }
     }
 
