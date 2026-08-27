@@ -8310,6 +8310,40 @@ pub(super) struct ClassGrammarDiagnosticPlan {
     pub(super) diagnostics: Vec<ClassGrammarDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RecoveredClassPropertyType {
+    Annotation(NodeRef),
+    Initializer(NodeRef),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RecoveredClassPropertyDeclaration {
+    pub(super) declaration: NodeRef,
+    pub(super) name: NodeRef,
+    pub(super) annotation: Option<NodeRef>,
+    pub(super) initializer: NodeRef,
+    auto_accessor: bool,
+    side: ClassPropertySide,
+}
+
+impl RecoveredClassPropertyDeclaration {
+    pub(super) fn type_source(&self) -> RecoveredClassPropertyType {
+        self.annotation.map_or(
+            RecoveredClassPropertyType::Initializer(self.initializer),
+            RecoveredClassPropertyType::Annotation,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RecoveredClassProperty {
+    pub(super) class: NodeRef,
+    pub(super) owner: SemanticSymbolId,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) declarations: Vec<RecoveredClassPropertyDeclaration>,
+    pub(super) type_source: RecoveredClassPropertyType,
+}
+
 /// One exported class with a single JSX-returning arrow instance field.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ExportedJsxArrowClassPlan {
@@ -10711,38 +10745,63 @@ fn plan_multiple_base_grammar_diagnostic(
     })
 }
 
-fn plan_duplicate_property_accessor_grammar_diagnostics(
+/// Reads one binder-owned property group without completing its class.
+pub(super) fn plan_recovered_class_property(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    owner: SemanticSymbolId,
-    declaration: NodeRef,
-    first: NodeRef,
-    second: NodeRef,
-) -> Option<[ClassGrammarDiagnostic; 2]> {
+    symbol: SemanticSymbolId,
+) -> Option<RecoveredClassProperty> {
+    let symbol_record = store.symbol(symbol)?;
+    let declarations = symbol_record
+        .declarations()
+        .filter(|nodes| !nodes.is_empty())?;
+    let first = declarations[0];
+    let first_record = preflight_node(store, host, first).ok()?;
+    let declaration = NodeRef::new(first.arena, first.file, first_record.parent?);
+    let class_record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &class_record.data else {
+        return None;
+    };
+    let owner = bound_symbol(store, host, declaration)?;
     let owner_record = store.symbol(owner)?;
-    let members = owner_record
-        .members()
-        .and_then(|members| store.symbol_table(members))?;
-    if members.len() != 1 {
+    if owner_record.flags() != SymbolFlags::CLASS
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.declarations() != Some(&[declaration])
+        || owner_record.value_declaration() != Some(declaration)
+        || !store.source_symbol_declarations_match(owner)
+        || !store.source_symbol_declarations_match(symbol)
+        || !store.source_declaration_belongs_to_symbol(declaration, owner)
+    {
         return None;
     }
 
-    let mut names = Vec::new();
-    names.try_reserve_exact(2).ok()?;
-    let mut previous_end = preflight_node(store, host, declaration).ok()?.range.start;
-    let mut merged_symbol = None;
-    for (index, member) in [first, second].into_iter().enumerate() {
+    let mut properties = Vec::new();
+    properties.try_reserve_exact(declarations.len()).ok()?;
+    let mut expected_flags = SymbolFlags::NONE;
+    let mut previous_end = class_record.range.start;
+    for &member in declarations {
         let member_record = preflight_node(store, host, member).ok()?;
         let NodeData::PropertyDeclaration(property) = &member_record.data else {
             return None;
         };
-        if member_record.kind != SyntaxKind::PropertyDeclaration
+        if !member.is_for(declaration.arena, declaration.file)
+            || member_record.kind != SyntaxKind::PropertyDeclaration
             || member_record.flags.0 != 0
             || member_record.parent != Some(declaration.node)
             || member_record.range.start < previous_end
+            || member_record.range.end > class_record.range.end
+            || class
+                .members
+                .nodes
+                .iter()
+                .filter(|node| **node == member.node)
+                .count()
+                != 1
             || property.symbol.is_some()
             || property.facts != 0
             || property.postfix_token.is_some()
+            || bound_symbol(store, host, member) != Some(symbol)
+            || !store.source_declaration_belongs_to_symbol(member, symbol)
         {
             return None;
         }
@@ -10751,115 +10810,388 @@ fn plan_duplicate_property_accessor_grammar_diagnostics(
         let name_record = preflight_node(store, host, name).ok()?;
         if name_record.range.start < member_record.range.start
             || name_record.range.end > member_record.range.end
+            || symbol_record.name().as_utf8() != Some(name_text.as_str())
         {
             return None;
         }
-        match (index, property.modifiers.as_ref()) {
-            (0, None) => {}
-            (1, Some(modifiers)) => {
-                let [modifier] = modifiers.list.nodes.as_slice() else {
-                    return None;
-                };
-                let modifier = NodeRef::new(member.arena, member.file, *modifier);
+        let mut modifier_kinds = Vec::new();
+        if let Some(modifiers) = &property.modifiers {
+            if modifiers.flags.0 != 0
+                || modifiers.list.has_trailing_comma
+                || modifiers.list.range.start != member_record.range.start
+                || modifiers.list.range.end > name_record.range.start
+            {
+                return None;
+            }
+            let mut previous_modifier_end = member_record.range.start;
+            for &modifier in &modifiers.list.nodes {
+                let modifier = NodeRef::new(member.arena, member.file, modifier);
                 let modifier_record = preflight_node(store, host, modifier).ok()?;
-                if modifiers.flags.0 != 0
-                    || modifiers.list.has_trailing_comma
-                    || modifiers.list.range.start != member_record.range.start
-                    || modifiers.list.range.end > name_record.range.start
-                    || modifier_record.kind != SyntaxKind::AccessorKeyword
-                    || modifier_record.flags.0 != 0
+                if modifier_record.flags.0 != 0
                     || modifier_record.parent != Some(member.node)
                     || !matches!(modifier_record.data, NodeData::Token(_))
-                    || modifier_record.range.start < modifiers.list.range.start
+                    || modifier_record.range.start < previous_modifier_end
                     || modifier_record.range.end > modifiers.list.range.end
                 {
                     return None;
                 }
+                previous_modifier_end = modifier_record.range.end;
+                modifier_kinds.push(modifier_record.kind);
+            }
+        }
+        let (side, auto_accessor) = match modifier_kinds.as_slice() {
+            [] => (ClassPropertySide::Instance, false),
+            [SyntaxKind::AccessorKeyword] => (ClassPropertySide::Instance, true),
+            [SyntaxKind::StaticKeyword] => (ClassPropertySide::Static, false),
+            [SyntaxKind::StaticKeyword, SyntaxKind::AccessorKeyword] => {
+                (ClassPropertySide::Static, true)
             }
             _ => return None,
-        }
-
-        let annotation = NodeRef::new(member.arena, member.file, property.type_?);
-        let annotation_record = preflight_node(store, host, annotation).ok()?;
-        if annotation_record.kind != SyntaxKind::NumberKeyword
-            || annotation_record.flags.0 != 0
-            || annotation_record.parent != Some(member.node)
-            || annotation_record.range.start < name_record.range.end
-            || annotation_record.range.end > member_record.range.end
-            || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+        };
+        if properties
+            .first()
+            .is_some_and(|property: &RecoveredClassPropertyDeclaration| property.side != side)
         {
             return None;
         }
+        expected_flags |= if auto_accessor {
+            SymbolFlags::ACCESSOR
+        } else {
+            SymbolFlags::PROPERTY
+        };
+        let annotation = property
+            .type_
+            .map(|node| NodeRef::new(member.arena, member.file, node));
+        let annotation_end = if let Some(annotation) = annotation {
+            let annotation_record = preflight_node(store, host, annotation).ok()?;
+            if !matches!(
+                annotation_record.kind,
+                SyntaxKind::NumberKeyword | SyntaxKind::StringKeyword
+            ) || annotation_record.flags.0 != 0
+                || annotation_record.parent != Some(member.node)
+                || annotation_record.range.start < name_record.range.end
+                || annotation_record.range.end > member_record.range.end
+                || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+            {
+                return None;
+            }
+            annotation_record.range.end
+        } else {
+            name_record.range.end
+        };
         let initializer = NodeRef::new(member.arena, member.file, property.initializer?);
         let initializer_record = preflight_node(store, host, initializer).ok()?;
-        let NodeData::NumericLiteral(literal) = &initializer_record.data else {
-            return None;
+        let valid_literal = match &initializer_record.data {
+            NodeData::NumericLiteral(literal) => {
+                initializer_record.kind == SyntaxKind::NumericLiteral
+                    && literal.token_flags.0 == 0
+                    && !ts_jsnum::from_string(&literal.text).is_nan()
+            }
+            NodeData::StringLiteral(literal) => {
+                initializer_record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0
+            }
+            _ => false,
         };
-        let spelling_matches = host
-            .source(initializer)
-            .and_then(|(arena, _)| arena.source_text())
-            .is_none_or(|source| {
-                source.get(
-                    initializer_record.range.start.get() as usize
-                        ..initializer_record.range.end.get() as usize,
-                ) == Some(literal.text.as_str())
-            });
-        if initializer_record.kind != SyntaxKind::NumericLiteral
+        if !valid_literal
             || initializer_record.flags.0 != 0
             || initializer_record.parent != Some(member.node)
-            || initializer_record.range.start < annotation_record.range.end
+            || initializer_record.range.start < annotation_end
             || initializer_record.range.end > member_record.range.end
-            || literal.token_flags.0 != 0
-            || ts_jsnum::from_string(&literal.text).is_nan()
-            || !spelling_matches
         {
             return None;
         }
-
-        let symbol = bound_symbol(store, host, member)?;
-        if merged_symbol.is_some_and(|expected| expected != symbol)
-            || members.get_source(&name_text) != Some(symbol)
-        {
-            return None;
-        }
-        merged_symbol = Some(symbol);
-        names.push((name, name_text));
+        properties.push(RecoveredClassPropertyDeclaration {
+            declaration: member,
+            name,
+            annotation,
+            initializer,
+            auto_accessor,
+            side,
+        });
     }
-
-    let symbol = merged_symbol?;
-    let symbol_record = store.symbol(symbol)?;
-    let [(first_name, first_text), (second_name, second_text)] = names.as_slice() else {
-        return None;
+    let table = match properties[0].side {
+        ClassPropertySide::Instance => owner_record.members(),
+        ClassPropertySide::Static => owner_record.exports(),
     };
-    if first_text != second_text
-        || symbol_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR)
+    if symbol_record.flags() != expected_flags
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name().as_utf8() != Some(first_text.as_str())
-        || symbol_record.declarations() != Some(&[first, second])
         || symbol_record.value_declaration() != Some(first)
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.parent() != Some(owner)
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
+        || table
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(symbol_record.name()))
+            != Some(symbol)
     {
         return None;
     }
+    // Accessor types take precedence over property value declarations upstream.
+    let type_source = properties
+        .iter()
+        .find(|property| property.auto_accessor)
+        .unwrap_or(&properties[0])
+        .type_source();
+    let plan = RecoveredClassProperty {
+        class: declaration,
+        owner,
+        symbol,
+        declarations: properties,
+        type_source,
+    };
+    recovered_class_property_caches_match(store, host, &plan).then_some(plan)
+}
 
-    Some([
-        ClassGrammarDiagnostic {
-            node: *first_name,
-            range_override: None,
-            code: 2300,
-            arguments: vec![first_text.clone()],
-        },
-        ClassGrammarDiagnostic {
-            node: *second_name,
-            range_override: None,
-            code: 2300,
-            arguments: vec![second_text.clone()],
-        },
-    ])
+pub(super) fn recovered_class_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    source: RecoveredClassPropertyType,
+) -> Option<TypeId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let node = match source {
+        RecoveredClassPropertyType::Annotation(node)
+        | RecoveredClassPropertyType::Initializer(node) => node,
+    };
+    let record = preflight_node(store, host, node).ok()?;
+    match (source, record.kind, &record.data) {
+        (
+            RecoveredClassPropertyType::Annotation(_),
+            SyntaxKind::NumberKeyword,
+            NodeData::KeywordTypeNode(_),
+        )
+        | (
+            RecoveredClassPropertyType::Initializer(_),
+            SyntaxKind::NumericLiteral,
+            NodeData::NumericLiteral(_),
+        ) => Some(bootstrap.number_type),
+        (
+            RecoveredClassPropertyType::Annotation(_),
+            SyntaxKind::StringKeyword,
+            NodeData::KeywordTypeNode(_),
+        )
+        | (
+            RecoveredClassPropertyType::Initializer(_),
+            SyntaxKind::StringLiteral,
+            NodeData::StringLiteral(_),
+        ) => Some(bootstrap.string_type),
+        _ => None,
+    }
+}
+
+fn recovered_class_property_caches_match(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &RecoveredClassProperty,
+) -> bool {
+    let Some(type_) = recovered_class_property_type(store, host, plan.type_source) else {
+        return false;
+    };
+    if store
+        .value_symbol_links(plan.symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store
+            .declared_type_links(plan.symbol)
+            .is_some_and(|links| links != &super::DeclaredTypeLinks::default())
+    {
+        return false;
+    }
+    let node_cache_matches = |node, expected_type, expected_symbol| {
+        store.type_node_links(node).is_none_or(|links| {
+            links.outer_type_parameters.is_none()
+                && links
+                    .resolved_type
+                    .is_none_or(|cached| cached == expected_type)
+        }) && store.symbol_node_links(node).is_none_or(|links| {
+            links
+                .resolved_symbol
+                .is_none_or(|cached| Some(cached) == expected_symbol)
+        })
+    };
+    for property in &plan.declarations {
+        if !node_cache_matches(property.declaration, type_, Some(plan.symbol))
+            || !node_cache_matches(property.name, type_, Some(plan.symbol))
+        {
+            return false;
+        }
+        if let Some(annotation) = property.annotation {
+            let Some(annotation_type) = recovered_class_property_type(
+                store,
+                host,
+                RecoveredClassPropertyType::Annotation(annotation),
+            ) else {
+                return false;
+            };
+            if !node_cache_matches(annotation, annotation_type, None) {
+                return false;
+            }
+        }
+        let Some(record) = host.node(property.initializer) else {
+            return false;
+        };
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return false;
+        };
+        let regular = match &record.data {
+            NodeData::NumericLiteral(literal) => {
+                bootstrap.cached_number_literal_type(ts_jsnum::from_string(&literal.text))
+            }
+            NodeData::StringLiteral(literal) => bootstrap.cached_string_literal_type(&literal.text),
+            _ => return false,
+        };
+        if store
+            .type_node_links(property.initializer)
+            .is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_some_and(|cached| {
+                        !regular.is_some_and(|regular| {
+                            store.validate_union_constituent(regular).is_ok()
+                                && (cached == regular
+                                    || store
+                                        .fresh_type_of_literal_type(regular)
+                                        .is_ok_and(|fresh| cached == fresh))
+                        })
+                    })
+            })
+            || store
+                .symbol_node_links(property.initializer)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn plan_duplicate_property_accessor_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Option<Vec<ClassGrammarDiagnostic>> {
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let mut groups = Vec::new();
+    let mut instance_symbols = HashSet::new();
+    let mut static_symbols = HashSet::new();
+    let mut previous_end = class.members.range.start;
+    for &member in &class.members.nodes {
+        let member = NodeRef::new(declaration.arena, declaration.file, member);
+        let record = preflight_node(store, host, member).ok()?;
+        if record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.end > class.members.range.end
+        {
+            return None;
+        }
+        previous_end = record.range.end;
+        if record.kind == SyntaxKind::SemicolonClassElement {
+            continue;
+        }
+        let symbol = bound_symbol(store, host, member)?;
+        let plan = plan_recovered_class_property(store, host, symbol)?;
+        if plan.class != declaration || plan.owner != owner {
+            return None;
+        }
+        let seen = match plan.declarations[0].side {
+            ClassPropertySide::Instance => &mut instance_symbols,
+            ClassPropertySide::Static => &mut static_symbols,
+        };
+        if seen.insert(symbol) {
+            groups.push(plan);
+        }
+    }
+    let owner_record = store.symbol(owner)?;
+    let instance_count = match owner_record.members() {
+        Some(table) => store.symbol_table(table)?.len(),
+        None => 0,
+    };
+    if instance_count != instance_symbols.len()
+        || owner_record
+            .exports()
+            .and_then(|table| store.symbol_table(table))?
+            .len()
+            != static_symbols.len() + 1
+        || !groups.iter().any(|group| {
+            group.declarations.len() > 1
+                && group
+                    .declarations
+                    .iter()
+                    .any(|member| !member.auto_accessor)
+        })
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let type_name = |type_| {
+        if type_ == bootstrap.number_type {
+            Some("number")
+        } else if type_ == bootstrap.string_type {
+            Some("string")
+        } else {
+            None
+        }
+    };
+    let mut diagnostics = Vec::new();
+    for group in groups {
+        let symbol_name = store.symbol(group.symbol)?.name().as_utf8()?.to_owned();
+        let type_ = recovered_class_property_type(store, host, group.type_source)?;
+        let duplicate = group.declarations.len() > 1
+            && group
+                .declarations
+                .iter()
+                .any(|member| !member.auto_accessor);
+        for (index, property) in group.declarations.iter().enumerate() {
+            if duplicate {
+                diagnostics.push(ClassGrammarDiagnostic {
+                    node: property.name,
+                    range_override: None,
+                    code: 2300,
+                    arguments: vec![symbol_name.clone()],
+                });
+            }
+            let declared_type = recovered_class_property_type(store, host, property.type_source())?;
+            if index > 0 && declared_type != type_ {
+                diagnostics.push(ClassGrammarDiagnostic {
+                    node: property.name,
+                    range_override: None,
+                    code: 2717,
+                    arguments: vec![
+                        symbol_name.clone(),
+                        type_name(type_)?.to_owned(),
+                        type_name(declared_type)?.to_owned(),
+                    ],
+                });
+            }
+            let initializer_type = recovered_class_property_type(
+                store,
+                host,
+                RecoveredClassPropertyType::Initializer(property.initializer),
+            )?;
+            let expected = if index == 0 { type_ } else { declared_type };
+            if initializer_type != expected {
+                diagnostics.push(ClassGrammarDiagnostic {
+                    node: property.name,
+                    range_override: None,
+                    code: 2322,
+                    arguments: vec![
+                        type_name(initializer_type)?.to_owned(),
+                        type_name(expected)?.to_owned(),
+                    ],
+                });
+            }
+        }
+    }
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            host.node(diagnostic.node).map(|node| node.range.start),
+            diagnostic.code,
+        )
+    });
+    Some(diagnostics)
 }
 
 fn plan_missing_constructor_grammar_diagnostic(
@@ -15021,6 +15353,19 @@ pub(super) fn plan_class_grammar_diagnostics(
     let export_table = store.symbol_table(exports)?;
 
     if !ambient
+        && !abstract_class
+        && class.heritage_clauses.is_none()
+        && let Some(diagnostics) =
+            plan_duplicate_property_accessor_grammar_diagnostics(store, host, symbol, declaration)
+    {
+        return Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics,
+        });
+    }
+
+    if !ambient
         && class.heritage_clauses.is_none()
         && export_table.len() == 1
         && let Some(diagnostics) = plan_abstract_class_method_diagnostics(
@@ -15228,20 +15573,6 @@ pub(super) fn plan_class_grammar_diagnostics(
                 }
                 diagnostics.try_reserve_exact(1).ok()?;
                 diagnostics.push(plan_missing_constructor_grammar_diagnostic(
-                    store,
-                    host,
-                    symbol,
-                    declaration,
-                    first,
-                    second,
-                )?);
-            }
-            SyntaxKind::PropertyDeclaration => {
-                if export_table.len() != 1 {
-                    return None;
-                }
-                diagnostics.try_reserve_exact(2).ok()?;
-                diagnostics.extend(plan_duplicate_property_accessor_grammar_diagnostics(
                     store,
                     host,
                     symbol,

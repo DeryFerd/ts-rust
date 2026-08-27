@@ -24795,7 +24795,7 @@ fn identifier_expression_type(
     }
 }
 
-fn widened_fresh_literal_type(
+pub(super) fn widened_fresh_literal_type(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Result<TypeId, SourceCheckError> {
@@ -49196,6 +49196,38 @@ pub(super) fn check_source_file(
                             diagnostic: Diagnostic::with_arguments(
                                 message_by_code(2728)
                                     .ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                                [name.clone()],
+                            ),
+                        }]
+                    } else if diagnostic.code == 2717 {
+                        let name = diagnostic
+                            .arguments
+                            .first()
+                            .ok_or(SourceCheckError::Class(class.declaration))?;
+                        let member = host
+                            .node(diagnostic.node)
+                            .and_then(|node| node.parent)
+                            .map(|node| {
+                                NodeRef::new(diagnostic.node.arena, diagnostic.node.file, node)
+                            })
+                            .ok_or(SourceCheckError::Class(class.declaration))?;
+                        let first = host
+                            .bound_file(member)
+                            .and_then(|bound| bound.symbol(member))
+                            .and_then(|symbol| store.symbol(symbol))
+                            .and_then(ts_binder::semantic::Symbol::value_declaration)
+                            .ok_or(SourceCheckError::Class(class.declaration))?;
+                        let Some(NodeData::PropertyDeclaration(first_property)) =
+                            host.node(first).map(|node| &node.data)
+                        else {
+                            return Err(SourceCheckError::Class(class.declaration));
+                        };
+                        let first_name = NodeRef::new(first.arena, first.file, first_property.name);
+                        vec![CanonicalCheckerRelatedInformation {
+                            node: Some(first_name),
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(6203)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(6203))?,
                                 [name.clone()],
                             ),
                         }]

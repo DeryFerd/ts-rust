@@ -6,6 +6,8 @@
 //! nodes, so these queries preserve the existing graph instead of constructing
 //! replacement symbols or types.
 
+use std::collections::HashSet;
+
 use ts_ast::{FileId, Node, NodeArena, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, InternalSymbolName,
@@ -1314,190 +1316,131 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(symbol))
     }
 
-    #[allow(clippy::too_many_lines)] // Keep the source recovery and its member ownership in one check.
     fn preflight_duplicate_property_artifact_nodes(
         &self,
         node: NodeRef,
-    ) -> Result<Option<(NodeRef, bool)>, CanonicalArtifactQueryError> {
-        let (annotation, initializer) = {
-            let (arena, bound, record) = self.validated_artifact_node(node)?;
-            let declaration = if matches!(record.data, NodeData::PropertyDeclaration(_)) {
-                node
-            } else if let Some(parent) = record.parent
-                && let Some(NodeData::PropertyDeclaration(property)) =
-                    arena.get(parent).map(|record| &record.data)
-                && (property.name == node.node
-                    || property.type_ == Some(node.node)
-                    || property.initializer == Some(node.node))
-            {
-                NodeRef::new(node.arena, node.file, parent)
-            } else {
-                return Ok(None);
-            };
-            let (_, _, declaration_record) = self.validated_artifact_node(declaration)?;
-            let Some(class_id) = declaration_record.parent else {
-                return Ok(None);
-            };
-            let class_node = NodeRef::new(node.arena, node.file, class_id);
-            let (_, _, class_record) = self.validated_artifact_node(class_node)?;
-            let NodeData::ClassDeclaration(class) = &class_record.data else {
-                return Ok(None);
-            };
-            let [first, second] = class.members.nodes.as_slice() else {
-                return Ok(None);
-            };
-            let first = NodeRef::new(node.arena, node.file, *first);
-            let second = NodeRef::new(node.arena, node.file, *second);
-            if declaration != first && declaration != second {
-                return Err(CanonicalArtifactQueryError::ForeignNode(declaration));
-            }
-            let NodeData::PropertyDeclaration(first_property) =
-                &self.validated_artifact_node(first)?.2.data
-            else {
-                return Ok(None);
-            };
-            let NodeData::PropertyDeclaration(second_property) =
-                &self.validated_artifact_node(second)?.2.data
-            else {
-                return Ok(None);
-            };
-            let first_name = NodeRef::new(node.arena, node.file, first_property.name);
-            let second_name = NodeRef::new(node.arena, node.file, second_property.name);
-            if !matches!(
-                (&self.validated_artifact_node(first_name)?.2.data,
-                 &self.validated_artifact_node(second_name)?.2.data),
-                (NodeData::Identifier(first), NodeData::Identifier(second))
-                    if first.text == second.text
-            ) || !ts_binder::canonical_has_syntactic_modifier(
-                arena,
-                second.node,
-                SyntaxKind::AccessorKeyword,
-            ) || ts_binder::canonical_has_syntactic_modifier(
-                arena,
-                first.node,
-                SyntaxKind::StaticKeyword,
-            ) != ts_binder::canonical_has_syntactic_modifier(
-                arena,
-                second.node,
-                SyntaxKind::StaticKeyword,
-            ) {
-                return Ok(None);
-            }
-            let Some(symbol) = bound.symbol(first) else {
-                return Ok(None);
-            };
-            if bound.symbol(second) != Some(symbol) {
-                return Ok(None);
-            }
-            let owner =
-                bound
-                    .symbol(class_node)
-                    .ok_or(CanonicalArtifactQueryError::MissingType {
-                        node,
-                        kind: record.kind,
-                    })?;
-            let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
-            let host =
-                super::DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
-            let grammar =
-                super::classes::plan_class_grammar_diagnostics(self.store(), &host, owner)
-                    .ok_or_else(invalid)?;
-            if grammar.declaration != class_node
-                || grammar.symbol != owner
-                || !matches!(grammar.diagnostics.as_slice(), [left, right]
-                    if left.code == 2300 && right.code == 2300
-                        && left.node == first_name && right.node == second_name)
-                || self
-                    .store()
-                    .value_symbol_links(symbol)
-                    .is_some_and(|links| links != &super::ValueSymbolLinks::default())
-                || self
-                    .store()
-                    .declared_type_links(symbol)
-                    .is_some_and(|links| links != &super::DeclaredTypeLinks::default())
-            {
-                return Err(invalid());
-            }
-            let annotation = first_property.type_.ok_or_else(invalid)?;
-            // Reject changed caches before source checking can add diagnostics.
-            for (member, property) in [(first, first_property), (second, second_property)] {
-                let name = NodeRef::new(node.arena, node.file, property.name);
-                let member_annotation =
-                    NodeRef::new(node.arena, node.file, property.type_.ok_or_else(invalid)?);
-                for (location, expected_symbol) in [
-                    (member, Some(symbol)),
-                    (name, Some(symbol)),
-                    (member_annotation, None),
-                ] {
-                    let cached = self.cached_artifact_type(location)?;
-                    if self
-                        .store()
-                        .type_node_links(location)
-                        .is_some_and(|links| links.outer_type_parameters.is_some())
-                    {
-                        return Err(CanonicalArtifactQueryError::MissingType {
-                            node: location,
-                            kind: self.validated_artifact_node(location)?.2.kind,
-                        });
-                    }
-                    if let Some(cached) = cached
-                        && !self
-                            .store()
-                            .source_direct_type_annotation_is_exact(member_annotation, cached)
-                    {
-                        return Err(CanonicalArtifactQueryError::InvalidType {
-                            node: location,
-                            type_: cached,
-                        });
-                    }
-                    if let Some(cached_symbol) = self
-                        .store()
-                        .symbol_node_links(location)
-                        .and_then(|links| links.resolved_symbol)
-                        && Some(cached_symbol) != expected_symbol
-                    {
-                        return Err(CanonicalArtifactQueryError::InvalidSymbol {
-                            node: location,
-                            symbol: cached_symbol,
-                        });
-                    }
-                }
-                self.preflight_primitive_initializer_artifact_node(NodeRef::new(
-                    node.arena,
-                    node.file,
-                    property.initializer.ok_or_else(invalid)?,
-                ))?;
-            }
-            (
-                NodeRef::new(node.arena, node.file, annotation),
-                first_property.initializer == Some(node.node)
-                    || second_property.initializer == Some(node.node),
-            )
+    ) -> Result<
+        Option<(super::classes::RecoveredClassPropertyType, bool)>,
+        CanonicalArtifactQueryError,
+    > {
+        let (arena, bound, record) = self.validated_artifact_node(node)?;
+        let declaration = if matches!(record.data, NodeData::PropertyDeclaration(_)) {
+            node
+        } else if let Some(parent) = record.parent
+            && let Some(NodeData::PropertyDeclaration(property)) =
+                arena.get(parent).map(|record| &record.data)
+            && (property.name == node.node
+                || property.type_ == Some(node.node)
+                || property.initializer == Some(node.node))
+        {
+            NodeRef::new(node.arena, node.file, parent)
+        } else {
+            return Ok(None);
         };
-        Ok(Some((annotation, initializer)))
+        let (_, _, declaration_record) = self.validated_artifact_node(declaration)?;
+        let Some(parent) = declaration_record.parent else {
+            return Ok(None);
+        };
+        let class_node = NodeRef::new(node.arena, node.file, parent);
+        let (_, _, class_record) = self.validated_artifact_node(class_node)?;
+        let NodeData::ClassDeclaration(class) = &class_record.data else {
+            return Ok(None);
+        };
+
+        let mut symbols = HashSet::new();
+        let has_duplicate = class
+            .members
+            .nodes
+            .iter()
+            .filter_map(|member| {
+                let member = NodeRef::new(node.arena, node.file, *member);
+                if !matches!(
+                    arena.get(member.node)?.data,
+                    NodeData::PropertyDeclaration(_)
+                ) {
+                    return None;
+                }
+                bound.symbol(member)
+            })
+            .any(|symbol| !symbols.insert(symbol));
+        if !has_duplicate {
+            return Ok(None);
+        }
+
+        let symbol = bound
+            .symbol(declaration)
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            })?;
+        let owner = bound
+            .symbol(class_node)
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            })?;
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
+        let host = self.declared_type_host()?;
+        let grammar = super::classes::plan_class_grammar_diagnostics(self.store(), &host, owner)
+            .ok_or_else(invalid)?;
+        if grammar.declaration != class_node
+            || grammar.symbol != owner
+            || !grammar
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == 2300)
+        {
+            return Err(invalid());
+        }
+        let plan = super::classes::plan_recovered_class_property(self.store(), &host, symbol)
+            .ok_or_else(invalid)?;
+        if plan.class != class_node || plan.owner != owner {
+            return Err(invalid());
+        }
+        let property = plan
+            .declarations
+            .iter()
+            .find(|property| property.declaration == declaration)
+            .ok_or_else(invalid)?;
+        let type_source = if property.annotation == Some(node) {
+            super::classes::RecoveredClassPropertyType::Annotation(node)
+        } else {
+            plan.type_source
+        };
+        Ok(Some((type_source, property.initializer == node)))
     }
 
     fn duplicate_property_artifact_type(
         &mut self,
         node: NodeRef,
     ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
-        let Some((annotation, initializer)) =
-            self.preflight_duplicate_property_artifact_nodes(node)?
+        let Some((source, initializer)) = self.preflight_duplicate_property_artifact_nodes(node)?
         else {
             return Ok(None);
         };
         if initializer {
             return self.primitive_initializer_artifact_type(node).map(Some);
         }
-        let type_ = self.get_type_from_type_node(annotation)?;
-        if !self
-            .store()
-            .source_direct_type_annotation_is_exact(annotation, type_)
+        let type_ = match source {
+            super::classes::RecoveredClassPropertyType::Annotation(annotation) => {
+                self.get_type_from_type_node(annotation)?
+            }
+            super::classes::RecoveredClassPropertyType::Initializer(initializer) => {
+                let literal = self.primitive_initializer_artifact_type(initializer)?;
+                let fresh = self
+                    .store()
+                    .fresh_type_of_literal_type(literal)
+                    .map_err(|_| CanonicalArtifactQueryError::InvalidType {
+                        node: initializer,
+                        type_: literal,
+                    })?;
+                super::source::widened_fresh_literal_type(self.store(), fresh)?
+            }
+        };
+        let host = self.declared_type_host()?;
+        if super::classes::recovered_class_property_type(self.store(), &host, source) != Some(type_)
         {
-            return Err(CanonicalArtifactQueryError::InvalidType {
-                node: annotation,
-                type_: self.cached_artifact_type(annotation)?.unwrap_or(type_),
-            });
+            return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
         }
         if self.store().type_node_links(node).is_some_and(|links| {
             links.outer_type_parameters.is_some()
@@ -5964,6 +5907,235 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn duplicate_recovery_queries_replay_without_class_publication() {
+        for (source, expected) in [
+            (
+                "class Model { before = 0; value = 1; middle = 'mid'; accessor value = 2; after = 'end'; }",
+                &["number", "number", "string", "number", "string"][..],
+            ),
+            (
+                "class Model { before = 0; value: number = 1; middle = 'mid'; accessor value: string = 'next'; after = 3; }",
+                &["number", "string", "string", "string", "number"][..],
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_121);
+            let members = parsed
+                .arena
+                .iter()
+                .filter_map(|(id, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, property.name),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for checked_first in [false, true] {
+                let mut context = context(&parsed, file);
+                if checked_first {
+                    context.check_source_file(file).unwrap();
+                }
+                let first_symbol = context.file(file).unwrap().1.symbol(members[0].0).unwrap();
+                let owner = context.store().get_parent_of_symbol(first_symbol).unwrap();
+                let mut types = Vec::new();
+                for ((declaration, name), expected) in members.iter().zip(expected) {
+                    let symbol = context.file(file).unwrap().1.symbol(*declaration).unwrap();
+                    let type_ = context.get_type_at_location(*name).unwrap();
+                    assert_eq!(
+                        context.type_to_string(type_).unwrap(),
+                        *expected,
+                        "{source}"
+                    );
+                    assert_eq!(context.get_type_at_location(*declaration).unwrap(), type_);
+                    assert_eq!(context.get_symbol_at_location(*name).unwrap(), Some(symbol));
+                    types.push(type_);
+                }
+                assert!(context.store().declared_type_links(owner).is_none());
+                assert!(context.store().value_symbol_links(owner).is_none());
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                );
+                for ((_, name), expected) in members.iter().zip(types) {
+                    assert_eq!(context.get_type_at_location(*name).unwrap(), expected);
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                    ),
+                    before,
+                    "{source}, checked_first {checked_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_recovery_checks_unrelated_caches_before_source_writes() {
+        let source = "class Model { before: number = 0; value: number = 1; middle: string = 'mid'; accessor value: number = 2; after: number = 3; }";
+        for checked_first in [false, true] {
+            for poison in 0..10 {
+                let parsed = parse_source_file(source);
+                let file = FileId::new(6_122);
+                let mut context = context(&parsed, file);
+                if checked_first {
+                    context.check_source_file(file).unwrap();
+                }
+                let members = parsed
+                    .arena
+                    .iter()
+                    .filter_map(|(id, record)| {
+                        let NodeData::PropertyDeclaration(property) = &record.data else {
+                            return None;
+                        };
+                        Some((
+                            NodeRef::new(parsed.arena.id(), file, id),
+                            NodeRef::new(parsed.arena.id(), file, property.name),
+                            NodeRef::new(parsed.arena.id(), file, property.type_.unwrap()),
+                            NodeRef::new(parsed.arena.id(), file, property.initializer.unwrap()),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let symbol = context.file(file).unwrap().1.symbol(members[1].0).unwrap();
+                let unrelated = context.file(file).unwrap().1.symbol(members[0].0).unwrap();
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                match poison {
+                    0 | 1 | 2 => {
+                        let (node, wrong) = match poison {
+                            0 => (members[0].1, string),
+                            1 => (members[2].3, number),
+                            _ => (members[4].2, string),
+                        };
+                        assert!(context.store_mut_for_test().set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: Some(wrong),
+                                outer_type_parameters: None
+                            }
+                        ));
+                    }
+                    3 => assert!(context.store_mut_for_test().set_symbol_node_links(
+                        members[3].1,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(unrelated)
+                        }
+                    )),
+                    4 => assert!(context.store_mut_for_test().set_symbol_node_links(
+                        members[0].3,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(unrelated)
+                        }
+                    )),
+                    5 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                        symbol,
+                        Some(vec![members[1].0]),
+                        Some(members[1].0)
+                    )),
+                    6 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                        symbol,
+                        Some(vec![members[3].0, members[1].0]),
+                        Some(members[1].0)
+                    )),
+                    7 => assert!(context.store_mut_for_test().set_symbol_flags(
+                        symbol,
+                        SymbolFlags::PROPERTY,
+                        CheckFlags::NONE
+                    )),
+                    8 => assert!(context.store_mut_for_test().set_type_node_links(
+                        members[4].0,
+                        TypeNodeLinks {
+                            resolved_type: None,
+                            outer_type_parameters: Some(vec![number])
+                        }
+                    )),
+                    9 => assert!(context.store_mut_for_test().set_symbol_relationships(
+                        symbol,
+                        None,
+                        None,
+                        Some(unrelated),
+                        None
+                    )),
+                    _ => unreachable!(),
+                }
+                let source_file = context.source_file(file).unwrap();
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                    context.store().source_file_links(source_file).cloned(),
+                );
+                for query in [members[1].1, members[0].1] {
+                    assert!(
+                        context.get_type_at_location(query).is_err(),
+                        "checked_first {checked_first}, poison {poison}"
+                    );
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signature_len(),
+                        context.store().symbol_store().symbol_table_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                        context.store().source_file_links(source_file).cloned(),
+                    ),
+                    before,
+                    "checked_first {checked_first}, poison {poison}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_recovery_does_not_complete_unsupported_bodies() {
+        for source in [
+            "class Model { value: number = 1; run() { missing(); } accessor value: number = 2; }",
+            "class Model { before = missing(); value: number = 1; accessor value: number = 2; }",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(6_123);
+            let mut context = context(&parsed, file);
+            let source_file = context.source_file(file).unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+                context.store().source_file_links(source_file).cloned(),
+            );
+            assert!(context.check_source_file(file).is_err(), "{source}");
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                    context.store().source_file_links(source_file).cloned(),
+                ),
+                before,
+                "{source}"
+            );
+        }
     }
 
     #[test]
