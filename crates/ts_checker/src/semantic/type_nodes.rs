@@ -11885,7 +11885,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         if arity == PlannedTypeReferenceArity::Valid && flags.contains(SymbolFlags::TYPE_ALIAS) {
-            self.preflight_cached_union_alias_instantiation(
+            self.preflight_cached_alias_instantiation(
                 symbol,
                 effective_alias_owner,
                 &type_arguments,
@@ -11912,7 +11912,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
-    fn preflight_cached_union_alias_instantiation(
+    fn preflight_cached_alias_instantiation(
         &self,
         symbol: SemanticSymbolId,
         owner: Option<SemanticSymbolId>,
@@ -11928,27 +11928,46 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         ) else {
             return Ok(());
         };
-        let Some(TypeData::Union(union)) = self.store.type_payload(declared).map(TypeRecord::data)
-        else {
-            return Ok(());
+        // Alias results can be cached before the source callable is published.
+        let union = match self.store.type_payload(declared).map(TypeRecord::data) {
+            Some(TypeData::Union(union)) => Some(union),
+            _ if self.source_callable_alias_planning => None,
+            _ => return Ok(()),
         };
         if parameters.len() != argument_nodes.len()
-            || union.union.types.iter().any(|type_| {
-                self.store
-                    .type_payload(*type_)
-                    .and_then(TypeRecord::symbol)
-                    .is_some_and(|symbol| {
+            || !self.source_callable_alias_planning
+                && union.is_some_and(|union| {
+                    union.union.types.iter().any(|type_| {
                         self.store
-                            .authenticated_type_literal_method_owner(symbol)
-                            .is_some()
+                            .type_payload(*type_)
+                            .and_then(TypeRecord::symbol)
+                            .is_some_and(|symbol| {
+                                self.store
+                                    .authenticated_type_literal_method_owner(symbol)
+                                    .is_some()
+                            })
                     })
-            })
+                })
         {
             return Ok(());
         }
         let Ok(arguments) = argument_nodes
             .iter()
-            .map(|node| self.cached_type_node_identity(symbol, *node))
+            .map(|node| {
+                // The parameter identity can exist while this argument node is still cold.
+                if self.source_callable_alias_planning
+                    && let Some(reference) = self.plan.references.get(node)
+                    && let Some(type_) = self
+                        .store
+                        .declared_type_links(reference.symbol)
+                        .and_then(|links| links.declared_type)
+                    && cached_ordinary_type_parameter_owner(self.store, type_)
+                        == Some(reference.symbol)
+                {
+                    return Ok(type_);
+                }
+                self.cached_type_node_identity(symbol, *node)
+            })
             .collect::<Result<Vec<_>, _>>()
         else {
             return Ok(());

@@ -4,13 +4,21 @@ use ts_binder::{
     EscapedName,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
+    TypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
 const FILE: FileId = FileId::new(4_520);
 
 fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+    context_with_options(parsed, CanonicalCheckerOptions::default())
+}
+
+fn context_with_options(
+    parsed: &ParseResult,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'_> {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let mut binder = CanonicalBinder::new();
     binder
@@ -29,12 +37,7 @@ fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
     binder
         .bind_typescript_declaration_slice(&parsed.arena, FILE)
         .unwrap();
-    CanonicalCheckerContext::new(
-        binder.finish(),
-        vec![(FILE, &parsed.arena)],
-        CanonicalCheckerOptions::default(),
-    )
-    .unwrap()
+    CanonicalCheckerContext::new(binder.finish(), vec![(FILE, &parsed.arena)], options).unwrap()
 }
 
 fn counts(context: &CanonicalCheckerContext<'_>) -> (usize, usize, usize, usize) {
@@ -183,6 +186,105 @@ fn generic_alias_interface_calls_reuse_existing_reference_arguments() {
 }
 
 #[test]
+fn generic_alias_optional_parameters_keep_base_and_resolved_types_distinct() {
+    for strict_null_checks in [false, true] {
+        for (annotation, optional) in [
+            ("T", true),
+            ("Identity<T>", false),
+            ("Identity<T>", true),
+            ("(Identity<T>)", true),
+        ] {
+            let question = if optional { "?" } else { "" };
+            let parsed = parse_source_file(&format!(
+                "type Identity<Value> = Value; \
+                 declare function f<T>(value{question}: {annotation}): Identity<T>;"
+            ));
+            let mut context = context_with_options(
+                &parsed,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types: false,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(FILE).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        FILE,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(FILE).unwrap().1.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+            else {
+                panic!("the declaration must retain a callable object")
+            };
+            let signature = object.structured.signatures.as_ref().unwrap()[0];
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.min_argument_count(), i32::from(!optional));
+            let base = record.type_parameters()[0];
+            let parameter = record.parameters()[0];
+            let resolved = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            if strict_null_checks && optional {
+                let TypeData::Union(union) = context.store().type_payload(resolved).unwrap().data()
+                else {
+                    panic!("the optional parameter must include undefined")
+                };
+                let undefined = context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_type;
+                assert_eq!(union.union.types.len(), 2);
+                assert!(union.union.types.contains(&base));
+                assert!(union.union.types.contains(&undefined));
+            } else {
+                assert_eq!(resolved, base);
+            }
+            assert_eq!(
+                context.get_return_type_of_signature(signature).unwrap(),
+                base
+            );
+            let before = counts(&context);
+            context.recheck_source_file(FILE).unwrap();
+            assert_eq!(counts(&context), before);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .unwrap()
+                    .resolved_type,
+                Some(resolved)
+            );
+            assert_eq!(
+                context.get_return_type_of_signature(signature).unwrap(),
+                base
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+}
+
+#[test]
 fn generic_alias_return_queries_keep_the_same_identity_in_either_query_order() {
     for before in [false, true] {
         for annotation in ["Identity<T>", "(Identity<T>)"] {
@@ -312,5 +414,33 @@ fn generic_alias_source_boundary_keeps_recursive_and_const_forms_unsupported() {
         let before = counts(&context);
         assert!(context.check_source_file(FILE).is_err(), "{source}");
         assert_eq!(counts(&context), before, "{source}");
+    }
+}
+
+#[test]
+fn unsupported_return_only_alias_does_not_publish_any_callable() {
+    for annotation in ["Unsupported<T>", "(Unsupported<T>)"] {
+        let parsed = parse_source_file(&format!(
+            "type Identity<Value> = Value; type Unsupported<Value> = {{ value: Value }}; \
+             declare function first<T>(value: Identity<T>): Identity<T>; \
+             declare function later<T>(): {annotation};"
+        ));
+        let mut context = context(&parsed);
+        assert!(context.check_source_file(FILE).is_err());
+        for (node, record) in parsed.arena.iter() {
+            if record.kind != SyntaxKind::FunctionDeclaration {
+                continue;
+            }
+            let declaration = NodeRef::new(parsed.arena.id(), FILE, node);
+            let owner = context.file(FILE).unwrap().1.symbol(declaration).unwrap();
+            assert!(
+                context.store().value_symbol_links(owner).is_none(),
+                "unsupported return-only alias published {declaration:?}: {annotation}"
+            );
+            assert!(context.store().signature_links(declaration).is_none());
+        }
+        let before = counts(&context);
+        assert!(context.check_source_file(FILE).is_err());
+        assert_eq!(counts(&context), before);
     }
 }

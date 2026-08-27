@@ -11440,7 +11440,7 @@ fn valid_stored_generic_source_signature(
                             array_targets,
                         ) && (*type_ == base
                             || index >= minimum_argument_count
-                                && valid_optional_type(store, array_targets, *type_, base));
+                                && valid_optional_type(store, array_targets, base, *type_));
                     }
                     valid_generic_source_parameter_type(
                         store,
@@ -13389,6 +13389,187 @@ mod tests {
                 warm,
             );
             assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn generic_alias_first_callable_query_rejects_forged_substitution_cache() {
+        for poison_cache in [false, true] {
+            for return_position in [false, true] {
+                for parenthesized in [false, true] {
+                    let annotation = if parenthesized {
+                        "(Identity<T>)"
+                    } else {
+                        "Identity<T>"
+                    };
+                    let source = if return_position {
+                        format!(
+                            "type Identity<Value> = Value; declare function select<T>(): {annotation}; export {{}};"
+                        )
+                    } else {
+                        format!(
+                            "type Identity<Value> = Value; declare function select<T>(value: {annotation}): T; export {{}};"
+                        )
+                    };
+                    let mut fixture = QueryFixture::with_source_language(
+                        &source,
+                        FileId::new(95_134),
+                        false,
+                        CanonicalModuleState::External,
+                        CanonicalSourceLanguage::TypeScript,
+                    );
+                    let (declaration, outer) = fixture
+                        .parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            let NodeData::FunctionDeclaration(function) = &record.data else {
+                                return None;
+                            };
+                            let annotation = if return_position {
+                                function.type_?
+                            } else {
+                                let parameter =
+                                    fixture.parsed.arena.get(function.parameters.nodes[0])?;
+                                let NodeData::ParameterDeclaration(parameter) = &parameter.data
+                                else {
+                                    return None;
+                                };
+                                parameter.type_?
+                            };
+                            Some((
+                                NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                                NodeRef::new(fixture.parsed.arena.id(), fixture.file, annotation),
+                            ))
+                        })
+                        .unwrap();
+                    let owner = fixture.bound.symbol(declaration).unwrap();
+                    let mut inner = outer;
+                    while let NodeData::ParenthesizedTypeNode(parenthesized) =
+                        &fixture.parsed.arena.get(inner.node).unwrap().data
+                    {
+                        inner = NodeRef::new(inner.arena, inner.file, parenthesized.type_);
+                    }
+                    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                    let expected = fixture.query_type_node(outer, &mut diagnostics).unwrap();
+                    assert!(matches!(
+                        fixture.store.type_payload(expected).unwrap().data(),
+                        TypeData::TypeParameter(_)
+                    ));
+                    assert!(
+                        fixture
+                            .store
+                            .source_callable_type_for_owner(owner)
+                            .is_none()
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .source_callable_alias_resolution(inner)
+                            .is_none()
+                    );
+                    let alias = fixture
+                        .store
+                        .symbol_node_links(inner)
+                        .unwrap()
+                        .resolved_symbol
+                        .unwrap();
+                    let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                    let mut links = fixture.store.type_alias_links(alias).unwrap().clone();
+                    if poison_cache {
+                        let key = super::super::type_nodes::type_alias_instantiation_cache_key(
+                            &[expected],
+                            None,
+                        );
+                        assert_eq!(
+                            links.instantiations.as_mut().unwrap().insert(key, number),
+                            Some(expected)
+                        );
+                        assert!(fixture.store.set_type_alias_links(alias, links.clone()));
+                        assert!(fixture.store.set_type_node_links(
+                            inner,
+                            TypeNodeLinks {
+                                resolved_type: Some(number),
+                                outer_type_parameters: None,
+                            },
+                        ));
+                        if outer != inner {
+                            assert!(fixture.store.set_type_node_links(
+                                outer,
+                                TypeNodeLinks {
+                                    resolved_type: Some(number),
+                                    outer_type_parameters: None,
+                                },
+                            ));
+                        }
+                    }
+
+                    let before = generic_transaction_state(&fixture.store);
+                    let result = fixture.query_callable(declaration, owner, &mut diagnostics);
+                    if poison_cache {
+                        assert!(
+                            result.is_err(),
+                            "forged alias substitution was accepted: return={return_position}, parenthesized={parenthesized}, result={result:?}"
+                        );
+                        assert_eq!(generic_transaction_state(&fixture.store), before);
+                        assert_eq!(fixture.store.type_alias_links(alias), Some(&links));
+                        assert_eq!(
+                            fixture.store.type_node_links(inner).unwrap().resolved_type,
+                            Some(number)
+                        );
+                        assert_eq!(
+                            fixture.store.type_node_links(outer).unwrap().resolved_type,
+                            Some(number)
+                        );
+                        assert!(
+                            fixture
+                                .store
+                                .source_callable_type_for_owner(owner)
+                                .is_none()
+                        );
+                        assert!(fixture.store.value_symbol_links(owner).is_none());
+                        assert!(fixture.store.signature_links(declaration).is_none());
+                        assert!(
+                            fixture
+                                .store
+                                .source_callable_alias_resolution(inner)
+                                .is_none()
+                        );
+                    } else {
+                        let callable = result.unwrap();
+                        let signature = fixture
+                            .store
+                            .source_callable_provenance(callable)
+                            .unwrap()
+                            .signature;
+                        assert_eq!(
+                            fixture.query_return(signature, &mut diagnostics).unwrap(),
+                            expected
+                        );
+                        if !return_position {
+                            let parameter =
+                                fixture.store.signature(signature).unwrap().parameters()[0];
+                            assert_eq!(
+                                fixture
+                                    .store
+                                    .value_symbol_links(parameter)
+                                    .unwrap()
+                                    .resolved_type,
+                                Some(expected)
+                            );
+                        }
+                        let warm = generic_transaction_state(&fixture.store);
+                        assert_eq!(
+                            fixture
+                                .query_callable(declaration, owner, &mut diagnostics)
+                                .unwrap(),
+                            callable
+                        );
+                        assert_eq!(generic_transaction_state(&fixture.store), warm);
+                    }
+                    assert!(diagnostics.is_empty());
+                }
+            }
         }
     }
 
