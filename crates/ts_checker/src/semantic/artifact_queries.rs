@@ -260,6 +260,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.export_equals_declared_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
             && let Some(type_) = self.cached_artifact_type(node)?
         {
@@ -2413,6 +2417,79 @@ impl CanonicalCheckerContext<'_> {
         }
     }
 
+    fn export_equals_declared_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        if !matches!(record.data, NodeData::Identifier(_)) {
+            return Ok(None);
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        let parent = NodeRef::new(node.arena, node.file, parent);
+        if !matches!(
+            &self.validated_artifact_node(parent)?.2.data,
+            NodeData::ExportAssignment(export)
+                if export.is_export_equals && export.expression == node.node
+        ) {
+            return Ok(None);
+        }
+        let Some(symbol) = self.lexical_artifact_symbol(
+            node,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+        )?
+        else {
+            return Ok(None);
+        };
+        let flags = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?
+            .flags();
+        if !flags.intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
+            || self
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        {
+            return Ok(None);
+        }
+        if !self.store().source_symbol_declarations_match(symbol)
+            || self
+                .cached_artifact_symbol(node)?
+                .is_some_and(|cached| cached != symbol)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        let type_ = self
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .ok_or(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            })?;
+        if flags.intersects(SymbolFlags::CLASS) {
+            if super::declared::cached_class_type(self.store(), symbol)? != Some(type_) {
+                return Err(CanonicalArtifactQueryError::InvalidType { node, type_ });
+            }
+        } else {
+            self.preflight_enum_type(symbol)?;
+        }
+        if let Some(cached) = self.cached_artifact_type(node)?
+            && cached != type_
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: cached,
+            });
+        }
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
     fn lexical_artifact_symbol(
         &self,
         node: NodeRef,
@@ -3330,8 +3407,9 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerOptions,
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
-        CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, IntrinsicBootstrapOptions,
-        ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks, ValueSymbolLinks,
+        CanonicalModuleResolutionMode, CanonicalResolvedModuleInput, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, ModuleSymbolLinks, SymbolNodeLinks, TypeData, TypeNodeLinks,
+        ValueSymbolLinks,
         types::{ObjectFlags, TypeFlags},
     };
 
@@ -3365,6 +3443,162 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both existing identities and rejected cache changes together.
+    fn export_equals_queries_keep_declared_and_value_identities_separate() {
+        for (index, text) in [
+            "class Value { value: number = 1; }\nconst observed = Value;\nexport = Value;\n",
+            "enum Value { One = 0, Two = 1 }\nconst observed = Value;\nexport = Value;\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(text);
+            assert!(parsed.diagnostics.is_empty());
+            let file = FileId::new(147_020 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/export.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            context.check_source_file(file).unwrap();
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::ClassDeclaration | SyntaxKind::EnumDeclaration
+                    )
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let owner = context.store().get_merged_symbol(owner).unwrap();
+            let declared_links = context.store().declared_type_links(owner).cloned().unwrap();
+            let declared = declared_links.declared_type.unwrap();
+            let value = context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_ne!(declared, value);
+            let exported = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ExportAssignment(export) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(parsed.arena.id(), file, export.expression))
+                })
+                .unwrap();
+            let read = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(parsed.arena.id(), file, variable.initializer?))
+                })
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .type_node_links(exported)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(exported)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_none()
+            );
+            let state = |store: &crate::semantic::CanonicalTypeMapperStore| {
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.declared_type_links(owner).cloned(),
+                    store.value_symbol_links(owner).cloned(),
+                    store.type_node_links(exported).cloned(),
+                    store.symbol_node_links(exported).cloned(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            for replay in [false, true] {
+                let before = state(context.store());
+                if replay {
+                    context.recheck_source_file(file).unwrap();
+                }
+                assert_eq!(context.get_type_at_location(exported), Ok(declared));
+                assert_eq!(context.get_type_at_location(read), Ok(value));
+                assert_eq!(context.get_symbol_at_location(exported), Ok(Some(owner)));
+                assert_eq!(context.type_to_string(declared).unwrap(), "Value");
+                assert_eq!(context.type_to_string(value).unwrap(), "typeof Value");
+                assert_eq!(state(context.store()), before);
+            }
+            for missing_declared in [false, true] {
+                if missing_declared {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_declared_type_links(owner, DeclaredTypeLinks::default())
+                    );
+                } else {
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        exported,
+                        TypeNodeLinks {
+                            resolved_type: Some(value),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                let before = state(context.store());
+                assert!(context.get_type_at_location(exported).is_err());
+                assert_eq!(state(context.store()), before);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_declared_type_links(owner, declared_links.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(exported, TypeNodeLinks::default())
+                );
+                assert_eq!(context.get_type_at_location(exported), Ok(declared));
+            }
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
