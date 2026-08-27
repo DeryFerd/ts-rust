@@ -1,6 +1,6 @@
 //! Owned facts retained while loading a Program's source graph.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io};
 
 use ts_ast::FileId;
 use ts_checker::semantic::{CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode};
@@ -31,6 +31,153 @@ pub struct ProgramGraphSource {
     pub is_default_library: bool,
     pub implied_node_format: ModuleKind,
     pub emit_module_mode: CanonicalModuleResolutionMode,
+}
+
+/// Why the existing source loader selected an implied Node format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramGraphPackageScopeDecision {
+    FixedExtension,
+    PackageJson,
+    InvalidPackageJson,
+    ReadFailure,
+    NoPackage,
+}
+
+/// An error from the package-scope read used by the source loader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramGraphPackageScopeReadError {
+    pub kind: io::ErrorKind,
+    pub message: String,
+}
+
+/// One existing source package-scope operation or decision, in execution order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramGraphPackageScopeEvent {
+    FileExists {
+        file_id: FileId,
+        path: String,
+        exists: bool,
+    },
+    /// Success retains the exact VFS text passed to the package JSON parser.
+    ReadFile {
+        file_id: FileId,
+        path: String,
+        result: Result<String, ProgramGraphPackageScopeReadError>,
+    },
+    /// Fixed extensions and searches with no package also record a decision.
+    Decision {
+        file_id: FileId,
+        implied_node_format: ModuleKind,
+        reason: ProgramGraphPackageScopeDecision,
+    },
+}
+
+/// A bounded prefix of source package-scope evidence, without deduplication.
+///
+/// The Program retains at most 16,384 events and 16 MiB of UTF-8 strings.
+/// After the first omitted event, later events are counted but not retained.
+/// Events and strings are never partially retained.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProgramGraphPackageScopeObservation {
+    pub events: Vec<ProgramGraphPackageScopeEvent>,
+    pub omitted_events: usize,
+}
+
+impl ProgramGraphPackageScopeObservation {
+    /// Whether every observed event was retained, not whether every source
+    /// in a Program has evidence or the package JSON inputs were valid.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.omitted_events == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PackageScopeObservationLimits {
+    pub max_events: usize,
+    pub max_string_bytes: usize,
+}
+
+impl Default for PackageScopeObservationLimits {
+    fn default() -> Self {
+        Self {
+            max_events: 16_384,
+            max_string_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PackageScopeObservationRecorder {
+    limits: PackageScopeObservationLimits,
+    string_bytes: usize,
+    observation: ProgramGraphPackageScopeObservation,
+}
+
+impl PackageScopeObservationRecorder {
+    fn retain(
+        &mut self,
+        string_bytes: Option<usize>,
+        event: impl FnOnce() -> ProgramGraphPackageScopeEvent,
+    ) {
+        let total = string_bytes.and_then(|bytes| self.string_bytes.checked_add(bytes));
+        if self.observation.omitted_events != 0
+            || self.observation.events.len() >= self.limits.max_events
+            || total.is_none_or(|bytes| bytes > self.limits.max_string_bytes)
+        {
+            self.observation.omitted_events = self.observation.omitted_events.saturating_add(1);
+            return;
+        }
+        self.string_bytes = total.expect("retained package-scope strings fit the limit");
+        self.observation.events.push(event());
+    }
+
+    pub(super) fn file_exists(&mut self, file_id: FileId, path: &str, exists: bool) {
+        self.retain(Some(path.len()), || {
+            ProgramGraphPackageScopeEvent::FileExists {
+                file_id,
+                path: path.to_owned(),
+                exists,
+            }
+        });
+    }
+
+    pub(super) fn read_text(&mut self, file_id: FileId, path: &str, text: &str) {
+        self.retain(path.len().checked_add(text.len()), || {
+            ProgramGraphPackageScopeEvent::ReadFile {
+                file_id,
+                path: path.to_owned(),
+                result: Ok(text.to_owned()),
+            }
+        });
+    }
+
+    pub(super) fn read_error(&mut self, file_id: FileId, path: &str, error: &io::Error) {
+        let message = error.to_string();
+        self.retain(path.len().checked_add(message.len()), || {
+            ProgramGraphPackageScopeEvent::ReadFile {
+                file_id,
+                path: path.to_owned(),
+                result: Err(ProgramGraphPackageScopeReadError {
+                    kind: error.kind(),
+                    message,
+                }),
+            }
+        });
+    }
+
+    pub(super) fn decision(
+        &mut self,
+        file_id: FileId,
+        implied_node_format: ModuleKind,
+        reason: ProgramGraphPackageScopeDecision,
+    ) {
+        self.retain(Some(0), || ProgramGraphPackageScopeEvent::Decision {
+            file_id,
+            implied_node_format,
+            reason,
+        });
+    }
 }
 
 /// Config data already read by the Program loader.
@@ -124,7 +271,7 @@ pub enum ProgramGraphMissingEvidence {
     ResolutionDefaultModes,
     /// A package JSON path is not a name, version, or peer-dependency identity.
     PackageIdentities,
-    /// The loader retains implied format, but not its package-scope inputs.
+    /// A source package-scope operation or final decision was not retained.
     SourcePackageScopes,
 }
 
@@ -145,6 +292,10 @@ pub struct ProgramGraphSnapshot {
     /// Read events retain VFS parser text, not raw disk bytes. Completeness
     /// describes event retention, not config validity or a complete Program.
     pub config_resolution_observation: Option<ConfigResolutionObservation>,
+    /// Existing package-scope calls used to select each source's implied format.
+    /// Bundled libraries do not make these calls. This is VFS text evidence,
+    /// not raw bytes, package identities, or realpath evidence.
+    pub source_package_scope_observation: ProgramGraphPackageScopeObservation,
     pub resolution_options: Option<ResolutionOptions>,
     pub resolutions: Vec<ProgramGraphResolution>,
     pub references: Vec<ProgramGraphReference>,
@@ -225,6 +376,7 @@ impl Program {
             config_file_path: self.config_file_path.clone(),
             config: self.graph_config.clone(),
             config_resolution_observation: self.graph_config_resolution_observation.clone(),
+            source_package_scope_observation: self.graph_package_scope_recorder.observation.clone(),
             resolution_options: self.graph_resolution_options.clone(),
             resolutions,
             references,
@@ -297,6 +449,29 @@ impl Program {
         {
             missing.push(ProgramGraphMissingEvidence::SourceRealPaths);
             missing.push(ProgramGraphMissingEvidence::PackageIdentities);
+        }
+        let package_scopes = &self.graph_package_scope_recorder.observation;
+        let package_scope_formats = package_scopes
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProgramGraphPackageScopeEvent::Decision {
+                    file_id,
+                    implied_node_format,
+                    ..
+                } => Some((*file_id, *implied_node_format)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let all_package_scopes_retained = package_scopes.is_complete()
+            && self
+                .source_files
+                .iter()
+                .filter(|source| !source.is_default_library)
+                .all(|source| {
+                    package_scope_formats.get(&source.id) == Some(&source.implied_node_format)
+                });
+        if !all_package_scopes_retained {
             missing.push(ProgramGraphMissingEvidence::SourcePackageScopes);
         }
         missing
@@ -305,14 +480,173 @@ impl Program {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use ts_ast::FileId;
     use ts_config::{ConfigObservationLimits, resolve_config_file_with_observation};
     use ts_module::{ModuleFormat, ResolutionResult};
+    use ts_options::ModuleKind;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        Program, ProgramGraphMissingEvidence, ProgramGraphResolutionKind,
-        ProgramGraphResolutionRequest,
+        PackageScopeObservationLimits, PackageScopeObservationRecorder, Program,
+        ProgramGraphMissingEvidence, ProgramGraphPackageScopeDecision,
+        ProgramGraphPackageScopeEvent, ProgramGraphResolutionKind, ProgramGraphResolutionRequest,
     };
+
+    #[test]
+    fn package_scope_limits_keep_a_prefix_without_changing_formats() {
+        let path = "/project/package.json";
+        let text = "{\"type\":\"module\"}";
+        let bytes = path.len() * 2 + text.len();
+        for (max_events, max_string_bytes, retained, omitted) in [
+            (0, usize::MAX, 0, 4),
+            (2, usize::MAX, 2, 2),
+            (4, bytes - 1, 1, 3),
+            (4, bytes, 4, 0),
+        ] {
+            let filesystem = MemoryFileSystem::new(true);
+            filesystem.write_file(path, text).unwrap();
+            filesystem
+                .write_file("/project/a.ts", "export const a = 1;")
+                .unwrap();
+            filesystem
+                .write_file("/project/b.cts", "export const b = 2;")
+                .unwrap();
+            let mut program = Program {
+                current_directory: "/project".to_owned(),
+                graph_package_scope_recorder: PackageScopeObservationRecorder {
+                    limits: PackageScopeObservationLimits {
+                        max_events,
+                        max_string_bytes,
+                    },
+                    ..PackageScopeObservationRecorder::default()
+                },
+                ..Program::default()
+            };
+            program.load_file(&filesystem, "/project/a.ts", true);
+            program.load_file(&filesystem, "/project/b.cts", true);
+            let graph = program.project_graph_snapshot();
+            let observation = &graph.source_package_scope_observation;
+            assert_eq!(observation.events.len(), retained);
+            assert_eq!(observation.omitted_events, omitted);
+            assert_eq!(observation.is_complete(), omitted == 0);
+            assert_eq!(graph.sources[0].implied_node_format, ModuleKind::EsNext);
+            assert_eq!(graph.sources[1].implied_node_format, ModuleKind::CommonJs);
+            assert_eq!(graph.sources[0].file_id, FileId::new(0));
+            assert_eq!(graph.sources[1].file_id, FileId::new(1));
+            assert_eq!(
+                graph
+                    .missing_evidence
+                    .contains(&ProgramGraphMissingEvidence::SourcePackageScopes),
+                omitted != 0,
+            );
+            assert!(
+                graph
+                    .missing_evidence
+                    .contains(&ProgramGraphMissingEvidence::SourceRealPaths)
+            );
+            assert!(
+                graph
+                    .missing_evidence
+                    .contains(&ProgramGraphMissingEvidence::PackageIdentities)
+            );
+            assert_eq!(program.project_graph_snapshot(), graph);
+        }
+    }
+
+    #[test]
+    fn package_scope_gap_requires_a_retained_decision_for_every_source() {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem
+            .write_file("/project/main.mts", "export const value = 1;")
+            .unwrap();
+        let mut program = Program {
+            current_directory: "/project".to_owned(),
+            ..Program::default()
+        };
+        program.load_file(&filesystem, "/project/main.mts", true);
+        let complete = program.graph_package_scope_recorder.observation.clone();
+        assert!(
+            !program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::SourcePackageScopes)
+        );
+        program
+            .graph_package_scope_recorder
+            .observation
+            .events
+            .clear();
+        assert!(
+            program
+                .graph_package_scope_recorder
+                .observation
+                .is_complete()
+        );
+        assert!(
+            program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::SourcePackageScopes)
+        );
+        program.graph_package_scope_recorder.observation = complete;
+        let ProgramGraphPackageScopeEvent::Decision {
+            implied_node_format,
+            ..
+        } = &mut program.graph_package_scope_recorder.observation.events[0]
+        else {
+            panic!("a fixed extension retains one decision");
+        };
+        *implied_node_format = ModuleKind::CommonJs;
+        assert!(
+            program
+                .project_graph_missing_evidence()
+                .contains(&ProgramGraphMissingEvidence::SourcePackageScopes)
+        );
+    }
+
+    #[test]
+    fn package_scope_read_errors_respect_utf8_string_limits_without_partial_events() {
+        let path = "/project/package.json";
+        let message = "denied \u{00e9}\r\n";
+        let bytes = path.len() * 2 + message.len();
+        for max_string_bytes in [bytes - 1, bytes] {
+            let mut recorder = PackageScopeObservationRecorder {
+                limits: PackageScopeObservationLimits {
+                    max_events: 3,
+                    max_string_bytes,
+                },
+                ..PackageScopeObservationRecorder::default()
+            };
+            recorder.file_exists(FileId::new(0), path, true);
+            recorder.read_error(
+                FileId::new(0),
+                path,
+                &io::Error::new(io::ErrorKind::PermissionDenied, message),
+            );
+            recorder.decision(
+                FileId::new(0),
+                ModuleKind::CommonJs,
+                ProgramGraphPackageScopeDecision::ReadFailure,
+            );
+            if max_string_bytes == bytes {
+                assert!(recorder.observation.is_complete());
+                assert_eq!(recorder.observation.events.len(), 3);
+                assert!(matches!(
+                    &recorder.observation.events[1],
+                    ProgramGraphPackageScopeEvent::ReadFile { result: Err(error), .. }
+                        if error.kind == io::ErrorKind::PermissionDenied && error.message == message
+                ));
+            } else {
+                assert!(!recorder.observation.is_complete());
+                assert_eq!(recorder.observation.events.len(), 1);
+                assert_eq!(recorder.observation.omitted_events, 2);
+                assert!(matches!(
+                    recorder.observation.events[0],
+                    ProgramGraphPackageScopeEvent::FileExists { .. }
+                ));
+            }
+        }
+    }
 
     #[test]
     fn config_evidence_gaps_follow_observation_retention() {
