@@ -1042,6 +1042,17 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .get_type_of_interface_method(symbol)
     }
 
+    pub(super) fn artifact_literal_type(
+        &mut self,
+        value: super::EvaluatorValue,
+    ) -> Result<TypeId, SourceCheckError> {
+        match value {
+            super::EvaluatorValue::String(value) => self.store.regular_string_literal_type(value),
+            super::EvaluatorValue::Number(value) => self.store.regular_number_literal_type(value),
+        }
+        .map_err(SourceCheckError::from)
+    }
+
     /// The immutable, checker-owned module-resolution capability.
     #[must_use]
     pub const fn module_resolutions(&self) -> &CanonicalModuleResolutionManifest {

@@ -228,6 +228,14 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.duplicate_property_artifact_type(node)? {
+            return Ok(type_);
+        }
+
+        if let Some(type_) = self.enum_initializer_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         let (kind, is_type_node, parent) = {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             (
@@ -1297,6 +1305,236 @@ impl CanonicalCheckerContext<'_> {
             });
         }
         Ok(Some(symbol))
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the source recovery and its member ownership in one check.
+    fn duplicate_property_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (annotation, initializer) = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            let declaration = if matches!(record.data, NodeData::PropertyDeclaration(_)) {
+                node
+            } else if let Some(parent) = record.parent
+                && let Some(NodeData::PropertyDeclaration(property)) =
+                    arena.get(parent).map(|record| &record.data)
+                && (property.name == node.node || property.initializer == Some(node.node))
+            {
+                NodeRef::new(node.arena, node.file, parent)
+            } else {
+                return Ok(None);
+            };
+            let (_, _, declaration_record) = self.validated_artifact_node(declaration)?;
+            let Some(class_id) = declaration_record.parent else {
+                return Ok(None);
+            };
+            let class_node = NodeRef::new(node.arena, node.file, class_id);
+            let (_, _, class_record) = self.validated_artifact_node(class_node)?;
+            let NodeData::ClassDeclaration(class) = &class_record.data else {
+                return Ok(None);
+            };
+            let [first, second] = class.members.nodes.as_slice() else {
+                return Ok(None);
+            };
+            let first = NodeRef::new(node.arena, node.file, *first);
+            let second = NodeRef::new(node.arena, node.file, *second);
+            if declaration != first && declaration != second {
+                return Err(CanonicalArtifactQueryError::ForeignNode(declaration));
+            }
+            let NodeData::PropertyDeclaration(first_property) =
+                &self.validated_artifact_node(first)?.2.data
+            else {
+                return Ok(None);
+            };
+            let NodeData::PropertyDeclaration(second_property) =
+                &self.validated_artifact_node(second)?.2.data
+            else {
+                return Ok(None);
+            };
+            let first_name = NodeRef::new(node.arena, node.file, first_property.name);
+            let second_name = NodeRef::new(node.arena, node.file, second_property.name);
+            if !matches!(
+                (&self.validated_artifact_node(first_name)?.2.data,
+                 &self.validated_artifact_node(second_name)?.2.data),
+                (NodeData::Identifier(first), NodeData::Identifier(second))
+                    if first.text == second.text
+            ) || !ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                second.node,
+                SyntaxKind::AccessorKeyword,
+            ) {
+                return Ok(None);
+            }
+            let owner =
+                bound
+                    .symbol(class_node)
+                    .ok_or(CanonicalArtifactQueryError::MissingType {
+                        node,
+                        kind: record.kind,
+                    })?;
+            let symbol =
+                bound
+                    .symbol(declaration)
+                    .ok_or(CanonicalArtifactQueryError::MissingType {
+                        node,
+                        kind: record.kind,
+                    })?;
+            let invalid = || CanonicalArtifactQueryError::InvalidSymbol { node, symbol };
+            let host =
+                super::DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+            let grammar =
+                super::classes::plan_class_grammar_diagnostics(self.store(), &host, owner)
+                    .ok_or_else(invalid)?;
+            if grammar.declaration != class_node
+                || grammar.symbol != owner
+                || !matches!(grammar.diagnostics.as_slice(), [left, right]
+                    if left.code == 2300 && right.code == 2300
+                        && left.node == first_name && right.node == second_name)
+                || self
+                    .store()
+                    .value_symbol_links(symbol)
+                    .is_some_and(|links| links != &super::ValueSymbolLinks::default())
+                || self
+                    .store()
+                    .declared_type_links(symbol)
+                    .is_some_and(|links| links != &super::DeclaredTypeLinks::default())
+            {
+                return Err(invalid());
+            }
+            let annotation = first_property.type_.ok_or_else(invalid)?;
+            (
+                NodeRef::new(node.arena, node.file, annotation),
+                first_property.initializer == Some(node.node)
+                    || second_property.initializer == Some(node.node),
+            )
+        };
+        if initializer {
+            return self.primitive_initializer_artifact_type(node).map(Some);
+        }
+        let type_ = self.get_type_from_type_node(annotation)?;
+        if !self
+            .store()
+            .source_direct_type_annotation_is_exact(annotation, type_)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node: annotation,
+                type_: self.cached_artifact_type(annotation)?.unwrap_or(type_),
+            });
+        }
+        if self.store().type_node_links(node).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: self.cached_artifact_type(node)?.unwrap_or(type_),
+            });
+        }
+        self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn enum_initializer_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let owner = {
+            let (arena, bound, record) = self.validated_artifact_node(node)?;
+            if !matches!(
+                record.data,
+                NodeData::StringLiteral(_) | NodeData::NumericLiteral(_)
+            ) {
+                return Ok(None);
+            }
+            let Some(member_id) = record.parent else {
+                return Ok(None);
+            };
+            let member = NodeRef::new(node.arena, node.file, member_id);
+            let (_, _, member_record) = self.validated_artifact_node(member)?;
+            let NodeData::EnumMember(data) = &member_record.data else {
+                return Ok(None);
+            };
+            if data.initializer != Some(node.node) {
+                return Ok(None);
+            }
+            let declaration = member_record
+                .parent
+                .ok_or(CanonicalArtifactQueryError::ForeignNode(member))?;
+            if !matches!(arena.get(declaration).map(|record| &record.data),
+                Some(NodeData::EnumDeclaration(enumeration))
+                    if enumeration.members.nodes.iter().filter(|member| **member == member_id).count() == 1)
+            {
+                return Err(CanonicalArtifactQueryError::ForeignNode(member));
+            }
+            let declaration = NodeRef::new(node.arena, node.file, declaration);
+            let owner = bound
+                .symbol(declaration)
+                .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+            self.merged_artifact_symbol(node, owner)?
+        };
+        self.preflight_enum_type(owner)?;
+        self.primitive_initializer_artifact_type(node).map(Some)
+    }
+
+    fn primitive_initializer_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<TypeId, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        let value = match &record.data {
+            NodeData::StringLiteral(literal) => super::EvaluatorValue::String(literal.text.clone()),
+            NodeData::NumericLiteral(literal) => super::EvaluatorValue::Number(
+                normalize_numeric_separators(&literal.text)
+                    .map(|text| ts_jsnum::from_string(&text))
+                    .filter(|value| !value.is_nan())
+                    .ok_or(CanonicalArtifactQueryError::UnsupportedNode {
+                        node,
+                        kind: record.kind,
+                    })?,
+            ),
+            _ => {
+                return Err(CanonicalArtifactQueryError::UnsupportedNode {
+                    node,
+                    kind: record.kind,
+                });
+            }
+        };
+        let regular = self.cached_literal_annotation_identity(node)?;
+        let cached = self.cached_artifact_type(node)?;
+        if let Some(cached) = cached
+            && !regular.is_some_and(|regular| {
+                (cached == regular
+                    || self
+                        .store()
+                        .fresh_type_of_literal_type(regular)
+                        .is_ok_and(|fresh| cached == fresh))
+                    && self.store().validate_union_constituent(regular).is_ok()
+            })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: cached,
+            });
+        }
+        if self
+            .store()
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+        {
+            return Err(CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            });
+        }
+        if let Some(symbol) = self
+            .store()
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        let type_ = self.artifact_literal_type(value)?;
+        self.validate_artifact_type(node, type_)
     }
 
     fn literal_annotation_artifact_type(
@@ -4993,6 +5231,322 @@ mod tests {
         }
 
         assert_eq!(names, ["Shape.item", "Model.value", "value"]);
+    }
+
+    #[test]
+    fn duplicate_member_artifacts_reuse_source_annotations_and_literal_identities() {
+        let parsed =
+            parse_source_file("class Model { value: number = 2; accessor value: number = 3; }");
+        let file = FileId::new(6_112);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2300, 2300]
+        );
+        let class_name = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                class
+                    .name
+                    .map(|name| NodeRef::new(parsed.arena.id(), file, name))
+            })
+            .unwrap();
+        let instance = context.get_type_at_location(class_name).unwrap();
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut results = Vec::new();
+        for (id, record) in parsed.arena.iter() {
+            let NodeData::PropertyDeclaration(property) = &record.data else {
+                continue;
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, id);
+            let name = NodeRef::new(parsed.arena.id(), file, property.name);
+            let initializer = NodeRef::new(parsed.arena.id(), file, property.initializer.unwrap());
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            assert_eq!(context.get_type_at_location(name).unwrap(), number);
+            assert_eq!(context.get_type_at_location(declaration).unwrap(), number);
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+            assert_eq!(
+                context.symbol_to_string_at_location(symbol, name).unwrap(),
+                "Model.value"
+            );
+            assert_eq!(context.get_symbol_declarations(symbol).unwrap().len(), 2);
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            let literal = context.get_type_at_location(initializer).unwrap();
+            let NodeData::NumericLiteral(source) =
+                &parsed.arena.get(initializer.node).unwrap().data
+            else {
+                panic!("the recovered initializer must remain numeric")
+            };
+            assert_eq!(context.type_to_string(literal).unwrap(), source.text);
+            let TypeData::Literal(data) = context.store().type_payload(literal).unwrap().data()
+            else {
+                panic!("the initializer must have its own literal type")
+            };
+            assert_eq!(data.regular_type, literal);
+            results.push((declaration, name, initializer, literal));
+        }
+        assert_eq!(results.len(), 2);
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().len(),
+        );
+        for (declaration, name, initializer, literal) in results {
+            assert_eq!(context.get_type_at_location(name).unwrap(), number);
+            assert_eq!(context.get_type_at_location(declaration).unwrap(), number);
+            assert_eq!(context.get_type_at_location(initializer).unwrap(), literal);
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn duplicate_member_artifacts_reject_changed_ownership_and_caches() {
+        for poison in 0..6 {
+            let parsed =
+                parse_source_file("class Model { value: number = 2; accessor value: number = 3; }");
+            let file = FileId::new(6_113);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let members = parsed
+                .arena
+                .iter()
+                .filter_map(|(id, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, property.name),
+                        NodeRef::new(parsed.arena.id(), file, property.type_.unwrap()),
+                        NodeRef::new(parsed.arena.id(), file, property.initializer.unwrap()),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let (declaration, name, annotation, initializer) = members[0];
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            match poison {
+                0 | 4 | 5 => {
+                    let node = match poison {
+                        0 => name,
+                        4 => annotation,
+                        _ => initializer,
+                    };
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: Some(string),
+                            outer_type_parameters: None
+                        }
+                    ));
+                }
+                1 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(string),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                2 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    symbol,
+                    Some(vec![members[1].0, declaration]),
+                    Some(declaration)
+                )),
+                3 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    symbol,
+                    SymbolFlags::PROPERTY,
+                    CheckFlags::NONE
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            let query = if poison == 5 { initializer } else { name };
+            assert!(
+                context.get_type_at_location(query).is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len()
+                ),
+                before,
+                "poison {poison}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_initializer_artifacts_use_primitive_literals_without_member_symbols() {
+        let parsed = parse_source_file("enum Choice { First = 'choice', Second = 42 }");
+        let file = FileId::new(6_114);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let mut results = Vec::new();
+        for (id, record) in parsed.arena.iter() {
+            if !matches!(
+                record.data,
+                NodeData::StringLiteral(_) | NodeData::NumericLiteral(_)
+            ) {
+                continue;
+            }
+            let node = NodeRef::new(parsed.arena.id(), file, id);
+            let type_ = context.get_type_at_location(node).unwrap();
+            let payload = context.store().type_payload(type_).unwrap();
+            let TypeData::Literal(literal) = payload.data() else {
+                panic!("an enum initializer must retain its primitive literal type")
+            };
+            assert_eq!(literal.regular_type, type_);
+            assert!(payload.symbol().is_none());
+            assert!(
+                !payload
+                    .flags()
+                    .contains(crate::semantic::TypeFlags::ENUM_LITERAL)
+            );
+            assert_eq!(context.get_symbol_at_location(node).unwrap(), None);
+            let fresh = context.store().fresh_type_of_literal_type(type_).unwrap();
+            assert!(context.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    outer_type_parameters: None,
+                }
+            ));
+            results.push((node, type_));
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(context.type_to_string(results[0].1).unwrap(), "\"choice\"");
+        assert_eq!(context.type_to_string(results[1].1).unwrap(), "42");
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for (node, type_) in results {
+            assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn enum_initializer_artifacts_reject_changed_enum_and_literal_caches() {
+        for poison in 0..4 {
+            let parsed = parse_source_file("enum Choice { First = 'choice' }");
+            let file = FileId::new(6_115);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let (member, initializer) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::EnumMember(member) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, member.initializer.unwrap()),
+                    ))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(member).unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_type_node_links(
+                    initializer,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        outer_type_parameters: None
+                    }
+                )),
+                1 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                2 => assert!(context.store_mut_for_test().set_symbol_node_links(
+                    initializer,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(symbol)
+                    }
+                )),
+                3 => {
+                    let member_type = context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap();
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        initializer,
+                        TypeNodeLinks {
+                            resolved_type: Some(member_type),
+                            outer_type_parameters: None,
+                        }
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            assert!(
+                context.get_type_at_location(initializer).is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len()
+                ),
+                before,
+                "poison {poison}"
+            );
+        }
     }
 
     #[test]

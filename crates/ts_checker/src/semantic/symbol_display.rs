@@ -91,12 +91,18 @@ impl std::error::Error for SymbolDisplayError {
 
 #[derive(Clone, Copy, Debug)]
 struct ScopeTable {
-    id: SymbolTableId,
+    entries: ScopeEntries,
     types_only: bool,
     local: bool,
 }
 
-type VisitedTables = HashSet<(SemanticSymbolId, SymbolTableId, bool)>;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ScopeEntries {
+    Table(SymbolTableId),
+    ClassExpressionName(SemanticSymbolId),
+}
+
+type VisitedTables = HashSet<(SemanticSymbolId, ScopeEntries, bool)>;
 
 /// One query's scope and independently checked alias targets.
 #[derive(Debug)]
@@ -129,7 +135,10 @@ impl SymbolDisplayContext {
         let mut tables = context
             .scopes
             .iter()
-            .map(|scope| scope.id)
+            .filter_map(|scope| match scope.entries {
+                ScopeEntries::Table(id) => Some(id),
+                ScopeEntries::ClassExpressionName(_) => None,
+            })
             .collect::<Vec<_>>();
         let (arena, bound) = host
             .source(enclosing)
@@ -287,6 +296,7 @@ impl SymbolDisplayContext {
                     .declarations()
                     .is_some_and(|declarations| !declarations.is_empty())
                 && !is_external_module(store, host, symbol)?
+                && class_expression_name(store, host, symbol)?.is_none()
             {
                 return Err(SymbolDisplayError::UnnameableSymbol(symbol));
             }
@@ -429,12 +439,15 @@ impl SymbolDisplayContext {
             }
         }
         let globals = *self.scopes.last().expect("scope lookup includes globals");
+        let ScopeEntries::Table(globals_id) = globals.entries else {
+            return Err(SymbolDisplayError::InvalidLocation(self.enclosing));
+        };
         let global_this = store
             .intrinsic_bootstrap()
-            .ok_or(SymbolDisplayError::InvalidTable(globals.id))?
+            .ok_or(SymbolDisplayError::InvalidTable(globals_id))?
             .global_this_symbol;
         if store.symbol(global_this).is_none_or(|record| {
-            record.name().as_utf8() != Some("globalThis") || record.exports() != Some(globals.id)
+            record.name().as_utf8() != Some("globalThis") || record.exports() != Some(globals_id)
         }) {
             return Err(SymbolDisplayError::InvalidSymbol(global_this));
         }
@@ -464,19 +477,30 @@ impl SymbolDisplayContext {
         ignore_qualification: bool,
         visited: &mut VisitedTables,
     ) -> Result<Vec<SemanticSymbolId>, SymbolDisplayError> {
-        if !visited.insert((symbol, scope.id, ignore_qualification)) {
+        if !visited.insert((symbol, scope.entries, ignore_qualification)) {
             return Ok(Vec::new());
         }
         let result = (|| {
             let target = store
                 .symbol(symbol)
                 .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
-            let table = store
-                .symbol_table(scope.id)
-                .ok_or(SymbolDisplayError::InvalidTable(scope.id))?;
-            if let Some(direct) = table
-                .get(target.name())
-                .filter(|direct| in_scope(store, scope, *direct))
+            let table = match scope.entries {
+                ScopeEntries::Table(id) => Some(
+                    store
+                        .symbol_table(id)
+                        .ok_or(SymbolDisplayError::InvalidTable(id))?,
+                ),
+                ScopeEntries::ClassExpressionName(_) => None,
+            };
+            let direct = match scope.entries {
+                ScopeEntries::Table(_) => table.and_then(|table| table.get(target.name())),
+                ScopeEntries::ClassExpressionName(owner) => {
+                    let name = class_expression_name(store, host, owner)?
+                        .ok_or(SymbolDisplayError::InvalidSymbol(owner))?;
+                    (target.name().as_utf8() == Some(name)).then_some(owner)
+                }
+            };
+            if let Some(direct) = direct.filter(|direct| in_scope(store, scope, *direct))
                 && (same_reference(store, direct, symbol)?
                     || store
                         .symbol(direct)
@@ -490,6 +514,9 @@ impl SymbolDisplayContext {
             {
                 return Ok(vec![symbol]);
             }
+            let Some(table) = table else {
+                return Ok(Vec::new());
+            };
             let mut candidates = Vec::new();
             for (_, alias) in table.iter() {
                 let record = store
@@ -539,7 +566,7 @@ impl SymbolDisplayContext {
                         symbol,
                         meaning,
                         ScopeTable {
-                            id: exports,
+                            entries: ScopeEntries::Table(exports),
                             types_only: false,
                             local: false,
                         },
@@ -557,7 +584,7 @@ impl SymbolDisplayContext {
             candidates.sort_by(|left, right| self.compare_chains(store, host, left, right));
             Ok(candidates.into_iter().next().unwrap_or_default())
         })();
-        visited.remove(&(symbol, scope.id, ignore_qualification));
+        visited.remove(&(symbol, scope.entries, ignore_qualification));
         result
     }
 
@@ -572,12 +599,18 @@ impl SymbolDisplayContext {
             .symbol(symbol)
             .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
         for scope in &self.scopes {
-            let table = store
-                .symbol_table(scope.id)
-                .ok_or(SymbolDisplayError::InvalidTable(scope.id))?;
-            let Some(raw) = table
-                .get(record.name())
-                .filter(|candidate| in_scope(store, *scope, *candidate))
+            let candidate = match scope.entries {
+                ScopeEntries::Table(id) => store
+                    .symbol_table(id)
+                    .ok_or(SymbolDisplayError::InvalidTable(id))?
+                    .get(record.name()),
+                ScopeEntries::ClassExpressionName(owner) => {
+                    let name = class_expression_name(store, host, owner)?
+                        .ok_or(SymbolDisplayError::InvalidSymbol(owner))?;
+                    (record.name().as_utf8() == Some(name)).then_some(owner)
+                }
+            };
+            let Some(raw) = candidate.filter(|candidate| in_scope(store, *scope, *candidate))
             else {
                 continue;
             };
@@ -766,7 +799,7 @@ fn scope_tables(
             && let Some(id) = bound.locals(node)
         {
             tables.push(ScopeTable {
-                id,
+                entries: ScopeEntries::Table(id),
                 types_only: false,
                 local: true,
             });
@@ -784,7 +817,7 @@ fn scope_tables(
                     .and_then(ts_binder::semantic::Symbol::exports)
                 {
                     tables.push(ScopeTable {
-                        id,
+                        entries: ScopeEntries::Table(id),
                         types_only: false,
                         local: true,
                     });
@@ -799,9 +832,19 @@ fn scope_tables(
                     .and_then(ts_binder::semantic::Symbol::members)
                 {
                     tables.push(ScopeTable {
-                        id,
+                        entries: ScopeEntries::Table(id),
                         types_only: true,
                         local: false,
+                    });
+                }
+                if matches!(&record.data, NodeData::ClassExpression(class) if class.name.is_some())
+                {
+                    class_expression_name(store, host, owner)?
+                        .ok_or(SymbolDisplayError::InvalidSymbol(owner))?;
+                    tables.push(ScopeTable {
+                        entries: ScopeEntries::ClassExpressionName(owner),
+                        types_only: false,
+                        local: true,
                     });
                 }
             }
@@ -812,16 +855,57 @@ fn scope_tables(
             .map(|parent| NodeRef::new(node.arena, node.file, parent));
     }
     tables.push(ScopeTable {
-        id: globals,
+        entries: ScopeEntries::Table(globals),
         types_only: false,
         local: true,
     });
     for scope in &tables {
-        if store.symbol_table(scope.id).is_none() {
-            return Err(SymbolDisplayError::InvalidTable(scope.id));
+        if let ScopeEntries::Table(id) = scope.entries
+            && store.symbol_table(id).is_none()
+        {
+            return Err(SymbolDisplayError::InvalidTable(id));
         }
     }
     Ok(tables)
+}
+
+fn class_expression_name<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<&'store str>, SymbolDisplayError> {
+    let invalid = || SymbolDisplayError::InvalidSymbol(symbol);
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some([declaration]) = record.declarations() else {
+        return Ok(None);
+    };
+    let Some(NodeData::ClassExpression(class)) = host.node(*declaration).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    let Some(name) = class.name else {
+        return Ok(None);
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    let source = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &source.data else {
+        return Err(invalid());
+    };
+    if record.flags() != SymbolFlags::CLASS
+        || record.check_flags() != ts_binder::CheckFlags::NONE
+        || record.value_declaration() != Some(*declaration)
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !host.symbol_matches(store, *declaration, symbol)
+        || !store.source_declaration_belongs_to_symbol(*declaration, symbol)
+        || source.parent != Some(declaration.node)
+        || identifier.text.is_empty()
+        || record.name().as_utf8() != Some(identifier.text.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(record.name().as_utf8())
 }
 
 fn checked_alias_target(
@@ -1152,6 +1236,18 @@ fn validate_symbol(
     let canonical = store
         .get_merged_symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+    if record.flags().contains(SymbolFlags::CLASS)
+        && record.declarations().is_none_or(<[NodeRef]>::is_empty)
+    {
+        return Err(SymbolDisplayError::InvalidSymbol(symbol));
+    }
+    if let Some([declaration]) = record.declarations()
+        && matches!(host.node(*declaration).map(|node| &node.data),
+            Some(NodeData::ClassExpression(class)) if class.name.is_some())
+    {
+        class_expression_name(store, host, symbol)?
+            .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+    }
     let source = object_literal_property_source(store, host, symbol)?;
     if canonical != symbol {
         object_literal_property_source(store, host, canonical)?;
@@ -1430,6 +1526,214 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
+    }
+
+    fn class_expression_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/class-expression.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn named_class_expression_display_uses_a_read_only_self_binding() {
+        let parsed = parse_source_file("class Shared {} const Holder = class Shared {};");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(41_031);
+        let mut context = class_expression_context(&parsed, file);
+        let outer = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                matches!(record.data, NodeData::ClassDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let (inner, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::ClassExpression(class) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, id),
+                    NodeRef::new(parsed.arena.id(), file, class.name.unwrap()),
+                ))
+            })
+            .unwrap();
+        let outer_symbol = symbol(&context, outer);
+        let inner_symbol = symbol(&context, inner);
+        let outer_type = context.get_declared_type_of_symbol(outer_symbol).unwrap();
+        let inner_type = context.get_declared_type_of_symbol(inner_symbol).unwrap();
+        let outside = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location(inner_type, name)
+                    .unwrap(),
+                "Shared"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location(outer_type, name)
+                    .unwrap(),
+                "globalThis.Shared"
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(inner_symbol, name)
+                    .unwrap(),
+                "Shared"
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(inner_symbol, outside)
+                    .unwrap(),
+                "Shared"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location(outer_type, outside)
+                    .unwrap(),
+                "Shared"
+            );
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn named_class_expression_display_rejects_changed_source_ownership() {
+        for poison in 0..5 {
+            let parsed = parse_source_file("class Shared {} const Holder = class Shared {};");
+            let file = FileId::new(41_032);
+            let mut context = class_expression_context(&parsed, file);
+            let outer =
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(id, record)| {
+                        matches!(record.data, NodeData::ClassDeclaration(_))
+                            .then_some(NodeRef::new(parsed.arena.id(), file, id))
+                    })
+                    .unwrap();
+            let (inner, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::ClassExpression(class) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, class.name.unwrap()),
+                    ))
+                })
+                .unwrap();
+            let owner = symbol(&context, inner);
+            let outer_owner = symbol(&context, outer);
+            assert_eq!(
+                context.symbol_to_string_at_location(owner, name).unwrap(),
+                "Shared"
+            );
+            match poison {
+                0 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    owner,
+                    SymbolFlags::INTERFACE,
+                    ts_binder::CheckFlags::NONE
+                )),
+                1 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    owner,
+                    Some(vec![inner]),
+                    Some(outer)
+                )),
+                2 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    owner,
+                    Some(vec![outer]),
+                    Some(outer)
+                )),
+                3 => {
+                    let record = context.store().symbol(owner).unwrap();
+                    let (members, exports) = (record.members(), record.exports());
+                    assert!(context.store_mut_for_test().set_symbol_relationships(
+                        owner,
+                        members,
+                        exports,
+                        Some(outer_owner),
+                        None
+                    ));
+                }
+                4 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    owner,
+                    Some(Vec::new()),
+                    None
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                context.symbol_to_string_at_location(owner, name).is_err(),
+                "poison {poison}"
+            );
+            let outside = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+            assert!(
+                context
+                    .symbol_to_string_at_location(owner, outside)
+                    .is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before,
+                "poison {poison}"
+            );
+        }
     }
 
     #[test]
