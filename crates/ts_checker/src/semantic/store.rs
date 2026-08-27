@@ -31,6 +31,7 @@ use super::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
     },
+    instantiated_members::InstantiatedPropertyRecovery,
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
     links::{
@@ -525,6 +526,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
+    instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_callable_alias_annotations: HashMap<
         NodeRef,
@@ -672,6 +674,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             direct_class_heritage_provenance: HashMap::new(),
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
+            instantiated_property_recoveries: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_callable_alias_annotations: HashMap::new(),
             source_callable_alias_owners: HashMap::new(),
@@ -4988,6 +4991,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
         });
         self.links.value_symbol.replace_key(symbol, links);
+        let mut recovery_invalidated = false;
+        for recovery in self.instantiated_property_recoveries.values_mut() {
+            recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
+        }
         if let Some(type_) = published_type
             && let Some(identity) = self.module_value_identities.get_mut(&symbol)
             && identity.type_() == type_
@@ -4997,12 +5004,42 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if changed {
             self.invalidate_inferred_return_cycles_for_symbol(symbol, published_type);
         }
-        if relation_dirty {
+        if relation_dirty || recovery_invalidated {
             self.mark_relation_inputs_dirty();
         }
-        if dirty {
+        if dirty || recovery_invalidated {
             self.mark_union_cache_validation_dirty();
         }
+        true
+    }
+
+    pub(super) fn instantiated_property_recovery(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&InstantiatedPropertyRecovery> {
+        self.observe_relation_symbol_read(symbol);
+        self.instantiated_property_recoveries.get(&symbol)
+    }
+
+    pub(super) fn try_reserve_instantiated_property_recoveries(&mut self) -> bool {
+        self.instantiated_property_recoveries.try_reserve(1).is_ok()
+    }
+
+    /// Only the checked property producer can construct this evidence.
+    pub(super) fn publish_instantiated_property_recovery(
+        &mut self,
+        recovery: InstantiatedPropertyRecovery,
+    ) -> bool {
+        let symbol = recovery.symbol();
+        if self.instantiated_property_recoveries.contains_key(&symbol)
+            || !recovery.matches_published_links(self.value_symbol_links(symbol))
+        {
+            return false;
+        }
+        self.instantiated_property_recoveries
+            .insert(symbol, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
         true
     }
 

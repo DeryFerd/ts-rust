@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use ts_ast::SyntaxKind;
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolData,
     SymbolFlags, SymbolTableId, semantic::PreparedSymbolTable,
@@ -19,7 +19,7 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId, TypeMapperId,
-    array_types::CanonicalArrayTargets,
+    array_types::{CanonicalArrayReference, CanonicalArrayTargets},
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
         validated_instantiated_method_mapper,
@@ -44,14 +44,15 @@ use super::{
         validate_resolved_declared_property_object,
     },
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
-    signatures::{ElementFlags, SignatureFlags, SignatureInstantiationError},
+    signatures::{ElementFlags, SignatureFlags, SignatureInstantiationError, TupleElementInfo},
     store::SourceNodeParent,
     structured_members::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
     },
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{
-        ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
+        ConstrainedTypeData, LiteralValue, ObjectTypeData, StructuredTypeData, TypeCacheState,
+        TypeData, TypeDataKind, TypeParameterData,
     },
     types::{AccessFlags, ObjectFlags, TypeFlags},
 };
@@ -249,6 +250,301 @@ struct GenericInterfaceShape {
     inherited_properties: Vec<SemanticSymbolId>,
     inherited_index_infos: Vec<IndexInfoId>,
     inherited_members_ready: bool,
+}
+
+/// Evidence created only after this producer observes a real caller limit event.
+#[derive(Debug)]
+pub(super) struct InstantiatedPropertyRecovery {
+    valid: bool,
+    symbol: SemanticSymbolId,
+    target: SemanticSymbolId,
+    template: TypeId,
+    mapper: TypeMapperId,
+    result: TypeId,
+    identity: Vec<RecoveredPropertyTypeIdentity>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecoveredPropertyTypeIdentity {
+    type_: TypeId,
+    flags: TypeFlags,
+    object_flags: ObjectFlags,
+    symbol: Option<SemanticSymbolId>,
+    alias: Option<(
+        super::TypeAliasId,
+        Option<SemanticSymbolId>,
+        Option<Vec<TypeId>>,
+    )>,
+    shape: RecoveredPropertyTypeShape,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RecoveredPropertyTypeShape {
+    Leaf(TypeDataKind),
+    Literal {
+        regular_type: TypeId,
+    },
+    Parameter(TypeParameterData),
+    Array(CanonicalArrayReference),
+    Reference {
+        target: TypeId,
+        arguments: Vec<TypeId>,
+    },
+    Tuple {
+        target: TypeId,
+        elements: Vec<TypeId>,
+        infos: Vec<TupleElementInfo>,
+        readonly: bool,
+    },
+    Union {
+        members: Vec<TypeId>,
+        origin: Option<TypeId>,
+    },
+    TemplateLiteral {
+        texts: Vec<String>,
+        types: Vec<TypeId>,
+    },
+    StringMapping(TypeId),
+    IndexedAccess {
+        object: TypeId,
+        index: TypeId,
+        access: AccessFlags,
+    },
+    Object {
+        data: ObjectTypeData,
+        signatures: Vec<RecoveredPropertySignatureIdentity>,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecoveredPropertySignatureIdentity {
+    signature: SignatureId,
+    flags: SignatureFlags,
+    declaration: Option<NodeRef>,
+    type_parameters: Vec<TypeId>,
+    parameters: Vec<(SemanticSymbolId, ValueSymbolLinks)>,
+    this_parameter: Option<(SemanticSymbolId, ValueSymbolLinks)>,
+    min_argument_count: i32,
+    return_type: Option<TypeId>,
+    predicate: Option<super::TypePredicateId>,
+    target: Option<SignatureId>,
+    mapper: Option<TypeMapperId>,
+    composite: Option<(bool, Vec<SignatureId>)>,
+}
+
+impl InstantiatedPropertyRecovery {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) fn invalidate_for_raw_write(&mut self, symbol: SemanticSymbolId) -> bool {
+        let invalidated = self.valid && (symbol == self.symbol || symbol == self.target);
+        if invalidated {
+            self.valid = false;
+        }
+        invalidated
+    }
+
+    pub(super) fn matches_published_links(&self, links: Option<&ValueSymbolLinks>) -> bool {
+        self.valid
+            && links.is_some_and(|links| {
+                links.target == Some(self.target)
+                    && links.mapper == Some(self.mapper)
+                    && links.resolved_type == Some(self.result)
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Every producer identity is part of the recovery key.
+    fn matches(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        symbol: SemanticSymbolId,
+        target: SemanticSymbolId,
+        template: TypeId,
+        mapper: TypeMapperId,
+        result: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        self.symbol == symbol
+            && self.target == target
+            && self.template == template
+            && self.mapper == mapper
+            && self.result == result
+            && self.matches_published_links(store.value_symbol_links(symbol))
+            && property_recovery_type_identity(store, &[template, result], array_targets)
+                .is_some_and(|identity| identity == self.identity)
+            && match array_targets {
+                Some(targets) => store
+                    .validate_cached_array_capability_with_array_targets(targets, result)
+                    .is_ok(),
+                None => store.validate_cached_array_capability(result).is_ok(),
+            }
+    }
+}
+
+/// Retains type arguments but not member caches that can legitimately warm later.
+fn property_recovery_type_identity(
+    store: &CanonicalTypeMapperStore,
+    roots: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<Vec<RecoveredPropertyTypeIdentity>> {
+    let mut pending = roots.to_vec();
+    let mut seen = HashSet::new();
+    let mut identity = Vec::new();
+    while let Some(type_) = pending.pop() {
+        if !seen.insert(type_) {
+            continue;
+        }
+        let record = store.type_payload(type_)?;
+        let alias = match record.alias() {
+            Some(alias) => {
+                let data = store.type_alias(alias)?;
+                let arguments = data.type_arguments().map(<[TypeId]>::to_vec);
+                pending.extend(arguments.as_deref().unwrap_or_default());
+                Some((alias, data.symbol(), arguments))
+            }
+            None => None,
+        };
+        let shape = if let Some(tuple) = store.canonical_tuple_shape(type_).ok()? {
+            let elements = tuple.element_types().to_vec();
+            pending.extend(&elements);
+            RecoveredPropertyTypeShape::Tuple {
+                target: tuple.target(),
+                elements,
+                infos: tuple.element_infos().to_vec(),
+                readonly: tuple.is_readonly(),
+            }
+        } else if let Some(array) = array_targets
+            .map(|targets| store.canonical_array_reference_with_targets(targets, type_))
+            .transpose()
+            .ok()?
+            .flatten()
+        {
+            pending.push(array.element_type);
+            RecoveredPropertyTypeShape::Array(array)
+        } else if let TypeData::Union(union) = record.data() {
+            let members = union.union.types.clone();
+            pending.extend(&members);
+            pending.extend(union.origin);
+            RecoveredPropertyTypeShape::Union {
+                members,
+                origin: union.origin,
+            }
+        } else if matches!(
+            record.data(),
+            TypeData::TypeReference(_) | TypeData::Interface(_)
+        ) && let Ok(reference) = validate_direct_generic_reference(store, type_)
+        {
+            pending.extend(&reference.type_arguments);
+            RecoveredPropertyTypeShape::Reference {
+                target: reference.target,
+                arguments: reference.type_arguments,
+            }
+        } else {
+            match record.data() {
+                TypeData::Intrinsic(_) => {
+                    store.validate_union_constituent(type_).ok()?;
+                    RecoveredPropertyTypeShape::Leaf(record.data().kind())
+                }
+                TypeData::Literal(literal) => {
+                    store.validate_union_constituent(type_).ok()?;
+                    pending.push(literal.regular_type);
+                    RecoveredPropertyTypeShape::Literal {
+                        regular_type: literal.regular_type,
+                    }
+                }
+                TypeData::TypeParameter(parameter) if parameter.target.is_some() => {
+                    let mut parameter = parameter.clone();
+                    parameter.constrained = ConstrainedTypeData::default();
+                    pending.extend(parameter.constraint);
+                    pending.extend(parameter.target);
+                    pending.extend(parameter.resolved_default_type);
+                    RecoveredPropertyTypeShape::Parameter(parameter)
+                }
+                TypeData::TemplateLiteral(template) => {
+                    pending.extend(&template.types);
+                    RecoveredPropertyTypeShape::TemplateLiteral {
+                        texts: template.texts.clone(),
+                        types: template.types.clone(),
+                    }
+                }
+                TypeData::StringMapping(mapping) => {
+                    pending.push(mapping.target);
+                    RecoveredPropertyTypeShape::StringMapping(mapping.target)
+                }
+                TypeData::IndexedAccess(indexed) => {
+                    pending.extend([indexed.object_type, indexed.index_type]);
+                    RecoveredPropertyTypeShape::IndexedAccess {
+                        object: indexed.object_type,
+                        index: indexed.index_type,
+                        access: indexed.access_flags,
+                    }
+                }
+                TypeData::Object(object) => {
+                    let mut signatures = Vec::new();
+                    for &signature in object.structured.signatures.as_deref().unwrap_or_default() {
+                        let record = store.signature(signature)?;
+                        let parameters = record
+                            .parameters()
+                            .iter()
+                            .map(|symbol| {
+                                Some((*symbol, store.value_symbol_links(*symbol)?.clone()))
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        let this_parameter = match record.this_parameter() {
+                            Some(symbol) => {
+                                Some((symbol, store.value_symbol_links(symbol)?.clone()))
+                            }
+                            None => None,
+                        };
+                        pending.extend(record.type_parameters());
+                        pending.extend(record.resolved_return_type());
+                        for (_, links) in parameters.iter().chain(this_parameter.iter()) {
+                            pending.extend(links.resolved_type);
+                            pending.extend(links.write_type);
+                            pending.extend(links.name_type);
+                        }
+                        if let Some(predicate) = record.resolved_type_predicate() {
+                            pending.extend(store.type_predicate(predicate)?.type_id());
+                        }
+                        signatures.push(RecoveredPropertySignatureIdentity {
+                            signature,
+                            flags: record.flags(),
+                            declaration: record.declaration(),
+                            type_parameters: record.type_parameters().to_vec(),
+                            parameters,
+                            this_parameter,
+                            min_argument_count: record.min_argument_count(),
+                            return_type: record.resolved_return_type(),
+                            predicate: record.resolved_type_predicate(),
+                            target: record.target(),
+                            mapper: record.mapper(),
+                            composite: record.composite().map(|composite| {
+                                (composite.is_union(), composite.signatures().to_vec())
+                            }),
+                        });
+                    }
+                    RecoveredPropertyTypeShape::Object {
+                        data: object.clone(),
+                        signatures,
+                    }
+                }
+                _ => RecoveredPropertyTypeShape::Leaf(record.data().kind()),
+            }
+        };
+        identity.push(RecoveredPropertyTypeIdentity {
+            type_,
+            flags: record.flags(),
+            object_flags: record.object_flags()
+                & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+                    | ObjectFlags::MEMBERS_RESOLVED),
+            symbol: record.symbol(),
+            alias,
+            shape,
+        });
+    }
+    Some(identity)
 }
 
 #[derive(Clone, Debug)]
@@ -570,17 +866,27 @@ pub(super) fn demand_instantiated_property_type(
         .and_then(|links| links.resolved_type)
         .ok_or(GenericInterfaceMemberError::InvalidMember(target))?;
     if let Some(cached) = cached {
-        if !cached_instantiated_property_type_matches(
+        if !cached_instantiated_property_value_matches(
             store,
+            symbol,
             template,
-            cached,
             mapper,
+            Some(cached),
             array_targets,
         ) {
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
         }
         return Ok(cached);
     }
+    if session.recovery_error_type().is_some_and(|error_type| {
+        store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.error_type != error_type)
+            || store.validate_union_constituent(error_type).is_err()
+    }) {
+        return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
+    }
+    let limit_mark = session.limit_event_mark();
     let instantiated = if store
         .symbol(target)
         .is_some_and(|record| record.flags().contains(SymbolFlags::METHOD))
@@ -606,6 +912,27 @@ pub(super) fn demand_instantiated_property_type(
     {
         return Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol));
     }
+    let recovery = if session.recovery_error_type().is_some()
+        && session.limit_event_occurred_since(limit_mark)
+    {
+        let identity =
+            property_recovery_type_identity(store, &[template, instantiated], array_targets)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;
+        if !store.try_reserve_instantiated_property_recoveries() {
+            return Err(GenericInterfaceMemberError::Capacity(template));
+        }
+        Some(InstantiatedPropertyRecovery {
+            valid: true,
+            symbol,
+            target,
+            template,
+            mapper,
+            result: instantiated,
+            identity,
+        })
+    } else {
+        None
+    };
     assert!(store.set_value_symbol_links(
         symbol,
         ValueSymbolLinks {
@@ -613,6 +940,9 @@ pub(super) fn demand_instantiated_property_type(
             ..links
         },
     ));
+    if let Some(recovery) = recovery {
+        assert!(store.publish_instantiated_property_recovery(recovery));
+    }
     Ok(instantiated)
 }
 
@@ -3981,6 +4311,39 @@ fn optional_member_type_is_normalized(
     })
 }
 
+fn cached_instantiated_property_value_matches(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    template: TypeId,
+    mapper: TypeMapperId,
+    cached: Option<TypeId>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    if let Some(recovery) = store.instantiated_property_recovery(symbol) {
+        let Some(cached) = cached else {
+            return false;
+        };
+        let Some(target) = store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.target)
+        else {
+            return false;
+        };
+        return recovery.matches(
+            store,
+            symbol,
+            target,
+            template,
+            mapper,
+            cached,
+            array_targets,
+        );
+    }
+    cached.is_none_or(|cached| {
+        cached_instantiated_property_type_matches(store, template, cached, mapper, array_targets)
+    })
+}
+
 fn cached_instantiated_property_type_matches(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
@@ -4528,15 +4891,14 @@ fn validate_warm_members(
             || links
                 .resolved_type
                 .is_some_and(|type_| store.type_payload(type_).is_none())
-            || links.resolved_type.is_some_and(|type_| {
-                !cached_instantiated_property_type_matches(
-                    store,
-                    source.type_,
-                    type_,
-                    mapper,
-                    array_targets,
-                )
-            })
+            || !cached_instantiated_property_value_matches(
+                store,
+                *property,
+                source.type_,
+                mapper,
+                links.resolved_type,
+                array_targets,
+            )
         {
             return Err(GenericInterfaceMemberError::InvalidCachedProperty(
                 *property,
@@ -4963,6 +5325,859 @@ mod tests {
             );
         }
         assert!(store.set_interface_declared_members(target, true, members, None, None, None));
+    }
+
+    struct PropertyRecoveryFixture<'a> {
+        context: CanonicalCheckerContext<'a>,
+        receiver: TypeId,
+        reference: TypeId,
+        members: InstantiatedInterfaceMembers,
+        proxy: SemanticSymbolId,
+        sibling: SemanticSymbolId,
+        target: SemanticSymbolId,
+        template: TypeId,
+        mapper: TypeMapperId,
+        array_targets: CanonicalArrayTargets,
+    }
+
+    fn property_recovery_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> PropertyRecoveryFixture<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        let box_owner = source_symbol(parsed, file, &context, "Box");
+        let first = context
+            .store()
+            .symbol(box_owner)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("first"))
+            .unwrap();
+        let annotation = context
+            .store()
+            .symbol(first)
+            .filter(|record| record.flags().contains(SymbolFlags::PROPERTY))
+            .and_then(|record| record.value_declaration())
+            .and_then(|declaration| context.store().source_direct_type_annotation(declaration));
+        if let Some(annotation) = annotation
+            && !matches!(
+                &parsed.arena.get(annotation.node).unwrap().data,
+                NodeData::TypeReferenceNode(reference) if reference.type_arguments.is_none()
+            )
+        {
+            let box_type = context.get_declared_type_of_symbol(box_owner).unwrap();
+            let child = context.store().intrinsic_bootstrap().and_then(|bootstrap| {
+                context
+                    .store()
+                    .symbol_table(bootstrap.globals)?
+                    .get_source("Child")
+            });
+            if let Some(child) = child {
+                let target = context.get_declared_type_of_symbol(child).unwrap();
+                let TypeData::Interface(interface) =
+                    context.store().type_payload(target).unwrap().data()
+                else {
+                    panic!("Child must retain its generic target")
+                };
+                let parameter = interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0];
+                publish_generic_target_for_test(
+                    &mut context,
+                    target,
+                    &[("value", parameter)],
+                    None,
+                );
+            }
+            let first_type = context.get_type_from_type_node(annotation).unwrap();
+            let TypeData::Interface(interface) =
+                context.store().type_payload(box_type).unwrap().data()
+            else {
+                panic!("Box must retain its generic target")
+            };
+            let parameter = interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0];
+            // Publish wrapped annotations directly. Direct properties and methods use source inheritance.
+            publish_generic_target_for_test(
+                &mut context,
+                box_type,
+                &[("first", first_type), ("second", parameter)],
+                None,
+            );
+        }
+        let owner = source_symbol(parsed, file, &context, "Derived");
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let array_targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let TypeData::Interface(interface) = context.store().type_payload(receiver).unwrap().data()
+        else {
+            panic!("Derived must retain its interface type")
+        };
+        let reference = interface.resolved_base_types.as_ref().unwrap()[0];
+        let store = context.store_mut_for_test();
+        let members =
+            resolve_members_with_array_targets(store, reference, Some(array_targets)).unwrap();
+        let table = store.symbol_table(members.members().unwrap()).unwrap();
+        let proxy = table.get_source("first").unwrap();
+        let sibling = table.get_source("second").unwrap();
+        let links = store.value_symbol_links(proxy).unwrap();
+        assert!(links.resolved_type.is_none());
+        let target = links.target.unwrap();
+        let mapper = links.mapper.unwrap();
+        let template = store
+            .value_symbol_links(target)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        PropertyRecoveryFixture {
+            context,
+            receiver,
+            reference,
+            members,
+            proxy,
+            sibling,
+            target,
+            template,
+            mapper,
+            array_targets,
+        }
+    }
+
+    fn property_recovery_source(member: &str) -> ParseResult {
+        parse_source_file(&format!(
+            "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+             interface Child<T> {{ value: T; }} \
+             interface Box<T> {{ {member} second: T; }} \
+             interface Derived extends Box<number> {{}}"
+        ))
+    }
+
+    fn property_recovery_store_counts(
+        store: &CanonicalTypeMapperStore,
+    ) -> ([usize; 6], [usize; 26]) {
+        (
+            [
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    #[test]
+    fn property_recovery_keeps_direct_and_wrapped_results_on_warm_reads() {
+        use crate::semantic::structured_members::{
+            InterfaceHeritageMembersValidation, inherited_generic_property_reference,
+            validate_interface_heritage_members_with_array_targets,
+        };
+
+        for (annotation, max_count) in [
+            ("T", 0),
+            ("[T]", 0),
+            ("readonly [head: T, tail?: T]", 0),
+            ("[] | [T]", 0),
+            ("Array<T>", 1),
+            ("ReadonlyArray<T>", 1),
+            ("Child<T>", 1),
+            ("[Child<T>, T[]]", 1),
+        ] {
+            eprintln!("recovery template: {annotation}");
+            let parsed = property_recovery_source(&format!("first: {annotation};"));
+            let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_280));
+            let store = fixture.context.store_mut_for_test();
+            let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+            let template_links = store.value_symbol_links(fixture.target).cloned().unwrap();
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            let mark = session.limit_event_mark();
+            let result = demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session,
+            )
+            .unwrap_or_else(|error| panic!("{annotation}: {error:?}"));
+            assert!(session.limit_event_occurred_since(mark), "{annotation}");
+            assert_eq!(
+                store
+                    .value_symbol_links(fixture.proxy)
+                    .unwrap()
+                    .resolved_type,
+                Some(result)
+            );
+            assert!(
+                store
+                    .instantiated_property_recovery(fixture.proxy)
+                    .is_some()
+            );
+            assert!(!cached_instantiated_property_type_matches(
+                store,
+                fixture.template,
+                result,
+                fixture.mapper,
+                Some(fixture.array_targets)
+            ));
+            if annotation == "T" {
+                assert_eq!(result, error_type);
+            } else {
+                assert_ne!(result, error_type, "{annotation}");
+            }
+            assert_eq!(
+                validate_generic_interface_members(
+                    store,
+                    fixture.reference,
+                    Some(fixture.array_targets)
+                ),
+                Ok(Some(fixture.members.clone())),
+                "{annotation}"
+            );
+            assert_eq!(
+                validate_interface_heritage_members_with_array_targets(
+                    store,
+                    fixture.receiver,
+                    Some(fixture.array_targets)
+                ),
+                InterfaceHeritageMembersValidation::Valid,
+                "{annotation}"
+            );
+            assert_eq!(
+                inherited_generic_property_reference(
+                    store,
+                    fixture.receiver,
+                    fixture.proxy,
+                    Some(fixture.array_targets)
+                ),
+                Some(fixture.reference)
+            );
+
+            if annotation == "Child<T>" {
+                let child = store
+                    .resolve_generic_interface_property(result, "value", None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(child.type_id(), error_type);
+            }
+
+            let before = property_recovery_store_counts(store);
+            let counts = (session.query_count(), session.total_count());
+            let mark = session.limit_event_mark();
+            for reset_query in [false, true] {
+                if reset_query {
+                    session.reset_query();
+                }
+                let property = resolve_property_with_array_targets_and_session(
+                    store,
+                    fixture.reference,
+                    EscapedNameRef::source("first"),
+                    Some(fixture.array_targets),
+                    &mut session,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(property.symbol(), fixture.proxy);
+                assert_eq!(property.type_id(), result);
+                assert_eq!(
+                    session.query_count(),
+                    if reset_query { 0 } else { counts.0 }
+                );
+                assert_eq!(session.total_count(), counts.1);
+                assert!(!session.limit_event_occurred_since(mark));
+            }
+            let mut other = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            let mark = other.limit_event_mark();
+            assert_eq!(
+                demand_instantiated_property_type(
+                    store,
+                    fixture.reference,
+                    fixture.proxy,
+                    Some(fixture.array_targets),
+                    &mut other
+                ),
+                Ok(result)
+            );
+            assert_eq!((other.query_count(), other.total_count()), (0, 0));
+            assert!(!other.limit_event_occurred_since(mark));
+            assert_eq!(property_recovery_store_counts(store), before);
+            assert_eq!(
+                store.value_symbol_links(fixture.target),
+                Some(&template_links)
+            );
+            assert!(
+                store
+                    .value_symbol_links(fixture.sibling)
+                    .unwrap()
+                    .resolved_type
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn property_recovery_allows_later_source_parameter_default_resolution() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Box<T = string> { first: T; second: T; } ",
+            "interface Derived extends Box<number> {} type DefaultBox = Box;",
+        ));
+        let file = FileId::new(6_290);
+        let mut fixture = property_recovery_fixture(&parsed, file);
+        let alias = source_symbol(&parsed, file, &fixture.context, "DefaultBox");
+        let store = fixture.context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (error_type, string) = (bootstrap.error_type, bootstrap.string_type);
+        let parameter_default = |store: &CanonicalTypeMapperStore| {
+            let TypeData::TypeParameter(parameter) =
+                store.type_payload(fixture.template).unwrap().data()
+            else {
+                panic!("the property must retain its source parameter")
+            };
+            parameter.resolved_default_type
+        };
+        assert_eq!(parameter_default(store), None);
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Ok(error_type)
+        );
+        fixture.context.get_declared_type_of_symbol(alias).unwrap();
+        let store = fixture.context.store_mut_for_test();
+        assert_eq!(parameter_default(store), Some(string));
+        let before = property_recovery_store_counts(store);
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(property_recovery_store_counts(store), before);
+        assert!(!session.limit_event_occurred_since(mark));
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+    }
+
+    #[test]
+    fn property_recovery_raw_proxy_and_target_writes_revoke_the_proof() {
+        for mutation in ["proxy", "clear", "restore", "normal", "target", "template"] {
+            let parsed = property_recovery_source("first: T;");
+            let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_281));
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (error_type, number) = (bootstrap.error_type, bootstrap.number_type);
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count: 0,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            assert_eq!(
+                demand_instantiated_property_type(
+                    store,
+                    fixture.reference,
+                    fixture.proxy,
+                    Some(fixture.array_targets),
+                    &mut session
+                ),
+                Ok(error_type)
+            );
+            let symbol = if matches!(mutation, "target" | "template") {
+                fixture.target
+            } else {
+                fixture.proxy
+            };
+            let mut links = store.value_symbol_links(symbol).cloned().unwrap();
+            if mutation == "restore" {
+                assert!(store.set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: None,
+                        ..links.clone()
+                    }
+                ));
+            }
+            if mutation == "clear" {
+                links.resolved_type = None;
+            } else if matches!(mutation, "normal" | "template") {
+                links.resolved_type = Some(number);
+            }
+            assert!(store.set_value_symbol_links(symbol, links.clone()));
+            assert!(
+                !store
+                    .instantiated_property_recovery(fixture.proxy)
+                    .unwrap()
+                    .valid
+            );
+            let before = (
+                property_recovery_store_counts(store),
+                store.relation_state_snapshot(),
+            );
+            let mark = session.limit_event_mark();
+            assert_eq!(
+                demand_instantiated_property_type(
+                    store,
+                    fixture.reference,
+                    fixture.proxy,
+                    Some(fixture.array_targets),
+                    &mut session
+                ),
+                Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                    fixture.proxy
+                )),
+                "{mutation}"
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(store),
+                    store.relation_state_snapshot()
+                ),
+                before,
+                "{mutation}"
+            );
+            assert_eq!(store.value_symbol_links(symbol), Some(&links));
+            assert!(!session.limit_event_occurred_since(mark));
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+        }
+    }
+
+    #[test]
+    fn property_recovery_rejects_unproven_error_any_and_other_proxy_values() {
+        for mutation in ["error", "any", "other_proxy"] {
+            let parsed = property_recovery_source("first: T;");
+            let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_282));
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (error_type, any) = (bootstrap.error_type, bootstrap.any_type);
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count: 0,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            let symbol = if mutation == "other_proxy" {
+                assert_eq!(
+                    demand_instantiated_property_type(
+                        store,
+                        fixture.reference,
+                        fixture.proxy,
+                        Some(fixture.array_targets),
+                        &mut session
+                    ),
+                    Ok(error_type)
+                );
+                fixture.sibling
+            } else {
+                fixture.proxy
+            };
+            let links = ValueSymbolLinks {
+                resolved_type: Some(if mutation == "any" { any } else { error_type }),
+                ..store.value_symbol_links(symbol).cloned().unwrap()
+            };
+            assert!(store.set_value_symbol_links(symbol, links.clone()));
+            assert!(store.instantiated_property_recovery(symbol).is_none());
+            let before = (
+                property_recovery_store_counts(store),
+                store.relation_state_snapshot(),
+            );
+            let mark = session.limit_event_mark();
+            assert_eq!(
+                demand_instantiated_property_type(
+                    store,
+                    fixture.reference,
+                    symbol,
+                    Some(fixture.array_targets),
+                    &mut session
+                ),
+                Err(GenericInterfaceMemberError::InvalidCachedProperty(symbol)),
+                "{mutation}"
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(store),
+                    store.relation_state_snapshot()
+                ),
+                before
+            );
+            assert_eq!(store.value_symbol_links(symbol), Some(&links));
+            assert!(!session.limit_event_occurred_since(mark));
+        }
+    }
+
+    #[test]
+    fn property_recovery_failed_and_unrelated_writes_keep_the_proof() {
+        let parsed = property_recovery_source("first: T;");
+        let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_283));
+        let mut foreign = CanonicalTypeMapperStore::new();
+        let foreign_type = foreign
+            .alloc_intrinsic_type(TypeFlags::ANY, "foreign")
+            .unwrap();
+        let store = fixture.context.store_mut_for_test();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Ok(error_type)
+        );
+        let proxy_links = store.value_symbol_links(fixture.proxy).cloned().unwrap();
+        let before = (
+            property_recovery_store_counts(store),
+            store.relation_state_snapshot(),
+        );
+        assert!(!store.set_value_symbol_links(
+            fixture.proxy,
+            ValueSymbolLinks {
+                resolved_type: Some(foreign_type),
+                ..proxy_links.clone()
+            }
+        ));
+        assert_eq!(
+            (
+                property_recovery_store_counts(store),
+                store.relation_state_snapshot()
+            ),
+            before
+        );
+        let sibling_links = store.value_symbol_links(fixture.sibling).cloned().unwrap();
+        assert!(store.set_value_symbol_links(fixture.sibling, sibling_links));
+        assert!(
+            store
+                .instantiated_property_recovery(fixture.proxy)
+                .unwrap()
+                .valid
+        );
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(store.value_symbol_links(fixture.proxy), Some(&proxy_links));
+        assert!(!session.limit_event_occurred_since(mark));
+    }
+
+    #[test]
+    fn property_recovery_rejects_noncanonical_recovery_before_instantiation() {
+        let parsed = property_recovery_source("first: T;");
+        let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_284));
+        let store = fixture.context.store_mut_for_test();
+        let any = store.intrinsic_bootstrap().unwrap().any_type;
+        let links = store.value_symbol_links(fixture.proxy).cloned().unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            any,
+        )
+        .unwrap();
+        let before = (
+            property_recovery_store_counts(store),
+            store.relation_state_snapshot(),
+        );
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                fixture.proxy
+            ))
+        );
+        assert_eq!(
+            (
+                property_recovery_store_counts(store),
+                store.relation_state_snapshot()
+            ),
+            before
+        );
+        assert_eq!(store.value_symbol_links(fixture.proxy), Some(&links));
+        assert!(
+            store
+                .instantiated_property_recovery(fixture.proxy)
+                .is_none()
+        );
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+        assert!(!session.limit_event_occurred_since(mark));
+    }
+
+    #[test]
+    fn property_recovery_rejects_changed_wrapped_results() {
+        for (annotation, max_count) in [("Array<T>", 1), ("[T]", 0), ("Child<T>", 1)] {
+            let parsed = property_recovery_source(&format!("first: {annotation};"));
+            let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_285));
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (error_type, number) = (bootstrap.error_type, bootstrap.number_type);
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            let result = demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session,
+            )
+            .unwrap();
+            assert_ne!(result, error_type);
+            assert!(store.set_type_reference_resolution(result, None, Some(vec![number])));
+            let before = (
+                property_recovery_store_counts(store),
+                store.relation_state_snapshot(),
+            );
+            let mark = session.limit_event_mark();
+            let rejected = demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session,
+            );
+            assert!(rejected.is_err(), "{annotation}: {rejected:?}");
+            assert_eq!(
+                (
+                    property_recovery_store_counts(store),
+                    store.relation_state_snapshot()
+                ),
+                before
+            );
+            assert!(!session.limit_event_occurred_since(mark));
+        }
+    }
+
+    #[test]
+    fn property_recovery_requires_the_callers_array_targets_before_writes() {
+        let parsed = property_recovery_source("first: Array<T>;");
+        let foreign = property_recovery_fixture(&parsed, FileId::new(6_287));
+        for targets in [None, Some(foreign.array_targets)] {
+            let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_288));
+            let store = fixture.context.store_mut_for_test();
+            let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count: 0,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            let links = store.value_symbol_links(fixture.proxy).cloned().unwrap();
+            let before = (
+                property_recovery_store_counts(store),
+                store.relation_state_snapshot(),
+            );
+            let mark = session.limit_event_mark();
+            assert!(
+                demand_instantiated_property_type(
+                    store,
+                    fixture.reference,
+                    fixture.proxy,
+                    targets,
+                    &mut session
+                )
+                .is_err()
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(store),
+                    store.relation_state_snapshot()
+                ),
+                before
+            );
+            assert_eq!(store.value_symbol_links(fixture.proxy), Some(&links));
+            assert!(
+                store
+                    .instantiated_property_recovery(fixture.proxy)
+                    .is_none()
+            );
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert!(!session.limit_event_occurred_since(mark));
+        }
+    }
+
+    #[test]
+    fn property_recovery_keeps_method_signature_results_on_warm_reads() {
+        let parsed = property_recovery_source("first(value: T): T;");
+        let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_286));
+        let store = fixture.context.store_mut_for_test();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let result = demand_instantiated_property_type(
+            store,
+            fixture.reference,
+            fixture.proxy,
+            Some(fixture.array_targets),
+            &mut session,
+        )
+        .unwrap();
+        let before = property_recovery_store_counts(store);
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Ok(result)
+        );
+        assert!(matches!(
+            crate::semantic::callable_sets::validate_stored_callable_set(store, result),
+            StoredCallableSetValidation::Valid { .. }
+        ));
+        assert_eq!(property_recovery_store_counts(store), before);
+        assert!(!session.limit_event_occurred_since(mark));
+    }
+
+    #[test]
+    fn property_recovery_rejects_changed_method_signature_results() {
+        let parsed = property_recovery_source("first(value: T): T;");
+        let mut fixture = property_recovery_fixture(&parsed, FileId::new(6_289));
+        let store = fixture.context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (error_type, number) = (bootstrap.error_type, bootstrap.number_type);
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let result = demand_instantiated_property_type(
+            store,
+            fixture.reference,
+            fixture.proxy,
+            Some(fixture.array_targets),
+            &mut session,
+        )
+        .unwrap();
+        let signature = store
+            .type_payload(result)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let parameter = store.signature(signature).unwrap().parameters()[0];
+        let links = store.value_symbol_links(parameter).cloned().unwrap();
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..links
+            }
+        ));
+        assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+        assert!(cached_instantiated_interface_method_type_matches(
+            store,
+            fixture.template,
+            result,
+            fixture.mapper,
+            Some(fixture.array_targets)
+        ));
+        let before = property_recovery_store_counts(store);
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                fixture.reference,
+                fixture.proxy,
+                Some(fixture.array_targets),
+                &mut session
+            ),
+            Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                fixture.proxy
+            ))
+        );
+        assert_eq!(property_recovery_store_counts(store), before);
+        assert!(!session.limit_event_occurred_since(mark));
     }
 
     #[derive(Clone, Copy)]

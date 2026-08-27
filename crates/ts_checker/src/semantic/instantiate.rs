@@ -300,6 +300,14 @@ impl InstantiationSession {
         self.limit_event_generation > mark.0
     }
 
+    /// The caller's recovery identity, without changing its budget or event state.
+    pub(super) const fn recovery_error_type(&self) -> Option<TypeId> {
+        match self.limit_policy {
+            InstantiationLimitPolicy::FailFast => None,
+            InstantiationLimitPolicy::Recover { error_type } => Some(error_type),
+        }
+    }
+
     fn handle_limit(
         &mut self,
         store: &CanonicalTypeMapperStore,
