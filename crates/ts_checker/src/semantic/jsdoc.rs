@@ -1171,9 +1171,9 @@ pub fn parse_jsdoc_comment_at(
     if !comment.starts_with("/**") || !comment.ends_with("*/") {
         return Err(JsDocCommentError::InvalidCommentSyntax(range));
     }
-    let mut scanner = Scanner::new(comment);
-    scanner.set_skip_trivia(false);
-    let token = scanner.scan();
+    let mut comment_lexer = Scanner::new(comment);
+    comment_lexer.set_skip_trivia(false);
+    let token = comment_lexer.scan();
     if token.kind != SyntaxKind::MultiLineCommentTrivia
         || token.text != comment
         || token.flags.contains(TokenFlags::UNTERMINATED)
