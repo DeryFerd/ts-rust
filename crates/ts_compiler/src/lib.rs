@@ -24,12 +24,17 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
     bind_source_file_in_file_with_facts,
 };
+use ts_checker::semantic::alias::{
+    CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolutionEvent,
+    CanonicalAliasTargetUnavailable,
+};
 use ts_checker::semantic::formatter::FunctionTypeDisplayUnavailable;
 use ts_checker::semantic::production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence};
 use ts_checker::semantic::{
-    ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError,
-    CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions, CanonicalGlobalInitializationError,
-    CanonicalGlobalTypeInitializationError, CanonicalModuleResolutionEntry,
+    AliasTargetState, ArrayTypeError, CanonicalAliasQueryError, CanonicalCheckerContext,
+    CanonicalCheckerContextError, CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions,
+    CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
+    CanonicalHelperSignatureError, CanonicalModuleExportQueryError, CanonicalModuleResolutionEntry,
     CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
     CanonicalResolvedModuleInput, DeclaredTypeError, DeclaredTypeUnavailable, DerivedTypeError,
     EnumTypeError, IntrinsicBootstrapOptions, RelationUnavailable, SourceCheckError,
@@ -285,6 +290,11 @@ pub enum CanonicalProgramCheckError {
         file_name: String,
         error: SourceCheckError,
     },
+    ImportHelper {
+        file_name: String,
+        node: NodeRef,
+        error: Box<CanonicalImportHelperError>,
+    },
     MissingBoundFile {
         file_name: String,
         file: FileId,
@@ -316,6 +326,47 @@ pub enum CanonicalProgramCheckError {
         node: NodeRef,
     },
     DiagnosticFormat(FormatError),
+}
+
+/// A helper dependency could not provide an exact export, value, or signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalImportHelperError {
+    ModuleSymbolUnavailable {
+        file_name: String,
+    },
+    Export(CanonicalModuleExportQueryError),
+    Alias(CanonicalAliasQueryError),
+    AliasUnresolved {
+        alias: CanonicalSymbolId,
+        resolution: CanonicalAliasResolution,
+    },
+    AliasEvents {
+        symbol: CanonicalSymbolId,
+        events: Vec<CanonicalAliasResolutionEvent>,
+    },
+    Signature(CanonicalHelperSignatureError),
+}
+
+impl std::fmt::Display for CanonicalImportHelperError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Export(error) => error.fmt(formatter),
+            Self::Alias(error) => error.fmt(formatter),
+            Self::Signature(error) => error.fmt(formatter),
+            error => write!(formatter, "helper dependency is unavailable: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalImportHelperError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Export(error) => Some(error),
+            Self::Alias(error) => Some(error),
+            Self::Signature(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Stable corpus classification for a canonical checker construction failure.
@@ -405,6 +456,9 @@ fn canonical_program_capability_code(error: &CanonicalProgramCheckError) -> Opti
         CanonicalProgramCheckError::SourceCheck { error, .. } => {
             source_check_capability_code(error)
         }
+        CanonicalProgramCheckError::ImportHelper { error, .. } => {
+            import_helper_capability_code(error)
+        }
         CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. } => {
             Some("M00.EXTERNAL_MODULE_TARGET")
         }
@@ -422,6 +476,60 @@ fn canonical_program_capability_code(error: &CanonicalProgramCheckError) -> Opti
         | CanonicalProgramCheckError::InvalidDiagnosticRange { .. }
         | CanonicalProgramCheckError::InvalidRelatedDiagnosticNode { .. }
         | CanonicalProgramCheckError::DiagnosticFormat(_) => None,
+    }
+}
+
+fn import_helper_capability_code(error: &CanonicalImportHelperError) -> Option<&'static str> {
+    match error {
+        CanonicalImportHelperError::ModuleSymbolUnavailable { .. } => {
+            Some("M00.IMPORT_HELPER_MODULE")
+        }
+        CanonicalImportHelperError::Export(
+            CanonicalModuleExportQueryError::UnsupportedModule(_)
+            | CanonicalModuleExportQueryError::UnsupportedExportCache(_),
+        ) => Some("M00.IMPORT_HELPER_EXPORT"),
+        CanonicalImportHelperError::Export(CanonicalModuleExportQueryError::Target(reason))
+            if alias_target_error_is_unsupported(*reason) =>
+        {
+            Some("M00.IMPORT_HELPER_EXPORT")
+        }
+        CanonicalImportHelperError::Export(CanonicalModuleExportQueryError::Source(error)) => {
+            source_check_capability_code(error)
+        }
+        CanonicalImportHelperError::Alias(error) if alias_query_error_is_unsupported(*error) => {
+            Some("M00.IMPORT_HELPER_ALIAS")
+        }
+        CanonicalImportHelperError::AliasUnresolved { resolution, .. }
+            if resolution.target == AliasTargetState::Unknown =>
+        {
+            Some("M00.IMPORT_HELPER_ALIAS")
+        }
+        CanonicalImportHelperError::AliasEvents { .. } => Some("M00.IMPORT_HELPER_ALIAS"),
+        CanonicalImportHelperError::Signature(
+            CanonicalHelperSignatureError::ProviderUnavailable { .. }
+            | CanonicalHelperSignatureError::ArityUnavailable { .. },
+        ) => Some("T06.IMPORT_HELPER_SIGNATURE"),
+        CanonicalImportHelperError::Signature(CanonicalHelperSignatureError::DeclaredType(
+            error,
+        )) if declared_type_error_is_unsupported(error) => Some("T06.IMPORT_HELPER_SIGNATURE"),
+        CanonicalImportHelperError::Export(_)
+        | CanonicalImportHelperError::Alias(_)
+        | CanonicalImportHelperError::AliasUnresolved { .. }
+        | CanonicalImportHelperError::Signature(_) => None,
+    }
+}
+
+fn alias_query_error_is_unsupported(error: CanonicalAliasQueryError) -> bool {
+    match error {
+        CanonicalAliasQueryError::AliasResolution(
+            CanonicalAliasResolutionError::TargetUnavailable { reason, .. },
+        )
+        | CanonicalAliasQueryError::SymbolFlags(
+            ts_checker::semantic::alias_flags::CanonicalSymbolFlagsError::AliasResolution(
+                CanonicalAliasResolutionError::TargetUnavailable { reason, .. },
+            ),
+        ) => alias_target_error_is_unsupported(reason),
+        _ => false,
     }
 }
 
@@ -486,6 +594,7 @@ fn canonical_program_invariant_code(error: &CanonicalProgramCheckError) -> &'sta
         CanonicalProgramCheckError::DeclarationBind { .. } => "INV.PROGRAM.DECLARATION_BIND",
         CanonicalProgramCheckError::Context(_) => "INV.PROGRAM.CHECKER_CONTEXT",
         CanonicalProgramCheckError::SourceCheck { error, .. } => source_check_invariant_code(error),
+        CanonicalProgramCheckError::ImportHelper { .. } => "INV.PROGRAM.IMPORT_HELPER",
         CanonicalProgramCheckError::MissingBoundFile { .. } => "INV.PROGRAM.MISSING_BOUND_FILE",
         CanonicalProgramCheckError::InvalidModuleSourceFile(_) => {
             "INV.PROGRAM.INVALID_MODULE_SOURCE"
@@ -896,10 +1005,7 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
 }
 
 fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDisplayError) -> bool {
-    use ts_checker::semantic::{
-        SymbolDisplayError,
-        alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable},
-    };
+    use ts_checker::semantic::SymbolDisplayError;
     match error {
         SymbolDisplayError::MissingModuleSpecifier(_)
         | SymbolDisplayError::CyclicAlias(_)
@@ -907,22 +1013,7 @@ fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDispla
         SymbolDisplayError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
             reason,
             ..
-        }) => matches!(
-            reason,
-            CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily
-                | CanonicalAliasTargetUnavailable::TargetProviderUnavailable
-                | CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(_)
-                | CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(_)
-                | CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(_)
-                | CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(_)
-                | CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(_)
-                | CanonicalAliasTargetUnavailable::UnsupportedLocalExport(_)
-                | CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported { .. }
-                | CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported { .. }
-                | CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported { .. }
-                | CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported { .. }
-                | CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported { .. }
-        ),
+        }) => alias_target_error_is_unsupported(reason),
         SymbolDisplayError::SourceHost(_)
         | SymbolDisplayError::AliasHost(_)
         | SymbolDisplayError::InvalidLocation(_)
@@ -933,6 +1024,25 @@ fn symbol_display_error_is_unsupported(error: ts_checker::semantic::SymbolDispla
         | SymbolDisplayError::Alias(_)
         | SymbolDisplayError::CyclicContainer(_) => false,
     }
+}
+
+fn alias_target_error_is_unsupported(reason: CanonicalAliasTargetUnavailable) -> bool {
+    matches!(
+        reason,
+        CanonicalAliasTargetUnavailable::UnsupportedDeclarationFamily
+            | CanonicalAliasTargetUnavailable::TargetProviderUnavailable
+            | CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(_)
+            | CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(_)
+            | CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(_)
+            | CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(_)
+            | CanonicalAliasTargetUnavailable::UnsupportedDefaultAlias(_)
+            | CanonicalAliasTargetUnavailable::UnsupportedLocalExport(_)
+            | CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::JavaScriptModuleUnsupported { .. }
+            | CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported { .. }
+    )
 }
 
 const fn function_display_error_is_unsupported(reason: FunctionTypeDisplayUnavailable) -> bool {
@@ -1024,6 +1134,14 @@ impl std::fmt::Display for CanonicalProgramCheckError {
                     "canonical checking failed for '{file_name}': {error}"
                 )
             }
+            Self::ImportHelper {
+                file_name,
+                node,
+                error,
+            } => write!(
+                formatter,
+                "canonical helper query failed for '{file_name}' at {node:?}: {error}"
+            ),
             Self::MissingBoundFile { file_name, file } => write!(
                 formatter,
                 "canonical binding omitted Program file {} ('{file_name}')",
@@ -1091,6 +1209,7 @@ impl std::error::Error for CanonicalProgramCheckError {
             Self::DeclarationBind { error, .. } => Some(error),
             Self::Context(error) => Some(error),
             Self::SourceCheck { error, .. } => Some(error),
+            Self::ImportHelper { error, .. } => Some(error.as_ref()),
             Self::DiagnosticFormat(error) => Some(error),
             Self::UnsupportedSourceKind { .. }
             | Self::FixedModuleFormatUnsupported { .. }
@@ -1556,7 +1675,7 @@ impl CanonicalProgramQueries<'_> {
                 })?;
         }
         let diagnostics = self.program.canonical_checker_diagnostics(
-            &self.context,
+            &mut self.context,
             &self.bind_diagnostics,
             &self.checked_sources,
         )?;
@@ -4955,51 +5074,7 @@ impl Program {
                 )
             })
             .collect::<Vec<_>>();
-        let options = CanonicalCheckerOptions {
-            intrinsic: IntrinsicBootstrapOptions {
-                strict_null_checks: self.options.strict_null_checks,
-                exact_optional_property_types: self.options.exact_optional_property_types,
-            },
-            strict_bind_call_apply: self.options.strict_bind_call_apply,
-            strict_builtin_iterator_return: self.options.strict_builtin_iterator_return,
-            strict_function_types: self.options.strict_function_types,
-            strict_property_initialization: self.options.strict_property_initialization,
-            use_unknown_in_catch_variables: if self.options.use_unknown_in_catch_variables_specified
-            {
-                self.options.use_unknown_in_catch_variables
-            } else {
-                self.options.strict
-            },
-            no_implicit_any: self.options.no_implicit_any,
-            no_implicit_this: if self.options.no_implicit_this_specified {
-                self.options.no_implicit_this
-            } else {
-                self.options.strict
-            },
-            no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
-            no_unused_locals: self.options.no_unused_locals,
-            no_unused_parameters: self.options.no_unused_parameters,
-            allow_unreachable_code: self.options.allow_unreachable_code,
-            preserve_const_enums: self.options.preserve_const_enums,
-            isolated_modules: self.options.isolated_modules,
-            jsx_runtime: if self.options.jsx_runtime_module_specifier().is_some() {
-                CanonicalJsxRuntime::Automatic
-            } else if self.options.jsx == ts_options::JsxEmit::React {
-                CanonicalJsxRuntime::Classic
-            } else {
-                CanonicalJsxRuntime::Preserve
-            },
-            emit_common_js: self.options.module == ModuleKind::CommonJs,
-            no_emit: self.options.no_emit,
-            uses_wildcard_types: self
-                .options
-                .types
-                .as_ref()
-                .is_some_and(|types| types.iter().any(|name| name == "*")),
-            no_error_truncation: self.options.no_error_truncation,
-            check_bigint_target: true,
-            name_resolution: (&self.options).into(),
-        };
+        let options = self.canonical_checker_options();
         let module_resolutions = self.canonical_module_resolution_manifest()?;
         let mut context = CanonicalCheckerContext::new_with_module_resolutions(
             binder.finish(),
@@ -5090,7 +5165,7 @@ impl Program {
         }
 
         let diagnostics =
-            self.canonical_checker_diagnostics(&context, &bind_diagnostics, &checked_sources)?;
+            self.canonical_checker_diagnostics(&mut context, &bind_diagnostics, &checked_sources)?;
         let cold_diagnostics = self.canonical_diagnostic_snapshot(&diagnostics);
         for ((enclosing, target), specifier) in &self.package_display_specifiers {
             if let Some(source) = self
@@ -5128,9 +5203,57 @@ impl Program {
         Ok((diagnostics, result))
     }
 
+    fn canonical_checker_options(&self) -> CanonicalCheckerOptions {
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: self.options.strict_null_checks,
+                exact_optional_property_types: self.options.exact_optional_property_types,
+            },
+            strict_bind_call_apply: self.options.strict_bind_call_apply,
+            strict_builtin_iterator_return: self.options.strict_builtin_iterator_return,
+            strict_function_types: self.options.strict_function_types,
+            strict_property_initialization: self.options.strict_property_initialization,
+            use_unknown_in_catch_variables: if self.options.use_unknown_in_catch_variables_specified
+            {
+                self.options.use_unknown_in_catch_variables
+            } else {
+                self.options.strict
+            },
+            no_implicit_any: self.options.no_implicit_any,
+            no_implicit_this: if self.options.no_implicit_this_specified {
+                self.options.no_implicit_this
+            } else {
+                self.options.strict
+            },
+            no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
+            no_unused_locals: self.options.no_unused_locals,
+            no_unused_parameters: self.options.no_unused_parameters,
+            allow_unreachable_code: self.options.allow_unreachable_code,
+            preserve_const_enums: self.options.preserve_const_enums,
+            isolated_modules: self.options.isolated_modules,
+            jsx_runtime: if self.options.jsx_runtime_module_specifier().is_some() {
+                CanonicalJsxRuntime::Automatic
+            } else if self.options.jsx == ts_options::JsxEmit::React {
+                CanonicalJsxRuntime::Classic
+            } else {
+                CanonicalJsxRuntime::Preserve
+            },
+            emit_common_js: self.options.module == ModuleKind::CommonJs,
+            no_emit: self.options.no_emit,
+            uses_wildcard_types: self
+                .options
+                .types
+                .as_ref()
+                .is_some_and(|types| types.iter().any(|name| name == "*")),
+            no_error_truncation: self.options.no_error_truncation,
+            check_bigint_target: true,
+            name_resolution: (&self.options).into(),
+        }
+    }
+
     fn canonical_checker_diagnostics(
         &self,
-        context: &CanonicalCheckerContext<'_>,
+        context: &mut CanonicalCheckerContext<'_>,
         bind_diagnostics: &[ProgramDiagnostic],
         checked_sources: &[CanonicalCheckedSource<'_>],
     ) -> Result<Vec<ProgramDiagnostic>, CanonicalProgramCheckError> {
@@ -5474,13 +5597,17 @@ impl Program {
     fn add_external_helper_diagnostics(
         &self,
         source: &SourceFile,
-        context: &CanonicalCheckerContext<'_>,
+        context: &mut CanonicalCheckerContext<'_>,
         diagnostics: &mut Vec<ProgramDiagnostic>,
     ) -> Result<(), CanonicalProgramCheckError> {
         let requirements = self.canonical_external_helper_requirements(source);
         if requirements.is_empty() {
             return Ok(());
         }
+        let has_private = requirements.iter().any(|(_, helper)| {
+            matches!(*helper, "__classPrivateFieldGet" | "__classPrivateFieldSet")
+        });
+        let mut staged = Vec::new();
 
         let containing = canonicalize(
             &source.file_name,
@@ -5498,21 +5625,16 @@ impl Program {
         else {
             let message = message_by_code(2354).expect("TS2354 must be in the diagnostic catalog");
             // Import-only sources retain their existing per-import diagnostics.
-            let limit = if requirements.iter().any(|(_, helper)| {
-                matches!(*helper, "__classPrivateFieldGet" | "__classPrivateFieldSet")
-            }) {
-                1
-            } else {
-                requirements.len()
-            };
+            let limit = if has_private { 1 } else { requirements.len() };
             for (statement, _) in requirements.into_iter().take(limit) {
-                diagnostics.push(self.canonical_program_diagnostic(
+                staged.push(self.canonical_program_diagnostic(
                     Some(statement),
                     None,
                     &Diagnostic::with_arguments(message, ["tslib"]),
                     std::iter::empty(),
                 )?);
             }
+            diagnostics.extend(staged);
             return Ok(());
         };
         let Some((_, bound)) = context.file(target.id) else {
@@ -5522,31 +5644,141 @@ impl Program {
             });
         };
         let Some(module) = bound.symbol(bound.source_file()) else {
+            if has_private {
+                if bound
+                    .source_facts()
+                    .is_none_or(CanonicalSourceFileFacts::is_external_or_common_js_module)
+                {
+                    return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                        bound.source_file(),
+                    ));
+                }
+                return Err(CanonicalProgramCheckError::ImportHelper {
+                    file_name: source.file_name.clone(),
+                    node: requirements[0].0,
+                    error: Box::new(CanonicalImportHelperError::ModuleSymbolUnavailable {
+                        file_name: target.file_name.clone(),
+                    }),
+                });
+            }
             return Ok(());
         };
-        let exports = context
-            .store()
-            .symbol(module)
-            .and_then(ts_binder::semantic::Symbol::exports)
-            .and_then(|exports| context.store().symbol_table(exports));
         let message = message_by_code(2343).expect("TS2343 must be in the diagnostic catalog");
 
         for (statement, helper) in requirements {
-            let available = exports
+            let private = match helper {
+                "__classPrivateFieldGet" => Some(PrivateImportHelper::Get),
+                "__classPrivateFieldSet" => Some(PrivateImportHelper::Set),
+                _ => None,
+            };
+            if let Some(private) = private {
+                if let Some(diagnostic) = self
+                    .private_import_helper_diagnostic(source, statement, private, module, context)?
+                {
+                    staged.push(diagnostic);
+                }
+                continue;
+            }
+            let available = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
                 .and_then(|exports| exports.get_source(helper))
                 .and_then(|symbol| context.store().symbol(symbol))
                 .is_some_and(|symbol| symbol.flags().intersects(SymbolFlags::VALUE));
             if available {
                 continue;
             }
-            diagnostics.push(self.canonical_program_diagnostic(
+            staged.push(self.canonical_program_diagnostic(
                 Some(statement),
                 None,
                 &Diagnostic::with_arguments(message, ["tslib", helper]),
                 std::iter::empty(),
             )?);
         }
+        diagnostics.extend(staged);
         Ok(())
+    }
+
+    fn private_import_helper_diagnostic(
+        &self,
+        source: &SourceFile,
+        node: NodeRef,
+        helper: PrivateImportHelper,
+        module: CanonicalSymbolId,
+        context: &mut CanonicalCheckerContext<'_>,
+    ) -> Result<Option<ProgramDiagnostic>, CanonicalProgramCheckError> {
+        let query_error = |error| CanonicalProgramCheckError::ImportHelper {
+            file_name: source.file_name.clone(),
+            node,
+            error: Box::new(error),
+        };
+        let symbol = context
+            .get_module_export_by_name(module, helper.name())
+            .map_err(|error| query_error(CanonicalImportHelperError::Export(error)))?;
+        let value = if let Some(mut symbol) = symbol {
+            if context
+                .store()
+                .symbol(symbol)
+                .is_some_and(|record| record.flags().intersects(SymbolFlags::ALIAS))
+            {
+                let resolution = context
+                    .resolve_alias(symbol)
+                    .map_err(|error| query_error(CanonicalImportHelperError::Alias(error)))?;
+                let AliasTargetState::Resolved(target) = resolution.target else {
+                    return Err(query_error(CanonicalImportHelperError::AliasUnresolved {
+                        alias: symbol,
+                        resolution,
+                    }));
+                };
+                if !resolution.events.is_empty() {
+                    return Err(query_error(CanonicalImportHelperError::AliasEvents {
+                        symbol,
+                        events: resolution.events,
+                    }));
+                }
+                symbol = target;
+            }
+            let meanings = context
+                .get_symbol_flags(symbol)
+                .map_err(|error| query_error(CanonicalImportHelperError::Alias(error)))?;
+            if !meanings.events.is_empty() {
+                return Err(query_error(CanonicalImportHelperError::AliasEvents {
+                    symbol,
+                    events: meanings.events,
+                }));
+            }
+            meanings
+                .flags
+                .intersects(SymbolFlags::VALUE)
+                .then_some(symbol)
+        } else {
+            None
+        };
+        let diagnostic = if let Some(value) = value {
+            if context
+                .has_call_signature_with_arity_greater_than(value, helper.required_parameters() - 1)
+                .map_err(|error| query_error(CanonicalImportHelperError::Signature(error)))?
+            {
+                return Ok(None);
+            }
+            Diagnostic::with_arguments(
+                message_by_code(2807).expect("TS2807 must be in the diagnostic catalog"),
+                [
+                    "tslib".to_owned(),
+                    helper.name().to_owned(),
+                    helper.required_parameters().to_string(),
+                ],
+            )
+        } else {
+            Diagnostic::with_arguments(
+                message_by_code(2343).expect("TS2343 must be in the diagnostic catalog"),
+                ["tslib", helper.name()],
+            )
+        };
+        self.canonical_program_diagnostic(Some(node), None, &diagnostic, std::iter::empty())
+            .map(Some)
     }
 
     fn add_missing_jsx_option_diagnostics(
@@ -8750,6 +8982,28 @@ fn is_javascript_file_name(file_name: &str) -> bool {
         ts_path::script_kind_from_path(file_name),
         ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateImportHelper {
+    Get,
+    Set,
+}
+
+impl PrivateImportHelper {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Get => "__classPrivateFieldGet",
+            Self::Set => "__classPrivateFieldSet",
+        }
+    }
+
+    const fn required_parameters(self) -> usize {
+        match self {
+            Self::Get => 4,
+            Self::Set => 5,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15189,6 +15443,19 @@ mod tests {
         "export {};\n",
     );
 
+    const PRIVATE_HELPER_GLOBALS: &str = concat!(
+        "interface IArguments {}\ninterface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\ninterface Object {}\n",
+        "interface Function {}\ninterface String {}\ninterface Number {}\n",
+        "interface Boolean {}\ninterface RegExp {}\n",
+    );
+
+    const PRIVATE_HELPER_COMPOUND_SOURCE: &str =
+        "class C { #state = 0; update() { this.#state += 1; } } export {};";
+
+    const PRIVATE_HELPER_READ_SOURCE: &str =
+        "export class Model { #value = 1; getValue() { return this.#value; } }";
+
     fn private_write_helper_options() -> CompilerOptions {
         CompilerOptions {
             target: ScriptTarget::Es2015,
@@ -15239,6 +15506,32 @@ mod tests {
         program
     }
 
+    fn private_helper_composition_program(
+        source: &str,
+        declarations: &str,
+        additional_files: &[(&str, &str)],
+    ) -> Program {
+        let fs = private_write_helper_files(source, Some(declarations));
+        fs.write_file("/project/globals.d.ts", PRIVATE_HELPER_GLOBALS)
+            .unwrap();
+        for (path, text) in additional_files {
+            fs.write_file(path, text).unwrap();
+        }
+        let mut program = Program::new_unchecked_with_options_and_checker(
+            &fs,
+            "/project",
+            &["globals.d.ts".to_owned(), "input.ts".to_owned()],
+            CompilerOptions {
+                no_emit: true,
+                skip_lib_check: true,
+                ..private_write_helper_options()
+            },
+            super::ProgramChecker::Canonical,
+        );
+        program.load_remaining_program_graph(&fs);
+        program
+    }
+
     // Bind the real program graph without claiming class-body checker support.
     fn private_write_helper_context(program: &Program) -> super::CanonicalCheckerContext<'_> {
         let sources = program.canonical_semantic_sources();
@@ -15254,9 +15547,12 @@ mod tests {
                 .unwrap();
         }
         for source in &sources {
-            binder
-                .bind_typescript_declaration_slice(&source.parse.arena, source.id)
-                .unwrap();
+            if super::is_javascript_file_name(&source.file_name) {
+                binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
+            } else {
+                binder.bind_typescript_declaration_slice(&source.parse.arena, source.id)
+            }
+            .unwrap();
         }
         super::CanonicalCheckerContext::new_with_module_resolutions(
             binder.finish(),
@@ -15264,7 +15560,7 @@ mod tests {
                 .into_iter()
                 .map(|source| (source.id, &source.parse.arena))
                 .collect(),
-            super::CanonicalCheckerOptions::default(),
+            program.canonical_checker_options(),
             program.canonical_module_resolution_manifest().unwrap(),
         )
         .unwrap()
@@ -15305,10 +15601,10 @@ mod tests {
             .map(|source| ts_path::base_file_name(&source.file_name))
             .collect::<Vec<_>>();
         assert_eq!(files, ["tslib.d.ts", "input.ts"]);
-        let context = private_write_helper_context(&program);
+        let mut context = private_write_helper_context(&program);
         let mut diagnostics = Vec::new();
         program
-            .add_external_helper_diagnostics(source, &context, &mut diagnostics)
+            .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
             .unwrap();
         let [diagnostic] = diagnostics.as_slice() else {
             panic!("one missing-helper diagnostic is expected: {diagnostics:?}");
@@ -15365,11 +15661,11 @@ mod tests {
                 super::ProgramChecker::Canonical,
             );
             program.load_remaining_program_graph(&fs);
-            let context = private_write_helper_context(&program);
+            let mut context = private_write_helper_context(&program);
             let source = program.source_file("/project/input.ts").unwrap();
             let mut diagnostics = Vec::new();
             program
-                .add_external_helper_diagnostics(source, &context, &mut diagnostics)
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
                 .unwrap();
             assert_eq!(
                 diagnostics
@@ -15610,10 +15906,10 @@ mod tests {
         );
         program.load_remaining_program_graph(&fs);
         let source = program.source_file("/project/input.ts").unwrap();
-        let context = private_write_helper_context(&program);
+        let mut context = private_write_helper_context(&program);
         let mut diagnostics = Vec::new();
         program
-            .add_external_helper_diagnostics(source, &context, &mut diagnostics)
+            .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
             .unwrap();
         assert_eq!(diagnostics.len(), 2);
         assert!(
@@ -15785,10 +16081,10 @@ mod tests {
             let program =
                 private_helper_program(text, Some("export {};"), private_write_helper_options());
             let source = program.source_file("/project/input.ts").unwrap();
-            let context = private_write_helper_context(&program);
+            let mut context = private_write_helper_context(&program);
             let mut diagnostics = Vec::new();
             program
-                .add_external_helper_diagnostics(source, &context, &mut diagnostics)
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
                 .unwrap();
             assert_eq!(diagnostics.len(), 1, "{text}: {diagnostics:?}");
             assert_eq!(diagnostics[0].code, Some(2343));
@@ -15819,10 +16115,10 @@ mod tests {
                 ["__classPrivateFieldSet", "__classPrivateFieldGet"],
             );
             assert_eq!(requirements[0].0, requirements[1].0);
-            let context = private_write_helper_context(&program);
+            let mut context = private_write_helper_context(&program);
             let mut diagnostics = Vec::new();
             program
-                .add_external_helper_diagnostics(source, &context, &mut diagnostics)
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
                 .unwrap();
             let sorted = program.canonical_diagnostic_snapshot(&diagnostics);
             if declarations.is_some() {
@@ -16005,11 +16301,11 @@ mod tests {
                     super::CanonicalModuleResolutionMode::None => unreachable!(),
                 })
             );
-            let context = private_write_helper_context(&program);
+            let mut context = private_write_helper_context(&program);
             let source = program.source_file(&path).unwrap();
             let mut diagnostics = Vec::new();
             program
-                .add_external_helper_diagnostics(source, &context, &mut diagnostics)
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
                 .unwrap();
             assert_eq!(
                 diagnostics.len(),
@@ -16017,6 +16313,337 @@ mod tests {
                 "{file_name}: {module:?}: {diagnostics:?}"
             );
             assert_eq!(diagnostics[0].code, Some(2343));
+        }
+    }
+
+    #[test]
+    fn canonical_private_helpers_compose_real_arity_queries() {
+        for (get, set, get_valid, set_valid) in [
+            (
+                "(a: unknown, b: unknown, c: unknown, d: unknown): unknown",
+                "(a: unknown, b: unknown, c: unknown, d: unknown, e: unknown): unknown",
+                true,
+                true,
+            ),
+            (
+                "(a: unknown, b: unknown, c: unknown): unknown",
+                "(a: unknown, b: unknown, c: unknown, d: unknown): unknown",
+                false,
+                false,
+            ),
+            (
+                "(a: unknown, b: unknown, c: unknown): unknown",
+                "(a: unknown, b: unknown, c: unknown, d: unknown, e: unknown): unknown",
+                false,
+                true,
+            ),
+            (
+                "<T>(a: T, b: unknown, c: unknown, d?: unknown): Missing",
+                "<T>(a: T, b: unknown, c: unknown, d: unknown, e?: unknown): Missing",
+                true,
+                true,
+            ),
+            (
+                "(...args: [unknown, unknown, unknown, unknown]): Missing",
+                "(...args: [unknown, unknown, unknown, unknown, unknown]): Missing",
+                true,
+                true,
+            ),
+            (
+                "(...args: unknown[]): Missing",
+                "(...args: unknown[]): Missing",
+                false,
+                false,
+            ),
+        ] {
+            let declarations = format!(
+                "export declare function __classPrivateFieldGet{get}; export declare function __classPrivateFieldSet{set};"
+            );
+            let program = private_helper_composition_program(
+                PRIVATE_HELPER_COMPOUND_SOURCE,
+                &declarations,
+                &[],
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            let mut context = private_write_helper_context(&program);
+            let mut diagnostics = Vec::new();
+            program
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+                .unwrap();
+            let sorted = program.canonical_diagnostic_snapshot(&diagnostics);
+            let expected = [
+                (get_valid, "__classPrivateFieldGet", 4),
+                (set_valid, "__classPrivateFieldSet", 5),
+            ]
+            .into_iter()
+            .filter(|(valid, _, _)| !valid)
+            .collect::<Vec<_>>();
+            assert_eq!(sorted.len(), expected.len(), "{declarations}: {sorted:?}");
+            for (diagnostic, (_, helper, arity)) in sorted.iter().zip(expected) {
+                assert_eq!(diagnostic.code, Some(2807));
+                assert!(
+                    diagnostic
+                        .message
+                        .contains(&format!("'{helper}' with {arity} parameters"))
+                );
+            }
+            let warm = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let mut repeated = Vec::new();
+            program
+                .add_external_helper_diagnostics(source, &mut context, &mut repeated)
+                .unwrap();
+            assert_eq!(program.canonical_diagnostic_snapshot(&repeated), sorted);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                warm
+            );
+            for file in program.source_files() {
+                assert!(
+                    context
+                        .store()
+                        .source_file_links(context.source_file(file.id).unwrap())
+                        .is_none_or(|links| !links.type_checked)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_private_helpers_compose_stars_and_type_only_aliases() {
+        let leaf = concat!(
+            "export declare function __classPrivateFieldGet(a: unknown, b: unknown, c: unknown, d: unknown): Missing;",
+            "export declare function __classPrivateFieldSet(a: unknown, b: unknown, c: unknown, d: unknown, e: unknown): Missing;",
+        );
+        for declarations in [
+            "export * from './helpers';",
+            "export type * from './helpers';",
+            "export { __classPrivateFieldGet, __classPrivateFieldSet } from './helpers';",
+            "export type { __classPrivateFieldGet, __classPrivateFieldSet } from './helpers';",
+        ] {
+            let program = private_helper_composition_program(
+                PRIVATE_HELPER_COMPOUND_SOURCE,
+                declarations,
+                &[("/project/node_modules/tslib/helpers.d.ts", leaf)],
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            let mut context = private_write_helper_context(&program);
+            for _ in 0..2 {
+                let mut diagnostics = Vec::new();
+                program
+                    .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+                    .unwrap();
+                assert!(diagnostics.is_empty(), "{declarations}: {diagnostics:?}");
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn canonical_private_helpers_require_value_meaning_and_callability() {
+        for (declarations, code) in [
+            (
+                "export type __classPrivateFieldGet = unknown; export interface __classPrivateFieldSet {}",
+                2343,
+            ),
+            (
+                "export declare const __classPrivateFieldGet: number; export declare const __classPrivateFieldSet: unknown;",
+                2807,
+            ),
+            (
+                "export declare const __classPrivateFieldGet: {}; export declare const __classPrivateFieldSet: { tag: number };",
+                2807,
+            ),
+        ] {
+            let program = private_helper_composition_program(
+                PRIVATE_HELPER_COMPOUND_SOURCE,
+                declarations,
+                &[],
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            let mut context = private_write_helper_context(&program);
+            let mut diagnostics = Vec::new();
+            program
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+                .unwrap();
+            assert_eq!(diagnostics.len(), 2, "{declarations}: {diagnostics:?}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code == Some(code))
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_private_helpers_preserve_provider_failures_atomically() {
+        for declarations in [
+            "export * from './missing';",
+            "export declare function __classPrivateFieldGet(this: object, a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
+            "export declare function __classPrivateFieldGet(a: unknown): unknown; export declare function __classPrivateFieldGet(a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
+        ] {
+            let program = private_helper_composition_program(
+                PRIVATE_HELPER_COMPOUND_SOURCE,
+                declarations,
+                &[],
+            );
+            let source = program.source_file("/project/input.ts").unwrap();
+            let mut context = private_write_helper_context(&program);
+            let sentinel = super::ProgramDiagnostic {
+                file_name: None,
+                range: None,
+                code: Some(1234),
+                category: ts_diagnostics::Category::Error,
+                message: "existing diagnostic".to_owned(),
+                related_information: Vec::new(),
+            };
+            let mut diagnostics = vec![sentinel.clone()];
+            let error = program
+                .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    super::CanonicalProgramCheckError::ImportHelper { .. }
+                ),
+                "{error:?}"
+            );
+            assert!(error.is_unsupported_boundary(), "{declarations}: {error:?}");
+            assert_eq!(diagnostics, [sentinel]);
+        }
+    }
+
+    #[test]
+    fn canonical_private_helpers_retain_alias_cycle_events() {
+        let program = private_helper_composition_program(
+            PRIVATE_HELPER_COMPOUND_SOURCE,
+            "export { __classPrivateFieldSet } from './cycle';",
+            &[(
+                "/project/node_modules/tslib/cycle.d.ts",
+                "export { __classPrivateFieldSet } from './tslib';",
+            )],
+        );
+        let source = program.source_file("/project/input.ts").unwrap();
+        let mut context = private_write_helper_context(&program);
+        let mut diagnostics = Vec::new();
+        let error = program
+            .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
+            .unwrap_err();
+        let super::CanonicalProgramCheckError::ImportHelper { error, .. } = error else {
+            panic!("expected helper alias error");
+        };
+        let super::CanonicalImportHelperError::AliasUnresolved { resolution, .. } = *error else {
+            panic!("expected unresolved alias: {error:?}");
+        };
+        assert_eq!(resolution.target, super::AliasTargetState::Unknown);
+        assert!(!resolution.events.is_empty());
+        assert!(
+            resolution
+                .events
+                .iter()
+                .all(|event| event.diagnostic_code() == 2303)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn canonical_private_helper_callbacks_and_replay_use_checked_sources() {
+        for declarations in [
+            "export {};",
+            "export declare function __classPrivateFieldGet(a: unknown, b: unknown, c: unknown): unknown;",
+            "export declare function __classPrivateFieldGet(a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
+        ] {
+            let fs = private_write_helper_files(PRIVATE_HELPER_READ_SOURCE, Some(declarations));
+            fs.write_file("/project/globals.d.ts", PRIVATE_HELPER_GLOBALS)
+                .unwrap();
+            let (program, snapshot) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &["globals.d.ts".to_owned(), "input.ts".to_owned()],
+                CompilerOptions {
+                    no_emit: true,
+                    skip_lib_check: true,
+                    ..private_write_helper_options()
+                },
+                |_, queries| {
+                    let cold = queries.cold_diagnostic_snapshot();
+                    assert_eq!(queries.has_diagnostics(), !cold.is_empty());
+                    assert_eq!(queries.replay_sources().unwrap(), cold);
+                    assert_eq!(queries.cold_diagnostic_snapshot(), cold);
+                    cold
+                },
+            )
+            .unwrap();
+            assert_eq!(snapshot.as_deref(), Some(program.diagnostics()));
+            let expected = if declarations == "export {};" {
+                Some(2343)
+            } else if declarations.contains("d: unknown") {
+                None
+            } else {
+                Some(2807)
+            };
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .filter_map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected.into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_private_helper_failure_and_no_check_do_not_call_queries() {
+        let declarations = "export declare function __classPrivateFieldGet(this: object, a: unknown, b: unknown, c: unknown, d: unknown): unknown;";
+        for no_check in [false, true] {
+            let fs = private_write_helper_files(PRIVATE_HELPER_READ_SOURCE, Some(declarations));
+            fs.write_file("/project/globals.d.ts", PRIVATE_HELPER_GLOBALS)
+                .unwrap();
+            let mut called = false;
+            let result = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &["globals.d.ts".to_owned(), "input.ts".to_owned()],
+                CompilerOptions {
+                    no_emit: true,
+                    no_check,
+                    skip_lib_check: true,
+                    ..private_write_helper_options()
+                },
+                |_, _| {
+                    called = true;
+                },
+            );
+            assert!(!called);
+            if no_check {
+                let (program, query) = result.unwrap();
+                assert!(query.is_none());
+                assert!(
+                    program
+                        .source_file("/project/node_modules/tslib/tslib.d.ts")
+                        .is_some()
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        super::CanonicalProgramCheckError::ImportHelper { .. }
+                    ),
+                    "{error:?}"
+                );
+                assert!(error.is_unsupported_boundary());
+            }
         }
     }
 
