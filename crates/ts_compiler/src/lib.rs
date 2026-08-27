@@ -15447,6 +15447,7 @@ mod tests {
         "interface IArguments {}\ninterface Array<T> {}\n",
         "interface ReadonlyArray<T> {}\ninterface Object {}\n",
         "interface Function {}\ninterface String {}\ninterface Number {}\n",
+        "interface CallableFunction {}\ninterface NewableFunction {}\n",
         "interface Boolean {}\ninterface RegExp {}\n",
     );
 
@@ -16338,8 +16339,8 @@ mod tests {
                 true,
             ),
             (
-                "<T>(a: T, b: unknown, c: unknown, d?: unknown): Missing",
-                "<T>(a: T, b: unknown, c: unknown, d: unknown, e?: unknown): Missing",
+                "<T>(a: T, b: unknown, c: unknown, d?: unknown): T",
+                "<T>(a: T, b: unknown, c: unknown, d: unknown, e?: unknown): T",
                 true,
                 true,
             ),
@@ -16369,7 +16370,7 @@ mod tests {
             let mut diagnostics = Vec::new();
             program
                 .add_external_helper_diagnostics(source, &mut context, &mut diagnostics)
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{declarations}: {error:?}"));
             let sorted = program.canonical_diagnostic_snapshot(&diagnostics);
             let expected = [
                 (get_valid, "__classPrivateFieldGet", 4),
@@ -16492,6 +16493,7 @@ mod tests {
             "export * from './missing';",
             "export declare function __classPrivateFieldGet(this: object, a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
             "export declare function __classPrivateFieldGet(a: unknown): unknown; export declare function __classPrivateFieldGet(a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
+            "export declare function __classPrivateFieldGet<T>(a: T, b: unknown, c: unknown, d?: unknown): Missing;",
         ] {
             let program = private_helper_composition_program(
                 PRIVATE_HELPER_COMPOUND_SOURCE,
