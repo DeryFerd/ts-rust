@@ -47,6 +47,7 @@ use super::{
         source_arrow_owner_expando_exports_are_valid,
         source_function_owner_expando_exports_are_valid, validate_stored_source_callable,
     },
+    source_imports::source_file_namespace_wrapper_member,
     spelling::get_spelling_suggestion,
     store::SourceNodeParent,
     type_records::{TypeData, TypeRecord},
@@ -2293,6 +2294,20 @@ fn resolve_namespace_property(
         }
         return Err(SourcePropertyError::InvalidCache(plan.node));
     };
+    if store
+        .source_file_namespace_wrapper_for_module(module)
+        .is_some()
+    {
+        if receiver.symbol() != Some(module) {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        let member = source_file_namespace_wrapper_member(store, receiver_type, &plan.name)
+            .map_err(|_| SourcePropertyError::InvalidCache(plan.node))?;
+        return Ok(Some(match member {
+            Some((symbol, type_)) => NamespaceProperty::Present { symbol, type_ },
+            None => NamespaceProperty::Missing,
+        }));
+    }
     let exports = store
         .module_symbol_links(module)
         .and_then(|links| links.resolved_exports)
@@ -5737,6 +5752,248 @@ mod tests {
                 .and_then(|links| links.resolved_symbol),
             Some(export_alias),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold and warm reads share the same real producer and restored caches.
+    fn namespace_wrapper_property_cache_changes_fail_before_publication() {
+        use crate::semantic::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        };
+        let importer = parsed(
+            "import * as ns from './producer.cjs'; export const copied = ns; const picked = ns.default;",
+        );
+        let producer = parsed("export const value: number = 1;");
+        let importer_file = FileId::new(14_010);
+        let producer_file = FileId::new(14_011);
+        let sources = [
+            (importer_file, &importer, "\"/consumer\""),
+            (producer_file, &producer, "\"/producer\""),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, source, path) in sources {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, source, _) in sources {
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let import = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ImportDeclaration(import) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    import.module_specifier,
+                ))
+            })
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            [
+                (importer_file, &importer.arena),
+                (producer_file, &producer.arena),
+            ]
+            .into_iter()
+            .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    import,
+                    CanonicalResolvedModuleInput::new(
+                        producer_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        context.check_source_file(importer_file).unwrap();
+        let binding = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = context
+            .file(importer_file)
+            .unwrap()
+            .1
+            .symbol(binding)
+            .unwrap();
+        let wrapped = context
+            .store()
+            .value_symbol_links(alias)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let wrapper = context
+            .store()
+            .source_file_namespace_wrapper(alias)
+            .cloned()
+            .unwrap();
+        let bare = context
+            .store()
+            .value_symbol_links(wrapper.source.module)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let access = property_access(&importer, importer_file);
+        let syntax =
+            plan_direct_source_property_syntax(&importer.arena, context.store(), access).unwrap();
+        let plan = finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, alias))
+            .unwrap();
+        let members = context
+            .store()
+            .type_payload(wrapped)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .unwrap();
+        let default = context
+            .store()
+            .symbol_table(members)
+            .unwrap()
+            .get_source("default")
+            .unwrap();
+        let alias_value = context.store().value_symbol_links(alias).cloned().unwrap();
+        let default_alias = context
+            .store()
+            .alias_symbol_links(wrapper.default)
+            .cloned()
+            .unwrap();
+        let default_value = context
+            .store()
+            .value_symbol_links(default)
+            .cloned()
+            .unwrap();
+        let exports = context
+            .store()
+            .export_type_links(wrapper.namespace)
+            .cloned()
+            .unwrap();
+        let original_type = context.store().type_node_links(access).cloned().unwrap();
+        let original_symbol = context.store().symbol_node_links(access).cloned().unwrap();
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                ),
+                (
+                    store.type_node_links(access).cloned(),
+                    store.symbol_node_links(access).cloned(),
+                ),
+                (
+                    store.value_symbol_links(alias).cloned(),
+                    store.alias_symbol_links(wrapper.default).cloned(),
+                    store.value_symbol_links(default).cloned(),
+                    store.export_type_links(wrapper.namespace).cloned(),
+                    store.type_payload(wrapped).unwrap().symbol(),
+                ),
+                store
+                    .source_file_namespace_identity(wrapper.namespace)
+                    .cloned(),
+            )
+        };
+        for warm in [false, true] {
+            for poison in 0..5 {
+                let store = context.store_mut_for_test();
+                assert!(store.set_type_node_links(
+                    access,
+                    if warm {
+                        original_type.clone()
+                    } else {
+                        TypeNodeLinks::default()
+                    }
+                ));
+                assert!(store.set_symbol_node_links(
+                    access,
+                    if warm {
+                        original_symbol.clone()
+                    } else {
+                        SymbolNodeLinks::default()
+                    }
+                ));
+                match poison {
+                    0 => assert!(store.set_type_symbol(wrapped, None)),
+                    1 => {
+                        let mut links = default_alias.clone();
+                        links.alias_target = AliasTargetState::Resolved(wrapper.namespace);
+                        assert!(store.set_alias_symbol_links(wrapper.default, links));
+                    }
+                    2 => {
+                        let mut links = default_value.clone();
+                        links.resolved_type =
+                            Some(store.intrinsic_bootstrap().unwrap().number_type);
+                        assert!(store.set_value_symbol_links(default, links));
+                    }
+                    3 => {
+                        let mut links = alias_value.clone();
+                        links.resolved_type = Some(bare);
+                        assert!(store.set_value_symbol_links(alias, links));
+                    }
+                    4 => {
+                        let mut links = exports.clone();
+                        links.target = Some(wrapper.namespace);
+                        assert!(store.set_export_type_links(wrapper.namespace, links));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = state(store);
+                assert_eq!(
+                    check_direct_source_property(store, None, &plan, wrapped),
+                    Err(SourcePropertyError::InvalidCache(access)),
+                    "warm={warm}, poison={poison}"
+                );
+                assert_eq!(state(store), before, "warm={warm}, poison={poison}");
+                assert!(store.set_type_symbol(wrapped, Some(wrapper.namespace)));
+                assert!(store.set_alias_symbol_links(wrapper.default, default_alias.clone()));
+                assert!(store.set_value_symbol_links(default, default_value.clone()));
+                assert!(store.set_value_symbol_links(alias, alias_value.clone()));
+                assert!(store.set_export_type_links(wrapper.namespace, exports.clone()));
+                assert_eq!(
+                    check_direct_source_property(store, None, &plan, wrapped),
+                    Ok(CheckedSourceProperty {
+                        type_: bare,
+                        diagnostic: None
+                    })
+                );
+                assert_eq!(
+                    store.symbol_node_links(access).unwrap().resolved_symbol,
+                    Some(wrapper.default)
+                );
+            }
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
