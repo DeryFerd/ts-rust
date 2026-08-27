@@ -32,12 +32,12 @@ exec 9>"${TMPDIR:-/tmp}/ts-rust-cargo-${lock_id}.lock"
 flock 9
 ulimit -c 0
 hash_file() { local hash ignored; read -r hash ignored < <(sha256sum -- "$1"); printf '%s' "$hash"; }
-git -C "$repo" diff --exit-code 0f8ee0cc5466fdb389636d9151c35df44d094924 -- scripts/run-go-project-oracle.sh
+git -C "$repo" diff --exit-code 0c79366b6ba75a447f920aa48fba77a09991dd4f -- scripts/run-go-project-oracle.sh
 git -C "$repo" diff --exit-code a84de244261ba1389603494fb7b97d510154355a -- \
   tools/ts_fixture/go_project_oracle/project_oracle_test.go.txt tools/ts_fixture/go_project_oracle/project_graph_test.go.txt \
   tools/ts_fixture/go_project_oracle/baseline_hooks.go.txt tools/ts_fixture/go_project_oracle/baseline_hooks.patch \
   tools/ts_fixture/go_project_oracle/checker_replay.go.txt
-git -C "$repo" diff --exit-code bb011473027b1baae8e61e7f54c2c971449b782a -- tools/ts_fixture/go_project_oracle/phase_correct
+git -C "$repo" diff --exit-code b249b9ed77cc1ff1f55df0ce7db3f5a01f0cf453 -- tools/ts_fixture/go_project_oracle/phase_correct
 git -C "$repo" diff --exit-code a84de244261ba1389603494fb7b97d510154355a -- \
   tools/ts_fixture/go_project_oracle/object_query_witness.go.txt \
   tools/ts_fixture/go_project_oracle/object_query_witness_checker.patch \
