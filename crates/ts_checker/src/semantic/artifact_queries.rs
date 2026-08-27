@@ -2362,6 +2362,30 @@ impl CanonicalCheckerContext<'_> {
             return self.lexical_artifact_symbol(node, SymbolFlags::NAMESPACE | SymbolFlags::ALIAS);
         }
 
+        if matches!(
+            &parent.data,
+            NodeData::ExportAssignment(export)
+                if export.is_export_equals && export.expression == node.node
+        ) {
+            let Some(symbol) = self.lexical_artifact_symbol(
+                node,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+            )?
+            else {
+                return Ok(None);
+            };
+            // Read an existing value identity without producing a cold declaration type.
+            let Some(type_) = self
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+            else {
+                return Ok(None);
+            };
+            self.validate_artifact_type(node, type_)?;
+            return Ok(Some(symbol));
+        }
+
         let mut current = node.node;
         let mut ancestor_id = parent_id;
         let mut ancestor = parent;

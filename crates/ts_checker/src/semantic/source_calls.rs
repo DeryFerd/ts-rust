@@ -12905,6 +12905,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep recovery and artifact identities on the same real import.
     fn namespace_import_of_merged_ambient_callable_reports_exact_ts2349_and_ts7038() {
         let importer = parsed("import * as foo from \"./foo\";\nfoo()\n");
         let declaration = parsed(concat!(
@@ -12941,6 +12942,20 @@ mod tests {
             })
             .unwrap();
         let function = first_function_symbol(&declaration, &context, declaration_file);
+        let exported = declaration
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExportAssignment(export) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    declaration.arena.id(),
+                    declaration_file,
+                    export.expression,
+                ))
+            })
+            .unwrap();
 
         context.check_source_file(declaration_file).unwrap();
         context.check_source_file(importer_file).unwrap();
@@ -13003,26 +13018,40 @@ mod tests {
             .unwrap();
         assert_eq!(structured.call_signature_count, 0);
         assert!(structured.signatures.is_none());
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
         let warm = (
             context.store().symbol_len(),
             context.store().symbol_store().symbol_table_len(),
             context.store().type_len(),
             context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
             context.diagnostics().as_slice().to_vec(),
         );
 
-        context.recheck_source_file(importer_file).unwrap();
-
-        assert_eq!(
-            (
-                context.store().symbol_len(),
-                context.store().symbol_store().symbol_table_len(),
-                context.store().type_len(),
-                context.store().signature_len(),
-                context.diagnostics().as_slice().to_vec(),
-            ),
-            warm
-        );
+        for replay in [false, true] {
+            if replay {
+                context.recheck_source_file(importer_file).unwrap();
+            }
+            for (node, symbol, type_) in [
+                (exported, Some(function), callable),
+                (callee, Some(alias), namespace),
+                (call, None, error_type),
+            ] {
+                assert_eq!(context.get_symbol_at_location(node), Ok(symbol));
+                assert_eq!(context.get_type_at_location(node), Ok(type_));
+            }
+            assert_eq!(
+                (
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                warm
+            );
+        }
         assert_eq!(
             context
                 .store()
