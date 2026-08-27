@@ -2087,7 +2087,7 @@ impl CanonicalCheckerContext<'_> {
             declaration.file,
             member.parent.ok_or_else(invalid)?,
         );
-        let (_, bound, class_record) = self.validated_artifact_node(class)?;
+        let (arena, bound, class_record) = self.validated_artifact_node(class)?;
         let source_members = match &class_record.data {
             NodeData::ClassDeclaration(class) => &class.members.nodes,
             NodeData::ClassExpression(class) => &class.members.nodes,
@@ -2101,9 +2101,16 @@ impl CanonicalCheckerContext<'_> {
             super::classes::authenticated_private_class_symbol_name(self.store(), owner, symbol)
                 .ok_or_else(invalid)?;
         let owner_record = self.store().symbol(owner).ok_or_else(invalid)?;
-        if owner_record.flags() != SymbolFlags::CLASS
+        let owner_declarations_match = if owner_record.flags() == SymbolFlags::CLASS {
+            owner_record.declarations() == Some(&[class])
+        } else {
+            let host =
+                super::DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+            super::classes::plan_nongeneric_class(self.store(), &host, owner)
+                .is_ok_and(|plan| plan.declaration() == class && plan.symbol() == owner)
+        };
+        if !owner_declarations_match
             || owner_record.check_flags() != ts_binder::CheckFlags::NONE
-            || owner_record.declarations() != Some(&[class])
             || owner_record.value_declaration() != Some(class)
             || !self.store().source_symbol_declarations_match(owner)
             || !self.store().source_symbol_declarations_match(symbol)
@@ -5516,6 +5523,185 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn private_member_artifacts_accept_class_namespace_owners_cold_and_warm() {
+        for source in [
+            "class Model { #value = 1; } namespace Model {}",
+            "class Model { static #value = 1; } namespace Model {}",
+            "class Model { #value = 1; } namespace Model { export var tag = 2; }",
+            "class Model { static #value = 1; } namespace Model { export var tag = 2; }",
+            "class Model { #run() {} } namespace Model {}",
+            concat!(
+                "class Model { get #value(): number { return 1; } set #value(next) {} } ",
+                "namespace Model { export var tag = 2; }",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let file = FileId::new(6_119);
+            let members = parsed
+                .arena
+                .iter()
+                .filter_map(|(id, record)| {
+                    let NodeData::PrivateIdentifier(identifier) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, record.parent.unwrap()),
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        format!("Model.{}", identifier.text),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            assert!(!members.is_empty(), "{source}");
+            for checked_first in [false, true] {
+                let mut context = context(&parsed, file);
+                if checked_first {
+                    context.check_source_file(file).unwrap();
+                }
+                let source_file = context.source_file(file).unwrap();
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                    context.store().source_file_links(source_file).cloned(),
+                );
+                for (declaration, name, expected) in &members {
+                    let symbol = context.file(file).unwrap().1.symbol(*declaration).unwrap();
+                    let encoded = context.store().symbol(symbol).unwrap().name().to_owned();
+                    let declarations = context.get_symbol_declarations(symbol).unwrap().to_vec();
+                    for _ in 0..2 {
+                        assert_eq!(context.symbol_to_string(symbol).unwrap(), *expected);
+                        assert_eq!(
+                            context.symbol_to_string_at_location(symbol, *name).unwrap(),
+                            *expected,
+                        );
+                    }
+                    assert_eq!(
+                        context.file(file).unwrap().1.symbol(*declaration),
+                        Some(symbol)
+                    );
+                    assert_eq!(
+                        context.get_symbol_declarations(symbol).unwrap(),
+                        declarations
+                    );
+                    assert_eq!(
+                        context.store().symbol(symbol).unwrap().name(),
+                        encoded.as_ref(),
+                    );
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().symbol_store().symbol_table_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                        context.store().source_file_links(source_file).cloned(),
+                    ),
+                    before,
+                    "{source}, checked_first {checked_first}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_member_artifacts_reject_changed_merged_owner_without_writes() {
+        for source in [
+            "class Model { #value = 1; } namespace Model {}",
+            "class Model { #value = 1; } namespace Model { export var tag = 2; }",
+        ] {
+            for checked_first in [false, true] {
+                for poison in 0..5 {
+                    let parsed = parse_source_file(source);
+                    let file = FileId::new(6_120);
+                    let mut context = context(&parsed, file);
+                    if checked_first {
+                        context.check_source_file(file).unwrap();
+                    }
+                    let (member, name) = parsed
+                        .arena
+                        .iter()
+                        .find_map(|(id, record)| {
+                            let NodeData::PropertyDeclaration(property) = &record.data else {
+                                return None;
+                            };
+                            Some((
+                                NodeRef::new(parsed.arena.id(), file, id),
+                                NodeRef::new(parsed.arena.id(), file, property.name),
+                            ))
+                        })
+                        .unwrap();
+                    let symbol = context.file(file).unwrap().1.symbol(member).unwrap();
+                    let owner = context.store().get_parent_of_symbol(symbol).unwrap();
+                    let record = context.store().symbol(owner).unwrap();
+                    let [class, namespace] = *record.declarations().unwrap() else {
+                        panic!("the class and namespace share one owner")
+                    };
+                    let flags = record.flags();
+                    match poison {
+                        0 | 1 => {
+                            let wrong = if poison == 0 {
+                                SymbolFlags::CLASS
+                            } else if flags.contains(SymbolFlags::VALUE_MODULE) {
+                                SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE
+                            } else {
+                                SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE
+                            };
+                            assert!(context.store_mut_for_test().set_symbol_flags(
+                                owner,
+                                wrong,
+                                CheckFlags::NONE,
+                            ));
+                        }
+                        2 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                            owner,
+                            Some(vec![namespace, class]),
+                            Some(class),
+                        )),
+                        3 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                            owner,
+                            Some(vec![class]),
+                            Some(class),
+                        )),
+                        4 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                            owner,
+                            Some(vec![class, namespace]),
+                            Some(namespace),
+                        )),
+                        _ => unreachable!(),
+                    }
+                    let source_file = context.source_file(file).unwrap();
+                    let before = (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().symbol_store().symbol_table_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                        context.store().source_file_links(source_file).cloned(),
+                    );
+                    assert!(context.symbol_to_string(symbol).is_err());
+                    assert!(context.symbol_to_string_at_location(symbol, name).is_err());
+                    assert_eq!(
+                        (
+                            context.store().type_len(),
+                            context.store().symbol_len(),
+                            context.store().symbol_store().symbol_table_len(),
+                            context.store().checker_link_allocated_lengths(),
+                            context.diagnostics().len(),
+                            context.store().source_file_links(source_file).cloned(),
+                        ),
+                        before,
+                        "{source}, checked_first {checked_first}, poison {poison}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
