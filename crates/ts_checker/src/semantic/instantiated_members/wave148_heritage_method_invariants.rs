@@ -230,7 +230,7 @@ fn property_recovery_wave148_parameter_return_and_callable_identity() {
             }
             "copied_parameter_flags" => {
                 let record = store.symbol(parameter).unwrap();
-                let flags = record.flags() & !SymbolFlags::TRANSIENT;
+                let flags = record.flags().without(SymbolFlags::TRANSIENT);
                 let checks = record.check_flags();
                 assert!(store.set_symbol_flags(parameter, flags, checks));
             }
