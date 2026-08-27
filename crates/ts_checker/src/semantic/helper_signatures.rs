@@ -9,9 +9,12 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     calls::{DirectCallError, DirectCallUnsupported, call_signature_parameter_counts},
     instantiate::InstantiationSession,
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     type_nodes::CanonicalTypeQuery,
-    type_records::{TypeData, TypeRecord},
-    types::{ObjectFlags, TypeFlags},
+    type_records::TypeRecord,
+    types::TypeFlags,
 };
 
 /// The helper query could not establish an exact answer for a resolved value.
@@ -261,15 +264,12 @@ impl HelperSignatureQuery<'_, '_> {
                 | TypeFlags::NEVER
                 | TypeFlags::NON_PRIMITIVE,
         );
-        let resolved_object = matches!(record.data(), TypeData::Object(_))
-            && record
-                .object_flags()
-                .contains(ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
-            && record.data().structured().is_some_and(|structured| {
-                structured.signatures.as_ref().is_some_and(Vec::is_empty)
-            });
-        if !primitive && !resolved_object {
-            return Err(unavailable());
+        if !primitive {
+            match validate_resolved_declared_property_object(self.store, type_) {
+                DeclaredPropertyObjectValidation::Valid(_) => {}
+                DeclaredPropertyObjectValidation::NotDeclared => return Err(unavailable()),
+                DeclaredPropertyObjectValidation::Malformed => return Err(invalid()),
+            }
         }
         self.store
             .validate_union_constituent_with_global_types(self.global_types, type_)
@@ -312,7 +312,7 @@ mod tests {
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalModuleResolutionEntry,
         CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
-        CanonicalResolvedModuleInput, TypeNodeLinks, ValueSymbolLinks,
+        CanonicalResolvedModuleInput, TypeNodeLinks, ValueSymbolLinks, types::ObjectFlags,
     };
 
     const LIBRARY: FileId = FileId::new(24_000);
@@ -581,6 +581,53 @@ mod tests {
         );
         assert_eq!(counts(&context), before);
         assert_unchecked(&context);
+    }
+
+    #[test]
+    fn non_callable_type_literals_use_the_declared_object_proof() {
+        let lib = library();
+        for annotation in ["{}", "{ tag: number }"] {
+            let source = parsed(&format!("declare const get: {annotation};"));
+            let mut context = context(&lib, &source, false);
+            let symbol = symbol(&context, &source, "get");
+            assert_eq!(
+                context.has_call_signature_with_arity_greater_than(symbol, 0),
+                Ok(false),
+                "{annotation}"
+            );
+            let before = counts(&context);
+            let links = context.store().value_symbol_links(symbol).unwrap().clone();
+            let type_ = links.resolved_type.unwrap();
+            let flags = context.store().type_payload(type_).unwrap().object_flags();
+            assert_eq!(
+                context.has_call_signature_with_arity_greater_than(symbol, 3),
+                Ok(false)
+            );
+            assert_eq!(counts(&context), before);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_object_flags(type_, flags & !ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert!(
+                context
+                    .has_call_signature_with_arity_greater_than(symbol, 3)
+                    .is_err()
+            );
+            assert_eq!(counts(&context), before);
+            assert_eq!(context.store().value_symbol_links(symbol), Some(&links));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_object_flags(type_, flags)
+            );
+            assert_eq!(
+                context.has_call_signature_with_arity_greater_than(symbol, 3),
+                Ok(false)
+            );
+            assert_eq!(counts(&context), before);
+            assert_unchecked(&context);
+        }
     }
 
     #[test]
