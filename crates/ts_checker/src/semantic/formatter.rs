@@ -1775,8 +1775,9 @@ fn display_validated_module_namespace(
     let owner_record = store
         .symbol(owner)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let wrapper = store.source_file_namespace_wrapper_for_module(owner);
     let module_owner = owner_record.flags().intersects(SymbolFlags::MODULE);
-    if !module_owner && !source_function {
+    if !module_owner && !source_function && wrapper.is_none() {
         return Ok(None);
     }
     let TypeData::Object(object) = record.data() else {
@@ -1790,6 +1791,42 @@ fn display_validated_module_namespace(
         {
             return Ok(None);
         }
+    }
+    if let Some(wrapper) = wrapper {
+        let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+        let origin = super::source_imports::source_file_namespace_wrapper_origin(store, type_id)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        if origin != wrapper.source.originating_import
+            || super::source_imports::source_file_namespace_type(store, host, owner)
+                .map_err(|_| invalid())?
+                != Some(type_id)
+        {
+            return Err(invalid());
+        }
+        if state.location.is_some() {
+            let name = display_location_symbol_name(
+                store,
+                host,
+                wrapper.source.alias,
+                SymbolFlags::VALUE,
+                state,
+            )?;
+            state.add(7);
+            return Ok(Some(format!("typeof {name}")));
+        }
+        let bare = store
+            .source_file_namespace_identity(wrapper.source.module)
+            .ok_or_else(invalid)?
+            .type_();
+        if bare == type_id {
+            return Err(invalid());
+        }
+        let bare_record = store.type_payload(bare).ok_or_else(invalid)?;
+        let name = display_validated_module_namespace(store, host, bare, bare_record, state)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        return Ok(Some(name));
     }
     if let Some(&declaration) = owner_record.declarations().and_then(|nodes| nodes.first())
         && let Some(NodeData::ModuleDeclaration(module)) =
@@ -6643,6 +6680,122 @@ mod tests {
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
     }
 
+    #[allow(clippy::too_many_lines)] // Keep source facts and import modes in one fixture.
+    fn namespace_wrapper_display_context<'arena>(
+        library: &'arena ParseResult,
+        target: &'arena ParseResult,
+        wrapped: &'arena ParseResult,
+        bare: &'arena ParseResult,
+    ) -> (CanonicalCheckerContext<'arena>, [NodeRef; 2]) {
+        use crate::semantic::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        };
+
+        let library_file = FileId::new(14_100);
+        let target_file = FileId::new(14_101);
+        let wrapped_file = FileId::new(14_102);
+        let bare_file = FileId::new(14_103);
+        let sources = [
+            (
+                library_file,
+                library,
+                "\"/formatter-arrays.ts\"",
+                CanonicalModuleState::Script,
+            ),
+            (
+                target_file,
+                target,
+                "\"/producer.cts\"",
+                CanonicalModuleState::External,
+            ),
+            (
+                wrapped_file,
+                wrapped,
+                "\"/wrapped.mts\"",
+                CanonicalModuleState::External,
+            ),
+            (
+                bare_file,
+                bare,
+                "\"/bare.cts\"",
+                CanonicalModuleState::External,
+            ),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path, mode) in sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        mode,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let imports = [
+            (wrapped_file, wrapped, CanonicalModuleResolutionMode::Esm),
+            (bare_file, bare, CanonicalModuleResolutionMode::CommonJs),
+        ];
+        let entries = imports.map(|(file, parsed, mode)| {
+            let specifier = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::ImportDeclaration(import) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        import.module_specifier,
+                    ))
+                })
+                .unwrap();
+            CanonicalModuleResolutionEntry::resolved(
+                specifier,
+                CanonicalResolvedModuleInput::new(
+                    target_file,
+                    mode,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            )
+        });
+        let queries = imports.map(|(file, parsed, _)| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::TypeQuery).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        });
+        let context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            sources
+                .map(|(file, parsed, _, _)| (file, &parsed.arena))
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap();
+        (context, queries)
+    }
+
     fn merged_interface_display_context<'arena>(
         files: &[(FileId, &'arena ParseResult, bool)],
     ) -> CanonicalCheckerContext<'arena> {
@@ -10785,6 +10938,336 @@ mod tests {
             context.type_to_string(namespace),
             Err(TypeDisplayUnavailable::MalformedType(namespace))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both publication orders and nested default display together.
+    fn namespace_wrappers_keep_import_names_and_nested_default_display() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let target = parse_source_file("export const value: number = 1;");
+        let wrapped = parse_source_file(
+            "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
+        );
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        for query_first in [false, true] {
+            let (mut context, queries) =
+                namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+            let cold = query_first.then(|| {
+                let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().mapper_len(),
+                    context.store().relation_state_snapshot(),
+                );
+                assert!(context.type_to_string(types[0]).is_err());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().mapper_len(),
+                        context.store().relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                for type_ in types {
+                    let owner = context
+                        .store()
+                        .type_payload(type_)
+                        .unwrap()
+                        .symbol()
+                        .unwrap();
+                    assert!(context.store().value_symbol_links(owner).is_none());
+                }
+                types
+            });
+            for query in queries {
+                context.check_source_file(query.file).unwrap();
+            }
+            let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+            assert!(cold.is_none_or(|cold| cold == types));
+            assert_ne!(types[0], types[1]);
+            let wrapper_namespace = context
+                .store()
+                .type_payload(types[0])
+                .unwrap()
+                .symbol()
+                .unwrap();
+            let wrapper = context
+                .store()
+                .source_file_namespace_wrapper_for_module(wrapper_namespace)
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                context.store().type_payload(types[1]).unwrap().symbol(),
+                Some(wrapper.source.module)
+            );
+            let default = crate::semantic::source_imports::source_file_namespace_wrapper_member(
+                context.store(),
+                types[0],
+                "default",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(default, (wrapper.default, types[1]));
+            let globals = context.global_types().clone();
+            let nested = context
+                .store_mut_for_test()
+                .create_canonical_array_type(&globals, default.1, false)
+                .unwrap();
+            for replay in [false, true] {
+                let before = (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().mapper_len(),
+                    context
+                        .store()
+                        .source_file_namespace_identity(wrapper_namespace)
+                        .cloned(),
+                    context
+                        .store()
+                        .source_file_namespace_identity(wrapper.source.module)
+                        .cloned(),
+                    context.store().relation_state_snapshot(),
+                );
+                if replay {
+                    for query in queries {
+                        context.recheck_source_file(query.file).unwrap();
+                    }
+                    assert_eq!(
+                        queries.map(|query| context.get_type_from_type_node(query).unwrap()),
+                        types
+                    );
+                }
+                assert_eq!(
+                    context.type_to_string(types[0]).unwrap(),
+                    "typeof import(\"producer\")"
+                );
+                assert_eq!(
+                    context.type_to_string(types[1]).unwrap(),
+                    "typeof import(\"producer\")"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location(types[0], queries[0])
+                        .unwrap(),
+                    "typeof ns"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location(types[1], queries[1])
+                        .unwrap(),
+                    "typeof bare"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location(default.1, queries[0])
+                        .unwrap(),
+                    "typeof import(\"./producer.cjs\")"
+                );
+                assert_eq!(
+                    context.type_to_string(nested).unwrap(),
+                    "typeof import(\"producer\")[]"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location(nested, queries[0])
+                        .unwrap(),
+                    "typeof import(\"./producer.cjs\")[]"
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().mapper_len(),
+                        context
+                            .store()
+                            .source_file_namespace_identity(wrapper_namespace)
+                            .cloned(),
+                        context
+                            .store()
+                            .source_file_namespace_identity(wrapper.source.module)
+                            .cloned(),
+                        context.store().relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each changed origin, owner, and cache is restored before retry.
+    fn namespace_wrapper_display_rejects_changed_origin_and_caches_without_repair() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let target = parse_source_file("export const value: number = 1;");
+        let wrapped = parse_source_file(
+            "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
+        );
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        let (mut context, queries) =
+            namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+        let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+        for query in queries {
+            context.check_source_file(query.file).unwrap();
+        }
+        let namespace = context
+            .store()
+            .type_payload(types[0])
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let wrapper = context
+            .store()
+            .source_file_namespace_wrapper_for_module(namespace)
+            .cloned()
+            .unwrap();
+        let default_property = {
+            let TypeData::Object(object) = context.store().type_payload(types[0]).unwrap().data()
+            else {
+                panic!("wrapper must be an object")
+            };
+            context
+                .store()
+                .symbol_table(object.structured.members.unwrap())
+                .unwrap()
+                .get_source("default")
+                .unwrap()
+        };
+        let wrong_origin = bare
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    bare.arena.id(),
+                    queries[1].file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let export_links = context
+            .store()
+            .export_type_links(namespace)
+            .cloned()
+            .unwrap();
+        let alias_links = context
+            .store()
+            .alias_symbol_links(wrapper.source.alias)
+            .cloned()
+            .unwrap();
+        let property_links = context
+            .store()
+            .value_symbol_links(default_property)
+            .cloned()
+            .unwrap();
+        let fake_owner_data = {
+            let record = context.store().symbol(wrapper.source.module).unwrap();
+            SymbolData {
+                declarations: Some(vec![wrapper.source.declaration]),
+                value_declaration: Some(wrapper.source.declaration),
+                exports: record.exports(),
+                ..SymbolData::new(SymbolFlags::VALUE_MODULE, record.name().to_owned())
+            }
+        };
+        let fake_owner = context
+            .store_mut_for_test()
+            .alloc_symbol(fake_owner_data)
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_export_type_links(fake_owner, export_links.clone())
+        );
+        assert_eq!(
+            context.type_to_string(types[0]).unwrap(),
+            "typeof import(\"producer\")"
+        );
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.type_alias_len(),
+                ],
+                [namespace, wrapper.source.module]
+                    .map(|module| store.source_file_namespace_identity(module).cloned()),
+                store
+                    .source_file_namespace_wrapper_for_module(namespace)
+                    .cloned(),
+                [wrapper.source.alias, wrapper.default]
+                    .map(|alias| store.alias_symbol_links(alias).cloned()),
+                store.export_type_links(namespace).cloned(),
+                types.map(|type_| store.type_payload(type_).unwrap().symbol()),
+                store.value_symbol_links(default_property).cloned(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for poison in 0..9 {
+            let store = context.store_mut_for_test();
+            match poison {
+                0..=3 => {
+                    let mut links = export_links.clone();
+                    match poison {
+                        0 => links.originating_import = Some(wrong_origin),
+                        1 => links.originating_import = None,
+                        2 => links.target = Some(namespace),
+                        3 => links = crate::semantic::ExportTypeLinks::default(),
+                        _ => unreachable!(),
+                    }
+                    assert!(store.set_export_type_links(namespace, links));
+                }
+                4 => assert!(store.set_alias_symbol_links(
+                    wrapper.source.alias,
+                    crate::semantic::AliasSymbolLinks::default()
+                )),
+                5 => {
+                    let mut links = property_links.clone();
+                    links.resolved_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+                    assert!(store.set_value_symbol_links(default_property, links));
+                }
+                6 => assert!(store.set_type_symbol(types[0], Some(wrapper.source.module))),
+                7 => assert!(store.set_type_symbol(types[1], Some(namespace))),
+                8 => assert!(store.set_type_symbol(types[1], Some(fake_owner))),
+                _ => unreachable!(),
+            }
+            let type_ = types[usize::from(poison >= 7)];
+            let before = state(context.store());
+            assert!(context.type_to_string(type_).is_err(), "poison={poison}");
+            assert_eq!(state(context.store()), before);
+            assert!(
+                context
+                    .type_to_string_at_location(type_, queries[0])
+                    .is_err(),
+                "poison={poison}"
+            );
+            assert_eq!(state(context.store()), before);
+            assert!(context.diagnostics().is_empty());
+            let store = context.store_mut_for_test();
+            assert!(store.set_export_type_links(namespace, export_links.clone()));
+            assert!(store.set_alias_symbol_links(wrapper.source.alias, alias_links.clone()));
+            assert!(store.set_value_symbol_links(default_property, property_links.clone()));
+            assert!(store.set_type_symbol(types[0], Some(namespace)));
+            assert!(store.set_type_symbol(types[1], Some(wrapper.source.module)));
+            assert_eq!(
+                context
+                    .type_to_string_at_location(types[0], queries[0])
+                    .unwrap(),
+                "typeof ns"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location(types[1], queries[1])
+                    .unwrap(),
+                "typeof bare"
+            );
+        }
     }
 
     #[test]
