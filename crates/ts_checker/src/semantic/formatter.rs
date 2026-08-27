@@ -1778,6 +1778,7 @@ fn display_validated_module_namespace(
     if owner_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
         && single_callable_family(store, type_id) == Some(CallableFamily::FunctionDeclaration)
     {
+        validate_type_only_namespace_function_owner(store, host, type_id, owner, owner_record)?;
         return Ok(None);
     }
     if let Some(&declaration) = owner_record.declarations().and_then(|nodes| nodes.first())
@@ -1917,6 +1918,41 @@ fn display_validated_module_namespace(
         "typeof import({})",
         quote_string_literal(specifier, '"')
     )))
+}
+
+fn validate_type_only_namespace_function_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    owner: SemanticSymbolId,
+    owner_record: &ts_binder::semantic::Symbol,
+) -> Result<(), TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let provenance = store
+        .source_callable_provenance(type_id)
+        .ok_or_else(invalid)?;
+    let (_, bound) = host.source(provenance.declaration).ok_or_else(invalid)?;
+    let source_owner = bound.symbol(provenance.declaration).ok_or_else(invalid)?;
+
+    // Function merges mark runtime and const-enum namespaces in this retained set.
+    // Changing semantic flags or export tables cannot erase that binder record.
+    if provenance.owner_symbol != owner
+        || owner_record.value_declaration() != Some(provenance.declaration)
+        || !bound.declaration_slice_bound()
+        || host
+            .node(provenance.declaration)
+            .is_none_or(|node| node.kind != SyntaxKind::FunctionDeclaration)
+        || store.get_merged_symbol(source_owner) != Some(owner)
+        || bound.is_not_const_enum_only_module(source_owner)
+        || owner_record.declarations().is_none_or(|declarations| {
+            declarations
+                .iter()
+                .any(|declaration| bound.symbol(*declaration) != Some(source_owner))
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn display_validated_class_type(
@@ -7792,6 +7828,52 @@ mod tests {
         }
     }
 
+    fn namespace_function_display_parts(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (NodeRef, SemanticSymbolId, TypeId) {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        (declaration, owner, callable)
+    }
+
+    fn hide_namespace_value_exports(
+        context: &mut CanonicalCheckerContext<'_>,
+        owner: SemanticSymbolId,
+    ) {
+        let owner_record = context.store().symbol(owner).unwrap();
+        let members = owner_record.members();
+        let parent = owner_record.parent();
+        let export_symbol = owner_record.export_symbol();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            owner,
+            SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE,
+            CheckFlags::NONE,
+        ));
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            owner,
+            members,
+            None,
+            parent,
+            export_symbol,
+        ));
+    }
+
     #[test]
     fn type_only_namespace_function_display_preserves_signature_and_identity() {
         for (index, (source, external, expected)) in [
@@ -7805,6 +7887,18 @@ mod tests {
                  declare namespace callable { export interface Box { value: string; } }",
                 false,
                 "(value: string) => number",
+            ),
+            (
+                "declare function callable(): void; \
+                 declare namespace callable { export type Result = string; }",
+                false,
+                "() => void",
+            ),
+            (
+                "declare namespace callable { export type Result = string; } \
+                 declare function callable(): void;",
+                false,
+                "() => void",
             ),
             (
                 "declare function callable(): void; \
@@ -7825,22 +7919,8 @@ mod tests {
                 parsed_context(&parsed, file, CanonicalCheckerOptions::default())
             };
             context.check_source_file(file).unwrap();
-            let declaration = parsed
-                .arena
-                .iter()
-                .find_map(|(node, record)| {
-                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
-                        parsed.arena.id(),
-                        file,
-                        node,
-                    ))
-                })
-                .unwrap();
-            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
-            let callable = context
-                .store()
-                .source_callable_type_for_owner(owner)
-                .unwrap();
+            let (declaration, owner, callable) =
+                namespace_function_display_parts(&context, &parsed, file);
             let signature = context
                 .store()
                 .source_callable_provenance(callable)
@@ -7900,22 +7980,7 @@ mod tests {
         let file = FileId::new(233);
         let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
         context.check_source_file(file).unwrap();
-        let declaration = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
-        let callable = context
-            .store()
-            .source_callable_type_for_owner(owner)
-            .unwrap();
+        let (_, owner, callable) = namespace_function_display_parts(&context, &parsed, file);
         assert_eq!(context.type_to_string(callable).unwrap(), "() => void");
         let string = context.store().intrinsic_bootstrap().unwrap().string_type;
         assert!(context.store_mut_for_test().set_value_symbol_links(
@@ -7937,26 +8002,126 @@ mod tests {
         let file = FileId::new(234);
         let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
         context.check_source_file(file).unwrap();
-        let declaration = parsed
+        let (_, owner, callable) = namespace_function_display_parts(&context, &parsed, file);
+        assert_eq!(
+            context.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        );
+        assert_malformed_display_without_writes(&context, callable);
+        assert!(
+            context
+                .file(file)
+                .unwrap()
+                .1
+                .is_not_const_enum_only_module(owner)
+        );
+        hide_namespace_value_exports(&mut context, owner);
+        assert_malformed_display_without_writes(&context, callable);
+    }
+
+    #[test]
+    fn const_enum_namespace_function_display_remains_unsupported() {
+        for (index, source) in [
+            "declare function callable(): void; \
+             declare namespace callable { export const enum Choice { First } }",
+            "declare namespace callable { export const enum Choice { First } } \
+             declare function callable(): void;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(235 + u32::try_from(index).unwrap());
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let (_, owner, callable) = namespace_function_display_parts(&context, &parsed, file);
+            assert_eq!(
+                context.store().symbol(owner).unwrap().flags(),
+                SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+            );
+            assert!(
+                context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .is_not_const_enum_only_module(owner)
+            );
+            assert_malformed_display_without_writes(&context, callable);
+            hide_namespace_value_exports(&mut context, owner);
+            assert_malformed_display_without_writes(&context, callable);
+        }
+    }
+
+    #[test]
+    fn namespace_function_display_rejects_pruned_runtime_declarations() {
+        let parsed = parse_source_file(concat!(
+            "declare function callable(): void; ",
+            "declare namespace callable { export const first: string; } ",
+            "declare namespace callable { export const second: string; }",
+        ));
+        let file = FileId::new(237);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (declaration, owner, callable) =
+            namespace_function_display_parts(&context, &parsed, file);
+        let first_namespace = parsed
             .arena
             .iter()
             .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
                     parsed.arena.id(),
                     file,
                     node,
                 ))
             })
             .unwrap();
-        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
-        let callable = context
-            .store()
-            .source_callable_type_for_owner(owner)
-            .unwrap();
-        assert_eq!(
-            context.store().symbol(owner).unwrap().flags(),
-            SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        hide_namespace_value_exports(&mut context, owner);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(vec![declaration, first_namespace]),
+            Some(declaration),
+        ));
+        assert!(
+            context
+                .file(file)
+                .unwrap()
+                .1
+                .is_not_const_enum_only_module(owner)
         );
+        assert_malformed_display_without_writes(&context, callable);
+    }
+
+    #[test]
+    fn namespace_function_display_rejects_another_namespaces_declaration() {
+        let parsed = parse_source_file(concat!(
+            "declare function callable(): void; ",
+            "declare namespace callable {} ",
+            "declare namespace Other {}",
+        ));
+        let file = FileId::new(238);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (declaration, owner, callable) =
+            namespace_function_display_parts(&context, &parsed, file);
+        assert_eq!(context.type_to_string(callable).unwrap(), "() => void");
+        let other_namespace = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(&parsed.arena.get(module.name)?.data,
+                    NodeData::Identifier(identifier) if identifier.text == "Other")
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(vec![declaration, other_namespace]),
+            Some(declaration),
+        ));
         assert_malformed_display_without_writes(&context, callable);
     }
 
