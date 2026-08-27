@@ -205,10 +205,11 @@ fn unused_or_disabled_commonjs_import_helpers_remain_unchecked() {
             "enabled={enabled}: {:?}",
             program.diagnostics()
         );
-        assert!(
+        assert_eq!(
             program
                 .source_file("/project/node_modules/tslib/tslib.d.ts")
-                .is_none()
+                .is_some(),
+            enabled,
         );
     }
 }
