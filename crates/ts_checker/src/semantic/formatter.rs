@@ -11271,6 +11271,66 @@ mod tests {
     }
 
     #[test]
+    fn namespace_wrapper_invariant_review_display_rejects_removed_owners() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let wrapped = parse_source_file(
+            "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
+        );
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        for target_text in [
+            "export const value: number = 1;",
+            "export interface Marker {}",
+        ] {
+            let target = parse_source_file(target_text);
+            let (mut context, queries) =
+                namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+            let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+            for query in queries {
+                context.check_source_file(query.file).unwrap();
+            }
+            let owners = types.map(|type_| {
+                context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .symbol()
+                    .unwrap()
+            });
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    [store.type_len(), store.symbol_len(), store.mapper_len()],
+                    owners.map(|owner| store.source_file_namespace_identity(owner).cloned()),
+                    types.map(|type_| store.type_payload(type_).unwrap().symbol()),
+                    store.relation_state_snapshot(),
+                )
+            };
+            for (index, type_) in types.into_iter().enumerate() {
+                assert_eq!(
+                    context.type_to_string(type_).unwrap(),
+                    "typeof import(\"producer\")"
+                );
+                assert!(context.store_mut_for_test().set_type_symbol(type_, None));
+                let before = state(context.store());
+                let plain = context.type_to_string(type_);
+                let located = context.type_to_string_at_location(type_, queries[index]);
+                assert_eq!(state(context.store()), before);
+                assert!(
+                    plain.is_err() && located.is_err(),
+                    "target={target_text}, index={index}, plain={plain:?}, located={located:?}"
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_symbol(type_, Some(owners[index]))
+                );
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
     fn unqualified_named_display_rejects_parent_and_flag_poisons() {
         let (mut interface_store, interface) = named_interface_store("Good");
         let interface_symbol = interface_store

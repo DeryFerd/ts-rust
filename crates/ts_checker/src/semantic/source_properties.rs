@@ -5997,6 +5997,188 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Read the copied value directly without replaying its import.
+    fn namespace_wrapper_invariant_review_copied_reads_reject_changed_owners() {
+        use crate::semantic::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+        };
+        let importer = parsed(concat!(
+            "import * as ns from './producer.cjs'; export const copied = ns; ",
+            "const named = copied.value; const fallback = copied.default;",
+        ));
+        let producer = parsed("export const value: number = 1;");
+        let importer_file = FileId::new(14_020);
+        let producer_file = FileId::new(14_021);
+        let sources = [
+            (importer_file, &importer, "\"/consumer\""),
+            (producer_file, &producer, "\"/producer\""),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, source, path) in sources {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, source, _) in sources {
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let import = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ImportDeclaration(import) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    import.module_specifier,
+                ))
+            })
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            sources
+                .map(|(file, source, _)| (file, &source.arena))
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    import,
+                    CanonicalResolvedModuleInput::new(
+                        producer_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        context.check_source_file(importer_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(importer_file).unwrap().1;
+        let importer_module = bound.symbol(bound.source_file()).unwrap();
+        let copied = context
+            .store()
+            .symbol(importer_module)
+            .unwrap()
+            .exports()
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap()
+            .get_source("copied")
+            .unwrap();
+        let wrapped = context
+            .store()
+            .value_symbol_links(copied)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let namespace = context
+            .store()
+            .type_payload(wrapped)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let wrapper = context
+            .store()
+            .source_file_namespace_wrapper_for_module(namespace)
+            .cloned()
+            .unwrap();
+        assert!(
+            !context
+                .store()
+                .symbol(copied)
+                .unwrap()
+                .flags()
+                .intersects(SymbolFlags::ALIAS | SymbolFlags::MODULE)
+        );
+        let accesses = importer.arena.iter().filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                importer.arena.id(),
+                importer_file,
+                node,
+            ))
+        });
+        let mut failures = Vec::new();
+        for access in accesses {
+            let syntax =
+                plan_direct_source_property_syntax(&importer.arena, context.store(), access)
+                    .unwrap();
+            let plan =
+                finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, copied))
+                    .unwrap();
+            let original_type = context.store().type_node_links(access).cloned().unwrap();
+            let original_symbol = context.store().symbol_node_links(access).cloned().unwrap();
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    [store.type_len(), store.symbol_len(), store.mapper_len()],
+                    store.type_node_links(access).cloned(),
+                    store.symbol_node_links(access).cloned(),
+                    store.type_payload(wrapped).unwrap().symbol(),
+                    store.source_file_namespace_identity(namespace).cloned(),
+                    store.value_symbol_links(copied).cloned(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            for warm in [false, true] {
+                for owner in [None, Some(wrapper.source.module)] {
+                    let store = context.store_mut_for_test();
+                    assert!(store.set_type_node_links(
+                        access,
+                        if warm {
+                            original_type.clone()
+                        } else {
+                            TypeNodeLinks::default()
+                        }
+                    ));
+                    assert!(store.set_symbol_node_links(
+                        access,
+                        if warm {
+                            original_symbol.clone()
+                        } else {
+                            SymbolNodeLinks::default()
+                        }
+                    ));
+                    assert!(store.set_type_symbol(wrapped, owner));
+                    let before = state(store);
+                    let result = check_direct_source_property(store, None, &plan, wrapped);
+                    if result.is_ok() || state(store) != before {
+                        failures.push(format!(
+                            "property={}, warm={warm}, owner={owner:?}, result={result:?}, unchanged={}",
+                            syntax.name, state(store) == before,
+                        ));
+                    }
+                    assert!(store.set_type_symbol(wrapped, Some(namespace)));
+                    assert!(store.set_type_node_links(access, original_type.clone()));
+                    assert!(store.set_symbol_node_links(access, original_symbol.clone()));
+                    assert_eq!(
+                        check_direct_source_property(store, None, &plan, wrapped).unwrap(),
+                        CheckedSourceProperty {
+                            type_: original_type.resolved_type.unwrap(),
+                            diagnostic: None,
+                        }
+                    );
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn namespace_alias_cache_mismatches_fail_before_access_publication() {
         let parsed = parsed("const result = namespace.value;");
         let file = FileId::new(517);
