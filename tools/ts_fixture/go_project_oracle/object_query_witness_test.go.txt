@@ -31,15 +31,18 @@ func objectWitnessFixture(t *testing.T, source, extension string) (*checker.Chec
 	file := program.GetSourceFile(filename)
 	fileChecker, done := program.GetTypeCheckerForFileExclusive(t.Context(), file)
 	t.Cleanup(done)
-	for _, statement := range file.Statements.Nodes {
-		if !ast.IsVariableStatement(statement) {
-			continue
+	var object *ast.Node
+	var findObject func(*ast.Node) bool
+	findObject = func(node *ast.Node) bool {
+		if ast.IsVariableDeclaration(node) && node.Name() != nil && ast.IsIdentifier(node.Name()) && node.Name().Text() == "object" {
+			object = node.Initializer()
+			return object != nil
 		}
-		for _, declaration := range statement.AsVariableStatement().DeclarationList.AsVariableDeclarationList().Declarations.Nodes {
-			if declaration.Name().Text() == "object" {
-				return fileChecker, declaration.Initializer()
-			}
-		}
+		return node.ForEachChild(findObject)
+	}
+	file.AsNode().ForEachChild(findObject)
+	if object != nil {
+		return fileChecker, object
 	}
 	t.Fatal("fixture has no object initializer")
 	return nil, nil
@@ -150,6 +153,96 @@ func TestObjectQueryWitnessRejectsSameTextMutations(t *testing.T) {
 	}
 }
 
+func TestObjectQueryWitnessAcceptsDeclaredClassTypeParameters(t *testing.T) {
+	for _, test := range []struct {
+		name, source string
+		edges        int
+	}{
+		{"call_result", `class MatchExpression<input, output> {
+  make(handler: (value: input) => output, value: input) {
+    const object = {matched: true as const, value: handler(value)};
+    return object;
+  }
+}`, 2},
+		{"two_parameters", `class Pair<Left, Right> {
+  make(left: () => Left, right: () => Right) {
+    const object = {left: left(), right: right()};
+    return object;
+  }
+}`, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, node := objectWitnessFixture(t, test.source, "ts")
+			coldType, cold, coldText := objectWitnessObserve(t, c, node, "")
+			warmType, warm, warmText := objectWitnessObserve(t, c, node, "")
+			t.Logf("raw_pointer_equal=%v cold=%q warm=%q", coldType == warmType, coldText, warmText)
+			result := c.ProjectOracleVerifyObjectsAfterArtifacts(cold, warm)
+			objectWitnessLog(t, result)
+			if coldType == warmType || coldText != warmText {
+				t.Fatalf("class parameter control requires different raw pointers and equal text: pointer_equal=%v cold=%q warm=%q", coldType == warmType, coldText, warmText)
+			}
+			if result.State != "verified" || result.FreshObjects != 1 || result.StableCacheEdges != test.edges ||
+				!result.Relation.Called || result.Relation.Identical == nil || !*result.Relation.Identical ||
+				result.Relation.Overflow == nil || *result.Relation.Overflow || result.Relation.WitnessDataChanged {
+				t.Fatalf("declared class parameter cache was not proved: %+v", result)
+			}
+		})
+	}
+}
+
+func TestObjectQueryWitnessKeepsCachedClassParameterObjectIncomplete(t *testing.T) {
+	c, node := objectWitnessFixture(t, `class Container<T> { make(value: T) { const object = {value}; return object; } }`, "ts")
+	coldType, cold, coldText := objectWitnessObserve(t, c, node, "")
+	warmType, warm, warmText := objectWitnessObserve(t, c, node, "")
+	if coldType != warmType || coldText != warmText {
+		t.Fatalf("cached shorthand control changed: pointer_equal=%v cold=%q warm=%q", coldType == warmType, coldText, warmText)
+	}
+	result := c.ProjectOracleVerifyObjectsAfterArtifacts(cold, warm)
+	objectWitnessLog(t, result)
+	if result.State != "incomplete" || result.Relation.Called || result.Reason != "returned object has no matching producer observation" {
+		t.Fatalf("a cached class-parameter object gained producer proof: %+v", result)
+	}
+}
+
+const objectWitnessClassParameterSource = `class Container<T, Other> {
+  make(handler: () => T) { const object = {value: handler()}; return object; }
+}
+class OtherOwner<T> {}`
+
+func TestObjectQueryWitnessClassParameterLookupDoesNotResolve(t *testing.T) {
+	c, node := objectWitnessFixture(t, objectWitnessClassParameterSource, "ts")
+	_, seed, _ := objectWitnessObserve(t, c, node, "")
+	if birth, closed := c.ProjectOracleObjectWitnessTestCacheEvidence(seed); !birth || !closed {
+		t.Fatal("class parameter control has no initial cache witness")
+	}
+	known, allocated, cacheCreated := c.ProjectOracleObjectWitnessTestMissingClassParameterCache(seed)
+	if known || allocated || cacheCreated {
+		t.Fatalf("missing cache lookup resolved evidence: known=%v allocated=%v cache_created=%v", known, allocated, cacheCreated)
+	}
+}
+
+func TestObjectQueryWitnessRequiresClassParameterCreationCache(t *testing.T) {
+	c, node := objectWitnessFixture(t, objectWitnessClassParameterSource, "ts")
+	_, seed, _ := objectWitnessObserve(t, c, node, "")
+	if birth, closed := c.ProjectOracleObjectWitnessTestCacheEvidence(seed); !birth || !closed {
+		t.Fatal("class parameter control has no initial cache witness")
+	}
+	if err := c.ProjectOracleObjectWitnessTestMutate(seed, "type_parameter_cache_missing"); err != nil {
+		t.Fatal(err)
+	}
+	_, cold, _ := objectWitnessObserve(t, c, node, "type_parameter_cache_restore")
+	_, warm, _ := objectWitnessObserve(t, c, node, "")
+	birth, closed := c.ProjectOracleObjectWitnessTestCacheEvidence(cold)
+	if birth || !closed {
+		t.Fatalf("class cache must be missing at creation and restored before closure: birth=%v, closed=%v", birth, closed)
+	}
+	result := c.ProjectOracleVerifyObjectsAfterArtifacts(cold, warm)
+	objectWitnessLog(t, result)
+	if result.State != "incomplete" || result.Relation.Called || result.Reason != "property type has no proved cache owner at creation" {
+		t.Fatalf("a repaired class cache replaced creation evidence: %+v", result)
+	}
+}
+
 func TestObjectQueryWitnessRejectsColdWindowMutations(t *testing.T) {
 	for _, mutation := range []string{
 		"boolean_regular_value", "boolean_false_value", "boolean_regular_header", "boolean_regular_id", "boolean_regular_links",
@@ -157,17 +250,25 @@ func TestObjectQueryWitnessRejectsColdWindowMutations(t *testing.T) {
 		"boolean_union_constraint", "boolean_union_regular", "boolean_union_without_abstract",
 		"boolean_union_property_cache", "boolean_union_constituent_map",
 		"signature", "signature_and_cache", "function_base_constraint", "function_instantiations", "function_without_abstract",
+		"type_parameter_cache_owner", "type_parameter_constraint", "type_parameter_base_constraint", "type_parameter_default",
+		"type_parameter_target", "type_parameter_mapper", "type_parameter_owner", "type_parameter_parent",
+		"type_parameter_declaration_constraint", "type_parameter_class_order", "type_parameter_memo_flags",
 	} {
 		windows := []string{"before_cold_close", "after_cold_close", "after_both_closes"}
 		if mutation == "boolean_union_regular" {
 			// This cache changes later queries, so first render both passes.
 			windows = []string{"after_both_closes"}
+		} else if mutation == "type_parameter_memo_flags" {
+			// A later query can restore memo flags before its creation snapshot.
+			windows = []string{"before_cold_close", "after_both_closes"}
 		}
 		for _, window := range windows {
 			t.Run(mutation+"/"+window, func(t *testing.T) {
 				source := `function stable(value: number): number { return value; } const object = {fn: stable};`
 				if strings.HasPrefix(mutation, "boolean_") {
 					source = `const object = {truth: true};`
+				} else if strings.HasPrefix(mutation, "type_parameter_") {
+					source = objectWitnessClassParameterSource
 				}
 				c, node := objectWitnessFixture(t, source, "ts")
 				pass, err := c.ProjectOracleBeginObjectPass()
@@ -368,6 +469,11 @@ func TestObjectQueryWitnessKeepsUnprovedProducersIncomplete(t *testing.T) {
 		{"const_assertion", `const object = {value: 1} as const;`, "ts"},
 		{"array", `const object = [1, 2];`, "ts"},
 		{"jsx", `declare namespace JSX { interface IntrinsicElements { div: {} } } const object = <div />;`, "tsx"},
+		{"constrained_class_parameter", `class Container<T extends string> { make(value: T) { const object = {value}; return object; } }`, "ts"},
+		{"defaulted_class_parameter", `class Container<T = number> { make(value: T) { const object = {value}; return object; } }`, "ts"},
+		{"const_class_parameter", `class Container<const T> { make(value: T) { const object = {value}; return object; } }`, "ts"},
+		{"function_parameter", `function make<T>(value: T) { const object = {value}; return object; }`, "ts"},
+		{"class_this_parameter", `class Container { make() { const object = {value: this}; return object; } }`, "ts"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c, node := objectWitnessFixture(t, test.source, test.extension)
