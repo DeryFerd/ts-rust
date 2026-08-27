@@ -597,11 +597,5 @@ fn empty_worker_inputs_are_distinct_from_missing_synthetic_evidence() {
 
     assert!(inputs.is_complete());
     assert!(inputs.events.is_empty());
-    assert_eq!(
-        fs.calls(),
-        [
-            FsCall::FileExists("/app/value.ts".to_owned()),
-            FsCall::Realpath("/app/value.ts".to_owned()),
-        ]
-    );
+    assert_eq!(fs.calls(), [FsCall::FileExists("/app/value.ts".to_owned())]);
 }
