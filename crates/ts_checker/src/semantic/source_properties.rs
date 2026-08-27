@@ -47,7 +47,7 @@ use super::{
         source_arrow_owner_expando_exports_are_valid,
         source_function_owner_expando_exports_are_valid, validate_stored_source_callable,
     },
-    source_imports::source_file_namespace_wrapper_member,
+    source_imports::{source_file_namespace_wrapper_member, validated_source_file_namespace_owner},
     spelling::get_spelling_suggestion,
     store::SourceNodeParent,
     type_records::{TypeData, TypeRecord},
@@ -2171,19 +2171,25 @@ fn resolve_namespace_property(
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
-    let receiver_module = receiver
-        .symbol()
-        .map(|symbol| {
-            store
-                .get_merged_symbol(symbol)
-                .ok_or(SourcePropertyError::InvalidCache(plan.node))
-        })
-        .transpose()?
-        .filter(|symbol| {
-            store
-                .symbol(*symbol)
-                .is_some_and(|record| record.flags().intersects(SymbolFlags::MODULE))
-        });
+    let receiver_module = match validated_source_file_namespace_owner(store, receiver_type)
+        .map_err(|_| SourcePropertyError::InvalidCache(plan.node))?
+    {
+        Some(module) if store.get_merged_symbol(module) == Some(module) => Some(module),
+        Some(_) => return Err(SourcePropertyError::InvalidCache(plan.node)),
+        None => receiver
+            .symbol()
+            .map(|symbol| {
+                store
+                    .get_merged_symbol(symbol)
+                    .ok_or(SourcePropertyError::InvalidCache(plan.node))
+            })
+            .transpose()?
+            .filter(|symbol| {
+                store
+                    .symbol(*symbol)
+                    .is_some_and(|record| record.flags().intersects(SymbolFlags::MODULE))
+            }),
+    };
     let alias_module = if let PlannedExpressionKind::Identifier(read) = &plan.receiver.kind {
         let receiver_symbol = store
             .symbol(read.value_symbol)
