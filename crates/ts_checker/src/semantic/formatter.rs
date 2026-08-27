@@ -18,7 +18,8 @@ use std::{
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
+    CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, InternalSymbolName,
+    SemanticSymbolId, SymbolFlags, canonical_has_syntactic_modifier,
 };
 use ts_scanner::is_identifier_text;
 
@@ -1807,14 +1808,35 @@ fn display_validated_module_namespace(
         {
             return Err(invalid());
         }
-        if state.location.is_some() {
-            let name = display_location_symbol_name(
-                store,
-                host,
-                wrapper.source.alias,
-                SymbolFlags::VALUE,
-                state,
-            )?;
+        if let Some(location) = &state.location {
+            let enclosing = location.enclosing();
+            let (arena, bound) = host.source(enclosing).ok_or_else(invalid)?;
+            let alias_name = store
+                .symbol(wrapper.source.alias)
+                .and_then(|symbol| symbol.name().as_utf8())
+                .ok_or_else(invalid)?;
+            let mut resolver_host = host.name_resolver_host(store).map_err(|_| invalid())?;
+            let visible =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut resolver_host)
+                    .map_err(|_| invalid())?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(enclosing)),
+                        alias_name,
+                        SymbolFlags::VALUE,
+                        None,
+                        true,
+                        false,
+                    )
+                    .map_err(|_| invalid())?;
+            let symbol = if visible.and_then(|symbol| store.get_merged_symbol(symbol))
+                == Some(wrapper.source.alias)
+            {
+                wrapper.source.alias
+            } else {
+                wrapper.source.module
+            };
+            let name =
+                display_location_symbol_name(store, host, symbol, SymbolFlags::VALUE, state)?;
             state.add(7);
             return Ok(Some(format!("typeof {name}")));
         }
@@ -11423,6 +11445,94 @@ mod tests {
                 );
             }
             assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn namespace_wrapper_display_resolves_aliases_in_the_callers_value_scope() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let target = parse_source_file("export const value: number = 1;");
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        for alias in ["ns", "moduleValue"] {
+            let wrapped = parse_source_file(&format!(
+                "import * as {alias} from './producer.cjs'; \
+                 export type Copy = typeof {alias}; export const copied = {alias}; \
+                 function hidden({alias}: number): number {{ copied; return {alias}; }} \
+                 function typeOnly<{alias}>(value: {alias}): {alias} {{ copied; return value; }}"
+            ));
+            let (mut context, queries) =
+                namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+            let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+            for query in queries {
+                context.check_source_file(query.file).unwrap();
+            }
+            let locations = ["hidden", "typeOnly"].map(|name| {
+                wrapped
+                    .arena
+                    .iter()
+                    .find_map(|(_, record)| {
+                        let NodeData::FunctionDeclaration(function) = &record.data else {
+                            return None;
+                        };
+                        let NodeData::Identifier(identifier) =
+                            &wrapped.arena.get(function.name?).unwrap().data
+                        else {
+                            return None;
+                        };
+                        (identifier.text == name).then(|| {
+                            NodeRef::new(
+                                wrapped.arena.id(),
+                                queries[0].file,
+                                function.body.unwrap(),
+                            )
+                        })
+                    })
+                    .unwrap()
+            });
+            for replay in [false, true] {
+                if replay {
+                    for query in queries {
+                        context.recheck_source_file(query.file).unwrap();
+                    }
+                }
+                let state = |store: &CanonicalTypeMapperStore| {
+                    (
+                        [store.type_len(), store.symbol_len(), store.mapper_len()],
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    )
+                };
+                let before = state(context.store());
+                for location in [queries[0], locations[1]] {
+                    assert_eq!(
+                        context
+                            .type_to_string_at_location(types[0], location)
+                            .unwrap(),
+                        format!("typeof {alias}")
+                    );
+                }
+                assert_eq!(
+                    context
+                        .type_to_string_at_location(types[0], locations[0])
+                        .unwrap(),
+                    "typeof import(\"./producer.cjs\")"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(
+                            types[0],
+                            locations[0],
+                            CanonicalTypeFormatFlags::NO_TRUNCATION
+                                | CanonicalTypeFormatFlags::USE_SINGLE_QUOTES_FOR_STRING_LITERAL_TYPE,
+                        )
+                        .unwrap(),
+                    "typeof import('./producer.cjs')"
+                );
+                assert_eq!(state(context.store()), before);
+                assert!(context.diagnostics().is_empty());
+            }
         }
     }
 
