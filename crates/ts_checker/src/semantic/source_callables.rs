@@ -2993,7 +2993,14 @@ fn plan_source_callable_with_owner_shape(
         min_argument_count,
         array_targets,
     };
-    if javascript_direct_implicit_any_arrow {
+    if javascript_direct_implicit_any_arrow
+        || view.family == SourceCallableFamily::ArrowFunction
+            && view.parameters.nodes.is_empty()
+            && bound
+                .source_facts()
+                .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+            && is_direct_noncontextual_source_arrow(store, host, declaration)?
+    {
         hydrate_warm_jsdoc_contextual_source_callable(store, host, &mut plan)?;
     }
     if array_filter_predicate_arrow
@@ -7768,9 +7775,10 @@ pub(super) fn authenticated_jsdoc_contextual_source_signature(
         || plan.body_mode != SourceCallableBodyMode::Present
         || !plan.return_type.is_inferred()
         || !plan.type_parameters.is_empty()
-        || plan.flags != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-        || plan.parameters.len() != 1
-        || plan.min_argument_count != 1
+        || plan.flags != SignatureFlags::NONE
+            && plan.flags != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+        || plan.parameters.len() > 1
+        || usize::try_from(plan.min_argument_count).ok() != Some(plan.parameters.len())
         || plan.owner_parent.is_some()
         || plan.export_local.is_some()
     {
@@ -7803,13 +7811,25 @@ pub(super) fn authenticated_jsdoc_contextual_source_signature(
 
     let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
         .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(plan.declaration)))?;
-    let Some(callback) = comments
-        .callable_declaration(arena, plan.declaration)
-        .and_then(|declaration| declaration.type_())
-        .and_then(super::jsdoc::PlannedJsDocType::resolved_callback)
-    else {
+    let Some(declaration) = comments.callable_declaration(arena, plan.declaration) else {
         return Ok(None);
     };
+    let Some(annotation) = declaration.type_() else {
+        return Ok(None);
+    };
+    let Some(callback) = annotation.resolved_callback() else {
+        return Ok(None);
+    };
+    if !matches!(annotation.type_(), JsDocType::Named(name) if name == callback.name())
+        || declaration
+            .callbacks()
+            .iter()
+            .filter(|candidate| *candidate == callback)
+            .count()
+            != 1
+    {
+        return Ok(None);
+    }
     let Some(return_type) = callback
         .return_type()
         .and_then(|annotation| jsdoc_intrinsic_type(store, annotation.type_()))
@@ -7913,7 +7933,7 @@ fn hydrate_warm_jsdoc_contextual_source_callable(
         || provenance.owner_symbol != plan.owner_symbol
         || provenance.contextual_target.is_some()
         || provenance.contextual_variable.is_some()
-        || signature.flags() != plan.flags
+        || signature.flags() != SignatureFlags::NONE
         || signature.resolved_return_type() != Some(return_type)
         || store.callable_signature_parameter_types(provenance.signature)
             != Some(parameter_types.as_slice())
@@ -7933,6 +7953,7 @@ fn hydrate_warm_jsdoc_contextual_source_callable(
             plan.declaration,
         )));
     }
+    plan.flags = SignatureFlags::NONE;
     for (parameter, type_) in plan.parameters.iter_mut().zip(parameter_types) {
         parameter.jsdoc_contextual_type = Some(type_);
     }
@@ -7957,6 +7978,7 @@ pub(super) fn publish_jsdoc_contextual_source_callable(
         )));
     };
     let mut contextual = plan.clone();
+    contextual.flags = SignatureFlags::NONE;
     for (parameter, type_) in contextual.parameters.iter_mut().zip(&parameter_types) {
         parameter.jsdoc_contextual_type = Some(*type_);
     }
@@ -8004,10 +8026,12 @@ pub(super) fn publish_jsdoc_contextual_source_callable(
     let pending = begin_source_callable(store, &contextual, &[])?
         .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
     finalize_source_callable_structure(store, &contextual, pending)?;
-    if !store.set_callable_signature_parameter_types_batch(vec![(
-        pending.signature,
-        parameter_types.clone(),
-    )]) {
+    if !parameter_types.is_empty()
+        && !store.set_callable_signature_parameter_types_batch(vec![(
+            pending.signature,
+            parameter_types.clone(),
+        )])
+    {
         return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
             plan.declaration,
         )));
@@ -16176,6 +16200,7 @@ mod tests {
             (bootstrap.string_type, bootstrap.void_type)
         };
         assert!(!contextual.parameters[0].is_implicit_any());
+        assert_eq!(contextual.flags, SignatureFlags::NONE);
         assert_eq!(
             contextual.parameters[0].base_type(context.store()),
             Some(string),
@@ -16192,7 +16217,7 @@ mod tests {
                 .signature(provenance.signature)
                 .unwrap()
                 .flags(),
-            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+            SignatureFlags::NONE,
         );
         assert_eq!(
             context
@@ -16225,6 +16250,7 @@ mod tests {
         let replay =
             plan_source_callable(context.store(), &host, arrow, owner, Some(targets)).unwrap();
         assert!(!replay.parameters[0].is_implicit_any());
+        assert_eq!(replay.flags, SignatureFlags::NONE);
         assert_eq!(
             publish_jsdoc_contextual_source_callable(
                 context.store_mut_for_test(),

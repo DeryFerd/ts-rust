@@ -77295,6 +77295,182 @@ class Foo2 {
     }
 
     #[test]
+    fn javascript_jsdoc_callback_arrows_call_directly_with_typed_flags_cold_and_warm() {
+        use super::super::calls::{
+            DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call,
+        };
+        for (parameter_tag, parameters, accepts_number) in [
+            (" * @param {string} name\n", "name", false),
+            (" * @param {any} name\n", "name", true),
+            ("", "", false),
+        ] {
+            let source = parse_javascript_source_file(&format!(
+                "/** @callback NS.Callback\n{parameter_tag} * @returns {{void}}\n */\n\
+                 /** @type {{NS.Callback}} */ const callback = ({parameters}) => {{}};",
+            ));
+            let file = FileId::new(9_970);
+            let options = CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            };
+            let mut context = javascript_context(file, &source, options);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let arrow = variable_initializer(&source, file, "callback");
+            let arrow_type = context.get_type_at_location(arrow).unwrap();
+            let declared = variable_value_type(&context, &source, file, "callback");
+            let signature = context
+                .store()
+                .source_callable_provenance(arrow_type)
+                .unwrap()
+                .signature;
+            let globals = context.global_types().clone();
+            let (string, number, void) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.void_type,
+                )
+            };
+            let arguments = if parameters.is_empty() {
+                Vec::new()
+            } else {
+                vec![string]
+            };
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signatures().len(),
+            );
+            for warm in [false, true] {
+                if warm {
+                    context.recheck_source_file(file).unwrap();
+                }
+                assert_eq!(context.get_type_at_location(arrow).unwrap(), arrow_type);
+                assert_eq!(
+                    variable_value_type(&context, &source, file, "callback"),
+                    declared
+                );
+                assert_eq!(
+                    context.store().signature(signature).unwrap().flags(),
+                    SignatureFlags::NONE
+                );
+                let call = resolve_direct_call(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options.strict_function_types,
+                    DirectCallRequest {
+                        form: DirectCallForm::Call,
+                        optional_chain: false,
+                        type_argument_count: 0,
+                        has_spread_argument: false,
+                        callee: arrow_type,
+                        arguments: &arguments,
+                    },
+                )
+                .unwrap();
+                assert_eq!(call.applicability, DirectCallApplicability::Applicable);
+                assert_eq!(call.projection.signature, signature);
+                assert_eq!(call.projection.return_type, void);
+                assert!(context.is_type_assignable_to(arrow_type, declared).unwrap());
+                let wrong = resolve_direct_call(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options.strict_function_types,
+                    DirectCallRequest {
+                        form: DirectCallForm::Call,
+                        optional_chain: false,
+                        type_argument_count: 0,
+                        has_spread_argument: false,
+                        callee: arrow_type,
+                        arguments: &[number],
+                    },
+                )
+                .unwrap();
+                if parameters.is_empty() {
+                    assert!(matches!(
+                        wrong.applicability,
+                        DirectCallApplicability::TooManyArguments { .. }
+                    ));
+                } else if !accepts_number {
+                    assert!(matches!(
+                        wrong.applicability,
+                        DirectCallApplicability::ArgumentNotAssignable { .. }
+                    ));
+                } else {
+                    assert_eq!(wrong.applicability, DirectCallApplicability::Applicable);
+                }
+                assert_eq!(wrong.projection.return_type, void);
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().signatures().len()
+                    ),
+                    before
+                );
+            }
+            assert!(
+                context.store_mut_for_test().set_signature_flags(
+                    signature,
+                    SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+                )
+            );
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+            assert!(context.recheck_source_file(file).is_err());
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    fn javascript_jsdoc_callback_flag_fix_preserves_untyped_arrows() {
+        use super::super::calls::{
+            DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call,
+        };
+        let source = parse_javascript_source_file("const callback = (name) => {}; callback(123);");
+        let file = FileId::new(9_971);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = javascript_context(file, &source, options);
+        context.check_source_file(file).unwrap();
+        let arrow = variable_initializer(&source, file, "callback");
+        let type_ = context.get_type_at_location(arrow).unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        let globals = context.global_types().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for warm in [false, true] {
+            if warm {
+                context.recheck_source_file(file).unwrap();
+            }
+            assert_eq!(context.get_type_at_location(arrow).unwrap(), type_);
+            assert_eq!(
+                context.store().signature(signature).unwrap().flags(),
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            );
+            let result = resolve_direct_call(
+                context.store_mut_for_test(),
+                &globals,
+                options.strict_function_types,
+                DirectCallRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    type_argument_count: 0,
+                    has_spread_argument: false,
+                    callee: type_,
+                    arguments: &[number],
+                },
+            )
+            .unwrap();
+            assert_eq!(result.applicability, DirectCallApplicability::Applicable);
+        }
+    }
+
+    #[test]
     fn javascript_jsdoc_callback_alias_rejects_poisoned_signatures_without_publication() {
         for poison in 0..4 {
             let source = parse_javascript_source_file(concat!(
@@ -77461,18 +77637,20 @@ class Foo2 {
 
     #[test]
     fn javascript_jsdoc_callback_alias_does_not_drop_generic_arguments() {
-        let source = parse_javascript_source_file(concat!(
-            "/** @template T\n * @callback NS.Mapper\n * @param {T} name\n * @returns {void}\n */\n",
-            "/** @type {NS.Mapper<string>} */ const callback = (name) => {};",
-        ));
-        let file = FileId::new(9_943);
-        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
-        let before = observable_state(&context, file);
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(_))
-        ));
-        assert_eq!(observable_state(&context, file), before);
+        for (parameter_tag, parameters) in [(" * @param {T} name\n", "name"), ("", "")] {
+            let source = parse_javascript_source_file(&format!(
+                "/** @template T\n * @callback NS.Mapper\n{parameter_tag} * @returns {{void}}\n */\n\
+                 /** @type {{NS.Mapper<string>}} */ const callback = ({parameters}) => {{}};",
+            ));
+            let file = FileId::new(9_943);
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+            let before = observable_state(&context, file);
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            assert_eq!(observable_state(&context, file), before);
+        }
     }
 
     #[test]

@@ -1681,7 +1681,7 @@ pub(super) fn plan_jsdoc_contextual_source_arrow(
         return Err(invalid_context());
     }
 
-    let planned = plan_source_arrow(store, host, variable_declaration, array_targets)?;
+    let mut planned = plan_source_arrow(store, host, variable_declaration, array_targets)?;
     let SourceArrowBodyPlan::EmptyBlock { block } = planned.body else {
         return Err(unsupported(SourceArrowUnsupported::ComplexBlock(
             planned.callable.body,
@@ -1700,12 +1700,8 @@ pub(super) fn plan_jsdoc_contextual_source_arrow(
         || planned.callable.parameters.len() != callback.parameters().len()
         || planned.callable.min_argument_count
             != i32::try_from(planned.callable.parameters.len()).map_err(|_| invalid_context())?
-        || planned.callable.flags
-            != if planned.callable.parameters.is_empty() {
-                SignatureFlags::NONE
-            } else {
-                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-            }
+        || planned.callable.flags != SignatureFlags::NONE
+            && planned.callable.flags != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
         || planned.callable.parameters.iter().any(|parameter| {
             parameter.explicit_type_node().is_some()
                 || parameter.initializer.is_some()
@@ -1716,6 +1712,7 @@ pub(super) fn plan_jsdoc_contextual_source_arrow(
         return Err(invalid_context());
     }
 
+    planned.callable.flags = SignatureFlags::NONE;
     Ok(planned)
 }
 
@@ -3615,10 +3612,7 @@ mod tests {
             Some(planned.callable.owner_symbol)
         );
         assert_ne!(planned.variable_symbol, planned.callable.owner_symbol);
-        assert_eq!(
-            planned.callable.flags,
-            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-        );
+        assert_eq!(planned.callable.flags, SignatureFlags::NONE);
         assert_eq!(planned.callable.min_argument_count, 1);
         assert_eq!(planned.callable.parameters.len(), 1);
         assert!(planned.callable.parameters[0].is_implicit_any());

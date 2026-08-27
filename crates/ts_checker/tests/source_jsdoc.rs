@@ -10,6 +10,7 @@ use ts_checker::semantic::{
         leading_jsdoc_comment, parse_jsdoc_comment_at, plan_javascript_source_jsdoc,
         resolve_intrinsic_jsdoc_type,
     },
+    signatures::SignatureFlags,
 };
 use ts_core::{TextPos, TextRange};
 use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
@@ -41,6 +42,31 @@ fn context(parsed: &ParseResult, options: CanonicalCheckerOptions) -> CanonicalC
         .unwrap();
     binder
         .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+}
+
+fn javascript_context(
+    parsed: &ParseResult,
+    file: FileId,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'_> {
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/input.js\""),
+                CanonicalSourceLanguage::JavaScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_javascript_declaration_slice(&parsed.arena, file)
         .unwrap();
     CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
 }
@@ -441,39 +467,44 @@ fn javascript_jsdoc_assignment_checks_only_the_annotated_declaration() {
 
 #[test]
 fn callback_alias_keeps_declared_and_arrow_type_identities() {
-    for alias in ["Callback", "NS.MyCallback", "A.B.Callback"] {
+    for (alias, parameter_tag, parameters, call, display) in [
+        (
+            "Callback",
+            " * @param {string} name\n",
+            "name",
+            "f('ok');",
+            "(name: string) => void",
+        ),
+        (
+            "NS.MyCallback",
+            " * @param {string} name\n",
+            "name",
+            "f('ok');",
+            "(name: string) => void",
+        ),
+        (
+            "NS.AnyCallback",
+            " * @param {any} name\n",
+            "name",
+            "f(123);",
+            "(name: any) => void",
+        ),
+        ("A.B.Empty", "", "", "f();", "() => void"),
+    ] {
         let parsed = parse_javascript_source_file(&format!(
-            "/** @callback {alias}\n * @param {{string}} name\n * @returns {{void}}\n */\n\
-             /** @type {{{alias}}} */\nconst f = (name) => {{}};\nf('ok');",
+            "/** @callback {alias}\n{parameter_tag} * @returns {{void}}\n */\n\
+             /** @type {{{alias}}} */\nconst f = ({parameters}) => {{}};\n{call}",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(36);
-        let mut binder = CanonicalBinder::new();
-        binder
-            .bind_source_file_with_facts(
-                &parsed.arena,
-                parsed.source_file,
-                file,
-                CanonicalSourceFileFacts::new(
-                    EscapedName::source("\"/project/input.js\""),
-                    CanonicalSourceLanguage::JavaScript,
-                    false,
-                    CanonicalModuleState::Script,
-                ),
-            )
-            .unwrap();
-        binder
-            .bind_javascript_declaration_slice(&parsed.arena, file)
-            .unwrap();
-        let mut context = CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
+        let mut context = javascript_context(
+            &parsed,
+            file,
             CanonicalCheckerOptions {
                 no_implicit_any: true,
                 ..CanonicalCheckerOptions::default()
             },
-        )
-        .unwrap();
+        );
         let (name, arrow) = parsed
             .arena
             .iter()
@@ -493,11 +524,13 @@ fn callback_alias_keeps_declared_and_arrow_type_identities() {
         let initializer = context.get_type_at_location(arrow).unwrap();
         assert_ne!(declared, initializer);
         assert_eq!(context.type_to_string(declared).unwrap(), alias);
-        assert_eq!(
-            context.type_to_string(initializer).unwrap(),
-            "(name: string) => void"
-        );
+        assert_eq!(context.type_to_string(initializer).unwrap(), display);
         assert!(context.is_type_assignable_to(declared, declared).unwrap());
+        assert!(
+            context
+                .is_type_assignable_to(initializer, declared)
+                .unwrap()
+        );
         let [declared_signature, arrow_signature] = [declared, initializer].map(|type_| {
             let TypeData::Object(object) = context.store().type_payload(type_).unwrap().data()
             else {
@@ -506,6 +539,10 @@ fn callback_alias_keeps_declared_and_arrow_type_identities() {
             object.structured.signatures.as_ref().unwrap()[0]
         });
         assert_ne!(declared_signature, arrow_signature);
+        assert_eq!(
+            context.store().signature(arrow_signature).unwrap().flags(),
+            SignatureFlags::NONE
+        );
         assert_eq!(
             context
                 .get_return_type_of_signature(declared_signature)
@@ -516,5 +553,14 @@ fn callback_alias_keeps_declared_and_arrow_type_identities() {
         assert_eq!(context.get_type_at_location(name).unwrap(), declared);
         assert_eq!(context.get_type_at_location(arrow).unwrap(), initializer);
         assert_eq!(context.type_to_string(declared).unwrap(), alias);
+        assert_eq!(
+            context.store().signature(arrow_signature).unwrap().flags(),
+            SignatureFlags::NONE
+        );
+        assert!(
+            context
+                .is_type_assignable_to(initializer, declared)
+                .unwrap()
+        );
     }
 }
