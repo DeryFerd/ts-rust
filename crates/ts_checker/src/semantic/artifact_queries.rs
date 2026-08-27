@@ -3325,11 +3325,11 @@ mod tests {
                 Err(CanonicalArtifactQueryError::ForeignNode(foreign_name)),
             );
             let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
-            assert!(
-                context
-                    .store_mut_for_test()
-                    .set_symbol_flags(symbol, SymbolFlags::FUNCTION_SCOPED_VARIABLE,)
-            );
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                symbol,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                CheckFlags::NONE,
+            ));
             assert!(matches!(
                 context.get_type_at_location(name),
                 Err(CanonicalArtifactQueryError::SourceCheck(_)),
