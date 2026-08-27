@@ -1236,6 +1236,17 @@ fn validate_symbol(
     let canonical = store
         .get_merged_symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+    if let Some(wrapper) = store.source_file_namespace_wrapper_for_module(symbol) {
+        if canonical != symbol
+            || !super::alias_provider::source_file_namespace_wrapper_is_exact(store, wrapper)
+        {
+            return Err(SymbolDisplayError::InvalidSymbol(symbol));
+        }
+        // A namespace wrapper shares source declarations but keeps its own aliases.
+        validate_symbol(store, host, wrapper.source.module)?;
+        validate_symbol(store, host, wrapper.source.alias)?;
+        return Ok(symbol);
+    }
     if record.flags().contains(SymbolFlags::CLASS)
         && record.declarations().is_none_or(<[NodeRef]>::is_empty)
     {
@@ -1339,6 +1350,13 @@ fn validated_parent(
     let Some(parent) = store.get_parent_of_symbol(symbol) else {
         return Ok(None);
     };
+    // Namespace wrappers reuse exports. They do not own source declarations.
+    if store
+        .source_file_namespace_wrapper_for_module(parent)
+        .is_some()
+    {
+        return Err(SymbolDisplayError::InvalidSymbol(symbol));
+    }
     validate_symbol(store, host, parent)?;
     let owner = store
         .symbol(parent)

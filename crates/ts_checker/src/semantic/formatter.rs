@@ -1839,14 +1839,7 @@ fn display_validated_module_namespace(
                     state,
                 )?
             } else {
-                // An alias for the bare module does not name its wrapped view.
-                let name = display_module_import_name(
-                    location,
-                    wrapper.source.module,
-                    state.format_flags,
-                )?;
-                state.add(name.len().saturating_add(1).saturating_mul(2));
-                name
+                display_location_symbol_name(store, host, owner, SymbolFlags::VALUE, state)?
             };
             state.add(7);
             return Ok(Some(format!("typeof {name}")));
@@ -5614,9 +5607,13 @@ fn display_location_symbol_name(
             && symbol_display::is_external_module(store, host, symbol)
                 .map_err(TypeDisplayUnavailable::SymbolDisplay)?
         {
+            // Alias selection keeps the wrapper identity. Its file path is shared.
+            let module = store
+                .source_file_namespace_wrapper_for_module(symbol)
+                .map_or(symbol, |wrapper| wrapper.source.module);
             result.push_str(&display_module_import_name(
                 location,
-                symbol,
+                module,
                 state.format_flags,
             )?);
             continue;
@@ -11608,6 +11605,119 @@ mod tests {
             }
             assert!(context.diagnostics().is_empty());
         }
+    }
+
+    #[test]
+    fn namespace_wrapper_symbol_chains_keep_source_ownership() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let target = parse_source_file(
+            "export const value: number = 1; function hidden(value: string): string { return value; }",
+        );
+        let wrapped = parse_source_file(
+            "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
+        );
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        let (mut context, queries) =
+            namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+        let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+        for query in queries {
+            context.check_source_file(query.file).unwrap();
+        }
+        let namespace = context
+            .store()
+            .type_payload(types[0])
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let wrapper = context
+            .store()
+            .source_file_namespace_wrapper_for_module(namespace)
+            .cloned()
+            .unwrap();
+        let value = context
+            .store()
+            .symbol_table(wrapper.source.exports.unwrap())
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        let hidden = target
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::FunctionDeclaration(function) = &node.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    target.arena.id(),
+                    wrapper.source.declaration.file,
+                    function.body.unwrap(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .artifact_symbol_chain(namespace, queries[0])
+                .unwrap(),
+            [wrapper.source.alias],
+        );
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                [store.type_len(), store.symbol_len(), store.signature_len()],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                [namespace, value].map(|symbol| {
+                    let record = store.symbol(symbol).unwrap();
+                    (
+                        record.members(),
+                        record.exports(),
+                        record.parent(),
+                        record.export_symbol(),
+                    )
+                }),
+                store.alias_symbol_links(wrapper.source.alias).cloned(),
+            )
+        };
+        for (symbol, location, wrong_parent) in [
+            (namespace, queries[0], wrapper.source.module),
+            (value, hidden, namespace),
+        ] {
+            let chain = context.artifact_symbol_chain(symbol, location).unwrap();
+            let record = context.store().symbol(symbol).unwrap();
+            let (members, exports, parent, exported) = (
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            );
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                symbol,
+                members,
+                exports,
+                Some(wrong_parent),
+                exported,
+            ));
+            let before = snapshot(context.store());
+            for _ in 0..2 {
+                assert!(context.artifact_symbol_chain(symbol, location).is_err());
+                assert_eq!(snapshot(context.store()), before);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_relationships(symbol, members, exports, parent, exported,)
+            );
+            assert_eq!(
+                context.artifact_symbol_chain(symbol, location).unwrap(),
+                chain
+            );
+        }
+        assert_eq!(
+            context.get_type_from_type_node(queries[0]).unwrap(),
+            types[0]
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
