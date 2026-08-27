@@ -52,7 +52,10 @@ use super::{
     relation::RelationStateSnapshot,
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{SemanticStore, SourceNodeParent},
-    structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
+    structured_members::{
+        InterfaceHeritageMembersValidation, inherited_generic_property_reference,
+        validate_interface_heritage_members,
+    },
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
         ConstituentMapState, ConstrainedTypeData, InterfaceTypeData, LiteralValue, ObjectTypeData,
@@ -2547,16 +2550,41 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                 .as_deref()
                                 .unwrap_or_default()
                             {
-                                let property_type = self
+                                let links = self
                                     .value_symbol_links(*property)
-                                    .and_then(|links| links.resolved_type)
                                     .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
-                                self.validate_cached_array_capability_worker(
-                                    property_type,
-                                    array_validation,
-                                    visited,
-                                    allowed_pending,
-                                )?;
+                                if let Some(target) = links.target {
+                                    let reference = inherited_generic_property_reference(
+                                        self,
+                                        type_,
+                                        *property,
+                                        array_validation.targets(),
+                                    )
+                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                                    let template = self
+                                        .value_symbol_links(target)
+                                        .and_then(|links| links.resolved_type)
+                                        .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                                    // The proxy can stay lazy, but its template and substitutions cannot be skipped.
+                                    for edge in [template, reference] {
+                                        self.validate_cached_array_capability_worker(
+                                            edge,
+                                            array_validation,
+                                            visited,
+                                            allowed_pending,
+                                        )?;
+                                    }
+                                } else if links.resolved_type.is_none() {
+                                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                                }
+                                if let Some(property_type) = links.resolved_type {
+                                    self.validate_cached_array_capability_worker(
+                                        property_type,
+                                        array_validation,
+                                        visited,
+                                        allowed_pending,
+                                    )?;
+                                }
                             }
                             return Ok(());
                         }
@@ -5951,6 +5979,415 @@ mod tests {
             .type_node_links(expression)
             .and_then(|links| links.resolved_type)
             .expect("the expression was checked")
+    }
+
+    fn inherited_graph_property(store: &TestStore) -> (TypeId, TypeId, SemanticSymbolId) {
+        let owner = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source("Derived"))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .unwrap();
+        let derived = store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(data) = store.type_payload(derived).unwrap().data() else {
+            panic!("Derived must retain its interface identity")
+        };
+        let base = data.resolved_base_types.as_ref().unwrap()[0];
+        let value = store
+            .symbol_table(data.reference.object.structured.members.unwrap())
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        (derived, base, value)
+    }
+
+    #[test]
+    fn inherited_callable_graph_keeps_proxies_lazy_and_validates_warm_values() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<T> { value: T; next(): T; } ",
+            "interface Derived extends Base<number> { own: number; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(FileId::new(192), &parsed);
+        context.check_source_file(FileId::new(192)).unwrap();
+        let store = context.store_mut_for_test();
+        let (derived, base, value) = inherited_graph_property(store);
+        let next = store
+            .type_payload(derived)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        let target = store.value_symbol_links(value).unwrap().target.unwrap();
+        let template = store.value_symbol_links(target).unwrap().clone();
+        let snapshot = |store: &TestStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for warm in [false, true] {
+            if warm {
+                for name in ["value", "next"] {
+                    store
+                        .resolve_generic_interface_property(base, name, None)
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                store
+                    .value_symbol_links(value)
+                    .unwrap()
+                    .resolved_type
+                    .is_some(),
+                warm
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(next)
+                    .unwrap()
+                    .resolved_type
+                    .is_some(),
+                warm
+            );
+            let before = snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(store.validate_cached_array_capability(derived), Ok(()));
+                assert_eq!(store.validate_union_constituent(derived), Ok(()));
+                assert_eq!(snapshot(store), before);
+                assert_eq!(store.value_symbol_links(target), Some(&template));
+                assert_eq!(
+                    store
+                        .value_symbol_links(value)
+                        .unwrap()
+                        .resolved_type
+                        .is_some(),
+                    warm
+                );
+                assert_eq!(
+                    store
+                        .value_symbol_links(next)
+                        .unwrap()
+                        .resolved_type
+                        .is_some(),
+                    warm
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation must fail before the graph reader changes any cache.
+    fn inherited_callable_graph_rejects_corrupt_proxy_and_template_caches() {
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            Target,
+            Mapper,
+            Flags,
+            Declaration,
+            MissingTemplate,
+            TemplateType,
+            CachedValue,
+            ExtraLink,
+            MissingMember,
+        }
+        for warm in [false, true] {
+            for poison in [
+                Poison::Target,
+                Poison::Mapper,
+                Poison::Flags,
+                Poison::Declaration,
+                Poison::MissingTemplate,
+                Poison::TemplateType,
+                Poison::CachedValue,
+                Poison::ExtraLink,
+                Poison::MissingMember,
+            ] {
+                let parsed = parse_source_file(concat!(
+                    "interface Base<T> { value: T; } ",
+                    "interface Derived extends Base<number> { own: number; }",
+                ));
+                let mut context = checker_context(FileId::new(193), &parsed);
+                context.check_source_file(FileId::new(193)).unwrap();
+                let store = context.store_mut_for_test();
+                let (derived, base, value) = inherited_graph_property(store);
+                if warm {
+                    store
+                        .resolve_generic_interface_property(base, "value", None)
+                        .unwrap()
+                        .unwrap();
+                }
+                assert_eq!(store.validate_cached_array_capability(derived), Ok(()));
+                let mut links = store.value_symbol_links(value).unwrap().clone();
+                let target = links.target.unwrap();
+                let string = store.intrinsic_bootstrap().unwrap().string_type;
+                let owner = store.type_payload(derived).unwrap().symbol().unwrap();
+                match poison {
+                    Poison::Target => {
+                        links.target = Some(owner);
+                        assert!(store.set_value_symbol_links(value, links));
+                    }
+                    Poison::Mapper => {
+                        let template = store
+                            .value_symbol_links(target)
+                            .unwrap()
+                            .resolved_type
+                            .unwrap();
+                        links.mapper =
+                            Some(store.new_type_mapper(vec![template], vec![string]).unwrap());
+                        assert!(store.set_value_symbol_links(value, links));
+                    }
+                    Poison::Flags => {
+                        let flags = store.symbol(value).unwrap().flags();
+                        assert!(store.set_symbol_flags(value, flags, CheckFlags::NONE));
+                    }
+                    Poison::Declaration => {
+                        let declaration = store.symbol(owner).unwrap().declarations().unwrap()[0];
+                        assert!(store.set_symbol_declarations(
+                            value,
+                            Some(vec![declaration]),
+                            Some(declaration)
+                        ));
+                    }
+                    Poison::MissingTemplate | Poison::TemplateType => {
+                        let mut links = store.value_symbol_links(target).unwrap().clone();
+                        links.resolved_type =
+                            matches!(poison, Poison::TemplateType).then_some(string);
+                        assert!(store.set_value_symbol_links(target, links));
+                    }
+                    Poison::CachedValue => {
+                        links.resolved_type = Some(string);
+                        assert!(store.set_value_symbol_links(value, links));
+                    }
+                    Poison::ExtraLink => {
+                        links.write_type = Some(string);
+                        assert!(store.set_value_symbol_links(value, links));
+                    }
+                    Poison::MissingMember => {
+                        assert!(
+                            store.set_structured_type_members(base, None, None, None, None, None)
+                        );
+                    }
+                }
+                let snapshot = |store: &TestStore| {
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.index_info_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    )
+                };
+                let before = snapshot(store);
+                for _ in 0..2 {
+                    assert_eq!(
+                        store.validate_cached_array_capability(derived),
+                        Err(LiteralTypeCacheError::InvalidCachedUnion(derived)),
+                        "warm={warm}, {poison:?}",
+                    );
+                    assert_eq!(
+                        store.validate_union_constituent(derived),
+                        Err(LiteralTypeCacheError::InvalidCachedUnion(derived)),
+                        "warm={warm}, {poison:?}",
+                    );
+                    assert_eq!(snapshot(store), before, "warm={warm}, {poison:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Array arguments and prepared-query ownership use the same lazy proxy.
+    fn inherited_callable_graph_preserves_array_and_prepared_query_capabilities() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; next(): T; } ",
+            "interface Derived extends Base<Array<number>> { own: number; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(FileId::new(194), &parsed);
+        context.check_source_file(FileId::new(194)).unwrap();
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let store = context.store_mut_for_test();
+        let (derived, base, value) = inherited_graph_property(store);
+        let array = validate_direct_generic_reference(store, base)
+            .unwrap()
+            .type_arguments[0];
+        let prepared = store
+            .prepare_type_query_types_with_global_types(&[], &[], &[], 0, 0, &globals)
+            .unwrap();
+        let no_targets = store.prepare_type_query_types(&[], &[], &[], 0, 0).unwrap();
+        let mut foreign = initialized(IntrinsicBootstrapOptions::default());
+        let foreign_prepared = foreign
+            .prepare_type_query_types(&[], &[], &[], 0, 0)
+            .unwrap();
+        let snapshot = |store: &TestStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for warm in [false, true] {
+            if warm {
+                let mut session = super::super::instantiate::InstantiationSession::new(
+                    super::super::instantiate::InstantiationLimits::default(),
+                );
+                assert_eq!(
+                    super::super::instantiated_members::demand_instantiated_property_type(
+                        store,
+                        base,
+                        value,
+                        Some(targets),
+                        &mut session,
+                    )
+                    .unwrap(),
+                    array,
+                );
+            }
+            assert_eq!(
+                store
+                    .value_symbol_links(value)
+                    .unwrap()
+                    .resolved_type
+                    .is_some(),
+                warm
+            );
+            let before = snapshot(store);
+            assert_eq!(
+                store.validate_cached_array_capability(derived),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array)),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, derived),
+                Ok(()),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_prepared(derived, Some(&globals), &prepared),
+                Ok(()),
+            );
+            for (globals, prepared) in [
+                (None, &prepared),
+                (Some(&globals), &no_targets),
+                (None, &foreign_prepared),
+            ] {
+                assert_eq!(
+                    store.validate_cached_array_capability_prepared(derived, globals, prepared),
+                    Err(LiteralTypeCacheError::InvalidPreparedQuery),
+                );
+            }
+            assert_eq!(snapshot(store), before);
+        }
+    }
+
+    #[test]
+    fn inherited_callable_graph_checks_array_edges_in_lazy_method_templates() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value(input: T): Array<number>; } ",
+            "interface Derived extends Base<number> { own: number; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(FileId::new(195), &parsed);
+        context.check_source_file(FileId::new(195)).unwrap();
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let store = context.store_mut_for_test();
+        let (derived, base, value) = inherited_graph_property(store);
+        let target = store.value_symbol_links(value).unwrap().target.unwrap();
+        let template = store
+            .value_symbol_links(target)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let signature = store
+            .type_payload(template)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        let array = store
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let snapshot = |store: &TestStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for warm in [false, true] {
+            if warm {
+                let mut session = super::super::instantiate::InstantiationSession::new(
+                    super::super::instantiate::InstantiationLimits::default(),
+                );
+                super::super::instantiated_members::demand_instantiated_property_type(
+                    store,
+                    base,
+                    value,
+                    Some(targets),
+                    &mut session,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                store
+                    .value_symbol_links(value)
+                    .unwrap()
+                    .resolved_type
+                    .is_some(),
+                warm
+            );
+            let before = snapshot(store);
+            assert_eq!(
+                store.validate_cached_array_capability(derived),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array)),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, derived),
+                Ok(()),
+            );
+            assert_eq!(snapshot(store), before);
+            assert_eq!(
+                store
+                    .value_symbol_links(value)
+                    .unwrap()
+                    .resolved_type
+                    .is_some(),
+                warm
+            );
+        }
     }
 
     #[test]

@@ -158,6 +158,130 @@ fn interface_property_names(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Cold checks and forced replay share the source and proxy identities.
+fn generic_base_function_parameters_preserve_lazy_members_cold_and_warm() {
+    for method in ["", "; next(): T"] {
+        for (parameter_type, body, reads_inherited) in [
+            ("Derived", "return value.own;", false),
+            ("Derived", "return 1;", false),
+            ("Derived", "return value.value;", true),
+            ("Base<number>", "return value.value;", true),
+        ] {
+            let source = format!(
+                "interface Base<T> {{ value: T{method} }}\n\
+                 interface Derived extends Base<number> {{ own: number }}\n\
+                 function read(value: {parameter_type}): number {{ {body} }}\n",
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(42);
+            let mut context =
+                checker_context(&parsed, file, "/project/generic-base-callable-graph.ts");
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{parameter_type}, {body}, {method}: {error:?}"));
+            assert!(context.diagnostics().is_empty());
+            let derived = declared_type(
+                &context,
+                interface_symbol(&parsed, file, &context, "Derived"),
+            );
+            let TypeData::Interface(data) = context.store().type_payload(derived).unwrap().data()
+            else {
+                panic!("Derived must retain its interface identity")
+            };
+            let base = data.resolved_base_types.as_ref().unwrap()[0];
+            let members = context
+                .store()
+                .symbol_table(data.reference.object.structured.members.unwrap())
+                .unwrap();
+            let inherited = members.get_source("value").unwrap();
+            let next = members.get_source("next");
+            assert_eq!(next.is_some(), !method.is_empty());
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(inherited)
+                    .unwrap()
+                    .resolved_type,
+                reads_inherited.then_some(number),
+            );
+            if let Some(next) = next {
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(next)
+                        .unwrap()
+                        .resolved_type
+                        .is_none()
+                );
+            }
+            let parameter = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == ts_ast::SyntaxKind::Parameter).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let parameter = context.file(file).unwrap().1.symbol(parameter).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .unwrap()
+                    .resolved_type,
+                Some(if parameter_type == "Derived" {
+                    derived
+                } else {
+                    base
+                }),
+            );
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                    context.store().index_info_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().relation_state_snapshot(),
+                    context.diagnostics().clone(),
+                )
+            };
+            let warm = snapshot(&context);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap_or_else(|error| {
+                    panic!("warm {parameter_type}, {body}, {method}: {error:?}")
+                });
+                assert_eq!(snapshot(&context), warm);
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(inherited)
+                        .unwrap()
+                        .resolved_type,
+                    reads_inherited.then_some(number),
+                );
+                if let Some(next) = next {
+                    assert!(
+                        context
+                            .store()
+                            .value_symbol_links(next)
+                            .unwrap()
+                            .resolved_type
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_reads() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -530,14 +654,6 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
                 "interface Base { value: number }\n",
                 "interface Derived extends Base { value: string }\n",
                 "function read(value: Derived): string { return value.value; }\n",
-            ),
-        ),
-        (
-            "generic-base",
-            concat!(
-                "interface Base<T> { value: T }\n",
-                "interface Derived extends Base<number> { own: number }\n",
-                "function read(value: Derived): number { return value.own; }\n",
             ),
         ),
         (
