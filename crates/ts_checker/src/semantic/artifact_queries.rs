@@ -3395,6 +3395,9 @@ fn supports_symbol_location(data: &NodeData) -> bool {
 }
 
 #[cfg(test)]
+mod export_equals_final_invariant_tests;
+
+#[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
