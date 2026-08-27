@@ -22903,7 +22903,7 @@ fn unresolved_ambient_import_equals_type_root(
     Some(root)
 }
 
-fn unresolved_namespace_import_read(
+pub(super) fn unresolved_namespace_import_read(
     arena: &NodeArena,
     bound: &BoundFile,
     source: SourceFileRef,

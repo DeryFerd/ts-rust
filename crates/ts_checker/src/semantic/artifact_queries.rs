@@ -14,9 +14,13 @@ use ts_binder::{
 use ts_jsnum::PseudoBigInt;
 
 use super::{
-    AliasTargetState, CanonicalAliasQueryError, CanonicalCheckerContext, DeclaredTypeError,
-    SourceCheckError, TypeData, TypeId, TypeNodeLinks,
+    AliasTargetState, CanonicalAliasQueryError, CanonicalCheckerContext,
+    CanonicalModuleResolutionLookup, DeclaredTypeError, SourceCheckError, TypeData, TypeId,
+    TypeNodeLinks,
+    alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable},
+    source::unresolved_namespace_import_read,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    source_imports::{SourceImportError, plan_top_level_named_value_import},
     type_nodes::{normalize_bigint_literal, normalize_numeric_separators},
     type_records::TypeRecord,
 };
@@ -224,10 +228,13 @@ impl CanonicalCheckerContext<'_> {
             )
         };
 
-        if let Some(LocationParent::Declaration(declaration)) = parent
-            && let Some(type_) = self.module_declaration_artifact_type(node, declaration)?
-        {
-            return Ok(type_);
+        if let Some(LocationParent::Declaration(declaration)) = parent {
+            if let Some(type_) = self.unresolved_namespace_declaration_type(node, declaration)? {
+                return Ok(type_);
+            }
+            if let Some(type_) = self.module_declaration_artifact_type(node, declaration)? {
+                return Ok(type_);
+            }
         }
 
         if let Some(type_) = self.declaration_method_artifact_type(node)? {
@@ -860,6 +867,121 @@ impl CanonicalCheckerContext<'_> {
             return Ok(None);
         };
         self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the source recovery and cache checks together.
+    fn unresolved_namespace_declaration_type(
+        &self,
+        node: NodeRef,
+        declaration: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (arena, bound, record) = self.validated_artifact_node(declaration)?;
+        let NodeData::NamespaceImport(namespace) = &record.data else {
+            return Ok(None);
+        };
+        if namespace.name != node.node {
+            return Ok(None);
+        }
+        let source = self
+            .source_file(node.file)
+            .ok_or(CanonicalArtifactQueryError::MissingFile(node.file))?;
+        if !self
+            .store()
+            .source_file_links(source)
+            .is_some_and(|links| links.type_checked)
+        {
+            return Ok(None);
+        }
+        let clause = record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+        let import = self
+            .validated_artifact_node(clause)?
+            .2
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(clause))?;
+        let NodeData::ImportDeclaration(import_data) =
+            &self.validated_artifact_node(import)?.2.data
+        else {
+            return Ok(None);
+        };
+        let specifier = NodeRef::new(import.arena, import.file, import_data.module_specifier);
+        if self.module_resolution(specifier) != CanonicalModuleResolutionLookup::Unresolved {
+            return Ok(None);
+        }
+        let alias = bound
+            .symbol(declaration)
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(declaration))?;
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol {
+            node,
+            symbol: alias,
+        };
+        let import = plan_top_level_named_value_import(arena, bound, self.store(), import)
+            .map_err(|_| invalid())?;
+        let [binding] = import.bindings.as_slice() else {
+            return Err(invalid());
+        };
+        if binding.declaration != declaration
+            || binding.local_name != node
+            || binding.alias_symbol != alias
+        {
+            return Err(invalid());
+        }
+        // Reuse the source recovery proof for this exact retained unresolved entry.
+        let failure = SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+            alias,
+            reason: CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(specifier),
+        });
+        let read = unresolved_namespace_import_read(
+            arena,
+            bound,
+            source,
+            self.store(),
+            &import,
+            binding,
+            &failure,
+        )
+        .ok_or_else(invalid)?;
+        let error_type = self
+            .store()
+            .intrinsic_bootstrap()
+            .ok_or_else(invalid)?
+            .error_type;
+        let expected = TypeNodeLinks {
+            resolved_type: Some(error_type),
+            ..TypeNodeLinks::default()
+        };
+        for cached_node in [node, declaration, read] {
+            if let Some(links) = self.store().type_node_links(cached_node)
+                && links != &TypeNodeLinks::default()
+                && links != &expected
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType {
+                    node: cached_node,
+                    type_: links.resolved_type.unwrap_or(error_type),
+                });
+            }
+            if let Some(symbol) = self
+                .store()
+                .symbol_node_links(cached_node)
+                .and_then(|links| links.resolved_symbol)
+                && symbol != alias
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol {
+                    node: cached_node,
+                    symbol,
+                });
+            }
+        }
+        if self.cached_artifact_type(read)? != Some(error_type) {
+            return Err(CanonicalArtifactQueryError::MissingType {
+                node: read,
+                kind: SyntaxKind::Identifier,
+            });
+        }
+        self.validate_artifact_type(node, error_type).map(Some)
     }
 
     fn arrow_artifact_type(
@@ -2606,6 +2728,336 @@ mod tests {
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    struct NamespaceAliasNodes {
+        declaration: NodeRef,
+        name: NodeRef,
+        specifier: NodeRef,
+        read: NodeRef,
+    }
+
+    fn namespace_alias_nodes(parsed: &ParseResult, file: FileId) -> NamespaceAliasNodes {
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::NamespaceImport(namespace) => {
+                    Some((reference(node), reference(namespace.name)))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let specifier = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ImportDeclaration(import) => Some(reference(import.module_specifier)),
+                _ => None,
+            })
+            .unwrap();
+        let read = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ExpressionStatement(statement) => Some(reference(statement.expression)),
+                _ => None,
+            })
+            .unwrap();
+        NamespaceAliasNodes {
+            declaration,
+            name,
+            specifier,
+            read,
+        }
+    }
+
+    fn namespace_alias_context(
+        parsed: &ParseResult,
+        file: FileId,
+        manifest: Option<CanonicalModuleResolutionManifestInput>,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/main.cts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let files = vec![(file, &parsed.arena)];
+        match manifest {
+            Some(manifest) => CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                files,
+                CanonicalCheckerOptions::default(),
+                manifest,
+            ),
+            None => CanonicalCheckerContext::new(
+                binder.finish(),
+                files,
+                CanonicalCheckerOptions::default(),
+            ),
+        }
+        .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold, warm, and replay queries use the same checker graph.
+    fn unresolved_namespace_alias_declaration_queries_reuse_source_recovery_cold_and_warm() {
+        for name in ["s", "renamed"] {
+            let parsed = parse_source_file(&format!("import * as {name} from 'self';\n{name};\n"));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_080);
+            let nodes = namespace_alias_nodes(&parsed, file);
+            let mut context = namespace_alias_context(
+                &parsed,
+                file,
+                Some(CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::unresolved(nodes.specifier),
+                ])),
+            );
+            let alias = context
+                .file(file)
+                .unwrap()
+                .1
+                .symbol(nodes.declaration)
+                .unwrap();
+            let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+            assert_ne!(
+                error_type,
+                context.store().intrinsic_bootstrap().unwrap().any_type
+            );
+            assert!(context.store().type_node_links(nodes.read).is_none());
+
+            assert_eq!(context.get_type_at_location(nodes.name), Ok(error_type));
+            assert_eq!(context.get_type_at_location(nodes.read), Ok(error_type));
+            assert_eq!(context.type_to_string(error_type).unwrap(), "any");
+            assert_eq!(context.get_symbol_at_location(nodes.name), Ok(Some(alias)));
+            assert_eq!(context.get_symbol_at_location(nodes.read), Ok(Some(alias)));
+            assert_eq!(
+                context.get_symbol_declarations(alias).unwrap(),
+                &[nodes.declaration]
+            );
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(alias, nodes.declaration)
+                    .unwrap(),
+                name
+            );
+            assert!(context.store().alias_symbol_links(alias).is_none());
+            assert!(context.store().value_symbol_links(alias).is_none());
+            let warm = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            for _ in 0..2 {
+                assert_eq!(context.get_type_at_location(nodes.name), Ok(error_type));
+                assert_eq!(context.get_type_at_location(nodes.read), Ok(error_type));
+                assert_eq!(context.get_symbol_at_location(nodes.name), Ok(Some(alias)));
+                assert_eq!(context.get_symbol_at_location(nodes.read), Ok(Some(alias)));
+                assert_eq!(
+                    context.module_resolution(nodes.specifier),
+                    crate::semantic::CanonicalModuleResolutionLookup::Unresolved,
+                );
+                assert!(context.store().alias_symbol_links(alias).is_none());
+                assert!(context.store().value_symbol_links(alias).is_none());
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().symbol_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.diagnostics().len(),
+                    ),
+                    warm,
+                );
+            }
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.get_type_at_location(nodes.name), Ok(error_type));
+            assert_eq!(context.get_symbol_at_location(nodes.name), Ok(Some(alias)));
+            assert!(context.store().alias_symbol_links(alias).is_none());
+            assert!(context.store().value_symbol_links(alias).is_none());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Apply each cache control to an independently checked source.
+    fn unresolved_namespace_alias_declaration_queries_reject_changed_recovery_caches() {
+        for poison in [
+            "name_type",
+            "declaration_type",
+            "read_type",
+            "read_metadata",
+            "missing_read",
+            "name_symbol",
+            "read_symbol",
+            "alias_value",
+            "alias_target",
+        ] {
+            let parsed = parse_source_file("import * as s from 'self';\ns;\n");
+            let file = FileId::new(6_081);
+            let nodes = namespace_alias_nodes(&parsed, file);
+            let mut context = namespace_alias_context(
+                &parsed,
+                file,
+                Some(CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::unresolved(nodes.specifier),
+                ])),
+            );
+            context.check_source_file(file).unwrap();
+            let alias = context
+                .file(file)
+                .unwrap()
+                .1
+                .symbol(nodes.declaration)
+                .unwrap();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let number = bootstrap.number_type;
+            let error_type = bootstrap.error_type;
+            let wrong_symbol = bootstrap.unknown_symbol;
+            match poison {
+                "name_type" | "declaration_type" | "read_type" => {
+                    let node = match poison {
+                        "name_type" => nodes.name,
+                        "declaration_type" => nodes.declaration,
+                        _ => nodes.read,
+                    };
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                "read_metadata" => assert!(context.store_mut_for_test().set_type_node_links(
+                    nodes.read,
+                    TypeNodeLinks {
+                        resolved_type: Some(error_type),
+                        outer_type_parameters: Some(Vec::new()),
+                    },
+                )),
+                "missing_read" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(nodes.read, TypeNodeLinks::default(),)
+                ),
+                "name_symbol" | "read_symbol" => {
+                    let node = if poison == "name_symbol" {
+                        nodes.name
+                    } else {
+                        nodes.read
+                    };
+                    assert!(context.store_mut_for_test().set_symbol_node_links(
+                        node,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(wrong_symbol),
+                        }
+                    ));
+                }
+                "alias_value" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    alias,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                "alias_target" => assert!(context.store_mut_for_test().set_alias_symbol_links(
+                    alias,
+                    AliasSymbolLinks {
+                        immediate_target: Some(wrong_symbol),
+                        alias_target: AliasTargetState::Resolved(wrong_symbol),
+                        ..AliasSymbolLinks::default()
+                    }
+                )),
+                _ => unreachable!("every recovery cache control is covered"),
+            }
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().alias_symbol_links(alias).cloned(),
+                    context.store().value_symbol_links(alias).cloned(),
+                    [nodes.name, nodes.declaration, nodes.read].map(|node| {
+                        (
+                            context.store().type_node_links(node).cloned(),
+                            context.store().symbol_node_links(node).cloned(),
+                        )
+                    }),
+                    context.diagnostics().len(),
+                )
+            };
+            let before = state(&context);
+            assert!(
+                matches!(
+                    context.get_type_at_location(nodes.name),
+                    Err(CanonicalArtifactQueryError::InvalidType { .. }
+                        | CanonicalArtifactQueryError::InvalidSymbol { .. }
+                        | CanonicalArtifactQueryError::MissingType { .. })
+                ),
+                "recovery cache control {poison} was accepted"
+            );
+            assert_eq!(
+                state(&context),
+                before,
+                "recovery cache control {poison} changed state"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_namespace_alias_declaration_queries_require_exact_manifest_evidence() {
+        let parsed = parse_source_file("import * as s from 'self';\ns;\n");
+        let file = FileId::new(6_082);
+        let nodes = namespace_alias_nodes(&parsed, file);
+        for manifest in [None, Some(CanonicalModuleResolutionManifestInput::new([]))] {
+            let mut context = namespace_alias_context(&parsed, file, manifest);
+            let before = context.module_resolution(nodes.specifier);
+            assert!(context.get_type_at_location(nodes.name).is_err());
+            assert_eq!(context.module_resolution(nodes.specifier), before);
+        }
+        let mut context = namespace_alias_context(
+            &parsed,
+            file,
+            Some(CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::unresolved(nodes.specifier),
+            ])),
+        );
+        let foreign = parse_source_file("import * as s from 'self';\ns;\n");
+        let foreign_name = NodeRef::new(foreign.arena.id(), file, nodes.name.node);
+        assert_eq!(
+            context.get_type_at_location(foreign_name),
+            Err(CanonicalArtifactQueryError::ForeignNode(foreign_name))
+        );
+        assert!(context.store().type_node_links(nodes.read).is_none());
+
+        let unsupported = parse_source_file("import * as s from 'missing';\ns;\n");
+        let nodes = namespace_alias_nodes(&unsupported, file);
+        let mut context = namespace_alias_context(
+            &unsupported,
+            file,
+            Some(CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::unresolved(nodes.specifier),
+            ])),
+        );
+        assert!(matches!(
+            context.get_type_at_location(nodes.name),
+            Err(CanonicalArtifactQueryError::SourceCheck(_))
+        ));
     }
 
     #[test]
