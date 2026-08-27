@@ -96,8 +96,15 @@ Resolved file names are selected lookup paths, not a guarantee that realpath
 was called. Original file names remain the lookup candidates before optional
 realpath handling. These fields do not close the `source_real_paths` gap.
 
-A known mismatch remains for nested package imports such as `"#dep": "pkg"`
-through a symlink outside `node_modules`. Rust retains `externalLibraryImport`
-as true where the pinned Go outer result is false. This mismatch predates the
-symlink change and is separate from this input-evidence work. These reports do
-not certify full module-resolution parity.
+Nested package imports such as `"#dep": "pkg"` now classify
+`externalLibraryImport` from the selected nested target path. A symlink target
+outside `node_modules` therefore produces false when symlinks are not preserved.
+The 192-case comparison matches pinned Go, with 18 corrected flags and no changes
+to Rust paths, host calls, retained inputs, or modes. Earlier input-evidence
+reports still describe the commits they tested.
+
+Broader module-resolution differences remain. Under NodeNext, explicitly
+disabling package imports blocks `#dep` in Rust but not in pinned Go. For nested
+imports without a changed realpath, Go can call `Realpath` again at each outer
+resolution, while Rust calls it once. The flag repair does not change those
+behaviors or establish full module-resolution or host-call parity.
