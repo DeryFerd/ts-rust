@@ -5943,7 +5943,7 @@ mod tests {
                 }
                 let first_symbol = context.file(file).unwrap().1.symbol(members[0].0).unwrap();
                 let owner = context.store().get_parent_of_symbol(first_symbol).unwrap();
-                let mut types = Vec::new();
+                let mut results = Vec::new();
                 for ((declaration, name), expected) in members.iter().zip(expected) {
                     let symbol = context.file(file).unwrap().1.symbol(*declaration).unwrap();
                     let type_ = context.get_type_at_location(*name).unwrap();
@@ -5954,7 +5954,7 @@ mod tests {
                     );
                     assert_eq!(context.get_type_at_location(*declaration).unwrap(), type_);
                     assert_eq!(context.get_symbol_at_location(*name).unwrap(), Some(symbol));
-                    types.push(type_);
+                    results.push(type_);
                 }
                 assert!(context.store().declared_type_links(owner).is_none());
                 assert!(context.store().value_symbol_links(owner).is_none());
@@ -5965,7 +5965,7 @@ mod tests {
                     context.store().checker_link_allocated_lengths(),
                     context.diagnostics().len(),
                 );
-                for ((_, name), expected) in members.iter().zip(types) {
+                for ((_, name), expected) in members.iter().zip(results) {
                     assert_eq!(context.get_type_at_location(*name).unwrap(), expected);
                 }
                 assert_eq!(
@@ -6014,7 +6014,7 @@ mod tests {
                 let number = context.store().intrinsic_bootstrap().unwrap().number_type;
                 let string = context.store().intrinsic_bootstrap().unwrap().string_type;
                 match poison {
-                    0 | 1 | 2 => {
+                    0..=2 => {
                         let (node, wrong) = match poison {
                             0 => (members[0].1, string),
                             1 => (members[2].3, number),
