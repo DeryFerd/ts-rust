@@ -229,6 +229,56 @@ class CachePathTests(unittest.TestCase):
                     output=self.directory / f"oracle-output-{index}",
                 )
 
+    def test_missing_intermediate_config_parent_is_not_normalized_away(self) -> None:
+        link, target, _, _ = self.config_link()
+        missing = target.parent / "missing"
+        config = missing / ".." / target.name
+        absolute_link = link.parent / "absolute-missing-parent.json"
+        absolute_link.symlink_to(config)
+        relative_link = link.parent / "relative-missing-parent.json"
+        relative_link.symlink_to(
+            Path(os.path.relpath(target.parent, link.parent)) / "missing" / ".." / target.name,
+        )
+        directory_link = link.parent / "missing-parent-directory"
+        directory_link.symlink_to(missing / "..", target_is_directory=True)
+        for index, config in enumerate([
+            config, absolute_link, relative_link, directory_link / target.name,
+        ]):
+            with self.subTest(config=config):
+                self.assert_rejected(
+                    None, "Config parent directories must exist", config=config,
+                    output=self.directory / f"oracle-output-{index}",
+                )
+        self.assertFalse(missing.exists())
+
+    def test_existing_intermediate_config_parent_keeps_requested_paths(self) -> None:
+        link, target, requested_root, physical_root = self.config_link(
+            requested_git=True, physical_git=True,
+        )
+        existing = target.parent / "existing"
+        existing.mkdir()
+        for name in [target.name, "absent.json"]:
+            config = existing / ".." / name
+            config_link = link.parent / f"parent-{name}"
+            config_link.symlink_to(
+                Path(os.path.relpath(target.parent, link.parent)) / "existing" / ".." / name,
+            )
+            for index, config in enumerate([config, config_link]):
+                with self.subTest(config=config):
+                    output = self.directory / f"oracle-output-{name}-{index}"
+                    result = self.run_helper(None, config=config, output=output)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    manifest = json.loads((output / "build.json").read_text())
+                    self.assertEqual(manifest["project"]["config_path"], str(config))
+                    self.assertEqual(
+                        manifest["project"]["root"],
+                        str(requested_root if config == config_link else physical_root),
+                    )
+                    self.assertEqual(manifest["state"], "prepared")
+                    self.assertIsNone(manifest["go"]["version"])
+                    self.assertIsNone(manifest["executable"])
+        self.assertFalse((target.parent / "absent.json").exists())
+
     def test_missing_config_file_with_existing_parent_remains_preparable(self) -> None:
         link, target, _, physical_root = self.config_link(physical_git=True)
         missing = target.parent / "absent.json"
