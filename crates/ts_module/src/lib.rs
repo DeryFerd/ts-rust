@@ -410,6 +410,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             specifier_uses_ts_extension: is_typescript_extension(specifier),
             candidate_ending_is_from_config: false,
             active_package_targets: BTreeSet::new(),
+            external_library_classification: ExternalLibraryClassification::LookupCandidate,
         };
         state.import_condition = mode.map_or_else(
             || state.use_import_condition(containing_file),
@@ -455,6 +456,12 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             {
                 self.apply_realpath(&mut resolved);
             }
+            // Go classifies the outer import from the nested target's selected path.
+            if state.external_library_classification == ExternalLibraryClassification::NestedTarget
+            {
+                resolved.is_external_library_import =
+                    resolved.resolved_file_name.contains("/node_modules/");
+            }
             resolved
         });
         let result = ResolutionResult {
@@ -487,6 +494,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             specifier_uses_ts_extension: is_typescript_extension(name),
             candidate_ending_is_from_config: false,
             active_package_targets: BTreeSet::new(),
+            external_library_classification: ExternalLibraryClassification::LookupCandidate,
         };
         state.import_condition = state.use_import_condition(containing_file);
         let containing_directory = directory_path(containing_file);
@@ -558,6 +566,13 @@ struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     specifier_uses_ts_extension: bool,
     candidate_ending_is_from_config: bool,
     active_package_targets: BTreeSet<(String, String)>,
+    external_library_classification: ExternalLibraryClassification,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExternalLibraryClassification {
+    LookupCandidate,
+    NestedTarget,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1055,6 +1070,9 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 .or_else(|| self.resolve_from_type_roots(specifier, package_directory))
         };
         self.active_package_targets.remove(&key);
+        if resolved.is_some() {
+            self.external_library_classification = ExternalLibraryClassification::NestedTarget;
+        }
         resolved
     }
 
