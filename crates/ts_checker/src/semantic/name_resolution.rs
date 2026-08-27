@@ -85,6 +85,7 @@ pub struct ProductionNameResolverHost<'store, 'arena> {
     sources: ProductionNameResolverSources<'arena>,
     options: CanonicalNameResolverOptions,
     spelling_suggestions: bool,
+    validate_class_enum_sources: bool,
 }
 
 /// Why a source set cannot back production name resolution.
@@ -250,6 +251,7 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             sources: ProductionNameResolverSources::Retained(retained),
             options,
             spelling_suggestions: false,
+            validate_class_enum_sources: false,
         })
     }
 
@@ -276,12 +278,19 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             sources: ProductionNameResolverSources::Registry(sources),
             options,
             spelling_suggestions: false,
+            validate_class_enum_sources: false,
         })
     }
 
     /// Enables upstream spelling lookup without changing ordinary resolution.
     pub(super) const fn with_spelling_suggestions(mut self) -> Self {
         self.spelling_suggestions = true;
+        self
+    }
+
+    /// Checks class and enum sources before their flags can filter a name lookup.
+    pub(super) const fn with_class_enum_source_validation(mut self) -> Self {
+        self.validate_class_enum_sources = true;
         self
     }
 
@@ -325,11 +334,24 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             .store
             .get_merged_symbol(raw)
             .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(raw))?;
-        let flags = self
+        let record = self
             .store
             .symbol(symbol)
-            .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(symbol))?
-            .flags();
+            .ok_or(CanonicalNameResolutionError::InvalidHostSymbol(symbol))?;
+        let flags = record.flags();
+        if self.validate_class_enum_sources
+            && (flags
+                | self
+                    .store
+                    .source_symbol_flags(symbol)
+                    .unwrap_or(SymbolFlags::NONE))
+            .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
+            && (record.name() != name
+                || !self.store.source_symbol_declarations_match(symbol)
+                || !self.store.source_merged_symbol_declarations_match(symbol))
+        {
+            return Err(CanonicalNameResolutionError::InvalidHostSymbol(symbol));
+        }
         if flags.intersects(meaning) {
             return Ok(Some(symbol));
         }

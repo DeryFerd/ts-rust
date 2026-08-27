@@ -2534,6 +2534,13 @@ impl CanonicalCheckerContext<'_> {
         let mut host = self
             .name_resolver_host(self.options().name_resolution)
             .map_err(DeclaredTypeError::from)?;
+        if matches!(
+            record.parent.and_then(|parent| arena.get(parent)).map(|parent| &parent.data),
+            Some(NodeData::ExportAssignment(export))
+                if export.is_export_equals && export.expression == node.node
+        ) {
+            host = host.with_class_enum_source_validation();
+        }
         let symbol =
             CanonicalNameResolver::new(arena, bound, self.store().symbol_store(), &mut host)
                 .map_err(DeclaredTypeError::from)?

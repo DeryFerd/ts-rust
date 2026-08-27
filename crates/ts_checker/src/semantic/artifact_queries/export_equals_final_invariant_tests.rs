@@ -1074,3 +1074,37 @@ fn export_equals_final_invariant_class_flags_cannot_hide_from_value_lookup() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn export_equals_type_only_locals_do_not_hide_a_global_class_value() {
+    for local in [
+        "interface Value { other: string; } export = Value;",
+        "type Value = string; export = Value;",
+    ] {
+        with_sources(
+            &[
+                (
+                    "declare class Value { value: number; }",
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+                (local, true, CanonicalModuleState::External),
+            ],
+            1,
+            |context, fixture| {
+                let owner = fixture.owner(context, "Value");
+                assert!(
+                    context
+                        .store()
+                        .symbol(owner)
+                        .unwrap()
+                        .flags()
+                        .contains(SymbolFlags::CLASS)
+                );
+                context.get_nongeneric_class_members(owner).unwrap();
+                let (declared, value) = identities(context, owner);
+                assert_healthy(context, fixture, owner, declared, value);
+            },
+        );
+    }
+}
