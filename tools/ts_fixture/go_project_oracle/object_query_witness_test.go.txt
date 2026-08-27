@@ -89,9 +89,11 @@ func TestObjectQueryWitnessAcceptsObservedProducers(t *testing.T) {
 	}{
 		{"empty", `const object = {};`, 1, 0},
 		{"properties", `const object = {number: 1, text: "a", truth: true, value: null};`, 1, 4},
+		{"boolean_literal_cache", `const object = {truth: true as true, falsity: false as false};`, 1, 2},
 		{"nested", `const object = {child: {value: 1}, other: {}};`, 3, 1},
 		{"parenthesized", `const object = ({child: ({value: 1})});`, 2, 1},
 		{"function_cache", `function stable(value: number): number { return value; } const object = {fn: stable};`, 1, 1},
+		{"boolean_function_cache", `function stable(value: boolean): boolean { return value; } const object = {fn: stable};`, 1, 1},
 		{"shorthand_function", `function stable(value: number): number { return value; } const object = {stable};`, 1, 1},
 		{"any_cache", `const object = {value: 1 as any};`, 1, 1},
 	} {
@@ -143,6 +145,126 @@ func TestObjectQueryWitnessRejectsSameTextMutations(t *testing.T) {
 				if anyText != errorText || !identical {
 					t.Fatalf("the pinned any/error control changed: %q / %q / %v", anyText, errorText, identical)
 				}
+			}
+		})
+	}
+}
+
+func TestObjectQueryWitnessRejectsColdWindowMutations(t *testing.T) {
+	for _, mutation := range []string{
+		"boolean_regular_value", "boolean_false_value", "boolean_regular_header", "boolean_regular_id", "boolean_regular_links",
+		"boolean_fresh_value", "boolean_fresh_owner", "boolean_fresh_links",
+		"boolean_union_constraint", "boolean_union_regular", "boolean_union_without_abstract",
+		"boolean_union_property_cache", "boolean_union_constituent_map",
+		"signature", "signature_and_cache", "function_base_constraint", "function_instantiations", "function_without_abstract",
+	} {
+		windows := []string{"before_cold_close", "after_cold_close", "after_both_closes"}
+		if mutation == "boolean_union_regular" {
+			// This cache changes later queries, so first render both passes.
+			windows = []string{"after_both_closes"}
+		}
+		for _, window := range windows {
+			t.Run(mutation+"/"+window, func(t *testing.T) {
+				source := `function stable(value: number): number { return value; } const object = {fn: stable};`
+				if strings.HasPrefix(mutation, "boolean_") {
+					source = `const object = {truth: true};`
+				}
+				c, node := objectWitnessFixture(t, source, "ts")
+				pass, err := c.ProjectOracleBeginObjectPass()
+				if err != nil {
+					t.Fatal(err)
+				}
+				typ, cold, err := c.ProjectOracleObjectQuery(pass, node)
+				if err != nil {
+					t.Fatal(err)
+				}
+				coldText := c.TypeToString(typ)
+				mutate := func() {
+					t.Helper()
+					if err := c.ProjectOracleObjectWitnessTestMutate(cold, mutation); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if window == "before_cold_close" {
+					mutate()
+				}
+				if err := c.ProjectOracleEndObjectPass(pass); err != nil {
+					t.Fatal(err)
+				}
+				if window == "after_cold_close" {
+					mutate()
+				}
+				_, warm, warmText := objectWitnessObserve(t, c, node, "")
+				if window == "after_both_closes" {
+					mutate()
+				}
+				if coldText != warmText {
+					t.Fatalf("mutation must keep artifact text equal: %q / %q", coldText, warmText)
+				}
+				result := c.ProjectOracleVerifyObjectsAfterArtifacts(cold, warm)
+				objectWitnessLog(t, result)
+				if result.State != "rejected" || result.Relation.Called {
+					t.Fatalf("accepted cache data changed during %s: %+v", window, result)
+				}
+			})
+		}
+	}
+}
+
+func TestObjectQueryWitnessRequiresCreationCacheEvidence(t *testing.T) {
+	for _, mutation := range []string{
+		"boolean_regular_value", "boolean_union_constraint", "boolean_union_without_abstract", "boolean_union_property_cache",
+		"signature_cache_missing", "signature_return_unresolved", "function_base_constraint", "function_instantiations", "function_without_abstract",
+	} {
+		t.Run(mutation, func(t *testing.T) {
+			source := `function stable(value: number): number { return value; } const object = {fn: stable};`
+			if strings.HasPrefix(mutation, "boolean_") {
+				source = `const object = {truth: true};`
+			}
+			c, node := objectWitnessFixture(t, source, "ts")
+			_, seed, _ := objectWitnessObserve(t, c, node, "")
+			if err := c.ProjectOracleObjectWitnessTestMutate(seed, mutation); err != nil {
+				t.Fatal(err)
+			}
+			_, cold, _ := objectWitnessObserve(t, c, node, "")
+			_, warm, _ := objectWitnessObserve(t, c, node, "")
+			if mutation == "signature_return_unresolved" {
+				birth, closed := c.ProjectOracleObjectWitnessTestCacheEvidence(cold)
+				if birth || !closed {
+					t.Fatalf("return cache must become known only after creation: birth=%v, closed=%v", birth, closed)
+				}
+			}
+			result := c.ProjectOracleVerifyObjectsAfterArtifacts(cold, warm)
+			objectWitnessLog(t, result)
+			if result.State != "incomplete" || result.Relation.Called {
+				t.Fatalf("missing initial cache proof was accepted or reported as a later change: %+v", result)
+			}
+		})
+	}
+}
+
+func TestObjectQueryWitnessRequiresProofForLazyPredicate(t *testing.T) {
+	for _, annotated := range []bool{true, false} {
+		name, annotation, expected := "explicit_annotation", ": number", "verified"
+		if !annotated {
+			name, annotation, expected = "inferred_return", "", "incomplete"
+		}
+		t.Run(name, func(t *testing.T) {
+			c, node := objectWitnessFixture(t, `function stable(value: number)`+annotation+` { return value; } const object = {fn: stable};`, "ts")
+			_, seed, _ := objectWitnessObserve(t, c, node, "")
+			if err := c.ProjectOracleObjectWitnessTestMutate(seed, "predicate_unresolved"); err != nil {
+				t.Fatal(err)
+			}
+			_, cold, _ := objectWitnessObserve(t, c, node, "")
+			_, warm, _ := objectWitnessObserve(t, c, node, "")
+			birth, closed := c.ProjectOracleObjectWitnessTestCacheEvidence(cold)
+			if birth != annotated || !closed {
+				t.Fatalf("unexpected predicate cache evidence: birth=%v, closed=%v", birth, closed)
+			}
+			result := c.ProjectOracleVerifyObjectsAfterArtifacts(cold, warm)
+			objectWitnessLog(t, result)
+			if result.State != expected || result.Relation.Called != annotated {
+				t.Fatalf("lazy predicate proof does not match the declaration: %+v", result)
 			}
 		})
 	}

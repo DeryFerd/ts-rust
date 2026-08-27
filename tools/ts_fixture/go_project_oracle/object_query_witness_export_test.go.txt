@@ -43,13 +43,55 @@ func (c *Checker) ProjectOracleObjectWitnessTestMutate(query *ProjectOracleObjec
 			Declarations: slices.Clone(target.Declarations), ValueDeclaration: target.ValueDeclaration, Parent: target.Parent}
 	case "declarations":
 		property.Declarations = nil
-	case "signature":
+	case "signature", "signature_and_cache":
 		function := c.valueSymbolLinks.Get(property).resolvedType.AsObjectType()
 		original := function.signatures[0]
 		copy := *original
 		c.SignatureCount++
 		copy.id = SignatureId(c.SignatureCount)
 		function.signatures = []*Signature{&copy}
+		if change == "signature_and_cache" {
+			c.signatureLinks.Get(copy.declaration).resolvedSignature = &copy
+		}
+	case "signature_cache_missing":
+		function := c.valueSymbolLinks.Get(property).resolvedType.AsObjectType()
+		c.signatureLinks.Get(function.signatures[0].declaration).resolvedSignature = nil
+	case "signature_return_unresolved":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().signatures[0].resolvedReturnType = nil
+	case "predicate_unresolved":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().signatures[0].resolvedTypePredicate = nil
+	case "function_base_constraint":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().resolvedBaseConstraint = c.numberType
+	case "function_instantiations":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().instantiations = map[CacheHashKey]*Type{{}: c.numberType}
+	case "function_without_abstract":
+		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().objectTypeWithoutAbstractConstructSignatures = c.numberType
+	case "boolean_regular_value":
+		c.regularTrueType.AsLiteralType().value = false
+	case "boolean_false_value":
+		c.regularFalseType.AsLiteralType().value = true
+	case "boolean_regular_header":
+		c.regularTrueType.objectFlags |= ObjectFlagsNonInferrableType
+	case "boolean_regular_id":
+		c.regularTrueType.id++
+	case "boolean_regular_links":
+		c.regularTrueType.AsLiteralType().regularType = c.regularFalseType
+	case "boolean_fresh_value":
+		c.trueType.AsLiteralType().value = false
+	case "boolean_fresh_owner":
+		c.trueType.checker = nil
+	case "boolean_fresh_links":
+		c.falseType.AsLiteralType().freshType = c.trueType
+	case "boolean_union_constraint":
+		c.booleanType.AsUnionType().resolvedBaseConstraint = c.numberType
+	case "boolean_union_regular":
+		c.booleanType.AsUnionType().regularType = c.numberType
+	case "boolean_union_without_abstract":
+		c.booleanType.AsUnionType().objectTypeWithoutAbstractConstructSignatures = c.numberType
+	case "boolean_union_property_cache":
+		c.booleanType.AsUnionType().propertyCache = ast.SymbolTable{"hidden": c.newProperty("hidden", c.numberType)}
+	case "boolean_union_constituent_map":
+		c.booleanType.AsUnionType().constituentMap = map[*Type]*Type{c.regularTrueType: c.numberType}
 	case "error_intrinsic":
 		c.valueSymbolLinks.Get(property).resolvedType = c.errorType
 	case "query_token":
@@ -67,6 +109,14 @@ func (c *Checker) ProjectOracleObjectWitnessTestMutate(query *ProjectOracleObjec
 		return fmt.Errorf("unknown test mutation %q", change)
 	}
 	return nil
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestCacheEvidence(query *ProjectOracleObjectQueryWitness) (bool, bool) {
+	production := query.productions[query.result]
+	property := query.result.AsObjectType().properties[0]
+	_, birth := production.birth.cacheEdges[property]
+	_, closed := query.closed[query.result].cacheEdges[property]
+	return birth, closed
 }
 
 func (c *Checker) ProjectOracleObjectWitnessTestSeedFlow(node *ast.Node, typ *Type) {
