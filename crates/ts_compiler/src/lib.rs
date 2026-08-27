@@ -16588,6 +16588,66 @@ mod tests {
     }
 
     #[test]
+    fn canonical_private_helpers_keep_foreign_source_identities_fatal() {
+        let program = private_helper_composition_program(
+            PRIVATE_HELPER_COMPOUND_SOURCE,
+            "export declare function __classPrivateFieldGet(a: unknown, b: unknown, c: unknown, d: unknown): unknown;",
+            &[],
+        );
+        let source = program.source_file("/project/input.ts").unwrap();
+        let target = program
+            .source_file("/project/node_modules/tslib/tslib.d.ts")
+            .unwrap();
+        let mut context = private_write_helper_context(&program);
+        let foreign = private_write_helper_context(&program);
+        let (_, bound) = foreign.file(target.id).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let (node, _) = program.canonical_external_helper_requirements(source)[0];
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().type_resolution_len(),
+        );
+        let error = program
+            .private_import_helper_diagnostic(
+                source,
+                node,
+                super::PrivateImportHelper::Get,
+                module,
+                &mut context,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            super::CanonicalProgramCheckError::ImportHelper { error, .. }
+                if matches!(error.as_ref(),
+                    super::CanonicalImportHelperError::Export(
+                        super::CanonicalModuleExportQueryError::InvalidModule(invalid)
+                    ) if *invalid == module)
+        ));
+        assert!(!error.is_unsupported_boundary());
+        assert_eq!(
+            error.failure_class(),
+            super::CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: "INV.PROGRAM.IMPORT_HELPER",
+            }
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().type_resolution_len(),
+            ),
+            before
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn canonical_private_helpers_retain_alias_cycle_events() {
         let program = private_helper_composition_program(
             PRIVATE_HELPER_COMPOUND_SOURCE,
