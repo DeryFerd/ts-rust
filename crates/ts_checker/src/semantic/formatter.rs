@@ -8093,6 +8093,38 @@ mod tests {
     }
 
     #[test]
+    fn namespace_function_display_rejects_erased_module_identity() {
+        let parsed = parse_source_file(concat!(
+            "declare function callable(): void; ",
+            "declare namespace callable { export const value: string; }",
+        ));
+        let file = FileId::new(239);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (declaration, owner, callable) =
+            namespace_function_display_parts(&context, &parsed, file);
+        hide_namespace_value_exports(&mut context, owner);
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            owner,
+            SymbolFlags::FUNCTION,
+            CheckFlags::NONE,
+        ));
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(vec![declaration]),
+            Some(declaration),
+        ));
+        assert!(
+            context
+                .file(file)
+                .unwrap()
+                .1
+                .is_not_const_enum_only_module(owner)
+        );
+        assert_malformed_display_without_writes(&context, callable);
+    }
+
+    #[test]
     fn namespace_function_display_rejects_another_namespaces_declaration() {
         let parsed = parse_source_file(concat!(
             "declare function callable(): void; ",
