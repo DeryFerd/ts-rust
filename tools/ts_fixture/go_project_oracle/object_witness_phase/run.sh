@@ -45,7 +45,7 @@ git -C "$repo" diff --exit-code a84de244261ba1389603494fb7b97d510154355a -- \
   tools/ts_fixture/go_project_oracle/baseline_hooks.go.txt tools/ts_fixture/go_project_oracle/baseline_hooks.patch \
   tools/ts_fixture/go_project_oracle/checker_replay.go.txt
 git -C "$repo" diff --exit-code 8bbd956142eb30920c28a736cb0c4de7fa12ad34 -- tools/ts_fixture/go_project_oracle/phase_correct
-git -C "$repo" diff --exit-code a84de244261ba1389603494fb7b97d510154355a -- \
+git -C "$repo" diff --exit-code 5251b6ba8695702a670862c0d4f2b44dba39bf5e -- \
   tools/ts_fixture/go_project_oracle/object_query_witness.go.txt \
   tools/ts_fixture/go_project_oracle/object_query_witness_checker.patch \
   tools/ts_fixture/go_project_oracle/object_query_witness_relation.patch \
@@ -110,7 +110,7 @@ jq --arg version "$version" --arg go_sha "$(hash_file "$go")" --argjson environm
     .build.arguments=$arguments | .instrumentation.overlays=$overlays[0] | .instrumentation.overlay_manifest_sha256=$overlay_sha |
     .phase_contract={report_schema_version:3,helper_sha256:$helper_sha,patch_sha256:$patch_sha,base_renderer_sha256:$base_sha,
       frozen_renderer_flag:true,independent_source_only_program:true,fresh_diagnostics:"unavailable",pointer_gate:"strict"} |
-    .object_witness_adapter={provider_commit:"b650cedf78cccd0e20782bc5df482cd6103059de",phase_base:"c0c729459fe2e6cc4c3b991dd7581aaa4bd33f23",
+    .object_witness_adapter={provider_commit:"5251b6ba8695702a670862c0d4f2b44dba39bf5e",phase_base:"c0c729459fe2e6cc4c3b991dd7581aaa4bd33f23",
       helper_sha256:$adapter_sha,walker_patch_sha256:$walker_sha,phase_patch_sha256:$phase_adapter_sha,
       provider_sha256:$provider_sha,provider_checker_patch_sha256:$provider_checker_sha,provider_relation_patch_sha256:$provider_relation_sha,
       queries:"one_provider_call_per_actual_type_query",verification:"after_both_closed_artifact_passes",acceptance:"unchanged"}
