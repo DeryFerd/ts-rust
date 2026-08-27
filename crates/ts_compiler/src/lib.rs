@@ -13,7 +13,7 @@ pub use project_graph::{
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     path::Path,
 };
 
@@ -230,6 +230,14 @@ fn compare_program_diagnostic_ranges(
     }
 }
 
+/// Why a resolved module was not admitted to the source graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalModuleTargetOmission {
+    NoResolve,
+    JavaScriptDisabled,
+    NodeModuleJavaScriptDepth { depth: u32, limit: i64 },
+}
+
 /// A typed failure from the experimental canonical diagnostics pipeline.
 ///
 /// These failures are construction boundaries, not TypeScript diagnostics. A
@@ -286,6 +294,11 @@ pub enum CanonicalProgramCheckError {
     ExternalModuleTargetUnsupported {
         specifier: NodeRef,
         target_file_name: String,
+    },
+    OmittedModuleTargetUnsupported {
+        specifier: NodeRef,
+        target_file_name: String,
+        reason: CanonicalModuleTargetOmission,
     },
     MissingResolvedModuleTarget {
         containing_file: String,
@@ -395,6 +408,9 @@ fn canonical_program_capability_code(error: &CanonicalProgramCheckError) -> Opti
         CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. } => {
             Some("M00.EXTERNAL_MODULE_TARGET")
         }
+        CanonicalProgramCheckError::OmittedModuleTargetUnsupported { .. } => {
+            Some("M00.OMITTED_MODULE_TARGET")
+        }
         CanonicalProgramCheckError::Bind { .. }
         | CanonicalProgramCheckError::DeclarationBind { .. }
         | CanonicalProgramCheckError::Context(_)
@@ -498,7 +514,8 @@ fn canonical_program_invariant_code(error: &CanonicalProgramCheckError) -> &'sta
         | CanonicalProgramCheckError::ModuleSpecifierResolutionModeUnsupported(_)
         | CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { .. }
         | CanonicalProgramCheckError::ProjectReferencesUnsupported { .. }
-        | CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. } => {
+        | CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. }
+        | CanonicalProgramCheckError::OmittedModuleTargetUnsupported { .. } => {
             "INV.PROGRAM.FAILURE_CLASSIFICATION"
         }
     }
@@ -1027,6 +1044,14 @@ impl std::fmt::Display for CanonicalProgramCheckError {
                 formatter,
                 "canonical module specifier {specifier:?} resolved to script source '{target_file_name}', whose external-module diagnostic is not yet ported"
             ),
+            Self::OmittedModuleTargetUnsupported {
+                specifier,
+                target_file_name,
+                reason,
+            } => write!(
+                formatter,
+                "canonical module specifier {specifier:?} resolved to '{target_file_name}', excluded by {reason:?}; checking this omitted target is not yet supported"
+            ),
             Self::MissingResolvedModuleTarget {
                 containing_file,
                 specifier,
@@ -1074,6 +1099,7 @@ impl std::error::Error for CanonicalProgramCheckError {
             | Self::PlainEsmModuleResolutionUnsupported { .. }
             | Self::ModuleSpecifierResolutionModeUnsupported(_)
             | Self::ExternalModuleTargetUnsupported { .. }
+            | Self::OmittedModuleTargetUnsupported { .. }
             | Self::DeclarationFileCheckingUnsupported { .. }
             | Self::ProjectReferencesUnsupported { .. }
             | Self::MissingBoundFile { .. }
@@ -1410,6 +1436,20 @@ enum SourceDependencyOrder {
     DynamicImport(TextPos),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SourceLoadKind {
+    Module(Option<SourceDependencyOrder>),
+    PathReference(TextPos),
+    TypeReference(TextPos),
+}
+
+#[derive(Clone, Debug)]
+struct SourceLoadDependency {
+    file_name: String,
+    external_library: bool,
+    kind: SourceLoadKind,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ResolvedModuleKey {
     containing_file: String,
@@ -1443,7 +1483,10 @@ pub struct Program {
     root_file_names: BTreeSet<String>,
     ordered_root_file_names: Vec<String>,
     source_dependencies: BTreeMap<FileId, Vec<(SourceDependencyOrder, FileId)>>,
+    source_node_module_depths: BTreeMap<FileId, u32>,
+    source_load_dependencies: BTreeMap<FileId, Vec<SourceLoadDependency>>,
     resolved_modules: BTreeMap<ResolvedModuleKey, String>,
+    resolved_module_loads: BTreeMap<ResolvedModuleKey, (FileId, SourceLoadDependency)>,
     graph_resolution_options: Option<ResolutionOptions>,
     graph_resolutions: Vec<ProgramGraphResolution>,
     graph_references: Vec<ProgramGraphReference>,
@@ -1843,9 +1886,14 @@ impl Program {
         self.graph_resolution_options = Some(resolution_options.clone());
         let resolver = Resolver::new(file_system, resolution_options);
         let mut ambient_modules = BTreeMap::new();
+        let mut pending_module_diagnostics = Vec::new();
         for source_file in &self.source_files {
+            self.source_node_module_depths
+                .entry(source_file.id)
+                .or_insert(0);
             register_ambient_external_modules(
                 source_file,
+                &self.options,
                 &self.current_directory,
                 self.case_sensitivity,
                 &mut ambient_modules,
@@ -1862,6 +1910,7 @@ impl Program {
             for source_file in &self.source_files[source_count_before_references..] {
                 register_ambient_external_modules(
                     source_file,
+                    &self.options,
                     &self.current_directory,
                     self.case_sensitivity,
                     &mut ambient_modules,
@@ -1869,6 +1918,7 @@ impl Program {
             }
             register_ambient_external_modules(
                 &self.source_files[file_index],
+                &self.options,
                 &self.current_directory,
                 self.case_sensitivity,
                 &mut ambient_modules,
@@ -1914,24 +1964,16 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    let target = canonicalize(
-                        &resolved.resolved_file_name,
-                        &self.current_directory,
-                        self.case_sensitivity,
-                    );
-                    self.resolved_modules.insert(
+                    self.load_resolved_module_target(
+                        file_system,
+                        containing_id,
                         ResolvedModuleKey::new(
                             containing,
                             specifier,
                             CanonicalModuleResolutionMode::Esm,
                         ),
-                        target,
-                    );
-                    self.load_file(file_system, &resolved.resolved_file_name, false);
-                    self.record_source_dependency(
-                        containing_id,
-                        &resolved.resolved_file_name,
-                        SourceDependencyOrder::JsxRuntime,
+                        &resolved,
+                        Some(SourceDependencyOrder::JsxRuntime),
                     );
                 }
             }
@@ -1967,24 +2009,16 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    let target = canonicalize(
-                        &resolved.resolved_file_name,
-                        &self.current_directory,
-                        self.case_sensitivity,
-                    );
-                    self.resolved_modules.insert(
+                    self.load_resolved_module_target(
+                        file_system,
+                        containing_id,
                         ResolvedModuleKey::new(
                             containing,
                             "tslib".to_owned(),
                             CanonicalModuleResolutionMode::CommonJs,
                         ),
-                        target,
-                    );
-                    self.load_file(file_system, &resolved.resolved_file_name, false);
-                    self.record_source_dependency(
-                        containing_id,
-                        &resolved.resolved_file_name,
-                        SourceDependencyOrder::ImportHelper,
+                        &resolved,
+                        Some(SourceDependencyOrder::ImportHelper),
                     );
                 }
             }
@@ -2085,27 +2119,18 @@ impl Program {
                         &self.current_directory,
                         self.case_sensitivity,
                     );
-                    let target = canonicalize(
-                        &resolved.resolved_file_name,
-                        &self.current_directory,
-                        self.case_sensitivity,
-                    );
-                    self.resolved_modules.insert(
-                        ResolvedModuleKey::new(containing, specifier.clone(), mode),
-                        target,
-                    );
                     let source_count_before_import = self.source_files.len();
-                    self.load_file(file_system, &resolved.resolved_file_name, false);
-                    if let Some(order) = dependency_order {
-                        self.record_source_dependency(
-                            containing_id,
-                            &resolved.resolved_file_name,
-                            order,
-                        );
-                    }
+                    self.load_resolved_module_target(
+                        file_system,
+                        containing_id,
+                        ResolvedModuleKey::new(containing, specifier.clone(), mode),
+                        &resolved,
+                        dependency_order,
+                    );
                     for source_file in &self.source_files[source_count_before_import..] {
                         register_ambient_external_modules(
                             source_file,
+                            &self.options,
                             &self.current_directory,
                             self.case_sensitivity,
                             &mut ambient_modules,
@@ -2126,11 +2151,13 @@ impl Program {
                     || self.options.skip_lib_check
                         && ts_path::is_declaration_file(&containing_file))
                 {
-                    self.diagnostics.push(if side_effect_only {
-                        side_effect_import_not_found_diagnostic(&containing_file, range, &specifier)
-                    } else {
-                        module_not_found_diagnostic(&containing_file, range, &specifier)
-                    });
+                    pending_module_diagnostics.push((
+                        containing_file.clone(),
+                        range,
+                        specifier,
+                        can_resolve_ambient,
+                        side_effect_only,
+                    ));
                 }
             }
             file_index += 1;
@@ -2138,7 +2165,158 @@ impl Program {
         for dependencies in self.source_dependencies.values_mut() {
             dependencies.sort_by_key(|(order, _)| *order);
         }
+        for (containing_file, range, specifier, can_resolve_ambient, side_effect_only) in
+            pending_module_diagnostics
+        {
+            if can_resolve_ambient && ambient_modules.contains_key(&specifier) {
+                continue;
+            }
+            self.diagnostics.push(if side_effect_only {
+                side_effect_import_not_found_diagnostic(&containing_file, range, &specifier)
+            } else {
+                module_not_found_diagnostic(&containing_file, range, &specifier)
+            });
+        }
         self.resolve_package_display_specifiers(&resolver);
+    }
+
+    fn allows_javascript_sources(&self) -> bool {
+        self.options.allow_js || self.options.check_js && !self.options.allow_js_specified
+    }
+
+    fn source_load_omission(
+        &self,
+        source: FileId,
+        dependency: &SourceLoadDependency,
+    ) -> Option<CanonicalModuleTargetOmission> {
+        if !matches!(dependency.kind, SourceLoadKind::Module(_)) {
+            return None;
+        }
+        if self.options.no_resolve {
+            return Some(CanonicalModuleTargetOmission::NoResolve);
+        }
+        if is_javascript_file_name(&dependency.file_name) {
+            if !self.allows_javascript_sources() {
+                return Some(CanonicalModuleTargetOmission::JavaScriptDisabled);
+            }
+            let depth = self
+                .source_node_module_depths
+                .get(&source)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(u32::from(dependency.external_library));
+            let limit = self.options.max_node_module_js_depth.unwrap_or(0);
+            if dependency.external_library
+                && dependency.file_name.contains("/node_modules/")
+                && i64::from(depth) > limit
+            {
+                return Some(CanonicalModuleTargetOmission::NodeModuleJavaScriptDepth {
+                    depth,
+                    limit,
+                });
+            }
+        }
+        None
+    }
+
+    fn load_source_at_node_depth(
+        &mut self,
+        file_system: &dyn FileSystem,
+        file_name: &str,
+        depth: u32,
+        report_missing: bool,
+    ) -> Option<(FileId, bool)> {
+        let previous = self.source_file(file_name).map(|source| source.id);
+        self.load_file(file_system, file_name, report_missing);
+        let target = self.source_file(file_name)?.id;
+        let old_depth = self
+            .source_node_module_depths
+            .get(&target)
+            .copied()
+            .or_else(|| previous.map(|_| 0));
+        let lowered = old_depth.is_none_or(|old| depth < old);
+        if lowered {
+            self.source_node_module_depths.insert(target, depth);
+        }
+        Some((target, lowered))
+    }
+
+    fn load_source_dependency(
+        &mut self,
+        file_system: &dyn FileSystem,
+        source: FileId,
+        dependency: SourceLoadDependency,
+    ) {
+        self.source_load_dependencies
+            .entry(source)
+            .or_default()
+            .push(dependency.clone());
+        let mut pending = VecDeque::from([(source, dependency)]);
+        while let Some((source, dependency)) = pending.pop_front() {
+            if self.source_load_omission(source, &dependency).is_some() {
+                continue;
+            }
+            let depth = self
+                .source_node_module_depths
+                .get(&source)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(u32::from(dependency.external_library));
+            let (order, report_missing) = match dependency.kind {
+                SourceLoadKind::Module(order) => (order, false),
+                SourceLoadKind::PathReference(position) => {
+                    (Some(SourceDependencyOrder::PathReference(position)), true)
+                }
+                SourceLoadKind::TypeReference(position) => {
+                    (Some(SourceDependencyOrder::TypeReference(position)), false)
+                }
+            };
+            let Some((target, lowered)) = self.load_source_at_node_depth(
+                file_system,
+                &dependency.file_name,
+                depth,
+                report_missing,
+            ) else {
+                continue;
+            };
+            if let Some(order) = order {
+                self.record_source_dependency(source, &dependency.file_name, order);
+            }
+            // A shallower route can admit previously excluded descendants.
+            // Reuse their resolved edges instead of repeating filesystem resolution.
+            if lowered && let Some(dependencies) = self.source_load_dependencies.get(&target) {
+                pending.extend(
+                    dependencies
+                        .iter()
+                        .cloned()
+                        .map(|dependency| (target, dependency)),
+                );
+            }
+        }
+    }
+
+    fn load_resolved_module_target(
+        &mut self,
+        file_system: &dyn FileSystem,
+        source: FileId,
+        key: ResolvedModuleKey,
+        resolved: &ts_module::ResolvedModule,
+        order: Option<SourceDependencyOrder>,
+    ) {
+        let target = canonicalize(
+            &resolved.resolved_file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        let dependency = SourceLoadDependency {
+            file_name: resolved.resolved_file_name.clone(),
+            external_library: resolved.is_external_library_import,
+            kind: SourceLoadKind::Module(order),
+        };
+        self.resolved_modules.insert(key.clone(), target);
+        self.resolved_module_loads
+            .insert(key, (source, dependency.clone()));
+        self.load_source_dependency(file_system, source, dependency);
     }
 
     fn record_source_dependency(
@@ -2433,7 +2611,9 @@ impl Program {
         {
             self.diagnostics.push(emit_declaration_only_diagnostic());
         }
-        let resolution_options = self.options.module_resolution_options();
+        let mut resolution_options = self.options.module_resolution_options();
+        // Resolving a JavaScript file does not imply admitting it to the Program.
+        resolution_options.allow_javascript = true;
         if !self.options.no_check && !self.root_file_names.is_empty() {
             self.load_default_libraries();
             self.load_automatic_type_directives(file_system, &resolution_options);
@@ -4466,6 +4646,16 @@ impl Program {
         &self,
     ) -> Result<CanonicalModuleResolutionManifestInput, CanonicalProgramCheckError> {
         let mut entries = Vec::new();
+        let mut ambient_modules = BTreeMap::new();
+        for source in &self.source_files {
+            register_ambient_external_modules(
+                source,
+                &self.options,
+                &self.current_directory,
+                self.case_sensitivity,
+                &mut ambient_modules,
+            );
+        }
         for source in &self.source_files {
             let specifiers = canonical_static_module_specifiers(source)?;
             if specifiers.is_empty() {
@@ -4482,7 +4672,10 @@ impl Program {
                 let usage_mode =
                     requested_mode.unwrap_or_else(|| self.canonical_emit_module_mode(source));
                 let key = ResolvedModuleKey::new(containing.clone(), text, usage_mode);
-                let Some(resolved_file_name) = self.resolved_modules.get(&key) else {
+                let ambient_target = ambient_modules.get(&key.specifier);
+                let Some(resolved_file_name) =
+                    ambient_target.or_else(|| self.resolved_modules.get(&key))
+                else {
                     entries.push(CanonicalModuleResolutionEntry::unresolved(specifier));
                     continue;
                 };
@@ -4491,6 +4684,22 @@ impl Program {
                     .get(resolved_file_name)
                     .and_then(|index| self.source_files.get(*index))
                 else {
+                    if ambient_target.is_none()
+                        && let Some((owner, dependency)) = self.resolved_module_loads.get(&key)
+                        && *owner == source.id
+                        && canonicalize(
+                            &dependency.file_name,
+                            &self.current_directory,
+                            self.case_sensitivity,
+                        ) == *resolved_file_name
+                        && let Some(reason) = self.source_load_omission(source.id, dependency)
+                    {
+                        return Err(CanonicalProgramCheckError::OmittedModuleTargetUnsupported {
+                            specifier,
+                            target_file_name: resolved_file_name.clone(),
+                            reason,
+                        });
+                    }
                     return Err(CanonicalProgramCheckError::MissingResolvedModuleTarget {
                         containing_file: source.file_name.clone(),
                         specifier,
@@ -4534,7 +4743,7 @@ impl Program {
         let supported_source = (matches!(
             source_kind,
             ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx
-        ) || (self.options.allow_js
+        ) || (self.allows_javascript_sources()
             && matches!(
                 source_kind,
                 ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
@@ -6131,7 +6340,12 @@ impl Program {
                 None,
             );
             if let Some(resolved) = result.resolved {
-                self.load_file(file_system, &resolved.resolved_file_name, false);
+                self.load_source_at_node_depth(
+                    file_system,
+                    &resolved.resolved_file_name,
+                    u32::from(resolved.is_external_library_import),
+                    false,
+                );
             } else if resolution_options
                 .types
                 .as_ref()
@@ -6142,6 +6356,7 @@ impl Program {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Keep reference order, admission, and diagnostics together.
     fn load_reference_directives_for_file(
         &mut self,
         file_system: &dyn FileSystem,
@@ -6173,7 +6388,7 @@ impl Program {
                     let file_name = resolve_reference_path(
                         file_system,
                         &unresolved_file_name,
-                        self.options.allow_js,
+                        self.allows_javascript_sources(),
                     )
                     .unwrap_or(unresolved_file_name);
                     self.graph_references.push(ProgramGraphReference {
@@ -6187,11 +6402,14 @@ impl Program {
                             file_id: None,
                         }],
                     });
-                    self.load_file(file_system, &file_name, true);
-                    self.record_source_dependency(
+                    self.load_source_dependency(
+                        file_system,
                         containing_id,
-                        &file_name,
-                        SourceDependencyOrder::PathReference(directive.range.start),
+                        SourceLoadDependency {
+                            file_name,
+                            external_library: false,
+                            kind: SourceLoadKind::PathReference(directive.range.start),
+                        },
                     );
                 }
                 ReferenceKind::Types => {
@@ -6209,11 +6427,14 @@ impl Program {
                         None,
                     );
                     if let Some(resolved) = result.resolved {
-                        self.load_file(file_system, &resolved.resolved_file_name, false);
-                        self.record_source_dependency(
+                        self.load_source_dependency(
+                            file_system,
                             containing_id,
-                            &resolved.resolved_file_name,
-                            SourceDependencyOrder::TypeReference(directive.range.start),
+                            SourceLoadDependency {
+                                file_name: resolved.resolved_file_name,
+                                external_library: resolved.is_external_library_import,
+                                kind: SourceLoadKind::TypeReference(directive.range.start),
+                            },
                         );
                     } else if !source_ignores_processing_diagnostic(
                         &self.source_files[file_index],
@@ -9761,11 +9982,15 @@ fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool, bool)>
 
 fn register_ambient_external_modules(
     source_file: &SourceFile,
+    options: &CompilerOptions,
     current_directory: &str,
     case_sensitivity: CaseSensitivity,
     modules: &mut BTreeMap<String, String>,
 ) {
-    if source_file.is_default_library || source_file_is_external_module(&source_file.parse) {
+    if source_file.is_default_library
+        || !canonical_source_file_facts(source_file, options)
+            .is_ok_and(|facts| !facts.is_external_or_common_js_module())
+    {
         return;
     }
     let Some(NodeData::SourceFile(source)) = source_file
@@ -9784,11 +10009,13 @@ fn register_ambient_external_modules(
         let NodeData::ModuleDeclaration(module) = &node.data else {
             continue;
         };
-        if !node_has_modifier(
-            &source_file.parse.arena,
-            module.modifiers.as_ref(),
-            ts_ast::SyntaxKind::DeclareKeyword,
-        ) {
+        if !ts_path::is_declaration_file(&source_file.file_name)
+            && !node_has_modifier(
+                &source_file.parse.arena,
+                module.modifiers.as_ref(),
+                ts_ast::SyntaxKind::DeclareKeyword,
+            )
+        {
             continue;
         }
         let Some((name, _)) = string_literal(&source_file.parse.arena, module.name) else {
@@ -11099,6 +11326,58 @@ mod tests {
             })
             .count();
         assert_eq!(all_target_literals, 5);
+    }
+
+    #[test]
+    fn canonical_module_manifest_requires_proven_omissions_for_unretained_targets() {
+        for admitted in [false, true] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/main.ts", "import 'dependency'; export {};")
+                .unwrap();
+            fs.write_file(
+                "/project/node_modules/dependency/package.json",
+                r#"{"main":"index.js"}"#,
+            )
+            .unwrap();
+            fs.write_file(
+                "/project/node_modules/dependency/index.js",
+                "export const value = 1;",
+            )
+            .unwrap();
+            let mut program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    no_check: true,
+                    no_lib: true,
+                    types: Some(Vec::new()),
+                    max_node_module_js_depth: Some(i64::from(admitted)),
+                    ..plain_esm_bundler_options()
+                },
+            );
+            if admitted {
+                assert!(
+                    program
+                        .file_index
+                        .remove("/project/node_modules/dependency/index.js")
+                        .is_some()
+                );
+            } else {
+                program.resolved_module_loads.clear();
+            }
+            let error = program.canonical_module_resolution_manifest().unwrap_err();
+            assert!(matches!(
+                error,
+                CanonicalProgramCheckError::MissingResolvedModuleTarget { .. }
+            ));
+            assert!(!error.failure_class().is_unsupported());
+            assert_eq!(
+                error.failure_class().code(),
+                "INV.PROGRAM.MISSING_MODULE_TARGET"
+            );
+        }
     }
 
     #[test]

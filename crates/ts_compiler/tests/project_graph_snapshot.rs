@@ -575,9 +575,14 @@ fn graph_snapshot_keeps_manifest_errors_and_no_resolve_skips() {
     let graph = program.project_graph_snapshot();
     assert!(matches!(
         graph.module_resolution_manifest,
-        Err(CanonicalProgramCheckError::ExternalModuleTargetUnsupported { .. })
+        Err(CanonicalProgramCheckError::OmittedModuleTargetUnsupported {
+            reason: ts_compiler::CanonicalModuleTargetOmission::NoResolve,
+            ..
+        })
     ));
-    assert!(graph.resolutions[0].target.is_some());
+    assert!(graph.resolutions[0].result.resolved.is_some());
+    assert!(graph.resolutions[0].target.is_none());
+    assert!(program.source_file("/project/script.ts").is_none());
     assert!(graph.references[0].skipped);
     assert!(graph.references[0].targets.is_empty());
     assert!(

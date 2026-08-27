@@ -318,6 +318,22 @@ fn manifest_failure(
             "location": manifest_node_location(program, *specifier),
             "targetFile": path_identity(target_file_name),
         }),
+        CanonicalProgramCheckError::OmittedModuleTargetUnsupported {
+            specifier,
+            target_file_name,
+            reason,
+        } => json!({
+            "kind": "omitted_module_target_unsupported",
+            "location": manifest_node_location(program, *specifier),
+            "targetFile": path_identity(target_file_name),
+            "reason": match reason {
+                ts_compiler::CanonicalModuleTargetOmission::NoResolve => json!({"kind": "no_resolve"}),
+                ts_compiler::CanonicalModuleTargetOmission::JavaScriptDisabled => json!({"kind": "javascript_disabled"}),
+                ts_compiler::CanonicalModuleTargetOmission::NodeModuleJavaScriptDepth { depth, limit } => json!({
+                    "kind": "node_module_javascript_depth", "depth": depth, "limit": limit,
+                }),
+            },
+        }),
         CanonicalProgramCheckError::MissingResolvedModuleTarget {
             containing_file,
             specifier,
