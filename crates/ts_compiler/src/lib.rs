@@ -4684,7 +4684,17 @@ impl Program {
                     .get(resolved_file_name)
                     .and_then(|index| self.source_files.get(*index))
                 else {
-                    if ambient_target.is_none()
+                    // Roots and other routes can admit a target that this edge omits.
+                    // A missing index for a retained source remains an invariant failure.
+                    let admitted = self.source_files.iter().any(|target| {
+                        canonicalize(
+                            &target.file_name,
+                            &self.current_directory,
+                            self.case_sensitivity,
+                        ) == *resolved_file_name
+                    });
+                    if !admitted
+                        && ambient_target.is_none()
                         && let Some((owner, dependency)) = self.resolved_module_loads.get(&key)
                         && *owner == source.id
                         && canonicalize(
@@ -10574,11 +10584,12 @@ mod tests {
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        CanonicalBindError, CanonicalDeclarationError, CanonicalProgramCheckError,
-        CanonicalProgramCheckFailureClass, CanonicalProgramQueries, FileId, NodeData, Program,
-        SourceFile, SyntaxKind, bind_source_file_in_file, canonical_source_file_facts,
-        defer_export_only_bundle_imports, empty_check_result, parse_source_file,
-        percent_encode_source_map_url, source_file_is_external_module,
+        CanonicalBindError, CanonicalDeclarationError, CanonicalModuleTargetOmission,
+        CanonicalProgramCheckError, CanonicalProgramCheckFailureClass, CanonicalProgramQueries,
+        FileId, NodeData, Program, ResolvedModuleKey, SourceFile, SyntaxKind,
+        bind_source_file_in_file, canonical_source_file_facts, defer_export_only_bundle_imports,
+        empty_check_result, parse_source_file, percent_encode_source_map_url,
+        source_file_is_external_module,
     };
 
     fn plain_esm_bundler_options() -> CompilerOptions {
@@ -11330,7 +11341,7 @@ mod tests {
 
     #[test]
     fn canonical_module_manifest_requires_proven_omissions_for_unretained_targets() {
-        for admitted in [false, true] {
+        for (depth_limit, explicit_root) in [(0, false), (1, false), (0, true)] {
             let fs = MemoryFileSystem::new(true);
             fs.write_file("/project/main.ts", "import 'dependency'; export {};")
                 .unwrap();
@@ -11344,19 +11355,38 @@ mod tests {
                 "export const value = 1;",
             )
             .unwrap();
+            let mut roots = vec!["main.ts".to_owned()];
+            if explicit_root {
+                roots.push("node_modules/dependency/index.js".to_owned());
+            }
             let mut program = Program::new_with_options(
                 &fs,
                 "/project",
-                &["main.ts".to_owned()],
+                &roots,
                 CompilerOptions {
                     allow_js: true,
                     no_check: true,
                     no_lib: true,
                     types: Some(Vec::new()),
-                    max_node_module_js_depth: Some(i64::from(admitted)),
+                    max_node_module_js_depth: Some(depth_limit),
                     ..plain_esm_bundler_options()
                 },
             );
+            let admitted = depth_limit > 0 || explicit_root;
+            let retained_target = program
+                .source_files
+                .iter()
+                .find(|source| source.file_name == "/project/node_modules/dependency/index.js")
+                .map(|source| source.id);
+            assert_eq!(retained_target.is_some(), admitted);
+            if explicit_root {
+                assert_eq!(
+                    program
+                        .source_node_module_depths
+                        .get(&retained_target.unwrap()),
+                    Some(&0)
+                );
+            }
             if admitted {
                 assert!(
                     program
@@ -11367,6 +11397,9 @@ mod tests {
             } else {
                 program.resolved_module_loads.clear();
             }
+            let file_index = program.file_index.clone();
+            let resolved_modules = program.resolved_modules.clone();
+            let raw_resolutions = program.graph_resolutions.clone();
             let error = program.canonical_module_resolution_manifest().unwrap_err();
             assert!(matches!(
                 error,
@@ -11377,7 +11410,94 @@ mod tests {
                 error.failure_class().code(),
                 "INV.PROGRAM.MISSING_MODULE_TARGET"
             );
+            assert_eq!(program.file_index, file_index);
+            assert_eq!(program.resolved_modules, resolved_modules);
+            assert_eq!(program.graph_resolutions, raw_resolutions);
         }
+    }
+
+    #[test]
+    fn canonical_module_manifest_keeps_later_admission_fatal_after_index_loss() {
+        let fs = MemoryFileSystem::new(true);
+        for (path, text) in [
+            (
+                "/project/main.ts",
+                "import 'dependency'; import './bridge'; export {};",
+            ),
+            (
+                "/project/bridge.ts",
+                "import './node_modules/dependency/index.js'; export {};",
+            ),
+            (
+                "/project/node_modules/dependency/package.json",
+                r#"{"main":"index.js"}"#,
+            ),
+            (
+                "/project/node_modules/dependency/index.js",
+                "export const value = 1;",
+            ),
+        ] {
+            fs.write_file(path, text).unwrap();
+        }
+        let mut program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                no_check: true,
+                no_lib: true,
+                types: Some(Vec::new()),
+                max_node_module_js_depth: Some(0),
+                ..plain_esm_bundler_options()
+            },
+        );
+        let target = "/project/node_modules/dependency/index.js";
+        let target_id = program.source_file(target).unwrap().id;
+        assert_eq!(program.source_node_module_depths.get(&target_id), Some(&0));
+        let first_edge = program
+            .resolved_module_loads
+            .get(&ResolvedModuleKey::new(
+                "/project/main.ts".to_owned(),
+                "dependency".to_owned(),
+                CanonicalModuleResolutionMode::Esm,
+            ))
+            .unwrap();
+        assert!(matches!(
+            program.source_load_omission(first_edge.0, &first_edge.1),
+            Some(CanonicalModuleTargetOmission::NodeModuleJavaScriptDepth {
+                depth: 1,
+                limit: 0
+            })
+        ));
+        assert!(program.canonical_module_resolution_manifest().is_ok());
+        let resolved_modules = program.resolved_modules.clone();
+        let raw_resolutions = program.graph_resolutions.clone();
+        assert!(program.file_index.remove(target).is_some());
+
+        let error = program.canonical_module_resolution_manifest().unwrap_err();
+        assert!(matches!(
+            &error,
+            CanonicalProgramCheckError::MissingResolvedModuleTarget {
+                containing_file,
+                resolved_file_name,
+                ..
+            } if containing_file == "/project/main.ts" && resolved_file_name == target
+        ));
+        assert!(!error.failure_class().is_unsupported());
+        assert_eq!(
+            error.failure_class().code(),
+            "INV.PROGRAM.MISSING_MODULE_TARGET"
+        );
+        assert!(!program.file_index.contains_key(target));
+        assert!(
+            program
+                .source_files
+                .iter()
+                .any(|source| source.id == target_id)
+        );
+        assert_eq!(program.resolved_modules, resolved_modules);
+        assert_eq!(program.graph_resolutions, raw_resolutions);
     }
 
     #[test]
