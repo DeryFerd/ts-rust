@@ -3399,6 +3399,26 @@ mod tests {
             ("const f = (name?: string) => {};", CanonicalSourceLanguage::TypeScript),
             ("const f = (name: string = 'value') => {};", CanonicalSourceLanguage::TypeScript),
             (
+                "/** @satisfies {() => void} */ const f = () => {}; f();",
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "/** @satisfies {any} */ const f = () => {}; f();",
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "/** @satisfies {string} */ const f = () => {};",
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "/** @type {any} */ const f = () => {};",
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "/** @type {number} */ const f = () => {};",
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
                 "/** @callback Callback\n * @returns {void}\n */\n/** @type {Callback} */ const f = () => {};",
                 CanonicalSourceLanguage::JavaScript,
             ),

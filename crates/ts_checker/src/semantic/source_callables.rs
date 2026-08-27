@@ -2775,7 +2775,8 @@ fn plan_source_callable_with_owner_shape(
         && bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
-        && is_direct_noncontextual_source_arrow(store, host, declaration)?;
+        && is_direct_noncontextual_source_arrow(store, host, declaration)?
+        && !source_arrow_has_owned_jsdoc_context(store, host, declaration)?;
     let javascript_jsdoc_function_parameter = if view.family
         == SourceCallableFamily::FunctionDeclaration
         && view.parameters.nodes.len() == 1
@@ -4493,6 +4494,36 @@ fn stored_array_sort_argument_arrow_is_exact(
             .type_node_links(property)
             .and_then(|links| links.resolved_type)
             .is_some()
+}
+
+/// Only annotations on this variable supply context to its initializer.
+fn source_arrow_has_owned_jsdoc_context(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidSyntax(declaration));
+    let Some((arena, bound)) = host.source(declaration) else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(variable)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
+    };
+    let variable_record = preflight_node(store, host, variable)?;
+    if variable_record.kind != SyntaxKind::VariableDeclaration
+        || !matches!(
+            &variable_record.data,
+            NodeData::VariableDeclaration(variable)
+                if variable.initializer == Some(declaration.node)
+        )
+    {
+        return Err(invalid());
+    }
+    let comments =
+        plan_javascript_source_jsdoc(arena, bound.source_file()).map_err(|_| invalid())?;
+    Ok(comments.declaration(variable).is_some_and(|declaration| {
+        declaration.type_().is_some() || declaration.satisfies().is_some()
+    }))
 }
 
 fn is_direct_noncontextual_source_arrow(
@@ -17426,6 +17457,18 @@ mod tests {
             ("const callback = name => {};", false, 1),
             ("const callback = (name) => {};", true, 1),
             ("const callback = () => {};", true, 0),
+            ("/** Documentation. */ const callback = () => {};", true, 0),
+            ("/** @returns {void} */ const callback = () => {};", true, 0),
+            (
+                "/** @type {number} */ const count = 1; const callback = () => {};",
+                true,
+                0,
+            ),
+            (
+                "/** @satisfies {number} */ const count = 1; const callback = () => {};",
+                true,
+                0,
+            ),
         ]
         .into_iter()
         .enumerate()
