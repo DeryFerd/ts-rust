@@ -1560,7 +1560,7 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(
                 context.symbol_to_string_at_location(first, object),
-                Err(crate::semantic::CanonicalArtifactQueryError::SymbolDisplay(
+                Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
                     SymbolDisplayError::InvalidSymbol(symbol)
                 )) if symbol == first
             ));
