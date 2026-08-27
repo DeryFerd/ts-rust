@@ -5021,6 +5021,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.instantiated_property_recoveries.get(&symbol)
     }
 
+    pub(super) fn instantiated_property_method_recovery(
+        &self,
+        type_: TypeId,
+    ) -> Option<&InstantiatedPropertyRecovery> {
+        self.instantiated_property_recoveries
+            .values()
+            .find(|recovery| recovery.is_method_result(type_))
+    }
+
     pub(super) fn try_reserve_instantiated_property_recoveries(&mut self) -> bool {
         self.instantiated_property_recoveries.try_reserve(1).is_ok()
     }

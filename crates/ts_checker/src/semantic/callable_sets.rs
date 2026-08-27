@@ -81,6 +81,9 @@ pub(super) fn validate_stored_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredCallableSetValidation {
+    if let Some(validation) = validate_stored_recovered_property_callable_set(store, type_) {
+        return validation;
+    }
     if let Some(validation) =
         super::instantiated_members::validate_instantiated_function_member_callable(store, type_)
     {
@@ -215,6 +218,222 @@ pub(super) fn validate_stored_callable_set(
     }
 
     validate_stored_intersection_callable_set(store, type_)
+}
+
+/// Recovery is a separate producer proof. Normal source and return checks stay unchanged.
+fn validate_stored_recovered_property_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let recovery = store.instantiated_property_method_recovery(type_)?;
+    let family = CallableFamily::DeclaredCallSignatures;
+    let validated = (|| {
+        let recovery = recovery.checked_identity(store)?;
+        let StoredCallableSetValidation::Valid {
+            projection: source,
+            mut edges,
+            ..
+        } = validate_stored_declared_method_callable_set(store, recovery.source_type())?
+        else {
+            return None;
+        };
+        let receiver = recovery.receiver(store)?;
+        let record = store.type_payload(type_)?;
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.symbol() != Some(recovery.method())
+            || record.alias().is_some()
+            || object.target != Some(recovery.source_type())
+            || object.mapper != Some(recovery.mapper())
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.index_infos.is_some()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+            || !source.construct_signatures.is_empty()
+            || object.structured.call_signature_count != source.call_signatures.len()
+        {
+            return None;
+        }
+        let projection =
+            validate_stored_callable_set_projection_with(store, type_, true, |signature| {
+                let target = store.signature(signature)?.target()?;
+                let source = source
+                    .call_signatures
+                    .iter()
+                    .find(|source| source.signature == target)?;
+                recovered_property_signature_parameters(store, recovery, source, signature)
+            })?;
+        if !projection.construct_signatures.is_empty()
+            || projection.call_signatures.len() != source.call_signatures.len()
+        {
+            return None;
+        }
+        edges.extend([recovery.source_type(), receiver]);
+        for signature in &projection.call_signatures {
+            for &parameter in store.signature(signature.signature)?.type_parameters() {
+                let TypeData::TypeParameter(data) = store.type_payload(parameter)?.data() else {
+                    return None;
+                };
+                edges.push(parameter);
+                edges.extend(data.constraint);
+                edges.extend(data.resolved_default_type);
+            }
+            edges.extend(&signature.parameters);
+            edges.extend(signature.rest_parameter);
+            edges.push(signature.return_type?);
+        }
+        Some((projection, edges))
+    })();
+    Some(match validated {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
+}
+
+/// Checks copied signature identities against the exact result retained by its producer.
+fn recovered_property_signature_parameters(
+    store: &CanonicalTypeMapperStore,
+    recovery: super::instantiated_members::InstantiatedPropertyRecoveryIdentity<'_>,
+    source: &ValidatedSingleCallable,
+    actual: SignatureId,
+) -> Option<Vec<TypeId>> {
+    let signature_mapper = recovery.signature_mapper(source.signature, actual)?;
+    let original = store.signature(source.signature)?;
+    let signature = store.signature(actual)?;
+    if signature.target() != Some(source.signature)
+        || signature.mapper() != Some(signature_mapper)
+        || signature.flags() != original.flags() & SignatureFlags::PROPAGATING_FLAGS
+        || signature.declaration() != original.declaration()
+        || signature.this_parameter().is_some()
+        || signature.min_argument_count() != original.min_argument_count()
+        || signature.resolved_min_argument_count() != -1
+        || signature.resolved_type_predicate().is_some()
+        || signature.isolated_signature_type().is_some()
+        || signature.composite().is_some()
+        || store.signature_has_circular_return_type(actual)
+        || signature.type_parameters().len() != original.type_parameters().len()
+        || signature.parameters().len() != original.parameters().len()
+        || signature.resolved_return_type().is_none()
+    {
+        return None;
+    }
+    if original.type_parameters().is_empty() {
+        if signature_mapper != recovery.mapper() {
+            return None;
+        }
+    } else {
+        let TypeMapperApplication::Composite { first, second } =
+            store.mapper_application(signature_mapper, original.type_parameters()[0])?
+        else {
+            return None;
+        };
+        if second != recovery.mapper()
+            || store.type_mapper_has_exact_endpoints(
+                first,
+                original.type_parameters(),
+                signature.type_parameters(),
+            ) != Some(true)
+        {
+            return None;
+        }
+        let mut unique = HashSet::with_capacity(signature.type_parameters().len());
+        for (&source, &fresh) in original
+            .type_parameters()
+            .iter()
+            .zip(signature.type_parameters())
+        {
+            let source_record = store.type_payload(source)?;
+            let fresh_record = store.type_payload(fresh)?;
+            let TypeData::TypeParameter(fresh_data) = fresh_record.data() else {
+                return None;
+            };
+            if fresh == source
+                || !unique.insert(fresh)
+                || fresh_record.flags() != TypeFlags::TYPE_PARAMETER
+                || fresh_record.symbol() != source_record.symbol()
+                || fresh_record.alias().is_some()
+                || fresh_data.is_this_type
+                || fresh_data.target != Some(source)
+                || fresh_data.mapper != Some(signature_mapper)
+                || mapped_method_type_parameter(store, signature_mapper, source) != Some(fresh)
+            {
+                return None;
+            }
+        }
+    }
+    let source_types = source
+        .parameters
+        .iter()
+        .copied()
+        .chain(source.rest_parameter)
+        .collect::<Vec<_>>();
+    if source_types.len() != original.parameters().len() {
+        return None;
+    }
+    let mut parameters = Vec::with_capacity(signature.parameters().len());
+    for ((&parameter, &source_parameter), source_type) in signature
+        .parameters()
+        .iter()
+        .zip(original.parameters())
+        .zip(source_types)
+    {
+        let symbol = store.symbol(parameter)?;
+        let original_symbol = store.symbol(source_parameter)?;
+        let links = store.value_symbol_links(parameter)?;
+        let type_ = links.resolved_type?;
+        let valid_links = if parameter == source_parameter {
+            type_ == source_type
+                && links
+                    == &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+        } else {
+            symbol.flags() == original_symbol.flags() | SymbolFlags::TRANSIENT
+                && symbol.check_flags()
+                    == CheckFlags::INSTANTIATED
+                        | (original_symbol.check_flags()
+                            & (CheckFlags::READONLY
+                                | CheckFlags::LATE
+                                | CheckFlags::OPTIONAL_PARAMETER
+                                | CheckFlags::REST_PARAMETER))
+                && symbol.name() == original_symbol.name()
+                && symbol.declarations() == original_symbol.declarations()
+                && symbol.value_declaration() == original_symbol.value_declaration()
+                && symbol.parent() == original_symbol.parent()
+                && symbol.members().is_none()
+                && symbol.exports().is_none()
+                && symbol.export_symbol().is_none()
+                && store.get_merged_symbol(parameter) == Some(parameter)
+                && links
+                    == &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        target: Some(source_parameter),
+                        mapper: Some(signature_mapper),
+                        name_type: store
+                            .value_symbol_links(source_parameter)
+                            .and_then(|links| links.name_type),
+                        ..ValueSymbolLinks::default()
+                    })
+        };
+        if !valid_links {
+            return None;
+        }
+        parameters.push(type_);
+    }
+    Some(parameters)
 }
 
 fn validate_stored_class_constructor_callable_set(
