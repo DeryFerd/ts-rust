@@ -2586,6 +2586,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                     )?;
                                 }
                             }
+                            for index in interface
+                                .reference
+                                .object
+                                .structured
+                                .index_infos
+                                .as_deref()
+                                .unwrap_or_default()
+                            {
+                                let value_type = self
+                                    .index_info(*index)
+                                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?
+                                    .value_type();
+                                self.validate_cached_array_capability_worker(
+                                    value_type,
+                                    array_validation,
+                                    visited,
+                                    allowed_pending,
+                                )?;
+                            }
                             return Ok(());
                         }
                         InterfaceHeritageMembersValidation::Malformed
@@ -6001,6 +6020,127 @@ mod tests {
             .and_then(|members| members.get_source("value"))
             .unwrap();
         (derived, base, value)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Source-backed index identity and cold/warm proxy state share one fixture.
+    fn inherited_callable_graph_checks_array_edges_in_base_index_values() {
+        let declarations =
+            parse_source_file("interface Base<T> { value: T; [index: number]: Array<number>; }");
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Derived extends Base<number> {}",
+        ));
+        assert!(
+            declarations.diagnostics.is_empty(),
+            "{:?}",
+            declarations.diagnostics
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(196);
+        let library_file = FileId::new(197);
+        let mut binder = CanonicalBinder::new();
+        for (file, source, is_declaration) in
+            [(library_file, &declarations, true), (file, &parsed, false)]
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(if is_declaration {
+                            "\"/project/index-base.d.ts\""
+                        } else {
+                            "\"/project/index-derived.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &declarations.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let store = context.store_mut_for_test();
+        let (derived, base, value) = inherited_graph_property(store);
+        let index = store
+            .type_payload(derived)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .index_infos
+            .as_ref()
+            .unwrap()[0];
+        let array = store.index_info(index).unwrap().value_type();
+        for warm in [false, true] {
+            if warm {
+                let mut session = super::super::instantiate::InstantiationSession::new(
+                    super::super::instantiate::InstantiationLimits::default(),
+                );
+                super::super::instantiated_members::demand_instantiated_property_type(
+                    store,
+                    base,
+                    value,
+                    Some(targets),
+                    &mut session,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                store
+                    .value_symbol_links(value)
+                    .unwrap()
+                    .resolved_type
+                    .is_some(),
+                warm
+            );
+            let before = (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, derived),
+                Ok(()),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability(derived),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array)),
+                "warm={warm}",
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]

@@ -282,6 +282,188 @@ fn generic_base_function_parameters_preserve_lazy_members_cold_and_warm() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Both bodies must keep the same inherited index through forced replay.
+fn generic_base_index_values_preserve_callable_cold_and_warm_checks() {
+    let declarations =
+        parse_source_file("interface Base<T> { value: T; [index: number]: Array<number>; }");
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    for (body, reads_inherited) in [("return 1;", false), ("return value.value;", true)] {
+        let source = format!(
+            "interface Array<T> {{}} interface ReadonlyArray<T> {{}}\n\
+             interface Derived extends Base<number> {{}}\n\
+             function read(value: Derived): number {{ {body} }}",
+        );
+        let parsed = parse_source_file(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(43);
+        let library_file = FileId::new(1043);
+        let mut binder = CanonicalBinder::new();
+        for (file, source, is_declaration) in
+            [(library_file, &declarations, true), (file, &parsed, false)]
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(if is_declaration {
+                            "\"/project/index-base.d.ts\""
+                        } else {
+                            "\"/project/generic-base-index-graph.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &declarations.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let derived = declared_type(
+            &context,
+            interface_symbol(&parsed, file, &context, "Derived"),
+        );
+        let TypeData::Interface(data) = context.store().type_payload(derived).unwrap().data()
+        else {
+            panic!("Derived must retain its interface identity")
+        };
+        let base = data.resolved_base_types.as_ref().unwrap()[0];
+        let structured = &data.reference.object.structured;
+        let index = structured.index_infos.as_ref().unwrap()[0];
+        let TypeData::TypeReference(base_data) = context.store().type_payload(base).unwrap().data()
+        else {
+            panic!("Base<number> must retain its type-reference identity")
+        };
+        assert_eq!(
+            base_data.object.structured.index_infos.as_deref(),
+            Some(&[index][..]),
+        );
+        let value = context
+            .store()
+            .symbol_table(structured.members.unwrap())
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let array = context.store().index_info(index).unwrap().value_type();
+        assert_eq!(context.type_to_string(array).unwrap(), "number[]");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(value)
+                .unwrap()
+                .resolved_type,
+            reads_inherited.then_some(number),
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().index_info_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+                context.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(snapshot(&context), warm);
+            assert_eq!(
+                context.store().index_info(index).unwrap().value_type(),
+                array
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(value)
+                    .unwrap()
+                    .resolved_type,
+                reads_inherited.then_some(number),
+            );
+        }
+    }
+}
+
+#[test]
+fn keyof_alias_with_nested_generic_heritage_checks_cold_and_warm() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "interface Base<T> { value: T } ",
+        "interface Derived extends Base<number> { own: number } ",
+        "type Keys = keyof { nested: Derived }; ",
+        "function read(value: Keys): number { return 1; }",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(44);
+    let mut context = checker_context(&parsed, file, "/project/nested-heritage-keyof.ts");
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+    let parameter = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == ts_ast::SyntaxKind::Parameter).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let parameter = context.file(file).unwrap().1.symbol(parameter).unwrap();
+    let key = context
+        .store()
+        .value_symbol_links(parameter)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    assert_eq!(context.type_to_string(key).unwrap(), "\"nested\"");
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().index_info_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        )
+    };
+    let warm = snapshot(&context);
+    for _ in 0..2 {
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(snapshot(&context), warm);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .resolved_type,
+            Some(key)
+        );
+    }
+}
+
+#[test]
 fn direct_interface_heritage_publishes_inherited_properties_for_relations_and_reads() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
