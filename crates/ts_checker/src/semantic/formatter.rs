@@ -1017,6 +1017,9 @@ fn display_object_type(
     if record.flags() != TypeFlags::OBJECT {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
+    // A removed owner does not erase the retained source namespace identity.
+    super::source_imports::validated_source_file_namespace_owner(store, type_id)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
     if store
         .intrinsic_bootstrap()
         .is_some_and(|bootstrap| type_id == bootstrap.empty_type_literal_type)
@@ -11324,6 +11327,99 @@ mod tests {
                     context
                         .store_mut_for_test()
                         .set_type_symbol(type_, Some(owners[index]))
+                );
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn namespace_wrapper_owner_loss_is_read_only_before_and_after_publication() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let target = parse_source_file("export interface Marker {}");
+        let wrapped = parse_source_file(
+            "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
+        );
+        let bare = parse_source_file(
+            "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
+        );
+        for published in [false, true] {
+            let (mut context, queries) =
+                namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+            let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
+            if published {
+                for query in queries {
+                    context.check_source_file(query.file).unwrap();
+                }
+            }
+            let owners = types.map(|type_| {
+                context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .symbol()
+                    .unwrap()
+            });
+            let wrapper = context
+                .store()
+                .source_file_namespace_wrapper_for_module(owners[0])
+                .cloned()
+                .unwrap();
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    [store.type_len(), store.symbol_len(), store.mapper_len()],
+                    store.checker_link_allocated_lengths(),
+                    owners.map(|owner| {
+                        (
+                            store.source_file_namespace_identity(owner).cloned(),
+                            store.value_symbol_links(owner).cloned(),
+                            store.export_type_links(owner).cloned(),
+                        )
+                    }),
+                    [wrapper.source.alias, wrapper.default]
+                        .map(|alias| store.alias_symbol_links(alias).cloned()),
+                    store
+                        .source_file_namespace_wrapper_for_module(owners[0])
+                        .cloned(),
+                    types.map(|type_| store.type_payload(type_).unwrap().symbol()),
+                    store.relation_state_snapshot(),
+                )
+            };
+            for (index, type_) in types.into_iter().enumerate() {
+                assert!(context.store_mut_for_test().set_type_symbol(type_, None));
+                let before = state(context.store());
+                for _ in 0..2 {
+                    let plain = context.type_to_string(type_);
+                    let located = context.type_to_string_at_location(type_, queries[index]);
+                    assert!(
+                        plain.is_err() && located.is_err(),
+                        "published={published}, index={index}, plain={plain:?}, located={located:?}"
+                    );
+                    assert_eq!(state(context.store()), before);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_symbol(type_, Some(owners[index]))
+                );
+            }
+            for query in queries {
+                context.check_source_file(query.file).unwrap();
+            }
+            assert_eq!(
+                queries.map(|query| context.get_type_from_type_node(query).unwrap()),
+                types
+            );
+            for (index, type_) in types.into_iter().enumerate() {
+                assert_eq!(
+                    context.type_to_string(type_).unwrap(),
+                    "typeof import(\"producer\")"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location(type_, queries[index])
+                        .unwrap(),
+                    ["typeof ns", "typeof bare"][index]
                 );
             }
             assert!(context.diagnostics().is_empty());
