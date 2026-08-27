@@ -134,6 +134,18 @@ and base/local join identity restoration.
 
 ### Execution checkpoint: 2026-08-27
 
+The current saved semantic smoke records clean Rust commit `8357dac3` and
+51 exact results in 95 executed variants. The remaining results are 43
+unsupported and one artifact mismatch, with no fatal invariants. See the
+[checkpoint table](#quantitative-posture) for artifact counts and evidence.
+
+The retained 397/511 milestone is diagnostic-only and records clean `74fd417a`,
+not `8357dac3`. Full verification of `8357dac3`, a semantic milestone at that
+commit, complete upstream corpus parity, and a modern-project parity ring
+remain unproved. The full port goal remains active.
+
+### Earlier wave 131 checkpoint: 2026-08-27
+
 Wave 131 passes all 6,239 workspace tests. Strict workspace Clippy passes after
 one test-only lint fix. The fixed semantic report has 48 exact results in 95
 executed variants, one more than wave 128. The diagnostic-only milestone
@@ -215,14 +227,14 @@ The older figures below remain as execution history.
 
 ### Earlier checkpoint: 2026-08-22
 
-The latest focused package runs pass 189 parser unit tests, 174 binder unit
-tests, 1,226 checker unit tests, 159 compiler unit tests, and 564 printer unit
-tests. The parser also accepts all 108 bundled declaration libraries without
-diagnostics.
+At this historical checkpoint, focused package runs passed 189 parser unit
+tests, 174 binder unit tests, 1,226 checker unit tests, 159 compiler unit tests,
+and 564 printer unit tests. The parser also accepted all 108 bundled declaration
+libraries without diagnostics.
 
 Both fixed checker manifests are present. The smoke manifest contains 96
-variants, and the milestone manifest contains 512 variants. The latest smoke
-scorecard records commit `d97e5de` with uncommitted fixes. Of its 96 selected
+variants, and the milestone manifest contains 512 variants. The August 22 smoke
+scorecard recorded commit `d97e5de` with uncommitted fixes. Of its 96 selected
 variants, 95 execute and one is skipped by upstream. The executed variants
 produce 14 exact matches, 81 typed unsupported outcomes, and no fatal
 invariants.
@@ -232,10 +244,10 @@ Production location queries and fixture walkers generate `.types` and
 and JSDoc now have production checker implementations and focused tests.
 Complete support for those features remains in progress.
 
-The latest scorecard is
+That historical scorecard is
 `/tmp/ts-rust-type-node-zero-fatal-scorecard.json`. A completed run of the
 512-variant milestone, complete upstream corpus parity, and the final workspace
-verification remain unverified.
+verification were unverified at that checkpoint.
 
 ### Earlier implementation checkpoints
 
@@ -391,36 +403,47 @@ capability boundaries, two supported mismatches, and zero fatal invariants.
 
 ### Quantitative posture
 
-At the current checkpoint:
+The semantic smoke records clean Rust source
+`8357dac34c37b4a4f24b210a4ddafb76310bfaec` and clean upstream source
+`dc37b5249ab60e2bbce936f71b883e6c8136167e`.
 
-| Evidence | Current value | Interpretation |
-|---|---:|---|
-| Parser unit tests | 189 | Focused package suite passes |
-| Bundled declaration libraries | 108 | Parser accepts every bundled library without diagnostics |
-| Binder unit tests | 174 | Focused package suite passes |
-| Checker unit tests | 1,226 | Complete checker unit-test binary passes |
-| Compiler unit tests | 159 | Focused package suite passes |
-| Printer unit tests | 564 | Focused package suite passes |
-| Smoke manifest | 96 variants | 95 execute and one is skipped by upstream |
-| Smoke results | 14 exact, 81 unsupported, 0 fatal | Fixed selection only; not full corpus parity |
-| Milestone manifest | 512 variants | Checked in; complete execution remains unverified |
-| Port-map clusters | 46 | 11 verified, 30 porting, and 5 blocked |
+| Evidence | Recorded result | Scope |
+|---|---|---|
+| Smoke selection | 96 selected, 95 executed, one upstream skip | Fixed `checker-smoke-v1` selection |
+| Smoke outcomes | 51 exact, 43 unsupported, one artifact mismatch, zero fatal | Not full-corpus parity |
+| Unsupported outcomes | 28 checker capabilities, 15 harness/configuration errors | Neither category counts as success |
+| Smoke `.types` | 89 expected, 46 exact, one mismatch, 15 unsupported, 27 not reached | Production semantic artifact comparison |
+| Smoke `.symbols` | 89 expected, 54 exact, seven mismatches, one unsupported, 27 not reached | Secondary mismatches also remain failures |
+| Retained diagnostic-only milestone | 512 selected, 511 executed, one upstream skip, 397 exact, 114 unsupported, zero fatal | Clean `74fd417a`, not `8357dac3`. No type or symbol comparison |
+| Wave 137 check log | Dev check finished with 18 library warnings and one library-test warning | No source SHA in the log. Not full-test or strict-lint proof |
+| Full `8357dac3` verification | Unproved | Full tests, strict Clippy, rustdoc, and a semantic milestone need checkpoint-bound records |
+| Port-map clusters | 46 | Unchanged: 11 verified, 30 porting, and five blocked |
+
+Saved runtime evidence paths are relative to the main workspace:
+
+- Semantic smoke: `target/wave137-combined-semantic-smoke.json`.
+  SHA-256: `927cf97cb834c87da2fb2b3290f7438eea9de87da3a7e8f7b81e739782499d7a`.
+- Diagnostic-only milestone: `target/wave131-combined-milestone.json`, Rust SHA
+  `74fd417aab1365618db7d7d668e01a7d82294215`.
+  SHA-256: `dbe23396ff1571c9b00e02532da64e4e5b64fd6e59449fa69f43726372cb2054`.
+- Check log: `target/wave137-combined-check.log`.
 
 The implementation is no longer bottlenecked on basic representation. It is
 bottlenecked on semantic breadth behind intentionally fail-closed gates.
 
 ### Current measurement is a frontier, not coverage
 
-The current fixed smoke scorecard discovers 12,750 upstream cases. Its 96
-selected variants contain 95 executed variants and one upstream skip. The 95
-executed variants produce 14 exact matches, 81 typed unsupported outcomes, and
-no fatal invariants. Scorecard provenance identifies `d97e5de` and records a
-dirty worktree.
+The semantic smoke in the checkpoint table discovers 12,750 upstream cases.
+Discovery does not prove execution of every option configuration. Only exact
+variants count as success. Advancing an unsupported variant to a later
+unsupported boundary is not an exact win.
 
-The 512-variant milestone manifest is checked in, but this checkpoint does not
-prove a completed milestone run. The complete upstream corpus also remains
-unverified. Historical first-50 and 500-case runs predate the current checker,
-so their old failure totals are not the current port status.
+The retained milestone compares diagnostic artifacts only. Its invocation has
+no `--semantic-artifacts`, and `semanticArtifacts` is null. Its `full_artifact`
+label does not establish `.types` or `.symbols` parity. A semantic milestone
+at `8357dac3` and complete upstream corpus parity remain unverified.
+Historical first-50 and 500-case runs predate this checkpoint and are not its
+failure totals.
 
 The historical first blockers were dominated by:
 
