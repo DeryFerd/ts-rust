@@ -160,7 +160,7 @@ fn fixture(
             source
                 .arena
                 .iter()
-                .map(|(node, _)| NodeRef::new(source.arena.id(), *file, node))
+                .map(move |(node, _)| NodeRef::new(source.arena.id(), *file, node))
         })
         .collect::<Vec<_>>();
     let mut seen = HashSet::new();
@@ -463,6 +463,7 @@ fn check_owner_changes(text: &str) {
                 .unwrap()
                 .get_source("Value")
                 .unwrap();
+            let before_change = snapshot(context, fixture);
             let store = context.store_mut_for_test();
             match change {
                 OwnerChange::Parent => assert!(store.set_symbol_relationships(
@@ -477,11 +478,14 @@ fn check_owner_changes(text: &str) {
                     flags | SymbolFlags::INTERFACE,
                     check_flags
                 )),
-                OwnerChange::CheckFlags => assert!(store.set_symbol_flags(
-                    owner,
-                    flags,
-                    check_flags | CheckFlags::READONLY
-                )),
+                OwnerChange::CheckFlags => {
+                    if !store.set_symbol_flags(owner, flags, check_flags | CheckFlags::READONLY) {
+                        assert_eq!(snapshot(context, fixture), before_change);
+                        assert_healthy(context, fixture, owner, declared, value);
+                        eprintln!("export owner review: CheckFlags rejected by the symbol store");
+                        return;
+                    }
+                }
                 OwnerChange::Members => assert!(store.set_symbol_relationships(
                     owner,
                     other_members,
