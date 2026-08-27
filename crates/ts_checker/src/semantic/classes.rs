@@ -10886,6 +10886,15 @@ pub(super) fn plan_recovered_class_property(
                 initializer_record.kind == SyntaxKind::NumericLiteral
                     && literal.token_flags.0 == 0
                     && !ts_jsnum::from_string(&literal.text).is_nan()
+                    && host
+                        .source(initializer)
+                        .and_then(|(arena, _)| arena.source_text())
+                        .is_none_or(|source| {
+                            source.get(
+                                initializer_record.range.start.get() as usize
+                                    ..initializer_record.range.end.get() as usize,
+                            ) == Some(literal.text.as_str())
+                        })
             }
             NodeData::StringLiteral(literal) => {
                 initializer_record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0

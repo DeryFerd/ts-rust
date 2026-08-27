@@ -6105,6 +6105,57 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_recovery_rejects_numeric_text_changed_before_binding() {
+        for changed in [0, 3] {
+            let mut parsed = parse_source_file(
+                "class Model { before: number = 0; value: number = 1; middle: number = 3; accessor value: number = 2; }",
+            );
+            let file = FileId::new(6_124);
+            let members = parsed
+                .arena
+                .iter()
+                .filter_map(|(id, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else {
+                        return None;
+                    };
+                    Some((id, property.name, property.initializer.unwrap()))
+                })
+                .collect::<Vec<_>>();
+            // Bind the changed AST so this tests spelling, not a stale arena revision.
+            let NodeData::NumericLiteral(literal) =
+                &mut parsed.arena.get_mut(members[changed].2).unwrap().data
+            else {
+                unreachable!()
+            };
+            literal.text = "9".to_owned();
+            let mut context = context(&parsed, file);
+            let name = NodeRef::new(parsed.arena.id(), file, members[1].1);
+            let source_file = context.source_file(file).unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+                context.store().source_file_links(source_file).cloned(),
+            );
+            assert!(context.get_type_at_location(name).is_err());
+            assert!(context.check_source_file(file).is_err());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                    context.store().source_file_links(source_file).cloned(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_recovery_does_not_complete_unsupported_bodies() {
         for source in [
             "class Model { value: number = 1; run() { missing(); } accessor value: number = 2; }",

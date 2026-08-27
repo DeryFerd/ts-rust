@@ -141,6 +141,7 @@ const CASES: &[Case] = &[
 ];
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep each pinned field and its diagnostic checks together.
 fn recovered_duplicate_properties_match_pinned_types_symbols_and_diagnostics() {
     for case in CASES {
         let filesystem = MemoryFileSystem::new(true);

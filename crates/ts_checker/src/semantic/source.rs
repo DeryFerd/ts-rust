@@ -3145,6 +3145,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .ok_or(SourceCheckError::Provenance(
                                 SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                             ))?;
+                    if let Some(grammar) = plan_class_grammar_diagnostics(store, host, symbol)
+                        && grammar
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.code == 2300)
+                    {
+                        if grammar.declaration != statement || grammar.symbol != symbol {
+                            return Err(SourceCheckError::Class(statement));
+                        }
+                        statements.push(PlannedStatement::ClassGrammar(grammar));
+                        continue;
+                    }
                     let class = match plan_nongeneric_class_member_query_with_type_context(
                         store,
                         host,
