@@ -11422,7 +11422,15 @@ mod tests {
         for (path, text) in [
             (
                 "/project/main.ts",
-                "import 'dependency'; import './bridge'; export {};",
+                "import 'outer'; import './bridge'; export {};",
+            ),
+            (
+                "/project/node_modules/outer/package.json",
+                r#"{"types":"index.ts"}"#,
+            ),
+            (
+                "/project/node_modules/outer/index.ts",
+                "import 'dependency'; export {};",
             ),
             (
                 "/project/bridge.ts",
@@ -11448,27 +11456,25 @@ mod tests {
                 no_check: true,
                 no_lib: true,
                 types: Some(Vec::new()),
-                max_node_module_js_depth: Some(0),
+                max_node_module_js_depth: Some(1),
                 ..plain_esm_bundler_options()
             },
         );
+        let containing = "/project/node_modules/outer/index.ts";
         let target = "/project/node_modules/dependency/index.js";
         let target_id = program.source_file(target).unwrap().id;
-        assert_eq!(program.source_node_module_depths.get(&target_id), Some(&0));
+        assert_eq!(program.source_node_module_depths.get(&target_id), Some(&1));
         let first_edge = program
             .resolved_module_loads
             .get(&ResolvedModuleKey::new(
-                "/project/main.ts".to_owned(),
+                containing.to_owned(),
                 "dependency".to_owned(),
                 CanonicalModuleResolutionMode::Esm,
             ))
             .unwrap();
         assert!(matches!(
             program.source_load_omission(first_edge.0, &first_edge.1),
-            Some(CanonicalModuleTargetOmission::NodeModuleJavaScriptDepth {
-                depth: 1,
-                limit: 0
-            })
+            Some(CanonicalModuleTargetOmission::NodeModuleJavaScriptDepth { depth: 2, limit: 1 })
         ));
         assert!(program.canonical_module_resolution_manifest().is_ok());
         let resolved_modules = program.resolved_modules.clone();
@@ -11482,7 +11488,7 @@ mod tests {
                 containing_file,
                 resolved_file_name,
                 ..
-            } if containing_file == "/project/main.ts" && resolved_file_name == target
+            } if containing_file == containing && resolved_file_name == target
         ));
         assert!(!error.failure_class().is_unsupported());
         assert_eq!(
