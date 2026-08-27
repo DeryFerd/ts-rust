@@ -426,21 +426,23 @@ fn valid_untyped_javascript_source_signature(
     let Some(bootstrap) = store.intrinsic_bootstrap() else {
         return false;
     };
+    let zero_parameter_owner = match provenance.family {
+        SourceCallableFamily::FunctionDeclaration => true,
+        SourceCallableFamily::ArrowFunction => matches!(
+            store.source_node_parent(provenance.declaration),
+            Some(SourceNodeParent::Parent(variable))
+                if store.source_node_kind(variable) == Some(SyntaxKind::VariableDeclaration)
+        ),
+    };
     if record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
         || record.flags() != provenance.flags
         || record.declaration() != Some(provenance.declaration)
         || record.parameters().len() != parameter_types.len()
         || minimum != parameter_types.len()
         || minimum == 0
-            && (provenance.family != SourceCallableFamily::ArrowFunction
+            && (!zero_parameter_owner
                 || !record.parameters().is_empty()
-                || record.min_argument_count() != 0
-                || !matches!(
-                    store.source_node_parent(provenance.declaration),
-                    Some(SourceNodeParent::Parent(variable))
-                        if store.source_node_kind(variable)
-                            == Some(SyntaxKind::VariableDeclaration)
-                ))
+                || record.min_argument_count() != 0)
         || !record.type_parameters().is_empty()
         || record.this_parameter().is_some()
         || provenance.signature != signature
@@ -3229,165 +3231,175 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)] // Check calls, warm identity, and rejected flag changes together.
-    fn zero_parameter_untyped_javascript_arrows_require_exact_source_provenance() {
-        let parsed = parse_javascript_source_file("const f = () => {}; f();");
-        let file = FileId::new(4_425);
-        let mut context =
-            source_callable_context(&parsed, file, CanonicalSourceLanguage::JavaScript);
-        context.check_source_file(file).unwrap();
-        assert!(context.diagnostics().is_empty());
-        let declaration = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        let type_ = context.get_type_at_location(declaration).unwrap();
-        let provenance = context.store().source_callable_provenance(type_).unwrap();
-        assert_eq!(
-            provenance.flags,
-            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-        );
-        let globals = context.global_types().clone();
-        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
-        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
-        let before = (
-            context.store().type_len(),
-            context.store().signature_len(),
-            context.store().symbol_len(),
-            context.store().callable_signature_parameter_types_len(),
-        );
-        for warm in [false, true] {
-            if warm {
-                context.recheck_source_file(file).unwrap();
-            }
-            assert_eq!(context.get_type_at_location(declaration).unwrap(), type_);
-            assert_eq!(
-                context.store().source_callable_provenance(type_),
-                Some(provenance)
-            );
-            let StoredCallableSetValidation::Valid { projection, .. } =
-                validate_stored_callable_set(context.store(), type_)
-            else {
-                panic!("expected the authenticated zero-parameter JavaScript arrow")
-            };
-            let [callable] = projection.call_signatures.as_ref() else {
-                panic!("expected the original arrow signature")
-            };
-            assert_eq!(callable.signature, provenance.signature);
-            assert!(callable.parameters.is_empty());
-            assert!(callable.rest_parameter.is_none());
-            assert_eq!(callable.min_argument_count, 0);
-            assert_eq!(
-                context
-                    .store()
-                    .callable_signature_parameter_types(provenance.signature),
-                Some([].as_slice()),
-            );
-            for (arguments, expected) in [
-                (Vec::new(), DirectCallApplicability::Applicable),
-                (
-                    vec![number],
-                    DirectCallApplicability::TooManyArguments {
-                        expected_at_most: 0,
-                        actual: 1,
-                    },
-                ),
-            ] {
-                let call = resolve_direct_call(
-                    context.store_mut_for_test(),
-                    &globals,
-                    false,
-                    DirectCallRequest {
-                        form: DirectCallForm::Call,
-                        optional_chain: false,
-                        type_argument_count: 0,
-                        has_spread_argument: false,
-                        callee: type_,
-                        arguments: &arguments,
-                    },
-                )
-                .unwrap();
-                assert_eq!(call.applicability, expected);
-                assert_eq!(call.projection.signature, provenance.signature);
-                assert_eq!(call.projection.minimum_argument_count, 0);
-                assert_eq!(call.projection.maximum_argument_count, 0);
-                assert_eq!(call.projection.return_type, void);
-            }
-            assert_eq!(
-                (
-                    context.store().type_len(),
-                    context.store().signature_len(),
-                    context.store().symbol_len(),
-                    context.store().callable_signature_parameter_types_len(),
-                ),
-                before,
-            );
-        }
-        for flags in [
-            SignatureFlags::NONE,
-            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE | SignatureFlags::HAS_REST_PARAMETER,
+    fn zero_parameter_untyped_javascript_callables_require_exact_source_provenance() {
+        for (source, kind, family) in [
+            (
+                "const f = () => {}; f();",
+                SyntaxKind::ArrowFunction,
+                CallableFamily::ArrowFunction,
+            ),
+            (
+                "function f() {} f();",
+                SyntaxKind::FunctionDeclaration,
+                CallableFamily::FunctionDeclaration,
+            ),
         ] {
+            let parsed = parse_javascript_source_file(source);
+            let file = FileId::new(4_425);
+            let mut context =
+                source_callable_context(&parsed, file, CanonicalSourceLanguage::JavaScript);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let type_ = context.get_type_at_location(declaration).unwrap();
+            let provenance = context.store().source_callable_provenance(type_).unwrap();
+            assert_eq!(
+                provenance.flags,
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            );
+            let globals = context.global_types().clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().callable_signature_parameter_types_len(),
+            );
+            for warm in [false, true] {
+                if warm {
+                    context.recheck_source_file(file).unwrap();
+                }
+                assert_eq!(context.get_type_at_location(declaration).unwrap(), type_);
+                assert_eq!(
+                    context.store().source_callable_provenance(type_),
+                    Some(provenance)
+                );
+                let StoredCallableSetValidation::Valid { projection, .. } =
+                    validate_stored_callable_set(context.store(), type_)
+                else {
+                    panic!("expected the authenticated zero-parameter JavaScript callable")
+                };
+                let [callable] = projection.call_signatures.as_ref() else {
+                    panic!("expected the original source signature")
+                };
+                assert_eq!(callable.signature, provenance.signature);
+                assert!(callable.parameters.is_empty());
+                assert!(callable.rest_parameter.is_none());
+                assert_eq!(callable.min_argument_count, 0);
+                assert_eq!(
+                    context
+                        .store()
+                        .callable_signature_parameter_types(provenance.signature),
+                    Some([].as_slice()),
+                );
+                for (arguments, expected) in [
+                    (Vec::new(), DirectCallApplicability::Applicable),
+                    (
+                        vec![number],
+                        DirectCallApplicability::TooManyArguments {
+                            expected_at_most: 0,
+                            actual: 1,
+                        },
+                    ),
+                ] {
+                    let call = resolve_direct_call(
+                        context.store_mut_for_test(),
+                        &globals,
+                        false,
+                        DirectCallRequest {
+                            form: DirectCallForm::Call,
+                            optional_chain: false,
+                            type_argument_count: 0,
+                            has_spread_argument: false,
+                            callee: type_,
+                            arguments: &arguments,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(call.applicability, expected);
+                    assert_eq!(call.projection.signature, provenance.signature);
+                    assert_eq!(call.projection.minimum_argument_count, 0);
+                    assert_eq!(call.projection.maximum_argument_count, 0);
+                    assert_eq!(call.projection.return_type, void);
+                }
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context.store().signature_len(),
+                        context.store().symbol_len(),
+                        context.store().callable_signature_parameter_types_len(),
+                    ),
+                    before,
+                );
+            }
+            for flags in [
+                SignatureFlags::NONE,
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+                    | SignatureFlags::HAS_REST_PARAMETER,
+            ] {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_flags(provenance.signature, flags)
+                );
+                assert!(matches!(
+                    validate_stored_callable_set(context.store(), type_),
+                    StoredCallableSetValidation::Malformed {
+                        family: actual
+                    } if actual == family,
+                ));
+                assert!(context.recheck_source_file(file).is_err());
+                assert_eq!(
+                    context
+                        .store()
+                        .signature(provenance.signature)
+                        .unwrap()
+                        .flags(),
+                    flags
+                );
+            }
             assert!(
                 context
                     .store_mut_for_test()
-                    .set_signature_flags(provenance.signature, flags)
+                    .set_signature_flags(provenance.signature, provenance.flags)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_type_parameters(provenance.signature, vec![number])
             );
             assert!(matches!(
                 validate_stored_callable_set(context.store(), type_),
                 StoredCallableSetValidation::Malformed {
-                    family: CallableFamily::ArrowFunction
-                },
+                    family: actual
+                } if actual == family,
             ));
             assert!(context.recheck_source_file(file).is_err());
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_type_parameters(provenance.signature, Vec::new())
+            );
             assert_eq!(
                 context
-                    .store()
-                    .signature(provenance.signature)
-                    .unwrap()
-                    .flags(),
-                flags
+                    .store_mut_for_test()
+                    .replace_source_callable_provenance_for_test(type_, None),
+                Some(provenance),
             );
+            assert!(matches!(
+                validate_stored_callable_set(context.store(), type_),
+                StoredCallableSetValidation::Malformed {
+                    family: actual
+                } if actual == family,
+            ));
         }
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_signature_flags(provenance.signature, provenance.flags)
-        );
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_signature_type_parameters(provenance.signature, vec![number])
-        );
-        assert!(matches!(
-            validate_stored_callable_set(context.store(), type_),
-            StoredCallableSetValidation::Malformed {
-                family: CallableFamily::ArrowFunction
-            },
-        ));
-        assert!(context.recheck_source_file(file).is_err());
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_signature_type_parameters(provenance.signature, Vec::new())
-        );
-        assert_eq!(
-            context
-                .store_mut_for_test()
-                .replace_source_callable_provenance_for_test(type_, None),
-            Some(provenance),
-        );
-        assert!(matches!(
-            validate_stored_callable_set(context.store(), type_),
-            StoredCallableSetValidation::Malformed {
-                family: CallableFamily::ArrowFunction
-            },
-        ));
     }
 
     #[test]

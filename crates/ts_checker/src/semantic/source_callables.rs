@@ -2777,6 +2777,25 @@ fn plan_source_callable_with_owner_shape(
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
         && is_direct_noncontextual_source_arrow(store, host, declaration)?
         && !source_arrow_has_owned_jsdoc_context(store, host, declaration)?;
+    let javascript_zero_parameter_function = record.kind == SyntaxKind::FunctionDeclaration
+        && view.parameters.nodes.is_empty()
+        && type_parameters.is_empty()
+        && body_mode == SourceCallableBodyMode::Present
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+        && {
+            let invalid = || invariant(SourceCallableInvariant::InvalidSyntax(declaration));
+            let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+            // Go adds a typed `this` parameter from the host's last comment.
+            super::jsdoc::leading_jsdoc_comment(arena, declaration)
+                .map_err(|_| invalid())?
+                .is_none_or(|comment| {
+                    comment
+                        .this_tag()
+                        .is_none_or(|tag| tag.type_expression().is_none())
+                })
+        };
     let javascript_jsdoc_function_parameter = if view.family
         == SourceCallableFamily::FunctionDeclaration
         && view.parameters.nodes.len() == 1
@@ -2791,6 +2810,7 @@ fn plan_source_callable_with_owner_shape(
         None
     };
     let untyped_javascript_signature = javascript_direct_zero_parameter_arrow
+        || javascript_zero_parameter_function
         || bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
@@ -10981,9 +11001,14 @@ pub(super) fn validate_stored_source_callable(
             Some(SourceNodeParent::Parent(variable))
                 if store.source_node_kind(variable) == Some(SyntaxKind::VariableDeclaration)
         );
+    let zero_parameter_function = family == SourceCallableFamily::FunctionDeclaration
+        && store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration)
+        && signature_record.parameters().is_empty();
     if untyped_javascript
         && (signature_record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
-            || signature_record.parameters().len() != 1 && !direct_untyped_arrow
+            || signature_record.parameters().len() != 1
+                && !direct_untyped_arrow
+                && !zero_parameter_function
             || !signature_record.type_parameters().is_empty()
             || signature_record.min_argument_count()
                 != i32::try_from(signature_record.parameters().len()).unwrap_or(-1)
@@ -18509,7 +18534,10 @@ mod tests {
         let canonical = plan_source_callable(&fixture.store, &host, first, owner, None).unwrap();
         assert!(canonical.parameters.is_empty());
         assert_eq!(canonical.min_argument_count, 0);
-        assert_eq!(canonical.flags, SignatureFlags::NONE);
+        assert_eq!(
+            canonical.flags,
+            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+        );
 
         let secondary = plan_javascript_duplicate_function_implementation(
             &fixture.store,
@@ -18732,7 +18760,8 @@ mod tests {
     }
 
     #[test]
-    fn javascript_untyped_flags_require_one_function_or_object_arrow_parameter() {
+    #[allow(clippy::too_many_lines)] // Check planning, publication, and poisoned replay for the same sources.
+    fn javascript_untyped_flags_preserve_supported_function_and_arrow_shapes() {
         for (index, (source, family, flagged)) in [
             (
                 "function accept(value) {}",
@@ -18746,6 +18775,16 @@ mod tests {
             ),
             (
                 "function accept() {}",
+                SourceCallableFamily::FunctionDeclaration,
+                true,
+            ),
+            (
+                "/** @returns {void} */ function accept() {}",
+                SourceCallableFamily::FunctionDeclaration,
+                true,
+            ),
+            (
+                "/** @this {number} */ function accept() {}",
                 SourceCallableFamily::FunctionDeclaration,
                 false,
             ),
@@ -18833,17 +18872,25 @@ mod tests {
                 validate_stored_source_callable(&fixture.store, callable),
                 StoredSourceCallableValidation::Valid(_)
             ));
-            if !flagged {
-                assert!(fixture.store.set_signature_flags(
-                    signature,
-                    SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
-                ));
-                assert_eq!(
-                    validate_stored_source_callable(&fixture.store, callable),
-                    StoredSourceCallableValidation::Malformed
-                );
-                assert!(fixture.store.set_signature_flags(signature, expected_flags));
-            }
+            let poisoned_flags = if flagged {
+                SignatureFlags::NONE
+            } else {
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            };
+            assert!(fixture.store.set_signature_flags(signature, poisoned_flags));
+            let stale = generic_transaction_state(&fixture.store);
+            assert_eq!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Malformed,
+            );
+            assert!(
+                fixture
+                    .query_callable(declaration, owner, &mut diagnostics)
+                    .is_err(),
+                "{source}",
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), stale);
+            assert!(fixture.store.set_signature_flags(signature, expected_flags));
             let warm = publication_state(&fixture.store);
             assert_eq!(
                 fixture.query_callable(declaration, owner, &mut diagnostics),

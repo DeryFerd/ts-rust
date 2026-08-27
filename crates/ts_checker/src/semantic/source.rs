@@ -63168,7 +63168,7 @@ mod tests {
     #[test]
     fn javascript_constructor_jsdoc_boolean_assignments_publish_one_binder_owned_field() {
         let source = parse_javascript_source_file(concat!(
-            "class C { constructor() { ",
+            "class C { constructor() {\n",
             "/** @type {boolean} */ this.a = true; ",
             "this.a = !!this.a; ",
             "} }",
@@ -63234,7 +63234,7 @@ mod tests {
     #[test]
     fn javascript_constructor_jsdoc_boolean_assignments_reject_poisoned_field_cache() {
         let source = parse_javascript_source_file(concat!(
-            "class C { constructor() { ",
+            "class C { constructor() {\n",
             "/** @type {boolean} */ this.a = true; ",
             "this.a = !!this.a; ",
             "} }",

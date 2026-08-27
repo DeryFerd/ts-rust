@@ -283,6 +283,9 @@ fn leading_jsdoc_comments_stay_within_the_current_trivia() {
         ("/** @type {number} */ const n = 1; /* plain */", &[]),
         ("/** @satisfies {number} */ const n = 1; /* plain */", &[]),
         ("/** @type {number} */ const n = 1; // plain\n", &[]),
+        ("const n = 1; /** @type {any} */", &[]),
+        ("const n = 1; /** @satisfies {any} */", &[]),
+        ("const n = 1; /* plain\ncomment */ /** @type {any} */", &[]),
         ("const n = '/** @type {any} */'; /* plain */", &[]),
         ("const n = /[/** @type {any} */]/; /* plain */", &[]),
         (
@@ -294,6 +297,10 @@ fn leading_jsdoc_comments_stay_within_the_current_trivia() {
         ("/** @type {any} */ // plain\n", &["/** @type {any} */"]),
         (
             "const n = 1\n/** @type {any} */ /* plain */",
+            &["/** @type {any} */"],
+        ),
+        (
+            "const n = 1;\r\n/** @type {any} */",
             &["/** @type {any} */"],
         ),
         (
@@ -367,6 +374,153 @@ fn leading_jsdoc_comments_stay_within_the_current_trivia() {
             declaration.type_().is_some() || declaration.satisfies().is_some()
         });
         assert_eq!(context, !expected.is_empty(), "{text}");
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Cold and repeated checks must retain the same signature and state.
+fn zero_parameter_javascript_signatures_keep_exact_comment_context() {
+    for (javascript, source, expected_flags) in [
+        (true, "function callback() {} callback();", 64),
+        (
+            true,
+            "/** @returns {void} */ function callback() {} callback();",
+            64,
+        ),
+        (
+            true,
+            "/** @returns {number} */ function callback() { return 1; } callback();",
+            64,
+        ),
+        (true, "/** @this {number} */ function callback() {}", 0),
+        (
+            true,
+            "const prior = 1; /** @this {number} */ function callback() {} callback();",
+            64,
+        ),
+        (
+            true,
+            "/** @this {number} */\n/** @returns {void} */ function callback() {} callback();",
+            64,
+        ),
+        (false, "function callback() {} callback();", 0),
+        (true, "const callback = () => {}; callback();", 64),
+        (
+            true,
+            "const prior = 1; /** @type {any} */ const callback = () => {}; callback();",
+            64,
+        ),
+        (
+            true,
+            "const prior = 1; /** @satisfies {any} */ const callback = () => {}; callback();",
+            64,
+        ),
+        (
+            true,
+            "const prior = 1;\n/** @type {any} */ const callback = () => {}; callback();",
+            0,
+        ),
+        (
+            true,
+            "const prior = 1;\n/** @satisfies {any} */ const callback = () => {}; callback();",
+            0,
+        ),
+        (
+            true,
+            "/** @type {any} */ /* plain */ const callback = () => {}; callback();",
+            0,
+        ),
+        (
+            true,
+            "/** @satisfies {any} */ // plain\nconst callback = () => {}; callback();",
+            0,
+        ),
+        (
+            true,
+            "const prior = 1; /* plain\ncomment */ /** @type {any} */ const callback = () => {}; callback();",
+            64,
+        ),
+    ] {
+        let parsed = if javascript {
+            parse_javascript_source_file(source)
+        } else {
+            parse_source_file(source)
+        };
+        assert!(parsed.diagnostics.is_empty(), "{source}");
+        let file = FileId::new(0);
+        let mut context = if javascript {
+            javascript_context(&parsed, file, CanonicalCheckerOptions::default())
+        } else {
+            context(&parsed, CanonicalCheckerOptions::default())
+        };
+        context
+            .check_source_file(file)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert!(context.diagnostics().is_empty(), "{source}");
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let type_ = context.get_type_at_location(declaration).unwrap();
+        let signature = context
+            .store()
+            .signature_links(declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let expected_flags = if expected_flags == 64 {
+            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+        } else {
+            SignatureFlags::NONE
+        };
+        assert_eq!(
+            context.store().signature(signature).unwrap().flags(),
+            expected_flags,
+            "{source}"
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+                context.diagnostics().clone(),
+            )
+        };
+        let before = snapshot(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                context.get_type_at_location(declaration).unwrap(),
+                type_,
+                "{source}"
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(declaration)
+                    .unwrap()
+                    .resolved_signature
+                    .signature(),
+                Some(signature),
+                "{source}",
+            );
+            assert_eq!(
+                context.store().signature(signature).unwrap().flags(),
+                expected_flags,
+                "{source}"
+            );
+            assert_eq!(snapshot(&context), before, "{source}");
+        }
     }
 }
 

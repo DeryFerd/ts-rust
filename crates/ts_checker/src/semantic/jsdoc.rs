@@ -1416,21 +1416,37 @@ impl<'arena> LeadingJsDocComments<'arena> {
         scanner.reset_pos(start);
         scanner.set_skip_trivia(false);
         let mut comments = Vec::new();
+        let trailing = matches!(
+            record.kind,
+            SyntaxKind::Parameter
+                | SyntaxKind::TypeParameter
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::ParenthesizedExpression
+                | SyntaxKind::VariableDeclaration
+                | SyntaxKind::ExportSpecifier
+        );
+        let mut collecting = start == 0 || trailing;
         loop {
             let token = scanner.scan();
             match token.kind {
                 SyntaxKind::EndOfFile => break,
                 SyntaxKind::MultiLineCommentTrivia => {
-                    if token.flags.contains(TokenFlags::PRECEDING_JSDOC_COMMENT)
+                    if collecting
+                        && token.flags.contains(TokenFlags::PRECEDING_JSDOC_COMMENT)
                         && !token.flags.contains(TokenFlags::UNTERMINATED)
                     {
                         comments.push(token.range);
                     }
                 }
-                SyntaxKind::WhitespaceTrivia
-                | SyntaxKind::NewLineTrivia
-                | SyntaxKind::SingleLineCommentTrivia => {}
-                _ => comments.clear(),
+                SyntaxKind::NewLineTrivia => {
+                    collecting |= token.text.bytes().any(|byte| matches!(byte, b'\r' | b'\n'));
+                }
+                SyntaxKind::WhitespaceTrivia | SyntaxKind::SingleLineCommentTrivia => {}
+                _ => {
+                    comments.clear();
+                    collecting = trailing;
+                }
             }
         }
         Ok(comments)
@@ -6307,7 +6323,7 @@ mod tests {
                 SyntaxKind::MethodDeclaration,
             ),
         ] {
-            let source = format!("const object = {{ read() {{ {nested} }} }};");
+            let source = format!("const object = {{ read() {{\n{nested}\n}} }};");
             let javascript = parse_javascript_source_file(&source);
             assert!(
                 javascript.diagnostics.is_empty(),

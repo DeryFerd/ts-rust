@@ -11589,13 +11589,13 @@ mod tests {
                 "Base",
             ),
             (
-                "class Secret { /** @private */ constructor() {} } new Secret();",
+                "class Secret {\n/** @private */ constructor() {} } new Secret();",
                 true,
                 2673,
                 "Secret",
             ),
             (
-                "class Base { /** @protected */ constructor() {} } new Base();",
+                "class Base {\n/** @protected */ constructor() {} } new Base();",
                 true,
                 2674,
                 "Base",
