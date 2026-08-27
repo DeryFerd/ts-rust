@@ -1245,7 +1245,7 @@ struct TypeQueryPlan {
     recovered_missing_reference_diagnostics:
         BTreeMap<NodeRef, PlannedMissingTypeReferenceDiagnostic>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
-    namespace_type_queries: BTreeMap<NodeRef, SemanticSymbolId>,
+    namespace_type_queries: BTreeMap<NodeRef, super::alias_provider::NamespaceTypeQueryTarget>,
     class_type_queries: BTreeMap<SemanticSymbolId, ClassMemberQueryPlan>,
     imported_callable_type_queries:
         BTreeMap<SemanticSymbolId, source_callables::SourceCallablePlan>,
@@ -10936,7 +10936,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .map_err(|error| {
                 type_node_unavailable(TypeNodeUnavailable::NamespaceAliasHost { node, error })
             })?;
-        let module = provider
+        let namespace = provider
             .namespace_type_query_target(self.store, alias)
             .map_err(|reason| {
                 type_node_unavailable(TypeNodeUnavailable::NamespaceAlias {
@@ -10947,9 +10947,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     },
                 })
             })?;
-        let type_ =
-            super::source_imports::source_file_namespace_type(self.store, self.host, module)
-                .map_err(|_| invalid())?;
+        if matches!(
+            namespace,
+            super::alias_provider::NamespaceTypeQueryTarget::CommonJsWrapper { .. }
+        ) {
+            super::source_imports::source_file_namespace_type(
+                self.store,
+                self.host,
+                namespace.source_module(),
+            )
+            .map_err(|_| invalid())?;
+        }
+        let type_ = namespace
+            .namespace()
+            .map(|module| {
+                super::source_imports::source_file_namespace_type(self.store, self.host, module)
+                    .map_err(|_| invalid())
+            })
+            .transpose()?
+            .flatten();
         let cached_type = self
             .store
             .type_node_links(node)
@@ -10970,16 +10986,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || cached_symbol.is_some_and(|cached| cached != alias)
             || cached_type.is_some() != cached_symbol.is_some()
             || cached_type.is_some()
-                && self.store.alias_symbol_links(alias).is_none_or(|links| {
-                    links.alias_target != super::AliasTargetState::Resolved(module)
-                })
+                && self
+                    .store
+                    .alias_symbol_links(alias)
+                    .is_none_or(|links| links.alias_target.symbol() != namespace.namespace())
             || self.store.value_symbol_links(alias).is_some_and(|links| {
                 links != &super::ValueSymbolLinks::default()
                     && (links.resolved_type != type_
                         || type_.is_none()
-                        || self
-                            .store
-                            .value_symbol_links(module)
+                        || namespace
+                            .namespace()
+                            .and_then(|module| self.store.value_symbol_links(module))
                             .and_then(|links| links.resolved_type)
                             != type_
                         || links
@@ -11005,8 +11022,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self
                 .plan
                 .namespace_type_queries
-                .insert(node, module)
-                .is_some_and(|previous| previous != module)
+                .insert(node, namespace)
+                .is_some_and(|previous| previous != namespace)
         {
             return Err(invalid());
         }
@@ -26476,7 +26493,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<TypeId, DeclaredTypeError> {
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
         let query = plan.type_queries.get(&node).copied().ok_or_else(invalid)?;
-        let namespace_value = if let Some(module) = plan.namespace_type_queries.get(&node).copied()
+        let namespace_value = if let Some(target) = plan.namespace_type_queries.get(&node).copied()
         {
             let unavailable =
                 super::module_resolution::CanonicalModuleResolutionManifest::unavailable();
@@ -26495,10 +26512,42 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map_err(|error| {
                     type_node_unavailable(TypeNodeUnavailable::NamespaceAlias { node, error })
                 })?;
+            let actual = provider
+                .namespace_type_query_target(self.store, query.symbol)
+                .map_err(|reason| {
+                    type_node_unavailable(TypeNodeUnavailable::NamespaceAlias {
+                        node,
+                        error: super::alias::CanonicalAliasResolutionError::TargetUnavailable {
+                            alias: query.symbol,
+                            reason,
+                        },
+                    })
+                })?;
+            let module = actual.namespace().ok_or_else(invalid)?;
             if resolved.target != super::AliasTargetState::Resolved(module)
                 || !resolved.events.is_empty()
+                || target.source_module() != actual.source_module()
+                || matches!(
+                    target,
+                    super::alias_provider::NamespaceTypeQueryTarget::Module(_)
+                ) != matches!(
+                    actual,
+                    super::alias_provider::NamespaceTypeQueryTarget::Module(_)
+                )
+                || target.namespace().is_some_and(|planned| planned != module)
             {
                 return Err(invalid());
+            }
+            if matches!(
+                actual,
+                super::alias_provider::NamespaceTypeQueryTarget::CommonJsWrapper { .. }
+            ) {
+                super::source_imports::prepare_source_file_namespace_identity(
+                    self.store,
+                    self.host,
+                    actual.source_module(),
+                )
+                .map_err(|_| invalid())?;
             }
             Some(
                 super::source_imports::prepare_source_file_namespace_identity(

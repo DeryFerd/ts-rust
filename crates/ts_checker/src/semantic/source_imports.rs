@@ -208,6 +208,7 @@ struct SourceFileNamespacePlan {
     declaration: NodeRef,
     exports: Option<super::SymbolTableId>,
     entries: Vec<(EscapedName, SemanticSymbolId)>,
+    wrapper: Option<super::alias_provider::SourceFileNamespaceWrapper>,
 }
 
 /// One source-file namespace identity, shared by typeof and later value reads.
@@ -238,6 +239,25 @@ fn plan_source_file_namespace(
     module: SemanticSymbolId,
 ) -> Result<SourceFileNamespacePlan, SourceImportError> {
     let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(module));
+    if let Some(wrapper) = store.source_file_namespace_wrapper_for_module(module) {
+        if !super::alias_provider::source_file_namespace_wrapper_is_exact(store, wrapper)
+            || !host.symbol_matches(store, wrapper.source.binding, wrapper.source.alias)
+        {
+            return Err(invalid());
+        }
+        let mut plan = plan_source_file_namespace(store, host, wrapper.source.module)?;
+        if plan.wrapper.is_some()
+            || plan.declaration != wrapper.source.declaration
+            || plan.exports != wrapper.source.exports
+            || plan.entries != wrapper.source.entries
+        {
+            return Err(invalid());
+        }
+        plan.module = module;
+        plan.exports = wrapper.exports;
+        plan.wrapper = Some(wrapper.clone());
+        return Ok(plan);
+    }
     let record = store.symbol(module).ok_or_else(invalid)?;
     let Some([declaration]) = record.declarations() else {
         return Err(invalid());
@@ -279,6 +299,7 @@ fn plan_source_file_namespace(
         declaration,
         exports: record.exports(),
         entries,
+        wrapper: None,
     })
 }
 
@@ -298,13 +319,24 @@ fn source_file_namespace_identity<'store>(
         }
         return Ok(None);
     };
-    let record = store.type_payload(identity.type_).ok_or_else(invalid)?;
-    let TypeData::Object(object) = record.data() else {
+    if identity.plan != plan || !source_file_namespace_record_is_exact(store, identity) {
         return Err(invalid());
+    }
+    Ok(Some(identity))
+}
+
+fn source_file_namespace_record_is_exact(
+    store: &CanonicalTypeMapperStore,
+    identity: &SourceFileNamespaceIdentity,
+) -> bool {
+    let Some(record) = store.type_payload(identity.type_) else {
+        return false;
     };
-    if identity.plan != plan
-        || record.flags() != TypeFlags::OBJECT
-        || record.symbol() != Some(module)
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(identity.plan.module)
         || record.alias().is_some()
         || object.target.is_some()
         || object.mapper.is_some()
@@ -315,25 +347,32 @@ fn source_file_namespace_identity<'store>(
             .structured
             .object_type_without_abstract_construct_signatures
             .is_some()
-        || store.value_symbol_links(module).is_some_and(|links| {
-            links != &ValueSymbolLinks::default()
-                && links
-                    != &ValueSymbolLinks {
-                        resolved_type: Some(identity.type_),
-                        ..ValueSymbolLinks::default()
-                    }
-        })
+        || store
+            .value_symbol_links(identity.plan.module)
+            .is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && links
+                        != &ValueSymbolLinks {
+                            resolved_type: Some(identity.type_),
+                            ..ValueSymbolLinks::default()
+                        }
+            })
     {
-        return Err(invalid());
+        return false;
     }
     match &identity.properties {
         None if record.object_flags() == ObjectFlags::ANONYMOUS
-            && object == &super::type_records::ObjectTypeData::default() => {}
+            && object == &super::type_records::ObjectTypeData::default() =>
+        {
+            true
+        }
         Some(_)
-            if record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED => {}
-        _ => return Err(invalid()),
+            if record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED =>
+        {
+            true
+        }
+        _ => false,
     }
-    Ok(Some(identity))
 }
 
 /// Validates the deferred or completed namespace without demanding export types.
@@ -345,6 +384,11 @@ pub(super) fn source_file_namespace_type(
     let Some(identity) = source_file_namespace_identity(store, host, module)? else {
         return Ok(None);
     };
+    if identity.plan.wrapper.is_some() && identity.properties.is_some() {
+        validated_source_file_namespace_wrapper(store, identity.type_)?
+            .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+        return Ok(Some(identity.type_));
+    }
     if identity.properties.as_ref().is_some_and(|properties| {
         !valid_prepared_imported_namespace(
             store,
@@ -358,6 +402,103 @@ pub(super) fn source_file_namespace_type(
         return Err(invariant(SourceImportInvariant::InvalidTargetLinks(module)));
     }
     Ok(Some(identity.type_))
+}
+
+fn validated_source_file_namespace_wrapper(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<
+    Option<(
+        &super::alias_provider::SourceFileNamespaceWrapper,
+        &[PreparedSourceImportModuleProperty],
+    )>,
+    SourceImportError,
+> {
+    let Some(record) = store.type_payload(type_) else {
+        return Ok(None);
+    };
+    let Some(module) = record.symbol() else {
+        return Ok(None);
+    };
+    let Some(wrapper) = store.source_file_namespace_wrapper_for_module(module) else {
+        return Ok(None);
+    };
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(module));
+    let identity = store
+        .source_file_namespace_identity(module)
+        .ok_or_else(invalid)?;
+    let properties = identity.properties.as_deref().ok_or_else(invalid)?;
+    let bare = store
+        .source_file_namespace_identity(wrapper.source.module)
+        .ok_or_else(invalid)?;
+    let default = properties
+        .iter()
+        .find(|property| property.target_symbol == wrapper.default)
+        .ok_or_else(invalid)?;
+    let default_namespace = default.namespace.as_ref().ok_or_else(invalid)?;
+    if identity.type_ != type_
+        || identity.plan.wrapper.as_ref() != Some(wrapper)
+        || !source_file_namespace_record_is_exact(store, identity)
+        || !source_file_namespace_record_is_exact(store, bare)
+        || bare.plan.module != wrapper.source.module
+        || bare.plan.wrapper.is_some()
+        || bare.plan.declaration != wrapper.source.declaration
+        || bare.plan.exports != wrapper.source.exports
+        || bare.plan.entries != wrapper.source.entries
+        || default.type_ != bare.type_
+        || bare.properties.as_deref() != Some(default_namespace.properties.as_slice())
+        || store
+            .value_symbol_links(wrapper.source.alias)
+            .is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && (links
+                        != &ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        }
+                        || store
+                            .value_symbol_links(module)
+                            .and_then(|links| links.resolved_type)
+                            != Some(type_))
+            })
+        || !valid_prepared_imported_namespace(
+            store,
+            Some(wrapper.source.alias),
+            module,
+            wrapper.source.declaration,
+            type_,
+            properties,
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(Some((wrapper, properties)))
+}
+
+/// Returns the original export or generated default alias from a checked wrapper type.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn source_file_namespace_wrapper_member(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    name: &str,
+) -> Result<Option<(SemanticSymbolId, TypeId)>, SourceImportError> {
+    let Some((_, properties)) = validated_source_file_namespace_wrapper(store, type_)? else {
+        return Ok(None);
+    };
+    Ok(properties
+        .iter()
+        .find(|property| property.name.as_ref().as_utf8() == Some(name))
+        .map(|property| (property.target_symbol, property.type_)))
+}
+
+/// Supplies the import origin only after checking the complete namespace type.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn source_file_namespace_wrapper_origin(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<NodeRef>, SourceImportError> {
+    Ok(validated_source_file_namespace_wrapper(store, type_)?
+        .map(|(wrapper, _)| wrapper.source.originating_import))
 }
 
 pub(super) fn prepare_source_file_namespace_identity(
@@ -2465,22 +2606,20 @@ pub(super) fn resolve_source_import_namespace_exports(
     host: &DeclaredTypeHost<'_>,
     resolved: &ResolvedSourceImportBinding,
 ) -> Result<(), SourceImportError> {
-    preflight_namespace_export_cycles(
-        store,
-        alias_host,
-        host,
-        resolved.target_symbol,
-        &mut HashSet::new(),
-    )?;
+    let namespace = if let Some(wrapper) =
+        store.source_file_namespace_wrapper_for_module(resolved.target_symbol)
+    {
+        plan_source_file_namespace(store, host, resolved.target_symbol)?;
+        wrapper.source.module
+    } else {
+        resolved.target_symbol
+    };
+    preflight_namespace_export_cycles(store, alias_host, host, namespace, &mut HashSet::new())?;
     let mut staged = Vec::new();
-    stage_imported_namespace_const_alias(
-        store,
-        alias_host,
-        host,
-        resolved.target_symbol,
-        &mut staged,
-    )?;
-    if store.export_type_links(resolved.target_symbol).is_some() {
+    stage_imported_namespace_const_alias(store, alias_host, host, namespace, &mut staged)?;
+    if namespace == resolved.target_symbol
+        && store.export_type_links(resolved.target_symbol).is_some()
+    {
         authenticate_synthetic_import_namespace_identity(
             store,
             resolved.binding.alias_symbol,
@@ -2488,7 +2627,7 @@ pub(super) fn resolve_source_import_namespace_exports(
         )?;
         return Ok(());
     }
-    let module = store.symbol(resolved.target_symbol).ok_or_else(|| {
+    let module = store.symbol(namespace).ok_or_else(|| {
         invariant(SourceImportInvariant::InvalidTargetSymbol(
             resolved.target_symbol,
         ))
@@ -2500,7 +2639,7 @@ pub(super) fn resolve_source_import_namespace_exports(
         return Ok(());
     }
     let Some(exports) = store
-        .module_symbol_links(resolved.target_symbol)
+        .module_symbol_links(namespace)
         .and_then(|links| links.resolved_exports)
         .or_else(|| module.exports())
     else {
@@ -5495,6 +5634,20 @@ fn plan_direct_imported_module_namespace_members(
     let record = store
         .symbol(module)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(module)))?;
+    if let Some(wrapper) = store.source_file_namespace_wrapper_for_module(module) {
+        plan_source_file_namespace(store, host, module)?;
+        preflight_import_target_value_links(store, module)?;
+        return plan_direct_imported_module_namespace(
+            store,
+            host,
+            global_types,
+            options,
+            alias,
+            wrapper.source.module,
+            namespace_aliases,
+            active_modules,
+        );
+    }
     if store.export_type_links(module).is_some() {
         return plan_synthetic_import_namespace(store, host, global_types, alias, module);
     }
@@ -6296,6 +6449,22 @@ fn materialize_imported_module_namespace(
     members: Vec<PlannedSourceImportModuleMember>,
     expected_type: Option<TypeId>,
 ) -> Result<(TypeId, Vec<PreparedSourceImportModuleProperty>), SourceImportError> {
+    if let Some(wrapper) = store
+        .source_file_namespace_wrapper_for_module(module)
+        .cloned()
+    {
+        return materialize_source_file_namespace_wrapper(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            &wrapper,
+            members,
+            expected_type,
+        );
+    }
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
     let shared_owner = owner.filter(|owner| {
@@ -6578,6 +6747,121 @@ fn materialize_imported_module_namespace(
         assert!(store.record_source_file_namespace_identity(identity));
     }
     Ok((namespace_type, properties))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_source_file_namespace_wrapper(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    wrapper: &super::alias_provider::SourceFileNamespaceWrapper,
+    members: Vec<PlannedSourceImportModuleMember>,
+    expected_type: Option<TypeId>,
+) -> Result<(TypeId, Vec<PreparedSourceImportModuleProperty>), SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(wrapper.namespace));
+    plan_source_file_namespace(store, host, wrapper.namespace)?;
+    let retained = source_file_namespace_type(store, host, wrapper.namespace)?;
+    if expected_type.is_some_and(|expected| retained != Some(expected)) {
+        return Err(invalid());
+    }
+    let (bare, bare_properties) = materialize_imported_module_namespace(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        wrapper.source.declaration,
+        wrapper.source.module,
+        members,
+        None,
+    )?;
+    let default_namespace = Some(Box::new(PreparedSourceImportNestedNamespace {
+        declaration: wrapper.source.declaration,
+        properties: bare_properties.clone(),
+        links: prepare_value_links(store, wrapper.source.module, bare, false)?,
+    }));
+    let mut properties = bare_properties
+        .into_iter()
+        .filter(|property| property.name.as_ref() != InternalSymbolName::Default.as_ref())
+        .map(|mut property| {
+            // A recursive export still points to the bare module in the wrapped view.
+            property.recursive_const = None;
+            property
+        })
+        .collect::<Vec<_>>();
+    if let Some(identity) = store.source_file_namespace_identity(wrapper.namespace)
+        && let Some(existing) = &identity.properties
+    {
+        let default = existing
+            .iter()
+            .find(|property| property.name.as_ref() == InternalSymbolName::Default.as_ref())
+            .ok_or_else(invalid)?;
+        properties.push(PreparedSourceImportModuleProperty {
+            name: EscapedName::internal(InternalSymbolName::Default),
+            symbol: default.symbol,
+            target_symbol: wrapper.default,
+            value_symbol: wrapper.source.module,
+            type_: bare,
+            namespace: default_namespace,
+            recursive_const: None,
+        });
+        if &properties != existing {
+            return Err(invalid());
+        }
+        return Ok((identity.type_, properties));
+    }
+    if !store.try_reserve_checker_symbol_allocations(1, 1)
+        || !store.try_reserve_value_symbol_links(1)
+    {
+        return Err(invalid());
+    }
+    let type_ = prepare_source_file_namespace_identity(store, host, wrapper.namespace)?;
+    let default = store
+        .alloc_symbol(SymbolData::new(
+            SymbolFlags::PROPERTY,
+            EscapedName::internal(InternalSymbolName::Default),
+        ))
+        .ok_or_else(invalid)?;
+    if !store.set_value_symbol_links(
+        default,
+        ValueSymbolLinks {
+            resolved_type: Some(bare),
+            target: Some(wrapper.default),
+            ..ValueSymbolLinks::default()
+        },
+    ) {
+        return Err(invalid());
+    }
+    properties.push(PreparedSourceImportModuleProperty {
+        name: EscapedName::internal(InternalSymbolName::Default),
+        symbol: default,
+        target_symbol: wrapper.default,
+        value_symbol: wrapper.source.module,
+        type_: bare,
+        namespace: default_namespace,
+        recursive_const: None,
+    });
+    let table = store.alloc_symbol_table();
+    for property in &properties {
+        if store.insert_symbol(table, property.name.clone(), property.symbol) != Some(None) {
+            return Err(invalid());
+        }
+    }
+    let symbols = properties.iter().map(|property| property.symbol).collect();
+    if !store.set_structured_type_members(type_, Some(table), Some(symbols), None, None, None) {
+        return Err(invalid());
+    }
+    let mut identity = store
+        .source_file_namespace_identity(wrapper.namespace)
+        .cloned()
+        .ok_or_else(invalid)?;
+    identity.properties = Some(properties.clone());
+    assert!(store.record_source_file_namespace_identity(identity));
+    Ok((type_, properties))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9422,10 +9706,21 @@ fn valid_prepared_imported_namespace(
     let Some(structured) = record.data().structured() else {
         return false;
     };
+    let wrapper = store.source_file_namespace_wrapper_for_module(module);
+    if wrapper.is_some_and(|wrapper| {
+        !super::alias_provider::source_file_namespace_wrapper_is_exact(store, wrapper)
+    }) {
+        return false;
+    }
+    let exports_owner = wrapper.map_or(module, |wrapper| wrapper.source.module);
     let exports = store
-        .module_symbol_links(module)
+        .module_symbol_links(exports_owner)
         .and_then(|links| links.resolved_exports)
-        .or_else(|| target.exports())
+        .or_else(|| {
+            store
+                .symbol(exports_owner)
+                .and_then(ts_binder::semantic::Symbol::exports)
+        })
         .and_then(|exports| store.symbol_table(exports));
     let symbols = structured.properties.as_deref().unwrap_or_default();
     let members = structured
@@ -9433,7 +9728,7 @@ fn valid_prepared_imported_namespace(
         .and_then(|members| store.symbol_table(members));
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
-    let synthetic = if store.export_type_links(module).is_some() {
+    let synthetic = if wrapper.is_none() && store.export_type_links(module).is_some() {
         let Some(alias) = import_alias else {
             return false;
         };
@@ -9463,7 +9758,10 @@ fn valid_prepared_imported_namespace(
             symbols.contains(&property.symbol)
                 && members.and_then(|members| members.get(property.name.as_ref()))
                     == Some(property.symbol)
-                && exports.and_then(|exports| exports.get(property.name.as_ref()))
+                && wrapper
+                    .filter(|_| property.name.as_ref() == InternalSymbolName::Default.as_ref())
+                    .map(|wrapper| wrapper.default)
+                    .or_else(|| exports.and_then(|exports| exports.get(property.name.as_ref())))
                     == Some(property.target_symbol)
                 && store.symbol(property.symbol).is_some_and(|record| {
                     record.flags() == SymbolFlags::PROPERTY
@@ -9959,10 +10257,22 @@ mod tests {
                 let (_, bound) = context.file(files[1].0).unwrap();
                 let module = bound.symbol(bound.source_file()).unwrap();
                 let type_ = context.get_type_from_type_node(query).unwrap();
-                assert_eq!(
-                    context.store().type_payload(type_).unwrap().symbol(),
-                    Some(module)
-                );
+                let namespace = context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .symbol()
+                    .unwrap();
+                let wrapped = usage_mode == Esm && target_mode == CommonJs;
+                if wrapped {
+                    assert_ne!(namespace, module);
+                    assert_eq!(
+                        context.store().export_type_links(namespace).unwrap().target,
+                        Some(module)
+                    );
+                } else {
+                    assert_eq!(namespace, module);
+                }
                 assert_eq!(
                     context
                         .store()
@@ -10007,11 +10317,30 @@ mod tests {
                 assert_eq!(
                     context
                         .store()
-                        .value_symbol_links(module)
+                        .value_symbol_links(namespace)
                         .unwrap()
                         .resolved_type,
                     Some(type_)
                 );
+                let bare_type = context
+                    .store()
+                    .value_symbol_links(module)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                if wrapped {
+                    assert_ne!(bare_type, type_);
+                    let wrapper = context
+                        .store()
+                        .source_file_namespace_wrapper(alias)
+                        .unwrap();
+                    assert_eq!(
+                        source_file_namespace_wrapper_member(context.store(), type_, "default"),
+                        Ok(Some((wrapper.default, bare_type)))
+                    );
+                } else {
+                    assert_eq!(bare_type, type_);
+                }
                 assert_eq!(
                     context
                         .store()
@@ -10373,20 +10702,38 @@ mod tests {
             bound.symbol(bound.source_file()).unwrap()
         });
         let mut identities = HashMap::new();
-        for &(file, source) in &files {
+        let mut bare_identities = HashMap::new();
+        for (source_index, &(file, source)) in files.iter().enumerate() {
             for (name, target) in [("cjs", 2), ("mjs", 1), ("type", 0)] {
                 let query = namespace_type_query_node(source, file, name);
                 let type_ = context.get_type_from_type_node(query).unwrap();
-                assert_eq!(
-                    context.store().type_payload(type_).unwrap().symbol(),
-                    Some(modules[target])
-                );
-                if let Some(previous) = identities.insert(modules[target], type_) {
-                    assert_eq!(previous, type_);
+                let namespace = context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .symbol()
+                    .unwrap();
+                if modes[source_index] == Esm && modes[target] == CommonJs {
+                    assert_ne!(namespace, modules[target]);
+                    assert_eq!(
+                        context.store().export_type_links(namespace).unwrap().target,
+                        Some(modules[target])
+                    );
+                } else {
+                    assert_eq!(namespace, modules[target]);
+                    if let Some(previous) = bare_identities.insert(modules[target], type_) {
+                        assert_eq!(previous, type_);
+                    }
                 }
+                identities.insert((file, target), type_);
             }
         }
-        assert_eq!(identities.len(), 3);
+        assert_eq!(identities.len(), 9);
+        assert_eq!(bare_identities.len(), 3);
+        assert_eq!(
+            identities.values().copied().collect::<HashSet<_>>().len(),
+            5
+        );
         for &(file, _) in &files {
             context.check_source_file(file).unwrap();
         }
@@ -10410,7 +10757,7 @@ mod tests {
                         .value_symbol_links(property)
                         .unwrap()
                         .resolved_type,
-                    Some(identities[&modules[target]])
+                    Some(identities[&(file, target)])
                 );
             }
         }
@@ -10431,6 +10778,140 @@ mod tests {
             before
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn source_file_namespace_wrapper_rejects_changed_links_without_repair() {
+        use CanonicalModuleResolutionMode::{CommonJs, Esm};
+        let importer = parsed(
+            "import * as ns from './target'; type Copy = typeof ns; export const copied = ns;",
+        );
+        let target = parsed("export const value: number;");
+        let files = [
+            (FileId::new(13_840), &importer),
+            (FileId::new(13_841), &target),
+        ];
+        let routes = [Route {
+            source: 0,
+            specifier: 0,
+            target: Some(1),
+        }];
+        let mut context =
+            namespace_type_query_context(&files, &[Esm, CommonJs], Some(&routes), &[1]);
+        let query = namespace_type_query_node(&importer, files[0].0, "ns");
+        let type_ = context.get_type_from_type_node(query).unwrap();
+        context.check_source_file(files[0].0).unwrap();
+        let namespace = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let wrapper = context
+            .store()
+            .source_file_namespace_wrapper_for_module(namespace)
+            .cloned()
+            .unwrap();
+        let alias = wrapper.source.alias;
+        let default_property = context
+            .store()
+            .source_file_namespace_identity(namespace)
+            .unwrap()
+            .properties
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|property| property.target_symbol == wrapper.default)
+            .unwrap()
+            .symbol;
+        let alias_links = context.store().alias_symbol_links(alias).cloned().unwrap();
+        let default_links = context
+            .store()
+            .alias_symbol_links(wrapper.default)
+            .cloned()
+            .unwrap();
+        let export_links = context
+            .store()
+            .export_type_links(namespace)
+            .cloned()
+            .unwrap();
+        let property_links = context
+            .store()
+            .value_symbol_links(default_property)
+            .cloned()
+            .unwrap();
+        for poison in 0..6 {
+            let store = context.store_mut_for_test();
+            match poison {
+                0 => {
+                    let mut links = alias_links.clone();
+                    links.alias_target = AliasTargetState::Resolved(wrapper.source.module);
+                    assert!(store.set_alias_symbol_links(alias, links));
+                }
+                1 => {
+                    let mut links = default_links.clone();
+                    links.alias_target = AliasTargetState::Resolved(namespace);
+                    assert!(store.set_alias_symbol_links(wrapper.default, links));
+                }
+                2 => {
+                    let mut links = export_links.clone();
+                    links.target = Some(wrapper.default);
+                    assert!(store.set_export_type_links(namespace, links));
+                }
+                3 => assert!(store.set_type_symbol(type_, Some(wrapper.source.module))),
+                4 => {
+                    let mut links = property_links.clone();
+                    links.resolved_type = Some(store.intrinsic_bootstrap().unwrap().string_type);
+                    assert!(store.set_value_symbol_links(default_property, links));
+                }
+                5 => assert!(store.set_alias_symbol_links(alias, AliasSymbolLinks::default())),
+                _ => unreachable!(),
+            }
+            let before = (
+                store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            let identity = context
+                .store()
+                .source_file_namespace_identity(namespace)
+                .cloned();
+            assert!(
+                context.get_type_from_type_node(query).is_err(),
+                "poison={poison}"
+            );
+            assert_eq!(
+                (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().signature_len()
+                ),
+                before
+            );
+            assert_eq!(
+                context.store().source_file_namespace_identity(namespace),
+                identity.as_ref()
+            );
+            let store = context.store_mut_for_test();
+            assert!(store.set_alias_symbol_links(alias, alias_links.clone()));
+            assert!(store.set_alias_symbol_links(wrapper.default, default_links.clone()));
+            assert!(store.set_export_type_links(namespace, export_links.clone()));
+            assert!(store.set_type_symbol(type_, Some(namespace)));
+            assert!(store.set_value_symbol_links(default_property, property_links.clone()));
+            assert_eq!(context.get_type_from_type_node(query), Ok(type_));
+            assert_eq!(
+                source_file_namespace_wrapper_origin(context.store(), type_),
+                Ok(Some(wrapper.source.originating_import))
+            );
+            assert_eq!(
+                source_file_namespace_wrapper_member(context.store(), type_, "default"),
+                Ok(Some((
+                    wrapper.default,
+                    property_links.resolved_type.unwrap()
+                )))
+            );
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     fn fixture(sources: &[&str], routes: &[Route]) -> Fixture {

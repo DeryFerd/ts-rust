@@ -19,6 +19,7 @@ use ts_core::TextRange;
 use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
+    alias_provider::SourceFileNamespaceWrapper,
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
     conditional_types::{
@@ -544,6 +545,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
     source_file_namespace_identities: HashMap<SemanticSymbolId, SourceFileNamespaceIdentity>,
+    source_file_namespace_wrappers: HashMap<SemanticSymbolId, SourceFileNamespaceWrapper>,
+    source_file_namespace_wrapper_aliases: HashMap<SemanticSymbolId, SemanticSymbolId>,
+    source_file_namespace_wrapper_defaults: HashMap<SemanticSymbolId, SemanticSymbolId>,
     source_overload_provenance: HashMap<TypeId, SourceOverloadProvenance>,
     source_overload_types_by_declaration: HashMap<NodeRef, TypeId>,
     source_overload_types_by_owner: HashMap<SemanticSymbolId, TypeId>,
@@ -680,6 +684,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
             source_file_namespace_identities: HashMap::new(),
+            source_file_namespace_wrappers: HashMap::new(),
+            source_file_namespace_wrapper_aliases: HashMap::new(),
+            source_file_namespace_wrapper_defaults: HashMap::new(),
             source_overload_provenance: HashMap::new(),
             source_overload_types_by_declaration: HashMap::new(),
             source_overload_types_by_owner: HashMap::new(),
@@ -2995,6 +3002,81 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_file_namespace_identities
             .try_reserve(count)
             .is_ok()
+    }
+
+    pub(super) fn source_file_namespace_wrapper(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Option<&SourceFileNamespaceWrapper> {
+        self.source_file_namespace_wrappers.get(&alias)
+    }
+
+    pub(super) fn source_file_namespace_wrapper_for_module(
+        &self,
+        module: SemanticSymbolId,
+    ) -> Option<&SourceFileNamespaceWrapper> {
+        let alias = self.source_file_namespace_wrapper_aliases.get(&module)?;
+        self.source_file_namespace_wrappers.get(alias)
+    }
+
+    pub(super) fn source_file_namespace_wrapper_default(
+        &self,
+        module: SemanticSymbolId,
+    ) -> Option<SemanticSymbolId> {
+        self.source_file_namespace_wrapper_defaults
+            .get(&module)
+            .copied()
+    }
+
+    pub(super) fn try_reserve_source_file_namespace_wrappers(&mut self, count: usize) -> bool {
+        self.source_file_namespace_wrappers
+            .try_reserve(count)
+            .is_ok()
+            && self
+                .source_file_namespace_wrapper_aliases
+                .try_reserve(count)
+                .is_ok()
+            && self
+                .source_file_namespace_wrapper_defaults
+                .try_reserve(count)
+                .is_ok()
+    }
+
+    pub(super) fn record_source_file_namespace_wrapper(
+        &mut self,
+        wrapper: SourceFileNamespaceWrapper,
+    ) -> bool {
+        if let Some(existing) = self
+            .source_file_namespace_wrappers
+            .get(&wrapper.source.alias)
+        {
+            return existing == &wrapper;
+        }
+        if self
+            .source_file_namespace_wrapper_aliases
+            .contains_key(&wrapper.namespace)
+            || self
+                .source_file_namespace_wrapper_defaults
+                .get(&wrapper.source.module)
+                .is_some_and(|default| *default != wrapper.default)
+            || [
+                wrapper.source.alias,
+                wrapper.source.module,
+                wrapper.namespace,
+                wrapper.default,
+            ]
+            .iter()
+            .any(|symbol| self.symbol(*symbol).is_none())
+        {
+            return false;
+        }
+        self.source_file_namespace_wrapper_aliases
+            .insert(wrapper.namespace, wrapper.source.alias);
+        self.source_file_namespace_wrapper_defaults
+            .insert(wrapper.source.module, wrapper.default);
+        self.source_file_namespace_wrappers
+            .insert(wrapper.source.alias, wrapper);
+        true
     }
 
     pub(super) fn record_source_file_namespace_identity(

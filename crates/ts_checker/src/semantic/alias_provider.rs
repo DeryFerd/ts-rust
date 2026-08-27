@@ -97,6 +97,160 @@ pub(super) enum DisplayAliasTarget {
     Namespace(SemanticSymbolId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NamespaceTypeQueryTarget {
+    Module(SemanticSymbolId),
+    CommonJsWrapper {
+        module: SemanticSymbolId,
+        namespace: Option<SemanticSymbolId>,
+    },
+}
+
+impl NamespaceTypeQueryTarget {
+    pub(super) const fn namespace(self) -> Option<SemanticSymbolId> {
+        match self {
+            Self::Module(module) => Some(module),
+            Self::CommonJsWrapper { namespace, .. } => namespace,
+        }
+    }
+
+    pub(super) const fn source_module(self) -> SemanticSymbolId {
+        match self {
+            Self::Module(module) | Self::CommonJsWrapper { module, .. } => module,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFileNamespaceWrapperSource {
+    pub(super) alias: SemanticSymbolId,
+    pub(super) binding: NodeRef,
+    pub(super) module: SemanticSymbolId,
+    pub(super) declaration: NodeRef,
+    pub(super) originating_import: NodeRef,
+    pub(super) exports: Option<super::SymbolTableId>,
+    pub(super) entries: Vec<(EscapedName, SemanticSymbolId)>,
+    module_name: EscapedName,
+    alias_name: EscapedName,
+    alias_declarations: Vec<NodeRef>,
+    alias_export_symbol: Option<SemanticSymbolId>,
+}
+
+/// One import-owned namespace. Its default alias points to the bare source module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFileNamespaceWrapper {
+    pub(super) source: SourceFileNamespaceWrapperSource,
+    pub(super) namespace: SemanticSymbolId,
+    pub(super) exports: Option<super::SymbolTableId>,
+    pub(super) default: SemanticSymbolId,
+}
+
+fn source_file_namespace_default_is_exact<MapperPayload>(
+    store: &CanonicalSemanticStore<MapperPayload>,
+    module: SemanticSymbolId,
+    default: SemanticSymbolId,
+) -> bool {
+    store.symbol(default).is_some_and(|record| {
+        record.flags() == SymbolFlags::ALIAS
+            && record.check_flags() == CheckFlags::NONE
+            && record.name() == InternalSymbolName::Default.as_ref()
+            && record.declarations().is_none()
+            && record.value_declaration().is_none()
+            && record.parent() == Some(module)
+            && record.members().is_none()
+            && record.exports().is_none()
+            && record.export_symbol().is_none()
+    }) && store.get_merged_symbol(default) == Some(default)
+        && store.alias_symbol_links(default).is_some_and(|links| {
+            links.immediate_target == Some(module)
+                && links.alias_target == AliasTargetState::Resolved(module)
+                && links.type_only_declaration.is_none()
+        })
+        && store
+            .value_symbol_links(default)
+            .is_none_or(|links| links == &super::ValueSymbolLinks::default())
+}
+
+pub(super) fn source_file_namespace_wrapper_is_exact<MapperPayload>(
+    store: &CanonicalSemanticStore<MapperPayload>,
+    wrapper: &SourceFileNamespaceWrapper,
+) -> bool {
+    let source = &wrapper.source;
+    let Some(module) = store.symbol(source.module) else {
+        return false;
+    };
+    let Some(namespace) = store.symbol(wrapper.namespace) else {
+        return false;
+    };
+    let Some(alias) = store.symbol(source.alias) else {
+        return false;
+    };
+    let exports_match = |table| match table {
+        None => source.entries.is_empty(),
+        Some(table) => store.symbol_table(table).is_some_and(|table| {
+            table.len() == source.entries.len()
+                && source
+                    .entries
+                    .iter()
+                    .all(|(name, symbol)| table.get(name.as_ref()) == Some(*symbol))
+        }),
+    };
+    module.flags() == SymbolFlags::VALUE_MODULE
+        && module.check_flags() == CheckFlags::NONE
+        && module.name() == source.module_name.as_ref()
+        && module.declarations() == Some(&[source.declaration])
+        && module.value_declaration() == Some(source.declaration)
+        && module.parent().is_none()
+        && module.members().is_none()
+        && module.export_symbol().is_none()
+        && module.exports() == source.exports
+        && exports_match(source.exports)
+        && store.source_symbol_declarations_match(source.module)
+        && store.export_type_links(source.module).is_none()
+        && store.source_node_kind(source.declaration) == Some(SyntaxKind::SourceFile)
+        && store.get_merged_symbol(source.module) == Some(source.module)
+        && namespace.flags() == module.flags()
+        && namespace.check_flags() == CheckFlags::NONE
+        && namespace.name() == module.name()
+        && namespace.declarations() == module.declarations()
+        && namespace.value_declaration() == module.value_declaration()
+        && namespace.parent().is_none()
+        && namespace.members().is_none()
+        && namespace.export_symbol().is_none()
+        && namespace.exports() == wrapper.exports
+        && wrapper.exports.is_some() == source.exports.is_some()
+        && exports_match(wrapper.exports)
+        && store.get_merged_symbol(wrapper.namespace) == Some(wrapper.namespace)
+        && store.export_type_links(wrapper.namespace)
+            == Some(&ExportTypeLinks {
+                target: Some(source.module),
+                originating_import: Some(source.originating_import),
+            })
+        && source_file_namespace_default_is_exact(store, source.module, wrapper.default)
+        && store.source_file_namespace_wrapper_default(source.module) == Some(wrapper.default)
+        && alias.flags() == SymbolFlags::ALIAS
+        && alias.check_flags() == CheckFlags::NONE
+        && alias.name() == source.alias_name.as_ref()
+        && alias.declarations() == Some(source.alias_declarations.as_slice())
+        && alias.value_declaration().is_none()
+        && alias.parent().is_none()
+        && alias.members().is_none()
+        && alias.exports().is_none()
+        && alias.export_symbol() == source.alias_export_symbol
+        && store.source_symbol_declarations_match(source.alias)
+        && store.get_merged_symbol(source.alias) == Some(source.alias)
+        && store.alias_symbol_links(source.alias).is_some_and(|links| {
+            links.immediate_target == Some(wrapper.namespace)
+                && (links.alias_target == AliasTargetState::Unresolved
+                    || links.alias_target == AliasTargetState::Resolved(wrapper.namespace))
+        })
+        && store
+            .alias_symbol_links(source.alias)
+            .is_some_and(|links| links.type_only_declaration.is_none())
+        && store.source_file_namespace_wrapper(source.alias) == Some(wrapper)
+        && store.source_file_namespace_wrapper_for_module(wrapper.namespace) == Some(wrapper)
+}
+
 impl DisplayAliasTarget {
     pub(super) const fn reference(self) -> Option<SemanticSymbolId> {
         match self {
@@ -1187,7 +1341,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         alias: SemanticSymbolId,
-    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+    ) -> Result<NamespaceTypeQueryTarget, CanonicalAliasTargetUnavailable> {
         if store.id() != self.store {
             return Err(CanonicalAliasTargetUnavailable::ForeignStore {
                 expected: self.store,
@@ -1242,6 +1396,19 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 },
             );
         }
+        if resolved.usage_mode() == CanonicalModuleResolutionMode::Esm
+            && resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
+        {
+            let source = self.source_file_namespace_wrapper_source(
+                store,
+                alias,
+                declaration,
+                resolved,
+                module,
+            )?;
+            let namespace = Self::cached_source_file_namespace_wrapper(store, &source)?;
+            return Ok(NamespaceTypeQueryTarget::CommonJsWrapper { module, namespace });
+        }
         if store.alias_symbol_links(alias).is_some_and(|links| {
             links
                 .immediate_target
@@ -1256,6 +1423,212 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
         }
         Self::direct_namespace_target(store, declaration, module)
+            .map(NamespaceTypeQueryTarget::Module)
+    }
+
+    fn source_file_namespace_wrapper_source<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+        binding: NodeRef,
+        resolved: CanonicalResolvedModule,
+        module: SemanticSymbolId,
+    ) -> Result<SourceFileNamespaceWrapperSource, CanonicalAliasTargetUnavailable> {
+        let invalid = || CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+            declaration: binding,
+            module,
+        };
+        let target = self
+            .sources
+            .get(resolved.target_file())
+            .ok_or_else(invalid)?;
+        let facts = target.bound.source_facts().ok_or_else(invalid)?;
+        let declaration = target.bound.source_file();
+        let record = store.symbol(module).ok_or_else(invalid)?;
+        let alias_record = store.symbol(alias).ok_or_else(invalid)?;
+        let importer = self.sources.get(binding.file).ok_or_else(invalid)?;
+        let clause = importer
+            .arena
+            .get(binding.node)
+            .and_then(|node| node.parent)
+            .ok_or_else(invalid)?;
+        let import = importer
+            .arena
+            .get(clause)
+            .and_then(|node| node.parent)
+            .ok_or_else(invalid)?;
+        let originating_import = NodeRef::new(binding.arena, binding.file, import);
+        if resolved.is_ambient_module()
+            || resolved.usage_mode() != CanonicalModuleResolutionMode::Esm
+            || resolved.target_mode() != CanonicalModuleResolutionMode::CommonJs
+            || !facts.is_external_module()
+            || facts.is_javascript_file()
+            || facts.is_common_js_module()
+            || record.flags() != SymbolFlags::VALUE_MODULE
+            || record.check_flags() != CheckFlags::NONE
+            || record.name() != facts.source_file_symbol_name()
+            || record.declarations() != Some(&[declaration])
+            || record.value_declaration() != Some(declaration)
+            || record.parent().is_some()
+            || record.members().is_some()
+            || record.export_symbol().is_some()
+            || store.export_type_links(module).is_some()
+            || target.bound.symbol(declaration) != Some(module)
+            || !store.source_symbol_declarations_match(module)
+            || store.get_merged_symbol(module) != Some(module)
+            || importer
+                .arena
+                .get(import)
+                .is_none_or(|node| node.kind != SyntaxKind::ImportDeclaration)
+        {
+            return Err(invalid());
+        }
+        let entries = record
+            .exports()
+            .map(|exports| {
+                store
+                    .symbol_table(exports)
+                    .ok_or_else(invalid)
+                    .map(|exports| {
+                        exports
+                            .iter()
+                            .map(|(name, symbol)| (name.to_owned(), symbol))
+                            .collect()
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(SourceFileNamespaceWrapperSource {
+            alias,
+            binding,
+            module,
+            declaration,
+            originating_import,
+            exports: record.exports(),
+            entries,
+            module_name: record.name().to_owned(),
+            alias_name: alias_record.name().to_owned(),
+            alias_declarations: alias_record.declarations().ok_or_else(invalid)?.to_vec(),
+            alias_export_symbol: alias_record.export_symbol(),
+        })
+    }
+
+    fn cached_source_file_namespace_wrapper<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        source: &SourceFileNamespaceWrapperSource,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
+        let invalid = || CanonicalAliasTargetUnavailable::InvalidAliasLinks(source.alias);
+        let cached_default = store.source_file_namespace_wrapper_default(source.module);
+        if cached_default.is_some_and(|default| {
+            !source_file_namespace_default_is_exact(store, source.module, default)
+        }) {
+            return Err(invalid());
+        }
+        let Some(wrapper) = store.source_file_namespace_wrapper(source.alias) else {
+            if store.alias_symbol_links(source.alias).is_some_and(|links| {
+                links.immediate_target.is_some()
+                    || links.alias_target != AliasTargetState::Unresolved
+                    || links.type_only_declaration.is_some()
+            }) || store
+                .value_symbol_links(source.alias)
+                .is_some_and(|links| links != &super::ValueSymbolLinks::default())
+            {
+                return Err(invalid());
+            }
+            return Ok(None);
+        };
+        if &wrapper.source != source || !source_file_namespace_wrapper_is_exact(store, wrapper) {
+            return Err(invalid());
+        }
+        Ok(Some(wrapper.namespace))
+    }
+
+    fn source_file_namespace_wrapper_target<MapperPayload>(
+        store: &mut CanonicalSemanticStore<MapperPayload>,
+        source: SourceFileNamespaceWrapperSource,
+        publish: bool,
+    ) -> Result<DisplayAliasTarget, CanonicalAliasTargetUnavailable> {
+        if let Some(namespace) = Self::cached_source_file_namespace_wrapper(store, &source)? {
+            return Ok(DisplayAliasTarget::Symbol(namespace));
+        }
+        if !publish {
+            return Ok(DisplayAliasTarget::Namespace(source.module));
+        }
+        let invalid = || CanonicalAliasTargetUnavailable::InvalidAliasLinks(source.alias);
+        let cached_default = store.source_file_namespace_wrapper_default(source.module);
+        if !store.try_reserve_checker_symbol_allocations(2, usize::from(source.exports.is_some()))
+            || !store.try_reserve_source_file_namespace_wrappers(1)
+            || !store.ensure_alias_symbol_links(source.alias)
+        {
+            return Err(invalid());
+        }
+        let exports = source.exports.map(|_| store.alloc_symbol_table());
+        if let Some(exports) = exports {
+            for (name, symbol) in &source.entries {
+                if store.insert_symbol(exports, name.clone(), *symbol) != Some(None) {
+                    return Err(invalid());
+                }
+            }
+        }
+        let default = if let Some(default) = cached_default {
+            default
+        } else {
+            let default = store
+                .alloc_symbol(SymbolData {
+                    parent: Some(source.module),
+                    ..SymbolData::new(
+                        SymbolFlags::ALIAS,
+                        EscapedName::internal(InternalSymbolName::Default),
+                    )
+                })
+                .ok_or_else(invalid)?;
+            if !store.set_alias_symbol_links(
+                default,
+                AliasSymbolLinks {
+                    immediate_target: Some(source.module),
+                    alias_target: AliasTargetState::Resolved(source.module),
+                    ..AliasSymbolLinks::default()
+                },
+            ) {
+                return Err(invalid());
+            }
+            default
+        };
+        let namespace = store
+            .alloc_symbol(SymbolData {
+                declarations: Some(vec![source.declaration]),
+                value_declaration: Some(source.declaration),
+                exports,
+                ..SymbolData::new(SymbolFlags::VALUE_MODULE, source.module_name.clone())
+            })
+            .ok_or_else(invalid)?;
+        if !store.set_export_type_links(
+            namespace,
+            ExportTypeLinks {
+                target: Some(source.module),
+                originating_import: Some(source.originating_import),
+            },
+        ) {
+            return Err(invalid());
+        }
+        let alias = source.alias;
+        assert!(
+            store.record_source_file_namespace_wrapper(SourceFileNamespaceWrapper {
+                source,
+                namespace,
+                exports,
+                default
+            })
+        );
+        let mut links = store
+            .alias_symbol_links(alias)
+            .cloned()
+            .ok_or(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias))?;
+        links.immediate_target = Some(namespace);
+        if !store.set_alias_symbol_links(alias, links) {
+            return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(alias));
+        }
+        Ok(DisplayAliasTarget::Symbol(namespace))
     }
 
     /// Resolves the exact string argument of a source-owned `JSDoc` import type.
@@ -3055,6 +3428,31 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 if runtime_namespace_export_equals =>
             {
                 export_equals.expect("runtime namespace export-equals was authenticated")
+            }
+            SupportedAliasDeclaration::NamespaceImport {
+                type_only: false, ..
+            } if export_equals.is_none()
+                && !resolved.is_ambient_module()
+                && resolved.usage_mode() == CanonicalModuleResolutionMode::Esm
+                && resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
+                && self
+                    .sources
+                    .get(resolved.target_file())
+                    .and_then(|source| source.bound.source_facts())
+                    .is_some_and(|facts| !facts.is_javascript_file()) =>
+            {
+                let source = self.source_file_namespace_wrapper_source(
+                    store,
+                    alias,
+                    declaration,
+                    resolved,
+                    module,
+                )?;
+                match Self::source_file_namespace_wrapper_target(store, source, publish_namespaces)?
+                {
+                    DisplayAliasTarget::Symbol(namespace) => namespace,
+                    namespace @ DisplayAliasTarget::Namespace(_) => return Ok((namespace, None)),
+                }
             }
             SupportedAliasDeclaration::NamespaceImport { .. } => {
                 Self::direct_namespace_target(store, declaration, module)?
@@ -5399,6 +5797,73 @@ mod tests {
     }
 
     #[test]
+    fn nested_ambient_namespace_import_keeps_its_commonjs_wrapper_origin() {
+        let importer = parsed("declare module 'consumer' { import * as ns from 'target'; }");
+        let target = parsed("export const value: number;");
+        let importer_file = FileId::new(13_845);
+        let target_file = FileId::new(13_846);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::Script),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let specifier = node_ref(&importer, importer_file, module_specifiers(&importer)[0]);
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+            &[importer_file, target_file],
+        );
+        let binding = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(node_ref(
+                    &importer,
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = alias(&bound_files, binding);
+        let module = source_module(&bound_files, target_file);
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let result = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(alias)
+            .unwrap();
+        let AliasTargetState::Resolved(namespace) = result.target else {
+            panic!("the import resolves")
+        };
+        assert!(result.events.is_empty());
+        assert_ne!(namespace, module);
+        let wrapper = store.source_file_namespace_wrapper(alias).unwrap();
+        assert_eq!(wrapper.source.module, module);
+        assert_eq!(
+            wrapper.source.originating_import.node,
+            importer.arena.get(specifier.node).unwrap().parent.unwrap()
+        );
+        assert!(source_file_namespace_wrapper_is_exact(&store, wrapper));
+        let before = (store.symbol_len(), store.symbol_store().symbol_table_len());
+        assert_eq!(
+            host.get_target_of_alias_declaration(&mut store, alias),
+            Ok(CanonicalImmediateAliasTarget::Resolved(namespace))
+        );
+        assert_eq!(
+            (store.symbol_len(), store.symbol_store().symbol_table_len()),
+            before
+        );
+    }
+
+    #[test]
     fn nested_ambient_namespace_import_preserves_merged_export_equals_target() {
         let importer = parsed(concat!(
             "declare module 'mymod' { ",
@@ -6742,7 +7207,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_imports_preserve_module_identity_across_authenticated_module_modes() {
+    fn namespace_imports_preserve_mode_specific_module_identity() {
         for (index, usage_mode, target_mode, declaration_file) in [
             (
                 0,
@@ -6809,35 +7274,50 @@ mod tests {
                 .resolve_alias(namespace)
                 .unwrap();
 
-            assert_eq!(resolved.target, AliasTargetState::Resolved(module));
+            let wrapped = usage_mode == CanonicalModuleResolutionMode::Esm
+                && target_mode == CanonicalModuleResolutionMode::CommonJs;
+            let expected = if wrapped {
+                let wrapper = store.source_file_namespace_wrapper(namespace).unwrap();
+                assert_eq!(wrapper.source.module, module);
+                assert!(source_file_namespace_wrapper_is_exact(&store, wrapper));
+                wrapper.namespace
+            } else {
+                module
+            };
+            let allocations = (
+                symbols.0 + usize::from(wrapped) * 2,
+                symbols.1 + usize::from(wrapped),
+            );
+            assert_eq!(resolved.target, AliasTargetState::Resolved(expected));
             assert!(resolved.events.is_empty());
             assert_eq!(
                 store.alias_symbol_links(namespace),
                 Some(&AliasSymbolLinks {
-                    alias_target: AliasTargetState::Resolved(module),
+                    immediate_target: wrapped.then_some(expected),
+                    alias_target: AliasTargetState::Resolved(expected),
                     ..AliasSymbolLinks::default()
                 }),
             );
             assert_eq!(
                 (store.symbol_len(), store.symbol_store().symbol_table_len()),
-                symbols,
+                allocations,
             );
             assert_eq!(
                 CanonicalAliasResolver::new(&mut store, &mut host)
                     .resolve_alias(namespace)
                     .unwrap()
                     .target,
-                AliasTargetState::Resolved(module),
+                AliasTargetState::Resolved(expected),
             );
             assert_eq!(
                 store
                     .alias_symbol_links(namespace)
                     .and_then(|links| links.immediate_target),
-                None,
+                wrapped.then_some(expected),
             );
             assert_eq!(
                 (store.symbol_len(), store.symbol_store().symbol_table_len()),
-                symbols,
+                allocations,
             );
         }
     }

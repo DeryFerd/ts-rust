@@ -73658,14 +73658,56 @@ mod tests {
                 .unwrap();
             let (_, source_bound) = context.file(source_file).unwrap();
             let alias = source_bound.symbol(binding).unwrap();
+            let expected_module = if usage_mode == CanonicalModuleResolutionMode::Esm
+                && target_mode == CanonicalModuleResolutionMode::CommonJs
+            {
+                let wrapper = context
+                    .store()
+                    .source_file_namespace_wrapper(alias)
+                    .unwrap();
+                assert_eq!(wrapper.source.module, target_module);
+                let namespace_type = context
+                    .store()
+                    .value_symbol_links(wrapper.namespace)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let bare_type = context
+                    .store()
+                    .value_symbol_links(target_module)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                assert_ne!(namespace_type, bare_type);
+                assert_eq!(
+                    crate::semantic::source_imports::source_file_namespace_wrapper_member(
+                        context.store(),
+                        namespace_type,
+                        "default"
+                    ),
+                    Ok(Some((wrapper.default, bare_type))),
+                );
+                wrapper.namespace
+            } else {
+                target_module
+            };
+            let exports = context
+                .store()
+                .symbol(target_module)
+                .unwrap()
+                .exports()
+                .unwrap();
+            let exports = context.store().symbol_table(exports).unwrap();
+            assert_eq!(exports.len(), 1);
+            assert!(exports.get_source("default").is_none());
             assert_eq!(
                 context
                     .store()
                     .alias_symbol_links(alias)
                     .map(|links| (links.immediate_target, links.alias_target)),
                 Some((
-                    Some(target_module),
-                    AliasTargetState::Resolved(target_module)
+                    Some(expected_module),
+                    AliasTargetState::Resolved(expected_module)
                 )),
             );
             assert_eq!(
