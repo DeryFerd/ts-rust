@@ -194,8 +194,19 @@ type objectWitnessSignature struct {
 	composite        *CompositeSignature
 }
 
+type objectWitnessClassTypeParameter struct {
+	header                    objectWitnessHeader
+	data                      TypeParameter
+	owner, parentOwner        objectWitnessSymbol
+	ownerLinks                DeclaredTypeLinks
+	declaration, name, parent objectWitnessNode
+	parameters                []*ast.Node
+	file                      *ast.SourceFile
+}
+
 type objectWitnessCacheEdge struct {
 	intrinsic      *objectWitnessIntrinsic
+	classParameter *objectWitnessClassTypeParameter
 	owner          objectWitnessSymbol
 	ownerLinks     ValueSymbolLinks
 	declaration    objectWitnessNode
@@ -547,9 +558,74 @@ func (c *Checker) objectWitnessIntrinsicSnapshot(typ *Type) (objectWitnessIntrin
 	return result, true
 }
 
+// A declared class parameter must already have its canonical cache entry.
+func (c *Checker) objectWitnessClassTypeParameterSnapshot(typ *Type) (objectWitnessClassTypeParameter, bool) {
+	if typ == nil || typ.checker != c || typ.flags != TypeFlagsTypeParameter ||
+		typ.alias != nil || typ.symbol == nil || typ.id == 0 || uint32(typ.id) > c.TypeCount {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	memoizedVariables := ObjectFlagsCouldContainTypeVariablesComputed | ObjectFlagsCouldContainTypeVariables
+	if typ.objectFlags != 0 && typ.objectFlags != memoizedVariables {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	owner := typ.symbol
+	links := c.declaredTypeLinks.TryGet(owner)
+	data, known := typ.data.(*TypeParameter)
+	if links == nil || links.declaredType != typ || !known || data == nil || data.AsType() != typ ||
+		data.target != nil || data.mapper != nil || data.isThisType ||
+		(data.constraint != nil && data.constraint != c.noConstraintType) ||
+		(data.resolvedBaseConstraint != nil && data.resolvedBaseConstraint != c.noConstraintType) ||
+		(data.resolvedDefaultType != nil && data.resolvedDefaultType != c.noConstraintType) ||
+		owner.Flags != ast.SymbolFlagsTypeParameter || owner.CheckFlags != 0 || owner.ExportSymbol != nil ||
+		owner.ValueDeclaration != nil || len(owner.Declarations) != 1 || len(owner.Members) != 0 || len(owner.Exports) != 0 {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	declaration := owner.Declarations[0]
+	if declaration == nil || !ast.IsTypeParameterDeclaration(declaration) || declaration.Symbol() != owner ||
+		declaration.Name() == nil || !ast.IsIdentifier(declaration.Name()) || declaration.Name().Parent != declaration ||
+		declaration.Name().Text() != owner.Name || declaration.Modifiers() != nil ||
+		declaration.Parent == nil || !ast.IsClassDeclaration(declaration.Parent) {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	parameter := declaration.AsTypeParameterDeclaration()
+	if parameter.Constraint != nil || parameter.DefaultType != nil || parameter.Expression != nil {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	parent := declaration.Parent
+	parentOwner := parent.Symbol()
+	if parentOwner == nil || parentOwner.Flags != ast.SymbolFlagsClass || parentOwner.CheckFlags != 0 ||
+		len(parentOwner.Declarations) != 1 || parentOwner.Declarations[0] != parent || parentOwner.ValueDeclaration != parent ||
+		parent.Name() == nil || !ast.IsIdentifier(parent.Name()) || parent.Name().Parent != parent || parent.Name().Text() != parentOwner.Name {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	parameters := parent.TypeParameters()
+	occurrences := 0
+	for _, item := range parameters {
+		if item == declaration {
+			occurrences++
+		}
+	}
+	if occurrences != 1 {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	file, err := c.objectWitnessSource(declaration)
+	if err != nil {
+		return objectWitnessClassTypeParameter{}, false
+	}
+	return objectWitnessClassTypeParameter{
+		header: objectWitnessTypeHeader(typ), data: *data,
+		owner: objectWitnessSymbolSnapshot(owner), parentOwner: objectWitnessSymbolSnapshot(parentOwner), ownerLinks: *links,
+		declaration: objectWitnessNodeSnapshot(declaration), name: objectWitnessNodeSnapshot(declaration.Name()), parent: objectWitnessNodeSnapshot(parent),
+		parameters: slices.Clone(parameters), file: file,
+	}, true
+}
+
 func (c *Checker) objectWitnessCacheSnapshot(typ *Type, expression *ast.Node) (objectWitnessCacheEdge, bool) {
 	if intrinsic, known := c.objectWitnessIntrinsicSnapshot(typ); known {
 		return objectWitnessCacheEdge{intrinsic: &intrinsic}, true
+	}
+	if parameter, known := c.objectWitnessClassTypeParameterSnapshot(typ); known {
+		return objectWitnessCacheEdge{classParameter: &parameter}, true
 	}
 	expression = objectWitnessUnwrap(expression)
 	if typ == nil || typ.checker != c || expression == nil || !ast.IsIdentifier(expression) {
@@ -631,13 +707,22 @@ func objectWitnessSameCache(left, right objectWitnessCacheEdge) bool {
 	if left.intrinsic != nil || right.intrinsic != nil {
 		return left.intrinsic != nil && right.intrinsic != nil && *left.intrinsic == *right.intrinsic
 	}
+	if left.classParameter != nil || right.classParameter != nil {
+		if left.classParameter == nil || right.classParameter == nil {
+			return false
+		}
+		l, r := left.classParameter, right.classParameter
+		return l.header == r.header && l.data == r.data && l.owner == r.owner && l.parentOwner == r.parentOwner &&
+			l.ownerLinks == r.ownerLinks && l.declaration == r.declaration && l.name == r.name && l.parent == r.parent &&
+			l.file == r.file && slices.Equal(l.parameters, r.parameters)
+	}
 	return left.owner == right.owner && left.ownerLinks == right.ownerLinks && left.header == right.header &&
 		left.declaration == right.declaration && left.annotation == right.annotation && left.signatureLinks == right.signatureLinks &&
 		left.signature == right.signature && left.returnType == right.returnType && slices.Equal(left.parameters, right.parameters)
 }
 
 func (c *Checker) objectWitnessCacheClosedFromBirth(birth, closed objectWitnessCacheEdge) bool {
-	if birth.intrinsic != nil || closed.intrinsic != nil {
+	if birth.intrinsic != nil || closed.intrinsic != nil || birth.classParameter != nil || closed.classParameter != nil {
 		return objectWitnessSameCache(birth, closed)
 	}
 	// Only these monotonic lazy changes follow from the captured declaration.

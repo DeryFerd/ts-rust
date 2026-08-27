@@ -5,6 +5,7 @@ import (
 	"slices"
 
 	"github.com/microsoft/typescript-go/internal/ast"
+	"github.com/microsoft/typescript-go/internal/core"
 )
 
 // These mutation helpers exist only in the added checker test overlay.
@@ -66,6 +67,55 @@ func (c *Checker) ProjectOracleObjectWitnessTestMutate(query *ProjectOracleObjec
 		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().instantiations = map[CacheHashKey]*Type{{}: c.numberType}
 	case "function_without_abstract":
 		c.valueSymbolLinks.Get(property).resolvedType.AsObjectType().objectTypeWithoutAbstractConstructSignatures = c.numberType
+	case "type_parameter_cache_missing", "type_parameter_cache_restore", "type_parameter_cache_owner":
+		typ := c.valueSymbolLinks.Get(property).resolvedType
+		cached := typ
+		if change == "type_parameter_cache_missing" {
+			cached = nil
+		} else if change == "type_parameter_cache_owner" {
+			cached = c.numberType
+		}
+		c.declaredTypeLinks.Get(typ.symbol).declaredType = cached
+	case "type_parameter_constraint":
+		c.valueSymbolLinks.Get(property).resolvedType.AsTypeParameter().constraint = c.stringType
+	case "type_parameter_base_constraint":
+		c.valueSymbolLinks.Get(property).resolvedType.AsTypeParameter().resolvedBaseConstraint = c.stringType
+	case "type_parameter_default":
+		c.valueSymbolLinks.Get(property).resolvedType.AsTypeParameter().resolvedDefaultType = c.stringType
+	case "type_parameter_target":
+		typ := c.valueSymbolLinks.Get(property).resolvedType
+		other := typ.symbol.Declarations[0].Parent.TypeParameters()[1].Symbol()
+		links := c.declaredTypeLinks.TryGet(other)
+		if links == nil || links.declaredType == nil {
+			return fmt.Errorf("test has no second declared class parameter")
+		}
+		typ.AsTypeParameter().target = links.declaredType
+	case "type_parameter_mapper":
+		c.valueSymbolLinks.Get(property).resolvedType.AsTypeParameter().mapper = &TypeMapper{}
+	case "type_parameter_memo_flags":
+		c.valueSymbolLinks.Get(property).resolvedType.objectFlags ^= ObjectFlagsCouldContainTypeVariablesComputed | ObjectFlagsCouldContainTypeVariables
+	case "type_parameter_owner":
+		typ := c.valueSymbolLinks.Get(property).resolvedType
+		original := typ.symbol
+		typ.symbol = &ast.Symbol{Flags: original.Flags, Name: original.Name, Parent: original.Parent,
+			Declarations: slices.Clone(original.Declarations), ValueDeclaration: original.ValueDeclaration}
+	case "type_parameter_parent":
+		declaration := c.valueSymbolLinks.Get(property).resolvedType.symbol.Declarations[0]
+		for _, statement := range query.file.Statements.Nodes {
+			if ast.IsClassDeclaration(statement) && statement.Name() != nil && statement.Name().Text() == "OtherOwner" {
+				declaration.Parent = statement
+				return nil
+			}
+		}
+		return fmt.Errorf("test has no alternate class owner")
+	case "type_parameter_declaration_constraint":
+		declaration := c.valueSymbolLinks.Get(property).resolvedType.symbol.Declarations[0]
+		declaration.AsTypeParameterDeclaration().Constraint = declaration.Name()
+	case "type_parameter_class_order":
+		parent := c.valueSymbolLinks.Get(property).resolvedType.symbol.Declarations[0].Parent.AsClassDeclaration()
+		nodes := slices.Clone(parent.TypeParameters.Nodes)
+		nodes[0], nodes[1] = nodes[1], nodes[0]
+		parent.TypeParameters.Nodes = nodes
 	case "boolean_regular_value":
 		c.regularTrueType.AsLiteralType().value = false
 	case "boolean_false_value":
@@ -117,6 +167,17 @@ func (c *Checker) ProjectOracleObjectWitnessTestCacheEvidence(query *ProjectOrac
 	_, birth := production.birth.cacheEdges[property]
 	_, closed := query.closed[query.result].cacheEdges[property]
 	return birth, closed
+}
+
+func (c *Checker) ProjectOracleObjectWitnessTestMissingClassParameterCache(query *ProjectOracleObjectQueryWitness) (known, allocated, cacheCreated bool) {
+	property := query.result.AsObjectType().properties[0]
+	typ := c.valueSymbolLinks.TryGet(property).resolvedType
+	before := c.declaredTypeLinks
+	defer func() { c.declaredTypeLinks = before }()
+	c.declaredTypeLinks = core.LinkStore[*ast.Symbol, DeclaredTypeLinks]{}
+	types, symbols, signatures := c.TypeCount, c.SymbolCount, c.SignatureCount
+	_, known = c.objectWitnessClassTypeParameterSnapshot(typ)
+	return known, types != c.TypeCount || symbols != c.SymbolCount || signatures != c.SignatureCount, c.declaredTypeLinks.Has(typ.symbol)
 }
 
 func (c *Checker) ProjectOracleObjectWitnessTestSeedFlow(node *ast.Node, typ *Type) {
