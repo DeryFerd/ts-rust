@@ -24,7 +24,8 @@ exec 9>"${TMPDIR:-/tmp}/ts-rust-cargo-${lock_id}.lock"
 flock 9
 ulimit -c 0
 hash_file() { local hash ignored; read -r hash ignored < <(sha256sum -- "$1"); printf '%s' "$hash"; }
-git -C "$repo" diff --exit-code 7b912dc5 -- scripts/run-go-project-oracle.sh \
+git -C "$repo" diff --exit-code f7c3b0ab5bb3587c8dfddee8940eeb6598e24633 -- scripts/run-go-project-oracle.sh
+git -C "$repo" diff --exit-code 7b912dc5 -- \
   tools/ts_fixture/go_project_oracle/project_oracle_test.go.txt tools/ts_fixture/go_project_oracle/project_graph_test.go.txt \
   tools/ts_fixture/go_project_oracle/baseline_hooks.go.txt tools/ts_fixture/go_project_oracle/baseline_hooks.patch \
   tools/ts_fixture/go_project_oracle/checker_replay.go.txt
