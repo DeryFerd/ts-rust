@@ -48973,24 +48973,52 @@ pub(super) fn check_source_file(
                     .and_then(|plan| plan.declaration(arrow.source.variable_declaration))
                     .and_then(super::jsdoc::PlannedJavaScriptDeclaration::type_)
                     .and_then(PlannedJsDocType::resolved_callback);
-                let (materialized, callable) = if let Some(callback) = callback {
-                    let resolved = resolve_planned_jsdoc_callback_signature(
+                let resolved_callback = callback
+                    .map(|callback| {
+                        resolve_planned_jsdoc_callback_signature(
+                            store,
+                            global_types,
+                            options,
+                            callback,
+                            &[],
+                        )
+                        .map_err(|_| {
+                            SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                arrow.source.variable_declaration,
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                if let Some(resolved) = resolved_callback.as_ref()
+                    && super::source_callables::authenticated_jsdoc_contextual_source_signature(
                         store,
-                        global_types,
-                        options,
-                        callback,
-                        &[],
+                        host,
+                        &arrow.source.callable,
+                        Some(resolved),
                     )
-                    .map_err(|_| {
-                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                    .map_err(SourcePlanner::callable_plan_error)?
+                    .is_none()
+                {
+                    return Err(SourceCheckError::Arrow(arrow.source.variable_declaration));
+                }
+                let callback_type = callback
+                    .map(|_| {
+                        super::jsdoc::resolve_source_jsdoc_callback_type(
+                            store,
+                            host,
+                            global_types,
+                            options,
                             arrow.source.variable_declaration,
-                        ))
-                    })?;
+                        )
+                        .map_err(|_| SourceCheckError::Arrow(arrow.source.variable_declaration))
+                    })
+                    .transpose()?;
+                let (materialized, callable) = if let Some(resolved) = resolved_callback.as_ref() {
                     let (type_, callable) = publish_jsdoc_contextual_source_callable(
                         store,
                         host,
                         &arrow.source.callable,
-                        &resolved,
+                        resolved,
                     )
                     .map_err(SourcePlanner::callable_plan_error)?;
                     let signature = store
@@ -49204,15 +49232,16 @@ pub(super) fn check_source_file(
                         declaration,
                     )?;
                 }
+                let declared_type = callback_type.unwrap_or(materialized.type_);
                 stage_value_type(
                     store,
                     &mut staged_value_types,
                     &mut value_order,
                     arrow.source.variable_symbol,
-                    materialized.type_,
+                    declared_type,
                 )?;
                 if current_flow_types
-                    .insert(arrow.source.variable_symbol, materialized.type_)
+                    .insert(arrow.source.variable_symbol, declared_type)
                     .is_some()
                 {
                     return Err(SourceCheckError::Variable(
@@ -77237,9 +77266,21 @@ class Foo2 {
         let callable = variable_value_type(&context, &source, file, "callback");
         let signature = context
             .store()
-            .source_callable_provenance(callable)
-            .map(|provenance| provenance.signature)
-            .unwrap();
+            .type_payload(callable)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(context.type_to_string(callable).unwrap(), "NS.MyCallback");
+        let initializer_type = context.get_type_at_location(arrow).unwrap();
+        assert_ne!(callable, initializer_type);
+        assert_eq!(
+            context.type_to_string(initializer_type).unwrap(),
+            "(name: string) => void"
+        );
         assert_eq!(
             context
                 .store()
@@ -77251,6 +77292,187 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_jsdoc_callback_alias_rejects_poisoned_signatures_without_publication() {
+        for poison in 0..4 {
+            let source = parse_javascript_source_file(concat!(
+                "/** @callback NS.Callback\n * @param {string} name\n * @returns {void}\n */\n",
+                "/** @type {NS.Callback} */ const callback = (name) => {};",
+            ));
+            let file = FileId::new(9_940);
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let type_ = variable_value_type(&context, &source, file, "callback");
+            let signature = context
+                .store()
+                .type_payload(type_)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_ref()
+                .unwrap()[0];
+            let parameter = context.store().signature(signature).unwrap().parameters()[0];
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let owner = variable_symbol(&context, &source, file, "callback");
+            match poison {
+                0 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(signature, Some(number))
+                ),
+                1 => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                2 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_flags(signature, SignatureFlags::ABSTRACT)
+                ),
+                3 => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_symbol(type_, Some(owner))
+                ),
+                _ => unreachable!(),
+            }
+            let before = observable_state(&context, file);
+            assert!(context.type_to_string(type_).is_err(), "poison {poison}");
+            assert!(
+                context.get_return_type_of_signature(signature).is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(observable_state(&context, file), before);
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+            assert!(
+                context.recheck_source_file(file).is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    fn javascript_jsdoc_callback_alias_rejects_foreign_types_and_keeps_equal_offset_owners() {
+        let first = parse_javascript_source_file(concat!(
+            "/** @callback First.Callback\n * @param {string} name\n * @returns {void}\n */\n",
+            "/** @type {First.Callback} */ const first = (name) => {};",
+        ));
+        let other = parse_javascript_source_file(concat!(
+            "/** @callback Other.Callback\n * @param {string} name\n * @returns {void}\n */\n",
+            "/** @type {Other.Callback} */ const other = (name) => {};",
+        ));
+        let first_file = FileId::new(9_941);
+        let other_file = FileId::new(9_942);
+        let mut binder = CanonicalBinder::new();
+        for (file, source) in [(first_file, &first), (other_file, &other)] {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.js\"", file.index())),
+                        CanonicalSourceLanguage::JavaScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_javascript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions::default();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(first_file, &first.arena), (other_file, &other.arena)],
+            options,
+        )
+        .unwrap();
+        context.check_source_file(first_file).unwrap();
+        context.check_source_file(other_file).unwrap();
+        let first_type = variable_value_type(&context, &first, first_file, "first");
+        let other_type = variable_value_type(&context, &other, other_file, "other");
+        assert_ne!(first_type, other_type);
+        let first_identity = context
+            .store()
+            .source_jsdoc_callback_identity(first_type)
+            .unwrap();
+        let other_identity = context
+            .store()
+            .source_jsdoc_callback_identity(other_type)
+            .unwrap();
+        assert_eq!(
+            first_identity.definition.range(),
+            other_identity.definition.range()
+        );
+        assert_ne!(first_identity.owner, other_identity.owner);
+        assert_eq!(
+            context.type_to_string(first_type).unwrap(),
+            "First.Callback"
+        );
+        assert_eq!(
+            context.type_to_string(other_type).unwrap(),
+            "Other.Callback"
+        );
+        let before = observable_state(&context, first_file);
+        context.recheck_source_file(first_file).unwrap();
+        context.recheck_source_file(other_file).unwrap();
+        assert_eq!(observable_state(&context, first_file), before);
+
+        let mut foreign = javascript_context(first_file, &first, options);
+        foreign.check_source_file(first_file).unwrap();
+        let foreign_type = variable_value_type(&foreign, &first, first_file, "first");
+        assert!(context.type_to_string(foreign_type).is_err());
+        let foreign_signature = foreign
+            .store()
+            .type_payload(foreign_type)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        assert!(
+            context
+                .get_return_type_of_signature(foreign_signature)
+                .is_err()
+        );
+        let owner = variable_symbol(&context, &first, first_file, "first");
+        assert!(!context.store_mut_for_test().set_value_symbol_links(
+            owner,
+            ValueSymbolLinks {
+                resolved_type: Some(foreign_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert_eq!(observable_state(&context, first_file), before);
+    }
+
+    #[test]
+    fn javascript_jsdoc_callback_alias_does_not_drop_generic_arguments() {
+        let source = parse_javascript_source_file(concat!(
+            "/** @template T\n * @callback NS.Mapper\n * @param {T} name\n * @returns {void}\n */\n",
+            "/** @type {NS.Mapper<string>} */ const callback = (name) => {};",
+        ));
+        let file = FileId::new(9_943);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+        let before = observable_state(&context, file);
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+        assert_eq!(observable_state(&context, file), before);
     }
 
     #[test]

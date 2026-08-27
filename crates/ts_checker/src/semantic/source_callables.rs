@@ -7757,7 +7757,7 @@ pub(super) fn publish_jsdoc_parameterized_source_callable(
     Ok((pending.type_, pending.signature))
 }
 
-fn authenticated_jsdoc_contextual_source_signature(
+pub(super) fn authenticated_jsdoc_contextual_source_signature(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceCallablePlan,
@@ -7941,8 +7941,8 @@ fn hydrate_warm_jsdoc_contextual_source_callable(
 
 /// Publishes a JavaScript arrow from its authenticated local `@callback`.
 ///
-/// The callback exists only in source comments, so its resolved parameter and
-/// return types belong directly to the arrow instead of a fabricated target.
+/// The arrow retains its own callable and signature. The `JSDoc` provider
+/// publishes the declared callback type separately.
 pub(super) fn publish_jsdoc_contextual_source_callable(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,

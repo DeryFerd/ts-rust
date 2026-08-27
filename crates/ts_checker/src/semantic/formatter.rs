@@ -634,6 +634,14 @@ fn display_type_worker(
         .type_payload(type_id)
         .ok_or(TypeDisplayUnavailable::Type(type_id))?;
     let type_flags = record.flags();
+    if store.source_jsdoc_callback_identity(type_id).is_some() {
+        let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let name =
+            super::jsdoc::validate_source_jsdoc_callback_name(store, host, global_types, type_id)
+                .map_err(|()| TypeDisplayUnavailable::MalformedType(type_id))?;
+        state.add(name.len());
+        return Ok(name.to_owned());
+    }
     if store.source_jsdoc_typedef_identity(type_id).is_some() {
         let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
         let name =
