@@ -4752,6 +4752,11 @@ impl Program {
                 self.options.strict
             },
             no_implicit_any: self.options.no_implicit_any,
+            no_implicit_this: if self.options.no_implicit_this_specified {
+                self.options.no_implicit_this
+            } else {
+                self.options.strict
+            },
             no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
             no_unused_locals: self.options.no_unused_locals,
             no_unused_parameters: self.options.no_unused_parameters,
@@ -5594,6 +5599,11 @@ impl Program {
                                 .options
                                 .strict_property_initialization,
                             no_implicit_any: self.options.no_implicit_any,
+                            no_implicit_this: if self.options.no_implicit_this_specified {
+                                self.options.no_implicit_this
+                            } else {
+                                self.options.strict
+                            },
                             no_implicit_returns: self.options.no_implicit_returns,
                             no_unused_locals: self.options.no_unused_locals,
                             no_unused_parameters: self.options.no_unused_parameters,
@@ -11851,6 +11861,48 @@ mod tests {
             "{:?}",
             program.diagnostics()
         );
+    }
+
+    #[test]
+    fn canonical_program_projects_no_implicit_this_option_independently() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "const value = 1;")
+            .unwrap();
+
+        for strict in [false, true] {
+            for explicit in [None, Some(false), Some(true)] {
+                for no_implicit_any in [false, true] {
+                    let (program, projected) = Program::try_new_with_canonical_checker_and_queries(
+                        &fs,
+                        "/project",
+                        &["input.ts".to_owned()],
+                        CompilerOptions {
+                            strict,
+                            no_implicit_this: explicit.unwrap_or(!strict),
+                            no_implicit_this_specified: explicit.is_some(),
+                            no_implicit_any,
+                            lib: Some(vec!["es5".to_owned()]),
+                            ..CompilerOptions::default()
+                        },
+                        |_, queries| {
+                            let options = queries.context.options();
+                            (options.no_implicit_this, options.no_implicit_any)
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        projected,
+                        Some((explicit.unwrap_or(strict), no_implicit_any)),
+                        "strict={strict} explicit={explicit:?} noImplicitAny={no_implicit_any}",
+                    );
+                    assert!(
+                        program.diagnostics().is_empty(),
+                        "{:?}",
+                        program.diagnostics(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

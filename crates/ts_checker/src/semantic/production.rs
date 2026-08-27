@@ -107,6 +107,7 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// admission check when intrinsic strict-null identity is also enabled.
 /// `no_implicit_any` controls diagnostics and evolving inference for
 /// unannotated declarations.
+/// `no_implicit_this` retains the effective option for untyped `this` reads.
 /// `no_unchecked_indexed_access` includes `undefined` in unchecked index
 /// signature reads when strict null checking makes that distinction observable.
 /// `no_unused_locals` enables diagnostics for unreferenced local declarations.
@@ -134,6 +135,7 @@ pub struct CanonicalCheckerOptions {
     pub strict_property_initialization: bool,
     pub use_unknown_in_catch_variables: bool,
     pub no_implicit_any: bool,
+    pub no_implicit_this: bool,
     pub no_unchecked_indexed_access: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
@@ -159,6 +161,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             strict_property_initialization: false,
             use_unknown_in_catch_variables: false,
             no_implicit_any: false,
+            no_implicit_this: false,
             no_unchecked_indexed_access: false,
             no_unused_locals: false,
             no_unused_parameters: false,
@@ -3520,6 +3523,7 @@ mod tests {
         assert!(!defaults.strict_property_initialization);
         assert!(!defaults.use_unknown_in_catch_variables);
         assert!(!defaults.no_implicit_any);
+        assert!(!defaults.no_implicit_this);
         assert!(!defaults.no_unchecked_indexed_access);
         assert!(!defaults.no_unused_locals);
         assert!(!defaults.no_unused_parameters);
@@ -3544,6 +3548,7 @@ mod tests {
         assert!(!options.strict_property_initialization);
         assert!(!options.use_unknown_in_catch_variables);
         assert!(!options.no_implicit_any);
+        assert!(!options.no_implicit_this);
         assert!(!options.no_unchecked_indexed_access);
         assert!(!options.no_unused_locals);
         assert!(!options.no_unused_parameters);
