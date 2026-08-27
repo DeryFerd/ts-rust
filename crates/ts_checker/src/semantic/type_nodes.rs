@@ -8705,7 +8705,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
     }
 
-    /// Finds a typeof body through already-validated cached alias links.
+    /// Finds a typeof body after checking each forwarding reference's source target.
     fn cached_type_query_alias_target(
         &self,
         mut symbol: SemanticSymbolId,
@@ -8724,13 +8724,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             match self.cached_type_alias_rhs(symbol)? {
                 CachedTypeAliasRhs::TypeQuery(_) => return Ok(Some(symbol)),
                 CachedTypeAliasRhs::TypeReference(reference) => {
-                    let Some(target) = self
+                    let resolved = self.resolve_uncached_type_reference_symbol(reference)?;
+                    let target = self.store.get_merged_symbol(resolved).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol))
+                    })?;
+                    if self
                         .store
                         .symbol_node_links(reference)
                         .and_then(|links| links.resolved_symbol)
-                    else {
-                        return Ok(None);
-                    };
+                        != Some(target)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+                        ));
+                    }
                     if !self
                         .store
                         .symbol(target)
@@ -49612,6 +49619,249 @@ mod tests {
                 Ok(expected)
             );
             assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn typeof_alias_union_forward_target_cannot_be_redirected() {
+        let mut fixture = fixture(concat!(
+            "type Seed = number | string; type Other = number | string; ",
+            "declare let value: Seed; type Result = typeof value; ",
+            "type Forward = Result;",
+        ));
+        let result_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+        let forward = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Forward");
+        let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let expected = query_declared(
+            &mut fixture,
+            result_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                forward,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(expected),
+        );
+        let wrong = query_declared(
+            &mut fixture,
+            other,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_ne!(wrong, expected);
+        let reference = alias_parts(&fixture, "Forward").2;
+        let original_alias = fixture.store.type_alias_links(forward).unwrap().clone();
+        let original_type = fixture.store.type_node_links(reference).unwrap().clone();
+        let original_symbol = fixture.store.symbol_node_links(reference).unwrap().clone();
+        let mut alias = original_alias.clone();
+        alias.declared_type = Some(wrong);
+        let mut type_links = original_type.clone();
+        type_links.resolved_type = Some(wrong);
+        assert!(fixture.store.set_type_alias_links(forward, alias));
+        assert!(fixture.store.set_type_node_links(reference, type_links));
+        assert!(fixture.store.set_symbol_node_links(
+            reference,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other),
+            },
+        ));
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                union_state(store),
+                store.type_alias_links(forward).cloned(),
+                store.type_alias_links(result_alias).cloned(),
+                store.type_node_links(reference).cloned(),
+                store.symbol_node_links(reference).cloned(),
+                store.relation_state_snapshot(),
+            )
+        };
+        let before = state(&fixture.store);
+        let result = query_declared(
+            &mut fixture,
+            forward,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        );
+        assert!(
+            result.is_err(),
+            "forwarding target redirection was accepted: {result:?}"
+        );
+        assert_eq!(state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+        assert!(fixture.store.set_type_alias_links(forward, original_alias));
+        assert!(fixture.store.set_type_node_links(reference, original_type));
+        assert!(
+            fixture
+                .store
+                .set_symbol_node_links(reference, original_symbol)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                forward,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(expected),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source-scope lookup, rejection, and retry in one fixture.
+    fn typeof_alias_union_forwarding_uses_source_scope() {
+        for reference_text in ["Result", "((Result))"] {
+            let mut fixture = fixture(&format!(
+                "type Seed = number | string; type Result = number | string; \
+                 declare let value: Seed; function scope() {{ \
+                 type Result = (typeof value); type Forward = {reference_text}; \
+                 type ForwardAgain = (Forward); }}"
+            ));
+            let seed = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Seed");
+            let outer_result = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let expected = query_declared(
+                &mut fixture,
+                seed,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let wrong = query_declared(
+                &mut fixture,
+                outer_result,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert_ne!(expected, wrong);
+            let forwards = ["Forward", "ForwardAgain"].map(|name| {
+                let symbol = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+                let mut reference = alias_parts(&fixture, name).2;
+                while let NodeData::ParenthesizedTypeNode(parenthesized) =
+                    &fixture.parsed.arena.get(reference.node).unwrap().data
+                {
+                    reference = NodeRef::new(reference.arena, reference.file, parenthesized.type_);
+                }
+                (symbol, reference)
+            });
+            for (symbol, reference) in forwards {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        symbol,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(expected),
+                );
+                assert_eq!(
+                    query_node(&mut fixture, reference, &mut diagnostics),
+                    Ok(expected)
+                );
+            }
+            let original = forwards.map(|(symbol, reference)| {
+                (
+                    fixture.store.type_alias_links(symbol).cloned().unwrap(),
+                    fixture.store.type_node_links(reference).cloned().unwrap(),
+                    fixture.store.symbol_node_links(reference).cloned().unwrap(),
+                )
+            });
+            let inner_result = original[0].2.resolved_symbol.unwrap();
+            assert_ne!(inner_result, outer_result);
+            assert_eq!(original[1].2.resolved_symbol, Some(forwards[0].0));
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    union_state(store),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    [seed, outer_result, inner_result]
+                        .map(|symbol| store.type_alias_links(symbol).cloned()),
+                    forwards.map(|(symbol, reference)| {
+                        (
+                            store.type_alias_links(symbol).cloned(),
+                            store.type_node_links(reference).cloned(),
+                            store.symbol_node_links(reference).cloned(),
+                        )
+                    }),
+                    store.relation_state_snapshot(),
+                )
+            };
+            for cached_target in [Some(outer_result), None] {
+                if cached_target.is_some() {
+                    for ((symbol, reference), (alias, type_links, _)) in
+                        forwards.iter().zip(&original)
+                    {
+                        let mut alias = alias.clone();
+                        alias.declared_type = Some(wrong);
+                        let mut type_links = type_links.clone();
+                        type_links.resolved_type = Some(wrong);
+                        assert!(fixture.store.set_type_alias_links(*symbol, alias));
+                        assert!(fixture.store.set_type_node_links(*reference, type_links));
+                    }
+                }
+                assert!(fixture.store.set_symbol_node_links(
+                    forwards[0].1,
+                    SymbolNodeLinks {
+                        resolved_symbol: cached_target
+                    },
+                ));
+                let before = state(&fixture.store);
+                let result = query_declared(
+                    &mut fixture,
+                    forwards[1].0,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                );
+                assert!(
+                    result.is_err(),
+                    "{reference_text}, {cached_target:?}: {result:?}"
+                );
+                assert_eq!(state(&fixture.store), before);
+                let result = query_node(&mut fixture, forwards[1].1, &mut diagnostics);
+                assert!(
+                    result.is_err(),
+                    "{reference_text}, {cached_target:?}: {result:?}"
+                );
+                assert_eq!(state(&fixture.store), before);
+                assert!(diagnostics.is_empty());
+                for ((symbol, reference), (alias, type_links, symbol_links)) in
+                    forwards.iter().zip(&original)
+                {
+                    assert!(fixture.store.set_type_alias_links(*symbol, alias.clone()));
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_node_links(*reference, type_links.clone())
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .set_symbol_node_links(*reference, symbol_links.clone())
+                    );
+                }
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        forwards[1].0,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(expected),
+                );
+                assert_eq!(
+                    query_node(&mut fixture, forwards[1].1, &mut diagnostics),
+                    Ok(expected)
+                );
+                assert!(diagnostics.is_empty());
+            }
         }
     }
 
