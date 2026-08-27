@@ -2,6 +2,7 @@ package checker
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/microsoft/typescript-go/internal/ast"
@@ -161,6 +162,14 @@ type objectWitnessIntrinsic struct {
 	name           string
 	value          any
 	fresh, regular *Type
+	baseConstraint *Type
+	boolean        [4]objectWitnessBooleanLiteral
+}
+
+type objectWitnessBooleanLiteral struct {
+	header         objectWitnessHeader
+	value          bool
+	fresh, regular *Type
 }
 
 type objectWitnessParameter struct {
@@ -186,13 +195,16 @@ type objectWitnessSignature struct {
 }
 
 type objectWitnessCacheEdge struct {
-	intrinsic  *objectWitnessIntrinsic
-	owner      objectWitnessSymbol
-	ownerLinks ValueSymbolLinks
-	header     objectWitnessHeader
-	signature  objectWitnessSignature
-	parameters []objectWitnessParameter
-	returnType objectWitnessIntrinsic
+	intrinsic      *objectWitnessIntrinsic
+	owner          objectWitnessSymbol
+	ownerLinks     ValueSymbolLinks
+	declaration    objectWitnessNode
+	annotation     objectWitnessNode
+	header         objectWitnessHeader
+	signatureLinks SignatureLinks
+	signature      objectWitnessSignature
+	parameters     []objectWitnessParameter
+	returnType     objectWitnessIntrinsic
 }
 
 func objectWitnessNodeSnapshot(node *ast.Node) objectWitnessNode {
@@ -323,14 +335,14 @@ func (c *Checker) projectOracleObjectLiteralProduced(node *ast.Node, result *Typ
 		creationTypeCount: c.TypeCount,
 		destructuring:     destructuring, constContext: constContext, contextualPattern: contextualPattern,
 	}
-	production.birth, production.error = c.objectWitnessSnapshot(production, false)
+	production.birth, production.error = c.objectWitnessSnapshot(production)
 	if query.productions[result] != nil {
 		production.error = "producer returned the same result more than once"
 	}
 	query.productions[result] = production
 }
 
-func (c *Checker) objectWitnessSnapshot(production *objectWitnessProduction, close bool) (objectWitnessSnapshot, string) {
+func (c *Checker) objectWitnessSnapshot(production *objectWitnessProduction) (objectWitnessSnapshot, string) {
 	typ, node := production.result, production.node
 	if typ == nil || node == nil {
 		return objectWitnessSnapshot{}, "producer result or node is missing"
@@ -367,7 +379,7 @@ func (c *Checker) objectWitnessSnapshot(production *objectWitnessProduction, clo
 			if links := c.valueSymbolLinks.TryGet(member); links != nil {
 				property.links, property.linksKnown = *links, true
 				property.target = objectWitnessSymbolSnapshot(links.target)
-				if close && production.query.productions[links.resolvedType] == nil {
+				if production.query.productions[links.resolvedType] == nil {
 					if edge, known := c.objectWitnessCacheSnapshot(links.resolvedType, property.value); known {
 						result.cacheEdges[member] = edge
 					}
@@ -398,7 +410,7 @@ func (c *Checker) ProjectOracleEndObjectPass(pass *ProjectOracleObjectPass) erro
 		}
 		query.closed = map[*Type]objectWitnessSnapshot{}
 		for typ, production := range query.productions {
-			snapshot, failure := c.objectWitnessSnapshot(production, true)
+			snapshot, failure := c.objectWitnessSnapshot(production)
 			if failure != "" {
 				query.closeError = failure
 			}
@@ -421,6 +433,32 @@ func objectWitnessUnwrap(node *ast.Node) *ast.Node {
 		node = node.Expression()
 	}
 	return node
+}
+
+func (c *Checker) objectWitnessBooleanSnapshot() ([4]objectWitnessBooleanLiteral, bool) {
+	var result [4]objectWitnessBooleanLiteral
+	for index, expected := range []struct {
+		typ, regular, fresh *Type
+		value               bool
+	}{
+		{c.regularFalseType, c.regularFalseType, c.falseType, false},
+		{c.falseType, c.regularFalseType, c.falseType, false},
+		{c.regularTrueType, c.regularTrueType, c.trueType, true},
+		{c.trueType, c.regularTrueType, c.trueType, true},
+	} {
+		typ := expected.typ
+		if typ == nil || typ.checker != c || typ.flags != TypeFlagsBooleanLiteral || typ.objectFlags != 0 ||
+			typ.alias != nil || typ.symbol != nil || typ.id == 0 || uint32(typ.id) > c.TypeCount || expected.regular == expected.fresh {
+			return result, false
+		}
+		data, known := typ.data.(*LiteralType)
+		if !known || data == nil || data.AsType() != typ || data.value != expected.value ||
+			data.regularType != expected.regular || data.freshType != expected.fresh {
+			return result, false
+		}
+		result[index] = objectWitnessBooleanLiteral{objectWitnessTypeHeader(typ), expected.value, data.freshType, data.regularType}
+	}
+	return result, true
 }
 
 func (c *Checker) objectWitnessIntrinsicSnapshot(typ *Type) (objectWitnessIntrinsic, bool) {
@@ -453,10 +491,23 @@ func (c *Checker) objectWitnessIntrinsicSnapshot(typ *Type) (objectWitnessIntrin
 	}
 	if typ == c.booleanType {
 		data, ok := typ.data.(*UnionType)
-		if !ok || data == nil || !slices.Equal(data.types, []*Type{c.regularFalseType, c.regularTrueType}) {
+		if !ok || data == nil || data.AsType() != typ || typ.flags != TypeFlagsUnion|TypeFlagsBoolean ||
+			!slices.Equal(data.types, []*Type{c.regularFalseType, c.regularTrueType}) ||
+			(data.resolvedBaseConstraint != nil && data.resolvedBaseConstraint != typ) ||
+			(data.regularType != nil && data.regularType != typ) || data.resolvedReducedType != nil || data.origin != nil ||
+			data.objectTypeWithoutAbstractConstructSignatures != nil || len(data.members) != 0 || len(data.properties) != 0 ||
+			len(data.signatures) != 0 || data.callSignatureCount != 0 || len(data.indexInfos) != 0 ||
+			len(data.propertyCache) != 0 || len(data.propertyCacheWithoutFunctionPropertyAugment) != 0 ||
+			len(data.resolvedProperties) != 0 || data.keyPropertyName != "" || len(data.constituentMap) != 0 {
+			return objectWitnessIntrinsic{}, false
+		}
+		var known bool
+		result.boolean, known = c.objectWitnessBooleanSnapshot()
+		if !known {
 			return objectWitnessIntrinsic{}, false
 		}
 		result.anchor = "boolean"
+		result.regular, result.baseConstraint = data.regularType, data.resolvedBaseConstraint
 		return result, true
 	}
 	data, ok := typ.data.(*LiteralType)
@@ -472,6 +523,11 @@ func (c *Checker) objectWitnessIntrinsicSnapshot(typ *Type) (objectWitnessIntrin
 	case jsnum.PseudoBigInt:
 		regular, result.anchor = c.bigintLiteralTypes[value], "bigint_literal"
 	case bool:
+		var known bool
+		result.boolean, known = c.objectWitnessBooleanSnapshot()
+		if !known {
+			return objectWitnessIntrinsic{}, false
+		}
 		result.anchor = "boolean_literal"
 		regular = c.regularFalseType
 		if value {
@@ -510,19 +566,35 @@ func (c *Checker) objectWitnessCacheSnapshot(typ *Type, expression *ast.Node) (o
 		owner.CheckFlags != 0 || len(owner.Declarations) != 1 || owner.ValueDeclaration == nil ||
 		owner.Declarations[0] != owner.ValueDeclaration || owner.ValueDeclaration.Symbol() != owner ||
 		!ast.IsFunctionDeclaration(owner.ValueDeclaration) || len(owner.Exports) != 0 ||
-		!ok || data == nil || typ.flags != TypeFlagsObject || typ.symbol != owner || typ.alias != nil ||
-		typ.objectFlags&(ObjectFlagsAnonymous|ObjectFlagsMembersResolved) != ObjectFlagsAnonymous|ObjectFlagsMembersResolved ||
+		!ok || data == nil || data.AsType() != typ || typ.flags != TypeFlagsObject || typ.symbol != owner || typ.alias != nil ||
+		typ.objectFlags&ObjectFlagsAnonymous == 0 ||
 		typ.objectFlags & ^(ObjectFlagsAnonymous|ObjectFlagsMembersResolved|ObjectFlagsCouldContainTypeVariablesComputed|ObjectFlagsCouldContainTypeVariables) != 0 ||
 		(typ.objectFlags&ObjectFlagsCouldContainTypeVariablesComputed != 0) != (typ.objectFlags&ObjectFlagsCouldContainTypeVariables != 0) ||
 		data.target != nil || data.mapper != nil || len(data.members) != 0 || len(data.properties) != 0 ||
-		len(data.indexInfos) != 0 || len(data.signatures) != 1 || data.callSignatureCount != 1 {
+		len(data.indexInfos) != 0 || data.resolvedBaseConstraint != nil || len(data.instantiations) != 0 ||
+		data.objectTypeWithoutAbstractConstructSignatures != nil {
 		return objectWitnessCacheEdge{}, false
 	}
-	signature := data.signatures[0]
+	// The declaration cache exists before lazy function members are rendered.
+	signatureLinks := c.signatureLinks.TryGet(owner.ValueDeclaration)
+	if signatureLinks == nil || signatureLinks.resolvedSignature == nil {
+		return objectWitnessCacheEdge{}, false
+	}
+	signature := signatureLinks.resolvedSignature
+	if typ.objectFlags&ObjectFlagsMembersResolved != 0 {
+		if len(data.signatures) != 1 || data.callSignatureCount != 1 || data.signatures[0] != signature {
+			return objectWitnessCacheEdge{}, false
+		}
+	} else if len(data.signatures) != 0 || data.callSignatureCount != 0 {
+		return objectWitnessCacheEdge{}, false
+	}
+	annotation := owner.ValueDeclaration.Type()
+	noPredicateAnnotation := annotation != nil && !ast.IsTypePredicateNode(annotation) && annotation.Parent == owner.ValueDeclaration
 	if signature == nil || signature.declaration != owner.ValueDeclaration ||
 		signature.flags & ^(SignatureFlagsHasRestParameter|SignatureFlagsHasLiteralTypes) != 0 ||
 		len(signature.typeParameters) != 0 || signature.thisParameter != nil || signature.target != nil ||
-		signature.mapper != nil || signature.composite != nil || signature.resolvedTypePredicate != c.noTypePredicate ||
+		signature.mapper != nil || signature.composite != nil ||
+		(signature.resolvedTypePredicate != c.noTypePredicate && (signature.resolvedTypePredicate != nil || !noPredicateAnnotation)) ||
 		len(signature.parameters) != len(owner.ValueDeclaration.Parameters()) {
 		return objectWitnessCacheEdge{}, false
 	}
@@ -532,6 +604,7 @@ func (c *Checker) objectWitnessCacheSnapshot(typ *Type, expression *ast.Node) (o
 	}
 	result := objectWitnessCacheEdge{
 		owner: objectWitnessSymbolSnapshot(owner), ownerLinks: *links, header: objectWitnessTypeHeader(typ), returnType: returned,
+		declaration: objectWitnessNodeSnapshot(owner.ValueDeclaration), annotation: objectWitnessNodeSnapshot(annotation), signatureLinks: *signatureLinks,
 		signature: objectWitnessSignature{signature, signature.id, signature.flags, signature.minArgumentCount,
 			signature.resolvedMinArgumentCount, signature.declaration, signature.thisParameter, signature.resolvedReturnType,
 			signature.resolvedTypePredicate, signature.target, signature.mapper, signature.isolatedSignatureType, signature.composite},
@@ -559,16 +632,52 @@ func objectWitnessSameCache(left, right objectWitnessCacheEdge) bool {
 		return left.intrinsic != nil && right.intrinsic != nil && *left.intrinsic == *right.intrinsic
 	}
 	return left.owner == right.owner && left.ownerLinks == right.ownerLinks && left.header == right.header &&
+		left.declaration == right.declaration && left.annotation == right.annotation && left.signatureLinks == right.signatureLinks &&
 		left.signature == right.signature && left.returnType == right.returnType && slices.Equal(left.parameters, right.parameters)
 }
 
-func objectWitnessSameSnapshot(left, right objectWitnessSnapshot) bool {
+func (c *Checker) objectWitnessCacheClosedFromBirth(birth, closed objectWitnessCacheEdge) bool {
+	if birth.intrinsic != nil || closed.intrinsic != nil {
+		return objectWitnessSameCache(birth, closed)
+	}
+	// Only these monotonic lazy changes follow from the captured declaration.
+	addedFlags := closed.header.objectFlags &^ birth.header.objectFlags
+	allowedFlags := ObjectFlagsMembersResolved | ObjectFlagsCouldContainTypeVariablesComputed | ObjectFlagsCouldContainTypeVariables
+	if birth.header.objectFlags&^closed.header.objectFlags != 0 || addedFlags & ^allowedFlags != 0 {
+		return false
+	}
+	birth.header.objectFlags = closed.header.objectFlags
+	if birth.signature.predicate == nil && closed.signature.predicate == c.noTypePredicate &&
+		birth.annotation.ref != nil && birth.annotation.kind != ast.KindTypePredicate && birth.annotation.parent == birth.declaration.ref {
+		birth.signature.predicate = closed.signature.predicate
+	}
+	return objectWitnessSameCache(birth, closed)
+}
+
+func objectWitnessSameProducer(left, right objectWitnessSnapshot) bool {
 	return left.header == right.header && left.node == right.node && left.owner == right.owner &&
 		slices.Equal(left.declarations, right.declarations) && slices.Equal(left.properties, right.properties) &&
 		slices.Equal(left.ordered, right.ordered) && slices.Equal(left.signatures, right.signatures) &&
 		left.callCount == right.callCount && slices.Equal(left.indexes, right.indexes) &&
 		left.target == right.target && left.mapper == right.mapper && left.instantiations == right.instantiations &&
 		left.baseConstraint == right.baseConstraint && left.withoutAbstract == right.withoutAbstract
+}
+
+func objectWitnessSameSnapshot(left, right objectWitnessSnapshot) bool {
+	return objectWitnessSameProducer(left, right) && maps.EqualFunc(left.cacheEdges, right.cacheEdges, objectWitnessSameCache)
+}
+
+func (c *Checker) objectWitnessClosedFromBirth(birth, closed objectWitnessSnapshot) bool {
+	if !objectWitnessSameProducer(birth, closed) {
+		return false
+	}
+	for member, before := range birth.cacheEdges {
+		after, known := closed.cacheEdges[member]
+		if !known || !c.objectWitnessCacheClosedFromBirth(before, after) {
+			return false
+		}
+	}
+	return true
 }
 
 func objectWitnessResult(state, reason string) ProjectOracleObjectVerification {
@@ -697,9 +806,9 @@ func (c *Checker) ProjectOracleVerifyObjectsAfterArtifacts(cold, warm *ProjectOr
 		if !lok || !rok {
 			return "incomplete", "closed producer snapshot is missing"
 		}
-		ll, le := c.objectWitnessSnapshot(l, true)
-		rl, re := c.objectWitnessSnapshot(r, true)
-		if le != "" || re != "" || !objectWitnessSameSnapshot(l.birth, lc) || !objectWitnessSameSnapshot(r.birth, rc) ||
+		ll, le := c.objectWitnessSnapshot(l)
+		rl, re := c.objectWitnessSnapshot(r)
+		if le != "" || re != "" || !c.objectWitnessClosedFromBirth(l.birth, lc) || !c.objectWitnessClosedFromBirth(r.birth, rc) ||
 			!objectWitnessSameSnapshot(lc, ll) || !objectWitnessSameSnapshot(rc, rl) {
 			return "rejected", "producer metadata changed after its creation"
 		}
@@ -731,12 +840,14 @@ func (c *Checker) ProjectOracleVerifyObjectsAfterArtifacts(cold, warm *ProjectOr
 					return "incomplete", "nested object is not owned by the property initializer"
 				}
 			} else {
+				_, lborn := l.birth.cacheEdges[lp.symbol.ref]
+				_, rborn := r.birth.cacheEdges[rp.symbol.ref]
 				la, lknown := lc.cacheEdges[lp.symbol.ref]
 				ra, rknown := rc.cacheEdges[rp.symbol.ref]
 				liveLeft, liveLKnown := ll.cacheEdges[lp.symbol.ref]
 				liveRight, liveRKnown := rl.cacheEdges[rp.symbol.ref]
-				if !lknown || !rknown {
-					return "incomplete", "property type has no proved cache owner"
+				if !lborn || !rborn || !lknown || !rknown {
+					return "incomplete", "property type has no proved cache owner at creation"
 				}
 				if !liveLKnown || !liveRKnown || lp.links.resolvedType != rp.links.resolvedType || !objectWitnessSameCache(la, ra) || !objectWitnessSameCache(la, liveLeft) || !objectWitnessSameCache(ra, liveRight) {
 					return "rejected", "cache-owned property type identity or signature changed"
@@ -759,7 +870,7 @@ func (c *Checker) ProjectOracleVerifyObjectsAfterArtifacts(cold, warm *ProjectOr
 	result.Relation = c.objectWitnessIdentityAfterArtifacts(cold.result, warm.result)
 	for _, query := range []*ProjectOracleObjectQueryWitness{cold, warm} {
 		for typ, production := range query.productions {
-			current, failure := c.objectWitnessSnapshot(production, true)
+			current, failure := c.objectWitnessSnapshot(production)
 			closed := query.closed[typ]
 			if failure != "" || !objectWitnessSameSnapshot(current, closed) {
 				result.Relation.WitnessDataChanged = true
