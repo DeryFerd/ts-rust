@@ -8464,6 +8464,329 @@ mod tests {
     }
 
     #[test]
+    fn review_export_equals_artifacts_require_ready_direct_identifiers() {
+        for (export, direct) in [
+            ("export = value;", true),
+            ("export default value;", false),
+            ("export = (value);", false),
+            ("export = value.member;", false),
+            ("export = value();", false),
+        ] {
+            let parsed = parse_source_file(&format!("declare const value: number; {export}"));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(6_100);
+            let mut context = export_equals_declaration_context(&parsed, file);
+            let declaration =
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        matches!(record.data, NodeData::VariableDeclaration(_))
+                            .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let reference = parsed.arena.iter().filter_map(|(node, record)| {
+                matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == "value")
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            }).last().unwrap();
+            let source = context.source_file(file).unwrap();
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                        store.symbol_store().symbol_table_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                    store.source_file_links(source).cloned(),
+                    store.value_symbol_links(symbol).cloned(),
+                    store.symbol_node_links(reference).cloned(),
+                    store.type_node_links(reference).cloned(),
+                    context.diagnostics().as_slice().to_vec(),
+                )
+            };
+            let cold = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.uncached_artifact_reference_symbol(reference),
+                    Ok(None),
+                    "{export}"
+                );
+                if direct {
+                    assert_eq!(context.get_symbol_at_location(reference), Ok(None));
+                    assert!(
+                        matches!(context.get_type_at_location(reference), Err(CanonicalArtifactQueryError::MissingType { node, .. }) if node == reference)
+                    );
+                }
+                assert_eq!(snapshot(&context), cold, "{export}");
+            }
+            let expected = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(expected),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            let ready = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.uncached_artifact_reference_symbol(reference),
+                    Ok(direct.then_some(symbol)),
+                    "{export}"
+                );
+                if direct {
+                    assert_eq!(context.get_symbol_at_location(reference), Ok(Some(symbol)));
+                    assert_eq!(context.get_type_at_location(reference), Ok(expected));
+                }
+                assert_eq!(snapshot(&context), ready, "{export}");
+            }
+        }
+    }
+
+    fn export_equals_declaration_context(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/exports.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn review_export_equals_artifacts_keep_the_nearest_lexical_value() {
+        let parsed = parse_source_file(concat!(
+            "declare const value: number; ",
+            "declare module 'pkg' { const value: string; export = value; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_101);
+        let mut context = declaration_context(&parsed, file);
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(record.data, NodeData::VariableDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [outer, inner] = declarations.as_slice() else {
+            panic!("expected two scoped declarations")
+        };
+        let outer = context.file(file).unwrap().1.symbol(*outer).unwrap();
+        let inner = context.file(file).unwrap().1.symbol(*inner).unwrap();
+        assert_ne!(outer, inner);
+        let reference = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExportAssignment(export) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, export.expression))
+            })
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            outer,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let source = context.source_file(file).unwrap();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.source_file_links(source).cloned(),
+                [outer, inner].map(|symbol| store.value_symbol_links(symbol).cloned()),
+                store.symbol_node_links(reference).cloned(),
+                store.type_node_links(reference).cloned(),
+                context.diagnostics().as_slice().to_vec(),
+            )
+        };
+        let cold_inner = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(reference), Ok(None));
+            assert!(
+                matches!(context.get_type_at_location(reference), Err(CanonicalArtifactQueryError::MissingType { node, .. }) if node == reference)
+            );
+            assert_eq!(snapshot(&context), cold_inner);
+        }
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            inner,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let ready = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(reference), Ok(Some(inner)));
+            assert_eq!(context.get_type_at_location(reference), Ok(string));
+            assert_eq!(snapshot(&context), ready);
+        }
+    }
+
+    #[test]
+    fn review_export_equals_artifacts_keep_alias_identity_without_cold_resolution() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace Local { export const value: number; } ",
+            "import Alias = Local; export = Alias;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_102);
+        let mut context = export_equals_declaration_context(&parsed, file);
+        let namespace = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::ModuleDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let import =
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::ImportEqualsDeclaration(_))
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+        let reference = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExportAssignment(export) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, export.expression))
+            })
+            .unwrap();
+        let namespace = context.file(file).unwrap().1.symbol(namespace).unwrap();
+        let alias = context.file(file).unwrap().1.symbol(import).unwrap();
+        assert_ne!(alias, namespace);
+        assert!(
+            context
+                .store()
+                .symbol(alias)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::ALIAS)
+        );
+        let expected = context.get_type_of_module_value(namespace).unwrap();
+        let source = context.source_file(file).unwrap();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.source_file_links(source).cloned(),
+                [alias, namespace].map(|symbol| store.value_symbol_links(symbol).cloned()),
+                store.alias_symbol_links(alias).cloned(),
+                store.symbol_node_links(reference).cloned(),
+                store.type_node_links(reference).cloned(),
+                context.diagnostics().as_slice().to_vec(),
+            )
+        };
+        let cold_alias = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(reference), Ok(None));
+            assert!(
+                matches!(context.get_type_at_location(reference), Err(CanonicalArtifactQueryError::MissingType { node, .. }) if node == reference)
+            );
+            assert_eq!(snapshot(&context), cold_alias);
+        }
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            alias,
+            ValueSymbolLinks {
+                resolved_type: Some(expected),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let ready = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_symbol_at_location(reference), Ok(Some(alias)));
+            assert_eq!(context.get_type_at_location(reference), Ok(expected));
+            assert_eq!(snapshot(&context), ready);
+        }
+        let foreign_parsed = parse_source_file("");
+        let foreign_context = declaration_context(&foreign_parsed, FileId::new(6_103));
+        let foreign = foreign_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert_eq!(
+            context.validate_artifact_type(reference, foreign),
+            Err(CanonicalArtifactQueryError::InvalidType {
+                node: reference,
+                type_: foreign
+            })
+        );
+        assert!(!context.store_mut_for_test().set_value_symbol_links(
+            alias,
+            ValueSymbolLinks {
+                resolved_type: Some(foreign),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert_eq!(snapshot(&context), ready);
+        assert_eq!(context.get_symbol_at_location(reference), Ok(Some(alias)));
+        assert_eq!(context.get_type_at_location(reference), Ok(expected));
+        assert_eq!(snapshot(&context), ready);
+    }
+
+    #[test]
     fn lexical_this_queries_reuse_the_canonical_global_symbol_and_type() {
         let parsed = parse_source_file("var _this = 1; var capture = () => this;");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
