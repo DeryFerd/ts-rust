@@ -10316,6 +10316,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         };
 
+        let mut annotation_identity = None;
         let (source_node, type_) = match (&declaration_record.data, symbol_record.flags()) {
             (NodeData::ClassDeclaration(_), SymbolFlags::CLASS)
                 if declaration_record.kind == SyntaxKind::ClassDeclaration
@@ -10423,11 +10424,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                     Some(TypeData::Union(_))
                                 )
                             })
-                        || value_type.is_some_and(|value| annotation_type != Some(value))
                     {
                         return Err(invalid());
                     }
                     self.plan_type_node_in_context(annotation, None, false)?;
+                    (annotation_identity, _) =
+                        self.value_type_query_annotation_identity(node, annotation)?;
+                    if value_type.is_some_and(|value| annotation_identity != Some(value)) {
+                        return Err(invalid());
+                    }
                     (Some(annotation), annotation_type)
                 } else {
                     if list_record.flags.0 != NODE_FLAG_CONST
@@ -10574,7 +10579,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .store
                 .symbol_node_links(node)
                 .is_some_and(|links| links.resolved_symbol.is_some())
-            || cached_type.is_some_and(|cached| Some(cached) != type_)
+            || cached_type.is_some_and(|cached| Some(cached) != type_.or(annotation_identity))
             || cached_symbol.is_some_and(|cached| cached != symbol)
             || cached_type.is_some() != cached_symbol.is_some()
         {
@@ -10593,6 +10598,65 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(invalid());
         }
         Ok(())
+    }
+
+    /// Keywords, null, and parentheses can resolve without an annotation cache.
+    fn value_type_query_annotation_identity(
+        &self,
+        query: NodeRef,
+        annotation: NodeRef,
+    ) -> Result<(Option<TypeId>, NodeRef), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(query));
+        let mut identity_node = annotation;
+        while let NodeData::ParenthesizedTypeNode(parenthesized) =
+            &preflight_node(self.store, self.host, identity_node)?.data
+        {
+            identity_node = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+        }
+        let identity = if matches!(
+            self.plan.literals.get(&identity_node),
+            Some(PlannedLiteralType::Null)
+        ) {
+            Some(
+                self.store
+                    .intrinsic_bootstrap()
+                    .ok_or_else(invalid)?
+                    .null_type,
+            )
+        } else {
+            self.cached_array_element_identity(annotation)?
+        };
+        let mut current = annotation;
+        loop {
+            if self.store.type_node_links(current).is_some_and(|links| {
+                links.outer_type_parameters.is_some()
+                    || links
+                        .resolved_type
+                        .is_some_and(|cached| Some(cached) != identity)
+            }) || current != identity_node
+                && self
+                    .store
+                    .symbol_node_links(current)
+                    .is_some_and(|links| links != &super::SymbolNodeLinks::default())
+            {
+                return Err(invalid());
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) =
+                &preflight_node(self.store, self.host, current)?.data
+            else {
+                break;
+            };
+            current = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+        }
+        if identity.is_some_and(|type_| {
+            self.store.type_payload(type_).is_none()
+                || !self
+                    .store
+                    .source_direct_type_annotation_is_exact(identity_node, type_)
+        }) {
+            return Err(invalid());
+        }
+        Ok((identity, identity_node))
     }
 
     fn plan_namespace_alias_type_query(
@@ -11033,35 +11097,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let annotation_plan = self.plan_type_node_in_context(annotation, None, false);
         self.planning_imported_variables.remove(&symbol);
         annotation_plan?;
-        let annotation_identity = self.cached_array_element_identity(annotation)?;
-        let mut identity_node = annotation;
-        loop {
-            if self
-                .store
-                .type_node_links(identity_node)
-                .is_some_and(|links| {
-                    links.outer_type_parameters.is_some()
-                        || links
-                            .resolved_type
-                            .is_some_and(|cached| Some(cached) != annotation_identity)
-                })
-            {
-                return Err(invalid());
-            }
-            let identity_record = preflight_node(self.store, self.host, identity_node)?;
-            let NodeData::ParenthesizedTypeNode(parenthesized) = &identity_record.data else {
-                break;
-            };
-            identity_node = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
-        }
-        if value_type.is_some_and(|value| annotation_identity != Some(value))
-            || annotation_identity.is_some_and(|type_| {
-                self.store.type_payload(type_).is_none()
-                    || !self
-                        .store
-                        .source_direct_type_annotation_is_exact(identity_node, type_)
-            })
-        {
+        let (annotation_identity, identity_node) =
+            self.value_type_query_annotation_identity(node, annotation)?;
+        if value_type.is_some_and(|value| annotation_identity != Some(value)) {
             return Err(invalid());
         }
         if let Some(cached) = annotation_identity
@@ -48706,6 +48744,175 @@ mod tests {
         assert_eq!(union_state(&fixture.store), warm);
         assert!(fixture.store.value_symbol_links(symbol).is_none());
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn value_type_query_scalar_annotations_reject_changed_caches_before_writes() {
+        for annotation_text in ["number", "(number)", "null", "(null)"] {
+            for warm in [false, true] {
+                for poison in 0..5 {
+                    let mut fixture = fixture(&format!(
+                        "declare let value: {annotation_text}; type Result = typeof value;"
+                    ));
+                    let annotation = variable_type_node(&fixture, "value");
+                    let mut inner = annotation;
+                    while let NodeData::ParenthesizedTypeNode(parenthesized) =
+                        &fixture.parsed.arena.get(inner.node).unwrap().data
+                    {
+                        inner = NodeRef::new(inner.arena, inner.file, parenthesized.type_);
+                    }
+                    if poison == 3 && inner == annotation {
+                        continue;
+                    }
+                    let query = alias_parts(&fixture, "Result").2;
+                    let name = type_query_name(&fixture, query);
+                    let symbol = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "value");
+                    let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                    let wrong = bootstrap.string_type;
+                    let expected = if annotation_text.contains("null") {
+                        bootstrap.null_type
+                    } else {
+                        bootstrap.number_type
+                    };
+                    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                    if warm {
+                        assert_eq!(
+                            query_node(&mut fixture, query, &mut diagnostics),
+                            Ok(expected)
+                        );
+                    }
+                    let original = [annotation, inner, query, name].map(|node| {
+                        (
+                            node,
+                            fixture.store.type_node_links(node).cloned(),
+                            fixture.store.symbol_node_links(node).cloned(),
+                        )
+                    });
+                    match poison {
+                        0 | 4 => {
+                            assert!(fixture.store.set_type_node_links(
+                                inner,
+                                TypeNodeLinks {
+                                    resolved_type: Some(wrong),
+                                    outer_type_parameters: None,
+                                }
+                            ));
+                            if poison == 4 {
+                                assert!(fixture.store.set_type_node_links(
+                                    query,
+                                    TypeNodeLinks {
+                                        resolved_type: Some(wrong),
+                                        outer_type_parameters: None,
+                                    }
+                                ));
+                                assert!(fixture.store.set_symbol_node_links(
+                                    name,
+                                    SymbolNodeLinks {
+                                        resolved_symbol: Some(symbol)
+                                    }
+                                ));
+                            }
+                        }
+                        1 => assert!(fixture.store.set_type_node_links(
+                            inner,
+                            TypeNodeLinks {
+                                resolved_type: None,
+                                outer_type_parameters: Some(vec![wrong]),
+                            }
+                        )),
+                        2 | 3 => assert!(fixture.store.set_symbol_node_links(
+                            if poison == 2 { inner } else { annotation },
+                            SymbolNodeLinks {
+                                resolved_symbol: Some(symbol)
+                            }
+                        )),
+                        _ => unreachable!(),
+                    }
+                    let state = |store: &CanonicalTypeMapperStore| {
+                        (
+                            store_state(store),
+                            store.symbol_len(),
+                            store.signature_len(),
+                            store.value_symbol_links(symbol).cloned(),
+                            [annotation, inner, query, name].map(|node| {
+                                (
+                                    store.type_node_links(node).cloned(),
+                                    store.symbol_node_links(node).cloned(),
+                                )
+                            }),
+                        )
+                    };
+                    let before = state(&fixture.store);
+                    let result = query_node(&mut fixture, query, &mut diagnostics);
+                    assert!(
+                        result.is_err(),
+                        "{annotation_text}, warm={warm}, poison={poison}"
+                    );
+                    assert!(!matches!(
+                        result,
+                        Err(DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedSyntax { .. }
+                        ))
+                    ));
+                    assert_eq!(state(&fixture.store), before);
+                    assert!(diagnostics.is_empty());
+                    for (node, type_links, symbol_links) in original {
+                        assert!(
+                            fixture
+                                .store
+                                .set_type_node_links(node, type_links.unwrap_or_default())
+                        );
+                        assert!(
+                            fixture
+                                .store
+                                .set_symbol_node_links(node, symbol_links.unwrap_or_default())
+                        );
+                    }
+                    assert_eq!(
+                        query_node(&mut fixture, query, &mut diagnostics),
+                        Ok(expected)
+                    );
+                    assert!(fixture.store.value_symbol_links(symbol).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn value_type_query_does_not_rebuild_a_cleared_composite_annotation() {
+        for annotation_text in ["number | string", "(number | string)"] {
+            let mut fixture = fixture(&format!(
+                "declare let value: {annotation_text}; type Result = typeof value;"
+            ));
+            let mut annotation = variable_type_node(&fixture, "value");
+            if let NodeData::ParenthesizedTypeNode(parenthesized) =
+                &fixture.parsed.arena.get(annotation.node).unwrap().data
+            {
+                annotation = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+            }
+            let query = alias_parts(&fixture, "Result").2;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let expected = query_node(&mut fixture, query, &mut diagnostics).unwrap();
+            let original = fixture.store.type_node_links(annotation).cloned().unwrap();
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(annotation, TypeNodeLinks::default())
+            );
+            let before = store_state(&fixture.store);
+            assert!(query_node(&mut fixture, query, &mut diagnostics).is_err());
+            assert_eq!(store_state(&fixture.store), before);
+            assert_eq!(
+                fixture.store.type_node_links(annotation),
+                Some(&TypeNodeLinks::default())
+            );
+            assert!(fixture.store.set_type_node_links(annotation, original));
+            assert_eq!(
+                query_node(&mut fixture, query, &mut diagnostics),
+                Ok(expected)
+            );
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

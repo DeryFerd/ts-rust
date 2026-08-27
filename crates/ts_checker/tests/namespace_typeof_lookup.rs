@@ -81,7 +81,6 @@ fn assert_outer_value_query(
     parsed: &ParseResult,
     file: FileId,
     expected_text: &str,
-    warm: bool,
 ) {
     let query = first_node(parsed, file, SyntaxKind::TypeQuery);
     let name = query_name(parsed, query);
@@ -98,51 +97,68 @@ fn assert_outer_value_query(
         Some(outer)
     );
     assert!(checker.store().value_symbol_links(outer).is_none());
-    if warm {
-        let before = (
+    let before = (
+        checker.store().type_len(),
+        checker.store().symbol_len(),
+        checker.store().signature_len(),
+        checker.store().mapper_len(),
+    );
+    assert_eq!(checker.get_type_from_type_node(query), Ok(expected));
+    assert_eq!(
+        (
             checker.store().type_len(),
             checker.store().symbol_len(),
             checker.store().signature_len(),
             checker.store().mapper_len(),
-        );
-        assert_eq!(checker.get_type_from_type_node(query), Ok(expected));
-        assert_eq!(
-            (
-                checker.store().type_len(),
-                checker.store().symbol_len(),
-                checker.store().signature_len(),
-                checker.store().mapper_len(),
-            ),
-            before
-        );
-    }
+        ),
+        before
+    );
+    assert!(checker.store().value_symbol_links(outer).is_none());
     assert!(checker.diagnostics().is_empty());
 }
 
 #[test]
 fn outer_value_typeof_query_is_cold_and_warm_stable() {
-    let parsed = parse_source_file(
-        "declare let chosen: number | string; namespace Consumer { type Q = typeof chosen; }",
-    );
-    let file = FileId::new(13_600);
-    let mut checker = context(
-        &[TestSource {
-            parsed: &parsed,
-            file,
-            path: "\"/outer-value.ts\"",
-            module_state: CanonicalModuleState::Script,
-        }],
-        [],
-    );
-    assert_outer_value_query(&mut checker, &parsed, file, "string | number", true);
+    for (annotation, expected) in [
+        ("any", "any"),
+        ("unknown", "unknown"),
+        ("string", "string"),
+        ("number", "number"),
+        ("bigint", "bigint"),
+        ("boolean", "boolean"),
+        ("symbol", "symbol"),
+        ("void", "void"),
+        ("undefined", "undefined"),
+        ("never", "never"),
+        ("object", "object"),
+        ("null", "null"),
+        ("number | string", "string | number"),
+    ] {
+        for annotation in [annotation.to_owned(), format!("(({annotation}))")] {
+            let parsed = parse_source_file(&format!(
+                "declare let chosen: {annotation}; namespace Consumer {{ type Q = typeof chosen; }}"
+            ));
+            let file = FileId::new(13_600);
+            let mut checker = context(
+                &[TestSource {
+                    parsed: &parsed,
+                    file,
+                    path: "\"/outer-value.ts\"",
+                    module_state: CanonicalModuleState::Script,
+                }],
+                [],
+            );
+            assert_outer_value_query(&mut checker, &parsed, file, expected);
+        }
+    }
 }
 
 #[test]
 fn resolved_interface_alias_does_not_hide_outer_typeof_value() {
-    // Scalar annotation replay has a separate cache failure. The union isolates warm lookup.
-    for (annotation, expected, warm) in [
-        ("number", "number", false),
-        ("number | string", "string | number", true),
+    for (annotation, expected) in [
+        ("number", "number"),
+        ("(number)", "number"),
+        ("number | string", "string | number"),
     ] {
         let parsed = parse_source_file(&format!(
             "declare let chosen: {annotation}; \
@@ -177,9 +193,52 @@ fn resolved_interface_alias_does_not_hide_outer_typeof_value() {
                 .contains(&interface)
         );
         let links = checker.store().alias_symbol_links(alias).cloned();
-        assert_outer_value_query(&mut checker, &parsed, file, expected, warm);
+        assert_outer_value_query(&mut checker, &parsed, file, expected);
         assert_eq!(checker.store().alias_symbol_links(alias), links.as_ref());
         assert!(checker.store().value_symbol_links(alias).is_none());
+    }
+}
+
+#[test]
+fn qualified_ambient_typeof_reuses_uncached_scalar_annotations() {
+    for (annotation, expected) in [("number", "number"), ("(null)", "null")] {
+        let parsed = parse_source_file(&format!(
+            "declare namespace Values {{ export const chosen: {annotation}; }} \
+             type Q = typeof Values.chosen;"
+        ));
+        let file = FileId::new(13_604);
+        let mut checker = context(
+            &[TestSource {
+                parsed: &parsed,
+                file,
+                path: "\"/qualified-value.ts\"",
+                module_state: CanonicalModuleState::Script,
+            }],
+            [],
+        );
+        let query = first_node(&parsed, file, SyntaxKind::TypeQuery);
+        let declaration = first_node(&parsed, file, SyntaxKind::VariableDeclaration);
+        let symbol = checker.file(file).unwrap().1.symbol(declaration).unwrap();
+        let result = checker.get_type_from_type_node(query).unwrap();
+        assert_eq!(checker.type_to_string(result).unwrap(), expected);
+        let before = (
+            checker.store().type_len(),
+            checker.store().symbol_len(),
+            checker.store().signature_len(),
+            checker.store().mapper_len(),
+        );
+        assert_eq!(checker.get_type_from_type_node(query), Ok(result));
+        assert_eq!(
+            (
+                checker.store().type_len(),
+                checker.store().symbol_len(),
+                checker.store().signature_len(),
+                checker.store().mapper_len(),
+            ),
+            before
+        );
+        assert!(checker.store().value_symbol_links(symbol).is_none());
+        assert!(checker.diagnostics().is_empty());
     }
 }
 
