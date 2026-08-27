@@ -1247,6 +1247,14 @@ fn validate_symbol(
         validate_symbol(store, host, wrapper.source.alias)?;
         return Ok(symbol);
     }
+    // Namespace wrappers reuse exports. They do not own source declarations.
+    if store.get_parent_of_symbol(symbol).is_some_and(|parent| {
+        store
+            .source_file_namespace_wrapper_for_module(parent)
+            .is_some()
+    }) {
+        return Err(SymbolDisplayError::InvalidSymbol(symbol));
+    }
     if record.flags().contains(SymbolFlags::CLASS)
         && record.declarations().is_none_or(<[NodeRef]>::is_empty)
     {
@@ -1350,13 +1358,6 @@ fn validated_parent(
     let Some(parent) = store.get_parent_of_symbol(symbol) else {
         return Ok(None);
     };
-    // Namespace wrappers reuse exports. They do not own source declarations.
-    if store
-        .source_file_namespace_wrapper_for_module(parent)
-        .is_some()
-    {
-        return Err(SymbolDisplayError::InvalidSymbol(symbol));
-    }
     validate_symbol(store, host, parent)?;
     let owner = store
         .symbol(parent)
