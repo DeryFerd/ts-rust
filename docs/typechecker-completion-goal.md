@@ -132,7 +132,25 @@ inline indexed access, property objects in unions, all eight strict `typeof`
 tags, reversed comparisons, object/function classification, `void` projection,
 and base/local join identity restoration.
 
-### Execution checkpoint: 2026-08-26
+### Execution checkpoint: 2026-08-27
+
+Wave 131 passes all 6,239 workspace tests. Strict workspace Clippy passes after
+one test-only lint fix. The fixed semantic report has 48 exact results in 95
+executed variants, one more than wave 128. The diagnostic-only milestone
+retains all 397 exact results in 511 executed variants. Neither report lost an
+exact result or produced a fatal invariant.
+
+JSDoc callback alias identity, mode-aware module targets, dependency-ordered
+source checking, retained config and resolver inputs, and exact project error
+rendering are integrated. Approved input-preparation scripts for all seven
+projects are also included. The remaining semantic outcomes are 46 unsupported
+variants and one artifact mismatch. No modern-project parity ring is claimed.
+
+See [`typechecker-wave131-status.md`](typechecker-wave131-status.md) for runtime
+checkpoint `74fd417a`, test-only follow-up `4705d079`, script evidence, and the
+remaining work. The full port goal remains active.
+
+### Earlier wave 128 checkpoint: 2026-08-26
 
 Wave 128 passes all 6,173 workspace tests. Strict workspace Clippy passes after
 the lint-only follow-up. The fixed semantic report has 47 exact results in 95
