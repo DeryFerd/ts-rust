@@ -1564,6 +1564,7 @@ enum CachedTypeAliasRhs {
     DirectUnion,
     DirectIntersection(NodeRef),
     TypeReference(NodeRef),
+    TypeQuery(NodeRef),
     JsDocImport(NodeRef),
     TypeLiteral(NodeRef),
     FunctionType(NodeRef),
@@ -8659,6 +8660,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         CachedTypeAliasRhs::DirectIntersection(type_node)
                     }
                     SyntaxKind::TypeReference => CachedTypeAliasRhs::TypeReference(type_node),
+                    SyntaxKind::TypeQuery => CachedTypeAliasRhs::TypeQuery(type_node),
                     SyntaxKind::ImportType => CachedTypeAliasRhs::JsDocImport(type_node),
                     SyntaxKind::TypeLiteral => CachedTypeAliasRhs::TypeLiteral(type_node),
                     SyntaxKind::FunctionType => CachedTypeAliasRhs::FunctionType(type_node),
@@ -8701,6 +8703,47 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
             type_node = inner;
         }
+    }
+
+    /// Finds a typeof body through already-validated cached alias links.
+    fn cached_type_query_alias_target(
+        &self,
+        mut symbol: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+        let mut visited = HashSet::new();
+        while visited.insert(symbol) {
+            let has_source = self
+                .store
+                .symbol(symbol)
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| declarations.first())
+                .is_some_and(|declaration| self.host.source(*declaration).is_some());
+            if !has_source {
+                return Ok(None);
+            }
+            match self.cached_type_alias_rhs(symbol)? {
+                CachedTypeAliasRhs::TypeQuery(_) => return Ok(Some(symbol)),
+                CachedTypeAliasRhs::TypeReference(reference) => {
+                    let Some(target) = self
+                        .store
+                        .symbol_node_links(reference)
+                        .and_then(|links| links.resolved_symbol)
+                    else {
+                        return Ok(None);
+                    };
+                    if !self
+                        .store
+                        .symbol(target)
+                        .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::TYPE_ALIAS))
+                    {
+                        return Ok(None);
+                    }
+                    symbol = target;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     fn validate_cached_type_alias_identity(
@@ -9130,10 +9173,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     }
                     return Ok(());
                 }
-                CachedTypeAliasRhs::IndexedAccess(indexed_access) => {
+                CachedTypeAliasRhs::IndexedAccess(identity_node)
+                | CachedTypeAliasRhs::TypeQuery(identity_node) => {
                     let identity_seed = self
                         .store
-                        .type_node_links(indexed_access)
+                        .type_node_links(identity_node)
                         .and_then(|links| links.resolved_type);
                     if !missing_generic_metadata.is_empty()
                         || !identity_seed.is_some_and(|identity_seed| {
@@ -19577,6 +19621,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if cached.is_some() {
             self.validate_cached_generic_alias_constraints(symbol, &planned_parameters)?;
+        }
+        if cached.is_some_and(|cached| {
+            matches!(
+                self.store
+                    .type_payload(cached.declared_type)
+                    .map(TypeRecord::data),
+                Some(TypeData::Union(_))
+            )
+        }) && let Some(target) = self.cached_type_query_alias_target(symbol)?
+            && target != symbol
+        {
+            self.plan_type_alias(target, union_constituent)?;
         }
         if self.replay_cached_annotations
             || self.intersection_planning_depth != 0
@@ -49560,6 +49616,200 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check each failed read and retry against the same saved state.
+    fn typeof_alias_unions_reject_changed_or_cleared_caches_before_writes() {
+        for annotation_text in ["boolean", "number | string", "Seed"] {
+            for body in ["typeof value", "(typeof value)"] {
+                let mut fixture = fixture(&format!(
+                    "type Seed = number | string; type Other = number | string; \
+                     declare let value: {annotation_text}; type Result = {body}; \
+                     type Forward = Result;"
+                ));
+                let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+                let forward = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Forward");
+                let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+                let value = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "value");
+                let annotation = variable_type_node(&fixture, "value");
+                let mut query = alias_parts(&fixture, "Result").2;
+                if let NodeData::ParenthesizedTypeNode(parenthesized) =
+                    &fixture.parsed.arena.get(query.node).unwrap().data
+                {
+                    query = NodeRef::new(query.arena, query.file, parenthesized.type_);
+                }
+                let name = type_query_name(&fixture, query);
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let annotation_type =
+                    query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+                let expected = query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+                assert_eq!(expected, annotation_type);
+                let expected_owner = (annotation_text == "Seed")
+                    .then(|| named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Seed"));
+                assert_eq!(union_alias_symbol(&fixture.store, expected), expected_owner);
+                assert_eq!(
+                    query_node(&mut fixture, query, &mut diagnostics),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        forward,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(expected),
+                );
+                let forward_reference = alias_parts(&fixture, "Forward").2;
+                let members = union_types(&fixture.store, expected).to_vec();
+                let wrong = alloc_named_union(&mut fixture.store, other, &members);
+                let forged = alloc_forged_named_union(&mut fixture.store, other, members);
+                assert_ne!(wrong, expected);
+                let original_alias = fixture.store.type_alias_links(alias).cloned().unwrap();
+                let original_query = fixture.store.type_node_links(query).cloned().unwrap();
+                let original_forward = fixture.store.type_alias_links(forward).cloned().unwrap();
+                let original_reference = fixture
+                    .store
+                    .type_node_links(forward_reference)
+                    .cloned()
+                    .unwrap();
+                let original_annotation = fixture.store.type_node_links(annotation).cloned();
+                let original_name = fixture.store.symbol_node_links(name).cloned().unwrap();
+                let state = |store: &CanonicalTypeMapperStore| {
+                    (
+                        union_state(store),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.type_alias_links(alias).cloned(),
+                        store.type_alias_links(forward).cloned(),
+                        [query, annotation, name, forward_reference].map(|node| {
+                            (
+                                store.type_node_links(node).cloned(),
+                                store.symbol_node_links(node).cloned(),
+                            )
+                        }),
+                        store.value_symbol_links(value).cloned(),
+                        store.relation_state_snapshot(),
+                    )
+                };
+                for corruption in 0..9 {
+                    if matches!(corruption, 4 | 8) && original_annotation.is_none() {
+                        continue;
+                    }
+                    if matches!(corruption, 0 | 2 | 5 | 7) {
+                        let mut links = original_alias.clone();
+                        links.declared_type = Some(if corruption == 5 { forged } else { wrong });
+                        assert!(fixture.store.set_type_alias_links(alias, links));
+                    }
+                    match corruption {
+                        1 | 2 | 5 | 7 => {
+                            let mut links = original_query.clone();
+                            links.resolved_type =
+                                Some(if corruption == 5 { forged } else { wrong });
+                            assert!(fixture.store.set_type_node_links(query, links));
+                        }
+                        3 => {
+                            assert!(
+                                fixture
+                                    .store
+                                    .set_type_node_links(query, TypeNodeLinks::default())
+                            );
+                            assert!(
+                                fixture
+                                    .store
+                                    .set_symbol_node_links(name, SymbolNodeLinks::default())
+                            );
+                        }
+                        4 | 8 => {
+                            assert!(
+                                fixture
+                                    .store
+                                    .set_type_node_links(annotation, TypeNodeLinks::default())
+                            );
+                        }
+                        6 => {
+                            assert!(fixture.store.set_symbol_node_links(
+                                name,
+                                SymbolNodeLinks {
+                                    resolved_symbol: Some(other)
+                                },
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if corruption == 7 {
+                        let mut links = original_forward.clone();
+                        links.declared_type = Some(wrong);
+                        assert!(fixture.store.set_type_alias_links(forward, links));
+                        let mut links = original_reference.clone();
+                        links.resolved_type = Some(wrong);
+                        assert!(fixture.store.set_type_node_links(forward_reference, links));
+                    }
+                    let before = state(&fixture.store);
+                    let result = query_declared(
+                        &mut fixture,
+                        if matches!(corruption, 7 | 8) {
+                            forward
+                        } else {
+                            alias
+                        },
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    );
+                    assert!(
+                        result.is_err(),
+                        "{annotation_text}, {body}, corruption={corruption}, result={result:?}"
+                    );
+                    assert_eq!(state(&fixture.store), before);
+                    assert!(diagnostics.is_empty());
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_alias_links(alias, original_alias.clone())
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_alias_links(forward, original_forward.clone())
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_node_links(forward_reference, original_reference.clone())
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_node_links(query, original_query.clone())
+                    );
+                    assert!(fixture.store.set_type_node_links(
+                        annotation,
+                        original_annotation.clone().unwrap_or_default(),
+                    ));
+                    assert!(
+                        fixture
+                            .store
+                            .set_symbol_node_links(name, original_name.clone())
+                    );
+                    assert_eq!(
+                        query_declared(
+                            &mut fixture,
+                            alias,
+                            CanonicalTypeQueryOptions::default(),
+                            &mut diagnostics,
+                        ),
+                        Ok(expected),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn value_type_queries_materialize_authenticated_abstract_and_concrete_class_constructors() {
         for (source, abstract_class) in [
             (
@@ -50333,11 +50583,7 @@ mod tests {
                     .source_file_namespace_identity(module)
                     .cloned();
                 let actual = context.get_declared_type_of_symbol(alias);
-                let reason = if corruption == 2 {
-                    TypeNodeUnavailable::InvalidTypeReference(query)
-                } else {
-                    TypeNodeUnavailable::InvalidCachedTypeAlias(alias)
-                };
+                let reason = TypeNodeUnavailable::InvalidCachedTypeAlias(alias);
                 if actual != Err(DeclaredTypeError::TypeNodeUnavailable(reason)) {
                     failures.push((body, corruption, actual));
                 }
