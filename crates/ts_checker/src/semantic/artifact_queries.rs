@@ -1052,23 +1052,24 @@ impl CanonicalCheckerContext<'_> {
         if bound.symbol(element) != Some(symbol) || node != element && node != name {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
-        let error_type = self
-            .store()
-            .intrinsic_bootstrap()
-            .ok_or_else(unsupported)?
-            .error_type;
+        let bootstrap = self.store().intrinsic_bootstrap().ok_or_else(unsupported)?;
+        let type_ = if self.options().use_unknown_in_catch_variables {
+            bootstrap.error_type
+        } else {
+            bootstrap.any_type
+        };
         for location in [element, name] {
             if let Some(links) = self.store().type_node_links(location)
                 && links != &TypeNodeLinks::default()
                 && links
                     != &(TypeNodeLinks {
-                        resolved_type: Some(error_type),
+                        resolved_type: Some(type_),
                         ..TypeNodeLinks::default()
                     })
             {
                 return Err(CanonicalArtifactQueryError::InvalidType {
                     node: location,
-                    type_: links.resolved_type.unwrap_or(error_type),
+                    type_: links.resolved_type.unwrap_or(type_),
                 });
             }
             if let Some(cached) = self
@@ -1083,7 +1084,7 @@ impl CanonicalCheckerContext<'_> {
                 });
             }
         }
-        Ok(Some(error_type))
+        Ok(Some(type_))
     }
 
     fn arrow_artifact_type(
@@ -3139,28 +3140,48 @@ mod tests {
     }
 
     #[test]
-    fn catch_rest_artifacts_return_error_type_without_publishing_bindings() {
+    fn catch_rest_artifacts_follow_the_option_without_publishing_bindings() {
         let parsed = parse_source_file("try {\n  // ...\n} catch ({ ...rest }) {\n  // ...\n}\n");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(6_210);
         let (element, name) = catch_rest_nodes(&parsed, file);
-        for checked_first in [false, true] {
-            let mut context = context(&parsed, file);
+        for (use_unknown_in_catch_variables, checked_first) in [false, true]
+            .into_iter()
+            .flat_map(|unknown| [false, true].map(|checked| (unknown, checked)))
+        {
+            let mut context = context_with_options(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    use_unknown_in_catch_variables,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
             if checked_first {
                 context.check_source_file(file).unwrap();
             }
             let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
             let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-            let error_type = bootstrap.error_type;
-            assert_ne!(error_type, bootstrap.any_type);
-            assert_eq!(context.get_type_at_location(name), Ok(error_type));
-            assert_eq!(context.type_to_string(error_type).unwrap(), "any");
-            assert_eq!(context.get_symbol_at_location(name), Ok(Some(symbol)));
-            let [diagnostic] = context.diagnostics().as_slice() else {
-                panic!("expected the catch-rest diagnostic")
+            let expected = if use_unknown_in_catch_variables {
+                bootstrap.error_type
+            } else {
+                bootstrap.any_type
             };
-            assert_eq!(diagnostic.node, Some(name));
-            assert_eq!(diagnostic.diagnostic.code(), 2700);
+            assert_ne!(bootstrap.error_type, bootstrap.any_type);
+            assert_eq!(context.get_type_at_location(name), Ok(expected));
+            assert_eq!(context.type_to_string(expected).unwrap(), "any");
+            assert_eq!(context.get_symbol_at_location(name), Ok(Some(symbol)));
+            assert_eq!(
+                context.diagnostics().len(),
+                usize::from(use_unknown_in_catch_variables),
+            );
+            if use_unknown_in_catch_variables {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("expected the catch-rest diagnostic")
+                };
+                assert_eq!(diagnostic.node, Some(name));
+                assert_eq!(diagnostic.diagnostic.code(), 2700);
+            }
             let state = |context: &CanonicalCheckerContext<'_>| {
                 (
                     context.store().type_len(),
@@ -3172,7 +3193,7 @@ mod tests {
             let warm = state(&context);
             for _ in 0..2 {
                 for location in [element, name] {
-                    assert_eq!(context.get_type_at_location(location), Ok(error_type));
+                    assert_eq!(context.get_type_at_location(location), Ok(expected));
                     assert_eq!(context.get_symbol_at_location(location), Ok(Some(symbol)));
                     assert!(context.store().type_node_links(location).is_none());
                     assert!(context.store().symbol_node_links(location).is_none());
@@ -3190,26 +3211,39 @@ mod tests {
         let parsed = parse_source_file("try {} catch ({ ...rest }) {}");
         let file = FileId::new(6_211);
         let (element, name) = catch_rest_nodes(&parsed, file);
-        for checked_first in [false, true] {
+        for (use_unknown_in_catch_variables, checked_first) in [false, true]
+            .into_iter()
+            .flat_map(|unknown| [false, true].map(|checked| (unknown, checked)))
+        {
             for location in [element, name] {
                 for poison in ["type", "metadata", "value", "write", "symbol"] {
-                    let mut context = context(&parsed, file);
+                    let mut context = context_with_options(
+                        &parsed,
+                        file,
+                        CanonicalCheckerOptions {
+                            use_unknown_in_catch_variables,
+                            ..CanonicalCheckerOptions::default()
+                        },
+                    );
                     if checked_first {
                         context.check_source_file(file).unwrap();
                     }
                     let symbol = context.file(file).unwrap().1.symbol(element).unwrap();
                     let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-                    let error_type = bootstrap.error_type;
-                    let any = bootstrap.any_type;
+                    let (expected, wrong) = if use_unknown_in_catch_variables {
+                        (bootstrap.error_type, bootstrap.any_type)
+                    } else {
+                        (bootstrap.any_type, bootstrap.error_type)
+                    };
                     let other_symbol = bootstrap.undefined_symbol;
                     match poison {
                         "type" | "metadata" => {
                             assert!(context.store_mut_for_test().set_type_node_links(
                                 location,
                                 TypeNodeLinks {
-                                    resolved_type: (poison == "type").then_some(any),
+                                    resolved_type: (poison == "type").then_some(wrong),
                                     outer_type_parameters:
-                                        (poison == "metadata").then(|| vec![error_type]),
+                                        (poison == "metadata").then(|| vec![expected]),
                                 },
                             ));
                         }
@@ -3217,8 +3251,8 @@ mod tests {
                             assert!(context.store_mut_for_test().set_value_symbol_links(
                                 symbol,
                                 ValueSymbolLinks {
-                                    resolved_type: (poison == "value").then_some(error_type),
-                                    write_type: (poison == "write").then_some(error_type),
+                                    resolved_type: (poison == "value").then_some(expected),
+                                    write_type: (poison == "write").then_some(expected),
                                     ..ValueSymbolLinks::default()
                                 },
                             ));
@@ -3290,9 +3324,12 @@ mod tests {
                         ),
                         _ => unreachable!(),
                     }
-                    assert_eq!(context.get_type_at_location(name), Ok(error_type));
+                    assert_eq!(context.get_type_at_location(name), Ok(expected));
                     context.recheck_source_file(file).unwrap();
-                    assert_eq!(context.diagnostics().len(), 1);
+                    assert_eq!(
+                        context.diagnostics().len(),
+                        usize::from(use_unknown_in_catch_variables),
+                    );
                     assert!(
                         context
                             .store()
@@ -3311,8 +3348,18 @@ mod tests {
         let file = FileId::new(6_212);
         let (element, name) = catch_rest_nodes(&parsed, file);
         let (_, foreign_name) = catch_rest_nodes(&foreign, file);
-        for checked_first in [false, true] {
-            let mut context = context(&parsed, file);
+        for (use_unknown_in_catch_variables, checked_first) in [false, true]
+            .into_iter()
+            .flat_map(|unknown| [false, true].map(|checked| (unknown, checked)))
+        {
+            let mut context = context_with_options(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    use_unknown_in_catch_variables,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
             if checked_first {
                 context.check_source_file(file).unwrap();
             }

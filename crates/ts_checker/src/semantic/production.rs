@@ -123,6 +123,7 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// cutoff.
 /// `check_bigint_target` enables runtime bigint grammar and exponentiation
 /// checks against the configured language target.
+/// `use_unknown_in_catch_variables` retains the effective catch-variable option.
 #[allow(clippy::struct_excessive_bools)] // Flat immutable compiler-option projection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerOptions {
@@ -131,6 +132,7 @@ pub struct CanonicalCheckerOptions {
     pub strict_builtin_iterator_return: bool,
     pub strict_function_types: bool,
     pub strict_property_initialization: bool,
+    pub use_unknown_in_catch_variables: bool,
     pub no_implicit_any: bool,
     pub no_unchecked_indexed_access: bool,
     pub no_unused_locals: bool,
@@ -155,6 +157,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             strict_builtin_iterator_return: false,
             strict_function_types: false,
             strict_property_initialization: false,
+            use_unknown_in_catch_variables: false,
             no_implicit_any: false,
             no_unchecked_indexed_access: false,
             no_unused_locals: false,
@@ -3515,6 +3518,7 @@ mod tests {
         assert!(!defaults.strict_builtin_iterator_return);
         assert!(!defaults.strict_function_types);
         assert!(!defaults.strict_property_initialization);
+        assert!(!defaults.use_unknown_in_catch_variables);
         assert!(!defaults.no_implicit_any);
         assert!(!defaults.no_unchecked_indexed_access);
         assert!(!defaults.no_unused_locals);
@@ -3538,6 +3542,7 @@ mod tests {
         assert!(!options.strict_builtin_iterator_return);
         assert!(!options.strict_function_types);
         assert!(!options.strict_property_initialization);
+        assert!(!options.use_unknown_in_catch_variables);
         assert!(!options.no_implicit_any);
         assert!(!options.no_unchecked_indexed_access);
         assert!(!options.no_unused_locals);

@@ -52945,7 +52945,9 @@ pub(super) fn check_source_file(
                         VariableInvariant::InvalidValueLinks(catch.symbol),
                     ));
                 }
-                issue_node_diagnostic(diagnostics, catch.name, 2700)?;
+                if options.use_unknown_in_catch_variables {
+                    issue_node_diagnostic(diagnostics, catch.name, 2700)?;
+                }
             }
             PlannedStatement::ControlIf(control) => {
                 let checked = check_expression_type(
@@ -58506,7 +58508,13 @@ mod tests {
             "}\n",
         ));
         let file = FileId::new(8_380);
-        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                use_unknown_in_catch_variables: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
         let binding = source
             .arena
             .iter()

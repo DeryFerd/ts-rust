@@ -4742,6 +4742,12 @@ impl Program {
             strict_builtin_iterator_return: self.options.strict_builtin_iterator_return,
             strict_function_types: self.options.strict_function_types,
             strict_property_initialization: self.options.strict_property_initialization,
+            use_unknown_in_catch_variables: if self.options.use_unknown_in_catch_variables_specified
+            {
+                self.options.use_unknown_in_catch_variables
+            } else {
+                self.options.strict
+            },
             no_implicit_any: self.options.no_implicit_any,
             no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
             no_unused_locals: self.options.no_unused_locals,
