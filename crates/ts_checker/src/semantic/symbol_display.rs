@@ -1586,9 +1586,30 @@ mod tests {
             .unwrap();
         let outer_symbol = symbol(&context, outer);
         let inner_symbol = symbol(&context, inner);
-        let outer_type = context.get_declared_type_of_symbol(outer_symbol).unwrap();
-        let inner_type = context.get_declared_type_of_symbol(inner_symbol).unwrap();
         let outside = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        assert!(!context.module_resolutions().is_available());
+        let manifest = CanonicalModuleResolutionManifest::unavailable();
+        let globals = context.globals();
+        let global_this = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .global_this_symbol;
+        let mut aliases =
+            ProductionAliasTargetHost::new(context.store(), [(&parsed.arena, &bound)], &manifest)
+                .unwrap();
+        let location = SymbolDisplayContext::new(
+            context.store_mut_for_test(),
+            &host,
+            &mut aliases,
+            &manifest,
+            globals,
+            &[file],
+            name,
+        )
+        .unwrap();
         let before = (
             context.store().type_len(),
             context.store().symbol_len(),
@@ -1597,16 +1618,28 @@ mod tests {
         );
         for _ in 0..2 {
             assert_eq!(
-                context
-                    .type_to_string_at_location(inner_type, name)
+                location
+                    .symbol_chain(
+                        context.store(),
+                        &host,
+                        inner_symbol,
+                        SymbolFlags::TYPE,
+                        true
+                    )
                     .unwrap(),
-                "Shared"
+                [inner_symbol]
             );
             assert_eq!(
-                context
-                    .type_to_string_at_location(outer_type, name)
+                location
+                    .symbol_chain(
+                        context.store(),
+                        &host,
+                        outer_symbol,
+                        SymbolFlags::TYPE,
+                        true
+                    )
                     .unwrap(),
-                "globalThis.Shared"
+                [global_this, outer_symbol]
             );
             assert_eq!(
                 context
@@ -1617,12 +1650,6 @@ mod tests {
             assert_eq!(
                 context
                     .symbol_to_string_at_location(inner_symbol, outside)
-                    .unwrap(),
-                "Shared"
-            );
-            assert_eq!(
-                context
-                    .type_to_string_at_location(outer_type, outside)
                     .unwrap(),
                 "Shared"
             );

@@ -611,6 +611,8 @@ impl CanonicalCheckerContext<'_> {
         let escaped_identifier = self.escaped_identifier_artifact_name(symbol)?;
         let name = if record.name() == InternalSymbolName::Global.as_ref() {
             "global".to_owned()
+        } else if let Some(private) = self.private_artifact_symbol_name(symbol)? {
+            private
         } else {
             escaped_identifier
                 .clone()
@@ -745,6 +747,9 @@ impl CanonicalCheckerContext<'_> {
             .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
         if record.name() == InternalSymbolName::Global.as_ref() {
             return Ok(("global".to_owned(), false));
+        }
+        if let Some(name) = self.private_artifact_symbol_name(symbol)? {
+            return Ok((name, false));
         }
         if let Some(name) = self
             .written_default_symbol_name(symbol, enclosing, !qualified)
@@ -1967,6 +1972,134 @@ impl CanonicalCheckerContext<'_> {
             .and_then(|members| self.store().symbol_table(members))
             .and_then(|members| members.get(name))
             .ok_or_else(invalid)
+    }
+
+    #[allow(clippy::too_many_lines)] // Validate the private encoding against its source class and declarations.
+    fn private_artifact_symbol_name(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<String>, CanonicalArtifactQueryError> {
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        if !record.name().is_private_identifier() {
+            return Ok(None);
+        }
+        let declarations = record
+            .declarations()
+            .filter(|nodes| !nodes.is_empty())
+            .ok_or(CanonicalArtifactQueryError::ForeignSymbol(symbol))?;
+        let declaration = record
+            .value_declaration()
+            .filter(|declaration| declarations.contains(declaration))
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol {
+                node: declarations[0],
+                symbol,
+            })?;
+        let invalid = || CanonicalArtifactQueryError::InvalidSymbol {
+            node: declaration,
+            symbol,
+        };
+        let (_, _, member) = self.validated_artifact_node(declaration)?;
+        let class = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            member.parent.ok_or_else(invalid)?,
+        );
+        let (_, bound, class_record) = self.validated_artifact_node(class)?;
+        if !matches!(
+            class_record.data,
+            NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_)
+        ) {
+            return Err(invalid());
+        }
+        let owner = bound
+            .symbol(class)
+            .and_then(|owner| self.store().get_merged_symbol(owner))
+            .ok_or_else(invalid)?;
+        let name =
+            super::classes::authenticated_private_class_symbol_name(self.store(), owner, symbol)
+                .ok_or_else(invalid)?;
+        let owner_record = self.store().symbol(owner).ok_or_else(invalid)?;
+        if self.store().get_merged_symbol(symbol) != Some(symbol)
+            || self.store().get_parent_of_symbol(symbol) != Some(owner)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || record.check_flags().bits() & !ts_binder::CheckFlags::READONLY.bits() != 0
+            || ![owner_record.members(), owner_record.exports()]
+                .into_iter()
+                .flatten()
+                .any(|table| {
+                    self.store()
+                        .symbol_table(table)
+                        .and_then(|table| table.get(record.name()))
+                        == Some(symbol)
+                })
+        {
+            return Err(invalid());
+        }
+        let mut expected_flags = SymbolFlags::NONE;
+        for &declaration in declarations {
+            let (arena, bound, member) = self.validated_artifact_node(declaration)?;
+            let (name_id, flags, optional) = match &member.data {
+                NodeData::PropertyDeclaration(property) => (
+                    property.name,
+                    if ts_binder::canonical_has_syntactic_modifier(
+                        arena,
+                        declaration.node,
+                        SyntaxKind::AccessorKeyword,
+                    ) {
+                        SymbolFlags::ACCESSOR
+                    } else {
+                        SymbolFlags::PROPERTY
+                    },
+                    property.postfix_token,
+                ),
+                NodeData::MethodDeclaration(method) => {
+                    (method.name, SymbolFlags::METHOD, method.postfix_token)
+                }
+                NodeData::GetAccessorDeclaration(accessor) => (
+                    accessor.name,
+                    SymbolFlags::GET_ACCESSOR,
+                    accessor.postfix_token,
+                ),
+                NodeData::SetAccessorDeclaration(accessor) => (
+                    accessor.name,
+                    SymbolFlags::SET_ACCESSOR,
+                    accessor.postfix_token,
+                ),
+                _ => return Err(invalid()),
+            };
+            expected_flags |= flags;
+            if optional
+                .and_then(|token| arena.get(token))
+                .is_some_and(|token| token.kind == SyntaxKind::QuestionToken)
+            {
+                expected_flags |= SymbolFlags::OPTIONAL;
+            }
+            let name_node = NodeRef::new(declaration.arena, declaration.file, name_id);
+            let (_, _, name_record) = self.validated_artifact_node(name_node)?;
+            if member.parent != Some(class.node)
+                || !declaration.is_for(class.arena, class.file)
+                || bound
+                    .symbol(declaration)
+                    .and_then(|owner| self.store().get_merged_symbol(owner))
+                    != Some(symbol)
+                || !self
+                    .store()
+                    .source_declaration_belongs_to_symbol(declaration, symbol)
+                || name_record.parent != Some(declaration.node)
+                || !matches!(&name_record.data, NodeData::PrivateIdentifier(identifier) if identifier.text == name)
+            {
+                return Err(invalid());
+            }
+        }
+        if record.flags() != expected_flags {
+            return Err(invalid());
+        }
+        Ok(Some(name.to_owned()))
     }
 
     fn literal_artifact_symbol_name(
@@ -5231,6 +5364,137 @@ mod tests {
         }
 
         assert_eq!(names, ["Shape.item", "Model.value", "value"]);
+    }
+
+    #[test]
+    fn private_member_artifacts_use_source_spelling_without_changing_identity() {
+        let parsed = parse_source_file("class First { #value = 1; } class Second { #value = 2; }");
+        let file = FileId::new(6_116);
+        let mut context = context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let members = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, id),
+                    NodeRef::new(parsed.arena.id(), file, property.name),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 2);
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for ((declaration, name), expected) in
+            members.into_iter().zip(["First.#value", "Second.#value"])
+        {
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let encoded = context.store().symbol(symbol).unwrap().name().to_owned();
+            assert!(encoded.as_ref().is_private_identifier());
+            for _ in 0..2 {
+                assert_eq!(context.symbol_to_string(symbol).unwrap(), expected);
+                assert_eq!(
+                    context.symbol_to_string_at_location(symbol, name).unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(
+                context.store().symbol(symbol).unwrap().name(),
+                encoded.as_ref()
+            );
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn private_member_artifacts_reject_changed_class_and_declaration_ownership() {
+        for poison in 0..4 {
+            let parsed =
+                parse_source_file("class First { #value = 1; } class Second { #value = 2; }");
+            let file = FileId::new(6_117);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let members = parsed
+                .arena
+                .iter()
+                .filter_map(|(id, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, property.name),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let symbol = context.file(file).unwrap().1.symbol(members[0].0).unwrap();
+            let other = context.file(file).unwrap().1.symbol(members[1].0).unwrap();
+            match poison {
+                0 => {
+                    let owner = context.store().get_parent_of_symbol(other).unwrap();
+                    assert!(context.store_mut_for_test().set_symbol_relationships(
+                        symbol,
+                        None,
+                        None,
+                        Some(owner),
+                        None
+                    ));
+                }
+                1 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    symbol,
+                    Some(vec![members[1].0]),
+                    Some(members[1].0)
+                )),
+                2 => assert!(context.store_mut_for_test().set_symbol_flags(
+                    symbol,
+                    SymbolFlags::METHOD,
+                    CheckFlags::NONE
+                )),
+                3 => assert!(context.store_mut_for_test().set_symbol_declarations(
+                    symbol,
+                    Some(Vec::new()),
+                    None
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(context.symbol_to_string(symbol).is_err(), "poison {poison}");
+            assert!(
+                context
+                    .symbol_to_string_at_location(symbol, members[0].1)
+                    .is_err(),
+                "poison {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
     }
 
     #[test]
