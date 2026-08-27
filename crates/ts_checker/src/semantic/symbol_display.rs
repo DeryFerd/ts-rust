@@ -1140,17 +1140,25 @@ pub(super) fn is_external_module(
         ))
 }
 
+/// Returns the proved source symbol for declaration and parent matching.
 fn validate_symbol(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
-) -> Result<(), SymbolDisplayError> {
+) -> Result<SemanticSymbolId, SymbolDisplayError> {
     let record = store
         .symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
     let canonical = store
         .get_merged_symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+    let source = object_literal_property_source(store, host, symbol)?;
+    if canonical != symbol {
+        object_literal_property_source(store, host, canonical)?;
+    }
+    if let Some(source) = source {
+        return Ok(source);
+    }
     if record
         .declarations()
         .unwrap_or_default()
@@ -1158,9 +1166,8 @@ fn validate_symbol(
         .all(|declaration| {
             host.node(*declaration).is_some() && host.symbol_matches(store, *declaration, canonical)
         })
-        || object_literal_property_source(store, host, symbol).is_some()
     {
-        Ok(())
+        Ok(symbol)
     } else {
         Err(SymbolDisplayError::InvalidSymbol(symbol))
     }
@@ -1171,40 +1178,56 @@ fn object_literal_property_source(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
-) -> Option<SemanticSymbolId> {
-    let record = store.symbol(symbol)?;
-    let [declaration] = record.declarations()? else {
-        return None;
-    };
-    let declaration_record = host.node(*declaration)?;
-    let owner = NodeRef::new(
-        declaration.arena,
-        declaration.file,
-        declaration_record.parent?,
-    );
-    if store.source_node_kind(owner) != Some(SyntaxKind::ObjectLiteralExpression)
-        || !record
-            .flags()
-            .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+) -> Result<Option<SemanticSymbolId>, SymbolDisplayError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
+    if !record
+        .flags()
+        .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
     {
-        return None;
+        return Ok(None);
     }
-    let plan = super::object_members::plan_object_literal(store, host, owner).ok()?;
-    let state = super::object_members::object_literal_state(store, &plan).ok()??;
-    if !state.is_resolved() {
-        return None;
-    }
-    let members = store.type_payload(state.type_id())?.data().structured()?;
-    if !members.properties.as_ref()?.contains(&symbol)
-        || store.symbol_table(members.members?)?.get(record.name()) != Some(symbol)
-    {
-        return None;
-    }
-    let target = store.value_symbol_links(symbol)?.target?;
-    plan.properties
+    let Some(owner) = record
+        .declarations()
+        .unwrap_or_default()
         .iter()
-        .any(|property| property.symbol == target && property.declaration == *declaration)
-        .then_some(target)
+        .find_map(|declaration| {
+            let owner = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                host.node(*declaration)?.parent?,
+            );
+            (store.source_node_kind(owner) == Some(SyntaxKind::ObjectLiteralExpression))
+                .then_some(owner)
+        })
+    else {
+        return Ok(None);
+    };
+    let source = (|| {
+        let [declaration] = record.declarations()? else {
+            return None;
+        };
+        let plan = super::object_members::plan_object_literal(store, host, owner).ok()?;
+        let state = super::object_members::object_literal_state(store, &plan).ok()??;
+        if !state.is_resolved() {
+            return None;
+        }
+        let members = store.type_payload(state.type_id())?.data().structured()?;
+        if !members.properties.as_ref()?.contains(&symbol)
+            || store.symbol_table(members.members?)?.get(record.name()) != Some(symbol)
+        {
+            return None;
+        }
+        let target = store.value_symbol_links(symbol)?.target?;
+        plan.properties
+            .iter()
+            .any(|property| property.symbol == target && property.declaration == *declaration)
+            .then_some(target)
+    })();
+    source
+        .map(Some)
+        .ok_or(SymbolDisplayError::InvalidSymbol(symbol))
 }
 
 fn validated_parent(
@@ -1212,6 +1235,7 @@ fn validated_parent(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Result<Option<SemanticSymbolId>, SymbolDisplayError> {
+    let source = validate_symbol(store, host, symbol)?;
     let record = store
         .symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
@@ -1222,7 +1246,6 @@ fn validated_parent(
     let owner = store
         .symbol(parent)
         .ok_or(SymbolDisplayError::InvalidSymbol(parent))?;
-    let source = object_literal_property_source(store, host, symbol).unwrap_or(symbol);
     let member = [owner.members(), owner.exports()]
         .into_iter()
         .flatten()
@@ -1478,110 +1501,215 @@ mod tests {
     fn export_assignment_artifact_property_clones_retain_display_ownership() {
         let parsed = parse_source_file("export = { first: 1, second: 2 };");
         let file = FileId::new(41_020);
-        let mut binder = CanonicalBinder::new();
-        binder
-            .bind_source_file_with_facts(
-                &parsed.arena,
-                parsed.source_file,
-                file,
-                CanonicalSourceFileFacts::new(
-                    EscapedName::source("\"/export.ts\""),
-                    CanonicalSourceLanguage::TypeScript,
-                    false,
-                    CanonicalModuleState::External,
-                ),
+        for redirect_to_clone in [false, true] {
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/export.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions::default(),
             )
             .unwrap();
-        binder
-            .bind_typescript_declaration_slice(&parsed.arena, file)
-            .unwrap();
-        let mut context = CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
-            CanonicalCheckerOptions::default(),
-        )
-        .unwrap();
-        context.check_source_file(file).unwrap();
-        let object = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        let type_ = context.get_type_at_location(object).unwrap();
-        let members = context
-            .store()
-            .type_payload(type_)
-            .unwrap()
-            .data()
-            .structured()
-            .unwrap()
-            .members
-            .unwrap();
-        let [first, second] = ["first", "second"].map(|name| {
-            context
+            context.check_source_file(file).unwrap();
+            let object =
+                parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::ObjectLiteralExpression)
+                            .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                    })
+                    .unwrap();
+            let type_ = context.get_type_at_location(object).unwrap();
+            let members = context
                 .store()
-                .symbol_table(members)
+                .type_payload(type_)
                 .unwrap()
-                .get_source(name)
+                .data()
+                .structured()
                 .unwrap()
-        });
-        let original = context.store().value_symbol_links(first).unwrap().clone();
-        let source = original.target.unwrap();
-        assert_ne!(source, first);
-        assert_eq!(
-            context.get_symbol_declarations(first).unwrap(),
-            context.get_symbol_declarations(source).unwrap(),
-        );
-        for _ in 0..2 {
+                .members
+                .unwrap();
+            let [first, second] = ["first", "second"].map(|name| {
+                context
+                    .store()
+                    .symbol_table(members)
+                    .unwrap()
+                    .get_source(name)
+                    .unwrap()
+            });
+            let original = context.store().value_symbol_links(first).unwrap().clone();
+            let source = original.target.unwrap();
+            assert_ne!(source, first);
+            assert_eq!(
+                context.get_symbol_declarations(first).unwrap(),
+                context.get_symbol_declarations(source).unwrap(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    context.symbol_to_string_at_location(first, object).unwrap(),
+                    "first",
+                );
+            }
+            let other_source = context.store().value_symbol_links(second).unwrap().target;
+            let mut changed = original.clone();
+            changed.target = other_source;
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(first, changed)
+            );
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.symbol_to_string_at_location(first, object),
+                    Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                        SymbolDisplayError::InvalidSymbol(symbol)
+                    )) if symbol == first
+                ));
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(first, original)
+            );
             assert_eq!(
                 context.symbol_to_string_at_location(first, object).unwrap(),
                 "first",
             );
+            let mut changed = context.store().value_symbol_links(first).unwrap().clone();
+            changed.target = other_source;
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(first, changed)
+            );
+            let (target, redirected) = if redirect_to_clone {
+                (first, source)
+            } else {
+                (source, first)
+            };
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .record_merged_symbol(target, redirected),
+                Ok(None),
+            );
+            for queried in [first, source] {
+                for _ in 0..2 {
+                    let result = context.symbol_to_string_at_location(queried, object);
+                    if queried == source && !redirect_to_clone {
+                        assert_eq!(result.unwrap(), "first");
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                                SymbolDisplayError::InvalidSymbol(symbol)
+                            )) if symbol == first
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
         }
-        let other_source = context.store().value_symbol_links(second).unwrap().target;
-        let mut changed = original.clone();
-        changed.target = other_source;
+    }
+
+    #[test]
+    fn location_display_accepts_merged_source_properties() {
+        let first = parse_source_file("interface Shape { value: number; }");
+        let second = parse_source_file("interface Shape { value: number; }");
+        let files = [
+            (FileId::new(41_021), &first, "/first.d.ts"),
+            (FileId::new(41_022), &second, "/second.d.ts"),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path) in files {
+            bind(
+                &mut binder,
+                parsed,
+                file,
+                path,
+                CanonicalModuleState::Script,
+            );
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed, _)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let properties =
+            files.map(|(file, parsed, _)| {
+                let property =
+                    parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::PropertyDeclaration)
+                                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                        })
+                        .unwrap();
+                context.file(file).unwrap().1.symbol(property).unwrap()
+            });
+        let merged = context.store().get_merged_symbol(properties[0]).unwrap();
+        assert_eq!(
+            context.store().get_merged_symbol(properties[1]),
+            Some(merged)
+        );
         assert!(
             context
-                .store_mut_for_test()
-                .set_value_symbol_links(first, changed)
+                .store()
+                .symbol(merged)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,)
         );
-        let before = (
-            context.store().type_len(),
-            context.store().symbol_len(),
-            context.store().checker_link_allocated_lengths(),
-        );
-        for _ in 0..2 {
-            assert!(matches!(
-                context.symbol_to_string_at_location(first, object),
-                Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
-                    SymbolDisplayError::InvalidSymbol(symbol)
-                )) if symbol == first
-            ));
+        let enclosing = NodeRef::new(first.arena.id(), files[0].0, first.source_file);
+        for property in [properties[0], properties[1], merged] {
+            assert_eq!(
+                context
+                    .symbol_to_string_at_location(property, enclosing)
+                    .unwrap(),
+                "Shape.value",
+            );
         }
-        assert_eq!(
-            (
-                context.store().type_len(),
-                context.store().symbol_len(),
-                context.store().checker_link_allocated_lengths(),
-            ),
-            before,
-        );
-        assert!(
-            context
-                .store_mut_for_test()
-                .set_value_symbol_links(first, original)
-        );
-        assert_eq!(
-            context.symbol_to_string_at_location(first, object).unwrap(),
-            "first",
-        );
     }
 
     #[test]
