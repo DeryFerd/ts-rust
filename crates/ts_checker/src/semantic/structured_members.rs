@@ -155,7 +155,12 @@ pub(super) fn resolve_direct_interface_members(
     base_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
     resolve_direct_interface_members_with_array_targets(
-        store, plan, type_, property_types, base_types, None,
+        store,
+        plan,
+        type_,
+        property_types,
+        base_types,
+        None,
     )
 }
 
@@ -378,7 +383,10 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
         };
         if interface.resolved_base_types.as_deref() != Some(base_types)
             || !validate_planned_interface_heritage_members_with_array_targets(
-                store, plan, type_, array_targets,
+                store,
+                plan,
+                type_,
+                array_targets,
             )
             || interface.reference.object.structured.properties.as_deref()
                 != (!expected_properties.is_empty()).then_some(expected_properties.as_slice())
@@ -669,7 +677,7 @@ pub(super) fn validate_planned_interface_heritage_members(
     validate_planned_interface_heritage_members_with_array_targets(store, plan, type_, None)
 }
 
-fn validate_planned_interface_heritage_members_with_array_targets(
+pub(super) fn validate_planned_interface_heritage_members_with_array_targets(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
     type_: TypeId,
@@ -717,8 +725,7 @@ fn validate_planned_interface_heritage_members_with_array_targets(
     {
         return false;
     }
-    let Some(surface) =
-        validate_direct_heritage_property_interface(store, type_, array_targets)
+    let Some(surface) = validate_direct_heritage_property_interface(store, type_, array_targets)
     else {
         return false;
     };
@@ -906,7 +913,11 @@ fn validate_property_interface(
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Option<ValidatedInterfaceSurface> {
     validate_property_interface_worker(
-        store, type_, requires_direct_base, array_targets, &mut HashSet::new(),
+        store,
+        type_,
+        requires_direct_base,
+        array_targets,
+        &mut HashSet::new(),
     )
 }
 
@@ -1072,7 +1083,11 @@ fn validate_property_interface_worker(
             .direct_interface_heritage_provenance(base_type)
             .is_some();
         let base = validate_property_interface_worker(
-            store, base_type, inherited_base, array_targets, active,
+            store,
+            base_type,
+            inherited_base,
+            array_targets,
+            active,
         )?;
         let expected_owner = if index == 0 {
             heritage_provenance.base_symbol

@@ -26,7 +26,7 @@
 //! union read adapter.
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
+use ts_binder::{CheckFlags, EscapedNameRef, SemanticSymbolId, SymbolFlags};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -38,6 +38,7 @@ use super::{
     classes::{self, ClassConstructorVisibility, ClassHeritageMembersValidation},
     enums,
     formatter::type_to_string_with_host_global_types_and_flags,
+    instantiate::InstantiationSession,
     member_resolution::UnionPropertyError,
     relater::ResolvedOwnProperty,
     source::{PlannedExpression, PlannedExpressionKind},
@@ -504,11 +505,29 @@ pub(super) fn finish_direct_source_property_plan(
 
 /// Resolves an already-typed receiver and atomically publishes the access's
 /// exact symbol/type cache pair. Canonical `any` publishes only its type cache.
+#[cfg(test)]
 pub(super) fn check_direct_source_property(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
+) -> Result<CheckedSourceProperty, SourcePropertyError> {
+    let mut session = InstantiationSession::new(super::instantiate::InstantiationLimits::default());
+    check_direct_source_property_with_session(
+        store,
+        global_types,
+        plan,
+        receiver_type,
+        &mut session,
+    )
+}
+
+pub(super) fn check_direct_source_property_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
     let (any, error_type, undefined) = {
         let bootstrap = store
@@ -690,6 +709,18 @@ pub(super) fn check_direct_source_property(
                         )? {
                             Some(CanonicalArrayProperty::Present(property)) => Some(property),
                             Some(CanonicalArrayProperty::Missing) => None,
+                            None if store
+                                .direct_interface_heritage_provenance(receiver_type)
+                                .is_some() =>
+                            {
+                                super::object_members::resolve_object_property_by_key(
+                                    store,
+                                    global_types,
+                                    receiver_type,
+                                    EscapedNameRef::source(&plan.name),
+                                    session,
+                                )?
+                            }
                             None => store.resolved_own_property(receiver_type, &plan.name)?,
                         },
                     },

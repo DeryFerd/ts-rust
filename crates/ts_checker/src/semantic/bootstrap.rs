@@ -2541,7 +2541,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     && self.direct_interface_heritage_provenance(type_).is_some()
                 {
                     match validate_interface_heritage_members_with_array_targets(
-                        self, type_, array_validation.targets(),
+                        self,
+                        type_,
+                        array_validation.targets(),
                     ) {
                         InterfaceHeritageMembersValidation::Valid => {
                             for property in interface
@@ -3501,9 +3503,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 if self.direct_interface_heritage_provenance(type_).is_some() {
                     if validate_interface_heritage_members_with_array_targets(
-                        self, type_, array_validation.targets(),
-                    )
-                        != InterfaceHeritageMembersValidation::Valid
+                        self,
+                        type_,
+                        array_validation.targets(),
+                    ) != InterfaceHeritageMembersValidation::Valid
                     {
                         return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
                     }
@@ -6033,7 +6036,11 @@ mod tests {
             "interface Array<T> {} interface ReadonlyArray<T> {} ",
             "interface Base<T> { value: T; [index: number]: Array<number>; }",
         ));
-        assert!(declarations.diagnostics.is_empty(), "{:?}", declarations.diagnostics);
+        assert!(
+            declarations.diagnostics.is_empty(),
+            "{:?}",
+            declarations.diagnostics
+        );
         for (body, reads_inherited) in [("return 1;", false), ("return value.value;", true)] {
             let parsed = parse_source_file(&format!(
                 "interface Derived extends Base<number> {{}} \
@@ -6043,32 +6050,38 @@ mod tests {
             let file = FileId::new(198);
             let library_file = FileId::new(199);
             let mut binder = CanonicalBinder::new();
-            for (file, source, is_declaration) in [
-                (library_file, &declarations, true),
-                (file, &parsed, false),
-            ] {
-                binder.bind_source_file_with_facts(
-                    &source.arena,
-                    source.source_file,
-                    file,
-                    CanonicalSourceFileFacts::new(
-                        EscapedName::source(if is_declaration {
-                            "\"/project/cold-index-base.d.ts\""
-                        } else {
-                            "\"/project/cold-index-callable.ts\""
-                        }),
-                        CanonicalSourceLanguage::TypeScript,
-                        is_declaration,
-                        CanonicalModuleState::Script,
-                    ),
-                ).unwrap();
-                binder.bind_typescript_declaration_slice(&source.arena, file).unwrap();
+            for (file, source, is_declaration) in
+                [(library_file, &declarations, true), (file, &parsed, false)]
+            {
+                binder
+                    .bind_source_file_with_facts(
+                        &source.arena,
+                        source.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(if is_declaration {
+                                "\"/project/cold-index-base.d.ts\""
+                            } else {
+                                "\"/project/cold-index-callable.ts\""
+                            }),
+                            CanonicalSourceLanguage::TypeScript,
+                            is_declaration,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&source.arena, file)
+                    .unwrap();
             }
             let mut context = CanonicalCheckerContext::new(
                 binder.finish(),
-                [(library_file, &declarations.arena), (file, &parsed.arena)].into_iter().collect(),
+                [(library_file, &declarations.arena), (file, &parsed.arena)]
+                    .into_iter()
+                    .collect(),
                 CanonicalCheckerOptions::default(),
-            ).unwrap();
+            )
+            .unwrap();
             let targets = CanonicalArrayTargets::from_global_types(context.global_types());
             let assert_cold_arrays = |store: &TestStore| {
                 for target in [targets.array_type(), targets.readonly_array_type()] {
@@ -6079,18 +6092,30 @@ mod tests {
                 }
             };
             assert_cold_arrays(context.store());
-            context.check_source_file(file).unwrap_or_else(|error| panic!("{body}: {error:?}"));
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{body}: {error:?}"));
             assert!(context.diagnostics().is_empty());
             assert_cold_arrays(context.store());
             let store = context.store();
             let (derived, _, value) = inherited_graph_property(store);
             let number = store.intrinsic_bootstrap().unwrap().number_type;
-            let index = store.type_payload(derived).unwrap().data().structured().unwrap()
-                .index_infos.as_ref().unwrap()[0];
+            let index = store
+                .type_payload(derived)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .as_ref()
+                .unwrap()[0];
             let array = store.index_info(index).unwrap().value_type();
             assert_eq!(
-                store.canonical_array_reference_with_targets(targets, array)
-                    .unwrap().unwrap().element_type,
+                store
+                    .canonical_array_reference_with_targets(targets, array)
+                    .unwrap()
+                    .unwrap()
+                    .element_type,
                 number,
             );
             assert_eq!(
@@ -6099,10 +6124,14 @@ mod tests {
             );
             let snapshot = |store: &TestStore| {
                 (
-                    store.type_len(), store.symbol_len(), store.mapper_len(),
-                    store.signature_len(), store.index_info_len(),
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
                     store.symbol_store().symbol_table_len(),
-                    store.checker_link_allocated_lengths(), store.relation_state_snapshot(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
                 )
             };
             let warm = snapshot(store);
@@ -6113,7 +6142,9 @@ mod tests {
             assert_eq!(snapshot(store), warm);
             assert_cold_arrays(store);
             for _ in 0..2 {
-                context.recheck_source_file(file).unwrap_or_else(|error| panic!("warm {body}: {error:?}"));
+                context
+                    .recheck_source_file(file)
+                    .unwrap_or_else(|error| panic!("warm {body}: {error:?}"));
                 let store = context.store();
                 assert_eq!(snapshot(store), warm);
                 assert_cold_arrays(store);

@@ -244,7 +244,7 @@ use super::{
     },
     source_properties::{
         SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
-        SourcePropertyUnsupported, check_direct_source_property,
+        SourcePropertyUnsupported, check_direct_source_property_with_session,
         finish_direct_source_property_plan, plan_direct_source_property_call_syntax,
         plan_direct_source_property_syntax, prepare_source_property_diagnostic,
     },
@@ -24062,15 +24062,17 @@ fn expression_type(
     prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
     let mut property_diagnostics = prepare_source_property_diagnostic_sink(expression)?;
+    let mut session = InstantiationSession::new(super::instantiate::InstantiationLimits::default());
     Ok(execute_expression_types(
         store,
         None,
+        &mut session,
         &HashMap::new(),
         &HashMap::new(),
         expression,
         prepared,
         &mut property_diagnostics,
-        &mut |_, nested, _| {
+        &mut |_, _, nested, _| {
             Err(SourceCheckError::Unsupported(
                 if matches!(&nested.kind, PlannedExpressionKind::Arrow(_)) {
                     UnsupportedSourceSyntax::Arrow(nested.node)
@@ -24183,10 +24185,11 @@ fn prepare_const_object_property(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Tuple contexts must follow the existing expression inputs.
+#[allow(clippy::too_many_arguments)] // Prepared expressions keep their tuple context and caller session.
 fn execute_expression_types<F>(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     tuple_contexts: &HashMap<NodeRef, TypeId>,
     expression: &PlannedExpression,
@@ -24197,6 +24200,7 @@ fn execute_expression_types<F>(
 where
     F: FnMut(
         &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
         &PlannedExpression,
         Option<TypeId>,
     ) -> Result<CheckedExpressionTypes, SourceCheckError>,
@@ -24274,7 +24278,7 @@ where
         (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(_))
             if read.kind == PlannedIdentifierReadKind::Unresolved =>
         {
-            check_nested_expression(store, expression, None)
+            check_nested_expression(store, session, expression, None)
         }
         (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(treatment)) => {
             let raw = *current_flow_types
@@ -24358,6 +24362,7 @@ where
             let checked = execute_expression_types(
                 store,
                 global_types,
+                session,
                 current_flow_types,
                 tuple_contexts,
                 inner,
@@ -24372,7 +24377,7 @@ where
             }
         }
         (PlannedExpressionKind::Template(_), PreparedExpression::Template(contextual_type)) => {
-            check_nested_expression(store, expression, *contextual_type)
+            check_nested_expression(store, session, expression, *contextual_type)
         }
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
@@ -24390,6 +24395,7 @@ where
                 let checked = execute_expression_types(
                     store,
                     Some(global_types),
+                    session,
                     current_flow_types,
                     tuple_contexts,
                     element,
@@ -24503,7 +24509,7 @@ where
                 .map_err(source_object_execution_error)?;
             // Check every computed key before values or spreads, without a value context.
             for key in &expression.object_computed_keys {
-                let checked_key = check_nested_expression(store, key, None)?;
+                let checked_key = check_nested_expression(store, session, key, None)?;
                 preflight_source_expression_cache(store, key.node, checked_key.raw)?;
             }
             let mut checked_properties = Vec::with_capacity(properties.len());
@@ -24527,7 +24533,8 @@ where
                             type_: None,
                         }),
                     )?;
-                    spread_types.push(check_nested_expression(store, spread, None)?.result);
+                    spread_types
+                        .push(check_nested_expression(store, session, spread, None)?.result);
                     spread_index += 1;
                 }
                 let const_preparation = property_plan
@@ -24537,6 +24544,7 @@ where
                 let mut checked = execute_expression_types(
                     store,
                     global_types,
+                    session,
                     current_flow_types,
                     tuple_contexts,
                     property,
@@ -24569,7 +24577,8 @@ where
                         type_: None,
                     }),
                 )?;
-                spread_types.push(check_nested_expression(store, expression, None)?.result);
+                spread_types
+                    .push(check_nested_expression(store, session, expression, None)?.result);
                 spread_index += 1;
             }
             if spread_index != expression.object_spreads.len() {
@@ -24617,6 +24626,7 @@ where
             let receiver = execute_expression_types(
                 store,
                 global_types,
+                session,
                 current_flow_types,
                 tuple_contexts,
                 &property.receiver,
@@ -24624,9 +24634,14 @@ where
                 property_diagnostics,
                 check_nested_expression,
             )?;
-            let checked =
-                check_direct_source_property(store, global_types, property, receiver.result)
-                    .map_err(SourcePlanner::property_plan_error)?;
+            let checked = check_direct_source_property_with_session(
+                store,
+                global_types,
+                property,
+                receiver.result,
+                session,
+            )
+            .map_err(SourcePlanner::property_plan_error)?;
             if let Some(diagnostic) = checked.diagnostic {
                 if property_diagnostics.len() == property_diagnostics.capacity() {
                     return Err(SourceCheckError::Property(property.node));
@@ -24639,7 +24654,7 @@ where
         | (
             PlannedExpressionKind::Assertion { .. },
             PreparedExpression::Assertion(contextual_type),
-        ) => check_nested_expression(store, expression, *contextual_type),
+        ) => check_nested_expression(store, session, expression, *contextual_type),
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
     }?;
     publish_expression_type(store, expression.node, types.raw)?;
@@ -26392,9 +26407,14 @@ fn check_expression_type(
                     property.node,
                 )?;
             }
-            let checked =
-                check_direct_source_property(store, Some(global_types), property, receiver.result)
-                    .map_err(SourcePlanner::property_plan_error)?;
+            let checked = check_direct_source_property_with_session(
+                store,
+                Some(global_types),
+                property,
+                receiver.result,
+                session,
+            )
+            .map_err(SourcePlanner::property_plan_error)?;
             if let Some(diagnostic) = checked.diagnostic {
                 let diagnostic = prepare_source_property_diagnostic(
                     store,
@@ -27407,6 +27427,7 @@ fn check_expression_type(
                 let execution = {
                     let mut check_nested_expression =
                         |store: &mut CanonicalTypeMapperStore,
+                         session: &mut InstantiationSession,
                          nested: &PlannedExpression,
                          nested_context: Option<TypeId>| {
                             check_expression_type(
@@ -27427,6 +27448,7 @@ fn check_expression_type(
                     execute_expression_types(
                         store,
                         Some(global_types),
+                        session,
                         current_flow_types,
                         &tuple_contexts,
                         expression,
