@@ -48,6 +48,28 @@ class CachePathTests(unittest.TestCase):
         self.assertIn(message, result.stderr)
         self.assertFalse((output or self.output).exists())
 
+    def assert_canonical_output(self, output: Path, config: Path) -> None:
+        manifest = json.loads((output / "build.json").read_text())
+        self.assertEqual(manifest["state"], "prepared")
+        self.assertEqual(manifest["project"]["config_path"], str(config))
+        self.assertIsNone(manifest["go"]["version"])
+        self.assertIsNone(manifest["executable"])
+        for key, directory in [
+            ("GOCACHE", "go-cache"), ("GOMODCACHE", "go-mod-cache"),
+            ("GOTMPDIR", "go-tmp"), ("TMPDIR", "go-tmp"),
+        ]:
+            self.assertIn(f"{key}={output / directory}", manifest["build"]["environment"])
+        arguments = manifest["build"]["arguments"]
+        for flag, name in [
+            ("-modfile", "go.mod"), ("-overlay", "overlay.json"),
+            ("-o", "project-oracle.test"),
+        ]:
+            self.assertEqual(arguments[arguments.index(flag) + 1], str(output / name))
+        for overlay in manifest["instrumentation"]["overlays"]:
+            replacement = Path(overlay["replacement_path"])
+            self.assertEqual(replacement, output / "overlay" / replacement.name)
+            self.assertTrue(replacement.is_file())
+
     def config_link(
         self, *, requested_git: bool = False, physical_git: bool = False,
         missing_target_parent: bool = False,
@@ -126,6 +148,70 @@ class CachePathTests(unittest.TestCase):
             manifest["build"]["environment"],
         )
         self.assertIsNone(manifest["executable"])
+
+    def test_output_traversal_does_not_create_protected_intermediates(self) -> None:
+        link, target, requested_root, physical_root = self.config_link(
+            requested_git=True, physical_git=True,
+        )
+        config_bytes = target.read_bytes()
+        for index, project in enumerate([requested_root, physical_root]):
+            with self.subTest(project=project):
+                intermediate = project / "missing-output-parent"
+                output = intermediate / ".." / ".." / f"oracle-output-{index}"
+                destination = self.directory / f"oracle-output-{index}"
+                result = self.run_helper(None, config=link, output=output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(intermediate.exists())
+                self.assert_canonical_output(destination, link)
+        self.assertEqual(target.read_bytes(), config_bytes)
+
+    def test_safe_output_aliases_use_canonical_writes(self) -> None:
+        link, _, _, _ = self.config_link(requested_git=True, physical_git=True)
+        parent = self.directory / "safe-output-parent"
+        existing = parent / "existing"
+        existing.mkdir(parents=True)
+        alias = self.directory / "output-parent-link"
+        alias.symlink_to(parent, target_is_directory=True)
+        for output, destination in [
+            (parent / "nested" / "output", parent / "nested" / "output"),
+            (existing / ".." / "dotdot-output", parent / "dotdot-output"),
+            (alias / "symlink-output", parent / "symlink-output"),
+        ]:
+            with self.subTest(output=output):
+                result = self.run_helper(None, config=link, output=output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_canonical_output(destination, link)
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(alias.resolve(), parent)
+
+    def test_existing_canonical_output_is_rejected_without_parent_writes(self) -> None:
+        destination = self.directory / "existing-output"
+        destination.mkdir()
+        marker = destination / "keep.txt"
+        marker.write_text("unchanged\n", encoding="utf-8")
+        intermediate = self.directory / "missing-output-parent"
+        output = intermediate / ".." / destination.name
+        self.assert_rejected(None, "Output must not already exist", output=output)
+        self.assertFalse(intermediate.exists())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "unchanged\n")
+        self.assertEqual(list(destination.iterdir()), [marker])
+
+    def test_existing_output_symlinks_are_rejected(self) -> None:
+        for target_exists in [False, True]:
+            with self.subTest(target_exists=target_exists):
+                target = self.directory / f"output-target-{target_exists}"
+                if target_exists:
+                    target.mkdir()
+                link = self.directory / f"output-link-{target_exists}"
+                link.symlink_to(target, target_is_directory=True)
+                result = self.run_helper(None, output=link)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("Output must not already exist", result.stderr)
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.readlink(), target)
+                self.assertEqual(target.exists(), target_exists)
+                if target_exists:
+                    self.assertEqual(list(target.iterdir()), [])
 
     def test_config_symlink_protects_both_config_directories_from_output(self) -> None:
         link, target, _, _ = self.config_link()

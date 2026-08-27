@@ -9,6 +9,12 @@ out=$4
 mode=${5:-run}
 case "$mode" in controls|run) ;; *) exit 2 ;; esac
 for argument in "$go" "$upstream" "$config" "$out"; do [[ "$argument" == /* ]] || exit 2; done
+if [[ -e "$out" || -L "$out" ]]; then
+  printf 'Output must not already exist: %s\n' "$out" >&2
+  exit 2
+fi
+# Preparation and later writers must use the same destination.
+out="$(realpath -m -- "$out")"
 phase_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$phase_dir/../../../.." && pwd)"
 memory_kib=${TS_GO_ORACLE_MEMORY_LIMIT_KIB:-16777216}

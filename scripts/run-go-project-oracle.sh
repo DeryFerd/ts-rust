@@ -24,6 +24,12 @@ if [[ -e "$out" || -L "$out" ]]; then
   exit 2
 fi
 out_real="$(realpath -m -- "$out")"
+if [[ -e "$out_real" || -L "$out_real" ]]; then
+  printf 'Output must not already exist: %s\n' "$out_real" >&2
+  exit 2
+fi
+# Every writer must use the same canonical destination as the path guards.
+out=$out_real
 upstream_real="$(realpath -- "$upstream")"
 config_directory="$(dirname -- "$config")"
 # Keep the requested config for Go. Only the final file may be missing.
