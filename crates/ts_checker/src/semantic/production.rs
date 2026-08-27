@@ -1143,6 +1143,37 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             .map_err(Into::into)
     }
 
+    /// Tests the effective call arity of one resolved value symbol.
+    ///
+    /// Cold declaration-file values use the installed callable providers.
+    /// This query does not check a source body or demand a signature return.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider, provenance, or cache error instead of a
+    /// negative answer when the exact callable set is unavailable.
+    pub fn has_call_signature_with_arity_greater_than(
+        &mut self,
+        symbol: SemanticSymbolId,
+        arity: usize,
+    ) -> Result<bool, super::CanonicalHelperSignatureError> {
+        self.instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        super::helper_signatures::HelperSignatureQuery {
+            store: &mut self.store,
+            host: &host,
+            global_types: &self.global_types,
+            options: self.options,
+            session: &mut self.instantiation_session,
+            diagnostics: &mut self.diagnostics,
+        }
+        .has_arity_greater_than(symbol, arity)
+    }
+
     /// Resolves one declared type through the context-owned query session.
     ///
     /// # Errors

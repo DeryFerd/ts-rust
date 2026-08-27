@@ -771,6 +771,41 @@ pub(super) fn get_parameter_count(
             .map_or(0, RestParameterShape::parameter_count))
 }
 
+/// Reads every effective call arity without selecting a call or resolving a return.
+pub(super) fn call_signature_parameter_counts(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    callee: TypeId,
+) -> Result<Option<Vec<usize>>, DirectCallError> {
+    store
+        .type_payload(callee)
+        .ok_or(DirectCallInvariant::InvalidCalleeType(callee))?;
+    match validate_stored_callable_set(store, callee) {
+        StoredCallableSetValidation::NotCallable => Ok(None),
+        StoredCallableSetValidation::Pending { .. } => {
+            Err(DirectCallUnsupported::PendingCallable(callee).into())
+        }
+        StoredCallableSetValidation::Malformed { .. } => {
+            Err(DirectCallInvariant::MalformedCallable(callee).into())
+        }
+        StoredCallableSetValidation::Valid { projection, .. } => {
+            if projection.owner != callee {
+                return Err(DirectCallInvariant::CallableOwnerMismatch {
+                    callee,
+                    owner: projection.owner,
+                }
+                .into());
+            }
+            projection
+                .call_signatures
+                .iter()
+                .map(|callable| get_parameter_count(store, Some(global_types), callable))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        }
+    }
+}
+
 /// Fixed rest tuples have no effective rest. Tuple unions retain their rest semantics.
 pub(super) fn has_effective_rest_parameter(
     store: &CanonicalTypeMapperStore,

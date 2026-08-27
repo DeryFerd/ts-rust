@@ -31,6 +31,7 @@ pub mod formatter;
 mod functions;
 mod generic_calls;
 mod global_types;
+mod helper_signatures;
 pub mod ids;
 mod indexed_access_types;
 mod inference;
@@ -124,6 +125,7 @@ pub use formatter::{
 pub use global_types::{
     CanonicalGlobalTypeDiagnostic, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
 };
+pub use helper_signatures::CanonicalHelperSignatureError;
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
