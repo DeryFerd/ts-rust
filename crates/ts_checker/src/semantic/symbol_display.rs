@@ -1173,7 +1173,7 @@ fn validate_symbol(
     }
 }
 
-/// Object-literal value members retain the binder property through their target link.
+/// Proves an object-literal clone through its original binder property.
 fn object_literal_property_source(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1182,17 +1182,15 @@ fn object_literal_property_source(
     let record = store
         .symbol(symbol)
         .ok_or(SymbolDisplayError::InvalidSymbol(symbol))?;
-    if !record
-        .flags()
-        .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-    {
-        return Ok(None);
-    }
     let Some(owner) = record
         .declarations()
         .unwrap_or_default()
         .iter()
         .find_map(|declaration| {
+            // Raw binder identity does not change with flags or merge redirects.
+            if host.bound_file(*declaration)?.symbol(*declaration)? == symbol {
+                return None;
+            }
             let owner = NodeRef::new(
                 declaration.arena,
                 declaration.file,
@@ -1622,18 +1620,31 @@ mod tests {
                     .record_merged_symbol(target, redirected),
                 Ok(None),
             );
-            for queried in [first, source] {
-                for _ in 0..2 {
-                    let result = context.symbol_to_string_at_location(queried, object);
-                    if queried == source && !redirect_to_clone {
-                        assert_eq!(result.unwrap(), "first");
-                    } else {
-                        assert!(matches!(
-                            result,
-                            Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
-                                SymbolDisplayError::InvalidSymbol(symbol)
-                            )) if symbol == first
-                        ));
+            for flags in [
+                SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                SymbolFlags::PROPERTY,
+            ] {
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    first,
+                    flags,
+                    ts_binder::CheckFlags::NONE,
+                ));
+                for queried in [first, source] {
+                    for _ in 0..2 {
+                        let result = context.symbol_to_string_at_location(queried, object);
+                        if queried == source && !redirect_to_clone {
+                            assert_eq!(result.unwrap(), "first");
+                        } else {
+                            assert!(
+                                matches!(
+                                    &result,
+                                    Err(crate::semantic::artifact_queries::CanonicalArtifactQueryError::SymbolDisplay(
+                                        SymbolDisplayError::InvalidSymbol(symbol)
+                                    )) if *symbol == first
+                                ),
+                                "unexpected display result: {result:?}"
+                            );
+                        }
                     }
                 }
             }
