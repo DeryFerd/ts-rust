@@ -147,7 +147,14 @@ fn namespace_constructor_merge_preserves_cold_and_warm_type_and_value_identities
                     .symbol(),
                 Some(symbol)
             );
-            assert_eq!(checker.type_to_string(interface_type).unwrap(), "Foo");
+            assert_eq!(
+                checker
+                    .store()
+                    .declared_type_links(symbol)
+                    .unwrap()
+                    .declared_type,
+                Some(interface_type)
+            );
             assert_eq!(
                 checker.type_to_string(constructor_type).unwrap(),
                 "new () => number"
