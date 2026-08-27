@@ -14,7 +14,8 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, store::SourceNodeParent,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
+    classes::ClassMemberPlan, store::SourceNodeParent,
 };
 
 /// The declaration-list kind that determines a variable symbol's exact binder flags.
@@ -1668,6 +1669,45 @@ pub(super) fn plan_declared_value_identifier_read(
     name: &str,
     expected: SemanticSymbolId,
 ) -> Result<PlannedIdentifierRead, VariablePlanError> {
+    plan_declared_value_identifier_read_worker(
+        arena, bound, store, host, node, name, expected, None,
+    )
+}
+
+/// Reads a class whose full declaration set is covered by a sealed class plan.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_class_value_identifier_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+    class: &ClassMemberPlan,
+) -> Result<PlannedIdentifierRead, VariablePlanError> {
+    plan_declared_value_identifier_read_worker(
+        arena,
+        bound,
+        store,
+        host,
+        node,
+        name,
+        class.symbol(),
+        Some(class),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_declared_value_identifier_read_worker(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+    expected: SemanticSymbolId,
+    class: Option<&ClassMemberPlan>,
+) -> Result<PlannedIdentifierRead, VariablePlanError> {
     let mut callback_host = host
         .name_resolver_host(store)
         .map_err(VariablePlanError::DeclaredType)?;
@@ -1706,17 +1746,39 @@ pub(super) fn plan_declared_value_identifier_read(
             },
         ));
     }
-    let Some([declaration]) = record.declarations() else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::NonUniqueDeclaration {
-                node,
-                symbol: routed.target,
-                declaration_count: record.declarations().map_or(0, <[NodeRef]>::len),
-            },
-        ));
+    let declaration = if let Some(class) = class {
+        if !record.flags().contains(SymbolFlags::CLASS)
+            || class.symbol() != routed.target
+            || !store.source_merged_symbol_declarations_match(routed.target)
+            || record
+                .declarations()
+                .is_none_or(|declarations| !declarations.contains(&class.declaration()))
+        {
+            return Err(VariableInvariant::InvalidSymbolShape(routed.target).into());
+        }
+        class.declaration()
+    } else {
+        let Some([declaration]) = record.declarations() else {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::NonUniqueDeclaration {
+                    node,
+                    symbol: routed.target,
+                    declaration_count: record.declarations().map_or(0, <[NodeRef]>::len),
+                },
+            ));
+        };
+        *declaration
     };
-    let declaration = *declaration;
-    if declaration.file != node.file || declaration.arena != node.arena {
+    let declaration_bound = host
+        .bound_file(declaration)
+        .ok_or(VariableInvariant::MissingDeclarationSymbol(declaration))?;
+    let same_file = declaration.is_for(node.arena, node.file);
+    if !same_file
+        && (class.is_none()
+            || declaration_bound.source_facts().is_none_or(|facts| {
+                !facts.is_declaration_file() || facts.is_external_or_common_js_module()
+            }))
+    {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::CrossFileDeclaration { node, declaration },
         ));
@@ -1729,7 +1791,7 @@ pub(super) fn plan_declared_value_identifier_read(
     {
         return Err(VariableInvariant::InvalidSymbolShape(routed.target).into());
     }
-    let declaration_symbol = bound
+    let declaration_symbol = declaration_bound
         .symbol(declaration)
         .ok_or(VariableInvariant::MissingDeclarationSymbol(declaration))?;
     if store.get_merged_symbol(declaration_symbol) != Some(routed.target) {
@@ -1743,15 +1805,20 @@ pub(super) fn plan_declared_value_identifier_read(
     if let Some(local) = routed.export_local {
         validate_export_local(store, local, declaration, routed.target, name)?;
     }
-    if bound.local_symbol(declaration) != routed.export_local {
+    if declaration_bound.local_symbol(declaration) != routed.export_local {
         return Err(VariableInvariant::LocalExportSymbolMismatch {
             declaration,
             expected: routed.export_local,
-            actual: bound.local_symbol(declaration),
+            actual: declaration_bound.local_symbol(declaration),
         }
         .into());
     }
-    validate_target_parent(bound, store, routed.target, routed.export_local.is_some())?;
+    validate_target_parent(
+        declaration_bound,
+        store,
+        routed.target,
+        routed.export_local.is_some(),
+    )?;
     if store.symbol_node_links(node).is_some_and(|links| {
         links
             .resolved_symbol

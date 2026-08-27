@@ -9316,7 +9316,7 @@ fn plan_property(
         || !declarations_match
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
-        || symbol_record.parent() != Some(owner)
+        || !class_member_parent_matches(store, symbol, owner)
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
         || table.and_then(|table| table.get(symbol_record.name())) != Some(symbol)
@@ -9499,7 +9499,7 @@ fn validate_prototype(
         || record.value_declaration().is_some()
         || record.members().is_some()
         || record.exports().is_some()
-        || record.parent() != Some(owner)
+        || !class_member_parent_matches(store, prototype, owner)
         || record.export_symbol().is_some()
         || store.get_merged_symbol(prototype) != Some(prototype)
     {
@@ -10512,13 +10512,181 @@ pub(super) fn is_merged_auto_accessor_interface(
         .is_some_and(|merged| merged.interface_declaration == declaration)
 }
 
+/// Proves a global ambient class and every empty namespace merged into it.
+fn global_class_namespace_declaration(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    owner: &Symbol,
+) -> Option<NodeRef> {
+    if owner.flags()
+        != (SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE | SymbolFlags::TRANSIENT)
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.source_symbol_declarations_match(symbol)
+        || !store.source_merged_symbol_declarations_match(symbol)
+        || store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get(owner.name()))
+            != Some(symbol)
+    {
+        return None;
+    }
+    let declarations = owner.declarations()?;
+    let mut class = None;
+    let mut namespaces = 0;
+    let mut previous = None;
+    for &declaration in declarations {
+        let source_order = (
+            store.source_file_rank(declaration.file)?,
+            declaration.node.index(),
+        );
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(declaration)? else {
+            return None;
+        };
+        if previous.is_some_and(|previous| previous >= source_order)
+            || !store.source_is_script_declaration_file(declaration)
+            || store.source_node_kind(parent) != Some(SyntaxKind::SourceFile)
+            || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+        {
+            return None;
+        }
+        previous = Some(source_order);
+        let name = store.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
+        if store.source_identifier_text(name) != owner.name().as_utf8() {
+            return None;
+        }
+        match store.source_node_kind(declaration)? {
+            SyntaxKind::ClassDeclaration if class.is_none() => class = Some(declaration),
+            SyntaxKind::ModuleDeclaration => {
+                let body = store.source_child_with_kind(declaration, SyntaxKind::ModuleBlock)?;
+                if !store.source_direct_children(body)?.is_empty() {
+                    return None;
+                }
+                namespaces += 1;
+            }
+            _ => return None,
+        }
+    }
+    let class = class?;
+    (namespaces != 0 && owner.value_declaration() == Some(class)).then_some(class)
+}
+
+fn class_member_parent_matches(
+    store: &CanonicalTypeMapperStore,
+    member: SemanticSymbolId,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(parent) = store.symbol(member).and_then(Symbol::parent) else {
+        return false;
+    };
+    parent == owner
+        || store.get_merged_symbol(parent) == Some(owner)
+            && store.symbol(owner).is_some_and(|record| {
+                global_class_namespace_declaration(store, owner, record).is_some()
+            })
+}
+
+fn plan_global_class_namespaces(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    owner: &Symbol,
+) -> Result<Option<NodeRef>, ClassError> {
+    let Some(class) = global_class_namespace_declaration(store, symbol, owner) else {
+        return Ok(None);
+    };
+    for &namespace in owner
+        .declarations()
+        .unwrap()
+        .iter()
+        .filter(|&&node| node != class)
+    {
+        let reject = || unsupported(ClassUnsupported::MergedDeclarations(symbol));
+        let record = preflight_node(store, host, namespace)?;
+        let NodeData::ModuleDeclaration(module) = &record.data else {
+            return Err(reject());
+        };
+        if record.kind != SyntaxKind::ModuleDeclaration
+            || record.flags.0 != 0
+            || !host.symbol_matches(store, namespace, symbol)
+            || module.keyword != SyntaxKind::NamespaceKeyword
+            || module.asterisk_token.is_some()
+            || module.end_flow_node.is_some()
+            || module.flow_node.is_some()
+            || module.local_symbol.is_some()
+            || module.next_container.is_some()
+            || module.symbol.is_some()
+            || module.facts != 0
+        {
+            return Err(reject());
+        }
+        if let Some(modifiers) = &module.modifiers {
+            let [modifier] = modifiers.list.nodes.as_slice() else {
+                return Err(reject());
+            };
+            let modifier = NodeRef::new(namespace.arena, namespace.file, *modifier);
+            let modifier_record = preflight_node(store, host, modifier)?;
+            if modifiers.flags.0 != 0
+                || modifiers.list.has_trailing_comma
+                || modifier_record.kind != SyntaxKind::DeclareKeyword
+                || modifier_record.flags.0 != 0
+                || modifier_record.parent != Some(namespace.node)
+                || !matches!(modifier_record.data, NodeData::Token(_))
+            {
+                return Err(reject());
+            }
+        }
+        let name = NodeRef::new(namespace.arena, namespace.file, module.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(reject());
+        };
+        let body = NodeRef::new(
+            namespace.arena,
+            namespace.file,
+            module.body.ok_or_else(reject)?,
+        );
+        let body_record = preflight_node(store, host, body)?;
+        let NodeData::ModuleBlock(block) = &body_record.data else {
+            return Err(reject());
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(namespace.node)
+            || identifier.flow_node.is_some()
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || body_record.kind != SyntaxKind::ModuleBlock
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(namespace.node)
+            || block.flow_node.is_some()
+            || block.facts != 0
+            || block.statements.has_trailing_comma
+            || !block.statements.nodes.is_empty()
+        {
+            return Err(reject());
+        }
+    }
+    Ok(Some(class))
+}
+
 fn plan_class_owner_declarations(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
     owner: &Symbol,
 ) -> Result<(NodeRef, Vec<ClassNamespaceExportPlan>), ClassError> {
+    if !store.source_merged_symbol_declarations_match(symbol) {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
     let flags = owner.flags();
+    if flags.contains(SymbolFlags::TRANSIENT)
+        && let Some(declaration) = plan_global_class_namespaces(store, host, symbol, owner)?
+    {
+        return Ok((declaration, Vec::new()));
+    }
     if flags == SymbolFlags::CLASS {
         let Some([declaration]) = owner.declarations() else {
             return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
@@ -25613,7 +25781,7 @@ fn exact_stored_property(
         && record.value_declaration() == Some(*declaration)
         && record.members().is_none()
         && record.exports().is_none()
-        && record.parent() == Some(owner)
+        && class_member_parent_matches(store, property, owner)
         && record.export_symbol().is_none()
         && store.get_merged_symbol(property) == Some(property)
         && store.source_node_kind(*declaration) == Some(SyntaxKind::PropertyDeclaration)
@@ -26751,7 +26919,13 @@ fn stored_class_owner_declaration(
     owner: SemanticSymbolId,
     record: &Symbol,
 ) -> Option<NodeRef> {
+    if !store.source_merged_symbol_declarations_match(owner) {
+        return None;
+    }
     let flags = record.flags();
+    if flags.contains(SymbolFlags::TRANSIENT) {
+        return global_class_namespace_declaration(store, owner, record);
+    }
     if flags == SymbolFlags::CLASS {
         let [declaration] = record.declarations()? else {
             return None;

@@ -303,12 +303,12 @@ use super::{
     variables::{
         PlannedArrayBindingElement, PlannedComputedBindingElement, PlannedCrossFileGlobalRead,
         PlannedIdentifierRead as PlannedVariableRead, PlannedObjectBindingElement,
-        VariableBindingKind, VariablePlanError, plan_cross_file_global_identifier_read,
-        plan_declared_value_identifier_read, plan_identifier_read,
-        plan_recovered_anonymous_module_identifier_read, plan_recovered_anonymous_module_variable,
-        plan_redeclared_top_level_variable, plan_top_level_array_binding_elements,
-        plan_top_level_computed_binding_element, plan_top_level_object_binding_elements,
-        plan_top_level_variable,
+        VariableBindingKind, VariablePlanError, plan_class_value_identifier_read,
+        plan_cross_file_global_identifier_read, plan_declared_value_identifier_read,
+        plan_identifier_read, plan_recovered_anonymous_module_identifier_read,
+        plan_recovered_anonymous_module_variable, plan_redeclared_top_level_variable,
+        plan_top_level_array_binding_elements, plan_top_level_computed_binding_element,
+        plan_top_level_object_binding_elements, plan_top_level_variable,
     },
 };
 
@@ -2033,6 +2033,7 @@ struct SourceCheckPlan {
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
     ambient_variables: Vec<PlannedAmbientVariable>,
     cross_file_global_reads: Vec<PlannedCrossFileGlobalRead>,
+    ambient_class_reads: Vec<ClassMemberQueryPlan>,
     ambient_namespace_reads: Vec<PlannedAmbientNamespaceRead>,
     overloads: Vec<SourceOverloadPlan>,
     functions: Vec<PlannedFunction>,
@@ -2085,6 +2086,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     type_import_references: Vec<PlannedSourceTypeImportReference>,
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
     cross_file_global_reads: Vec<PlannedCrossFileGlobalRead>,
+    ambient_class_reads: Vec<ClassMemberQueryPlan>,
     ambient_namespace_reads: Vec<PlannedAmbientNamespaceRead>,
     semantic: Option<(
         &'semantic CanonicalTypeMapperStore,
@@ -2139,6 +2141,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_references: Vec::new(),
             type_import_value_uses: Vec::new(),
             cross_file_global_reads: Vec::new(),
+            ambient_class_reads: Vec::new(),
             ambient_namespace_reads: Vec::new(),
             semantic: None,
             array_targets: None,
@@ -2194,6 +2197,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_references: Vec::new(),
             type_import_value_uses: Vec::new(),
             cross_file_global_reads: Vec::new(),
+            ambient_class_reads: Vec::new(),
             ambient_namespace_reads: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
@@ -4310,6 +4314,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_value_uses: self.type_import_value_uses,
             ambient_variables,
             cross_file_global_reads: self.cross_file_global_reads,
+            ambient_class_reads: self.ambient_class_reads,
             ambient_namespace_reads: self.ambient_namespace_reads,
             overloads,
             functions,
@@ -7302,6 +7307,90 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn plan_declared_class_or_enum_read(
+        &self,
+        node: NodeRef,
+        name: &str,
+        symbol: SemanticSymbolId,
+    ) -> Result<PlannedVariableRead, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(SourceCheckError::Class(node));
+        };
+        let class = store
+            .symbol(symbol)
+            .filter(|record| {
+                record.flags().contains(SymbolFlags::CLASS)
+                    && record.flags().intersects(SymbolFlags::MODULE)
+            })
+            .and_then(|_| {
+                self.prior_classes.get(&symbol).or_else(|| {
+                    self.ambient_class_reads
+                        .iter()
+                        .find(|class| class.symbol() == symbol)
+                        .and_then(ClassMemberQueryPlan::direct_plan)
+                })
+            });
+        match class {
+            Some(class) => plan_class_value_identifier_read(
+                self.arena, self.bound, store, host, node, name, class,
+            ),
+            None => plan_declared_value_identifier_read(
+                self.arena, self.bound, store, host, node, name, symbol,
+            ),
+        }
+        .map_err(Self::variable_plan_error)
+    }
+
+    fn plan_ambient_class_value_read(
+        &mut self,
+        node: NodeRef,
+        name: &str,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<PlannedVariableRead>, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let Some(declaration) = store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+        else {
+            return Ok(None);
+        };
+        if declaration.is_for(node.arena, node.file)
+            || host.bound_file(declaration).is_none_or(|bound| {
+                bound.source_facts().is_none_or(|facts| {
+                    !facts.is_declaration_file() || facts.is_external_or_common_js_module()
+                })
+            })
+        {
+            return Ok(None);
+        }
+        if !self
+            .ambient_class_reads
+            .iter()
+            .any(|class| class.symbol() == symbol)
+        {
+            let class = plan_nongeneric_class_member_query_with_type_context(
+                store,
+                host,
+                symbol,
+                self.class_type_context.as_ref(),
+            )
+            .map_err(|error| Self::class_plan_error(node, error))?;
+            if class.declaration() != declaration
+                || class.export_local().is_some()
+                || class.direct_plan().is_none()
+            {
+                return Err(SourceCheckError::Class(node));
+            }
+            preflight_nongeneric_class_member_query(store, host, &class)
+                .map_err(|error| Self::class_plan_error(node, error))?;
+            self.ambient_class_reads.push(class);
+        }
+        self.plan_declared_class_or_enum_read(node, name, symbol)
+            .map(Some)
+    }
+
     fn plan_top_level_class_compound_assignment(
         &self,
         expression: NodeRef,
@@ -7368,7 +7457,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             _ => return Ok(None),
         }
 
-        let Some((store, host)) = self.semantic else {
+        let Some((store, _)) = self.semantic else {
             return Ok(None);
         };
         let Some(symbol) = self.planned_classes.iter().copied().find(|symbol| {
@@ -7379,16 +7468,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }) else {
             return Ok(None);
         };
-        let read = plan_declared_value_identifier_read(
-            self.arena,
-            self.bound,
-            store,
-            host,
-            left,
-            &identifier.text,
-            symbol,
-        )
-        .map_err(Self::variable_plan_error)?;
+        let read = self.plan_declared_class_or_enum_read(left, &identifier.text, symbol)?;
         if read.value_symbol != symbol {
             return Err(SourceCheckError::Class(expression));
         }
@@ -20365,10 +20445,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && (self.planned_classes.contains(&symbol)
                             || self.prior_enums.contains(&symbol)) =>
                     {
-                        let read = plan_declared_value_identifier_read(
-                            self.arena, self.bound, store, host, expression, &name, symbol,
-                        )
-                        .map_err(Self::variable_plan_error)?;
+                        let read =
+                            self.plan_declared_class_or_enum_read(expression, &name, symbol)?;
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::declared_value(
+                            read,
+                        ))
+                    }
+                    Err(
+                        error @ VariablePlanError::Unsupported(
+                            VariableUnsupported::NonVariableSymbol { symbol, flags, .. },
+                        ),
+                    ) if flags.contains(SymbolFlags::CLASS)
+                        && flags.intersects(SymbolFlags::MODULE) =>
+                    {
+                        let Some(read) =
+                            self.plan_ambient_class_value_read(expression, &name, symbol)?
+                        else {
+                            return Err(Self::variable_plan_error(error));
+                        };
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::declared_value(
                             read,
                         ))
@@ -49303,6 +49397,7 @@ pub(super) fn check_source_file(
         type_import_value_uses,
         ambient_variables,
         cross_file_global_reads,
+        ambient_class_reads,
         ambient_namespace_reads,
         overloads,
         mut functions,
@@ -50032,6 +50127,22 @@ pub(super) fn check_source_file(
         )?
         .preflight_type_from_type_node(type_node)?;
     }
+    for class in &ambient_class_reads {
+        preflight_nongeneric_class_member_query(store, host, class)
+            .map_err(|error| SourcePlanner::class_plan_error(class.declaration(), error))?;
+        if let Some(annotation) = class.constructor_interface_annotation() {
+            session.reset_query();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut type_import_preflight_diagnostics,
+            )?
+            .preflight_type_from_type_node(annotation)?;
+        }
+    }
     let mut preflighted_cross_file_globals = HashSet::new();
     for read in &cross_file_global_reads {
         if !preflighted_cross_file_globals.insert(read.read.value_symbol) {
@@ -50506,6 +50617,17 @@ pub(super) fn check_source_file(
                 )
                 .into());
             }
+        }
+    }
+
+    for class in &ambient_class_reads {
+        let materialized = execute_nongeneric_class_member_query(store, host, class)
+            .map_err(|error| SourcePlanner::class_plan_error(class.declaration(), error))?;
+        if current_flow_types
+            .insert(class.symbol(), materialized.shells().value_type())
+            .is_some()
+        {
+            return Err(SourceCheckError::Class(class.declaration()));
         }
     }
 
@@ -57171,6 +57293,9 @@ pub(super) fn publish_type_checked(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod class_namespace_value_tests;
 
 #[cfg(test)]
 mod tests {

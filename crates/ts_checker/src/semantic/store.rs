@@ -889,6 +889,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    /// Reads retained binder facts for an ambient script source.
+    #[must_use]
+    pub(super) fn source_is_script_declaration_file(&self, node: NodeRef) -> bool {
+        self.contains_node_ref(node)
+            && self.source_file_facts.get(&node.file).is_some_and(|facts| {
+                facts.is_declaration_file()
+                    && !facts.is_javascript_file()
+                    && !facts.is_external_or_common_js_module()
+            })
+    }
+
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
     #[must_use]
     pub(super) fn source_declaration_belongs_to_symbol(
