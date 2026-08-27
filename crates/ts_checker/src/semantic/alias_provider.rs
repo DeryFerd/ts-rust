@@ -2349,7 +2349,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         Ok(export_equals.is_some())
     }
 
-    fn direct_export<MapperPayload>(
+    pub(super) fn direct_export<MapperPayload>(
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
@@ -2453,9 +2453,53 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             visited.remove(&module);
             return Ok(None);
         }
+
+        let mut found = None;
+        for target in self.export_star_targets(store, declaration, module, type_only)? {
+            let Some(candidate) = self.direct_export_through_stars(
+                store,
+                declaration,
+                target,
+                name,
+                type_only,
+                visited,
+            )?
+            else {
+                continue;
+            };
+            if found.is_some_and(|previous| previous != candidate) {
+                return Err(
+                    CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
+                        declaration,
+                        module,
+                    },
+                );
+            }
+            found = Some(candidate);
+        }
+        visited.remove(&module);
+        Ok(found)
+    }
+
+    /// Resolves owned star declarations without resolving any exported aliases.
+    pub(super) fn export_star_targets<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+        type_only: bool,
+    ) -> Result<Vec<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
+        let malformed = || CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+            declaration,
+            module,
+        };
+        let record = store.symbol(module).ok_or_else(malformed)?;
+        let Some(exports) = record.exports() else {
+            return Ok(Vec::new());
+        };
+        let exports = store.symbol_table(exports).ok_or_else(malformed)?;
         let Some(star) = exports.get(InternalSymbolName::ExportStar.as_ref()) else {
-            visited.remove(&module);
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let unsupported = || CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
             declaration,
@@ -2478,7 +2522,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             return Err(unsupported());
         }
 
-        let mut found = None;
+        let mut targets = Vec::with_capacity(declarations.len());
         for star_declaration in declarations {
             let source = self.checked_source(store, *star_declaration)?;
             let node = source
@@ -2541,24 +2585,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     },
                 );
             }
-            let Some(candidate) = self.direct_export_through_stars(
-                store,
-                declaration,
-                target,
-                name,
-                type_only,
-                visited,
-            )?
-            else {
-                continue;
-            };
-            if found.is_some_and(|previous| previous != candidate) {
-                return Err(unsupported());
-            }
-            found = Some(candidate);
+            targets.push(target);
         }
-        visited.remove(&module);
-        Ok(found)
+        Ok(targets)
     }
 
     fn ambient_export_equals_member<MapperPayload>(

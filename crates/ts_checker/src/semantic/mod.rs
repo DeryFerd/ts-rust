@@ -51,6 +51,7 @@ mod mapped_types;
 pub mod mapper;
 mod member_resolution;
 mod merge;
+mod module_exports;
 pub mod module_resolution;
 pub mod name_resolution;
 mod object_diagnostics;
@@ -153,6 +154,7 @@ pub use merge::{
     CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,
     SymbolMergeDiagnosticKind, SymbolMergeError, SymbolMergeHost, get_excluded_symbol_flags,
 };
+pub use module_exports::CanonicalModuleExportQueryError;
 pub use module_resolution::{
     CanonicalModuleResolutionEntry, CanonicalModuleResolutionInput,
     CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,

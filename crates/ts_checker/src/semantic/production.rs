@@ -1054,6 +1054,32 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         self.module_resolutions.lookup(specifier)
     }
 
+    /// Looks up a source module export without resolving aliases or value types.
+    ///
+    /// Type-only aliases remain aliases. `None` requires a complete export search.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for unavailable star targets, unsupported module
+    /// families, stale sources, or export tables that disagree with their sources.
+    pub fn get_module_export_by_name(
+        &self,
+        module: SemanticSymbolId,
+        name: &str,
+    ) -> Result<Option<SemanticSymbolId>, super::CanonicalModuleExportQueryError> {
+        let aliases = ProductionAliasTargetHost::from_registry(
+            &self.store,
+            &self.files,
+            &self.module_resolutions,
+        )?;
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )?;
+        super::module_exports::get_module_export_by_name(&self.store, &host, &aliases, module, name)
+    }
+
     /// General checker diagnostics in raw issuance order.
     #[must_use]
     pub const fn diagnostics(&self) -> &CanonicalCheckerDiagnostics {
