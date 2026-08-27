@@ -18,7 +18,7 @@ use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic as CheckerDiagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
 use ts_parser::{parse_jsdoc_comment, parse_source_file};
-use ts_scanner::Scanner;
+use ts_scanner::{Scanner, TokenFlags};
 
 use super::{
     ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
@@ -1171,6 +1171,15 @@ pub fn parse_jsdoc_comment_at(
     if !comment.starts_with("/**") || !comment.ends_with("*/") {
         return Err(JsDocCommentError::InvalidCommentSyntax(range));
     }
+    let mut scanner = Scanner::new(comment);
+    scanner.set_skip_trivia(false);
+    let token = scanner.scan();
+    if token.kind != SyntaxKind::MultiLineCommentTrivia
+        || token.text != comment
+        || token.flags.contains(TokenFlags::UNTERMINATED)
+    {
+        return Err(JsDocCommentError::InvalidCommentSyntax(range));
+    }
 
     let parsed = parse_jsdoc_comment(comment);
     let NodeData::JsDoc(root) = &parsed
@@ -1308,7 +1317,7 @@ fn parse_overload_signature_tags<'source>(
     Ok(tags)
 }
 
-/// Finds and parses the immediately preceding `JSDoc` comment for a source node.
+/// Finds and parses the last `JSDoc` comment in a source node's leading trivia.
 ///
 /// # Errors
 ///
@@ -1318,32 +1327,11 @@ pub fn leading_jsdoc_comment(
     arena: &NodeArena,
     node: NodeRef,
 ) -> Result<Option<ParsedJsDocComment<'_>>, JsDocCommentError> {
-    if node.arena != arena.id() {
-        return Err(JsDocCommentError::InvalidSourceNode(node));
-    }
-    let record = arena
-        .get(node.node)
-        .ok_or(JsDocCommentError::InvalidSourceNode(node))?;
-    let source = arena
-        .source_text()
-        .ok_or(JsDocCommentError::MissingSourceText(node))?;
-    let node_start = usize::try_from(record.range.start.get())
-        .map_err(|_| JsDocCommentError::InvalidSourceNode(node))?;
-    let prefix = source
-        .get(..node_start)
-        .ok_or(JsDocCommentError::InvalidSourceNode(node))?
-        .trim_end_matches(char::is_whitespace);
-    if !prefix.ends_with("*/") {
-        return Ok(None);
-    }
-    let Some(comment_start) = prefix.rfind("/**") else {
-        return Ok(None);
-    };
-    let range = checked_range(comment_start, prefix.len())?;
-    parse_jsdoc_comment_at(source, range).map(Some)
+    let comments = LeadingJsDocComments::new(arena, node)?;
+    comments.last(node)
 }
 
-/// Returns all adjacent leading `JSDoc` comments in source order.
+/// Returns all `JSDoc` comments in a source node's leading trivia in source order.
 ///
 /// # Errors
 ///
@@ -1353,37 +1341,114 @@ pub fn leading_jsdoc_comments(
     arena: &NodeArena,
     node: NodeRef,
 ) -> Result<Vec<ParsedJsDocComment<'_>>, JsDocCommentError> {
-    if node.arena != arena.id() {
-        return Err(JsDocCommentError::InvalidSourceNode(node));
-    }
-    let record = arena
-        .get(node.node)
-        .ok_or(JsDocCommentError::InvalidSourceNode(node))?;
-    let source = arena
-        .source_text()
-        .ok_or(JsDocCommentError::MissingSourceText(node))?;
-    let mut end = usize::try_from(record.range.start.get())
-        .map_err(|_| JsDocCommentError::InvalidSourceNode(node))?;
-    let mut comments = Vec::new();
-    loop {
-        let prefix = source
-            .get(..end)
-            .ok_or(JsDocCommentError::InvalidSourceNode(node))?
-            .trim_end_matches(char::is_whitespace);
-        if !prefix.ends_with("*/") {
-            break;
+    let comments = LeadingJsDocComments::new(arena, node)?;
+    comments.all(node)
+}
+
+struct LeadingJsDocComments<'arena> {
+    arena: &'arena NodeArena,
+    source: &'arena str,
+    source_node_ends: Vec<TextPos>,
+}
+
+impl<'arena> LeadingJsDocComments<'arena> {
+    fn new(arena: &'arena NodeArena, node: NodeRef) -> Result<Self, JsDocCommentError> {
+        let invalid = || JsDocCommentError::InvalidSourceNode(node);
+        if node.arena != arena.id() {
+            return Err(invalid());
         }
-        let Some(start) = prefix.rfind("/**") else {
-            break;
-        };
-        comments.push(parse_jsdoc_comment_at(
+        let source = arena
+            .source_text()
+            .ok_or(JsDocCommentError::MissingSourceText(node))?;
+        let mut root = node.node;
+        let mut remaining = arena.len();
+        while let Some(parent) = arena.get(root).ok_or_else(invalid)?.parent {
+            remaining = remaining.checked_sub(1).ok_or_else(invalid)?;
+            root = parent;
+        }
+
+        let mut source_node_ends = Vec::new();
+        let mut pending = vec![root];
+        let mut remaining = arena.len();
+        while let Some(current) = pending.pop() {
+            remaining = remaining.checked_sub(1).ok_or_else(invalid)?;
+            let record = arena.get(current).ok_or_else(invalid)?;
+            // Reparsed annotations and their children are inside comments, not source code.
+            if record.flags.0 & NodeFlags::REPARSED.0 != 0 {
+                continue;
+            }
+            if record.range.start < record.range.end {
+                source_node_ends.push(record.range.end);
+            }
+            record.for_each_child(|child| pending.push(child));
+        }
+        source_node_ends.sort_unstable();
+        source_node_ends.dedup();
+        Ok(Self {
+            arena,
             source,
-            checked_range(start, prefix.len())?,
-        )?);
-        end = start;
+            source_node_ends,
+        })
     }
-    comments.reverse();
-    Ok(comments)
+
+    fn ranges(&self, node: NodeRef) -> Result<Vec<TextRange>, JsDocCommentError> {
+        let invalid = || JsDocCommentError::InvalidSourceNode(node);
+        if node.arena != self.arena.id() {
+            return Err(invalid());
+        }
+        let record = self.arena.get(node.node).ok_or_else(invalid)?;
+        let end = usize::try_from(record.range.start.get()).map_err(|_| invalid())?;
+        let index = self
+            .source_node_ends
+            .partition_point(|end| *end <= record.range.start);
+        let start = index
+            .checked_sub(1)
+            .map_or(TextPos::new(0), |index| self.source_node_ends[index]);
+        let start = usize::try_from(start.get()).map_err(|_| invalid())?;
+        let prefix = self.source.get(..end).ok_or_else(invalid)?;
+        if !prefix.is_char_boundary(start) {
+            return Err(invalid());
+        }
+
+        // The previous source node excludes strings, regular expressions, and template text.
+        // Scan the remaining punctuation and trivia without crossing the requested node.
+        let mut scanner = Scanner::new(prefix);
+        scanner.reset_pos(start);
+        scanner.set_skip_trivia(false);
+        let mut comments = Vec::new();
+        loop {
+            let token = scanner.scan();
+            match token.kind {
+                SyntaxKind::EndOfFile => break,
+                SyntaxKind::MultiLineCommentTrivia => {
+                    if token.flags.contains(TokenFlags::PRECEDING_JSDOC_COMMENT)
+                        && !token.flags.contains(TokenFlags::UNTERMINATED)
+                    {
+                        comments.push(token.range);
+                    }
+                }
+                SyntaxKind::WhitespaceTrivia
+                | SyntaxKind::NewLineTrivia
+                | SyntaxKind::SingleLineCommentTrivia => {}
+                _ => comments.clear(),
+            }
+        }
+        Ok(comments)
+    }
+
+    fn last(&self, node: NodeRef) -> Result<Option<ParsedJsDocComment<'arena>>, JsDocCommentError> {
+        self.ranges(node)?
+            .last()
+            .map(|range| parse_jsdoc_comment_at(self.source, *range))
+            .transpose()
+    }
+
+    fn all(&self, node: NodeRef) -> Result<Vec<ParsedJsDocComment<'arena>>, JsDocCommentError> {
+        self.ranges(node)?
+            .into_iter()
+            .map(|range| parse_jsdoc_comment_at(self.source, range))
+            .collect()
+    }
 }
 
 /// Collects source-owned `JSDoc` annotations for JavaScript declarations.
@@ -1435,6 +1500,7 @@ pub fn plan_javascript_source_jsdoc(
     }
 
     let mut pending = vec![source.node];
+    let leading_comments = LeadingJsDocComments::new(arena, source)?;
     let mut seen_comments = HashSet::new();
     let mut declarations = Vec::new();
     let mut expressions = Vec::new();
@@ -1453,7 +1519,8 @@ pub fn plan_javascript_source_jsdoc(
             continue;
         }
         if is_jsdoc_declaration_candidate(record.kind) {
-            let comments = leading_jsdoc_comments(arena, reference)?
+            let comments = leading_comments
+                .all(reference)?
                 .into_iter()
                 .filter(|comment| {
                     seen_comments.insert((comment.range().start.get(), comment.range().end.get()))
@@ -1492,7 +1559,7 @@ pub fn plan_javascript_source_jsdoc(
         if record.kind == SyntaxKind::ParenthesizedExpression
             && let Some((callable, declaration)) =
                 javascript_jsdoc_arrow_expression_owner(arena, reference)?
-            && let Some(comment) = leading_jsdoc_comment(arena, reference)?
+            && let Some(comment) = leading_comments.last(reference)?
             && let [tag] = comment.tags()
             && tag.kind() == JsDocTagKind::Type
             && let Some(annotation) = tag.type_expression()

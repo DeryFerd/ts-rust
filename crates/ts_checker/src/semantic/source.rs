@@ -78820,6 +78820,117 @@ class Foo2 {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check ownership, warm identity, and calls with the same cases.
+    fn javascript_arrow_comment_ownership_preserves_flags_and_calls_cold_and_warm() {
+        use super::super::calls::{
+            DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call,
+        };
+        for (prefix, contextual) in [
+            ("", false),
+            ("/* plain */", false),
+            ("/* @type {any} */", false),
+            ("/* @satisfies {any} */", false),
+            ("/** @returns {void} */", false),
+            ("/** @type {number} */ const n = 1;", false),
+            ("/** @satisfies {number} */ const n = 1;", false),
+            ("/** @type {number} */ const n = 1;\n/* plain */", false),
+            (
+                "/** @satisfies {number} */ const n = 1;\n/* plain */",
+                false,
+            ),
+            ("/** @type {number} */ const n = 1;\n// plain\n", false),
+            (
+                "/** @type {number} */ const n = 1;\n/** @returns {void} */",
+                false,
+            ),
+            ("/** @type {any} */", true),
+            ("/** @satisfies {any} */", true),
+            ("/** @type {any} */ /* plain */", true),
+            ("/** @satisfies {any} */ /* plain */", true),
+            ("/** @type {any} */ // plain\n", true),
+            ("/** @satisfies {any} */ // plain\n", true),
+            (
+                "/** @callback Callback\n * @returns {void}\n */\n/** @type {Callback} */",
+                true,
+            ),
+        ] {
+            let source = parse_javascript_source_file(&format!(
+                "{prefix} const callback = () => {{}}; callback();"
+            ));
+            assert!(source.diagnostics.is_empty(), "{prefix}");
+            let file = FileId::new(9_972);
+            let options = CanonicalCheckerOptions::default();
+            let mut context = javascript_context(file, &source, options);
+            context.check_source_file(file).unwrap();
+            assert!(
+                context.diagnostics().is_empty(),
+                "{prefix}: {:?}",
+                context.diagnostics()
+            );
+            let arrow = variable_initializer(&source, file, "callback");
+            let type_ = context.get_type_at_location(arrow).unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(type_)
+                .unwrap()
+                .signature;
+            let expected = if contextual {
+                SignatureFlags::NONE
+            } else {
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            };
+            let globals = context.global_types().clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+            let before = observable_state(&context, file);
+            for warm in [false, true] {
+                if warm {
+                    context.recheck_source_file(file).unwrap();
+                }
+                assert_eq!(
+                    context.get_type_at_location(arrow).unwrap(),
+                    type_,
+                    "{prefix}"
+                );
+                assert_eq!(
+                    context.store().signature(signature).unwrap().flags(),
+                    expected,
+                    "{prefix}"
+                );
+                for (arguments, expected_call) in [
+                    (Vec::new(), DirectCallApplicability::Applicable),
+                    (
+                        vec![number],
+                        DirectCallApplicability::TooManyArguments {
+                            expected_at_most: 0,
+                            actual: 1,
+                        },
+                    ),
+                ] {
+                    let result = resolve_direct_call(
+                        context.store_mut_for_test(),
+                        &globals,
+                        options.strict_function_types,
+                        DirectCallRequest {
+                            form: DirectCallForm::Call,
+                            optional_chain: false,
+                            type_argument_count: 0,
+                            has_spread_argument: false,
+                            callee: type_,
+                            arguments: &arguments,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(result.applicability, expected_call, "{prefix}");
+                    assert_eq!(result.projection.signature, signature, "{prefix}");
+                    assert_eq!(result.projection.return_type, void, "{prefix}");
+                }
+                assert_eq!(observable_state(&context, file), before, "{prefix}");
+            }
+        }
+    }
+
+    #[test]
     fn javascript_jsdoc_callback_alias_rejects_poisoned_signatures_without_publication() {
         for poison in 0..4 {
             let source = parse_javascript_source_file(concat!(
