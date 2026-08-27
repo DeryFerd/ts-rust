@@ -7567,7 +7567,8 @@ fn declared_namespace_type_parent(
     }
 
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
-    if owner.parent().is_none() && modifiers.is_none() {
+    if owner.parent().is_none() && modifiers.is_none() && bound.local_symbol(declaration).is_none()
+    {
         return Ok(None);
     }
     let namespace = bound
@@ -7619,9 +7620,28 @@ fn declared_namespace_type_parent(
                     && bound.local_symbol(*candidate) == Some(local)
             })
             .collect::<Vec<_>>();
+        // An interface and a variable share the binder's value-export placeholder.
+        let has_local_value = owner.flags().without(SymbolFlags::TRANSIENT)
+            == SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            && declarations.iter().any(|candidate| {
+                host.node(*candidate).is_some_and(|record| {
+                    matches!(
+                        (record.kind, &record.data),
+                        (
+                            SyntaxKind::VariableDeclaration,
+                            NodeData::VariableDeclaration(_)
+                        )
+                    )
+                })
+            });
+        let expected_local_flags = if has_local_value {
+            SymbolFlags::EXPORT_VALUE
+        } else {
+            SymbolFlags::NONE
+        };
         if local == symbol
             || store.get_merged_symbol(local) != Some(local)
-            || record.flags() != SymbolFlags::NONE
+            || record.flags() != expected_local_flags
             || record.check_flags() != CheckFlags::NONE
             || record.name().as_utf8() != Some(name)
             || declarations.is_empty()

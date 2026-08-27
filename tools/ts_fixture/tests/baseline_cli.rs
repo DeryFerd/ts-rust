@@ -742,6 +742,91 @@ fn canonical_checker_matches_pinned_simple_multi_file_diagnostic_and_semantic_ba
 }
 
 #[test]
+fn namespace_constructor_merge_matches_pinned_full_artifacts() {
+    let repository = TestRepository::new();
+    // Source and semantic baselines from the pinned Go declarationEmitConstructorType case.
+    repository.write_case(
+        "declarationEmitConstructorType",
+        concat!(
+            "// @declaration: true\n\n",
+            "declare namespace NS {\n",
+            "    interface Foo { }\n",
+            "    var Foo: new () => number;\n",
+            "}\n",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "declarationEmitConstructorType.types",
+        concat!(
+            "//// [tests/cases/compiler/declarationEmitConstructorType.ts] ////\r\n\r\n",
+            "=== declarationEmitConstructorType.ts ===\r\n",
+            "declare namespace NS {\r\n",
+            ">NS : typeof NS\r\n\r\n",
+            "    interface Foo { }\r\n",
+            "    var Foo: new () => number;\r\n",
+            ">Foo : new () => number\r\n",
+            "}\r\n\r\n",
+        ),
+    );
+    repository.write_baseline(
+        "declarationEmitConstructorType.symbols",
+        concat!(
+            "//// [tests/cases/compiler/declarationEmitConstructorType.ts] ////\r\n\r\n",
+            "=== declarationEmitConstructorType.ts ===\r\n",
+            "declare namespace NS {\r\n",
+            ">NS : Symbol(NS, Decl(declarationEmitConstructorType.ts, 0, 0))\r\n\r\n",
+            "    interface Foo { }\r\n",
+            ">Foo : Symbol(Foo, Decl(declarationEmitConstructorType.ts, 0, 22), Decl(declarationEmitConstructorType.ts, 2, 7))\r\n\r\n",
+            "    var Foo: new () => number;\r\n",
+            ">Foo : Symbol(Foo, Decl(declarationEmitConstructorType.ts, 0, 22), Decl(declarationEmitConstructorType.ts, 2, 7))\r\n",
+            "}\r\n\r\n",
+        ),
+    );
+    let scorecard_path = repository.0.join("namespace-constructor-scorecard.json");
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+            "--filter",
+            "declarationEmitConstructorType",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["schemaVersion"], 5);
+    assert_eq!(scorecard["checkerMode"], "canonical");
+    assert_eq!(scorecard["comparisonScope"], "full_artifact");
+    assert_eq!(scorecard["summary"]["executedVariants"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["fatalInvariants"], 0);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 0);
+    assert_eq!(scorecard["variants"][0]["status"], "exact_match");
+    assert_eq!(
+        scorecard["variants"][0]["frontierBlocker"],
+        serde_json::Value::Null
+    );
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 1);
+        assert_eq!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
+            "exact_match"
+        );
+    }
+}
+
+#[test]
 fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly() {
     let repository = TestRepository::new();
     repository.write_case(

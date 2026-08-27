@@ -55938,6 +55938,171 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // The same owner checks apply before and after cache publication.
+    fn namespace_constructor_merge_rejects_changed_local_export_identity() {
+        for warm in [false, true] {
+            for poison in 0..7 {
+                let mut fixture =
+                    fixture("declare namespace NS { interface Foo {} var Foo: new () => number; }");
+                let interface = named_node(&fixture, SyntaxKind::InterfaceDeclaration, "Foo");
+                let variable = named_node(&fixture, SyntaxKind::VariableDeclaration, "Foo");
+                let symbol =
+                    canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Foo");
+                let local = fixture
+                    .files
+                    .get(&fixture.file)
+                    .unwrap()
+                    .local_symbol(interface)
+                    .unwrap();
+                let original_local = fixture.store.symbol(local).unwrap().clone();
+                let original_owner = fixture.store.symbol(symbol).unwrap().clone();
+                assert_eq!(original_local.flags(), SymbolFlags::EXPORT_VALUE);
+                assert_eq!(original_local.value_declaration(), None);
+                assert_eq!(original_owner.value_declaration(), Some(variable));
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let resolved = warm.then(|| {
+                    query_declared(
+                        &mut fixture,
+                        symbol,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                });
+                match poison {
+                    0 => assert!(fixture.store.set_symbol_flags(
+                        local,
+                        SymbolFlags::NONE,
+                        CheckFlags::NONE
+                    )),
+                    1 => assert!(fixture.store.set_symbol_flags(
+                        local,
+                        SymbolFlags::EXPORT_VALUE | SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                        CheckFlags::NONE,
+                    )),
+                    2 => assert!(fixture.store.set_symbol_declarations(
+                        local,
+                        Some(vec![interface]),
+                        None
+                    )),
+                    3 => assert!(fixture.store.set_symbol_declarations(
+                        local,
+                        original_local.declarations().map(<[NodeRef]>::to_vec),
+                        Some(variable),
+                    )),
+                    4 => assert!(
+                        fixture
+                            .store
+                            .set_symbol_relationships(local, None, None, None, None)
+                    ),
+                    5 => assert!(fixture.store.set_symbol_relationships(
+                        local,
+                        None,
+                        None,
+                        original_owner.parent(),
+                        Some(symbol),
+                    )),
+                    6 => assert!(fixture.store.set_symbol_relationships(
+                        symbol,
+                        original_owner.members(),
+                        original_owner.exports(),
+                        None,
+                        original_owner.export_symbol(),
+                    )),
+                    _ => unreachable!(),
+                }
+                let before = store_state(&fixture.store);
+                assert!(
+                    query_declared(
+                        &mut fixture,
+                        symbol,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .is_err(),
+                    "warm={warm}, poison={poison}",
+                );
+                assert_eq!(store_state(&fixture.store), before);
+                assert!(diagnostics.is_empty());
+                assert!(fixture.store.set_symbol_flags(
+                    local,
+                    original_local.flags(),
+                    original_local.check_flags()
+                ));
+                assert!(fixture.store.set_symbol_declarations(
+                    local,
+                    original_local.declarations().map(<[NodeRef]>::to_vec),
+                    original_local.value_declaration(),
+                ));
+                assert!(fixture.store.set_symbol_relationships(
+                    local,
+                    original_local.members(),
+                    original_local.exports(),
+                    original_local.parent(),
+                    original_local.export_symbol(),
+                ));
+                assert!(fixture.store.set_symbol_relationships(
+                    symbol,
+                    original_owner.members(),
+                    original_owner.exports(),
+                    original_owner.parent(),
+                    original_owner.export_symbol(),
+                ));
+                let repaired = query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+                if let Some(resolved) = resolved {
+                    assert_eq!(repaired, resolved);
+                }
+                assert_eq!(
+                    fixture.store.type_payload(repaired).unwrap().symbol(),
+                    Some(symbol)
+                );
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_constructor_merge_does_not_accept_value_flags_without_a_variable() {
+        let mut fixture = fixture("declare namespace NS { interface Foo {} }");
+        let interface = named_node(&fixture, SyntaxKind::InterfaceDeclaration, "Foo");
+        let symbol = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Foo");
+        let local = fixture
+            .files
+            .get(&fixture.file)
+            .unwrap()
+            .local_symbol(interface)
+            .unwrap();
+        assert_eq!(
+            fixture.store.symbol(local).unwrap().flags(),
+            SymbolFlags::NONE
+        );
+        assert!(
+            fixture
+                .store
+                .set_symbol_flags(local, SymbolFlags::EXPORT_VALUE, CheckFlags::NONE)
+        );
+        let before = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            query_declared(
+                &mut fixture,
+                symbol,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err()
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn inline_empty_type_literal_reuses_bootstrap_but_aliased_empty_is_distinct() {
         let mut fixture = fixture("let inline: {}; type Empty = {};");
         let inline = variable_type_node(&fixture, "inline");
