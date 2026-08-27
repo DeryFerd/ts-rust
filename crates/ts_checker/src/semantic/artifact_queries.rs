@@ -2099,7 +2099,7 @@ impl CanonicalCheckerContext<'_> {
             declaration.file,
             member.parent.ok_or_else(invalid)?,
         );
-        let (arena, bound, class_record) = self.validated_artifact_node(class)?;
+        let (_, bound, class_record) = self.validated_artifact_node(class)?;
         let source_members = match &class_record.data {
             NodeData::ClassDeclaration(class) => &class.members.nodes,
             NodeData::ClassExpression(class) => &class.members.nodes,
@@ -2116,8 +2116,7 @@ impl CanonicalCheckerContext<'_> {
         let owner_declarations_match = if owner_record.flags() == SymbolFlags::CLASS {
             owner_record.declarations() == Some(&[class])
         } else {
-            let host =
-                super::DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+            let host = self.declared_type_host()?;
             super::classes::plan_nongeneric_class(self.store(), &host, owner)
                 .is_ok_and(|plan| plan.declaration() == class && plan.symbol() == owner)
         };
@@ -5544,6 +5543,11 @@ mod tests {
             "class Model { static #value = 1; } namespace Model {}",
             "class Model { #value = 1; } namespace Model { export var tag = 2; }",
             "class Model { static #value = 1; } namespace Model { export var tag = 2; }",
+            "class Model<First = any, Second = First> { #value = 1; } namespace Model {}",
+            concat!(
+                "class Model<First = any, Second = First> { #value = 1; } ",
+                "namespace Model { export var tag = 2; }",
+            ),
             "class Model { #run() {} } namespace Model {}",
             concat!(
                 "class Model { get #value(): number { return 1; } set #value(next) {} } ",
@@ -5627,6 +5631,7 @@ mod tests {
         for source in [
             "class Model { #value = 1; } namespace Model {}",
             "class Model { #value = 1; } namespace Model { export var tag = 2; }",
+            "class Model<First = any, Second = First> { #value = 1; } namespace Model {}",
         ] {
             for checked_first in [false, true] {
                 for poison in 0..5 {

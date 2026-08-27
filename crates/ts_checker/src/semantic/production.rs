@@ -1936,6 +1936,16 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         ProductionNameResolverHost::from_registry(&self.store, &self.files, options)
     }
 
+    /// Borrows this context's post-merge sources and name-resolution options.
+    pub(super) fn declared_type_host(&self) -> Result<DeclaredTypeHost<'_>, DeclaredTypeError> {
+        DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)
+    }
+
     /// The brand shared by adopted binder symbols and checker-owned records.
     #[must_use]
     pub fn id(&self) -> SemanticStoreId {
