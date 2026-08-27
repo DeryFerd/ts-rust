@@ -22451,7 +22451,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     }
 }
 
-/// Reuses the source proof without publishing the invalid catch binding.
+/// Reuses the source proof without publishing the catch binding's value type.
 pub(super) fn catch_object_rest_artifact_binding(
     arena: &NodeArena,
     bound: &BoundFile,
