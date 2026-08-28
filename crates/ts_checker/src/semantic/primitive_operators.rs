@@ -1,6 +1,6 @@
 //! Exact scalar kernel for ordinary non-assignment binary operators.
 //!
-//! The admitted domain is deliberately atomic: the canonical `string`,
+//! The admitted domain is deliberately atomic: the canonical `any`, `string`,
 //! `number`, `bigint`, and `boolean` types plus their validated literal pairs
 //! and authenticated homogeneous enum types. Every broader type family remains
 //! a typed boundary. The kernel mirrors the pinned checker's operator-specific
@@ -30,7 +30,7 @@ pub(super) enum PrimitiveBigIntExponentiationTarget {
     Unknown,
 }
 
-/// Unforgeable-at-source provenance for a result recovered by this kernel.
+/// Tracks canonical any and error results between primitive binary operations.
 ///
 /// The source executor retains this tag only on a completed primitive binary
 /// result and validates it against the exact bootstrap identity on reuse.
@@ -355,6 +355,12 @@ fn primitive_binary_operand(
         let bootstrap = store
             .intrinsic_bootstrap()
             .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+        if type_ == bootstrap.any_type {
+            store.validate_union_constituent(type_)?;
+            return Ok(PrimitiveBinaryOperand::Recovery(
+                PrimitiveBinaryRecovery::Any,
+            ));
+        }
         let nullish = if type_ == bootstrap.null_type || type_ == bootstrap.null_widening_type {
             Some(PrimitiveNullishFamily::Null)
         } else if type_ == bootstrap.undefined_type || type_ == bootstrap.undefined_widening_type {
@@ -1801,7 +1807,7 @@ mod tests {
                 },
             )),
         );
-        for unsupported in [any, error] {
+        for unsupported in [store.intrinsic_bootstrap().unwrap().unknown_type, error] {
             assert_eq!(
                 check_primitive_binary(
                     &mut store,
@@ -1815,6 +1821,106 @@ mod tests {
                 )),
             );
         }
+    }
+
+    #[test]
+    fn canonical_any_uses_binary_result_rules_without_recovery_tags() {
+        let parsed = parse_source_file("const value = left + right;");
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (any, number, string, bigint, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+            )
+        };
+        for (operator, left, right, expected, recovery) in [
+            (
+                SyntaxKind::PlusToken,
+                any,
+                number,
+                any,
+                Some(PrimitiveBinaryRecovery::Any),
+            ),
+            (
+                SyntaxKind::PlusToken,
+                any,
+                boolean,
+                any,
+                Some(PrimitiveBinaryRecovery::Any),
+            ),
+            (SyntaxKind::PlusToken, any, string, string, None),
+            (SyntaxKind::PlusToken, string, any, string, None),
+            (SyntaxKind::MinusToken, any, number, number, None),
+            (SyntaxKind::AsteriskToken, any, bigint, bigint, None),
+            (SyntaxKind::SlashToken, any, any, number, None),
+        ] {
+            let result =
+                check_primitive_binary(&mut store, request(nodes, operator, left, right)).unwrap();
+            assert_eq!(result.result_type, expected);
+            assert_eq!(result.recovery, recovery);
+            assert!(result.diagnostics.is_empty());
+        }
+        for operator in [
+            SyntaxKind::LessThanToken,
+            SyntaxKind::LessThanEqualsToken,
+            SyntaxKind::GreaterThanToken,
+            SyntaxKind::GreaterThanEqualsToken,
+            SyntaxKind::EqualsEqualsToken,
+            SyntaxKind::ExclamationEqualsToken,
+            SyntaxKind::EqualsEqualsEqualsToken,
+            SyntaxKind::ExclamationEqualsEqualsToken,
+        ] {
+            for (left, right) in [(any, number), (number, any), (any, any)] {
+                let result =
+                    check_primitive_binary(&mut store, request(nodes, operator, left, right))
+                        .unwrap();
+                assert_eq!(result.result_type, boolean);
+                assert_eq!(result.recovery, None);
+                assert!(result.diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_any_keeps_operand_diagnostics_and_invalid_operator_rejection() {
+        let parsed = parse_source_file("const value = left - right;");
+        let nodes = binary_nodes(&parsed);
+        let mut store = initialized_store();
+        let (any, boolean, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.boolean_type,
+                bootstrap.number_type,
+            )
+        };
+        for (left, right, node, code) in [
+            (any, boolean, nodes.right, 2363),
+            (boolean, any, nodes.left, 2362),
+        ] {
+            let result = check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::MinusToken, left, right),
+            )
+            .unwrap();
+            assert_eq!(result.result_type, number);
+            assert_eq!(result.recovery, None);
+            assert_eq!(result.diagnostics, [fixed_diagnostic(node, code).unwrap()]);
+        }
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusPlusToken, any, any),
+            ),
+            Err(PrimitiveBinaryError::Unsupported(
+                PrimitiveBinaryUnsupported::Operator(SyntaxKind::PlusPlusToken),
+            )),
+        );
     }
 
     #[test]
@@ -1856,21 +1962,21 @@ mod tests {
         let nodes = binary_nodes(&parsed);
         let mut store = initialized_store();
         let foreign = initialized_store();
-        let (number, any) = {
+        let (number, unknown) = {
             let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.number_type, bootstrap.any_type)
+            (bootstrap.number_type, bootstrap.unknown_type)
         };
         let foreign_number = foreign.intrinsic_bootstrap().unwrap().number_type;
 
         assert_eq!(
             check_primitive_binary(
                 &mut store,
-                request(nodes, SyntaxKind::PlusToken, any, number),
+                request(nodes, SyntaxKind::PlusToken, unknown, number),
             ),
             Err(PrimitiveBinaryError::Unsupported(
                 PrimitiveBinaryUnsupported::Operand {
                     node: nodes.left,
-                    type_: any,
+                    type_: unknown,
                 },
             ))
         );

@@ -63480,17 +63480,19 @@ mod tests {
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         assert_eq!(
             variable_value_type(&context, &source, file, "value"),
-            bootstrap.number_type,
+            bootstrap.any_type,
         );
         assert_eq!(
             variable_value_type(&context, &source, file, "key"),
             bootstrap.string_type,
         );
-        for (name, expected) in [
-            ("value", bootstrap.number_type),
-            ("key", bootstrap.string_type),
+        for (name, expected, count) in [
+            ("value", bootstrap.any_type, 6),
+            ("key", bootstrap.string_type, 4),
         ] {
-            for read in identifier_expressions(&source, file, name) {
+            let reads = identifier_expressions(&source, file, name);
+            assert_eq!(reads.len(), count);
+            for read in reads {
                 assert_eq!(resolved_node_type(&context, read), expected);
             }
         }
@@ -63521,15 +63523,14 @@ mod tests {
 
         context.check_source_file(file).unwrap();
 
-        let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 2);
-        for (diagnostic, value) in diagnostics.iter().zip(["1", "2"]) {
-            assert_eq!(diagnostic.diagnostic.code(), 2367);
-            assert_eq!(diagnostic.diagnostic.arguments, ["0", value]);
-            assert_eq!(
-                node_text(&source, diagnostic.node.unwrap()),
-                format!("value == {value}"),
-            );
+        // The unchanged empty Array interface gives any elements in the pinned checker.
+        assert!(context.diagnostics().is_empty());
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(variable_value_type(&context, &source, file, "value"), any);
+        let reads = identifier_expressions(&source, file, "value");
+        assert_eq!(reads.len(), 4);
+        for read in reads {
+            assert_eq!(resolved_node_type(&context, read), any);
         }
 
         let warm = observable_state(&context, file);
