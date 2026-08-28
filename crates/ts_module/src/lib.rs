@@ -784,13 +784,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         containing_directory: &str,
     ) -> Option<ResolvedModule> {
         for root in effective_type_roots(&self.resolver.options, containing_directory) {
-            let root = normalize_path(&root);
-            let name = if root.ends_with("/node_modules/@types") {
-                mangled_scoped_package_name(specifier)
-            } else {
-                specifier.to_owned()
-            };
-            let candidate = resolve_path(&root, &[&name]);
+            let candidate = type_root_candidate(&root, specifier);
             if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
                 resolved.is_external_library_import = true;
                 return Some(resolved);
@@ -805,7 +799,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         containing_directory: &str,
     ) -> Option<ResolvedModule> {
         for root in effective_type_roots(&self.resolver.options, containing_directory) {
-            let candidate = resolve_path(&root, &[specifier]);
+            let candidate = type_root_candidate(&root, specifier);
             if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
                 resolved.is_external_library_import = true;
                 return Some(resolved);
@@ -1486,6 +1480,17 @@ fn package_map_match<'a>(map: &'a Value, key: &str) -> Option<PackageMapMatch<'a
 fn invalid_package_path(path: &str) -> bool {
     path.split('/')
         .any(|segment| matches!(segment, "." | ".." | "node_modules"))
+}
+
+fn type_root_candidate(root: &str, specifier: &str) -> String {
+    let root = normalize_path(root);
+    let name = if root.ends_with("/node_modules/@types") || root.ends_with("/node_modules/@types/")
+    {
+        mangled_scoped_package_name(specifier)
+    } else {
+        specifier.to_owned()
+    };
+    resolve_path(&root, &[&name])
 }
 
 fn mangled_scoped_package_name(specifier: &str) -> String {
@@ -3402,6 +3407,137 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.resolved_file_name, "/custom/@scope/pkg/index.d.ts");
+    }
+
+    #[test]
+    fn ordinary_type_roots_keep_file_and_configured_root_order() {
+        let fs = fs(&[
+            ("/roots/first/pkg.d.ts", ""),
+            ("/roots/first/pkg/index.d.ts", ""),
+            ("/roots/second/pkg.d.ts", ""),
+        ]);
+        for mode in [ResolutionMode::Node10, ResolutionMode::Bundler] {
+            for (roots, expected) in [
+                (["/roots/first", "/roots/second"], "/roots/first/pkg.d.ts"),
+                (["/roots/second", "/roots/first"], "/roots/second/pkg.d.ts"),
+            ] {
+                let resolver = Resolver::new(
+                    &fs,
+                    ResolutionOptions {
+                        mode,
+                        type_roots: Some(roots.into_iter().map(str::to_owned).collect()),
+                        ..ResolutionOptions::default()
+                    },
+                );
+                for result in [
+                    resolver.resolve("pkg", "/app/main.ts"),
+                    resolver.resolve_type_reference("pkg", "/app/main.ts"),
+                ] {
+                    assert_eq!(result.resolved.unwrap().resolved_file_name, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_type_roots_use_only_the_special_at_types_spelling() {
+        for mode in [ResolutionMode::Node10, ResolutionMode::Bundler] {
+            for (root, name) in [
+                ("/custom", "@scope/pkg"),
+                ("/custom/@types", "@scope/pkg"),
+                ("/custom/node_modules", "@scope/pkg"),
+                ("/custom/node_modules/@types", "scope__pkg"),
+                ("/custom/node_modules/@types/", "scope__pkg"),
+            ] {
+                let scoped = resolve_path(root, &["@scope/pkg/index.d.ts"]);
+                let mangled = resolve_path(root, &["scope__pkg/index.d.ts"]);
+                let expected = resolve_path(root, &[name, "index.d.ts"]);
+                let fs = fs(&[(&scoped, ""), (&mangled, "")]);
+                let resolver = Resolver::new(
+                    &fs,
+                    ResolutionOptions {
+                        mode,
+                        type_roots: Some(vec![root.to_owned()]),
+                        ..ResolutionOptions::default()
+                    },
+                );
+                for result in [
+                    resolver.resolve("@scope/pkg", "/app/main.ts"),
+                    resolver.resolve_type_reference("@scope/pkg", "/app/main.ts"),
+                ] {
+                    assert_eq!(result.resolved.unwrap().resolved_file_name, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_type_roots_do_not_fall_back_to_the_other_spelling() {
+        for mode in [ResolutionMode::Node10, ResolutionMode::Bundler] {
+            for (root, wrong_name) in [
+                ("/custom", "scope__pkg"),
+                ("/custom/@types", "scope__pkg"),
+                ("/custom/node_modules/@types", "@scope/pkg"),
+                ("/custom/node_modules/@types/", "@scope/pkg"),
+            ] {
+                let wrong = resolve_path(root, &[wrong_name, "index.d.ts"]);
+                let fs = fs(&[(&wrong, "")]);
+                let resolver = Resolver::new(
+                    &fs,
+                    ResolutionOptions {
+                        mode,
+                        type_roots: Some(vec![root.to_owned()]),
+                        ..ResolutionOptions::default()
+                    },
+                );
+                assert!(
+                    resolver
+                        .resolve("@scope/pkg", "/app/main.ts")
+                        .resolved
+                        .is_none()
+                );
+                assert!(
+                    resolver
+                        .resolve_type_reference("@scope/pkg", "/app/main.ts")
+                        .resolved
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_module_and_type_roots_keep_distinct_search_priorities() {
+        let fs = fs(&[
+            ("/app/node_modules/@scope/pkg/index.d.ts", ""),
+            ("/custom/node_modules/@types/scope__pkg/index.d.ts", ""),
+        ]);
+        for mode in [ResolutionMode::Node10, ResolutionMode::Bundler] {
+            let resolver = Resolver::new(
+                &fs,
+                ResolutionOptions {
+                    mode,
+                    type_roots: Some(vec!["/custom/node_modules/@types".to_owned()]),
+                    ..ResolutionOptions::default()
+                },
+            );
+            assert_eq!(
+                resolver
+                    .resolve("@scope/pkg", "/app/main.ts")
+                    .resolved
+                    .unwrap()
+                    .resolved_file_name,
+                "/app/node_modules/@scope/pkg/index.d.ts"
+            );
+            assert_eq!(
+                resolver
+                    .resolve_type_reference("@scope/pkg", "/app/main.ts")
+                    .resolved
+                    .unwrap()
+                    .resolved_file_name,
+                "/custom/node_modules/@types/scope__pkg/index.d.ts"
+            );
+        }
     }
 
     #[test]
