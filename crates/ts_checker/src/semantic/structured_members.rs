@@ -304,7 +304,7 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
         let record = store
             .symbol(property.symbol)
             .ok_or_else(|| invalid(plan, type_))?;
-        if record.name().as_utf8() != Some(property.name.as_str())
+        if record.name() != property.name.as_ref()
             || record.parent() != Some(plan.symbol)
             || !inherited_index_infos.is_empty()
                 && (record.flags().contains(SymbolFlags::OPTIONAL) != property.optional
@@ -359,10 +359,7 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
     }
 
     for (index, property) in plan.properties.iter().enumerate() {
-        let Some(base_property) = inherited_by_name
-            .get(&EscapedName::source(&property.name))
-            .copied()
-        else {
+        let Some(base_property) = inherited_by_name.get(&property.name).copied() else {
             continue;
         };
         let own_type = *property_types
@@ -4070,8 +4067,6 @@ mod tests {
             .symbol(property_symbol)
             .unwrap()
             .name()
-            .as_utf8()
-            .unwrap()
             .to_owned();
         plan.properties = vec![PlannedProperty {
             declaration: property_declaration,
@@ -5372,7 +5367,7 @@ mod tests {
                     .string_type,
             ];
             match damage {
-                "name" => prepared.derived_plan.properties[0].name = String::from("01"),
+                "name" => prepared.derived_plan.properties[0].name = EscapedName::source("01"),
                 "optional" => prepared.derived_plan.properties[0].optional = false,
                 "foreign-type" => {
                     types[0] = fixture().store.intrinsic_bootstrap().unwrap().string_type;
@@ -6588,7 +6583,7 @@ mod tests {
                 ..ValueSymbolLinks::default()
             },
         ));
-        prepared.derived_plan.properties[0].name = "first".to_owned();
+        prepared.derived_plan.properties[0].name = EscapedName::source("first");
         let before = (
             derived_state(&prepared.fixture.store, prepared.derived_type, own),
             prepared.fixture.store.relation_state_snapshot(),

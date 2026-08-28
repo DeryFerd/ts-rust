@@ -1839,7 +1839,7 @@ pub(super) struct PlannedProperty {
     pub type_node: NodeRef,
     pub optional: bool,
     pub readonly: bool,
-    pub name: String,
+    pub name: EscapedName,
 }
 
 /// The source chosen when this provider publishes an object-literal property clone.
@@ -1874,7 +1874,7 @@ pub(super) struct PlannedObjectSpread {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedObjectProperty {
-    name: String,
+    name: EscapedName,
     type_: TypeId,
     readonly: bool,
     optional: bool,
@@ -3521,7 +3521,7 @@ fn plan_javascript_expando_object_literal(
         {
             return Err(invalid());
         }
-        let name = name.as_utf8().ok_or_else(invalid)?.to_owned();
+        let name = EscapedName::source(name.as_utf8().ok_or_else(invalid)?);
         properties.push(PlannedProperty {
             declaration,
             symbol: property,
@@ -4379,8 +4379,8 @@ pub(super) fn authenticated_react_portal_interface(
             .and_then(|symbol| store.get_merged_symbol(symbol))
             != Some(base.symbol)
         || members.len() != 2
-        || key.name != "key"
-        || children.name != "children"
+        || key.name.as_ref() != EscapedNameRef::source("key")
+        || children.name.as_ref() != EscapedNameRef::source("children")
     {
         return Ok(false);
     }
@@ -4393,7 +4393,7 @@ pub(super) fn authenticated_react_portal_interface(
             || property.readonly
             || record.flags() != SymbolFlags::PROPERTY
             || record.check_flags() != CheckFlags::NONE
-            || record.name().as_utf8() != Some(property.name.as_str())
+            || record.name() != property.name.as_ref()
             || record.declarations() != Some(&[property.declaration])
             || record.value_declaration() != Some(property.declaration)
             || record.members().is_some()
@@ -4428,9 +4428,9 @@ pub(super) fn authenticated_react_portal_interface(
         || !generic.spreads.is_empty()
         || !generic.indexes.is_empty()
         || !generic.call_signatures.is_empty()
-        || element_type.name != "type"
-        || element_props.name != "props"
-        || element_key.name != "key"
+        || element_type.name.as_ref() != EscapedNameRef::source("type")
+        || element_props.name.as_ref() != EscapedNameRef::source("props")
+        || element_key.name.as_ref() != EscapedNameRef::source("key")
         || !equivalent_merged_property_annotations(
             store,
             host,
@@ -5836,7 +5836,7 @@ pub(super) fn plan_global_array_property_augmentation(
             type_node: annotation,
             optional,
             readonly,
-            name: property_identifier.text.clone(),
+            name: EscapedName::source(&property_identifier.text),
         },
     }))
 }
@@ -6461,10 +6461,10 @@ fn materialize_global_concat_array_members(
     };
     if plan.heritage.is_some()
         || plan.properties.len() != 3
-        || plan.properties[0].name != "length"
+        || plan.properties[0].name.as_ref() != EscapedNameRef::source("length")
         || !plan.properties[0].readonly
-        || plan.properties[1].name != "join"
-        || plan.properties[2].name != "slice"
+        || plan.properties[1].name.as_ref() != EscapedNameRef::source("join")
+        || plan.properties[2].name.as_ref() != EscapedNameRef::source("slice")
         || !index.readonly
         || cached_planned_type_identity(store, index.key_type_node) != Some(number)
         || index.value_type_parameter.and_then(|symbol| {
@@ -7953,6 +7953,7 @@ fn plan_members(
     }
     let mut seen_symbols = HashSet::new();
     let mut seen_names = HashSet::new();
+    let mut computed_properties = HashSet::new();
     let mut planned_symbol_declarations = HashMap::<SemanticSymbolId, Vec<NodeRef>>::new();
     let mut properties = Vec::with_capacity(member_count);
     let mut methods = Vec::new();
@@ -8087,12 +8088,8 @@ fn plan_members(
             let accessor_symbol = store
                 .symbol(accessor.symbol)
                 .ok_or_else(|| invalid_plan(&provisional))?;
-            let property_name = accessor_symbol
-                .name()
-                .as_utf8()
-                .ok_or_else(|| invalid_plan(&provisional))?
-                .to_owned();
-            if table.and_then(|table| table.get_source(&property_name)) != Some(accessor.symbol) {
+            let property_name = accessor_symbol.name().to_owned();
+            if table.and_then(|table| table.get(property_name.as_ref())) != Some(accessor.symbol) {
                 return Err(invalid_plan(&provisional));
             }
             planned_symbol_declarations
@@ -8188,12 +8185,18 @@ fn plan_members(
             let method_record = store
                 .symbol(method.symbol)
                 .ok_or_else(|| invalid_plan(&provisional))?;
-            let property_name = method_record
-                .name()
-                .as_utf8()
-                .ok_or_else(|| invalid_plan(&provisional))?
-                .to_owned();
-            if table.and_then(|table| table.get_source(&property_name)) != Some(method.symbol) {
+            let property_name = method_record.name().to_owned();
+            if method.computed_key.is_some() {
+                if table
+                    .and_then(|table| table.get(property_name.as_ref()))
+                    .is_some()
+                {
+                    return Err(invalid_plan(&provisional));
+                }
+                computed_properties.insert(method.symbol);
+            } else if table.and_then(|table| table.get(property_name.as_ref()))
+                != Some(method.symbol)
+            {
                 return Err(invalid_plan(&provisional));
             }
             planned_symbol_declarations
@@ -8201,7 +8204,7 @@ fn plan_members(
                 .or_default()
                 .push(member);
             if seen_symbols.insert(method.symbol) {
-                if !seen_names.insert(property_name.clone()) {
+                if method.computed_key.is_none() && !seen_names.insert(property_name.clone()) {
                     return Err(invalid_plan(&provisional));
                 }
                 let NodeData::MethodSignatureDeclaration(declaration) = &member_record.data else {
@@ -8376,6 +8379,7 @@ fn plan_members(
                 });
             }
         };
+        let property_name = EscapedName::source(property_name);
         if name_record.parent != Some(member.node)
             || name_record.range.start < member_record.range.start
             || name_record.range.end > member_record.range.end
@@ -8466,7 +8470,7 @@ fn plan_members(
         if property_record.flags() != expected_flags
             || (property_record.check_flags() != CheckFlags::NONE
                 && property_record.check_flags() != expected_check_flags)
-            || property_record.name().as_utf8() != Some(property_name.as_str())
+            || property_record.name() != property_name.as_ref()
             || !declarations_valid
             || property_record.value_declaration() != symbol_declarations.first().copied()
             || property_record.members().is_some()
@@ -8476,7 +8480,7 @@ fn plan_members(
                 .parent()
                 .and_then(|parent| store.get_merged_symbol(parent))
                 != Some(symbol)
-            || table.and_then(|table| table.get_source(&property_name)) != Some(property_symbol)
+            || table.and_then(|table| table.get(property_name.as_ref())) != Some(property_symbol)
         {
             return Err(invalid_plan(&provisional));
         }
@@ -8612,6 +8616,7 @@ fn plan_members(
         table.len()
             != properties
                 .len()
+                .saturating_sub(computed_properties.len())
                 .saturating_add(reserved_index_count)
                 .saturating_add(reserved_call_count)
                 .saturating_add(parameter_count)
@@ -9728,7 +9733,11 @@ pub(super) fn plan_selected_interface_method(
             type_node: first.return_type,
             optional: first.optional,
             readonly: false,
-            name: source_record.name().escaped_display().to_string(),
+            name: store
+                .symbol(selected)
+                .ok_or_else(invalid)?
+                .name()
+                .to_owned(),
         }],
         methods,
         accessors: Vec::new(),
@@ -9900,7 +9909,7 @@ pub(super) fn publish_interface_method_names(
             kind: SyntaxKind::MethodSignature,
         });
     }
-    let (key_type, _) = resolved_computed_member_key(store, &key)
+    let (key_type, name) = resolved_computed_member_key(store, &key)
         .map_err(|_| invalid_plan(plan))?
         .ok_or(PropertyObjectError::UnsupportedMember {
             node: key.expression,
@@ -9942,6 +9951,7 @@ pub(super) fn publish_interface_method_names(
         method.symbol = symbol;
     }
     plan.properties[0].symbol = symbol;
+    plan.properties[0].name = name;
     Ok(())
 }
 
@@ -14427,7 +14437,7 @@ fn object_literal_property_types(
     let mut seen = HashSet::with_capacity(property_symbols.len());
     let mut property_types = Vec::with_capacity(property_symbols.len());
     for (property, cloned_symbol) in plan.properties.iter().zip(property_symbols) {
-        if !seen.insert(*cloned_symbol) || table.get_source(&property.name) != Some(*cloned_symbol)
+        if !seen.insert(*cloned_symbol) || table.get(property.name.as_ref()) != Some(*cloned_symbol)
         {
             return None;
         }
@@ -14456,7 +14466,7 @@ fn valid_object_literal_property(
     let cloned = store.symbol(cloned_symbol)?;
     if bound.flags() != SymbolFlags::PROPERTY
         || bound.check_flags() != CheckFlags::NONE
-        || bound.name().as_utf8() != Some(property.name.as_str())
+        || bound.name() != property.name.as_ref()
         || bound.declarations() != Some(&[property.declaration])
         || bound.value_declaration() != Some(property.declaration)
         || bound.members().is_some()
@@ -14568,7 +14578,7 @@ fn validated_synthetic_object_properties(
             return None;
         }
         resolved.push(ResolvedObjectProperty {
-            name: name.to_owned(),
+            name: EscapedName::source(name),
             type_,
             readonly: property.check_flags().contains(CheckFlags::READONLY),
             optional: property.flags().contains(SymbolFlags::OPTIONAL),
@@ -14663,7 +14673,7 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
             };
             return matches!(
                 super::declared_values::selected_declared_property(
-                    store, receiver, EscapedNameRef::source(&property.name),
+                    store, receiver, property.name.as_ref(),
                 ),
                 Ok(Some(super::declared_values::SelectedDeclaredProperty::Resolved(selected)))
                     if selected.symbol == property.symbol
@@ -14903,9 +14913,9 @@ fn valid_planned_call_signature_set(
                     .iter()
                     .any(PlannedCallSignature::is_construct))
         && plan.properties.iter().all(|property| {
-            members.get_source(&property.name) == Some(property.symbol)
+            members.get(property.name.as_ref()) == Some(property.symbol)
                 && store.symbol(property.symbol).is_some_and(|record| {
-                    record.name().as_utf8() == Some(property.name.as_str())
+                    record.name() == property.name.as_ref()
                         && store.get_parent_of_symbol(property.symbol) == Some(plan.symbol)
                         && store.get_merged_symbol(property.symbol) == Some(property.symbol)
                 })
@@ -16604,7 +16614,7 @@ fn publish_generic_interface_declared_members_worker(
                     };
                     declared_members
                         .and_then(|members| store.symbol_table(members))
-                        .and_then(|members| members.get_source(&property.name))
+                        .and_then(|members| members.get(property.name.as_ref()))
                         == Some(property.symbol)
                         && expected_type.is_some_and(|type_| {
                             store.value_symbol_links(property.symbol)
@@ -16728,7 +16738,7 @@ fn publish_generic_interface_declared_members_worker(
         assert_eq!(
             store.insert_symbol(
                 declared_members.expect("a generic property owns a declared member table"),
-                EscapedName::source(&property.name),
+                property.name.clone(),
                 property.symbol,
             ),
             Some(None)
@@ -17049,7 +17059,7 @@ fn valid_generic_publication_target(
                     .methods
                     .iter()
                     .any(|planned| planned.symbol == property.symbol)
-            || record.name().as_utf8() != Some(property.name.as_str())
+            || record.name() != property.name.as_ref()
             || property_declarations.first().copied() != Some(property.declaration)
             || record.value_declaration() != Some(property.declaration)
             || store.get_parent_of_symbol(property.symbol) != Some(plan.symbol)
@@ -17067,7 +17077,7 @@ fn valid_generic_publication_target(
             || store.source_node_parent(property.type_node)
                 != Some(SourceNodeParent::Parent(property.declaration))
             || !symbols.insert(property.symbol)
-            || !names.insert(property.name.as_str())
+            || !names.insert(property.name.as_ref())
         {
             return false;
         }
@@ -17290,7 +17300,7 @@ fn valid_generic_structured_members(
     let mut names = plan
         .properties
         .iter()
-        .map(|property| EscapedName::source(&property.name))
+        .map(|property| property.name.clone())
         .collect::<HashSet<_>>();
     let mut expected_indexes = interface
         .declared_index_infos
@@ -17413,7 +17423,7 @@ fn valid_bound_object_literal_property(
     store.get_merged_symbol(property.symbol) == Some(property.symbol)
         && bound.flags() == SymbolFlags::PROPERTY
         && bound.check_flags() == CheckFlags::NONE
-        && bound.name().as_utf8() == Some(property.name.as_str())
+        && bound.name() == property.name.as_ref()
         && bound.declarations() == Some(&[property.declaration])
         && bound.value_declaration() == Some(property.declaration)
         && bound.members().is_none()
@@ -17429,7 +17439,7 @@ fn valid_bound_object_literal_property(
         && plan
             .members
             .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get_source(&property.name))
+            .and_then(|members| members.get(property.name.as_ref()))
             == Some(property.symbol)
 }
 
@@ -17466,10 +17476,10 @@ fn publish_synthetic_object_literal(
     properties: &[ResolvedObjectProperty],
 ) -> Result<TypeId, PropertyObjectError> {
     if properties.iter().any(|property| {
-        let name = EscapedName::source(&property.name);
-        name.as_ref().is_reserved_member_name()
-            || name.as_ref().is_private_identifier()
-            || name.as_ref().is_late_bound()
+        let name = property.name.as_ref();
+        name.is_reserved_member_name()
+            || name.is_private_identifier()
+            || name.is_late_bound()
             || store.type_payload(property.type_).is_none()
     }) {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
@@ -17499,7 +17509,7 @@ fn publish_synthetic_object_literal(
             };
         let symbol = store.alloc_transient_symbol(
             flags,
-            EscapedName::source(&property.name),
+            property.name.clone(),
             source_property_check_flags(property.readonly),
         );
         assert!(store.set_value_symbol_links(
@@ -17510,7 +17520,7 @@ fn publish_synthetic_object_literal(
             },
         ));
         assert_eq!(
-            store.insert_symbol(members, EscapedName::source(&property.name), symbol),
+            store.insert_symbol(members, property.name.clone(), symbol),
             Some(None)
         );
         symbols.push(symbol);
@@ -17642,7 +17652,7 @@ pub(super) fn publish_object_literal(
         };
         assert!(store.set_value_symbol_links(cloned, links));
         assert_eq!(
-            store.insert_symbol(members, EscapedName::source(&property.name), cloned),
+            store.insert_symbol(members, property.name.clone(), cloned),
             Some(None)
         );
         assert!(store.record_object_literal_property_clone_origin(
@@ -17795,7 +17805,7 @@ fn projected_spread_donor_properties(
             return None;
         }
         result.push(ResolvedObjectProperty {
-            name: name.to_owned(),
+            name: EscapedName::source(name),
             type_,
             readonly: property.check_flags().contains(CheckFlags::READONLY),
             optional: property.flags().contains(SymbolFlags::OPTIONAL),
@@ -18049,7 +18059,7 @@ fn validated_source_object_spread_donor(
             return None;
         }
         result.push(ResolvedObjectProperty {
-            name: name.to_owned(),
+            name: EscapedName::source(name),
             type_: property_type,
             readonly: property.check_flags().contains(CheckFlags::READONLY),
             optional: false,
@@ -18177,7 +18187,7 @@ fn validated_javascript_expando_spread_donor(
             return None;
         }
         result.push(ResolvedObjectProperty {
-            name: name.to_owned(),
+            name: EscapedName::source(name),
             type_: property_type,
             readonly: false,
             optional: false,
@@ -18307,7 +18317,7 @@ fn validated_module_namespace_spread_donor(
             return None;
         }
         result.push(ResolvedObjectProperty {
-            name: name.to_owned(),
+            name: EscapedName::source(name),
             type_: property_type,
             readonly: false,
             optional: false,
@@ -18329,7 +18339,7 @@ fn validated_generic_interface_spread_donor(
 
     for symbol in members.properties() {
         let property = store.symbol(*symbol)?;
-        let name = property.name().as_utf8()?.to_owned();
+        let name = EscapedName::source(property.name().as_utf8()?);
         let readonly = property.check_flags().contains(CheckFlags::READONLY);
         if !property.flags().contains(SymbolFlags::PROPERTY)
             || property.flags().contains(SymbolFlags::OPTIONAL)
@@ -18411,7 +18421,7 @@ fn validate_union_spread_donor(
     };
     let constituents = union.union.types.clone();
     let mut entries = Vec::<(ResolvedObjectProperty, Vec<TypeId>, usize)>::new();
-    let mut positions = HashMap::<String, usize>::new();
+    let mut positions = HashMap::<EscapedName, usize>::new();
     let mut object_constituents = 0usize;
     for constituent in constituents.iter().copied() {
         if spread_union_empty_constituent(store, constituent) {
@@ -18551,7 +18561,7 @@ fn merge_spread_property(
     global_types: Option<&CanonicalGlobalTypes>,
     node: NodeRef,
     properties: &mut Vec<ResolvedObjectProperty>,
-    positions: &mut HashMap<String, usize>,
+    positions: &mut HashMap<EscapedName, usize>,
     property: ResolvedObjectProperty,
 ) -> Result<(), PropertyObjectError> {
     if let Some(index) = positions.get(&property.name).copied() {
@@ -20525,7 +20535,7 @@ mod generic_publication_tests {
         .expect("the source property must augment the initialized Array target");
 
         assert_eq!(plan.target, fixture.global_types.array_type);
-        assert_eq!(plan.property.name, "split");
+        assert_eq!(plan.property.name, EscapedName::source("split"));
         assert_eq!(
             fixture.store.source_node_kind(plan.property.type_node),
             Some(SyntaxKind::FunctionType),
@@ -20822,7 +20832,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["first", "last"],
         );
@@ -20963,31 +20973,31 @@ mod generic_publication_tests {
             validated_synthetic_object_properties(&fixture.store, result),
             Some(vec![
                 ResolvedObjectProperty {
-                    name: "start".to_owned(),
+                    name: EscapedName::source("start"),
                     type_: zero,
                     readonly: true,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "shared".to_owned(),
+                    name: EscapedName::source("shared"),
                     type_: boolean,
                     readonly: true,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "first".to_owned(),
+                    name: EscapedName::source("first"),
                     type_: number,
                     readonly: true,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "second".to_owned(),
+                    name: EscapedName::source("second"),
                     type_: number,
                     readonly: true,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "last".to_owned(),
+                    name: EscapedName::source("last"),
                     type_: four,
                     readonly: true,
                     optional: false,
@@ -21078,19 +21088,19 @@ mod generic_publication_tests {
             validated_synthetic_object_properties(&fixture.store, result),
             Some(vec![
                 ResolvedObjectProperty {
-                    name: "shared".to_owned(),
+                    name: EscapedName::source("shared"),
                     type_: shared,
                     readonly: true,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "left".to_owned(),
+                    name: EscapedName::source("left"),
                     type_: string,
                     readonly: true,
                     optional: true,
                 },
                 ResolvedObjectProperty {
-                    name: "right".to_owned(),
+                    name: EscapedName::source("right"),
                     type_: boolean,
                     readonly: true,
                     optional: true,
@@ -21223,7 +21233,7 @@ mod generic_publication_tests {
         assert_eq!(
             validated_synthetic_object_properties(&fixture.store, result),
             Some(vec![ResolvedObjectProperty {
-                name: "value".to_owned(),
+                name: EscapedName::source("value"),
                 type_: combined,
                 readonly: true,
                 optional: false,
@@ -21281,19 +21291,19 @@ mod generic_publication_tests {
             validated_synthetic_object_properties(&fixture.store, result),
             Some(vec![
                 ResolvedObjectProperty {
-                    name: "value".to_owned(),
+                    name: EscapedName::source("value"),
                     type_: number,
                     readonly: false,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "run".to_owned(),
+                    name: EscapedName::source("run"),
                     type_: callable,
                     readonly: false,
                     optional: false,
                 },
                 ResolvedObjectProperty {
-                    name: "indexed".to_owned(),
+                    name: EscapedName::source("indexed"),
                     type_: number,
                     readonly: false,
                     optional: false,
@@ -21670,7 +21680,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["property", "literal", "2", "template", "i\u{307}spanyol"]
         );
@@ -21788,7 +21798,7 @@ mod generic_publication_tests {
         assert_eq!(
             validated_synthetic_object_properties(&fixture.store, inner_type),
             Some(vec![ResolvedObjectProperty {
-                name: "nested".to_owned(),
+                name: EscapedName::source("nested"),
                 type_: one,
                 readonly: true,
                 optional: false,
@@ -21797,7 +21807,7 @@ mod generic_publication_tests {
         assert_eq!(
             validated_synthetic_object_properties(&fixture.store, outer_type),
             Some(vec![ResolvedObjectProperty {
-                name: "item".to_owned(),
+                name: EscapedName::source("item"),
                 type_: inner_type,
                 readonly: true,
                 optional: false,
@@ -21841,7 +21851,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             [
                 "new", "delete", "break", "continue", "count", "enabled", "total"
@@ -21896,7 +21906,7 @@ mod generic_publication_tests {
                 SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
             );
             assert_eq!(property.check_flags(), CheckFlags::READONLY);
-            assert_eq!(property.name().as_utf8(), Some(planned.name.as_str()));
+            assert_eq!(property.name(), planned.name.as_ref());
             assert_eq!(property.declarations(), Some(&[planned.declaration][..]));
             assert_eq!(
                 fixture.store.value_symbol_links(*symbol),
@@ -22124,7 +22134,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             [
                 "quoted",
@@ -23367,7 +23377,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["value", "callback", "run"],
         );
@@ -24005,7 +24015,7 @@ mod generic_publication_tests {
             let [property] = plan.properties.as_slice() else {
                 panic!("merged accessor declarations retain exactly one property")
             };
-            assert_eq!(property.name, "value");
+            assert_eq!(property.name, EscapedName::source("value"));
             assert!(!property.optional);
             assert!(!property.readonly);
             assert!(plan.accessor_write_type_node(property.symbol).is_some());
@@ -24079,7 +24089,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["read", "write", "separate"],
         );
@@ -25156,7 +25166,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["first", "reset", "run", "last"],
         );
@@ -27854,7 +27864,7 @@ mod generic_publication_tests {
         let plan = plan_interface(&fixture.store, &host, derived).unwrap();
 
         assert_eq!(plan.properties.len(), 1);
-        assert_eq!(plan.properties[0].name, "own");
+        assert_eq!(plan.properties[0].name, EscapedName::source("own"));
         assert_eq!(
             plan.heritage
                 .as_ref()
@@ -28499,7 +28509,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["first", "shared", "second"]
         );
@@ -28579,7 +28589,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["first", "second"],
         );
@@ -28715,7 +28725,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["first", "shared", "second"],
         );
@@ -30034,7 +30044,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["id", "title"],
         );
@@ -30515,7 +30525,7 @@ mod generic_publication_tests {
         assert_eq!(base.kind, DirectInterfaceBaseKind::Interface);
         assert_eq!(base.type_arguments.len(), 1);
         assert_eq!(plan.properties.len(), 1);
-        assert_eq!(plan.properties[0].name, "own");
+        assert_eq!(plan.properties[0].name, EscapedName::source("own"));
         assert_eq!(
             (
                 fixture.store.type_len(),
@@ -31280,7 +31290,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["key", "ns:thing"]
         );
@@ -31735,7 +31745,7 @@ mod generic_publication_tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["key", "ns:thing"],
         );

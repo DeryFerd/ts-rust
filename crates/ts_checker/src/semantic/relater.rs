@@ -576,8 +576,12 @@ impl ResolvedDeclaredPropertyObject {
     }
 
     pub(super) fn get_source(&self, name: &str) -> Option<&ResolvedDeclaredProperty> {
+        self.get(EscapedNameRef::source(name))
+    }
+
+    pub(super) fn get(&self, name: EscapedNameRef<'_>) -> Option<&ResolvedDeclaredProperty> {
         self.by_name
-            .get(&EscapedName::source(name))
+            .get(name.as_bytes())
             .map(|index| &self.properties[*index])
     }
 }
@@ -6777,7 +6781,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let mut properties = Vec::with_capacity(plan.properties.len());
             let mut by_name = HashMap::with_capacity(plan.properties.len());
             for (property, property_type) in plan.properties.into_iter().zip(property_types) {
-                let name = EscapedName::source(&property.name);
+                let name = property.name;
                 let index = properties.len();
                 if by_name.insert(name.clone(), index).is_some() {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));

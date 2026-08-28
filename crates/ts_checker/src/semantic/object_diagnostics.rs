@@ -415,15 +415,18 @@ fn elaborate_known_properties(
         if checked_property.result != source_property_type {
             return Err(invalid_structure(checked.result));
         }
-        let Some(target_property) = target.get_source(&source_property.name) else {
+        let Some(target_property) = target.get(source_property.name.as_ref()) else {
             if let Some(indexed_target) = indexed_target {
+                let name = source_property.name.as_utf8().ok_or(
+                    RelationUnavailable::UnsupportedProperty(source_property.symbol),
+                )?;
                 diagnostics.extend(elaborate_indexed_property(
                     store,
                     host,
                     global_types,
                     source_expression,
                     checked_property,
-                    &source_property.name,
+                    name,
                     source_property.name_node,
                     source_property_type,
                     indexed_target,
@@ -603,13 +606,17 @@ fn elaborate_indexed_properties(
         .zip(source_types)
         .enumerate()
     {
+        let name = property
+            .name
+            .as_utf8()
+            .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
         diagnostics.extend(elaborate_indexed_property(
             store,
             host,
             global_types,
             expression,
             &checked[index],
-            &property.name,
+            name,
             property.name_node,
             *source_type,
             target,
@@ -748,12 +755,11 @@ fn shape_or_generic_diagnostic(
     let source_names = plan
         .properties
         .iter()
-        .map(|property| property.name.as_str())
+        .map(|property| property.name.as_ref())
         .collect::<HashSet<_>>();
     let mut missing = Vec::new();
     for property in target.properties() {
-        let name = property_name(property)?;
-        if !property.optional && !source_names.contains(name) {
+        if !property.optional && !source_names.contains(&property.name.as_ref()) {
             missing.push(property);
         }
     }
@@ -791,11 +797,12 @@ fn first_excess_property<'source>(
 ) -> Result<Option<&'source super::object_members::PlannedProperty>, SourceCheckError> {
     let index = declared_index_target(store, host, target_type)?;
     for property in &source.properties {
-        if target.get_source(&property.name).is_some() {
+        if target.get(property.name.as_ref()).is_some() {
             continue;
         }
         if let Some(index) = index
-            && declared_index_accepts_name(store, index, &property.name)?
+            && let Some(name) = property.name.as_utf8()
+            && declared_index_accepts_name(store, index, name)?
         {
             continue;
         }
@@ -844,7 +851,14 @@ fn discriminated_union_excess_property_diagnostic(
         let Some(source_type) = literal_discriminant_type(store, expression) else {
             continue;
         };
-        if !is_discriminant_property(store, &targets, &source_property.name)? {
+        let name =
+            source_property
+                .name
+                .as_utf8()
+                .ok_or(RelationUnavailable::UnsupportedProperty(
+                    source_property.symbol,
+                ))?;
+        if !is_discriminant_property(store, &targets, name)? {
             continue;
         }
 
@@ -854,7 +868,7 @@ fn discriminated_union_excess_property_diagnostic(
             if !included[index] {
                 continue;
             }
-            let Some(property) = target.get_source(&source_property.name) else {
+            let Some(property) = target.get(source_property.name.as_ref()) else {
                 continue;
             };
             if store.is_type_assignable_to_with_global_types(
@@ -974,8 +988,12 @@ fn excess_property_diagnostic(
         target_type,
         flags,
     )?;
+    let name = excess
+        .name
+        .as_utf8()
+        .ok_or(RelationUnavailable::UnsupportedProperty(excess.symbol))?;
     let suggestion = get_spelling_suggestion(
-        &excess.name,
+        name,
         target.properties().iter().enumerate(),
         |candidate| candidate.1.name.as_utf8(),
         |left, right| left.0.cmp(&right.0),
@@ -986,12 +1004,12 @@ fn excess_property_diagnostic(
         Some(suggestion) => primary(
             2561,
             excess.name_node,
-            vec![excess.name.clone(), target_display, suggestion],
+            vec![name.to_owned(), target_display, suggestion],
         ),
         None => primary(
             2353,
             excess.name_node,
-            vec![excess.name.clone(), target_display],
+            vec![name.to_owned(), target_display],
         ),
     }
 }
@@ -2362,7 +2380,7 @@ fn resolved_source_property_types(
         .ok_or_else(|| invalid_structure(source_type))?;
     let mut property_types = Vec::with_capacity(property_symbols.len());
     for (planned, symbol) in plan.properties.iter().zip(property_symbols) {
-        if table.get_source(&planned.name) != Some(symbol) {
+        if table.get(planned.name.as_ref()) != Some(symbol) {
             return Err(invalid_structure(source_type));
         }
         let links = store

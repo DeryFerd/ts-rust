@@ -4756,7 +4756,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let [property] = literal.properties.as_slice() else {
             return Ok(false);
         };
-        Ok(property.name == key_data.text
+        Ok(property.name.as_utf8() == Some(key_data.text.as_str())
             && !literal.methods.is_empty()
             && literal
                 .methods
@@ -23461,7 +23461,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             .and_then(|record| record.data().structured())
                             .and_then(|structured| structured.members)
                             .and_then(|members| self.store.symbol_table(members))
-                            .and_then(|members| members.get_source(&property.name));
+                            .and_then(|members| members.get(property.name.as_ref()));
                         if let Some(inherited) = inherited {
                             let reference = if !base.type_arguments.is_empty() {
                                 Some(type_)
@@ -23704,11 +23704,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .iter()
                 .filter(|property| property.type_node == property.name_node)
             {
+                let name = property.name.as_utf8().ok_or_else(|| {
+                    property_object_error(PropertyObjectError::InvalidInterfaceSymbol(symbol))
+                })?;
                 self.diagnostics.lookup_or_issue(
                     Some(property.name_node),
                     Diagnostic::with_arguments(
                         message_by_code(7008).expect("TS7008 is in the diagnostic catalog"),
-                        [property.name.as_str(), "any"],
+                        [name, "any"],
                     ),
                 );
             }
@@ -28482,7 +28485,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let mut properties = interface
             .properties
             .iter()
-            .filter(|property| property.name == "type" && !property.optional);
+            .filter(|property| property.name.as_utf8() == Some("type") && !property.optional);
         let property = properties.next()?;
         if interface.symbol != owner || properties.next().is_some() {
             return None;
@@ -51127,7 +51130,7 @@ mod tests {
             model_plan
                 .properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["id", "optional", "nested"]
         );
@@ -51135,7 +51138,7 @@ mod tests {
             shape_plan
                 .properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["first", "second", "nested"]
         );
@@ -51166,7 +51169,7 @@ mod tests {
                 let NodeData::Identifier(identifier) = &name.data else {
                     panic!("planned property name must remain an identifier")
                 };
-                assert_eq!(identifier.text, property.name);
+                assert_eq!(Some(identifier.text.as_str()), property.name.as_utf8());
                 assert_eq!(name.parent, Some(property.declaration.node));
             }
         }
@@ -51641,7 +51644,7 @@ mod tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["label", "value", "stable"],
         );
@@ -51726,7 +51729,7 @@ mod tests {
             assert_eq!(record.check_flags(), expected_checks);
             assert_eq!(record.value_declaration(), Some(property.declaration));
             assert_eq!(record.parent(), Some(plan.symbol));
-            assert_eq!(table.get_source(&property.name), Some(property.symbol));
+            assert_eq!(table.get(property.name.as_ref()), Some(property.symbol));
             assert_eq!(
                 fixture
                     .files
@@ -51863,7 +51866,11 @@ mod tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| (property.name.as_str(), property.optional, property.readonly))
+                .map(|property| (
+                    property.name.as_utf8().unwrap(),
+                    property.optional,
+                    property.readonly
+                ))
                 .collect::<Vec<_>>(),
             [("label", true, true), ("enabled", false, false)],
         );

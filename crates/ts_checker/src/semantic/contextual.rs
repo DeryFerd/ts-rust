@@ -620,10 +620,14 @@ fn prepare_expression(
             )?;
             let mut prepared = Vec::with_capacity(properties.len());
             for (property, expression) in plan.properties.iter().zip(properties) {
+                let name = property
+                    .name
+                    .as_utf8()
+                    .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
                 let property_context = contextual_property_type(
                     store,
                     &contextual,
-                    &property.name,
+                    name,
                     expression,
                     state.current_flow_types,
                 )?;
@@ -728,11 +732,15 @@ fn contextual_objects(
             }
         }
         for (property, expression) in source_properties.iter().zip(expressions) {
+            let name = property
+                .name
+                .as_utf8()
+                .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
             let discriminates = candidates.iter().try_fold(false, |found, candidate| {
                 if found {
                     return Ok::<_, SourceCheckError>(true);
                 }
-                let Some(target) = candidate.get_source(&property.name) else {
+                let Some(target) = candidate.get_source(name) else {
                     return Ok(false);
                 };
                 Ok(
@@ -746,7 +754,7 @@ fn contextual_objects(
             let retained = candidates
                 .iter()
                 .filter_map(|candidate| {
-                    let Some(target) = candidate.get_source(&property.name) else {
+                    let Some(target) = candidate.get_source(name) else {
                         return Some(Ok(candidate.clone()));
                     };
                     match source_matches_discriminant(store, expression, target, current_flow_types)
@@ -2423,7 +2431,7 @@ mod tests {
         assert_eq!(
             plan.properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["second", "first"],
         );

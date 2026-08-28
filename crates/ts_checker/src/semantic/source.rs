@@ -4819,7 +4819,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         || !bindings.iter().any(|binding| {
                             self.node(binding.name).is_ok_and(|record| {
                                 matches!(&record.data, NodeData::Identifier(name)
-                                    if name.text == property.name)
+                                    if property.name.as_utf8() == Some(name.text.as_str()))
                             })
                         })
                     {
@@ -10526,7 +10526,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             (first_kind.is_keyword_type()
                 && second_kind.is_keyword_type()
                 && first_kind != second_kind)
-                .then_some(first_property.name.clone())
+                .then(|| first_property.name.as_utf8().map(str::to_owned))
+                .flatten()
         });
         let Some(property_name) = conflict else {
             return Ok(None);
