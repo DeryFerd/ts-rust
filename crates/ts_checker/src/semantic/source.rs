@@ -29572,6 +29572,30 @@ fn check_planned_class_body(
                 return Err(SourceCheckError::Class(parameter.declaration));
             }
             publish_expression_type(store, parameter.name_node, type_)?;
+            if options.no_implicit_any
+                && matches!(body.kind, ClassBodyKind::Method { .. })
+                && parameter.annotation.is_none()
+                && parameter.initializer.is_none()
+            {
+                let Some(NodeData::Identifier(identifier)) =
+                    host.node(parameter.name_node).map(|node| &node.data)
+                else {
+                    return Err(SourceCheckError::Class(parameter.declaration));
+                };
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(parameter.declaration),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(7006)
+                                .ok_or(SourceCheckError::MissingDiagnostic(7006))?,
+                            [identifier.text.as_str(), "any"],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+            }
         }
         let flow = ClassInitializationFrame::new(body, &planned.flow, bound, access.clone(), base)
             .map_err(|error| class_body_flow_error(body.declaration, error))?;

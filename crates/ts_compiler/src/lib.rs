@@ -6657,11 +6657,14 @@ impl Program {
             });
         }
         if is_javascript {
+            let check_js = source_check_js_directive(&source_text).unwrap_or(self.options.check_js);
             self.diagnostics.extend(javascript_syntax_diagnostics(
                 file_name,
                 &parse,
-                !source_check_js_directive(&source_text).unwrap_or(self.options.check_js)
-                    && !self.options.experimental_decorators,
+                !self.options.experimental_decorators
+                    && (!check_js
+                        || self.checker == ProgramChecker::Canonical && !self.options.no_check),
+                check_js,
             ));
         }
         let index = self.source_files.len();
@@ -10922,6 +10925,7 @@ fn javascript_syntax_diagnostics(
     file_name: &str,
     parse: &ParseResult,
     report_parameter_decorators: bool,
+    check_js: bool,
 ) -> Vec<ProgramDiagnostic> {
     const JSDOC_OR_REPARSED: u32 = (1 << 22) | NodeFlags::REPARSED.0;
     let source_node = |id| {
@@ -10988,7 +10992,15 @@ fn javascript_syntax_diagnostics(
                             .iter()
                             .find(|node| node.kind == SyntaxKind::Decorator)
                     {
-                        report(decorator.range, 1206, &[]);
+                        let range = if check_js {
+                            TextRange::new(
+                                decorator.range.start,
+                                TextPos::new(decorator.range.start.get() + 1),
+                            )
+                        } else {
+                            decorator.range
+                        };
+                        report(range, 1206, &[]);
                     }
                 }
             }

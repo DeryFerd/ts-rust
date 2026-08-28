@@ -942,7 +942,7 @@ pub(super) fn plan_source_class_members(
                             name_node: NodeRef::new(member.arena, member.file, data.name),
                             symbol: parameter.symbol,
                             property_symbol: None,
-                            annotation: Some(parameter.type_node),
+                            annotation: parameter.type_node,
                             initializer: None,
                             type_: parameter.type_,
                             optional: false,
@@ -1667,11 +1667,13 @@ fn validate_source_class_stored_layout(
                     resolved_type: Some(parameter.type_),
                     ..ValueSymbolLinks::default()
                 })
-                || store.type_node_links(parameter.type_node)
-                    != Some(&TypeNodeLinks {
-                        resolved_type: Some(parameter.type_),
-                        ..TypeNodeLinks::default()
-                    })
+                || parameter.type_node.is_some_and(|node| {
+                    store.type_node_links(node)
+                        != Some(&TypeNodeLinks {
+                            resolved_type: Some(parameter.type_),
+                            ..TypeNodeLinks::default()
+                        })
+                })
             {
                 return Err(reject());
             }
@@ -2074,13 +2076,15 @@ pub(super) fn prepare_source_class_members(
             )
             .expect("source method signature capacity was reserved");
         for parameter in &method.method.parameters {
-            assert!(store.set_type_node_links(
-                parameter.type_node,
-                TypeNodeLinks {
-                    resolved_type: Some(parameter.type_),
-                    ..TypeNodeLinks::default()
-                }
-            ));
+            if let Some(type_node) = parameter.type_node {
+                assert!(store.set_type_node_links(
+                    type_node,
+                    TypeNodeLinks {
+                        resolved_type: Some(parameter.type_),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
             assert!(store.set_value_symbol_links(
                 parameter.symbol,
                 ValueSymbolLinks {
@@ -4490,7 +4494,7 @@ struct ClassMethodPrivateTaggedCallPlan {
 struct ClassMethodParameterPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
-    type_node: NodeRef,
+    type_node: Option<NodeRef>,
     type_: TypeId,
 }
 
@@ -8050,6 +8054,12 @@ fn plan_class_method_parameter_with_body_mode(
     let NodeData::ParameterDeclaration(data) = &record.data else {
         return Err(reject());
     };
+    let javascript = source_body
+        && host.bound_file(parameter).is_some_and(|bound| {
+            bound
+                .source_facts()
+                .is_some_and(|facts| facts.is_javascript_file() && !facts.is_declaration_file())
+        });
     if record.kind != SyntaxKind::Parameter
         || record.flags.0 != 0
         || record.parent != Some(method.node)
@@ -8061,7 +8071,6 @@ fn plan_class_method_parameter_with_body_mode(
         || data.question_token.is_some()
         || data.symbol.is_some()
         || data.facts != 0
-        || data.modifiers.is_some()
     {
         return Err(reject());
     }
@@ -8083,27 +8092,72 @@ fn plan_class_method_parameter_with_body_mode(
         return Err(reject());
     }
 
-    let Some(type_node) = data.type_ else {
+    if let Some(modifiers) = &data.modifiers {
+        if !javascript
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifiers.list.nodes.is_empty()
+            || modifiers.list.range.start < record.range.start
+            || modifiers.list.range.end > name_record.range.start
+        {
+            return Err(reject());
+        }
+        let mut previous_end = record.range.start;
+        for &decorator in &modifiers.list.nodes {
+            let decorator = NodeRef::new(parameter.arena, parameter.file, decorator);
+            let decorator_record = preflight_node(store, host, decorator)?;
+            let NodeData::Decorator(decorator_data) = &decorator_record.data else {
+                return Err(reject());
+            };
+            let expression =
+                NodeRef::new(parameter.arena, parameter.file, decorator_data.expression);
+            let expression_record = preflight_node(store, host, expression)?;
+            if decorator_record.kind != SyntaxKind::Decorator
+                || decorator_record.flags.0 != 0
+                || decorator_record.parent != Some(parameter.node)
+                || decorator_record.range.start < previous_end
+                || decorator_record.range.end > name_record.range.start
+                || decorator_data.facts != 0
+                || expression_record.parent != Some(decorator.node)
+                || expression_record.range.start <= decorator_record.range.start
+                || expression_record.range.end != decorator_record.range.end
+            {
+                return Err(reject());
+            }
+            previous_end = decorator_record.range.end;
+        }
+    }
+
+    let (type_node, type_) = if let Some(type_node) = data.type_ {
+        let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
+        let type_record = preflight_node(store, host, type_node)?;
+        if type_record.flags.0 != 0
+            || type_record.parent != Some(parameter.node)
+            || type_record.range.start < name_record.range.end
+            || type_record.range.end != record.range.end
+            || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+        {
+            return Err(reject());
+        }
+        let type_ =
+            primitive_keyword_type(store, type_node, type_record.kind).map_err(|error| {
+                if matches!(error, ClassError::Unsupported(_)) {
+                    reject()
+                } else {
+                    error
+                }
+            })?;
+        validate_index_type_cache(store, type_node, type_)?;
+        (Some(type_node), type_)
+    } else if javascript && name_record.range.end == record.range.end {
+        let any = store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(parameter)))?
+            .any_type;
+        (None, any)
+    } else {
         return Err(reject());
     };
-    let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
-    let type_record = preflight_node(store, host, type_node)?;
-    if type_record.flags.0 != 0
-        || type_record.parent != Some(parameter.node)
-        || type_record.range.start < name_record.range.end
-        || type_record.range.end != record.range.end
-        || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
-    {
-        return Err(reject());
-    }
-    let type_ = primitive_keyword_type(store, type_node, type_record.kind).map_err(|error| {
-        if matches!(error, ClassError::Unsupported(_)) {
-            reject()
-        } else {
-            error
-        }
-    })?;
-    validate_index_type_cache(store, type_node, type_)?;
 
     let symbol = bound_symbol(store, host, parameter)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
@@ -14045,12 +14099,14 @@ fn exact_method_value(
                             && store.source_node_parent(parameter.declaration)
                                 == Some(SourceNodeParent::Parent(declaration))
                             && store.source_direct_type_annotation(parameter.declaration)
-                                == Some(parameter.type_node)
-                            && store.type_node_links(parameter.type_node)
-                                == Some(&TypeNodeLinks {
-                                    resolved_type: Some(parameter.type_),
-                                    ..TypeNodeLinks::default()
-                                })
+                                == parameter.type_node
+                            && parameter.type_node.is_none_or(|node| {
+                                store.type_node_links(node)
+                                    == Some(&TypeNodeLinks {
+                                        resolved_type: Some(parameter.type_),
+                                        ..TypeNodeLinks::default()
+                                    })
+                            })
                             && store.value_symbol_links(parameter.symbol)
                                 == Some(&ValueSymbolLinks {
                                     resolved_type: Some(parameter.type_),
@@ -14284,7 +14340,9 @@ fn validate_method_cache_state(
         }
     }
     for parameter in &method.parameters {
-        validate_index_type_cache(store, parameter.type_node, parameter.type_)?;
+        if let Some(type_node) = parameter.type_node {
+            validate_index_type_cache(store, type_node, parameter.type_)?;
+        }
         if store
             .value_symbol_links(parameter.symbol)
             .is_some_and(|links| {
@@ -23600,13 +23658,15 @@ fn publish_class_method_callable(
         ));
     }
     for parameter in &method.parameters {
-        assert!(store.set_type_node_links(
-            parameter.type_node,
-            TypeNodeLinks {
-                resolved_type: Some(parameter.type_),
-                ..TypeNodeLinks::default()
-            },
-        ));
+        if let Some(type_node) = parameter.type_node {
+            assert!(store.set_type_node_links(
+                type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+        }
         assert!(store.set_value_symbol_links(
             parameter.symbol,
             ValueSymbolLinks {
@@ -24214,7 +24274,8 @@ pub(super) fn execute_nongeneric_class_members(
         .methods
         .iter()
         .flat_map(|method| &method.parameters)
-        .filter(|parameter| store.type_node_links(parameter.type_node).is_none())
+        .filter_map(|parameter| parameter.type_node)
+        .filter(|type_node| store.type_node_links(*type_node).is_none())
         .count();
     let missing_method_body_type_node_links = plan
         .class
@@ -27361,7 +27422,7 @@ fn exact_stored_ambient_class_method_parameters(
         planned.push(ClassMethodParameterPlan {
             declaration: parameter,
             symbol,
-            type_node,
+            type_node: Some(type_node),
             type_,
         });
     }
