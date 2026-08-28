@@ -14555,6 +14555,174 @@ fn validate_empty_class_grammar_body(
     .then_some(())
 }
 
+/// Checks every constructor before returning parameter-property grammar errors.
+#[allow(clippy::too_many_lines)] // The constructor list and its parameter bindings form one check.
+fn plan_constructor_parameter_property_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    members: &ts_ast::NodeList,
+    ambient: bool,
+) -> Option<Vec<ClassGrammarDiagnostic>> {
+    let instance_members = store.symbol(owner)?.members()?;
+    let member_table = store.symbol_table(instance_members)?;
+    let symbol = member_table.get(InternalSymbolName::Constructor.as_ref())?;
+    let symbol_record = store.symbol(symbol)?;
+    let constructors = members
+        .nodes
+        .iter()
+        .map(|&node| NodeRef::new(declaration.arena, declaration.file, node))
+        .collect::<Vec<_>>();
+    if constructors.is_empty()
+        || symbol_record.flags() != SymbolFlags::CONSTRUCTOR
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Constructor.as_ref()
+        || symbol_record.declarations() != Some(constructors.as_slice())
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut property_symbols = HashSet::new();
+    let mut parameter_types = Vec::new();
+    let mut previous_end = members.range.start;
+    for (index, &constructor) in constructors.iter().enumerate() {
+        let record = preflight_node(store, host, constructor).ok()?;
+        let NodeData::ConstructorDeclaration(data) = &record.data else {
+            return None;
+        };
+        if record.kind != SyntaxKind::Constructor
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.end > members.range.end
+            || data.asterisk_token.is_some()
+            || data.end_flow_node.is_some()
+            || data.full_signature.is_some()
+            || data.next_container.is_some()
+            || data.return_flow_node.is_some()
+            || data.symbol.is_some()
+            || data.type_.is_some()
+            || data.type_parameters.is_some()
+            || data.facts != 0
+            || data.modifiers.is_some()
+            || data.parameters.has_trailing_comma
+            || data.parameters.range.start < record.range.start
+            || data.parameters.range.end > record.range.end
+            || bound_symbol(store, host, constructor) != Some(symbol)
+            || store
+                .signature_links(constructor)
+                .is_some_and(|links| links != &SignatureLinks::default())
+        {
+            return None;
+        }
+        previous_end = record.range.end;
+
+        // Other body shapes need the normal body and overload checks.
+        match data.body {
+            Some(body) if !ambient && index + 1 == constructors.len() => {
+                validate_empty_class_grammar_body(
+                    store,
+                    host,
+                    constructor,
+                    body,
+                    data.parameters.range.end,
+                )?;
+            }
+            None if ambient || index + 1 < constructors.len() => {}
+            _ => return None,
+        }
+
+        let mut types = Vec::new();
+        let mut parameter_end = data.parameters.range.start;
+        for &parameter in &data.parameters.nodes {
+            let parameter = NodeRef::new(constructor.arena, constructor.file, parameter);
+            let parameter_record = preflight_node(store, host, parameter).ok()?;
+            if parameter_record.range.start < parameter_end
+                || parameter_record.range.end > data.parameters.range.end
+            {
+                return None;
+            }
+            parameter_end = parameter_record.range.end;
+            let PlannedConstructorParameter::Primitive(planned) =
+                plan_constructor_parameter_with_body_mode(
+                    store,
+                    host,
+                    owner,
+                    constructor,
+                    parameter,
+                    Some(instance_members),
+                    None,
+                    true,
+                )
+                .ok()?
+            else {
+                return None;
+            };
+            let name = store.symbol(planned.symbol)?.name().as_utf8()?;
+            if planned.decorator.is_some()
+                || planned.initializer.is_some()
+                || planned.optional
+                || matches!(name, "eval" | "arguments")
+                || planned.property.is_some() && name == "constructor"
+            {
+                return None;
+            }
+            types.push(planned.type_);
+            if let Some(property) = planned.property {
+                if !property_symbols.insert(property.symbol) {
+                    return None;
+                }
+                if data.body.is_none() {
+                    diagnostics.push(ClassGrammarDiagnostic {
+                        node: parameter,
+                        range_override: None,
+                        code: 2369,
+                        arguments: Vec::new(),
+                    });
+                }
+            }
+        }
+        let locals = host
+            .bound_file(constructor)?
+            .locals(constructor)
+            .and_then(|locals| store.symbol_table(locals));
+        if locals.map_or(0, ts_binder::semantic::SymbolTable::len) != types.len() {
+            return None;
+        }
+        parameter_types.push(types);
+    }
+
+    if !ambient {
+        let (implementation, overloads) = parameter_types.split_last()?;
+        let any = store.intrinsic_bootstrap()?.any_type;
+        // Do not hide an overload compatibility error behind TS2369.
+        if overloads.iter().any(|parameters| {
+            parameters.len() != implementation.len()
+                || parameters
+                    .iter()
+                    .zip(implementation)
+                    .any(|(parameter, target)| parameter != target && *target != any)
+        }) {
+            return None;
+        }
+    }
+    if diagnostics.is_empty() || member_table.len() != property_symbols.len().checked_add(1)? {
+        return None;
+    }
+    Some(diagnostics)
+}
+
 fn plan_initialized_setter_grammar_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -19634,6 +19802,25 @@ pub(super) fn plan_class_grammar_diagnostics(
     let exports = owner.exports()?;
     validate_prototype(store, symbol, exports).ok()?;
     let export_table = store.symbol_table(exports)?;
+
+    if !abstract_class
+        && class.heritage_clauses.is_none()
+        && export_table.len() == 1
+        && let Some(diagnostics) = plan_constructor_parameter_property_grammar_diagnostics(
+            store,
+            host,
+            symbol,
+            declaration,
+            &class.members,
+            ambient,
+        )
+    {
+        return Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics,
+        });
+    }
 
     if !ambient
         && !abstract_class

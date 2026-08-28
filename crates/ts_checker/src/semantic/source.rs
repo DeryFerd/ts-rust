@@ -3343,7 +3343,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && grammar
                             .diagnostics
                             .iter()
-                            .any(|diagnostic| matches!(diagnostic.code, 2300 | 2662))
+                            .any(|diagnostic| matches!(diagnostic.code, 1183 | 2300 | 2369 | 2662))
                     {
                         if grammar.declaration != statement || grammar.symbol != symbol {
                             return Err(SourceCheckError::Class(statement));
