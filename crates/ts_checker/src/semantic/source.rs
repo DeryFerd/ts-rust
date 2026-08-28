@@ -34315,6 +34315,12 @@ fn source_type_is_assignable_to(
         }
         return Ok(assignable);
     }
+    let wrapper_types = [
+        global_types.object_type,
+        global_types.string_type,
+        global_types.number_type,
+        global_types.boolean_type,
+    ];
     let mut resolved_signatures = HashSet::new();
     let mut resolved_members = HashSet::new();
     let mut resolved_properties = HashSet::new();
@@ -34340,6 +34346,63 @@ fn source_type_is_assignable_to(
                     &mut resolution_diagnostics,
                 )?
                 .get_return_type_of_signature(signature);
+                merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+                resolved?;
+            }
+            Err(error @ RelationUnavailable::UnresolvedStructuredMembers(type_))
+                if wrapper_types.contains(&type_) =>
+            {
+                if !resolved_members.insert(type_) {
+                    return Err(error.into());
+                }
+                let owner = store
+                    .type_payload(type_)
+                    .and_then(TypeRecord::symbol)
+                    .ok_or(error)?;
+                let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut resolution_diagnostics,
+                )?
+                .get_declared_type_of_symbol(owner);
+                merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+                if resolved? != type_ {
+                    return Err(error.into());
+                }
+            }
+            Err(error @ RelationUnavailable::UnresolvedPropertyType(symbol))
+                if store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::parent)
+                    .and_then(|owner| store.get_merged_symbol(owner))
+                    .and_then(|owner| store.declared_type_links(owner))
+                    .and_then(|links| links.declared_type)
+                    .is_some_and(|owner| wrapper_types.contains(&owner)) =>
+            {
+                if !resolved_properties.insert(symbol) {
+                    return Err(error.into());
+                }
+                let method = store
+                    .symbol(symbol)
+                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD));
+                let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut resolution_diagnostics,
+                )?;
+                let resolved = if method {
+                    query.get_type_of_interface_method(symbol)
+                } else {
+                    query.get_type_of_declared_value(symbol)
+                };
                 merge_retry_diagnostics(diagnostics, resolution_diagnostics);
                 resolved?;
             }

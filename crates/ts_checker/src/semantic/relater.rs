@@ -2190,9 +2190,7 @@ impl<'store> RelaterSession<'store> {
                     .global_types
                     .and_then(|global_types| global_types.apparent_primitive_type(source_flags))
             {
-                if self
-                    .unresolved_primitive_wrapper_lacks_required_property(apparent_source, target)?
-                {
+                if self.unresolved_primitive_wrapper_is_incompatible(apparent_source, target)? {
                     return Ok(Ternary::False);
                 }
                 return self.is_related_to_ex(
@@ -3874,9 +3872,15 @@ impl<'store> RelaterSession<'store> {
             if source_property == *target_property {
                 continue;
             }
+            let source_origin = if source_members.properties.contains(&source_property) {
+                source_members.property_origin
+            } else {
+                self.property_type(source_property)?;
+                ObjectPropertyOrigin::Declared
+            };
             let related = self.property_related_to(
                 source_property,
-                source_members.property_origin,
+                source_origin,
                 *target_property,
                 target_members.property_origin,
             )?;
@@ -4640,6 +4644,18 @@ impl<'store> RelaterSession<'store> {
             return Ok(None);
         }
         if !object_flags.intersects(ObjectFlags::MEMBERS_RESOLVED) {
+            if no_inherited_members {
+                let property = self
+                    .store
+                    .symbol(global_object)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| self.store.symbol_table(members))
+                    .filter(|members| members.get(InternalSymbolName::Computed.as_ref()).is_none())
+                    .and_then(|members| members.get(name));
+                if let Some(property) = property {
+                    return Ok(Some(property));
+                }
+            }
             return Err(RelationUnavailable::UnresolvedStructuredMembers(
                 global_object_type,
             ));
@@ -4703,7 +4719,7 @@ impl<'store> RelaterSession<'store> {
         Ok(Some(property))
     }
 
-    fn unresolved_primitive_wrapper_lacks_required_property(
+    fn unresolved_primitive_wrapper_is_incompatible(
         &mut self,
         wrapper: TypeId,
         target: TypeId,
@@ -4775,6 +4791,24 @@ impl<'store> RelaterSession<'store> {
                 && self.global_object_property(name.as_ref())?.is_none()
             {
                 return Ok(true);
+            }
+            let source_property = self
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(name.as_ref()));
+            if required && let Some(source_property) = source_property {
+                self.property_type(source_property)?;
+                if self.property_related_to(
+                    source_property,
+                    ObjectPropertyOrigin::Declared,
+                    property,
+                    target_members.property_origin,
+                )? == Ternary::False
+                {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -6567,6 +6601,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Err(RelationUnavailable::MalformedFunctionType(type_))
             }
         }
+    }
+
+    /// Uses the relation's global Object fallback without demanding unrelated values.
+    pub(super) fn global_object_property_symbol(
+        &mut self,
+        name: EscapedNameRef<'_>,
+    ) -> Result<Option<SemanticSymbolId>, RelationUnavailable> {
+        let bootstrap = self.relation_bootstrap_facts()?;
+        RelaterSession::new(self, RelationKind::Assignable, bootstrap).global_object_property(name)
     }
 
     /// Looks up one required-or-optional own property without synthesizing an
@@ -15074,6 +15117,21 @@ mod tests {
                 boolean_wrapper: wrapper,
             };
             let before = fixture.store.relation_state_snapshot();
+            let expected = match object {
+                Some(object) => RelationUnavailable::UnresolvedStructuredMembers(object),
+                None => {
+                    let property = fixture
+                        .store
+                        .type_payload(wrapper)
+                        .and_then(TypeRecord::symbol)
+                        .and_then(|owner| fixture.store.symbol(owner))
+                        .and_then(ts_binder::semantic::Symbol::members)
+                        .and_then(|members| fixture.store.symbol_table(members))
+                        .and_then(|members| members.get_source("id"))
+                        .unwrap();
+                    RelationUnavailable::UnresolvedPropertyType(property)
+                }
+            };
 
             assert_eq!(
                 fixture.store.is_type_related_to_with_optional_global_types(
@@ -15082,9 +15140,7 @@ mod tests {
                     RelationKind::Assignable,
                     Some(global_types),
                 ),
-                Err(RelationUnavailable::UnresolvedStructuredMembers(
-                    object.unwrap_or(wrapper)
-                ))
+                Err(expected)
             );
             assert_eq!(fixture.store.relation_state_snapshot(), before);
         }

@@ -758,9 +758,16 @@ fn shape_or_generic_diagnostic(
         .map(|property| property.name.as_ref())
         .collect::<HashSet<_>>();
     let mut missing = Vec::new();
+    let mut prototype_properties = Vec::new();
     for property in target.properties() {
         if !property.optional && !source_names.contains(&property.name.as_ref()) {
-            missing.push(property);
+            if let Some(source_property) =
+                store.global_object_property_symbol(property.name.as_ref())?
+            {
+                prototype_properties.push((source_property, property));
+            } else {
+                missing.push(property);
+            }
         }
     }
     if !missing.is_empty() {
@@ -776,7 +783,7 @@ fn shape_or_generic_diagnostic(
         );
     }
 
-    generic_assignability_diagnostic(
+    let mut diagnostic = generic_assignability_diagnostic(
         store,
         host,
         global_types,
@@ -785,7 +792,100 @@ fn shape_or_generic_diagnostic(
         fallback_node,
         flags,
         options,
+    )?;
+    if diagnostic.diagnostic.details.is_empty() {
+        for (source_property, target_property) in prototype_properties {
+            let details = prototype_method_return_details(
+                store,
+                host,
+                global_types,
+                source_property,
+                target_property,
+                flags,
+                options,
+            )?;
+            if !details.is_empty() {
+                diagnostic.diagnostic.details = details;
+                break;
+            }
+        }
+    }
+    Ok(diagnostic)
+}
+
+fn prototype_method_return_details(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_property: ts_binder::semantic::SemanticSymbolId,
+    target_property: &ResolvedDeclaredProperty,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+) -> Result<Vec<String>, SourceCheckError> {
+    for symbol in [source_property, target_property.symbol] {
+        if !store
+            .symbol(symbol)
+            .ok_or(RelationUnavailable::Symbol(symbol))?
+            .flags()
+            .contains(SymbolFlags::METHOD)
+        {
+            return Ok(Vec::new());
+        }
+    }
+    let source_type = store
+        .value_symbol_links(source_property)
+        .and_then(|links| links.resolved_type)
+        .ok_or(RelationUnavailable::UnresolvedPropertyType(source_property))?;
+    let mut return_types = Vec::with_capacity(2);
+    for type_ in [source_type, target_property.type_] {
+        let callable = match validate_stored_single_callable(store, type_) {
+            StoredSingleCallableValidation::Valid { callable, .. } => callable,
+            StoredSingleCallableValidation::NotCallable
+            | StoredSingleCallableValidation::Pending { .. } => return Ok(Vec::new()),
+            StoredSingleCallableValidation::Malformed { .. } => {
+                return Err(invalid_structure(type_));
+            }
+        };
+        if !callable.parameters.is_empty()
+            || store
+                .signature(callable.signature)
+                .is_none_or(|signature| !signature.type_parameters().is_empty())
+        {
+            return Ok(Vec::new());
+        }
+        return_types.push(callable.return_type.ok_or(
+            RelationUnavailable::UnresolvedSignatureReturn(callable.signature),
+        )?);
+    }
+    let [source_return, target_return] = return_types.as_slice() else {
+        unreachable!("a prototype method comparison has exactly two signatures")
+    };
+    if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        *source_return,
+        *target_return,
+        global_types,
+        options.strict_function_types,
+    )? {
+        return Ok(Vec::new());
+    }
+    let message = Diagnostic::with_arguments(
+        message_by_code(2201).ok_or(SourceCheckError::MissingDiagnostic(2201))?,
+        [format!("{}()", property_name(target_property)?)],
     )
+    .render()
+    .expect("TS2201 has one property-call argument");
+    Ok(vec![
+        format!("  {message}"),
+        nested_assignability_message(
+            store,
+            host,
+            global_types,
+            *source_return,
+            *target_return,
+            flags,
+            2,
+        )?,
+    ])
 }
 
 fn first_excess_property<'source>(
@@ -2334,6 +2434,8 @@ fn declared_property_name_node(
     let name = match &declaration.data {
         NodeData::PropertyDeclaration(property) => property.name,
         NodeData::PropertySignatureDeclaration(property) => property.name,
+        NodeData::MethodDeclaration(method) => method.name,
+        NodeData::MethodSignatureDeclaration(method) => method.name,
         _ => return Err(invalid_structure(target_type)),
     };
     let name = NodeRef::new(property.declaration.arena, property.declaration.file, name);
