@@ -3,7 +3,7 @@
 //! This is the dependency-closed expression prefix of pinned
 //! `checkElementAccessExpression` plus `getPropertyTypeForIndexType`. It
 //! supports canonical `any`, direct `Array<T>`/`ReadonlyArray<T>` references,
-//! validated fixed tuple elements,
+//! validated fixed and rest tuple elements,
 //! required own and shared union properties selected by string or number
 //! literals, authenticated enum members and numeric reverse indices, primitive
 //! string indexing, resolved anonymous string/number index signatures, finite
@@ -34,6 +34,7 @@ use super::{
     interface_indexes::{InterfaceIndexError, resolve_own_numeric_interface_index},
     member_resolution::UnionPropertyError,
     object_members::{self, PropertyObjectState},
+    signatures::ElementFlags,
     source::PlannedExpression,
     source_callables::cached_annotation_identity,
     store::SourceNodeParent,
@@ -1673,7 +1674,9 @@ fn resolve_element_index(
         } else {
             ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
         }
-    } else if let Some(tuple) = resolve_tuple_element(store, receiver_type, index, undefined)? {
+    } else if let Some(tuple) =
+        resolve_tuple_element(store, global_types, plan, receiver_type, index, undefined)?
+    {
         tuple
     } else if is_string_receiver(store, receiver_type)? {
         if index.is_number_applicable() {
@@ -1920,7 +1923,9 @@ impl ElementResolution {
 }
 
 fn resolve_tuple_element(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourceElementPlan,
     receiver_type: TypeId,
     index: &ClassifiedIndex,
     undefined: TypeId,
@@ -1946,16 +1951,34 @@ fn resolve_tuple_element(
     let Ok(position) = name.parse::<usize>() else {
         return Ok(None);
     };
-    if let Some(element) = shape.element_types().get(position).copied() {
-        return Ok(Some(ElementResolution::success(element, None)));
+    if position < shape.fixed_length() {
+        return Ok(Some(ElementResolution::success(
+            shape.element_types()[position],
+            None,
+        )));
     }
-    if shape
-        .element_infos()
-        .last()
-        .is_some_and(|info| info.flags().contains(super::signatures::ElementFlags::REST))
-        && let Some(element) = shape.element_types().last().copied()
-    {
-        return Ok(Some(ElementResolution::success(element, None)));
+    if shape.combined_flags().intersects(ElementFlags::VARIABLE) {
+        if shape.combined_flags().intersects(ElementFlags::VARIADIC) {
+            return Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::Receiver(plan.receiver.node),
+            ));
+        }
+        // A rest element shifts the suffix. Each variable position can read
+        // any type in that part of the tuple, including its fixed suffix.
+        let fixed_count = shape.fixed_length()
+            + shape
+                .element_infos()
+                .iter()
+                .rev()
+                .take_while(|info| info.flags().intersects(ElementFlags::FIXED))
+                .count();
+        let elements = shape.element_types()[shape.fixed_length()..].to_vec();
+        let type_ = element_union_type(store, global_types, plan.node, &elements, None)?;
+        return Ok(Some(if position >= fixed_count {
+            ElementResolution::index_signature(type_)
+        } else {
+            ElementResolution::success(type_, None)
+        }));
     }
     Ok(Some(ElementResolution::diagnostic(
         undefined,
@@ -5900,6 +5923,91 @@ mod tests {
                     diagnostic: None,
                 }),
             );
+        }
+    }
+
+    #[test]
+    fn rest_tuple_indices_union_the_tail_and_widen_only_unchecked_reads() {
+        for position in [0_u32, 1, 2, 10] {
+            for unchecked in [false, true] {
+                for write in [false, true] {
+                    let parsed = parse_fixture(&format!("const result = tuple[{position}];"));
+                    let file = FileId::new(617);
+                    let mut store = registered_store(&parsed, file);
+                    let (boolean, string, number, undefined) = {
+                        let bootstrap = store.intrinsic_bootstrap().unwrap();
+                        (
+                            bootstrap.boolean_type,
+                            bootstrap.string_type,
+                            bootstrap.number_type,
+                            bootstrap.undefined_type,
+                        )
+                    };
+                    let infos = [
+                        ElementFlags::REQUIRED,
+                        ElementFlags::REST,
+                        ElementFlags::REQUIRED,
+                    ]
+                    .map(|flags| store.create_tuple_element_info(flags, None).unwrap());
+                    let tuple = store
+                        .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                            &[boolean, string, number],
+                            &infos,
+                            false,
+                        ))
+                        .unwrap();
+                    let target = canonical_array_target(&mut store);
+                    let receiver =
+                        alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "tuple");
+                    let value = ts_jsnum::Number::new(f64::from(position));
+                    let index = store.regular_number_literal_type(value).unwrap();
+                    let plan = source_plan(
+                        &parsed,
+                        file,
+                        &store,
+                        PlannedExpressionKind::Number {
+                            value,
+                            unary_operand: None,
+                        },
+                        receiver,
+                    );
+                    let expected = if position == 0 {
+                        boolean
+                    } else {
+                        let elements = if position >= 2 && unchecked && !write {
+                            vec![string, number, undefined]
+                        } else {
+                            vec![string, number]
+                        };
+                        store
+                            .expression_union_type(&elements, UnionReduction::Literal)
+                            .unwrap()
+                    };
+                    for _ in 0..2 {
+                        assert_eq!(
+                            check_direct_source_element_worker(
+                                &mut store,
+                                &empty_host(),
+                                None,
+                                CanonicalArrayTargets::for_test(target, target),
+                                CanonicalCheckerOptions {
+                                    no_unchecked_indexed_access: unchecked,
+                                    ..strict_options()
+                                },
+                                &plan,
+                                tuple,
+                                index,
+                                write,
+                            ),
+                            Ok(CheckedSourceElement {
+                                type_: expected,
+                                diagnostic: None,
+                            }),
+                            "position={position}, unchecked={unchecked}, write={write}",
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -32815,7 +32815,7 @@ fn check_assignment_to_type_with_class_context(
             options,
             session,
         )?;
-        let conditional_detail = conditional_assignment_detail(
+        let union_detail = union_assignment_detail(
             store,
             host,
             global_types,
@@ -32845,7 +32845,7 @@ fn check_assignment_to_type_with_class_context(
             }
             if diagnostic.diagnostic.code() == 2322
                 && diagnostic.diagnostic.details.is_empty()
-                && let Some(detail) = conditional_detail.as_ref()
+                && let Some(detail) = union_detail.as_ref()
             {
                 diagnostic.diagnostic.details.push(format!("  {detail}"));
             }
@@ -33219,7 +33219,7 @@ fn check_compound_assignment(
     })
 }
 
-fn conditional_assignment_detail(
+fn union_assignment_detail(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -33230,7 +33230,7 @@ fn conditional_assignment_detail(
 ) -> Result<Option<String>, SourceCheckError> {
     if !matches!(
         expression.unparenthesized().kind,
-        PlannedExpressionKind::Conditional(_)
+        PlannedExpressionKind::Conditional(_) | PlannedExpressionKind::Element(_)
     ) {
         return Ok(None);
     }
@@ -33260,7 +33260,7 @@ fn conditional_assignment_detail(
             [display.source, display.target],
         )
         .render()
-        .map_err(|_| SourceCheckError::Conditional(expression.node))?;
+        .map_err(|_| SourceCheckError::MissingDiagnostic(2322))?;
         return Ok(Some(detail));
     }
     Ok(None)
