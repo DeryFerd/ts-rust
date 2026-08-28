@@ -9179,7 +9179,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     if union.union.types.len() == 2
                         && union.union.types.contains(&target)
                         && union.union.types.contains(&self.intrinsic_bootstrap()?.undefined_type)
-                        && self.validate_union_constituent(*parameter).is_ok());
+                        && self.validate_union_query_metadata(*parameter).is_ok());
             let super::callables::StoredSingleCallableValidation::Valid {
                 callable: callback, ..
             } = super::callables::validate_stored_single_callable(self, target)

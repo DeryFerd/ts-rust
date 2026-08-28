@@ -13959,6 +13959,66 @@ mod tests {
     }
 
     #[test]
+    fn canonical_sort_callback_preserves_nested_array_tuple_elements() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/nestedSort.ts",
+            concat!(
+                "declare function entries(): [string, number[]][];\n",
+                "function foo() {\n",
+                "    return entries().sort(([k1, v1], [k2, v2]) => 0);\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let (program, state) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["nestedSort.ts".to_owned()],
+            CompilerOptions {
+                strict: true,
+                strict_specified: true,
+                no_emit: true,
+                target: ScriptTarget::EsNext,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let file = program.source_file("/project/nestedSort.ts").unwrap().id;
+                let (arena, _) = queries.context.file(file).unwrap();
+                let function = arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let ts_ast::NodeData::FunctionDeclaration(function) = &record.data else {
+                            return None;
+                        };
+                        let ts_ast::NodeData::Identifier(name) = &arena.get(function.name?)?.data
+                        else {
+                            return None;
+                        };
+                        (name.text == "foo").then_some(ts_ast::NodeRef::new(arena.id(), file, node))
+                    })
+                    .unwrap();
+                let returned = queries
+                    .context
+                    .store()
+                    .signature_links(function)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .and_then(|signature| queries.context.store().signature(signature))
+                    .and_then(|signature| signature.resolved_return_type())
+                    .unwrap();
+                assert_eq!(
+                    queries.context.type_to_string(returned).unwrap(),
+                    "[string, number[]][]"
+                );
+                queries.context.recheck_source_file(file).unwrap();
+            },
+        )
+        .unwrap();
+        assert!(program.diagnostics().is_empty());
+        assert!(state.is_some());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Diagnostics and replay checks share the original source and checker.
     fn canonical_conditional_return_expression_matches_original_and_replays() {
         let source = concat!(
