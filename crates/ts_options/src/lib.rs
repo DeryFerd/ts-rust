@@ -1672,35 +1672,27 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     let Some(resolution) = options.module_resolution else {
         return;
     };
-    let required = match options.module {
+    let node_module = match options.module {
         Some(module @ (ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20)) => {
             Some((module, ModuleResolutionKind::Node16))
         }
         Some(module @ ModuleKind::NodeNext) => Some((module, ModuleResolutionKind::NodeNext)),
         _ => None,
     };
-    if let Some((module, required)) = required
-        && resolution != required
-    {
-        diagnostics.push(diagnostic(
-            5109,
-            [module_resolution_name(required), module_name(module)],
-        ));
-        return;
-    }
-    match resolution {
-        ModuleResolutionKind::Node16
-            if !matches!(
-                options.module,
-                Some(ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20)
-            ) =>
-        {
-            diagnostics.push(diagnostic(5110, ["Node16", "Node16"]));
+    let is_node_resolution = matches!(
+        resolution,
+        ModuleResolutionKind::Node16 | ModuleResolutionKind::NodeNext
+    );
+    if let Some((module, default_resolution)) = node_module {
+        if !is_node_resolution {
+            diagnostics.push(diagnostic(
+                5109,
+                [module_resolution_name(default_resolution), module_name(module)],
+            ));
         }
-        ModuleResolutionKind::NodeNext if options.module != Some(ModuleKind::NodeNext) => {
-            diagnostics.push(diagnostic(5110, ["NodeNext", "NodeNext"]));
-        }
-        _ => {}
+    } else if is_node_resolution {
+        let name = module_resolution_name(resolution);
+        diagnostics.push(diagnostic(5110, [name, name]));
     }
 }
 
@@ -3718,7 +3710,7 @@ mod tests {
     fn validates_conflicting_and_paired_options() {
         let result = parse_compiler_options(&object([
             ("module", JsonValue::String("NodeNext".into())),
-            ("moduleResolution", JsonValue::String("Node16".into())),
+            ("moduleResolution", JsonValue::String("Node10".into())),
             ("noEmit", JsonValue::Bool(true)),
             ("emitDeclarationOnly", JsonValue::Bool(true)),
         ]));
@@ -3733,7 +3725,34 @@ mod tests {
     }
 
     #[test]
-    fn node_module_resolution_requires_a_matching_explicit_module() {
+    fn node_module_resolution_accepts_all_node_module_modes() {
+        for (module, expected_module) in [
+            ("node16", ModuleKind::Node16),
+            ("node18", ModuleKind::Node18),
+            ("node20", ModuleKind::Node20),
+            ("nodenext", ModuleKind::NodeNext),
+        ] {
+            for (resolution, expected_resolution) in [
+                ("node16", ModuleResolutionKind::Node16),
+                ("nodenext", ModuleResolutionKind::NodeNext),
+            ] {
+                let result = parse_compiler_options(&object([
+                    ("module", JsonValue::String(module.to_owned())),
+                    ("moduleResolution", JsonValue::String(resolution.to_owned())),
+                ]));
+                assert!(
+                    result.is_ok(),
+                    "{module}/{resolution}: {:?}",
+                    result.diagnostics,
+                );
+                assert_eq!(result.options.module, expected_module);
+                assert_eq!(result.options.module_resolution, expected_resolution);
+            }
+        }
+    }
+
+    #[test]
+    fn node_module_resolution_requires_an_explicit_node_module() {
         for (resolution, expected) in [("node16", "Node16"), ("nodenext", "NodeNext")] {
             let missing = parse_compiler_options(&object([(
                 "moduleResolution",
