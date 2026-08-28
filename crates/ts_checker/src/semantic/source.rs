@@ -16536,10 +16536,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .and_then(|candidate| store.get_merged_symbol(candidate))
                         == Some(target_symbol)
             });
-        let export_equals_variable = export_equals
-            && target.flags().intersects(
-                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
-            )
+        let variable_alias = target
+            .flags()
+            .intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE)
             && target.flags().without(
                 SymbolFlags::FUNCTION_SCOPED_VARIABLE
                     | SymbolFlags::BLOCK_SCOPED_VARIABLE
@@ -16693,7 +16692,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || imported_enum_alias
             || export_equals_import_alias
             || export_equals_callable
-            || export_equals_variable
+            || variable_alias
             || export_equals_class
             || export_equals_ambient_class
             || export_equals_namespace
@@ -16701,7 +16700,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if !supported_target
             || !imported_enum_alias
                 && !export_equals_import_alias
-                && !export_equals_variable
+                && !variable_alias
                 && !export_equals_ambient_class
                 && target_record.parent != Some(self.source.node_ref().node)
             || !export_equals_namespace
@@ -80011,6 +80010,145 @@ mod tests {
         assert!(is_type_checked(&context, file));
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), after_first);
+    }
+
+    #[test]
+    fn default_identifier_exports_preserve_variable_types_and_import_aliases() {
+        for (declaration, type_name) in [
+            ("declare const _await: any;", "any"),
+            ("declare let _await: string;", "string"),
+            ("const _await: number = 1;", "number"),
+            ("let _await: number = 1;", "number"),
+            ("var _await: string = 'ready';", "string"),
+        ] {
+            for check_provider_first in [false, true] {
+                let provider = parsed(&format!("{declaration} export default _await;"));
+                let importer = parsed("import selected from './provider';");
+                let provider_file = FileId::new(9_180);
+                let importer_file = FileId::new(9_181);
+                let mut context = external_context_with_import_routes(
+                    &[(provider_file, &provider), (importer_file, &importer)],
+                    &[SourceImportRoute {
+                        source: 1,
+                        specifier: 0,
+                        target: 0,
+                    }],
+                );
+                let value = variable_symbol(&context, &provider, provider_file, "_await");
+                let (_, bound) = context.file(provider_file).unwrap();
+                let module = bound.symbol(bound.source_file()).unwrap();
+                let default = context
+                    .store()
+                    .symbol(module)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| context.store().symbol_table(exports))
+                    .and_then(|exports| {
+                        exports.get(ts_binder::InternalSymbolName::Default.as_ref())
+                    })
+                    .unwrap();
+                let (_, bound) = context.file(importer_file).unwrap();
+                let selected_alias = bound
+                    .locals(bound.source_file())
+                    .and_then(|locals| context.store().symbol_table(locals))
+                    .and_then(|locals| locals.get_source("selected"))
+                    .unwrap();
+
+                if check_provider_first {
+                    context.check_source_file(provider_file).unwrap();
+                }
+                context.check_source_file(importer_file).unwrap();
+                context.check_source_file(provider_file).unwrap();
+
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let expected_type = match type_name {
+                    "any" => bootstrap.any_type,
+                    "number" => bootstrap.number_type,
+                    "string" => bootstrap.string_type,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    variable_value_type(&context, &provider, provider_file, "_await"),
+                    expected_type,
+                );
+                for (alias, immediate) in [(default, value), (selected_alias, default)] {
+                    assert_eq!(
+                        context.store().symbol(alias).unwrap().flags(),
+                        SymbolFlags::ALIAS,
+                    );
+                    assert_eq!(
+                        context
+                            .store()
+                            .alias_symbol_links(alias)
+                            .map(|links| (links.immediate_target, links.alias_target)),
+                        Some((Some(immediate), AliasTargetState::Resolved(value))),
+                    );
+                    assert!(context.store().value_symbol_links(alias).is_none());
+                }
+                assert!(context.diagnostics().is_empty());
+
+                let warm = observable_state(&context, importer_file);
+                context.recheck_source_file(provider_file).unwrap();
+                context.recheck_source_file(importer_file).unwrap();
+                assert_eq!(observable_state(&context, importer_file), warm);
+                assert_eq!(
+                    variable_symbol(&context, &provider, provider_file, "_await"),
+                    value,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_identifier_exports_reject_mismatched_alias_targets_without_writes() {
+        for mismatch_immediate in [false, true] {
+            let source = parsed(concat!(
+                "declare const value: number; ",
+                "declare const other: number; ",
+                "export default value;",
+            ));
+            let file = FileId::new(9_182);
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let export = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (_, bound) = context.file(file).unwrap();
+            let alias = bound.symbol(export).unwrap();
+            let other = variable_symbol(&context, &source, file, "other");
+            context.check_source_file(file).unwrap();
+
+            let mut poisoned = context.store().alias_symbol_links(alias).unwrap().clone();
+            if mismatch_immediate {
+                poisoned.immediate_target = Some(other);
+            } else {
+                poisoned.alias_target = AliasTargetState::Resolved(other);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(alias, poisoned.clone())
+            );
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Import(node)) if node == export
+            ));
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(context.store().alias_symbol_links(alias), Some(&poisoned));
+        }
     }
 
     #[test]
