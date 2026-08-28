@@ -5,12 +5,13 @@
 //! upstream records the source type itself as a covariant or authenticated
 //! contravariant candidate. The bounded Rust branch accepts primitive, literal,
 //! unique-symbol, anonymous primitive-union, and exact resolved nongeneric
-//! declared-property-object
-//! candidates, authenticated template-literal patterns, fixed tuples, and
+//! declared-property-object candidates, validated derived object literals,
+//! authenticated template-literal patterns, fixed tuples, and
 //! canonical Array/ReadonlyArray references when the caller retains the
 //! authoritative global targets.
 //! Declared objects and tuples are admitted only as root candidates or nested
-//! array/tuple elements, not as union constituents. The branch preserves
+//! array/tuple elements, not as union constituents. Derived object literals
+//! are also admitted as union constituents. The branch preserves
 //! candidates that do not require widening, including fresh literals.
 //! Authenticated internal placeholders are skipped so binding patterns cannot
 //! become the only source of a public type argument.
@@ -25,6 +26,7 @@ use super::{
     RelationUnavailable, TypeId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    derived_types::DerivedObjectLiteralValidation,
     instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
     object_members::{
@@ -841,6 +843,18 @@ fn validate_inference_candidate(
         TypeData::Intrinsic(_) if intrinsic_leaf_flags(record.flags()) => Ok(()),
         TypeData::Literal(_) if literal_leaf_flags(record.flags()) => Ok(()),
         TypeData::UniqueEsSymbol(_) if record.flags() == TypeFlags::UNIQUE_ES_SYMBOL => Ok(()),
+        TypeData::Object(_)
+            if matches!(
+                array_targets.map_or_else(
+                    || store.validate_derived_object_literal_for_relation(candidate),
+                    |targets| store
+                        .validate_derived_object_literal_with_array_targets(candidate, targets),
+                ),
+                DerivedObjectLiteralValidation::Valid { .. }
+            ) =>
+        {
+            Ok(())
+        }
         TypeData::Union(union) => {
             if record.alias().is_some() {
                 return Err(NakedTypeInferenceError::AliasedUnion(candidate));
@@ -1673,6 +1687,142 @@ mod tests {
                 assert!(data.union.types.contains(&a));
                 assert!(data.union.types.contains(&nullable));
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source graph checks object and array candidates.
+    fn derived_object_candidates_keep_their_types_and_complete_union() {
+        let source = parse_source_file(concat!(
+            "declare const log: any; ",
+            "const broad = { log }; ",
+            "const text = { log: 'value' }; ",
+            "const highlighted = { log: 'value', highlighted: true }; ",
+            "const numeric = { log: 1 };",
+        ));
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(163_001);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/derived-inference.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &source.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let mut object_nodes = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some((
+                    record.range.start,
+                    NodeRef::new(source.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        object_nodes.sort_by_key(|(start, _)| *start);
+        let originals = object_nodes
+            .iter()
+            .map(|(_, node)| {
+                context
+                    .store()
+                    .type_node_links(*node)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let store = context.store_mut_for_test();
+        let branch_source = store
+            .literal_union_type(&[originals[2], originals[0]], None)
+            .unwrap();
+        let branches = store.get_widened_type(branch_source).unwrap();
+        assert_eq!(infer_naked_type_parameter(store, branches), Ok(branches));
+        let TypeData::Union(branch_union) = store.type_payload(branches).unwrap().data() else {
+            panic!("the first argument must retain both object branches")
+        };
+        assert_eq!(branch_union.union.types.len(), 2);
+        assert!(branch_union.union.types.iter().any(|member| {
+            store
+                .type_payload(*member)
+                .and_then(|record| record.data().structured())
+                .and_then(|record| record.members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("highlighted"))
+                .and_then(|property| store.symbol(property))
+                .is_some_and(|property| property.flags().contains(SymbolFlags::OPTIONAL))
+        }));
+        let derived = originals
+            .into_iter()
+            .map(|original| store.get_widened_type(original).unwrap())
+            .collect::<Vec<_>>();
+        let [broad, text, highlighted, numeric] = derived.as_slice() else {
+            panic!("expected the four real object literal types")
+        };
+        for &candidate in &derived {
+            assert!(matches!(
+                store.validate_derived_object_literal_for_relation(candidate),
+                DerivedObjectLiteralValidation::Valid { .. }
+            ));
+            assert_eq!(infer_naked_type_parameter(store, candidate), Ok(candidate));
+        }
+        assert_ne!(broad, text);
+        let constituents = [*text, *highlighted, *numeric];
+        let union = store.literal_union_type(&constituents, None).unwrap();
+        assert_eq!(infer_naked_type_parameter(store, union), Ok(union));
+        let TypeData::Union(data) = store.type_payload(union).unwrap().data() else {
+            panic!("the object candidates must retain their complete union")
+        };
+        assert_eq!(data.union.types.len(), constituents.len());
+        for candidate in constituents {
+            assert!(data.union.types.contains(&candidate));
+        }
+        let targets = CanonicalArrayTargets::for_test(
+            canonical_array_target(store, "Array"),
+            canonical_array_target(store, "ReadonlyArray"),
+        );
+        for element in [*broad, branches, union] {
+            let array = store
+                .create_canonical_array_type_with_targets(targets, element, false)
+                .unwrap();
+            assert_eq!(
+                validate_inference_leaf_with_array_targets(store, array, targets),
+                Ok(())
+            );
+            assert_eq!(
+                infer_naked_type_parameter_candidates_with_array_targets(
+                    store,
+                    &[array],
+                    InferenceLiteralTreatment::Widen,
+                    targets,
+                    CanonicalTypeMapperStore::is_type_strict_subtype_of,
+                    CanonicalTypeMapperStore::is_type_subtype_of,
+                ),
+                Ok(Some(array)),
+            );
         }
     }
 
