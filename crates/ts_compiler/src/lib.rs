@@ -6563,6 +6563,37 @@ impl Program {
                 related_information: Vec::new(),
             });
         }
+        if is_javascript
+            && !source_check_js_directive(&source_text).unwrap_or(self.options.check_js)
+            && !self.options.experimental_decorators
+        {
+            let message = message_by_code(1206).expect("TS1206 must be in the diagnostic catalog");
+            for (_, node) in parse.arena.iter() {
+                let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                    continue;
+                };
+                let Some(decorator) = parameter.modifiers.as_ref().and_then(|modifiers| {
+                    modifiers.list.nodes.iter().find_map(|modifier| {
+                        parse
+                            .arena
+                            .get(*modifier)
+                            .filter(|modifier| modifier.kind == SyntaxKind::Decorator)
+                    })
+                }) else {
+                    continue;
+                };
+                self.diagnostics.push(ProgramDiagnostic {
+                    file_name: Some(file_name.to_owned()),
+                    range: Some(decorator.range),
+                    code: Some(message.code()),
+                    category: message.category(),
+                    message: message
+                        .format(&[])
+                        .expect("TS1206 has no diagnostic arguments"),
+                    related_information: Vec::new(),
+                });
+            }
+        }
         let index = self.source_files.len();
         let file_id =
             FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
@@ -19569,6 +19600,99 @@ export function create() { return new M.Value(); }"#,
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2339))
         );
+    }
+
+    #[test]
+    fn unchecked_javascript_parameter_decorators_match_upstream() {
+        let source = concat!(
+            "function dec(target, key, index) {}\n",
+            "\n",
+            "class Foo {\n",
+            "    method(@dec x) {}\n",
+            "}\n",
+        );
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/a.js", source).unwrap();
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/",
+            &["a.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: false,
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected the parameter decorator diagnostic: {:?}",
+                program.diagnostics()
+            );
+        };
+        assert_eq!(diagnostic.code, Some(1206));
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/a.js"));
+        assert_eq!(diagnostic.message, "Decorators are not valid here.");
+        let range = diagnostic.range.unwrap();
+        assert_eq!(range.start.get() as usize, source.find("@dec").unwrap());
+        assert_eq!(range.end.get() - range.start.get(), 4);
+    }
+
+    #[test]
+    fn unchecked_javascript_parameter_decorators_respect_options_and_directives() {
+        for (file_name, prefix, check_js, experimental_decorators, expected) in [
+            ("a.js", "", false, false, true),
+            ("a.js", "", false, true, false),
+            ("a.js", "", true, false, false),
+            ("a.js", "// @ts-check\n", false, false, false),
+            ("a.js", "// @ts-nocheck\n", true, false, true),
+            ("a.ts", "", false, false, false),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            let source = format!(
+                "{prefix}function dec() {{}} class Foo {{ method(@dec @dec x, @dec y) {{}} }}"
+            );
+            fs.write_file(&format!("/{file_name}"), &source).unwrap();
+            let program = Program::new_unchecked_with_options_and_checker(
+                &fs,
+                "/",
+                &[file_name.to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    check_js,
+                    experimental_decorators,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+                super::ProgramChecker::Canonical,
+            );
+            let ranges = program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1206))
+                .map(|diagnostic| diagnostic.range.unwrap())
+                .collect::<Vec<_>>();
+            if expected {
+                assert_eq!(ranges.len(), 2);
+                assert_eq!(ranges[0].start.get() as usize, source.find("@dec").unwrap());
+                assert_eq!(
+                    ranges[1].start.get() as usize,
+                    source.rfind("@dec").unwrap()
+                );
+                for range in ranges {
+                    assert_eq!(
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                        "@dec"
+                    );
+                }
+            } else {
+                assert!(
+                    ranges.is_empty(),
+                    "{file_name}, {prefix:?}, checkJs={check_js}"
+                );
+            }
+        }
     }
 
     #[test]
