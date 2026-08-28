@@ -1,6 +1,7 @@
 //! Compiler Program and source-file graph foundations.
 
 mod project_graph;
+mod top_level_await;
 
 pub use project_graph::{
     ProgramGraphConfig, ProgramGraphMissingEvidence, ProgramGraphPackageScopeDecision,
@@ -5063,6 +5064,7 @@ impl Program {
                     )?,
                 );
             }
+            self.add_top_level_await_identifier_diagnostics(source, bound, &mut bind_diagnostics)?;
             if bound
                 .source_facts()
                 .is_some_and(CanonicalSourceFileFacts::is_external_or_common_js_module)
