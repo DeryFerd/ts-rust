@@ -2664,21 +2664,28 @@ fn resolve_published_scalar_wrapper_method(
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
-    let (wrapper_type, wrapper_name, expected_parameters) = match receiver.flags() {
-        flags
-            if (flags == TypeFlags::STRING || flags == TypeFlags::STRING_LITERAL)
-                && plan.name == "toLowerCase" =>
-        {
-            (global_types.string_type, "String", 0)
-        }
-        flags
-            if (flags == TypeFlags::NUMBER || flags == TypeFlags::NUMBER_LITERAL)
-                && plan.name == "toFixed" =>
-        {
-            (global_types.number_type, "Number", 1)
-        }
-        _ => return Ok(None),
-    };
+    let (wrapper_type, wrapper_name, expected_parameters, minimum_arguments) =
+        match receiver.flags() {
+            flags
+                if (flags == TypeFlags::STRING || flags == TypeFlags::STRING_LITERAL)
+                    && plan.name == "toLowerCase" =>
+            {
+                (global_types.string_type, "String", 0, 0)
+            }
+            flags
+                if (flags == TypeFlags::STRING || flags == TypeFlags::STRING_LITERAL)
+                    && plan.name == "startsWith" =>
+            {
+                (global_types.string_type, "String", 2, 1)
+            }
+            flags
+                if (flags == TypeFlags::NUMBER || flags == TypeFlags::NUMBER_LITERAL)
+                    && plan.name == "toFixed" =>
+            {
+                (global_types.number_type, "Number", 1, 0)
+            }
+            _ => return Ok(None),
+        };
     let wrapper = store
         .type_payload(wrapper_type)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
@@ -2720,14 +2727,25 @@ fn resolve_published_scalar_wrapper_method(
     let Some(symbol) = members.get_source(&plan.name) else {
         return Ok(None);
     };
-    let Some((authenticated_wrapper, declaration)) =
-        store.authenticated_global_interface_method(symbol)
-    else {
-        return Err(SourcePropertyError::InvalidCache(plan.node));
+    let declaration = if plan.name == "startsWith" {
+        if store.authenticated_interface_method_owner(symbol) != Some((owner, wrapper_type)) {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?
+    } else {
+        let Some((authenticated_wrapper, declaration)) =
+            store.authenticated_global_interface_method(symbol)
+        else {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        };
+        if authenticated_wrapper != wrapper_type {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        declaration
     };
-    if authenticated_wrapper != wrapper_type {
-        return Err(SourcePropertyError::InvalidCache(plan.node));
-    }
 
     let Some(links) = store.value_symbol_links(symbol) else {
         return Err(RelationUnavailable::UnresolvedPropertyType(symbol).into());
@@ -2756,16 +2774,20 @@ fn resolve_published_scalar_wrapper_method(
     let [callable] = projection.call_signatures.as_ref() else {
         return Err(SourcePropertyError::InvalidCache(plan.node));
     };
-    let string_type = store
+    let bootstrap = store
         .intrinsic_bootstrap()
-        .ok_or(RelationUnavailable::MissingBootstrap)?
-        .string_type;
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let return_type = if plan.name == "startsWith" {
+        bootstrap.boolean_type
+    } else {
+        bootstrap.string_type
+    };
     if projection.owner != type_
         || !projection.construct_signatures.is_empty()
         || callable.owner != type_
         || callable.parameters.len() != expected_parameters
-        || callable.min_argument_count != 0
-        || callable.return_type != Some(string_type)
+        || callable.min_argument_count != minimum_arguments
+        || callable.return_type != Some(return_type)
         || store
             .signature(callable.signature)
             .and_then(super::signatures::Signature::declaration)

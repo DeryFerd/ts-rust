@@ -13505,6 +13505,170 @@ mod tests {
     }
 
     #[test]
+    fn canonical_conditional_return_expression_matches_original_and_replays() {
+        let source = concat!(
+            "// @noEmit: true\n",
+            "// @target: esnext\n\n",
+            "function return1(x: boolean): 3 {\n",
+            "    return (x ? (1) : 2);\n",
+            "}\n\n",
+            "declare function getAny(): any;\n\n",
+            "function return2(x: string): string {\n",
+            "    return x.startsWith(\"a\") ? getAny() : 1;\n",
+            "}\n\n",
+            "function return3(x: string): string {\n",
+            "    return x.startsWith(\"a\") ? \"a\" : x;\n",
+            "}\n\n",
+            "function return4(x: string): string {\n",
+            "    return (x.startsWith(\"a\") ? getAny() : 1) as string;\n",
+            "}\n\n",
+            "const return5 = (x: string): string => x.startsWith(\"a\") ? getAny() : 1;\n\n",
+            "const return6 = (x: string): string => (x.startsWith(\"a\") ? getAny() : 1) as string;",
+        );
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/conditionalReturnExpression.ts", source)
+            .unwrap();
+        let (program, state) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["conditionalReturnExpression.ts".to_owned()],
+            CompilerOptions {
+                no_emit: true,
+                target: ScriptTarget::EsNext,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let file = program
+                    .source_file("/project/conditionalReturnExpression.ts")
+                    .unwrap()
+                    .id;
+                let store = queries.context.store();
+                let wrapper = queries.context.global_types().string_type;
+                let owner = store.type_payload(wrapper).unwrap().symbol().unwrap();
+                let method = store
+                    .symbol(owner)
+                    .and_then(|symbol| symbol.members())
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source("startsWith"))
+                    .unwrap();
+                let declaration = store.symbol(method).unwrap().value_declaration().unwrap();
+                let signature = store
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .and_then(|signature| store.signature(signature))
+                    .unwrap();
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                assert_eq!(signature.parameters().len(), 2);
+                assert_eq!(signature.min_argument_count(), 1);
+                assert_eq!(
+                    signature.resolved_return_type(),
+                    Some(bootstrap.boolean_type)
+                );
+                assert_eq!(
+                    store
+                        .value_symbol_links(signature.parameters()[0])
+                        .unwrap()
+                        .resolved_type,
+                    Some(bootstrap.string_type)
+                );
+                let before = (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    queries.context.diagnostics().len(),
+                );
+                queries.context.recheck_source_file(file).unwrap();
+                let after = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.diagnostics().len(),
+                );
+                (before, after)
+            },
+        )
+        .unwrap();
+        let (before, after) = state.unwrap();
+        assert_eq!(before, after);
+        let expected = [
+            (5, 18, "1", "Type '1' is not assignable to type '3'."),
+            (5, 23, "2", "Type '2' is not assignable to type '3'."),
+            (
+                11,
+                43,
+                "1",
+                "Type 'number' is not assignable to type 'string'.",
+            ),
+            (
+                22,
+                71,
+                "1",
+                "Type 'number' is not assignable to type 'string'.",
+            ),
+        ];
+        assert_eq!(program.diagnostics().len(), expected.len());
+        for (diagnostic, (line, column, text, message)) in
+            program.diagnostics().iter().zip(expected)
+        {
+            assert_eq!(diagnostic.code, Some(2322));
+            assert_eq!(
+                diagnostic.file_name.as_deref(),
+                Some("/project/conditionalReturnExpression.ts")
+            );
+            assert_eq!(diagnostic.message, message);
+            let range = diagnostic.range.unwrap();
+            let start = range.start.get() as usize;
+            let end = range.end.get() as usize;
+            assert_eq!(&source[start..end], text);
+            assert_eq!(
+                source[..start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1,
+                line
+            );
+            assert_eq!(
+                source[..start].rsplit('\n').next().unwrap().len() + 1,
+                column
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_string_starts_with_checks_real_parameter_types_and_arity() {
+        let source = concat!(
+            "declare const value: string;\n",
+            "const first: boolean = value.startsWith('a');\n",
+            "const positioned: boolean = value.startsWith('a', 1);\n",
+            "value.startsWith(1);\n",
+            "value.startsWith('a', 'wrong');\n",
+            "value.startsWith();\n",
+        );
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/startsWith.ts", source).unwrap();
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["startsWith.ts".to_owned()],
+            CompilerOptions {
+                no_emit: true,
+                target: ScriptTarget::EsNext,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code.unwrap())
+                .collect::<Vec<_>>(),
+            [2345, 2345, 2554]
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Calls, parameters, and diagnostics share the same parsed cases.
     fn canonical_program_recovers_authenticated_strict_arguments_collisions() {
         type StrictCollisionCase = (&'static str, &'static str, &'static [(u32, u32)]);
