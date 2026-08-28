@@ -102,7 +102,10 @@ use super::{
         cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference,
         preflight_node, type_list_key,
     },
-    formatter::type_to_string_with_host_global_types_and_flags,
+    formatter::{
+        get_type_names_for_assignability_error_with_host_global_types_and_flags,
+        type_to_string_with_host_global_types_and_flags,
+    },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
@@ -110,11 +113,16 @@ use super::{
     interface_heritage::{DirectInterfaceBaseKind, plan_direct_interface_heritage},
     jsdoc::{JsDocIntrinsicType, JsDocType, leading_jsdoc_comment},
     links::{SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
+    object_diagnostics::{
+        callable_assignability_details, declared_property_mismatch_details,
+        property_visibility_mismatch_detail,
+    },
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation, plan_interface,
         plan_type_literal, validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
+    relater::ResolvedDeclaredProperty,
     signatures::{SignatureFlags, SignatureKind},
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     source_calls::{SourceCallCalleeForm, plan_direct_source_call_syntax},
@@ -3482,6 +3490,351 @@ pub(super) fn check_class_index_constraints(
         }
     }
     Ok(())
+}
+
+/// Checks completed instance members before checking the static member types.
+#[allow(clippy::too_many_lines)] // Both diagnostics use the same completed class and base identities.
+pub(super) fn check_class_heritage_compatibility(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    declaration: NodeRef,
+    members: &ClassMembers,
+) -> Result<(), SourceCheckError> {
+    let Some(base) = members.base() else {
+        return Ok(());
+    };
+    let source_type = members.shells().instance_type();
+    let target_type = base.instance_type();
+    for type_ in [source_type, target_type] {
+        if validate_class_heritage_members(store, type_) != ClassHeritageMembersValidation::Valid {
+            return Err(SourceCheckError::Class(declaration));
+        }
+        let Some(TypeData::Interface(instance)) = store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Err(SourceCheckError::Class(declaration));
+        };
+        // Generic heritage needs the derived class's instantiated this argument.
+        if instance
+            .all_type_parameters
+            .as_ref()
+            .is_some_and(|parameters| parameters.len() > 1)
+        {
+            return Ok(());
+        }
+    }
+    let Some(NodeData::ClassDeclaration(class)) = host.node(declaration).map(|record| &record.data)
+    else {
+        return Err(SourceCheckError::Class(declaration));
+    };
+    let name = class.name.map_or(declaration, |name| {
+        NodeRef::new(declaration.arena, declaration.file, name)
+    });
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let target_members = store
+        .type_payload(target_type)
+        .and_then(|record| record.data().structured())
+        .ok_or(SourceCheckError::Class(declaration))?
+        .clone();
+    let mut issued_member_error = false;
+    let mut visibility_error: Option<(usize, String)> = None;
+    for &property in members.declared_instance_properties() {
+        let own = class_heritage_property(store, property, declaration)?;
+        let Some(base_property) = target_members
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|table| table.get(own.name.as_ref()))
+        else {
+            continue;
+        };
+        if property == base_property {
+            continue;
+        }
+        let mut inherited = class_heritage_property(store, base_property, declaration)?;
+        let view = prepare_class_instance_super_view(store, host, members.shells.symbol, None)
+            .map_err(|_| SourceCheckError::Class(declaration))?;
+        inherited.type_ = prepare_class_instance_super_member_type(
+            store,
+            host,
+            Some(global_types),
+            view,
+            base_property,
+        )
+        .map_err(|_| SourceCheckError::Class(declaration))?;
+        let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+        )?;
+        let property_name = own
+            .name
+            .as_utf8()
+            .ok_or(SourceCheckError::Class(declaration))?;
+        if !store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            own.type_,
+            inherited.type_,
+            global_types,
+            options.strict_function_types,
+        )? {
+            let own_name = match host.node(own.declaration).map(|record| &record.data) {
+                Some(NodeData::MethodDeclaration(member)) => Some(member.name),
+                Some(NodeData::PropertyDeclaration(member)) => Some(member.name),
+                Some(NodeData::ParameterDeclaration(member)) => Some(member.name),
+                Some(NodeData::GetAccessorDeclaration(member)) => Some(member.name),
+                Some(NodeData::SetAccessorDeclaration(member)) => Some(member.name),
+                _ => None,
+            }
+            .map_or(own.declaration, |name| {
+                NodeRef::new(own.declaration.arena, own.declaration.file, name)
+            });
+            let detail = class_heritage_type_mismatch(
+                store,
+                host,
+                global_types,
+                options,
+                own.type_,
+                inherited.type_,
+                flags,
+            )?;
+            let mut diagnostic = Diagnostic::with_arguments(
+                message_by_code(2416).ok_or(SourceCheckError::MissingDiagnostic(2416))?,
+                [property_name.to_owned(), names.source, names.target],
+            );
+            diagnostic.details = detail.lines().map(|line| format!("  {line}")).collect();
+            diagnostics.lookup_or_issue(Some(own_name), diagnostic);
+            issued_member_error = true;
+            continue;
+        }
+        let source = class_heritage_diagnostic_type(store, source_type);
+        let target = class_heritage_diagnostic_type(store, target_type);
+        let mut detail = property_visibility_mismatch_detail(
+            store,
+            host,
+            global_types,
+            source,
+            target,
+            &own,
+            &inherited,
+            flags,
+            1,
+        )?;
+        if detail.is_none() && own.optional && !inherited.optional {
+            detail = Some(format!(
+                "  {}",
+                Diagnostic::with_arguments(
+                    message_by_code(2327).ok_or(SourceCheckError::MissingDiagnostic(2327))?,
+                    [property_name.to_owned(), names.source, names.target],
+                )
+                .render()
+                .map_err(|_| SourceCheckError::MissingDiagnostic(2327))?
+            ));
+        }
+        if let Some(detail) = detail {
+            let index = target_members
+                .properties
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .position(|property| *property == base_property)
+                .ok_or(SourceCheckError::Class(declaration))?;
+            if visibility_error
+                .as_ref()
+                .is_none_or(|(first, _)| index < *first)
+            {
+                visibility_error = Some((index, detail));
+            }
+        }
+    }
+    if issued_member_error {
+        return Ok(());
+    }
+    if let Some((_, detail)) = visibility_error {
+        let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+        )?;
+        let mut diagnostic = Diagnostic::with_arguments(
+            message_by_code(2415).ok_or(SourceCheckError::MissingDiagnostic(2415))?,
+            [names.source, names.target],
+        );
+        diagnostic.details.push(detail);
+        diagnostics.lookup_or_issue(Some(name), diagnostic);
+        return Ok(());
+    }
+
+    // The static base loses its construct signatures in Go. Compare its actual
+    // members here, excluding prototype, without comparing constructor parameters.
+    let inherited = store
+        .type_payload(base.value_type())
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.properties.clone())
+        .ok_or(SourceCheckError::Class(declaration))?;
+    for property in inherited {
+        let target = store
+            .symbol(property)
+            .ok_or(SourceCheckError::Class(declaration))?;
+        if target.flags().contains(SymbolFlags::PROTOTYPE) {
+            continue;
+        }
+        let property_name = target.name().to_owned();
+        let source_property = store
+            .symbol_table(members.static_members())
+            .and_then(|table| table.get(property_name.as_ref()))
+            .ok_or(SourceCheckError::Class(declaration))?;
+        if source_property == property {
+            continue;
+        }
+        let source = class_heritage_property(store, source_property, declaration)?.type_;
+        let target = class_heritage_property(store, property, declaration)?.type_;
+        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source,
+            target,
+            global_types,
+            options.strict_function_types,
+        )? {
+            continue;
+        }
+        let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            members.shells().value_type(),
+            base.value_type(),
+            flags,
+        )?;
+        let property_name = property_name
+            .as_utf8()
+            .ok_or(SourceCheckError::Class(declaration))?;
+        let property_detail = Diagnostic::with_arguments(
+            message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
+            [property_name],
+        )
+        .render()
+        .map_err(|_| SourceCheckError::MissingDiagnostic(2326))?;
+        let detail = class_heritage_type_mismatch(
+            store,
+            host,
+            global_types,
+            options,
+            source,
+            target,
+            flags,
+        )?;
+        let mut diagnostic = Diagnostic::with_arguments(
+            message_by_code(2417).ok_or(SourceCheckError::MissingDiagnostic(2417))?,
+            [names.source, names.target],
+        );
+        diagnostic.details.push(format!("  {property_detail}"));
+        diagnostic
+            .details
+            .extend(detail.lines().map(|line| format!("    {line}")));
+        diagnostics.lookup_or_issue(Some(name), diagnostic);
+        break;
+    }
+    Ok(())
+}
+
+fn class_heritage_property(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<ResolvedDeclaredProperty, SourceCheckError> {
+    let symbol = store
+        .symbol(property)
+        .ok_or(SourceCheckError::Class(declaration))?;
+    Ok(ResolvedDeclaredProperty {
+        symbol: property,
+        name: symbol.name().to_owned(),
+        type_: store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+            .ok_or(SourceCheckError::Class(declaration))?,
+        optional: symbol.flags().contains(SymbolFlags::OPTIONAL),
+        declaration: symbol
+            .value_declaration()
+            .ok_or(SourceCheckError::Class(declaration))?,
+    })
+}
+
+// Go reduces classes with no declared instance members to their single base
+// during relation checks, but keeps the original names in the main message.
+fn class_heritage_diagnostic_type(store: &CanonicalTypeMapperStore, mut type_: TypeId) -> TypeId {
+    let mut visited = HashSet::new();
+    while visited.insert(type_) {
+        let Some(base) = store.direct_class_heritage_provenance(type_) else {
+            break;
+        };
+        let has_members = store
+            .type_payload(type_)
+            .and_then(TypeRecord::symbol)
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .is_some_and(|members| !members.is_empty());
+        if has_members {
+            break;
+        }
+        type_ = base.base_instance_type;
+    }
+    type_
+}
+
+fn class_heritage_type_mismatch(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    source: TypeId,
+    target: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<String, SourceCheckError> {
+    let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        source,
+        target,
+        flags,
+    )?;
+    let mut diagnostic = Diagnostic::with_arguments(
+        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+        [names.source, names.target],
+    );
+    diagnostic.details = declared_property_mismatch_details(
+        store,
+        host,
+        global_types,
+        source,
+        target,
+        flags,
+        options,
+    )?;
+    if diagnostic.details.is_empty() {
+        diagnostic.details = callable_assignability_details(
+            store,
+            host,
+            global_types,
+            source,
+            target,
+            flags,
+            options,
+        )?;
+    }
+    diagnostic
+        .render()
+        .map_err(|_| SourceCheckError::MissingDiagnostic(2322))
 }
 
 pub(super) fn class_member_source(

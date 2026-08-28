@@ -1722,7 +1722,7 @@ fn diagnostic_property_visibility(
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps property and containing-type identities separate.
-fn property_visibility_mismatch_detail(
+pub(super) fn property_visibility_mismatch_detail(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,

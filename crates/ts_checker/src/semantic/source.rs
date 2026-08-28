@@ -109,14 +109,14 @@ use super::{
         ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassConstructorVisibility,
         ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassHeritageMembersValidation,
         ClassMemberPlan, ClassMemberQueryPlan, ClassTypeQueryContext, ExportedJsxArrowClassPlan,
-        PreparedSourceClass, SourceClassPlan, complete_source_class_body,
-        execute_exported_jsx_arrow_class, execute_nongeneric_class_member_query,
-        finish_source_class_members, plan_anonymous_abstract_class_expression_grammar,
-        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_exported_static_member_name_grammar_diagnostics, plan_nongeneric_class_member_query,
-        plan_nongeneric_class_member_query_with_type_context, plan_source_class_members,
-        preflight_nongeneric_class_member_query, prepare_source_class_members,
-        validate_class_heritage_members,
+        PreparedSourceClass, SourceClassPlan, check_class_heritage_compatibility,
+        complete_source_class_body, execute_exported_jsx_arrow_class,
+        execute_nongeneric_class_member_query, finish_source_class_members,
+        plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
+        plan_exported_jsx_arrow_class, plan_exported_static_member_name_grammar_diagnostics,
+        plan_nongeneric_class_member_query, plan_nongeneric_class_member_query_with_type_context,
+        plan_source_class_members, preflight_nongeneric_class_member_query,
+        prepare_source_class_members, validate_class_heritage_members,
     },
     contextual::{
         LiteralTreatment, PreparedExpression,
@@ -29357,6 +29357,15 @@ fn check_planned_source_class(
     }
     let members = finish_source_class_members(store, host, &class.source, &prepared)
         .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+    check_class_heritage_compatibility(
+        store,
+        host,
+        global_types,
+        options,
+        diagnostics,
+        declaration,
+        &members,
+    )?;
     for body in class.source.bodies() {
         let checked = state
             .body_diagnostics
@@ -53510,6 +53519,15 @@ pub(super) fn check_source_file(
                 let declaration = class.declaration();
                 let materialized = execute_nongeneric_class_member_query(store, host, &class)
                     .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+                check_class_heritage_compatibility(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    declaration,
+                    &materialized,
+                )?;
                 super::classes::check_class_index_constraints(
                     store,
                     host,

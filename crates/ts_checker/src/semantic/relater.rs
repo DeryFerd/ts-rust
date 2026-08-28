@@ -4630,6 +4630,12 @@ impl<'store> RelaterSession<'store> {
             return Ok(false);
         }
 
+        if self.project_exact_callable_signature(target)?.is_some()
+            && self.raw_symbol_members_prove_absent(owner, InternalSymbolName::Call.as_ref())?
+        {
+            return Ok(true);
+        }
+
         let target_members =
             self.resolved_object_property_surface(target, self.allows_fresh_object_target())?;
         for property in target_members.properties {
