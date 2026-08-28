@@ -20,9 +20,9 @@ use std::{
 use ts_ast::{FileId, Node, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     BindResult, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
-    CanonicalModuleState, CanonicalNameResolutionError, CanonicalSourceFileFacts,
-    CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
-    bind_source_file_in_file_with_facts,
+    CanonicalModuleAugmentation, CanonicalModuleState, CanonicalNameResolutionError,
+    CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolFlags,
+    bind_source_file_in_file, bind_source_file_in_file_with_facts,
 };
 use ts_checker::semantic::alias::{
     CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolutionEvent,
@@ -2149,23 +2149,25 @@ impl Program {
                     );
                 }
             }
-            let usage_modes = canonical_static_module_specifiers(&self.source_files[file_index])
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|(specifier, _, requested_mode)| {
-                    self.source_files[file_index]
-                        .parse
-                        .arena
-                        .get(specifier.node)
-                        .map(|node| (node.range, requested_mode.unwrap_or(source_mode)))
-                })
-                .collect::<Vec<_>>();
+            let usage_modes =
+                canonical_static_module_specifiers(&self.source_files[file_index], &self.options)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(specifier, _, requested_mode)| {
+                        self.source_files[file_index]
+                            .parse
+                            .arena
+                            .get(specifier.node)
+                            .map(|node| (node.range, requested_mode.unwrap_or(source_mode)))
+                    })
+                    .collect::<Vec<_>>();
             let specifiers = module_specifiers(&self.source_files[file_index], &self.options);
             for ModuleSpecifier {
                 text: specifier,
                 range,
                 can_resolve_ambient,
                 side_effect_only,
+                is_augmentation,
                 dependency_order,
             } in specifiers
             {
@@ -2273,6 +2275,7 @@ impl Program {
                         target,
                     );
                 } else if !(self.options.no_check
+                    || is_augmentation
                     || side_effect_only && !self.options.no_unchecked_side_effect_imports
                     || self.options.skip_lib_check
                         && ts_path::is_declaration_file(&containing_file))
@@ -4783,7 +4786,7 @@ impl Program {
             );
         }
         for source in &self.source_files {
-            let specifiers = canonical_static_module_specifiers(source)?;
+            let specifiers = canonical_static_module_specifiers(source, &self.options)?;
             if specifiers.is_empty() {
                 continue;
             }
@@ -5284,6 +5287,11 @@ impl Program {
             self.add_missing_jsx_option_diagnostics(checked.source, &mut diagnostics);
             self.add_erasable_import_assignment_diagnostics(checked.source, &mut diagnostics);
             self.add_external_helper_diagnostics(checked.source, context, &mut diagnostics)?;
+            self.add_canonical_module_target_diagnostics(
+                checked.source,
+                context,
+                &mut diagnostics,
+            )?;
         }
 
         // Program.GetGlobalDiagnostics skips checker diagnostics without source files.
@@ -5334,6 +5342,71 @@ impl Program {
         );
         self.apply_comment_directives(&mut diagnostics, &checked_files);
         Ok(diagnostics)
+    }
+
+    fn add_canonical_module_target_diagnostics(
+        &self,
+        source: &SourceFile,
+        context: &CanonicalCheckerContext<'_>,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        let source_ref = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+        let (_, bound) =
+            context
+                .file(source.id)
+                .ok_or(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                    source_ref,
+                ))?;
+        for (specifier, text, _) in canonical_static_module_specifiers(source, &self.options)? {
+            let Some(augmentation) = bound
+                .module_augmentations()
+                .iter()
+                .find(|augmentation| augmentation.name() == specifier)
+            else {
+                continue;
+            };
+            if augmentation.in_ambient_context() {
+                continue;
+            }
+            let declaration = self
+                .node(specifier)
+                .and_then(|node| node.parent)
+                .map(|node| NodeRef::new(specifier.arena, specifier.file, node))
+                .ok_or(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ))?;
+            let first_declaration = bound
+                .symbol(declaration)
+                .and_then(|symbol| context.store().symbol(symbol))
+                .and_then(|symbol| symbol.declarations())
+                .and_then(|declarations| declarations.first())
+                .ok_or(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ))?;
+            if *first_declaration != declaration {
+                continue;
+            }
+            let diagnostic = match context.module_resolution(specifier) {
+                CanonicalModuleResolutionLookup::Unresolved => Diagnostic::with_arguments(
+                    message_by_code(2664).expect("TS2664 must be in the generated catalog"),
+                    [text],
+                ),
+                CanonicalModuleResolutionLookup::Resolved(_) => continue,
+                CanonicalModuleResolutionLookup::Unavailable
+                | CanonicalModuleResolutionLookup::EntryAbsent => {
+                    return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                        specifier,
+                    ));
+                }
+            };
+            diagnostics.push(self.canonical_program_diagnostic(
+                Some(specifier),
+                None,
+                &diagnostic,
+                std::iter::empty(),
+            )?);
+        }
+        Ok(())
     }
 
     fn canonical_diagnostic_snapshot(
@@ -9770,6 +9843,7 @@ fn percent_encode_source_map_url(url: &str) -> String {
 
 fn canonical_static_module_specifiers(
     source: &SourceFile,
+    options: &CompilerOptions,
 ) -> Result<Vec<(NodeRef, String, Option<CanonicalModuleResolutionMode>)>, CanonicalProgramCheckError>
 {
     let source_ref = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
@@ -9783,6 +9857,8 @@ fn canonical_static_module_specifiers(
             source_ref,
         ));
     };
+    // An unrelated source-admission error must not discard existing import usage modes.
+    let augmentation_facts = canonical_source_file_facts(source, options).ok();
     let mut specifiers = Vec::new();
     let mut pending = file
         .statements
@@ -9802,6 +9878,17 @@ fn canonical_static_module_specifiers(
             return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
                 source_ref,
             ));
+        }
+        if let Some(facts) = &augmentation_facts
+            && let Some(augmentation) = CanonicalModuleAugmentation::for_declaration(
+                &source.parse.arena,
+                source.id,
+                statement,
+                facts,
+            )
+            && let Some((text, _)) = string_literal(&source.parse.arena, augmentation.name().node)
+        {
+            specifiers.push((augmentation.name(), text, None));
         }
         if canonical_ambient_module_statements(
             source,
@@ -10215,6 +10302,7 @@ struct ModuleSpecifier {
     range: TextRange,
     can_resolve_ambient: bool,
     side_effect_only: bool,
+    is_augmentation: bool,
     dependency_order: Option<SourceDependencyOrder>,
 }
 
@@ -10276,6 +10364,7 @@ fn parsed_module_specifier(
         range,
         can_resolve_ambient,
         side_effect_only,
+        is_augmentation: false,
         dependency_order: Some(dependency_order),
     })
 }
@@ -10396,6 +10485,32 @@ fn module_specifiers(source: &SourceFile, options: &CompilerOptions) -> Vec<Modu
             Some(specifier)
         })
         .collect::<Vec<_>>();
+    for (specifier, text, _) in
+        canonical_static_module_specifiers(source, options).unwrap_or_default()
+    {
+        let Some(node) = parse.arena.get(specifier.node) else {
+            continue;
+        };
+        if node
+            .parent
+            .and_then(|parent| parse.arena.get(parent))
+            .is_some_and(|parent| {
+                matches!(
+                    &parent.data,
+                    NodeData::ModuleDeclaration(module) if module.name == specifier.node
+                )
+            })
+        {
+            specifiers.push(ModuleSpecifier {
+                text,
+                range: node.range,
+                can_resolve_ambient: true,
+                side_effect_only: false,
+                is_augmentation: true,
+                dependency_order: None,
+            });
+        }
+    }
     if let Some(source) = parse.arena.source_text() {
         for (specifier, range, can_resolve_ambient, side_effect_only) in
             jsdoc_import_specifiers(source)
@@ -10411,6 +10526,7 @@ fn module_specifiers(source: &SourceFile, options: &CompilerOptions) -> Vec<Modu
                     range,
                     can_resolve_ambient,
                     side_effect_only,
+                    is_augmentation: false,
                     dependency_order: is_javascript
                         .then_some(SourceDependencyOrder::DynamicImport(range.start)),
                 });
@@ -12218,13 +12334,25 @@ mod tests {
         );
         let manifest = program.canonical_module_resolution_manifest().unwrap();
         let entries = manifest.entries();
-        assert_eq!(entries.len(), 4);
-        for (entry, (expected_text, expected_mode)) in entries.iter().zip([
-            ("./first", CanonicalModuleResolutionMode::Esm),
-            ("./target", CanonicalModuleResolutionMode::CommonJs),
-            ("./middle", CanonicalModuleResolutionMode::Esm),
-            ("./last", CanonicalModuleResolutionMode::Esm),
-        ]) {
+        assert_eq!(entries.len(), 5);
+        assert_eq!(
+            entries[1].resolution(),
+            CanonicalModuleResolutionInput::Unresolved,
+        );
+        assert!(matches!(
+            &program.node(entries[1].specifier()).unwrap().data,
+            NodeData::StringLiteral(literal) if literal.text == "wrapper"
+        ));
+        for (entry, (expected_text, expected_mode)) in
+            [entries[0], entries[2], entries[3], entries[4]]
+                .iter()
+                .zip([
+                    ("./first", CanonicalModuleResolutionMode::Esm),
+                    ("./target", CanonicalModuleResolutionMode::CommonJs),
+                    ("./middle", CanonicalModuleResolutionMode::Esm),
+                    ("./last", CanonicalModuleResolutionMode::Esm),
+                ])
+        {
             let NodeData::StringLiteral(literal) = &program.node(entry.specifier()).unwrap().data
             else {
                 panic!("expected a source-owned static module specifier")

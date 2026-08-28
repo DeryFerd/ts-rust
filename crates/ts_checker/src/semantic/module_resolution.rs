@@ -650,7 +650,12 @@ fn validate_specifier(
             specifier,
         ));
     }
-    if !is_supported_specifier_position(arena, specifier.node) {
+    if !is_supported_specifier_position(arena, specifier.node)
+        && !bound
+            .module_augmentations()
+            .iter()
+            .any(|augmentation| augmentation.name() == specifier)
+    {
         return Err(
             CanonicalModuleResolutionManifestError::UnsupportedSpecifierPosition(specifier),
         );

@@ -42102,10 +42102,12 @@ fn publish_imported_namespace_augmentation_exports(
     {
         return Ok(());
     }
-    let augmentation_exports = store
+    let augmentation = store
         .symbol(namespace.symbol)
-        .and_then(ts_binder::semantic::Symbol::exports)
         .ok_or(SourceCheckError::Import(namespace.declaration))?;
+    let Some(augmentation_exports) = augmentation.exports() else {
+        return Ok(());
+    };
 
     for import in imports {
         let specifier =

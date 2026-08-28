@@ -361,6 +361,31 @@ impl CanonicalPatternAmbientModule {
 }
 
 impl CanonicalModuleAugmentation {
+    /// Reads the same augmentation facts used by declaration binding.
+    #[must_use]
+    pub fn for_declaration(
+        arena: &NodeArena,
+        file: FileId,
+        declaration: NodeId,
+        facts: &CanonicalSourceFileFacts,
+    ) -> Option<Self> {
+        let node = arena.get(declaration)?;
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            return None;
+        };
+        if node.kind != SyntaxKind::ModuleDeclaration
+            || !is_ambient_module(arena, declaration)
+            || !is_module_augmentation_external(arena, declaration, facts)
+            || !is_parser_collected_module_augmentation(arena, declaration, facts)
+        {
+            return None;
+        }
+        Some(Self {
+            name: NodeRef::new(arena.id(), file, module.name),
+            in_ambient_context: is_ambient_node(arena, node.parent?, facts),
+        })
+    }
+
     #[must_use]
     pub const fn name(self) -> NodeRef {
         self.name
@@ -2399,11 +2424,7 @@ impl CanonicalBinder {
                 self.push_bind_diagnostic(arena, file, node, 2668, std::iter::empty::<String>());
             }
             let is_external_augmentation = is_module_augmentation_external(arena, node, facts);
-            if is_external_augmentation
-                && is_parser_collected_module_augmentation(arena, node, facts)
-            {
-                self.record_module_augmentation(arena, file, node, facts);
-            }
+            self.record_module_augmentation(arena, file, node, facts);
             if is_external_augmentation {
                 self.declare_module_symbol(arena, file, node, facts, state)?;
             } else {
@@ -2496,23 +2517,16 @@ impl CanonicalBinder {
         node: NodeId,
         facts: &CanonicalSourceFileFacts,
     ) {
-        let Some(NodeData::ModuleDeclaration(module)) = arena.get(node).map(|node| &node.data)
+        let Some(augmentation) =
+            CanonicalModuleAugmentation::for_declaration(arena, file, node, facts)
         else {
-            unreachable!("ambient-module dispatch is kind checked");
+            return;
         };
-        let container = arena
-            .get(node)
-            .and_then(|module| module.parent)
-            .expect("parser-collected module augmentation has a container");
-        let in_ambient_context = is_ambient_node(arena, container, facts);
         self.files
             .get_mut(&file)
             .expect("module-augmentation file is registered")
             .module_augmentations
-            .push(CanonicalModuleAugmentation {
-                name: NodeRef::new(arena.id(), file, module.name),
-                in_ambient_context,
-            });
+            .push(augmentation);
     }
 
     fn declare_module_symbol(
