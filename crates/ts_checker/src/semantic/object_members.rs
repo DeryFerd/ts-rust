@@ -43,6 +43,7 @@ use super::{
     instantiate::{InstantiationLimits, InstantiationSession},
     instantiated_members::{
         GenericInterfaceMemberError, demand_instantiated_property_type,
+        instantiate_published_generic_array_property_callable,
         instantiate_published_generic_interface_method_with_session, property_instantiation_error,
         resolve_members_with_array_targets, resolve_property_with_array_targets_and_session,
         validate_generic_interface_members,
@@ -572,6 +573,9 @@ pub(super) fn resolve_object_property_by_key_with_source(
             session,
         )
         .map_err(|error| source_generic_member_error(receiver, &error))?
+    } else if array.is_some() && store.type_has_function_type_provenance(template) {
+        instantiate_published_generic_array_property_callable(store, global_types, receiver, symbol)
+            .map_err(|error| source_generic_member_error(receiver, &error))?
     } else {
         super::instantiate::instantiate_type_with_vector_and_session(
             store,

@@ -95356,6 +95356,63 @@ class Foo2 {
     }
 
     #[test]
+    fn global_array_property_augmentation_keeps_call_and_redeclaration_diagnostics() {
+        let library = parsed(concat!(
+            "interface IArguments {} ",
+            "interface Array<T> { [index: number]: T; } declare var Array: any; ",
+            "interface Object {} interface Function {} ",
+            "interface String {} interface Number {} interface Boolean {} ",
+            "interface RegExp {} interface ReadonlyArray<T> {} interface ThisType<T> {}",
+        ));
+        let source = parsed(concat!(
+            "interface Array<T> { split: (parts: number) => T[][]; } ",
+            "var strings = ['']; ",
+            "var result = strings.split('bad'); ",
+            "var result: number[][]; ",
+            "var numbers = [1]; ",
+            "var numeric = numbers.split(2); ",
+            "strings.split();",
+        ));
+        let library_file = FileId::new(17_800);
+        let source_file = FileId::new(17_801);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (source_file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345, 2403, 2554],
+        );
+        assert_eq!(node_text(&source, diagnostics[0].node.unwrap()), "'bad'");
+        assert_eq!(
+            diagnostics[1].diagnostic.arguments,
+            ["result", "string[][]", "number[][]"],
+        );
+        assert_eq!(diagnostics[1].related_information.len(), 1);
+        assert_eq!(
+            diagnostics[1].related_information[0].diagnostic.code(),
+            6203
+        );
+        for (name, expected) in [("result", "string[][]"), ("numeric", "number[][]")] {
+            let type_ = variable_value_type(&context, &source, source_file, name);
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+        let expected_diagnostics = context.diagnostics().as_slice().to_vec();
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+        assert_eq!(context.diagnostics().as_slice(), expected_diagnostics);
+    }
+
+    #[test]
     fn array_bindings_preserve_numeric_index_types_and_warm_symbol_links() {
         for (index, (unchecked, expected)) in [(false, "string"), (true, "string | undefined")]
             .into_iter()
