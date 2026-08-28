@@ -60864,7 +60864,7 @@ mod tests {
         assert!(context.diagnostics().is_empty());
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         for (name, expected) in [
-            ("savedValue", bootstrap.number_type),
+            ("savedValue", bootstrap.any_type),
             ("savedKey", bootstrap.string_type),
         ] {
             assert_eq!(variable_value_type(&context, &source, file, name), expected);
@@ -61196,7 +61196,7 @@ mod tests {
     }
 
     #[test]
-    fn function_for_of_invalid_operands_preserve_the_error_iteration_type() {
+    fn function_for_of_without_library_uses_any_iteration_type() {
         let source = parsed(concat!(
             "declare function consume(value: any): void; ",
             "function iterate(): void { for (const item of 1) { consume(item); } }",
@@ -61206,15 +61206,10 @@ mod tests {
 
         context.check_source_file(file).unwrap();
 
-        let [diagnostic] = context.diagnostics().as_slice() else {
-            panic!("expected one invalid function-owned for-of operand diagnostic")
-        };
-        assert_eq!(diagnostic.diagnostic.code(), 2495);
-        assert_eq!(diagnostic.diagnostic.arguments, ["1"]);
-        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "1");
+        assert!(context.diagnostics().is_empty());
         assert_eq!(
             variable_value_type(&context, &source, file, "item"),
-            context.store().intrinsic_bootstrap().unwrap().error_type,
+            context.store().intrinsic_bootstrap().unwrap().any_type,
         );
 
         let warm = observable_state(&context, file);
@@ -62797,7 +62792,7 @@ mod tests {
             let expected = if (3..6).contains(&index) {
                 bootstrap.string_type
             } else {
-                bootstrap.number_type
+                bootstrap.any_type
             };
             assert_eq!(resolved_node_type(&context, *capture), expected);
             assert!(
@@ -63662,7 +63657,7 @@ mod tests {
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         for (name, expected) in [
             ("savedNumber", bootstrap.number_type),
-            ("copiedNumber", bootstrap.number_type),
+            ("copiedNumber", bootstrap.any_type),
             ("first", bootstrap.any_type),
             ("second", bootstrap.any_type),
         ] {
@@ -63769,26 +63764,21 @@ mod tests {
 
         context.check_source_file(file).unwrap();
 
-        let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 2);
-        for (diagnostic, (name, actual, expected)) in diagnostics.iter().zip([
-            ("numberItem", "number", "string"),
-            ("textItem", "string", "number"),
-        ]) {
-            assert_eq!(diagnostic.diagnostic.code(), 2345);
-            assert_eq!(diagnostic.diagnostic.arguments, [actual, expected]);
-            assert_eq!(node_text(&source, diagnostic.node.unwrap()), name);
-            assert_eq!(
-                diagnostic.diagnostic.render().unwrap(),
-                format!(
-                    "Argument of type '{actual}' is not assignable to parameter of type '{expected}'.",
-                ),
-            );
-        }
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected only the string iteration argument diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "textItem");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'.",
+        );
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        // Empty Array<T> has no numeric index to supply an element type.
         assert_eq!(
             variable_value_type(&context, &source, file, "numberItem"),
-            bootstrap.number_type,
+            bootstrap.any_type,
         );
         assert_eq!(
             variable_value_type(&context, &source, file, "textItem"),
@@ -94598,32 +94588,38 @@ class Foo2 {
                 let iterable_links = iterable_symbol
                     .and_then(|symbol| context.store().declared_type_links(symbol).cloned());
 
-                let result = context.check_source_file(file);
+                context.check_source_file(file).unwrap();
 
-                if requires_protocol {
-                    assert_eq!(
-                        result,
-                        Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Element(pattern),
-                        ))
-                    );
-                    assert_eq!(observable_state(&context, file), cold);
-                } else {
-                    result.unwrap();
-                    assert_eq!(
-                        object_binding_value_type(&context, &source, file, "second"),
-                        context.store().intrinsic_bootstrap().unwrap().string_type,
-                    );
-                    let warm = observable_state(&context, file);
-                    context.recheck_source_file(file).unwrap();
-                    assert_eq!(observable_state(&context, file), warm);
-                }
+                assert_ne!(observable_state(&context, file), cold);
                 assert_eq!(
-                    iterable_symbol
-                        .and_then(|symbol| context.store().declared_type_links(symbol).cloned()),
-                    iterable_links,
+                    object_binding_value_type(&context, &source, file, "second"),
+                    context.store().intrinsic_bootstrap().unwrap().string_type,
                 );
-                assert!(context.diagnostics().is_empty());
+                if requires_protocol {
+                    let [diagnostic] = context.diagnostics().as_slice() else {
+                        panic!("expected one missing iterator diagnostic")
+                    };
+                    assert_eq!(diagnostic.diagnostic.code(), 2488);
+                    assert_eq!(diagnostic.diagnostic.arguments, ["string[]"]);
+                    assert_eq!(diagnostic.node, Some(pattern));
+                    assert!(
+                        iterable_symbol
+                            .and_then(|symbol| context.store().declared_type_links(symbol))
+                            .and_then(|links| links.declared_type)
+                            .is_some()
+                    );
+                } else {
+                    assert_eq!(
+                        iterable_symbol.and_then(|symbol| {
+                            context.store().declared_type_links(symbol).cloned()
+                        }),
+                        iterable_links,
+                    );
+                    assert!(context.diagnostics().is_empty());
+                }
+                let warm = observable_state(&context, file);
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm);
             }
         }
     }
@@ -94667,7 +94663,7 @@ class Foo2 {
     }
 
     #[test]
-    fn array_iteration_preflight_rejects_before_callable_or_initializer_publication() {
+    fn array_iteration_preflight_allows_protocol_checks_and_publication() {
         for (index, text) in [
             "function prior(value: number = 1): void {} function select([, value]: number[]): void {}",
             "var input: number[]; function select([, value] = input) {}",
@@ -94692,23 +94688,47 @@ class Foo2 {
             }).unwrap();
             let cold = observable_state(&context, file);
 
-            assert_eq!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Element(pattern))),
-            );
+            context.check_source_file(file).unwrap();
 
-            assert_eq!(observable_state(&context, file), cold);
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one missing iterator diagnostic")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2488);
+            assert_eq!(diagnostic.diagnostic.arguments, ["number[]"]);
+            assert_eq!(diagnostic.node, Some(pattern));
+            assert_ne!(observable_state(&context, file), cold);
+            assert_eq!(
+                object_binding_value_type(&context, &source, file, "value"),
+                context.store().intrinsic_bootstrap().unwrap().number_type,
+            );
             for (node, record) in source.arena.iter() {
                 let node = NodeRef::new(source.arena.id(), file, node);
                 if record.kind == SyntaxKind::FunctionDeclaration {
                     let symbol = context.file(file).unwrap().1.symbol(node).unwrap();
-                    assert!(context.store().source_callable_type_for_owner(symbol).is_none());
+                    assert!(context.store().source_callable_type_for_owner(symbol).is_some());
                 } else if record.kind == SyntaxKind::Parameter {
                     let symbol = context.file(file).unwrap().1.symbol(node).unwrap();
-                    assert!(context.store().value_symbol_links(symbol).is_none());
+                    let type_ = context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .and_then(|links| links.resolved_type)
+                        .unwrap();
+                    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                        panic!("expected a parameter declaration")
+                    };
+                    let expected = if source.arena.get(parameter.name).unwrap().kind
+                        == SyntaxKind::ArrayBindingPattern
+                    {
+                        "number[]"
+                    } else {
+                        "number"
+                    };
+                    assert_eq!(context.type_to_string(type_).unwrap(), expected);
                 }
             }
-            assert!(context.diagnostics().is_empty());
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
         }
     }
 
@@ -94757,18 +94777,32 @@ class Foo2 {
             let result = context.check_source_file(file);
 
             match cache {
-                Cache::Valid => assert!(matches!(
-                    result,
-                    Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Element(_)
-                    ))
-                )),
-                Cache::WrongType | Cache::WrongArity => assert!(matches!(
-                    result,
-                    Err(SourceCheckError::DeclaredType(_) | SourceCheckError::Element(_))
-                )),
+                Cache::Valid => {
+                    result.unwrap();
+                    let [diagnostic] = context.diagnostics().as_slice() else {
+                        panic!("expected one missing iterator diagnostic")
+                    };
+                    assert_eq!(diagnostic.diagnostic.code(), 2488);
+                    assert_eq!(diagnostic.diagnostic.arguments, ["number[]"]);
+                    assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[, value]");
+                    assert_eq!(
+                        object_binding_value_type(&context, &source, file, "value"),
+                        context.store().intrinsic_bootstrap().unwrap().number_type,
+                    );
+                    assert_ne!(observable_state(&context, file), before);
+                    let warm = observable_state(&context, file);
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+                Cache::WrongType | Cache::WrongArity => {
+                    assert!(matches!(
+                        result,
+                        Err(SourceCheckError::DeclaredType(_) | SourceCheckError::Element(_))
+                    ));
+                    assert_eq!(observable_state(&context, file), before);
+                    assert!(context.diagnostics().is_empty());
+                }
             }
-            assert_eq!(observable_state(&context, file), before);
             assert_eq!(
                 context
                     .store()
@@ -94776,7 +94810,6 @@ class Foo2 {
                     .and_then(|links| links.declared_type),
                 Some(cached)
             );
-            assert!(context.diagnostics().is_empty());
         }
     }
 
