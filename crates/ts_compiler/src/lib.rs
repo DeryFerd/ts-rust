@@ -5297,6 +5297,7 @@ impl Program {
         for checked in checked_sources {
             self.add_missing_jsx_option_diagnostics(checked.source, &mut diagnostics);
             self.add_erasable_import_assignment_diagnostics(checked.source, &mut diagnostics);
+            self.add_strict_reserved_identifier_diagnostics(checked.source, &mut diagnostics)?;
             self.add_checked_javascript_parameter_decorator_diagnostics(
                 checked.source,
                 &mut diagnostics,
@@ -5362,6 +5363,66 @@ impl Program {
         );
         self.apply_comment_directives(&mut diagnostics, &checked_files);
         Ok(diagnostics)
+    }
+
+    fn add_strict_reserved_identifier_diagnostics(
+        &self,
+        source: &SourceFile,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        const JSDOC_OR_REPARSED: u32 = (1 << 22) | NodeFlags::REPARSED.0;
+        if self.options.no_check
+            || !source.parse.diagnostics.is_empty()
+            || ts_path::is_declaration_file(&source.file_name)
+            || canonical_source_file_facts(source, &self.options)?.is_external_module()
+        {
+            return Ok(());
+        }
+        let arena = &source.parse.arena;
+        let mut pending = vec![source.parse.source_file];
+        while let Some(id) = pending.pop() {
+            let Some(node) = arena.get(id) else {
+                continue;
+            };
+            if node.flags.0 & JSDOC_OR_REPARSED != 0
+                || matches!(
+                    node.data,
+                    NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_)
+                )
+            {
+                continue;
+            }
+            node.for_each_child(|child| pending.push(child));
+            let NodeData::Identifier(identifier) = &node.data else {
+                continue;
+            };
+            // The pinned binder checks these names even when alwaysStrict is disabled.
+            let keyword = ts_scanner::Scanner::new(&identifier.text).scan().kind as u16;
+            if !(SyntaxKind::FIRST_FUTURE_RESERVED_WORD as u16
+                ..=SyntaxKind::LAST_FUTURE_RESERVED_WORD as u16)
+                .contains(&keyword)
+                || strict_reserved_identifier_is_name(arena, id)
+                || private_helper_access_is_ambient(arena, id)
+            {
+                continue;
+            }
+            let reference = NodeRef::new(arena.id(), source.id, id);
+            let spelling = source
+                .source_text
+                .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(reference))?;
+            let diagnostic = Diagnostic::with_arguments(
+                message_by_code(1212).expect("TS1212 must be in the diagnostic catalog"),
+                [spelling],
+            );
+            diagnostics.push(self.canonical_program_diagnostic(
+                Some(reference),
+                None,
+                &diagnostic,
+                std::iter::empty(),
+            )?);
+        }
+        Ok(())
     }
 
     fn add_checked_javascript_parameter_decorator_diagnostics(
@@ -9317,6 +9378,36 @@ fn private_helper_assignment_kind(
         current = parent;
     }
     PrivateHelperAssignmentKind::None
+}
+
+fn strict_reserved_identifier_is_name(arena: &ts_ast::NodeArena, id: NodeId) -> bool {
+    let Some(parent) = arena
+        .get(id)
+        .and_then(|node| node.parent)
+        .and_then(|parent| arena.get(parent))
+    else {
+        return false;
+    };
+    match &parent.data {
+        NodeData::PropertyDeclaration(data) => data.name == id,
+        NodeData::PropertySignatureDeclaration(data) => data.name == id,
+        NodeData::MethodDeclaration(data) => data.name == id,
+        NodeData::MethodSignatureDeclaration(data) => data.name == id,
+        NodeData::GetAccessorDeclaration(data) => data.name == id,
+        NodeData::SetAccessorDeclaration(data) => data.name == id,
+        NodeData::EnumMember(data) => data.name == id,
+        NodeData::PropertyAssignment(data) => data.name == id,
+        NodeData::PropertyAccessExpression(data) => data.name == id,
+        NodeData::QualifiedName(data) => data.right == id,
+        NodeData::BindingElement(data) => data.property_name == Some(id),
+        NodeData::ImportSpecifier(data) => data.property_name == Some(id),
+        NodeData::ExportSpecifier(_)
+        | NodeData::JsxAttribute(_)
+        | NodeData::JsxSelfClosingElement(_)
+        | NodeData::JsxOpeningElement(_)
+        | NodeData::JsxClosingElement(_) => true,
+        _ => false,
+    }
 }
 
 fn private_helper_access_is_ambient(arena: &ts_ast::NodeArena, access: NodeId) -> bool {
@@ -13515,6 +13606,81 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn strict_reserved_identifier_contexts_match_pinned_go() {
+        for (file_name, source, expected) in [
+            (
+                "a.ts",
+                "var implements = 1, interface = 2, let = 3, package = 4, private = 5, protected = 6, public = 7, static = 8, yield = 9;",
+                vec![
+                    "implements",
+                    "interface",
+                    "let",
+                    "package",
+                    "private",
+                    "protected",
+                    "public",
+                    "static",
+                    "yield",
+                ],
+            ),
+            (
+                "a.ts",
+                "var object = { let: 1, interface: 2 }; object.let; object.interface;",
+                vec![],
+            ),
+            (
+                "a.ts",
+                "var let = 1; var object = { let };",
+                vec!["let", "let"],
+            ),
+            (
+                "a.ts",
+                "const { interface: value } = { interface: 1 };",
+                vec![],
+            ),
+            (
+                "a.ts",
+                "declare var let: number; declare function yield(): void;",
+                vec![],
+            ),
+            ("a.d.ts", "var let: number;", vec![]),
+            ("a.ts", "class C { method() { var let = 1; } }", vec![]),
+            ("a.ts", "export {}; var let = 1;", vec![]),
+            ("a.ts", "var let = ;", vec![]),
+            ("a.ts", "var await = 1;", vec![]),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file(&format!("/{file_name}"), source).unwrap();
+            let program = Program::new_unchecked_with_options_and_checker(
+                &fs,
+                "/",
+                &[file_name.to_owned()],
+                CompilerOptions {
+                    no_emit: true,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+                super::ProgramChecker::Canonical,
+            );
+            let source_file = program.source_file(&format!("/{file_name}")).unwrap();
+            let mut diagnostics = Vec::new();
+            program
+                .add_strict_reserved_identifier_diagnostics(source_file, &mut diagnostics)
+                .unwrap();
+            diagnostics.sort_by(super::compare_program_diagnostics);
+            let actual = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    assert_eq!(diagnostic.code, Some(1212));
+                    let range = diagnostic.range.unwrap();
+                    &source[range.start.get() as usize..range.end.get() as usize]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{source}");
         }
     }
 
