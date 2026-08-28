@@ -27851,6 +27851,29 @@ fn source_property_is_direct_method_call(host: &DeclaredTypeHost<'_>, node: Node
         })
 }
 
+/// Keeps contextual sort callbacks on the existing tuple-binding call path.
+fn source_property_is_contextual_sort_call(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
+    let Some((arena, _)) = host.source(node) else {
+        return false;
+    };
+    let Some(parent) = host.node(node).and_then(|record| record.parent) else {
+        return false;
+    };
+    let Some(NodeData::CallExpression(call)) = arena.get(parent).map(|record| &record.data) else {
+        return false;
+    };
+    let [argument] = call.arguments.nodes.as_slice() else {
+        return false;
+    };
+    arena
+        .get(*argument)
+        .is_some_and(|record| record.kind == SyntaxKind::ArrowFunction)
+        && super::source_calls::is_authenticated_sort_callback_syntax(
+            arena,
+            NodeRef::new(node.arena, node.file, *argument),
+        )
+}
+
 fn source_method_receiver_needs_source_query(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -27897,6 +27920,7 @@ fn check_source_selected_method_property(
 ) -> Result<Option<super::source_properties::CheckedSourceProperty>, SourceCheckError> {
     if plan.class_access_context().is_some()
         || !source_property_is_direct_method_call(host, plan.node)
+        || source_property_is_contextual_sort_call(host, plan.node)
         || source_global_wrapper_method_name(host, plan.node).is_some()
         || source_is_global_array_concat_method(host, plan.node)
         || source_global_array_callback_method_name(host, plan.node).is_some()
@@ -28605,6 +28629,7 @@ fn check_expression_type_with_class_context(
         PlannedExpressionKind::Property(property)
             if property.class_access_context().is_some()
                 || source_property_is_direct_method_call(host, property.node)
+                    && !source_property_is_contextual_sort_call(host, property.node)
                     && source_method_receiver_needs_source_query(
                         store,
                         global_types,
