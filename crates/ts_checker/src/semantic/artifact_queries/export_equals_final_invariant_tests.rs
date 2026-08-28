@@ -29,7 +29,7 @@ struct Fixture {
     nodes: Vec<NodeRef>,
     owners: Vec<SemanticSymbolId>,
     tables: Vec<SymbolTableId>,
-    local_table: SymbolTableId,
+    local_table: Option<SymbolTableId>,
     exported: NodeRef,
     read: Option<NodeRef>,
 }
@@ -185,8 +185,7 @@ fn fixture(
         .file(file)
         .unwrap()
         .1
-        .locals(reference(source.source_file))
-        .unwrap();
+        .locals(reference(source.source_file));
     Fixture {
         files: files.to_vec(),
         nodes,
@@ -460,7 +459,7 @@ fn check_owner_changes(text: &str) {
                 .unwrap_or_default();
             let local = context
                 .store()
-                .symbol_table(fixture.local_table)
+                .symbol_table(fixture.local_table.unwrap())
                 .unwrap()
                 .get_source("Value")
                 .unwrap();
@@ -555,7 +554,7 @@ fn check_owner_changes(text: &str) {
                 OwnerChange::LexicalTarget | OwnerChange::LexicalTargetAndCaches => {
                     assert_eq!(
                         store.insert_symbol(
-                            fixture.local_table,
+                            fixture.local_table.unwrap(),
                             EscapedName::source("Value"),
                             other
                         ),
@@ -606,7 +605,11 @@ fn check_owner_changes(text: &str) {
             assert!(store.set_symbol_node_links(fixture.exported, symbol_links));
             assert!(
                 store
-                    .insert_symbol(fixture.local_table, EscapedName::source("Value"), local)
+                    .insert_symbol(
+                        fixture.local_table.unwrap(),
+                        EscapedName::source("Value"),
+                        local,
+                    )
                     .is_some()
             );
             assert_healthy(context, fixture, owner, declared, value);
@@ -1181,7 +1184,7 @@ fn export_equals_final_invariant_class_flags_cannot_hide_from_value_lookup() {
                 assert_eq!(
                     context
                         .store()
-                        .symbol_table(fixture.local_table)
+                        .symbol_table(fixture.local_table.unwrap())
                         .unwrap()
                         .get_source("Value"),
                     Some(owner)
@@ -1274,6 +1277,7 @@ fn review_merged_export_guard_keeps_cold_global_declarations_unpublished() {
             ],
             2,
             |context, fixture| {
+                assert!(fixture.local_table.is_none());
                 let owner = fixture.owner(context, "Value");
                 assert!(
                     crate::semantic::classes::global_class_namespace_declaration(
