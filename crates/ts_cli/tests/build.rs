@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -652,6 +653,15 @@ fn stale_or_missing_outputs_are_rebuilt_with_deterministic_build_info() {
 
     fs::write(&output, "stale sentinel").unwrap();
     fs::write(&source, "export const value: number = 1;\n").unwrap();
+    // Consecutive writes can receive the same filesystem timestamp.
+    let source_time = fs::metadata(&source).unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&output)
+        .unwrap()
+        .set_modified(source_time - Duration::from_secs(1))
+        .unwrap();
+    assert!(fs::metadata(&output).unwrap().modified().unwrap() < source_time);
     assert!(run(&directory.0, &arguments).status.success());
     assert_ne!(fs::read_to_string(output).unwrap(), "stale sentinel");
     assert_eq!(fs::read_to_string(build_info).unwrap(), original_build_info);
