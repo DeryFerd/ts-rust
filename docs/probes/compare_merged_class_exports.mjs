@@ -9,8 +9,15 @@ const goRows = JSON.parse(fs.readFileSync(goPath, "utf8"));
 const rustRows = JSON.parse(fs.readFileSync(rustPath, "utf8"));
 const key = (row) => `${row.name}/${row.order}`;
 const rustByKey = new Map(rustRows.map((row) => [key(row), row]));
+const syntaxKinds = new Map([
+  ["KindClassDeclaration", "ClassDeclaration"],
+  ["KindModuleDeclaration", "ModuleDeclaration"],
+  ["KindPropertyDeclaration", "PropertyDeclaration"],
+  ["KindVariableDeclaration", "VariableDeclaration"],
+]);
 
 // Transient marks checker-created storage, not a different source symbol.
+// Go's enum names add Kind to the same four declaration kinds.
 function semanticValue(value) {
   if (Array.isArray(value)) return value.map(semanticValue);
   if (value !== null && typeof value === "object") {
@@ -18,7 +25,9 @@ function semanticValue(value) {
       Object.entries(value)
         .filter(([name]) => name !== "transient")
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([name, child]) => [name, semanticValue(child)]),
+        .map(([name, child]) => [name, semanticValue(name === "kind"
+          ? syntaxKinds.get(child) ?? child
+          : child)]),
     );
   }
   return value;
