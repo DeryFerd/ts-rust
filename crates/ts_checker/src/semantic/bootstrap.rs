@@ -48,7 +48,9 @@ use super::{
     links::ValueSymbolLinks,
     mapper::{TypeMapper, TypeMapperApplication},
     object_members,
-    reference_types::validate_direct_generic_reference,
+    reference_types::{
+        validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
+    },
     relation::RelationStateSnapshot,
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{SemanticStore, SourceNodeParent},
@@ -2830,6 +2832,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result
     }
 
+    /// Library return annotations can use a declared identity before its members are queried.
+    fn valid_lazy_default_library_interface_union_constituent(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        interface: &InterfaceTypeData,
+    ) -> bool {
+        let Some(symbol) = record.symbol() else {
+            return false;
+        };
+        object_members::authenticated_default_library_interface_owner(self, symbol)
+            && validate_nongeneric_interface_argument_origin(self, type_).is_ok()
+            && record.object_flags()
+                & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+                == ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+            && interface.reference.object.structured == StructuredTypeData::default()
+            && !interface.base_types_resolved
+            && self.direct_interface_heritage_provenance(type_).is_none()
+            && interface.resolved_base_constructor_type.is_none()
+            && interface.resolved_base_types.is_none()
+            && !interface.declared_members_resolved
+            && interface.declared_members.is_none()
+            && interface.declared_call_signatures.is_none()
+            && interface.declared_construct_signatures.is_none()
+            && interface.declared_index_infos.is_none()
+    }
+
     fn validate_supported_canonical_tuple(
         &self,
         type_: TypeId,
@@ -3500,6 +3530,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeData::Interface(interface) => {
+                if self.valid_lazy_default_library_interface_union_constituent(
+                    type_, record, interface,
+                ) {
+                    return Ok(());
+                }
                 match validate_stored_callable_set(self, type_) {
                     StoredCallableSetValidation::Valid { edges, .. } => {
                         if !visiting.insert(type_) {

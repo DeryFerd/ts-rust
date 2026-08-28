@@ -2234,6 +2234,79 @@ fn cached_alias_parameter_symbols(
     .map(Some)
 }
 
+fn interface_method_this_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<SemanticSymbolId, DeclaredTypeError> {
+    let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+    let unsupported = || {
+        type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+            node,
+            kind: SyntaxKind::ThisType,
+        })
+    };
+    let record = preflight_node(store, host, node)?;
+    if record.kind != SyntaxKind::ThisType
+        || record.flags.0 != 0
+        || !matches!(record.data, NodeData::ThisTypeNode(_))
+    {
+        return Err(invalid());
+    }
+    let method = record
+        .parent
+        .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        .ok_or_else(unsupported)?;
+    let method_record = preflight_node(store, host, method)?;
+    let NodeData::MethodSignatureDeclaration(data) = &method_record.data else {
+        return Err(unsupported());
+    };
+    if data.type_ != Some(node.node) {
+        return Err(unsupported());
+    }
+    let declaration = method_record
+        .parent
+        .map(|parent| NodeRef::new(method.arena, method.file, parent))
+        .ok_or_else(unsupported)?;
+    if preflight_node(store, host, declaration)?.kind != SyntaxKind::InterfaceDeclaration {
+        return Err(unsupported());
+    }
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let owner = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.flags().contains(SymbolFlags::CLASS)
+        || !host.symbol_matches(store, declaration, owner)
+        || bound.contains_this(declaration) != Some(true)
+        || object_members::plan_interface_method(store, host, declaration, owner, method)
+            .map_err(property_object_error)?
+            .return_type
+            != node
+    {
+        return Err(invalid());
+    }
+    preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
+    let expected = super::declared::cached_interface_type(store, owner)?
+        .and_then(|type_| store.type_payload(type_))
+        .and_then(|record| match record.data() {
+            TypeData::Interface(interface) => interface.this_type,
+            _ => None,
+        });
+    if store.type_node_links(node).is_some_and(|links| {
+        links.outer_type_parameters.is_some()
+            || links.resolved_type.is_some() && links.resolved_type != expected
+    }) || store
+        .symbol_node_links(node)
+        .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return Err(invalid());
+    }
+    Ok(owner)
+}
+
 /// Checks the query used by an arrow whose return is currently being inferred or replayed.
 pub(super) fn authenticated_active_recursive_arrow_query(
     store: &CanonicalTypeMapperStore,
@@ -2741,6 +2814,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             | SyntaxKind::NeverKeyword
             | SyntaxKind::ObjectKeyword
             | SyntaxKind::IntrinsicKeyword => Ok(()),
+            SyntaxKind::ThisType if alias_owner.is_none() && !union_constituent => {
+                interface_method_this_owner(self.store, self.host, node).map(|_| ())
+            }
             SyntaxKind::ParenthesizedType => {
                 let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
                     return Err(type_node_unavailable(
@@ -6905,15 +6981,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     }
                 }
             }
-            for property in planned.property_type_nodes() {
-                self.plan_type_node_in_context(property, None, false)?;
-            }
-            for (key_type, value_type) in planned.index_type_nodes() {
-                self.plan_type_node_in_context(key_type, None, false)?;
-                self.plan_type_node_in_context(value_type, None, false)?;
-            }
-            for annotation in planned.call_type_nodes() {
-                self.plan_type_node_in_context(annotation, None, false)?;
+            let library_method_returns = planned
+                .methods
+                .iter()
+                .filter(|method| {
+                    self.store
+                        .source_is_default_library_declaration(method.declaration)
+                })
+                .map(|method| method.return_type)
+                .collect::<HashSet<_>>();
+            for annotation in planned
+                .property_type_nodes()
+                .chain(
+                    planned
+                        .index_type_nodes()
+                        .flat_map(|(key, value)| [key, value]),
+                )
+                .chain(planned.call_type_nodes())
+            {
+                let previous = self.lazy_interface_values;
+                self.lazy_interface_values |= library_method_returns.contains(&annotation);
+                let result = self.plan_type_node_in_context(annotation, None, false);
+                self.lazy_interface_values = previous;
+                result?;
             }
             Ok(())
         })();
@@ -24226,6 +24316,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             | SyntaxKind::NeverKeyword
             | SyntaxKind::ObjectKeyword
             | SyntaxKind::IntrinsicKeyword => self.keyword_type(record.kind),
+            SyntaxKind::ThisType => self.execute_interface_method_this_type(node),
             SyntaxKind::ParenthesizedType => {
                 let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
                     return Err(type_node_unavailable(
@@ -24306,6 +24397,42 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_interface_method_this_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let owner = interface_method_this_owner(self.store, self.host, node)?;
+        let flags = self.symbol_flags(owner)?;
+        let type_ =
+            get_declared_class_interface_or_type_parameter(self.store, self.host, owner, flags)?
+                .ok_or_else(invalid)?;
+        let resolved = self
+            .store
+            .type_payload(type_)
+            .and_then(|record| match record.data() {
+                TypeData::Interface(interface) => interface.this_type,
+                _ => None,
+            })
+            .ok_or_else(invalid)?;
+        if !self
+            .store
+            .try_reserve_type_node_links(usize::from(self.store.type_node_links(node).is_none()))
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::LiteralTypeCapacity,
+            ));
+        }
+        assert!(self.store.set_type_node_links(
+            node,
+            TypeNodeLinks {
+                resolved_type: Some(resolved),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        Ok(resolved)
     }
 
     fn execute_type_predicate(

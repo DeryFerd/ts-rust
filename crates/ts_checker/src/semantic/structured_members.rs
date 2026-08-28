@@ -23,9 +23,10 @@ use super::{
         MembersOrExportsResolutionKind, ResolvedSignatureState, SignatureLinks, ValueSymbolLinks,
     },
     object_members::{
-        DirectInterfaceDeclaredState, PlannedComputedMemberKey, PropertyObjectError,
-        PropertyObjectKind, PropertyObjectPlan, PropertyObjectState, ResolvedCallSignatureTypes,
-        StoredDeclaredCallSetValidation, planned_declared_property_key,
+        DeclaredPropertyTypeGraphValidation, DirectInterfaceDeclaredState,
+        PlannedComputedMemberKey, PropertyObjectError, PropertyObjectKind, PropertyObjectPlan,
+        PropertyObjectState, ResolvedCallSignatureTypes, StoredDeclaredCallSetValidation,
+        authenticated_default_library_interface_owner, planned_declared_property_key,
         prepare_direct_interface_declared_properties, publish_declared_members,
         publish_prepared_direct_interface_declared_properties, resolved_computed_member_key,
         valid_declared_property_check_flags, validate_stored_declared_call_set,
@@ -832,6 +833,70 @@ fn validate_no_heritage_property_interface(
     validate_property_interface(store, type_, false, array_targets)
 }
 
+/// Reuses complete member checks for published library interfaces without a base.
+pub(super) fn validate_default_library_interface_type_graph(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> DeclaredPropertyTypeGraphValidation {
+    use DeclaredPropertyTypeGraphValidation::{Malformed, Opaque, Traversable};
+
+    let Some(record) = store.type_payload(type_) else {
+        return Opaque;
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return Opaque;
+    };
+    let Some(owner) = record.symbol() else {
+        return Opaque;
+    };
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+        || !authenticated_default_library_interface_owner(store, owner)
+        || store
+            .symbol(owner)
+            .and_then(|owner| owner.declarations())
+            .is_none_or(|declarations| {
+                declarations.iter().any(|declaration| {
+                    store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+                        && store
+                            .source_direct_children(*declaration)
+                            .is_none_or(|children| {
+                                children.iter().any(|child| {
+                                    !matches!(
+                                        store.source_node_kind(*child),
+                                        Some(
+                                            SyntaxKind::Identifier
+                                                | SyntaxKind::DeclareKeyword
+                                                | SyntaxKind::PropertySignature
+                                                | SyntaxKind::PropertyDeclaration
+                                                | SyntaxKind::MethodSignature
+                                        )
+                                    )
+                                })
+                            })
+                })
+            })
+    {
+        return Opaque;
+    }
+    let Some(members) = validate_no_heritage_property_interface(store, type_, None) else {
+        return Malformed;
+    };
+    if interface.declared_index_infos.is_some()
+        || !members.index_infos.is_empty()
+        || !members.call_signatures.is_empty()
+    {
+        return Malformed;
+    }
+    members
+        .properties
+        .into_iter()
+        .map(|property| store.value_symbol_links(property)?.resolved_type)
+        .collect::<Option<Vec<_>>>()
+        .map_or(Malformed, Traversable)
+}
+
 fn validate_generic_base_property_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -985,8 +1050,11 @@ fn validate_property_interface_worker(
         return None;
     }
     let record = store.type_payload(type_)?;
-    let reference_identity =
-        requires_direct_base && validate_nongeneric_interface_argument_origin(store, type_).is_ok();
+    let library_owner = record
+        .symbol()
+        .is_some_and(|owner| authenticated_default_library_interface_owner(store, owner));
+    let reference_identity = (requires_direct_base || library_owner)
+        && validate_nongeneric_interface_argument_origin(store, type_).is_ok();
     if record.object_flags().contains(ObjectFlags::REFERENCE) && !reference_identity {
         let result = validate_generic_base_property_interface(store, type_, array_targets);
         assert!(active.remove(&type_));
@@ -1031,14 +1099,19 @@ fn validate_property_interface_worker(
         || object_flags != identity_flags | ObjectFlags::MEMBERS_RESOLVED
         || record.alias().is_some()
         || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            && !library_owner
         || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.value_declaration().is_some()
+        || owner_record.value_declaration().is_some() && !library_owner
         || !valid_declared_member_table(store, owner, interface.declared_members)
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
         || owner_declarations.iter().any(|declaration| {
             store.source_node_kind(*declaration) != Some(SyntaxKind::InterfaceDeclaration)
+                && !(library_owner
+                    && owner_record.value_declaration() == Some(*declaration)
+                    && store.source_node_kind(*declaration)
+                        == Some(SyntaxKind::VariableDeclaration))
         })
         || store
             .declared_type_links(owner)
@@ -2268,7 +2341,7 @@ fn valid_interface_method_signatures(
 ) -> Option<&[SignatureId]> {
     let method_record = store.symbol(method)?;
     let declarations = method_record.declarations()?;
-    let owner = method_record.parent()?;
+    let owner = store.get_parent_of_symbol(method)?;
     let owner_record = store.symbol(owner)?;
     let owner_declarations = owner_record.declarations()?;
     let bootstrap = store.intrinsic_bootstrap()?;
@@ -2310,6 +2383,7 @@ fn valid_interface_method_signatures(
             .is_some_and(|(authenticated_owner, _)| authenticated_owner == owner);
     if owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         && !merged_namespace_interface
+        && !authenticated_default_library_interface_owner(store, owner)
         || declarations.is_empty()
         || declarations.len() != signatures.len()
         || record.flags() != TypeFlags::OBJECT

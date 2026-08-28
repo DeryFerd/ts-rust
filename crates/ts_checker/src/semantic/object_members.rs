@@ -4881,7 +4881,14 @@ fn authenticated_global_builtin_interface(
         "String" => ("StringConstructor", "toLowerCase", 0),
         "Object" => ("ObjectConstructor", "toString", 0),
         "Symbol" => ("SymbolConstructor", "toString", 0),
-        _ => return false,
+        _ => {
+            return authenticated_default_library_method_interface(
+                store,
+                host,
+                symbol,
+                *declaration,
+            );
+        }
     };
     if !authenticated_global_builtin_value_declaration(
         store,
@@ -4946,6 +4953,64 @@ fn authenticated_global_builtin_interface(
         && plan.spreads.is_empty()
         && plan.call_signatures.is_empty()
         && plan.heritage.is_none()
+}
+
+/// The value side does not change methods owned by the original library interface.
+fn authenticated_default_library_method_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    value_declaration: NodeRef,
+) -> bool {
+    authenticated_default_library_interface_owner(store, symbol)
+        && store.symbol(symbol).is_some_and(|owner| {
+            owner.value_declaration() == Some(value_declaration)
+                && owner.declarations().is_some_and(|declarations| {
+                    declarations
+                        .iter()
+                        .all(|declaration| host.symbol_matches(store, *declaration, symbol))
+                })
+        })
+}
+
+pub(super) fn authenticated_default_library_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(globals) = store.source_global_bindings() else {
+        return false;
+    };
+    let Some(original) = globals.get(owner.name()) else {
+        return false;
+    };
+    let allowed =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    owner.flags().contains(SymbolFlags::INTERFACE)
+        && owner.flags().without(allowed) == SymbolFlags::NONE
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.exports().is_none()
+        && owner.export_symbol().is_none()
+        && globals.table == bootstrap.globals
+        && original.symbol == symbol
+        && original.flags == owner.flags()
+        && store.get_merged_symbol(original.table_symbol) == Some(symbol)
+        && store
+            .symbol_table(globals.table)
+            .and_then(|table| table.get(owner.name()))
+            == Some(original.table_symbol)
+        && owner.parent().is_none()
+        && store.source_merged_symbol_declarations_match(symbol)
+        && owner.declarations().is_some_and(|declarations| {
+            declarations
+                .iter()
+                .all(|declaration| store.source_is_default_library_declaration(*declaration))
+        })
 }
 
 fn authenticated_default_library_builtin_symbol_tag(
@@ -12375,7 +12440,7 @@ fn validate_object_record(
                 return Some(PropertyObjectState::Shell(type_));
             }
             if record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
-                && valid_declared_structured_members(store, object, plan)
+                && valid_declared_structured_members(store, object, plan, false)
                 && resolved_property_links(store, plan)
             {
                 return Some(PropertyObjectState::Resolved(type_));
@@ -12418,6 +12483,20 @@ fn validate_interface_record(
         return None;
     };
     let owner = store.symbol(plan.symbol)?;
+    let reference_identity = validate_nongeneric_interface_argument_origin(store, type_).is_ok();
+    let identity_flags = ObjectFlags::INTERFACE
+        | if reference_identity {
+            ObjectFlags::REFERENCE
+        } else {
+            ObjectFlags::NONE
+        };
+    let object_flags = if reference_identity {
+        record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+    } else {
+        record.object_flags()
+    };
     let exact_declarations = owner
         .declarations()?
         .iter()
@@ -12430,12 +12509,24 @@ fn validate_interface_record(
         || record.symbol() != Some(plan.symbol)
         || record.alias().is_some()
         || !exact_declarations
-        || !valid_thisless_interface_identity(interface)
+        || !valid_thisless_interface_identity(interface) && !reference_identity
     {
         return None;
     }
-    if record.object_flags() == ObjectFlags::INTERFACE
-        && valid_unresolved_interface_members(interface)
+    let unresolved_members = if reference_identity {
+        interface.reference.object.structured == StructuredTypeData::default()
+            && interface.resolved_base_constructor_type.is_none()
+            && interface.resolved_base_types.is_none()
+            && !interface.declared_members_resolved
+            && interface.declared_members.is_none()
+            && interface.declared_call_signatures.is_none()
+            && interface.declared_construct_signatures.is_none()
+            && interface.declared_index_infos.is_none()
+    } else {
+        valid_unresolved_interface_members(interface)
+    };
+    if object_flags == identity_flags
+        && unresolved_members
         && unresolved_property_links(store, plan)
     {
         return Some(PropertyObjectState::Shell(type_));
@@ -12454,7 +12545,7 @@ fn validate_interface_record(
         .as_deref()
         .filter(|signatures| signatures.len() != call_signature_count)
         .map(|signatures| &signatures[call_signature_count..]);
-    if record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+    if object_flags == identity_flags | ObjectFlags::MEMBERS_RESOLVED
         && interface.base_types_resolved
         && interface.resolved_base_constructor_type.is_none()
         && interface.resolved_base_types.is_none()
@@ -12464,7 +12555,12 @@ fn validate_interface_record(
         && interface.declared_construct_signatures.as_deref() == expected_constructs
         && interface.declared_index_infos.as_deref()
             == interface.reference.object.structured.index_infos.as_deref()
-        && valid_declared_structured_members(store, &interface.reference.object, plan)
+        && valid_declared_structured_members(
+            store,
+            &interface.reference.object,
+            plan,
+            reference_identity,
+        )
         && resolved_property_links(store, plan)
     {
         return Some(PropertyObjectState::Resolved(type_));
@@ -13637,6 +13733,10 @@ pub(super) fn validate_resolved_declared_property_type_graph(
     type_: TypeId,
 ) -> DeclaredPropertyTypeGraphValidation {
     match validate_global_date_interface_type_graph(store, type_) {
+        DeclaredPropertyTypeGraphValidation::Opaque => {}
+        validation => return validation,
+    }
+    match super::structured_members::validate_default_library_interface_type_graph(store, type_) {
         DeclaredPropertyTypeGraphValidation::Opaque => {}
         validation => return validation,
     }
@@ -14977,6 +15077,7 @@ fn valid_declared_structured_members(
     store: &CanonicalTypeMapperStore,
     object: &ObjectTypeData,
     plan: &PropertyObjectPlan,
+    reference_identity: bool,
 ) -> bool {
     let call_signatures = resolved_call_signature_ids(store, plan);
     let call_signature_count = plan
@@ -15003,7 +15104,7 @@ fn valid_declared_structured_members(
                         .error_type
                 }),
             ))
-        && valid_object_tail(object)
+        && (reference_identity || valid_object_tail(object))
         && object.structured.constrained == ConstrainedTypeData::default()
         && object.structured.members == plan.members
         && object.structured.properties == plan.expected_properties()
