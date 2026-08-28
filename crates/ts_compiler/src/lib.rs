@@ -6653,36 +6653,13 @@ impl Program {
                 related_information: Vec::new(),
             });
         }
-        if is_javascript
-            && !source_check_js_directive(&source_text).unwrap_or(self.options.check_js)
-            && !self.options.experimental_decorators
-        {
-            let message = message_by_code(1206).expect("TS1206 must be in the diagnostic catalog");
-            for (_, node) in parse.arena.iter() {
-                let NodeData::ParameterDeclaration(parameter) = &node.data else {
-                    continue;
-                };
-                let Some(decorator) = parameter.modifiers.as_ref().and_then(|modifiers| {
-                    modifiers.list.nodes.iter().find_map(|modifier| {
-                        parse
-                            .arena
-                            .get(*modifier)
-                            .filter(|modifier| modifier.kind == SyntaxKind::Decorator)
-                    })
-                }) else {
-                    continue;
-                };
-                self.diagnostics.push(ProgramDiagnostic {
-                    file_name: Some(file_name.to_owned()),
-                    range: Some(decorator.range),
-                    code: Some(message.code()),
-                    category: message.category(),
-                    message: message
-                        .format(&[])
-                        .expect("TS1206 has no diagnostic arguments"),
-                    related_information: Vec::new(),
-                });
-            }
+        if is_javascript {
+            self.diagnostics.extend(javascript_syntax_diagnostics(
+                file_name,
+                &parse,
+                !source_check_js_directive(&source_text).unwrap_or(self.options.check_js)
+                    && !self.options.experimental_decorators,
+            ));
         }
         let index = self.source_files.len();
         let file_id =
@@ -10934,6 +10911,236 @@ fn check_js_requires_allow_js_diagnostic() -> ProgramDiagnostic {
             .expect("TS5052 has two formatting arguments"),
         related_information: Vec::new(),
     }
+}
+
+/// Reports TypeScript-only syntax from the original JavaScript AST.
+#[allow(clippy::too_many_lines)] // Keep the related syntax rules in one AST walk.
+fn javascript_syntax_diagnostics(
+    file_name: &str,
+    parse: &ParseResult,
+    report_parameter_decorators: bool,
+) -> Vec<ProgramDiagnostic> {
+    const JSDOC_OR_REPARSED: u32 = (1 << 22) | NodeFlags::REPARSED.0;
+    let source_node = |id| {
+        parse
+            .arena
+            .get(id)
+            .filter(|node| node.flags.0 & JSDOC_OR_REPARSED == 0)
+    };
+    let mut diagnostics = Vec::new();
+    let mut report = |range: TextRange, code, arguments: &[&str]| {
+        let message = message_by_code(code)
+            .expect("JavaScript syntax diagnostics must be in the diagnostic catalog");
+        diagnostics.push(ProgramDiagnostic {
+            file_name: Some(file_name.to_owned()),
+            range: Some(range),
+            code: Some(code),
+            category: message.category(),
+            message: Diagnostic::with_arguments(message, arguments.iter().copied())
+                .render()
+                .expect("JavaScript syntax diagnostic arguments must match"),
+            related_information: Vec::new(),
+        });
+    };
+    let mut pending = vec![parse.source_file];
+    while let Some(node_id) = pending.pop() {
+        let Some(node) = source_node(node_id) else {
+            continue;
+        };
+        node.for_each_child(|child| pending.push(child));
+        let mut annotation = None;
+        let mut question_token = None;
+        let mut type_parameters = None;
+        let mut modifiers = None;
+        let mut signature_without_body = false;
+
+        macro_rules! signature {
+            ($data:ident, $has_body:expr) => {{
+                annotation = $data.type_;
+                type_parameters = $data.type_parameters.as_ref();
+                modifiers = $data.modifiers.as_ref();
+                signature_without_body = !$has_body;
+            }};
+        }
+
+        match &node.data {
+            NodeData::ParameterDeclaration(parameter) => {
+                annotation = parameter.type_;
+                question_token = parameter.question_token;
+                if let Some(modifiers) = parameter.modifiers.as_ref() {
+                    let modifier_nodes = modifiers
+                        .list
+                        .nodes
+                        .iter()
+                        .filter_map(|modifier| source_node(*modifier))
+                        .collect::<Vec<_>>();
+                    if modifier_nodes.iter().any(|node| node.kind.is_modifier())
+                        && let (Some(first), Some(last)) =
+                            (modifier_nodes.first(), modifier_nodes.last())
+                    {
+                        report(TextRange::new(first.range.start, last.range.end), 8012, &[]);
+                    }
+                    if report_parameter_decorators
+                        && let Some(decorator) = modifier_nodes
+                            .iter()
+                            .find(|node| node.kind == SyntaxKind::Decorator)
+                    {
+                        report(decorator.range, 1206, &[]);
+                    }
+                }
+            }
+            NodeData::PropertyDeclaration(property) => {
+                annotation = property.type_;
+                question_token = property.postfix_token;
+                modifiers = property.modifiers.as_ref();
+            }
+            NodeData::MethodDeclaration(method) => {
+                question_token = method.postfix_token;
+                signature!(method, method.body.is_some());
+            }
+            NodeData::ConstructorDeclaration(constructor) => {
+                signature!(constructor, constructor.body.is_some());
+            }
+            NodeData::GetAccessorDeclaration(accessor) => {
+                signature!(accessor, accessor.body.is_some());
+            }
+            NodeData::SetAccessorDeclaration(accessor) => {
+                signature!(accessor, accessor.body.is_some());
+            }
+            NodeData::FunctionDeclaration(function) => {
+                signature!(function, function.body.is_some());
+            }
+            NodeData::FunctionExpression(function) => {
+                signature!(function, true);
+            }
+            NodeData::ArrowFunction(function) => {
+                signature!(function, true);
+            }
+            NodeData::MethodSignatureDeclaration(_) | NodeData::IndexSignatureDeclaration(_) => {
+                signature_without_body = true;
+            }
+            NodeData::VariableDeclaration(variable) => annotation = variable.type_,
+            NodeData::VariableStatement(statement) => modifiers = statement.modifiers.as_ref(),
+            NodeData::ClassDeclaration(class) => {
+                type_parameters = class.type_parameters.as_ref();
+                modifiers = class.modifiers.as_ref();
+            }
+            NodeData::ClassExpression(class) => {
+                type_parameters = class.type_parameters.as_ref();
+                modifiers = class.modifiers.as_ref();
+            }
+            NodeData::ImportEqualsDeclaration(_) => report(node.range, 8002, &[]),
+            NodeData::ExportAssignment(export) if export.is_export_equals => {
+                report(node.range, 8003, &[]);
+            }
+            NodeData::HeritageClause(heritage)
+                if heritage.token == SyntaxKind::ImplementsKeyword =>
+            {
+                report(node.range, 8005, &[]);
+            }
+            NodeData::InterfaceDeclaration(interface) => {
+                if let Some(name) = source_node(interface.name) {
+                    report(name.range, 8006, &["interface"]);
+                }
+            }
+            NodeData::EnumDeclaration(enumeration) => {
+                if let Some(name) = source_node(enumeration.name) {
+                    report(name.range, 8006, &["enum"]);
+                }
+            }
+            NodeData::ModuleDeclaration(module) => {
+                let keyword = match module.keyword {
+                    SyntaxKind::NamespaceKeyword => "namespace",
+                    SyntaxKind::ModuleKeyword => "module",
+                    SyntaxKind::GlobalKeyword => "global",
+                    _ => continue,
+                };
+                if let Some(name) = source_node(module.name) {
+                    report(name.range, 8006, &[keyword]);
+                }
+            }
+            NodeData::TypeAliasDeclaration(alias) => {
+                if let Some(name) = source_node(alias.name) {
+                    report(name.range, 8008, &[]);
+                }
+            }
+            NodeData::ImportDeclaration(import) => {
+                if import.import_clause.is_some_and(|clause| {
+                    source_node(clause).is_some_and(|node| {
+                        matches!(&node.data, NodeData::ImportClause(clause)
+                            if clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+                    })
+                }) {
+                    report(node.range, 8006, &["import type"]);
+                }
+            }
+            NodeData::ExportDeclaration(export) if export.is_type_only => {
+                report(node.range, 8006, &["export type"]);
+            }
+            NodeData::ImportSpecifier(import) if import.is_type_only => {
+                report(node.range, 8006, &["import...type"]);
+            }
+            NodeData::ExportSpecifier(export) if export.is_type_only => {
+                report(node.range, 8006, &["export...type"]);
+            }
+            _ => {}
+        }
+
+        if let Some(token) = question_token.and_then(source_node)
+            && token.kind == SyntaxKind::QuestionToken
+        {
+            report(token.range, 8009, &["?"]);
+        }
+        if signature_without_body {
+            report(node.range, 8017, &[]);
+        } else if let Some(annotation) = annotation.and_then(source_node) {
+            report(annotation.range, 8010, &[]);
+        }
+        if let Some(parameters) = type_parameters {
+            let mut source_parameters = parameters
+                .nodes
+                .iter()
+                .filter_map(|parameter| source_node(*parameter));
+            if let Some(first) = source_parameters.next() {
+                let last = source_parameters.next_back().unwrap_or(first);
+                // Rust retains the angle brackets in this list range; Go excludes them.
+                let end = parameters
+                    .range
+                    .end
+                    .get()
+                    .saturating_sub(1)
+                    .max(last.range.end.get());
+                report(
+                    TextRange::new(first.range.start, TextPos::new(end)),
+                    8004,
+                    &[],
+                );
+            }
+        }
+        if let Some(modifiers) = modifiers {
+            for modifier in &modifiers.list.nodes {
+                let Some(modifier) = source_node(*modifier) else {
+                    continue;
+                };
+                let keyword = match modifier.kind {
+                    SyntaxKind::AbstractKeyword => "abstract",
+                    SyntaxKind::DeclareKeyword => "declare",
+                    SyntaxKind::PublicKeyword => "public",
+                    SyntaxKind::ProtectedKeyword => "protected",
+                    SyntaxKind::PrivateKeyword => "private",
+                    SyntaxKind::ReadonlyKeyword => "readonly",
+                    SyntaxKind::OverrideKeyword => "override",
+                    SyntaxKind::ConstKeyword => "const",
+                    SyntaxKind::InKeyword => "in",
+                    SyntaxKind::OutKeyword => "out",
+                    _ => continue,
+                };
+                report(modifier.range, 8009, &[keyword]);
+            }
+        }
+    }
+    diagnostics.sort_by(compare_program_diagnostics);
+    diagnostics
 }
 
 fn javascript_file_not_allowed_diagnostic(file_name: &str) -> ProgramDiagnostic {
