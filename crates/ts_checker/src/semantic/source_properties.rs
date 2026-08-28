@@ -22,8 +22,10 @@
 //! unions of source-declared type literals reuse the canonical union-property
 //! adapter. A property missing from any union constituent recovers with
 //! `errorType` plus a deferred TS2339 or stable-common-candidate TS2551
-//! descriptor. Global `Object` members, comparator-dependent suggestion ties,
-//! apparent/index members stay fail-closed. Optional members and optional
+//! descriptor. A shared global `Object` member keeps its declaration symbol
+//! when both constituents lack an own member. Mixed own/global members,
+//! comparator-dependent suggestion ties, and apparent/index members stay
+//! fail-closed. Optional members and optional
 //! property chains retain their pinned `undefined` result. A member call is
 //! admitted only when its exact
 //! enclosing call grants callee capability and deliberately does not use the
@@ -1725,12 +1727,31 @@ pub(super) fn check_direct_source_property_with_session(
         .map_or(CopiedMissingUnionProperty::Unavailable, |constituents| {
             copied_first_missing_union_constituent(store, plan, constituents)
         });
+    let global_union_property = match (missing_union_property, union_constituents, global_types) {
+        (CopiedMissingUnionProperty::Missing(_), Some(constituents), Some(global_types)) => {
+            resolve_common_global_object_property(
+                store,
+                global_types,
+                constituents,
+                &plan.name,
+                session,
+            )?
+        }
+        _ => None,
+    };
     let union_suggestion = if matches!(
         missing_union_property,
         CopiedMissingUnionProperty::Missing(_)
-    ) {
+    ) && global_union_property.is_none()
+    {
         if let Some(global_types) = global_types
-            && global_object_affects_missing_property(store, global_types, plan.node, &plan.name)?
+            && global_object_affects_missing_property(
+                store,
+                global_types,
+                plan.node,
+                &plan.name,
+                session,
+            )?
         {
             return Err(SourcePropertyError::Unsupported(
                 SourcePropertyUnsupported::ApparentObjectProperty {
@@ -1795,6 +1816,23 @@ pub(super) fn check_direct_source_property_with_session(
         }
     } else if receiver_type == any || receiver_type == error_type {
         (receiver_type, None, None)
+    } else if let Some(property) = global_union_property {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?;
+        let type_ = if property.optional && bootstrap.options.strict_null_checks {
+            let sentinel = bootstrap.undefined_or_missing_type;
+            property_union_type(
+                store,
+                global_types,
+                plan.node,
+                &[property.type_, sentinel],
+                Some(property.symbol),
+            )?
+        } else {
+            property.type_
+        };
+        (type_, Some(property.symbol), None)
     } else if union_read {
         if let Some(property) = store
             .resolved_union_property(receiver_type, &plan.name)
@@ -1865,6 +1903,7 @@ pub(super) fn check_direct_source_property_with_session(
                             global_types,
                             plan,
                             receiver_type,
+                            session,
                         )? {
                             Some(CanonicalArrayProperty::Present(property)) => Some(property),
                             Some(CanonicalArrayProperty::Missing) => None,
@@ -3508,6 +3547,7 @@ fn resolve_published_canonical_array_property(
     global_types: Option<&CanonicalGlobalTypes>,
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
+    session: &mut InstantiationSession,
 ) -> Result<Option<CanonicalArrayProperty>, SourcePropertyError> {
     let Some(global_types) = global_types else {
         return Ok(None);
@@ -3581,7 +3621,13 @@ fn resolve_published_canonical_array_property(
         .and_then(|members| store.symbol_table(members))
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
     let Some(symbol) = members.get_source(&plan.name) else {
-        if global_object_affects_missing_property(store, global_types, plan.node, &plan.name)? {
+        if global_object_affects_missing_property(
+            store,
+            global_types,
+            plan.node,
+            &plan.name,
+            session,
+        )? {
             return Err(SourcePropertyError::Unsupported(
                 SourcePropertyUnsupported::ApparentObjectProperty {
                     node: plan.node,
@@ -4668,17 +4714,61 @@ fn direct_property_spelling_suggestion(
     })
 }
 
+fn resolve_common_global_object_property(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    constituents: [TypeId; 2],
+    name: &str,
+    session: &mut InstantiationSession,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    for constituent in constituents {
+        if store.resolved_own_property(constituent, name)?.is_some() {
+            return Ok(None);
+        }
+    }
+    super::object_members::resolve_object_property_by_key(
+        store,
+        Some(global_types),
+        global_types.object_type,
+        EscapedNameRef::source(name),
+        session,
+    )
+    .map_err(Into::into)
+}
+
 fn global_object_affects_missing_property(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     node: NodeRef,
     name: &str,
+    session: &mut InstantiationSession,
 ) -> Result<bool, SourcePropertyError> {
-    let structured = store
+    if super::object_members::resolve_object_property_by_key(
+        store,
+        Some(global_types),
+        global_types.object_type,
+        EscapedNameRef::source(name),
+        session,
+    )?
+    .is_some()
+    {
+        return Ok(true);
+    }
+    let record = store
         .type_payload(global_types.object_type)
-        .and_then(|record| record.data().structured())
         .ok_or(SourcePropertyError::InvalidCache(node))?;
-    let Some(members) = structured.members else {
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(SourcePropertyError::InvalidCache(node))?;
+    // The provider validated the member table even when its types remain cold.
+    let members = structured.members.or_else(|| {
+        record
+            .symbol()
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(ts_binder::semantic::Symbol::members)
+    });
+    let Some(members) = members else {
         return Ok(false);
     };
     let members = store
