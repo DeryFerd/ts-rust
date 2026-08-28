@@ -25,7 +25,9 @@ mod artifacts;
 mod oracle;
 pub mod project;
 
-use artifacts::{GeneratedSemanticArtifacts, SemanticArtifactKind};
+use artifacts::{
+    ArtifactRenderError, GeneratedSemanticArtifacts, SemanticArtifactError, SemanticArtifactKind,
+};
 
 pub use oracle::{
     OracleArtifactCounts, UpstreamCaseDisposition, UpstreamCaseManifest, UpstreamManifest,
@@ -1865,9 +1867,9 @@ fn semantic_artifact_result(
     };
     let actual = match artifacts.result(kind) {
         Ok(actual) => actual,
-        Err(detail) => {
+        Err(error) => {
             result.status = SemanticArtifactStatus::Unsupported;
-            result.unsupported_detail = Some(detail.clone());
+            result.unsupported_detail = Some(error.to_string());
             return Ok(result);
         }
     };
@@ -2119,6 +2121,10 @@ fn execute_diagnostic_variant(
         }
     };
     let mut actual = render_error_baseline(&plan.case, &compilation.diagnostics);
+    let artifact_failure = compilation
+        .semantic_artifacts
+        .as_ref()
+        .and_then(semantic_artifact_failure);
     actual
         .unsupported_details
         .extend(plan.variant.unsupported_details.iter().cloned());
@@ -2159,15 +2165,14 @@ fn execute_diagnostic_variant(
             }
         }
     }
-    let checker_blocked = checker_frontier.is_some();
-    let status = if checker_blocked {
-        DiagnosticVariantStatus::UnsupportedDetail
-    } else {
-        comparison.status()
-    };
-    let (outcome_class, frontier_blocker) =
-        comparison_frontier(status, &comparison, checker_frontier);
-    if comparison.is_exact() && !checker_blocked {
+    let (status, outcome_class, frontier_blocker) =
+        comparison_frontier(&comparison, checker_frontier, artifact_failure);
+    if status == DiagnosticVariantStatus::FatalInvariant {
+        comparison
+            .mismatch_kinds
+            .push(DiagnosticArtifactMismatchKind::FatalInvariant);
+    }
+    if status == DiagnosticVariantStatus::ExactMatch {
         summary.matched += 1;
         scorecard.summary.exact_matches += 1;
     } else {
@@ -2178,10 +2183,11 @@ fn execute_diagnostic_variant(
             scorecard.summary.header_mismatches += 1;
         }
         match status {
-            DiagnosticVariantStatus::ExactMatch
-            | DiagnosticVariantStatus::UpstreamSkipped
-            | DiagnosticVariantStatus::FatalInvariant => {
+            DiagnosticVariantStatus::ExactMatch | DiagnosticVariantStatus::UpstreamSkipped => {
                 unreachable!()
+            }
+            DiagnosticVariantStatus::FatalInvariant => {
+                scorecard.summary.fatal_invariants += 1;
             }
             DiagnosticVariantStatus::HeaderOnlyMatch => {
                 scorecard.summary.header_only_matches += 1;
@@ -2207,7 +2213,17 @@ fn execute_diagnostic_variant(
             }
         }
         let label = variant_label(&plan.variant, &plan.axes);
-        if let Some(difference) = comparison.first_difference.as_ref() {
+        if let Some(error) = artifact_failure
+            && !error.class.is_unsupported()
+        {
+            writeln!(
+                writer,
+                "FATAL {}{label}: {}: {}",
+                plan.scorecard_case,
+                error.class.code(),
+                error.detail,
+            )?;
+        } else if let Some(difference) = comparison.first_difference.as_ref() {
             writeln!(
                 writer,
                 "MISMATCH {}{label}: {status:?} at artifact line {}; expected {:?}, actual {:?}",
@@ -2499,16 +2515,52 @@ fn capability_registry_contains(code: &str) -> bool {
         .any(|line| line.split('\t').next() == Some(code))
 }
 
+fn semantic_artifact_failure(
+    artifacts: &GeneratedSemanticArtifacts,
+) -> Option<&ArtifactRenderError> {
+    [&artifacts.types, &artifacts.symbols]
+        .into_iter()
+        .filter_map(|result| match result {
+            Err(SemanticArtifactError::Checker(error)) => Some(error),
+            Ok(_) | Err(SemanticArtifactError::HarnessConfig(_)) => None,
+        })
+        // A failed invariant invalidates the run even if the other artifact is unsupported.
+        .min_by_key(|error| error.class.is_unsupported())
+}
+
 fn comparison_frontier(
-    status: DiagnosticVariantStatus,
     comparison: &DiagnosticArtifactComparison,
     checker_frontier: Option<(String, String)>,
+    artifact_failure: Option<&ArtifactRenderError>,
 ) -> (
+    DiagnosticVariantStatus,
     DiagnosticVariantOutcomeClass,
     Option<DiagnosticFrontierBlocker>,
 ) {
+    if let Some(error) = artifact_failure {
+        let (status, outcome_class) = match error.class {
+            ts_compiler::CanonicalProgramCheckFailureClass::Unsupported { .. } => (
+                DiagnosticVariantStatus::UnsupportedDetail,
+                DiagnosticVariantOutcomeClass::CheckerCapability,
+            ),
+            ts_compiler::CanonicalProgramCheckFailureClass::Fatal { .. } => (
+                DiagnosticVariantStatus::FatalInvariant,
+                DiagnosticVariantOutcomeClass::FatalInvariant,
+            ),
+        };
+        return (
+            status,
+            outcome_class,
+            Some(DiagnosticFrontierBlocker {
+                outcome_class,
+                code: Some(error.class.code().to_owned()),
+                detail: error.detail.clone(),
+            }),
+        );
+    }
     if let Some((code, detail)) = checker_frontier {
         return (
+            DiagnosticVariantStatus::UnsupportedDetail,
             DiagnosticVariantOutcomeClass::CheckerCapability,
             Some(DiagnosticFrontierBlocker {
                 outcome_class: DiagnosticVariantOutcomeClass::CheckerCapability,
@@ -2518,10 +2570,16 @@ fn comparison_frontier(
         );
     }
     if comparison.is_exact() {
-        return (DiagnosticVariantOutcomeClass::Exact, None);
+        return (
+            DiagnosticVariantStatus::ExactMatch,
+            DiagnosticVariantOutcomeClass::Exact,
+            None,
+        );
     }
+    let status = comparison.status();
     if let Some(detail) = comparison.unsupported_details.first() {
         return (
+            status,
             DiagnosticVariantOutcomeClass::HarnessConfig,
             Some(DiagnosticFrontierBlocker {
                 outcome_class: DiagnosticVariantOutcomeClass::HarnessConfig,
@@ -2540,6 +2598,7 @@ fn comparison_frontier(
         },
     );
     (
+        status,
         DiagnosticVariantOutcomeClass::SupportedMismatch,
         Some(DiagnosticFrontierBlocker {
             outcome_class: DiagnosticVariantOutcomeClass::SupportedMismatch,
@@ -6447,20 +6506,131 @@ mod tests {
         let comparison = DiagnosticArtifactComparison::default();
         assert!(comparison.is_exact());
 
-        let (outcome, blocker) = comparison_frontier(
-            DiagnosticVariantStatus::UnsupportedDetail,
+        let (status, outcome, blocker) = comparison_frontier(
             &comparison,
             Some((
                 "C00.SOURCE_KIND".to_owned(),
                 "typed checker boundary".to_owned(),
             )),
+            None,
         );
 
+        assert_eq!(status, DiagnosticVariantStatus::UnsupportedDetail);
         assert_eq!(outcome, DiagnosticVariantOutcomeClass::CheckerCapability);
         assert_eq!(
             blocker.as_ref().and_then(|blocker| blocker.code.as_deref()),
             Some("C00.SOURCE_KIND")
         );
+    }
+
+    #[test]
+    fn semantic_artifact_failure_prefers_fatal_classes_without_reading_text() {
+        use ts_compiler::CanonicalProgramCheckFailureClass;
+
+        use super::{
+            ArtifactRenderError, GeneratedSemanticArtifacts, SemanticArtifactError,
+            semantic_artifact_failure,
+        };
+
+        let fatal = ArtifactRenderError {
+            class: CanonicalProgramCheckFailureClass::Fatal {
+                invariant_code: "INV.SOURCE.TYPE_DISPLAY",
+            },
+            detail: "same display text".to_owned(),
+        };
+        let unsupported = ArtifactRenderError {
+            class: CanonicalProgramCheckFailureClass::Unsupported {
+                capability_code: "ARTIFACT.MISSING_TYPE",
+            },
+            detail: fatal.detail.clone(),
+        };
+        for (types, symbols) in [
+            (
+                Err(SemanticArtifactError::Checker(fatal.clone())),
+                Err(SemanticArtifactError::Checker(unsupported.clone())),
+            ),
+            (
+                Err(SemanticArtifactError::Checker(unsupported.clone())),
+                Err(SemanticArtifactError::Checker(fatal.clone())),
+            ),
+            (
+                Ok("<no content>".to_owned()),
+                Err(SemanticArtifactError::Checker(fatal.clone())),
+            ),
+        ] {
+            let artifacts = GeneratedSemanticArtifacts {
+                walk: super::artifacts::SemanticArtifactWalk::default(),
+                types,
+                symbols,
+            };
+            assert_eq!(semantic_artifact_failure(&artifacts), Some(&fatal));
+            for comparison in [
+                DiagnosticArtifactComparison::default(),
+                DiagnosticArtifactComparison {
+                    mismatch_kinds: vec![DiagnosticArtifactMismatchKind::Code],
+                    ..DiagnosticArtifactComparison::default()
+                },
+            ] {
+                let (status, outcome, blocker) =
+                    comparison_frontier(&comparison, None, semantic_artifact_failure(&artifacts));
+                assert_eq!(status, DiagnosticVariantStatus::FatalInvariant);
+                assert_eq!(outcome, DiagnosticVariantOutcomeClass::FatalInvariant);
+                assert_eq!(blocker.unwrap().code.as_deref(), Some(fatal.class.code()));
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_artifact_frontier_keeps_harness_errors_separate() {
+        use ts_compiler::CanonicalProgramCheckFailureClass;
+
+        use super::{
+            ArtifactRenderError, GeneratedSemanticArtifacts, SemanticArtifactError,
+            semantic_artifact_failure,
+        };
+
+        let detail = "same display text";
+        let unsupported = ArtifactRenderError {
+            class: CanonicalProgramCheckFailureClass::Unsupported {
+                capability_code: "ARTIFACT.MISSING_TYPE",
+            },
+            detail: detail.to_owned(),
+        };
+        let mut artifacts = GeneratedSemanticArtifacts::unavailable(
+            super::artifacts::SemanticArtifactWalk::default(),
+            detail,
+        );
+        assert_eq!(semantic_artifact_failure(&artifacts), None);
+        let comparison = DiagnosticArtifactComparison {
+            unsupported_details: vec![detail.to_owned()],
+            ..DiagnosticArtifactComparison::default()
+        };
+        let (status, outcome, blocker) =
+            comparison_frontier(&comparison, None, semantic_artifact_failure(&artifacts));
+        assert_eq!(status, DiagnosticVariantStatus::UnsupportedDetail);
+        assert_eq!(outcome, DiagnosticVariantOutcomeClass::HarnessConfig);
+        assert!(blocker.unwrap().code.is_none());
+        artifacts.symbols = Err(SemanticArtifactError::Checker(unsupported.clone()));
+        assert_eq!(semantic_artifact_failure(&artifacts), Some(&unsupported));
+        let (status, outcome, blocker) =
+            comparison_frontier(&comparison, None, semantic_artifact_failure(&artifacts));
+        assert_eq!(status, DiagnosticVariantStatus::UnsupportedDetail);
+        assert_eq!(outcome, DiagnosticVariantOutcomeClass::CheckerCapability);
+        assert_eq!(
+            blocker.unwrap().code.as_deref(),
+            Some(unsupported.class.code())
+        );
+        artifacts.types = Ok("<no content>".to_owned());
+        artifacts.symbols = Ok("<no content>".to_owned());
+        assert_eq!(semantic_artifact_failure(&artifacts), None);
+        let (status, outcome, blocker) = comparison_frontier(
+            &DiagnosticArtifactComparison::default(),
+            None,
+            semantic_artifact_failure(&artifacts),
+        );
+        assert_eq!(status, DiagnosticVariantStatus::ExactMatch);
+        assert_eq!(outcome, DiagnosticVariantOutcomeClass::Exact);
+        assert!(blocker.is_none());
     }
 
     #[test]

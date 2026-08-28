@@ -53,20 +53,23 @@ pub(crate) struct SemanticArtifactWalk {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GeneratedSemanticArtifacts {
     pub(crate) walk: SemanticArtifactWalk,
-    pub(crate) types: Result<String, String>,
-    pub(crate) symbols: Result<String, String>,
+    pub(crate) types: Result<String, SemanticArtifactError>,
+    pub(crate) symbols: Result<String, SemanticArtifactError>,
 }
 
 impl GeneratedSemanticArtifacts {
     pub(crate) fn unavailable(walk: SemanticArtifactWalk, detail: &str) -> Self {
         Self {
             walk,
-            types: Err(detail.to_owned()),
-            symbols: Err(detail.to_owned()),
+            types: Err(SemanticArtifactError::HarnessConfig(detail.to_owned())),
+            symbols: Err(SemanticArtifactError::HarnessConfig(detail.to_owned())),
         }
     }
 
-    pub(crate) fn result(&self, kind: SemanticArtifactKind) -> &Result<String, String> {
+    pub(crate) fn result(
+        &self,
+        kind: SemanticArtifactKind,
+    ) -> &Result<String, SemanticArtifactError> {
         match kind {
             SemanticArtifactKind::Types => &self.types,
             SemanticArtifactKind::Symbols => &self.symbols,
@@ -77,6 +80,30 @@ impl GeneratedSemanticArtifacts {
         match kind {
             SemanticArtifactKind::Types => self.walk.types.len(),
             SemanticArtifactKind::Symbols => self.walk.symbols.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SemanticArtifactError {
+    HarnessConfig(String),
+    Checker(ArtifactRenderError),
+}
+
+impl fmt::Display for SemanticArtifactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HarnessConfig(detail) => formatter.write_str(detail),
+            Self::Checker(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SemanticArtifactError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::HarnessConfig(_) => None,
+            Self::Checker(error) => Some(error),
         }
     }
 }
@@ -323,7 +350,7 @@ fn render_baseline(
     kind: SemanticArtifactKind,
     nodes: &[NodeRef],
     has_diagnostics: bool,
-) -> Result<String, String> {
+) -> Result<String, SemanticArtifactError> {
     let mut sections = String::new();
     for (index, unit, source) in source_files(case, program) {
         let lines = nodes
@@ -334,7 +361,7 @@ fn render_baseline(
             .map(|result| result.map(|result| result.line))
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
+            .map_err(SemanticArtifactError::Checker)?;
         render_source_section(
             &mut sections,
             &baseline_unit_name(case, unit, index),
@@ -1048,7 +1075,10 @@ pub(super) fn declaration_name(parent: &Node) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use ts_ast::{NodeData, SyntaxKind};
-    use ts_checker::semantic::{ClassError, ClassInvariant, ClassUnsupported, SymbolDisplayError};
+    use ts_checker::semantic::{
+        ClassError, ClassInvariant, ClassUnsupported, SymbolDisplayError, TypeDisplayUnavailable,
+        formatter::FunctionTypeDisplayUnavailable,
+    };
     use ts_compiler::{CanonicalArtifactQueryError, CanonicalProgramCheckFailureClass, Program};
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
@@ -1056,8 +1086,9 @@ mod tests {
     use crate::{Case, fixture_case_sensitive, virtual_harness_path, virtual_unit_path};
 
     use super::{
-        ArtifactRenderError, SemanticArtifactWalk, declaration_full_start,
-        ecma_line_and_utf16_column, render_program, source_files, walk_program,
+        ArtifactRenderError, SemanticArtifactError, SemanticArtifactKind, SemanticArtifactWalk,
+        declaration_full_start, ecma_line_and_utf16_column, render_baseline, render_program,
+        source_files, walk_program,
     };
 
     #[test]
@@ -1158,7 +1189,8 @@ mod tests {
     }
 
     #[test]
-    fn symbol_display_errors_keep_compiler_failure_classes() {
+    #[allow(clippy::too_many_lines)] // One checker graph supplies IDs for the typed error cases.
+    fn semantic_artifact_query_errors_keep_compiler_failure_classes() {
         let filesystem = MemoryFileSystem::new(true);
         filesystem
             .write_file("/project/main.ts", "const value = 1;")
@@ -1184,30 +1216,152 @@ mod tests {
                     })
                     .unwrap();
                 let symbol = queries.get_symbol_at_location(node).unwrap().unwrap();
+                let type_id = queries.get_type_at_location(node).unwrap();
                 for (error, expected) in [
                     (
-                        SymbolDisplayError::MissingModuleSpecifier(symbol),
+                        CanonicalArtifactQueryError::SymbolDisplay(
+                            SymbolDisplayError::MissingModuleSpecifier(symbol),
+                        ),
                         CanonicalProgramCheckFailureClass::Unsupported {
                             capability_code: "T07.TYPE_DISPLAY",
                         },
                     ),
                     (
-                        SymbolDisplayError::InvalidSymbol(symbol),
+                        CanonicalArtifactQueryError::SymbolDisplay(
+                            SymbolDisplayError::InvalidSymbol(symbol),
+                        ),
+                        CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code: "INV.SOURCE.TYPE_DISPLAY",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::MissingType {
+                            node,
+                            kind: SyntaxKind::Identifier,
+                        },
+                        CanonicalProgramCheckFailureClass::Unsupported {
+                            capability_code: "ARTIFACT.MISSING_TYPE",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::UnsupportedNode {
+                            node,
+                            kind: SyntaxKind::Identifier,
+                        },
+                        CanonicalProgramCheckFailureClass::Unsupported {
+                            capability_code: "ARTIFACT.UNSUPPORTED_NODE",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::InvalidType {
+                            node,
+                            type_: type_id,
+                        },
+                        CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code: "INV.ARTIFACT.QUERY",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::SourceCheck(
+                            TypeDisplayUnavailable::MalformedType(type_id).into(),
+                        ),
+                        CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code: "INV.SOURCE.TYPE_DISPLAY",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::SourceCheck(
+                            TypeDisplayUnavailable::FunctionType {
+                                type_id,
+                                reason: FunctionTypeDisplayUnavailable::CallableProperties,
+                            }
+                            .into(),
+                        ),
+                        CanonicalProgramCheckFailureClass::Unsupported {
+                            capability_code: "T07.TYPE_DISPLAY",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::SourceCheck(
+                            TypeDisplayUnavailable::FunctionType {
+                                type_id,
+                                reason: FunctionTypeDisplayUnavailable::PendingSignature,
+                            }
+                            .into(),
+                        ),
+                        CanonicalProgramCheckFailureClass::Fatal {
+                            invariant_code: "INV.SOURCE.TYPE_DISPLAY",
+                        },
+                    ),
+                    (
+                        CanonicalArtifactQueryError::SourceCheck(
+                            TypeDisplayUnavailable::FunctionType {
+                                type_id,
+                                reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+                            }
+                            .into(),
+                        ),
                         CanonicalProgramCheckFailureClass::Fatal {
                             invariant_code: "INV.SOURCE.TYPE_DISPLAY",
                         },
                     ),
                 ] {
                     assert_eq!(
-                        ArtifactRenderError::query(
-                            "symbol display",
-                            &source.file_name,
-                            CanonicalArtifactQueryError::SymbolDisplay(error),
-                        )
-                        .class,
+                        ArtifactRenderError::query("artifact query", &source.file_name, error,)
+                            .class,
                         expected,
                     );
                 }
+            },
+        )
+        .unwrap();
+        result.expect("canonical checker ran");
+    }
+
+    #[test]
+    fn semantic_artifact_rendering_keeps_foreign_nodes_fatal_after_warm_queries() {
+        let case = Case::parse("foreignArtifact.ts", "const value: number = 1;\n").unwrap();
+        let filesystem = fixture_filesystem(&case);
+        let file_name = virtual_unit_path(&case, &case.units[0], 0);
+        let roots = [file_name.clone()];
+        let options = CompilerOptions {
+            no_lib: true,
+            no_emit: true,
+            ..CompilerOptions::default()
+        };
+        let foreign = Program::new_with_options(&filesystem, "/.src", &roots, options.clone());
+        let foreign_node = walk_program(&case, &foreign).unwrap().types[0];
+        let (_, result) = Program::try_new_with_canonical_checker_and_queries(
+            &filesystem,
+            "/.src",
+            &roots,
+            options,
+            |program, queries| {
+                let artifacts = render_program(&case, program, queries, false).unwrap();
+                assert!(artifacts.types.is_ok(), "{:?}", artifacts.types);
+                assert!(artifacts.symbols.is_ok(), "{:?}", artifacts.symbols);
+                assert_eq!(
+                    foreign_node.file,
+                    program.source_file(&file_name).unwrap().id
+                );
+                let error = render_baseline(
+                    &case,
+                    program,
+                    queries,
+                    SemanticArtifactKind::Types,
+                    &[foreign_node],
+                    false,
+                )
+                .unwrap_err();
+                let SemanticArtifactError::Checker(error) = error else {
+                    panic!("foreign nodes must retain their typed checker failure");
+                };
+                assert_eq!(
+                    error.class,
+                    CanonicalProgramCheckFailureClass::Fatal {
+                        invariant_code: "INV.ARTIFACT.NODE",
+                    },
+                );
             },
         )
         .unwrap();

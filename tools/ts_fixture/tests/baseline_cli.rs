@@ -1392,6 +1392,9 @@ fn semantic_artifact_mode_reports_when_no_check_prevents_checker_queries() {
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["variants"][0]["status"], "unsupported_detail");
+    assert_eq!(scorecard["variants"][0]["outcomeClass"], "harness_config");
     for kind in ["types", "symbols"] {
         assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 1);
         assert_eq!(
