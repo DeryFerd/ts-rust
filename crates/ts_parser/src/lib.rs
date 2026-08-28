@@ -8463,6 +8463,17 @@ impl<'a> Parser<'a> {
                 break;
             }
             let separator = self.current.kind;
+            if separator == SyntaxKind::SemicolonToken {
+                self.error_current("Expected ','.");
+                if self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                {
+                    // Leave a next-line semicolon for the enclosing statement.
+                    break;
+                }
+            }
             self.bump();
             trailing = separator == SyntaxKind::CommaToken
                 && self.current.kind == SyntaxKind::CloseBraceToken;
