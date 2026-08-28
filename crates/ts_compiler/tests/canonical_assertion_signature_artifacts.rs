@@ -31,6 +31,7 @@ fn identifiers(program: &Program, name: &str) -> Vec<NodeRef> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the complete artifact checks and their replay together.
 fn assertion_display_keeps_optional_value_types_call_results_and_symbols() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem
@@ -52,8 +53,15 @@ fn assertion_display_keeps_optional_value_types_call_results_and_symbols() {
             let names = identifiers(program, "assertWeird");
             assert_eq!(names.len(), 3);
             let callable = queries.get_type_at_location(names[0]).unwrap();
-            let symbol = queries.get_symbol_at_location(names[0]).unwrap().unwrap();
-            let declarations = queries.get_symbol_declarations(symbol).unwrap().to_vec();
+            // Export declarations and local references retain separate symbol IDs.
+            let symbols = names
+                .iter()
+                .map(|&location| queries.get_symbol_at_location(location).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            let declarations = queries
+                .get_symbol_declarations(symbols[0])
+                .unwrap()
+                .to_vec();
             assert_eq!(declarations.len(), 1);
             let value = identifiers(program, "value")[0];
             let value_type = queries.get_type_at_location(value).unwrap();
@@ -75,11 +83,21 @@ fn assertion_display_keeps_optional_value_types_call_results_and_symbols() {
                 if replay {
                     assert_eq!(queries.replay_sources().unwrap(), cold);
                 }
-                for &location in &names {
+                for (&location, &symbol) in names.iter().zip(&symbols) {
                     assert_eq!(queries.get_type_at_location(location).unwrap(), callable);
                     assert_eq!(
                         queries.get_symbol_at_location(location).unwrap(),
                         Some(symbol),
+                    );
+                    assert_eq!(
+                        queries.get_symbol_declarations(symbol).unwrap(),
+                        declarations,
+                    );
+                    assert_eq!(
+                        queries
+                            .symbol_to_string_at_location(symbol, location)
+                            .unwrap(),
+                        "assertWeird",
                     );
                     assert_eq!(
                         queries
@@ -105,10 +123,6 @@ fn assertion_display_keeps_optional_value_types_call_results_and_symbols() {
                     let return_type = queries.get_type_at_location(call).unwrap();
                     assert_eq!(queries.type_to_string(return_type).unwrap(), "void");
                 }
-                assert_eq!(
-                    queries.get_symbol_declarations(symbol).unwrap(),
-                    declarations
-                );
                 assert_eq!(queries.semantic_store_id(), store);
             }
         },
@@ -204,7 +218,10 @@ fn assert_signature_display(source: &str, expected: &str, context_free: &str) {
         |program, queries| {
             let names = identifiers(program, "check");
             let callable = queries.get_type_at_location(names[0]).unwrap();
-            let symbol = queries.get_symbol_at_location(names[0]).unwrap().unwrap();
+            let symbols = names
+                .iter()
+                .map(|&location| queries.get_symbol_at_location(location).unwrap().unwrap())
+                .collect::<Vec<_>>();
             let cold = queries.cold_diagnostic_snapshot();
             assert!(cold.is_empty(), "{source}: {cold:?}");
             let store = queries.semantic_store_id();
@@ -212,11 +229,17 @@ fn assert_signature_display(source: &str, expected: &str, context_free: &str) {
                 if replay {
                     assert_eq!(queries.replay_sources().unwrap(), cold, "{source}");
                 }
-                for &location in &names {
+                for (&location, &symbol) in names.iter().zip(&symbols) {
                     assert_eq!(queries.get_type_at_location(location).unwrap(), callable);
                     assert_eq!(
                         queries.get_symbol_at_location(location).unwrap(),
                         Some(symbol),
+                    );
+                    assert_eq!(
+                        queries
+                            .symbol_to_string_at_location(symbol, location)
+                            .unwrap(),
+                        "check",
                     );
                     assert_eq!(
                         queries
