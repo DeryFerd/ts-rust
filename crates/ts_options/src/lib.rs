@@ -1687,7 +1687,10 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
         if !is_node_resolution {
             diagnostics.push(diagnostic(
                 5109,
-                [module_resolution_name(default_resolution), module_name(module)],
+                [
+                    module_resolution_name(default_resolution),
+                    module_name(module),
+                ],
             ));
         }
     } else if is_node_resolution {
