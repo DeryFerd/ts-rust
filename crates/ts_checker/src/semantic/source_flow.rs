@@ -10,6 +10,8 @@
 //! boundaries.
 //! Class initialization keeps the actual constructor exit and super-call edges.
 //! Static blocks retain their outer start and receiver-specific property keys.
+//! Field initializers retain their own flow containers. Local destructuring
+//! assignments do not initialize class fields.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -84,6 +86,7 @@ pub(super) struct SourceTruthinessCondition {
     /// The exact AST payload carried by both binder condition nodes.
     pub(super) expression: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+    pub(super) negated: bool,
 }
 
 /// One JavaScript `typeof` result admitted by the bounded source-flow slice.
@@ -681,6 +684,7 @@ impl SourceFlowPlan {
     }
 
     /// Uses the binder's body flow, including an inline static block's outer start.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn preflight_class_body(
         arena: &NodeArena,
@@ -690,6 +694,33 @@ impl SourceFlowPlan {
         body: &ClassBodyPlan,
         points: impl IntoIterator<Item = NodeRef>,
         assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+    ) -> Result<Self, SourceFlowError> {
+        Self::preflight_class_body_with_conditions(
+            arena,
+            bound,
+            store,
+            host,
+            body,
+            points,
+            [],
+            assignments,
+            [],
+            calls,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_class_body_with_conditions(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        body: &ClassBodyPlan,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        local_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
         calls: impl IntoIterator<Item = NodeRef>,
     ) -> Result<Self, SourceFlowError> {
         let invalid = || SourceFlowInvariant::InvalidClassBody(body.declaration);
@@ -723,12 +754,19 @@ impl SourceFlowPlan {
             {
                 Some(data.body)
             }
+            (NodeData::PropertyDeclaration(data), ClassBodyKind::PropertyInitializer { .. })
+                if declaration.kind == SyntaxKind::PropertyDeclaration =>
+            {
+                data.initializer
+            }
             _ => return Err(invalid().into()),
         };
         if expected_body != Some(body.body.node)
             || declaration.parent != Some(body.class_declaration.node)
             || arena.get(body.body.node).is_none_or(|block| {
-                block.kind != SyntaxKind::Block || block.parent != Some(body.declaration.node)
+                !matches!(body.kind, ClassBodyKind::PropertyInitializer { .. })
+                    && block.kind != SyntaxKind::Block
+                    || block.parent != Some(body.declaration.node)
             })
         {
             return Err(invalid().into());
@@ -749,6 +787,21 @@ impl SourceFlowPlan {
                 .transpose()?,
             ..SourceFlowEffects::default()
         };
+        let mut assignments = assignments.into_iter().collect::<Vec<_>>();
+        for assignment in local_assignments {
+            validate_class_local_assignment(arena, bound, store, host, body, assignment)?;
+            if effects
+                .assignment_declarations
+                .insert(assignment.target, assignment.parameter)
+                .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(assignment.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: assignment.target,
+                symbol: assignment.symbol,
+            });
+        }
         for call in calls {
             let statement = validate_class_body_call(arena, bound, body, container, call)?;
             if effects.calls.insert(call, statement).is_some() {
@@ -757,7 +810,7 @@ impl SourceFlowPlan {
         }
         if matches!(
             body.kind,
-            ClassBodyKind::Constructor | ClassBodyKind::StaticBlock
+            ClassBodyKind::Constructor | ClassBodyKind::Method { .. } | ClassBodyKind::StaticBlock
         ) {
             let mut pending = points
                 .iter()
@@ -768,6 +821,7 @@ impl SourceFlowPlan {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             pending.extend(bound.flow_graph().container_return(body.declaration));
+            pending.extend(bound.flow_graph().container_end(body.declaration));
             let mut visited = HashSet::new();
             while let Some(flow) = pending.pop() {
                 if !visited.insert(flow) {
@@ -779,7 +833,10 @@ impl SourceFlowPlan {
                 let node = flow_node(bound.flow_graph(), flow)?;
                 if source_flow_kind(flow, node.flags)? == SourceFlowKind::Assignment {
                     let target = ast_payload(flow, &node)?;
-                    let assignment = if matches!(body.kind, ClassBodyKind::Constructor) {
+                    let assignment = if matches!(
+                        body.kind,
+                        ClassBodyKind::Constructor | ClassBodyKind::Method { .. }
+                    ) {
                         plan_constructor_property_assignment(
                             arena, bound, store, host, body, target, flow,
                         )?
@@ -804,7 +861,15 @@ impl SourceFlowPlan {
                 return Err(SourceFlowUnsupported::PropertyWrite(point).into());
             }
         }
-        Self::preflight_with_effects(bound, container, None, points, [], assignments, effects)
+        Self::preflight_with_effects(
+            bound,
+            container,
+            None,
+            points,
+            conditions,
+            assignments,
+            effects,
+        )
     }
 
     /// Freezes and validates every flow chain that the source executor may
@@ -975,6 +1040,8 @@ impl SourceFlowPlan {
                 if bound.symbol(*parameter) != Some(assignment.symbol)
                     || bound.container(*parameter) != Some(container)
                     || bound.container(assignment.declaration) != Some(container)
+                        && !(effects.class_body.is_some()
+                            && bound.flow_container(assignment.declaration) == Some(container))
                 {
                     return Err(SourceFlowInvariant::InvalidParameterAssignment(
                         assignment.declaration,
@@ -1079,6 +1146,8 @@ impl SourceFlowPlan {
             if bound.symbol(*parameter) != Some(assignment.symbol)
                 || bound.container(*parameter) != Some(self.container)
                 || bound.container(*target) != Some(self.container)
+                    && !(self.class_body.is_some()
+                        && bound.flow_container(*target) == Some(self.container))
             {
                 return Err(SourceFlowInvariant::InvalidParameterAssignment(*target).into());
             }
@@ -1369,8 +1438,10 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         let invalid = || SourceFlowInvariant::InvalidClassProperty(target);
         let (identities, _) = validate_class_property_write_access(store, host, plan, &self.access)
             .map_err(|_| invalid())?;
-        if !matches!(self.body.kind, ClassBodyKind::Constructor)
-            || identities.class_symbol != self.body.class_symbol
+        if !matches!(
+            self.body.kind,
+            ClassBodyKind::Constructor | ClassBodyKind::Method { .. }
+        ) || identities.class_symbol != self.body.class_symbol
             || identities.body_declaration != self.body.declaration
             || identities.class_declaration != self.body.class_declaration
         {
@@ -1464,7 +1535,10 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         {
             return Err(invalid().into());
         }
-        if !matches!(self.body.kind, ClassBodyKind::Constructor) || identities.base.is_none() {
+        if context.is_deferred()
+            || !matches!(self.body.kind, ClassBodyKind::Constructor)
+            || identities.base.is_none()
+        {
             return Ok(false);
         }
         let flow = self
@@ -1847,11 +1921,25 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                 }))
             }
             SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition => {
-                Err(SourceFlowUnsupported::FlowKind {
-                    flow,
-                    flags: node.flags,
+                let condition = ast_payload(flow, &node)?;
+                if !matches!(
+                    self.flow.plan.conditions.get(&condition),
+                    Some(SourceFlowCondition::Truthiness(_))
+                ) {
+                    return Err(SourceFlowUnsupported::FlowKind {
+                        flow,
+                        flags: node.flags,
+                    }
+                    .into());
                 }
-                .into())
+                self.property_state_at(
+                    store,
+                    host,
+                    linear_antecedent(flow, &node)?,
+                    query,
+                    visiting,
+                    depth + 1,
+                )
             }
         };
         visiting.remove(&flow);
@@ -2121,11 +2209,11 @@ impl SourceFlowFrame<'_, '_> {
                 };
                 let narrowed = match condition {
                     SourceFlowCondition::Unchanged(_) => unreachable!(),
-                    SourceFlowCondition::Truthiness(_) => narrow_by_truthiness(
+                    SourceFlowCondition::Truthiness(condition) => narrow_by_truthiness(
                         store,
                         Some(globals),
                         current,
-                        if assume_true {
+                        if assume_true != condition.negated {
                             TruthinessAssumption::Truthy
                         } else {
                             TruthinessAssumption::Falsy
@@ -3232,6 +3320,88 @@ fn parameter_assignment_declaration_and_name(
     }
 }
 
+fn validate_class_local_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    assignment: SourceFlowParameterAssignment,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(assignment.target);
+    if !matches!(
+        body.kind,
+        ClassBodyKind::Constructor | ClassBodyKind::Method { .. }
+    ) || bound.symbol(assignment.parameter) != Some(assignment.symbol)
+        || bound.container(assignment.parameter) != Some(body.declaration)
+        || bound.flow_container(assignment.target) != Some(body.declaration)
+    {
+        return Err(invalid().into());
+    }
+    let target_record = host.node(assignment.target).ok_or_else(invalid)?;
+    let NodeData::Identifier(target) = &target_record.data else {
+        return Err(invalid().into());
+    };
+    let binding = target_record
+        .parent
+        .map(|node| NodeRef::new(assignment.target.arena, assignment.target.file, node))
+        .ok_or_else(invalid)?;
+    let pattern = host
+        .node(binding)
+        .and_then(|record| record.parent)
+        .map(|node| NodeRef::new(binding.arena, binding.file, node))
+        .ok_or_else(invalid)?;
+    let expression = host
+        .node(pattern)
+        .and_then(|record| record.parent)
+        .map(|node| NodeRef::new(binding.arena, binding.file, node))
+        .ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &host.node(expression).ok_or_else(invalid)?.data
+    else {
+        return Err(invalid().into());
+    };
+    let receiver = NodeRef::new(binding.arena, binding.file, binary.right);
+    let plan =
+        super::source_properties::plan_class_binding_property(store, host, binding, receiver)
+            .map_err(|_| invalid())?;
+    if plan.target() != assignment.target
+        || !source_node_is_descendant_of(arena, expression, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    let declaration = host.node(assignment.parameter).ok_or_else(invalid)?;
+    let name = match &declaration.data {
+        NodeData::BindingElement(element) => element.name,
+        NodeData::VariableDeclaration(variable) => Some(variable.name),
+        _ => None,
+    }
+    .ok_or_else(invalid)?;
+    let Some(NodeData::Identifier(name)) = arena.get(name).map(|record| &record.data) else {
+        return Err(invalid().into());
+    };
+    if target_record.flags.0 != 0 || target.flow_node.is_some() || target.text != name.text {
+        return Err(invalid().into());
+    }
+    let mut callback_host = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|_| invalid())?;
+    let symbol = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(assignment.target)),
+            &target.text,
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| invalid())?;
+    if symbol != Some(assignment.symbol) {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
 fn validate_parameter_assignment(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -3738,8 +3908,10 @@ fn plan_constructor_property_assignment(
         return Ok(None);
     }
     let invalid = || SourceFlowInvariant::InvalidClassProperty(target);
-    if !matches!(body.kind, ClassBodyKind::Constructor)
-        || !source_node_is_descendant_of(arena, target, body.body.node)
+    if !matches!(
+        body.kind,
+        ClassBodyKind::Constructor | ClassBodyKind::Method { .. }
+    ) || !source_node_is_descendant_of(arena, target, body.body.node)
         || bound.flow_container(target) != Some(body.declaration)
     {
         return Err(invalid().into());
@@ -5246,6 +5418,7 @@ mod tests {
             [SourceFlowCondition::Truthiness(SourceTruthinessCondition {
                 expression: condition,
                 symbol,
+                negated: false,
             })],
             [],
         )

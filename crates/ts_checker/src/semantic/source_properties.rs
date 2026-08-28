@@ -223,6 +223,239 @@ impl ClassAccessContext {
     pub(super) const fn body_declaration(&self) -> NodeRef {
         self.body_declaration
     }
+
+    pub(super) const fn is_deferred(&self) -> bool {
+        matches!(self.phase, ClassAccessPhase::Deferred)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassBindingPropertyPlan {
+    binding: NodeRef,
+    property: NodeRef,
+    target: NodeRef,
+    name: String,
+    context: ClassAccessContext,
+}
+
+impl ClassBindingPropertyPlan {
+    pub(super) const fn target(&self) -> NodeRef {
+        self.target
+    }
+    pub(super) const fn property(&self) -> NodeRef {
+        self.property
+    }
+    pub(super) const fn receiver(&self) -> NodeRef {
+        self.context.receiver
+    }
+}
+
+/// Retains the real binding or assignment property. No property-access node is synthesized.
+pub(super) fn plan_class_binding_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    binding: NodeRef,
+    receiver: NodeRef,
+) -> Result<ClassBindingPropertyPlan, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(binding);
+    let record = class_access_node(store, host, binding)?;
+    let parent = NodeRef::new(
+        binding.arena,
+        binding.file,
+        record.parent.ok_or_else(invalid)?,
+    );
+    let parent_record = class_access_node(store, host, parent)?;
+    let (property, target) = match &record.data {
+        NodeData::BindingElement(element)
+            if record.kind == SyntaxKind::BindingElement
+                && element.initializer.is_none()
+                && element.dot_dot_dot_token.is_none()
+                && element.flow_node.is_none()
+                && element.facts == 0 =>
+        {
+            let NodeData::BindingPattern(pattern) = &parent_record.data else {
+                return Err(invalid());
+            };
+            let declaration = NodeRef::new(
+                binding.arena,
+                binding.file,
+                parent_record.parent.ok_or_else(invalid)?,
+            );
+            let NodeData::VariableDeclaration(variable) =
+                &class_access_node(store, host, declaration)?.data
+            else {
+                return Err(invalid());
+            };
+            if parent_record.kind != SyntaxKind::ObjectBindingPattern
+                || !pattern.elements.nodes.contains(&binding.node)
+                || variable.name != parent.node
+                || variable.initializer != Some(receiver.node)
+                || variable.type_.is_some()
+            {
+                return Err(unsupported_access(binding));
+            }
+            let target = element.name.ok_or_else(invalid)?;
+            (element.property_name.unwrap_or(target), target)
+        }
+        NodeData::PropertyAssignment(property)
+            if record.kind == SyntaxKind::PropertyAssignment && property.facts == 0 =>
+        {
+            (property.name, property.initializer)
+        }
+        NodeData::ShorthandPropertyAssignment(property)
+            if record.kind == SyntaxKind::ShorthandPropertyAssignment
+                && property.object_assignment_initializer.is_none()
+                && property.facts == 0 =>
+        {
+            (property.name, property.name)
+        }
+        _ => return Err(unsupported_access(binding)),
+    };
+    if !matches!(record.data, NodeData::BindingElement(_)) {
+        let NodeData::ObjectLiteralExpression(object) = &parent_record.data else {
+            return Err(invalid());
+        };
+        let assignment = NodeRef::new(
+            binding.arena,
+            binding.file,
+            parent_record.parent.ok_or_else(invalid)?,
+        );
+        let assignment_record = class_access_node(store, host, assignment)?;
+        let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+            return Err(invalid());
+        };
+        if parent_record.kind != SyntaxKind::ObjectLiteralExpression
+            || !object.properties.nodes.contains(&binding.node)
+            || binary.left != parent.node
+            || binary.right != receiver.node
+            || class_access_node(
+                store,
+                host,
+                NodeRef::new(binding.arena, binding.file, binary.operator_token),
+            )?
+            .kind
+                != SyntaxKind::EqualsToken
+        {
+            return Err(unsupported_access(binding));
+        }
+    }
+    let target = NodeRef::new(binding.arena, binding.file, target);
+    let property = NodeRef::new(binding.arena, binding.file, property);
+    let target_record = class_access_node(store, host, target)?;
+    let property_record = class_access_node(store, host, property)?;
+    let name = match &property_record.data {
+        NodeData::Identifier(identifier)
+            if property_record.kind == SyntaxKind::Identifier && identifier.flow_node.is_none() =>
+        {
+            identifier.text.clone()
+        }
+        NodeData::StringLiteral(literal)
+            if property_record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0 =>
+        {
+            literal.text.clone()
+        }
+        _ => return Err(unsupported_access(property)),
+    };
+    if record.flags.0 != 0
+        || parent_record.flags.0 != 0
+        || target_record.kind != SyntaxKind::Identifier
+        || target_record.flags.0 != 0
+        || target_record.parent != Some(binding.node)
+        || property_record.parent != Some(binding.node)
+        || property_record.flags.0 != 0
+        || name.is_empty()
+    {
+        return Err(invalid());
+    }
+    let context = plan_class_access_context(store, host, receiver)?
+        .ok_or_else(|| unsupported_access(receiver))?;
+    if context.kind != ClassReceiverKind::This {
+        return Err(unsupported_access(receiver));
+    }
+    Ok(ClassBindingPropertyPlan {
+        binding,
+        property,
+        target,
+        name,
+        context,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_class_binding_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &ClassBindingPropertyPlan,
+    receiver_type: TypeId,
+    flow: &mut ClassInitializationFrame<'_, '_>,
+) -> Result<CheckedSourceProperty, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(plan.property);
+    if plan_class_binding_property(store, host, plan.binding, plan.receiver())? != *plan {
+        return Err(invalid());
+    }
+    let identities = class_receiver_identities(store, host, &plan.context, Some(flow))?;
+    if identities.receiver_type(&plan.context)? != receiver_type {
+        return Err(invalid());
+    }
+    let lookup_type = identities.lookup_type(&plan.context)?;
+    let symbol = store
+        .type_payload(lookup_type)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&plan.name))
+        .ok_or_else(|| unsupported_access(plan.property))?;
+    let (property, member) = class_context_member_for_symbol(
+        store,
+        host,
+        plan.property,
+        lookup_type,
+        &plan.context,
+        identities,
+        symbol,
+    )?;
+    let kind = class_accessibility_diagnostic(
+        store,
+        host,
+        &plan.context,
+        &member,
+        SourcePropertyPrivacy::Identifier,
+    )?;
+    let diagnostics = kind
+        .into_iter()
+        .map(|kind| SourcePropertyDiagnostic {
+            name_node: plan.property,
+            receiver_type,
+            missing_type: None,
+            suggestion: None,
+            private_owner: None,
+            accessibility: Some(ClassPropertyAccessDiagnostic::Class {
+                context: plan.context,
+                property: symbol,
+                lookup_type,
+                kind,
+                binding: Some(plan.binding),
+            }),
+        })
+        .collect();
+    let type_ = if property.optional && options.intrinsic.strict_null_checks {
+        let undefined = store
+            .intrinsic_bootstrap()
+            .ok_or_else(invalid)?
+            .undefined_or_missing_type;
+        property_union_type(
+            store,
+            Some(globals),
+            plan.property,
+            &[property.type_, undefined],
+            Some(symbol),
+        )?
+    } else {
+        property.type_
+    };
+    Ok(CheckedSourceProperty { type_, diagnostics })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,7 +503,7 @@ impl DirectSourcePropertySyntax {
     }
 }
 
-/// A constructor assignment with a separate left-hand-side position proof.
+/// A class field assignment with a separate left-hand-side position proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceClassPropertyWritePlan {
     statement: NodeRef,
@@ -401,15 +634,20 @@ pub(super) fn plan_class_property_write(
         .ok_or_else(|| unsupported_access(target))?;
     if context.kind != ClassReceiverKind::This
         || context.side != ClassPropertySide::Instance
-        || context.phase != ClassAccessPhase::Constructor
+        || !matches!(
+            context.phase,
+            ClassAccessPhase::Constructor | ClassAccessPhase::Method
+        )
     {
         return Err(unsupported_access(target));
     }
-    let constructor = class_access_node(store, host, context.body_declaration)?;
-    let NodeData::ConstructorDeclaration(constructor) = &constructor.data else {
-        return Err(invalid());
+    let declaration = class_access_node(store, host, context.body_declaration)?;
+    let body = match &declaration.data {
+        NodeData::ConstructorDeclaration(constructor) => constructor.body,
+        NodeData::MethodDeclaration(method) => method.body,
+        _ => return Err(invalid()),
     };
-    let body = constructor.body.ok_or_else(invalid)?;
+    let body = body.ok_or_else(invalid)?;
     let statement = NodeRef::new(
         assignment.arena,
         assignment.file,
@@ -433,14 +671,20 @@ pub(super) fn plan_class_property_write(
             .ok_or_else(invalid)?;
         let parent = NodeRef::new(assignment.arena, assignment.file, parent);
         let parent_record = class_access_node(store, host, parent)?;
-        let NodeData::Block(block) = &parent_record.data else {
-            return Err(unsupported_access(assignment));
+        let valid_parent = match &parent_record.data {
+            NodeData::Block(block) => {
+                block.statements.nodes.contains(&child.node)
+                    && block.flow_node.is_none()
+                    && block.facts == 0
+            }
+            NodeData::IfStatement(branch) => {
+                (branch.then_statement == child.node || branch.else_statement == Some(child.node))
+                    && branch.flow_node.is_none()
+                    && branch.facts == 0
+            }
+            _ => return Err(unsupported_access(assignment)),
         };
-        if parent_record.flags.0 != 0
-            || !block.statements.nodes.contains(&child.node)
-            || block.flow_node.is_some()
-            || block.facts != 0
-        {
+        if parent_record.flags.0 != 0 || !valid_parent {
             return Err(invalid());
         }
         if parent.node == body {
@@ -491,11 +735,6 @@ pub(super) fn plan_class_property_write(
                     arena,
                     declaration.node,
                     SyntaxKind::AccessorKeyword,
-                )
-                && !ts_binder::canonical_has_syntactic_modifier(
-                    arena,
-                    declaration.node,
-                    SyntaxKind::AbstractKeyword,
                 ) =>
         {
             ClassMemberOrigin::Field {
@@ -518,6 +757,9 @@ pub(super) fn plan_class_property_write(
         declaration.node,
         SyntaxKind::ReadonlyKeyword,
     );
+    if readonly && context.phase != ClassAccessPhase::Constructor {
+        return Err(unsupported_access(target));
+    }
     Ok(SourceClassPropertyWritePlan {
         statement,
         assignment,
@@ -553,12 +795,44 @@ pub(super) fn validate_class_property_write_access(
         || member.declaration != plan.declaration
         || member.origin != plan.origin
         || member.side != ClassPropertySide::Instance
-        || member.abstract_
         || member.readonly != plan.readonly
     {
         return Err(invalid());
     }
     Ok((identities, member))
+}
+
+pub(super) fn class_property_write_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: &CheckedClassPropertyWriteTarget,
+    receiver_type: TypeId,
+) -> Result<Vec<SourcePropertyDiagnostic>, SourcePropertyError> {
+    let plan = target.plan();
+    let (identities, member) =
+        validate_class_property_write_access(store, host, plan, target.access_token())?;
+    if receiver_type != identities.this_type {
+        return Err(SourcePropertyError::InvalidCache(plan.target()));
+    }
+    let kind =
+        class_accessibility_diagnostic(store, host, &plan.context, &member, plan.property.privacy)?;
+    Ok(kind
+        .into_iter()
+        .map(|kind| SourcePropertyDiagnostic {
+            name_node: plan.property.name_node,
+            receiver_type,
+            missing_type: None,
+            suggestion: None,
+            private_owner: None,
+            accessibility: Some(ClassPropertyAccessDiagnostic::Class {
+                context: plan.context,
+                property: plan.member,
+                lookup_type: identities.instance_type,
+                kind,
+                binding: None,
+            }),
+        })
+        .collect())
 }
 
 pub(super) fn check_class_property_write_target(
@@ -1075,6 +1349,7 @@ enum ClassPropertyAccessDiagnostic {
         property: SemanticSymbolId,
         lookup_type: TypeId,
         kind: ClassAccessDiagnosticKind,
+        binding: Option<NodeRef>,
     },
 }
 
@@ -1756,6 +2031,33 @@ fn class_context_member(
     let Some(symbol) = symbol else {
         return Ok(None);
     };
+    class_context_member_for_symbol(
+        store,
+        host,
+        plan.node,
+        lookup_type,
+        context,
+        identities,
+        symbol,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn class_context_member_for_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    lookup_type: TypeId,
+    context: &ClassAccessContext,
+    identities: ClassReceiverIdentities,
+    symbol: SemanticSymbolId,
+) -> Result<(ResolvedOwnProperty, ClassMemberSource), SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(node);
+    let structured = store
+        .type_payload(lookup_type)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
     let source = classes::class_member_source(store, host, symbol).map_err(|_| invalid())?;
     let property = store.symbol(symbol).ok_or_else(invalid)?;
     let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
@@ -1780,7 +2082,7 @@ fn class_context_member(
     {
         return Err(invalid());
     }
-    Ok(Some((
+    Ok((
         ResolvedOwnProperty {
             symbol,
             type_,
@@ -1788,7 +2090,7 @@ fn class_context_member(
             readonly: source.readonly,
         },
         source,
-    )))
+    ))
 }
 
 /// Mirrors getNamedMembers: own declarations first, then pinned symbol order.
@@ -1899,6 +2201,7 @@ fn class_access_diagnostic(
             property,
             lookup_type,
             kind,
+            binding: None,
         }),
     }
 }
@@ -2140,6 +2443,18 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
         return Err(SourcePropertyError::InvalidCache(plan.node));
     }
     let Some(context) = plan.class_access else {
+        if let Some(flow) = flow.as_deref()
+            && let Some(checked) = check_prepared_class_instance_property(
+                store,
+                host,
+                globals,
+                plan,
+                receiver_type,
+                flow,
+            )?
+        {
+            return Ok(checked);
+        }
         return check_direct_source_property_with_session(
             store,
             globals,
@@ -2298,7 +2613,7 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
     }
     let mut type_ = declared_type;
     if !private_error && !matches!(member.origin, ClassMemberOrigin::Method) {
-        if let Some(flow) = flow {
+        if let Some(flow) = flow.filter(|_| !context.is_deferred()) {
             let read = flow.property_read(
                 store,
                 host,
@@ -2329,6 +2644,85 @@ pub(super) fn check_direct_source_property_with_class_context_and_session(
     };
     publish_property_links(store, plan.node, symbol, type_)?;
     Ok(CheckedSourceProperty { type_, diagnostics })
+}
+
+fn check_prepared_class_instance_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    flow: &ClassInitializationFrame<'_, '_>,
+) -> Result<Option<CheckedSourceProperty>, SourcePropertyError> {
+    let invalid = || SourcePropertyError::InvalidCache(plan.node);
+    let identities =
+        classes::class_body_identities(store, host, flow.access_token()).map_err(|_| invalid())?;
+    if receiver_type != identities.instance_type {
+        return Ok(None);
+    }
+    let (arena, _) = host.source(plan.node).ok_or_else(invalid)?;
+    let syntax = plan_direct_source_property_syntax_at(arena, store, plan.node, plan.position)?;
+    if syntax.receiver != plan.receiver.node
+        || syntax.name_node != plan.name_node
+        || syntax.name != plan.name
+        || syntax.privacy != plan.privacy
+        || syntax.optional != plan.optional
+    {
+        return Err(invalid());
+    }
+    if plan.privacy != SourcePropertyPrivacy::Identifier || plan.optional {
+        return Ok(None);
+    }
+    let structured = store
+        .type_payload(receiver_type)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    let Some(symbol) = structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&plan.name))
+    else {
+        return Ok(None);
+    };
+    if structured
+        .properties
+        .as_deref()
+        .is_none_or(|properties| !properties.contains(&symbol))
+    {
+        return Err(invalid());
+    }
+    let member = classes::class_member_source(store, host, symbol).map_err(|_| invalid())?;
+    if member.side != ClassPropertySide::Instance
+        || member.visibility != ClassConstructorVisibility::Public
+    {
+        return Ok(None);
+    }
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
+    let mut type_ = links
+        .resolved_type
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or_else(invalid)?;
+    if record.parent() != Some(member.declaring_class)
+        || record.value_declaration() != Some(member.declaration)
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(invalid());
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    if record.flags().contains(SymbolFlags::OPTIONAL) && bootstrap.options.strict_null_checks {
+        let undefined = bootstrap.undefined_or_missing_type;
+        type_ = property_union_type(store, globals, plan.node, &[type_, undefined], Some(symbol))?;
+    }
+    publish_property_links(store, plan.node, Some(symbol), type_)?;
+    Ok(Some(CheckedSourceProperty {
+        type_,
+        diagnostics: Vec::new(),
+    }))
 }
 
 fn validate_class_property_flow_read(
@@ -4293,6 +4687,21 @@ pub(super) fn prepare_source_property_diagnostic(
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     let (name, private_name) = match host.node(deferred.name_node) {
+        Some(node)
+            if node.kind == SyntaxKind::StringLiteral
+                && matches!(
+                    deferred.accessibility,
+                    Some(ClassPropertyAccessDiagnostic::Class {
+                        binding: Some(_),
+                        ..
+                    })
+                ) =>
+        {
+            let NodeData::StringLiteral(literal) = &node.data else {
+                return Err(SourcePropertyError::InvalidCache(deferred.name_node));
+            };
+            (literal.text.as_str(), false)
+        }
         Some(node) if node.kind == SyntaxKind::Identifier => match &node.data {
             NodeData::Identifier(identifier) if !identifier.text.is_empty() => {
                 (identifier.text.as_str(), false)
@@ -4314,6 +4723,7 @@ pub(super) fn prepare_source_property_diagnostic(
         property,
         lookup_type,
         kind,
+        binding,
     }) = deferred.accessibility
     {
         return prepare_class_access_diagnostic(
@@ -4328,6 +4738,7 @@ pub(super) fn prepare_source_property_diagnostic(
             property,
             lookup_type,
             kind,
+            binding,
         );
     }
     if let Some(accessibility) = deferred.accessibility {
@@ -4532,6 +4943,7 @@ fn prepare_class_access_diagnostic(
     property: SemanticSymbolId,
     lookup_type: TypeId,
     kind: ClassAccessDiagnosticKind,
+    binding: Option<NodeRef>,
 ) -> Result<CanonicalCheckerDiagnostic, SourcePropertyError> {
     let invalid = || SourcePropertyError::InvalidCache(deferred.name_node);
     if deferred.missing_type.is_some()
@@ -4541,22 +4953,35 @@ fn prepare_class_access_diagnostic(
     {
         return Err(invalid());
     }
-    let name_record = class_access_node(store, host, deferred.name_node)?;
-    let access = NodeRef::new(
-        context.receiver.arena,
-        context.receiver.file,
-        name_record.parent.ok_or_else(invalid)?,
-    );
-    let NodeData::PropertyAccessExpression(access_data) =
-        &class_access_node(store, host, access)?.data
-    else {
-        return Err(invalid());
+    let access = if let Some(binding) = binding {
+        let plan = plan_class_binding_property(store, host, binding, context.receiver)?;
+        if plan.property != deferred.name_node
+            || plan.name != name
+            || plan.context != *context
+            || private_name
+        {
+            return Err(invalid());
+        }
+        binding
+    } else {
+        let name_record = class_access_node(store, host, deferred.name_node)?;
+        let access = NodeRef::new(
+            context.receiver.arena,
+            context.receiver.file,
+            name_record.parent.ok_or_else(invalid)?,
+        );
+        let NodeData::PropertyAccessExpression(access_data) =
+            &class_access_node(store, host, access)?.data
+        else {
+            return Err(invalid());
+        };
+        if access_data.expression != context.receiver.node
+            || access_data.name != deferred.name_node.node
+        {
+            return Err(invalid());
+        }
+        access
     };
-    if access_data.expression != context.receiver.node
-        || access_data.name != deferred.name_node.node
-    {
-        return Err(invalid());
-    }
     let member = classes::class_member_source(store, host, property).map_err(|_| invalid())?;
     let record = store.symbol(property).ok_or_else(invalid)?;
     let structured = store
@@ -4625,9 +5050,19 @@ fn prepare_class_access_diagnostic(
         }
     }
     if kind == ClassAccessDiagnosticKind::UsedBeforeInitialization {
+        let NodeData::PropertyDeclaration(property) =
+            &class_access_node(store, host, member.declaration)?.data
+        else {
+            return Err(invalid());
+        };
+        let declaration_name = NodeRef::new(
+            member.declaration.arena,
+            member.declaration.file,
+            property.name,
+        );
         return class_used_before_initialization_diagnostic(
             deferred.name_node,
-            member.declaration,
+            declaration_name,
             name,
         );
     }
@@ -4694,7 +5129,7 @@ fn prepare_class_access_diagnostic(
 
 fn class_used_before_initialization_diagnostic(
     name_node: NodeRef,
-    declaration: NodeRef,
+    declaration_name: NodeRef,
     name: &str,
 ) -> Result<CanonicalCheckerDiagnostic, SourcePropertyError> {
     Ok(CanonicalCheckerDiagnostic {
@@ -4705,7 +5140,7 @@ fn class_used_before_initialization_diagnostic(
             [name],
         ),
         related_information: vec![CanonicalCheckerRelatedInformation {
-            node: Some(declaration),
+            node: Some(declaration_name),
             diagnostic: Diagnostic::with_arguments(
                 message_by_code(2728).ok_or(SourcePropertyError::MissingDiagnostic(2728))?,
                 [name],
@@ -5872,16 +6307,25 @@ mod tests {
                 first
             );
             if expected == Some(true) {
+                let NodeData::PropertyDeclaration(property) = &host.node(declaration).unwrap().data
+                else {
+                    panic!("expected a class field declaration");
+                };
+                let declaration_name =
+                    NodeRef::new(declaration.arena, declaration.file, property.name);
                 let diagnostic =
-                    class_used_before_initialization_diagnostic(name, declaration, "first")
+                    class_used_before_initialization_diagnostic(name, declaration_name, "first")
                         .unwrap();
                 assert_eq!(diagnostic.diagnostic.code(), 2729);
                 assert_eq!(diagnostic.node, Some(name));
                 assert_eq!(diagnostic.related_information.len(), 1);
-                assert_eq!(diagnostic.related_information[0].node, Some(declaration));
+                assert_eq!(
+                    diagnostic.related_information[0].node,
+                    Some(declaration_name)
+                );
                 assert_eq!(diagnostic.related_information[0].diagnostic.code(), 2728);
                 assert_eq!(
-                    class_used_before_initialization_diagnostic(name, declaration, "first")
+                    class_used_before_initialization_diagnostic(name, declaration_name, "first")
                         .unwrap(),
                     diagnostic
                 );

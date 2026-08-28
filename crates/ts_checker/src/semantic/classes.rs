@@ -69,6 +69,9 @@
 //! Constructor-factory inheritance retains exact later-field initialization
 //! diagnostics without replacing binder-owned property symbols.
 //! Direct inherited field calls through `super` retain their exact TS2855 span.
+//! Source-body plans also retain required class-reference constructor parameters,
+//! function-typed fields, and field initializers. The source executor checks
+//! each initializer before publishing its inferred field type.
 //! Other nonempty executable bodies, general heritage, and non-primitive
 //! field and method annotations remain later class stages.
 
@@ -172,6 +175,10 @@ pub(super) enum ClassBodyKind {
         symbol: SemanticSymbolId,
         side: ClassPropertySide,
     },
+    PropertyInitializer {
+        symbol: SemanticSymbolId,
+        side: ClassPropertySide,
+    },
     StaticBlock,
 }
 
@@ -183,8 +190,75 @@ pub(super) struct ClassBodyParameterPlan {
     pub(super) property_symbol: Option<SemanticSymbolId>,
     pub(super) annotation: Option<NodeRef>,
     pub(super) initializer: Option<NodeRef>,
-    pub(super) type_: TypeId,
+    pub(super) type_: ClassBodyParameterType,
     pub(super) optional: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClassBodyParameterType {
+    Known(TypeId),
+    ClassReference {
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    },
+}
+
+impl ClassBodyParameterType {
+    pub(super) fn resolved(self, store: &CanonicalTypeMapperStore) -> Result<TypeId, ClassError> {
+        match self {
+            Self::Known(type_) => Ok(type_),
+            Self::ClassReference { node, symbol } => {
+                let type_ = store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyTypeCache(node)))?;
+                if store.type_node_links(node)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    })
+                    || store.symbol_node_links(node)
+                        != Some(&SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        })
+                {
+                    return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(node)));
+                }
+                Ok(type_)
+            }
+        }
+    }
+
+    fn materialize(
+        self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<TypeId, ClassError> {
+        match self {
+            Self::Known(type_) => Ok(type_),
+            Self::ClassReference { node, symbol } => {
+                let type_ = store.get_declared_type_of_symbol(host, symbol)?;
+                if !store.try_reserve_type_node_links(1) || !store.try_reserve_symbol_node_links(1)
+                {
+                    return Err(invariant(ClassInvariant::Capacity(node)));
+                }
+                assert!(store.set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                assert!(store.set_symbol_node_links(
+                    node,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(symbol)
+                    }
+                ));
+                self.resolved(store)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +300,8 @@ pub(super) struct SourceClassPlan {
     header: ClassDeclarationHeader,
     revision: ts_ast::NodeArenaRevision,
     properties: Vec<(ClassPropertyPlan, TypeId)>,
+    function_properties: Vec<(ClassPropertyPlan, super::functions::FunctionTypePlan)>,
+    initialized_properties: Vec<ClassPropertyPlan>,
     methods: Vec<SourceClassMethodPlan>,
     constructor: Option<SourceClassConstructorPlan>,
     bodies: Vec<ClassBodyPlan>,
@@ -285,6 +361,12 @@ fn capture_source_class_bindings(
                 .iter()
                 .map(|parameter| parameter.symbol),
         );
+        symbols.extend(constructor.parameters.iter().filter_map(
+            |parameter| match parameter.type_ {
+                ClassBodyParameterType::ClassReference { symbol, .. } => Some(symbol),
+                ClassBodyParameterType::Known(_) => None,
+            },
+        ));
     }
     symbols.extend(plan.methods.iter().flat_map(|method| {
         method
@@ -336,7 +418,7 @@ struct SourceClassConstructorPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     visibility: ClassConstructorVisibility,
-    parameters: Vec<ClassConstructorParameterPlan>,
+    parameters: Vec<ClassConstructorParameterPlan<ClassBodyParameterType>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -479,6 +561,7 @@ pub(super) struct SourceClassProvenance {
     base_members: Option<ClassMembers>,
     inherited_values: Vec<(SemanticSymbolId, TypeId, Option<SignatureId>)>,
     method_returns: Vec<Option<TypeId>>,
+    property_types: Vec<Option<TypeId>>,
     completed_bodies: Vec<bool>,
     complete: bool,
 }
@@ -533,7 +616,7 @@ fn source_class_body(
 fn source_constructor_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    parameter: ClassConstructorParameterPlan,
+    parameter: ClassConstructorParameterPlan<ClassBodyParameterType>,
 ) -> Result<ClassBodyParameterPlan, ClassError> {
     let record = preflight_node(store, host, parameter.declaration)?;
     let NodeData::ParameterDeclaration(data) = &record.data else {
@@ -541,18 +624,23 @@ fn source_constructor_parameter(
             parameter.declaration,
         )));
     };
-    let type_ = optional_constructor_parameter_type(
-        store,
-        parameter.type_,
-        parameter.optional,
-        parameter.declaration,
-    )?
-    .ok_or_else(|| {
-        unsupported(ClassUnsupported::PropertyType {
-            node: parameter.type_node,
-            kind: SyntaxKind::Parameter,
-        })
-    })?;
+    let type_ = match parameter.type_ {
+        ClassBodyParameterType::Known(type_) => ClassBodyParameterType::Known(
+            optional_constructor_parameter_type(
+                store,
+                type_,
+                parameter.optional,
+                parameter.declaration,
+            )?
+            .ok_or_else(|| {
+                unsupported(ClassUnsupported::PropertyType {
+                    node: parameter.type_node,
+                    kind: SyntaxKind::Parameter,
+                })
+            })?,
+        ),
+        reference @ ClassBodyParameterType::ClassReference { .. } => reference,
+    };
     Ok(ClassBodyParameterPlan {
         declaration: parameter.declaration,
         name_node: NodeRef::new(
@@ -695,22 +783,26 @@ fn plan_source_class_constructor(
             return Err(invariant(ClassInvariant::InvalidProperty(parameter)));
         }
         previous_end = parameter_record.range.end;
-        let PlannedConstructorParameter::Primitive(planned) =
-            plan_constructor_parameter_with_body_mode(
-                store,
-                host,
-                header.symbol,
-                declaration,
-                parameter,
-                header.instance_members,
-                None,
-                true,
-            )?
-        else {
-            return Err(unsupported(ClassUnsupported::Member {
-                node: parameter,
-                kind: SyntaxKind::Parameter,
-            }));
+        let planned = match plan_constructor_parameter_with_body_mode(
+            store,
+            host,
+            header.symbol,
+            declaration,
+            parameter,
+            header.instance_members,
+            None,
+            true,
+        )? {
+            PlannedConstructorParameter::Primitive(planned) => {
+                planned.with_type(ClassBodyParameterType::Known(planned.type_))
+            }
+            PlannedConstructorParameter::ClassReference(planned) => planned,
+            PlannedConstructorParameter::Annotated(_) => {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: parameter,
+                    kind: SyntaxKind::Parameter,
+                }));
+            }
         };
         if !names.insert(planned.symbol)
             || planned.decorator.is_some()
@@ -838,6 +930,8 @@ pub(super) fn plan_source_class_members(
         header,
         revision,
         properties: Vec::new(),
+        function_properties: Vec::new(),
+        initialized_properties: Vec::new(),
         methods: Vec::new(),
         constructor: None,
         bodies: Vec::new(),
@@ -866,10 +960,13 @@ pub(super) fn plan_source_class_members(
                 let (constructor, body) =
                     plan_source_class_constructor(store, host, &plan.header, member)?;
                 for &parameter in &constructor.parameters {
-                    if let Some(property) = source_parameter_property(store, host, parameter)? {
+                    if let ClassBodyParameterType::Known(type_) = parameter.type_
+                        && let Some(property) =
+                            source_parameter_property(store, host, parameter.with_type(type_))?
+                    {
                         plan.sources
                             .push(source_property_origin(store, symbol, &property));
-                        plan.properties.push((property, parameter.type_));
+                        plan.properties.push((property, type_));
                     }
                 }
                 if let Some(body) = body {
@@ -944,7 +1041,7 @@ pub(super) fn plan_source_class_members(
                             property_symbol: None,
                             annotation: parameter.type_node,
                             initializer: None,
-                            type_: parameter.type_,
+                            type_: ClassBodyParameterType::Known(parameter.type_),
                             optional: false,
                         });
                     }
@@ -967,24 +1064,72 @@ pub(super) fn plan_source_class_members(
                 });
             }
             NodeData::PropertyDeclaration(_) => {
-                let property = plan_property(
+                let property = plan_property_with_body_mode(
                     store,
                     host,
                     symbol,
                     member,
                     plan.header.instance_members,
                     plan.header.static_members,
+                    true,
                 )?;
                 if property.initializer_parameter_name.is_some()
                     || property.initializer_assertion.is_some()
                 {
                     return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                 }
-                let type_ = planned_property_type(store, host, &property)?;
-                validate_property_cache_state(store, &property, type_)?;
                 plan.sources
                     .push(source_property_origin(store, symbol, &property));
-                plan.properties.push((property, type_));
+                if let Some(initializer) = property.initializer_node
+                    && matches!(
+                        store.source_node_kind(initializer),
+                        Some(SyntaxKind::PropertyAccessExpression | SyntaxKind::ArrowFunction)
+                    )
+                {
+                    plan.bodies.push(ClassBodyPlan {
+                        class_declaration: plan.declaration(),
+                        class_symbol: symbol,
+                        declaration: member,
+                        body: initializer,
+                        kind: ClassBodyKind::PropertyInitializer {
+                            symbol: property.symbol,
+                            side: property.side,
+                        },
+                        parameters: Vec::new(),
+                        return_annotation: (property.type_node != initializer)
+                            .then_some(property.type_node),
+                    });
+                    plan.initialized_properties.push(property);
+                } else if store.source_node_kind(property.type_node)
+                    == Some(SyntaxKind::FunctionType)
+                    && property.initializer_node.is_none()
+                {
+                    let function = super::functions::plan_function_type(
+                        store,
+                        host,
+                        property.type_node,
+                        None,
+                        false,
+                        None,
+                    )
+                    .map_err(|_| {
+                        unsupported(ClassUnsupported::PropertyType {
+                            node: property.type_node,
+                            kind: SyntaxKind::FunctionType,
+                        })
+                    })?;
+                    if !function.type_parameters.is_empty() {
+                        return Err(unsupported(ClassUnsupported::PropertyType {
+                            node: property.type_node,
+                            kind: SyntaxKind::FunctionType,
+                        }));
+                    }
+                    plan.function_properties.push((property, function));
+                } else {
+                    let type_ = planned_property_type(store, host, &property)?;
+                    validate_property_cache_state(store, &property, type_)?;
+                    plan.properties.push((property, type_));
+                }
             }
             NodeData::ClassStaticBlockDeclaration(data) => {
                 if record.kind != SyntaxKind::ClassStaticBlockDeclaration
@@ -1230,7 +1375,9 @@ fn source_inherited_values(
         .collect()
 }
 
-fn source_class_minimum(parameters: &[ClassConstructorParameterPlan]) -> Result<i32, ClassError> {
+fn source_class_minimum<T>(
+    parameters: &[ClassConstructorParameterPlan<T>],
+) -> Result<i32, ClassError> {
     parameters
         .iter()
         .enumerate()
@@ -1358,7 +1505,8 @@ fn validate_source_class_stored_header(
     }
     if provenance.complete
         && (!provenance.completed_bodies.iter().all(|complete| *complete)
-            || provenance.method_returns.iter().any(Option::is_none))
+            || provenance.method_returns.iter().any(Option::is_none)
+            || provenance.property_types.iter().any(Option::is_none))
     {
         return Err(reject());
     }
@@ -1424,6 +1572,7 @@ fn validate_source_class_stored_layout(
         || members.shells.declaration != plan.declaration()
         || prepared.methods.len() != plan.methods.len()
         || provenance.method_returns.len() != plan.methods.len()
+        || provenance.property_types.len() != plan.initialized_properties.len()
         || provenance.completed_bodies.len() != plan.bodies.len()
         || store
             .declared_type_links(plan.symbol())
@@ -1575,9 +1724,10 @@ fn validate_source_class_stored_layout(
             return Err(reject());
         }
         for parameter in &constructor.parameters {
+            let annotation_type = parameter.type_.resolved(store)?;
             let type_ = optional_constructor_parameter_type(
                 store,
-                parameter.type_,
+                annotation_type,
                 parameter.optional,
                 parameter.declaration,
             )?
@@ -1589,7 +1739,7 @@ fn validate_source_class_stored_layout(
                 })
                 || store.type_node_links(parameter.type_node)
                     != Some(&TypeNodeLinks {
-                        resolved_type: Some(parameter.type_),
+                        resolved_type: Some(annotation_type),
                         ..TypeNodeLinks::default()
                     })
             {
@@ -1616,6 +1766,69 @@ fn validate_source_class_stored_layout(
             })
         {
             return Err(reject());
+        }
+    }
+    for (property, function) in &plan.function_properties {
+        let type_ = store
+            .type_node_links(function.node)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(reject)?;
+        if !matches!(
+            validate_stored_callable_set(store, type_),
+            StoredCallableSetValidation::Valid { .. }
+        ) || store.type_payload(type_).and_then(TypeRecord::symbol) != Some(function.symbol)
+            || store.value_symbol_links(property.symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(reject());
+        }
+    }
+    for (index, property) in plan.initialized_properties.iter().enumerate() {
+        let type_ = provenance.property_types[index];
+        let completed = plan
+            .bodies
+            .iter()
+            .position(|body| body.declaration == property.declaration)
+            .is_some_and(|body| provenance.completed_bodies[body]);
+        let links = store
+            .value_symbol_links(property.symbol)
+            .cloned()
+            .unwrap_or_default();
+        if type_.is_some() != completed
+            || links
+                != (ValueSymbolLinks {
+                    resolved_type: type_,
+                    ..ValueSymbolLinks::default()
+                })
+            || store.symbol(property.symbol).is_none_or(|symbol| {
+                symbol.check_flags()
+                    != if property.readonly {
+                        CheckFlags::READONLY
+                    } else {
+                        CheckFlags::NONE
+                    }
+            })
+        {
+            return Err(reject());
+        }
+        if let Some(type_) = type_ {
+            if store.type_payload(type_).is_none()
+                || property
+                    .initializer_node
+                    .and_then(|node| store.type_node_links(node))
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+                || property.initializer_node != Some(property.type_node)
+                    && store
+                        .type_node_links(property.type_node)
+                        .and_then(|links| links.resolved_type)
+                        != Some(type_)
+            {
+                return Err(reject());
+            }
         }
     }
     for (index, method) in plan.methods.iter().enumerate() {
@@ -1776,6 +1989,7 @@ pub(super) fn prepare_source_class_members(
             base_members: base,
             inherited_values,
             method_returns: returns,
+            property_types: vec![None; plan.initialized_properties.len()],
             completed_bodies: vec![false; plan.bodies.len()],
             complete: false,
         };
@@ -1948,7 +2162,12 @@ pub(super) fn prepare_source_class_members(
         numbers.extend(property_initializer_number(property));
         strings.extend(property.initializer_string.clone());
     }
-    let count = plan.properties.len() + plan.methods.len() + constructor_parameters.len() + 4;
+    let count = plan.properties.len()
+        + plan.function_properties.len()
+        + plan.initialized_properties.len()
+        + plan.methods.len()
+        + constructor_parameters.len()
+        + 4;
     if !store.try_reserve_types(count * 3)
         || !store.try_reserve_signatures(plan.methods.len() + 1)
         || !store.try_reserve_checker_symbol_allocations(0, 2)
@@ -1983,6 +2202,24 @@ pub(super) fn prepare_source_class_members(
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol()))
             .expect("source class value capacity was reserved")
     });
+    for (property, _) in &plan.function_properties {
+        let options = CanonicalTypeQueryOptions {
+            strict_builtin_iterator_return: store
+                .claimed_strict_builtin_iterator_return()
+                .unwrap_or_default(),
+            no_implicit_any: true,
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(store, host, options, &mut diagnostics)?
+            .get_type_from_type_node(property.type_node)?;
+        if !diagnostics.is_empty() {
+            return Err(unsupported(ClassUnsupported::PropertyType {
+                node: property.type_node,
+                kind: SyntaxKind::FunctionType,
+            }));
+        }
+        publish_class_property(store, property, type_);
+    }
     let instance_members = prepared_instance.map(|prepared| {
         let table = store.alloc_prepared_symbol_table(prepared);
         for (name, symbol) in instance_entries {
@@ -2023,11 +2260,13 @@ pub(super) fn prepare_source_class_members(
             }
         ));
         for &parameter in &constructor.parameters {
-            let type_ = prepare_constructor_parameter_type(store, parameter)?;
+            let annotation_type = parameter.type_.materialize(store, host)?;
+            let type_ =
+                prepare_constructor_parameter_type(store, parameter.with_type(annotation_type))?;
             assert!(store.set_type_node_links(
                 parameter.type_node,
                 TypeNodeLinks {
-                    resolved_type: Some(parameter.type_),
+                    resolved_type: Some(annotation_type),
                     ..TypeNodeLinks::default()
                 }
             ));
@@ -2052,6 +2291,17 @@ pub(super) fn prepare_source_class_members(
         } else {
             publish_class_property(store, property, *type_);
         }
+    }
+    for property in &plan.initialized_properties {
+        if store
+            .value_symbol_links(property.symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                property.symbol,
+            )));
+        }
+        assert!(store.set_source_property_readonly(property.symbol, property.readonly));
     }
     for method in &plan.methods {
         let type_ = store
@@ -2166,6 +2416,7 @@ pub(super) fn prepare_source_class_members(
         base_members: base.clone(),
         inherited_values,
         method_returns,
+        property_types: vec![None; plan.initialized_properties.len()],
         completed_bodies,
         complete: false,
     };
@@ -2259,7 +2510,7 @@ fn source_class_body_token(
     }
     let signature = match body.kind {
         ClassBodyKind::Constructor => Some(prepared.construct_signature),
-        ClassBodyKind::StaticBlock => None,
+        ClassBodyKind::StaticBlock | ClassBodyKind::PropertyInitializer { .. } => None,
         ClassBodyKind::Method { symbol, .. } => {
             let index = prepared
                 .plan
@@ -3308,6 +3559,44 @@ pub(super) fn complete_source_class_body(
         }
         _ => None,
     };
+    let property = if let ClassBodyKind::PropertyInitializer { symbol, .. } = body.kind {
+        let index = prepared
+            .plan
+            .initialized_properties
+            .iter()
+            .position(|property| property.symbol == symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(body.declaration)))?;
+        let type_ = checked
+            .property_type()
+            .filter(|type_| store.type_payload(*type_).is_some())
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyTypeCache(body.declaration)))?;
+        if checked.inferred_return_type().is_some()
+            || store
+                .type_node_links(body.body)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+            || body.return_annotation.is_some_and(|annotation| {
+                store
+                    .type_node_links(annotation)
+                    .and_then(|links| links.resolved_type)
+                    != Some(type_)
+            })
+            || provenance.completed_bodies[body_index]
+                && provenance.property_types[index] != Some(type_)
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                body.declaration,
+            )));
+        }
+        Some((index, symbol, type_))
+    } else {
+        if checked.property_type().is_some() {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                body.declaration,
+            )));
+        }
+        None
+    };
     if provenance.completed_bodies[body_index] {
         return Ok(());
     }
@@ -3318,11 +3607,27 @@ pub(super) fn complete_source_class_body(
             body.declaration,
         )));
     }
+    if let Some((_, symbol, type_)) = property {
+        if !store.try_reserve_value_symbol_links(1)
+            || !store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            )
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+    }
     let provenance = store
         .source_class_provenance_mut(prepared.instance_type)
         .expect("the prepared class record was authenticated");
     if let Some((index, returned)) = inferred {
         provenance.method_returns[index] = Some(returned);
+    }
+    if let Some((index, _, type_)) = property {
+        provenance.property_types[index] = Some(type_);
     }
     provenance.completed_bodies[body_index] = true;
     Ok(())
@@ -3346,6 +3651,7 @@ pub(super) fn finish_source_class_members(
     validate_source_class_header(store, host, provenance)?;
     if !provenance.completed_bodies.iter().all(|complete| *complete)
         || provenance.method_returns.iter().any(Option::is_none)
+        || provenance.property_types.iter().any(Option::is_none)
     {
         return Err(unsupported(ClassUnsupported::Member {
             node: plan.declaration(),
@@ -4006,9 +4312,10 @@ fn prepare_source_constructor_call_types(
 ) -> Result<(), ClassError> {
     if let Some(constructor) = &plan.constructor {
         for parameter in &constructor.parameters {
+            let annotation_type = parameter.type_.materialize(store, host)?;
             prepare_constructor_optional_type(
                 store,
-                parameter.type_,
+                annotation_type,
                 parameter.optional || parameter.initializer.is_some(),
                 parameter.declaration,
             )?;
@@ -4351,15 +4658,30 @@ impl ClassConstructorPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ClassConstructorParameterPlan {
+struct ClassConstructorParameterPlan<T = TypeId> {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     type_node: NodeRef,
-    type_: TypeId,
+    type_: T,
     optional: bool,
     initializer: Option<NodeRef>,
     decorator: Option<ClassConstructorParameterDecoratorPlan>,
     property: Option<ClassConstructorPrimitiveParameterPropertyPlan>,
+}
+
+impl<T> ClassConstructorParameterPlan<T> {
+    fn with_type<U>(self, type_: U) -> ClassConstructorParameterPlan<U> {
+        ClassConstructorParameterPlan {
+            declaration: self.declaration,
+            symbol: self.symbol,
+            type_node: self.type_node,
+            type_,
+            optional: self.optional,
+            initializer: self.initializer,
+            decorator: self.decorator,
+            property: self.property,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4375,6 +4697,7 @@ struct ClassConstructorAnnotatedParameterPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlannedConstructorParameter {
     Primitive(ClassConstructorParameterPlan),
+    ClassReference(ClassConstructorParameterPlan<ClassBodyParameterType>),
     Annotated(ClassConstructorAnnotatedParameterPlan),
 }
 
@@ -6038,7 +6361,21 @@ fn plan_constructor_parameter_with_body_mode(
     let initializer = data
         .initializer
         .map(|initializer| NodeRef::new(parameter.arena, parameter.file, initializer));
-    let annotated = !matches!(type_record.data, NodeData::KeywordTypeNode(_));
+    let class_reference = if source_body
+        && type_record.kind == SyntaxKind::TypeReference
+        && decorator.is_none()
+        && property_readonly.is_none()
+        && !optional
+        && initializer.is_none()
+    {
+        Some(plan_source_class_parameter_reference(
+            store, host, type_node,
+        )?)
+    } else {
+        None
+    };
+    let annotated =
+        !matches!(type_record.data, NodeData::KeywordTypeNode(_)) && class_reference.is_none();
     let annotation_initializer = if annotated {
         let context = type_context.ok_or_else(reject)?;
         let initializer = initializer
@@ -6194,6 +6531,38 @@ fn plan_constructor_parameter_with_body_mode(
     if property.is_none() && bound_symbol(store, host, parameter) != Some(symbol) {
         return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
     }
+    if let Some(class) = class_reference {
+        let expected = store
+            .declared_type_links(class)
+            .and_then(|links| links.declared_type);
+        if store.value_symbol_links(symbol).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && expected.is_none_or(|type_| {
+                    links
+                        != &ValueSymbolLinks {
+                            resolved_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        }
+                })
+        }) {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+        return Ok(PlannedConstructorParameter::ClassReference(
+            ClassConstructorParameterPlan {
+                declaration: parameter,
+                symbol,
+                type_node,
+                type_: ClassBodyParameterType::ClassReference {
+                    node: type_node,
+                    symbol: class,
+                },
+                optional: false,
+                initializer: None,
+                decorator: None,
+                property: None,
+            },
+        ));
+    }
     if annotated {
         let plan = ClassConstructorAnnotatedParameterPlan {
             declaration: parameter,
@@ -6244,6 +6613,74 @@ fn plan_constructor_parameter_with_body_mode(
             property,
         },
     ))
+}
+
+fn plan_source_class_parameter_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<SemanticSymbolId, ClassError> {
+    let reject = || {
+        unsupported(ClassUnsupported::PropertyType {
+            node,
+            kind: SyntaxKind::TypeReference,
+        })
+    };
+    let record = preflight_node(store, host, node)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Err(reject());
+    };
+    if reference.type_arguments.is_some() {
+        return Err(reject());
+    }
+    let name = NodeRef::new(node.arena, node.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    if name_record.flags.0 != 0 || name_record.parent != Some(node.node) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(node)));
+    }
+    let (arena, bound) = host.source(node).ok_or_else(reject)?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let class = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::TYPE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(reject)?;
+    if store
+        .symbol(class)
+        .is_none_or(|record| record.flags() != SymbolFlags::CLASS)
+        || preflight_class_or_interface_reference(store, host, class, SymbolFlags::CLASS)? != 0
+    {
+        return Err(reject());
+    }
+    let type_ = store
+        .declared_type_links(class)
+        .and_then(|links| links.declared_type);
+    if store.type_node_links(node).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && type_.is_none_or(|type_| {
+                links
+                    != &TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    }
+            })
+    }) || store.symbol_node_links(node).is_some_and(|links| {
+        links != &SymbolNodeLinks::default() && links.resolved_symbol != Some(class)
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(node)));
+    }
+    Ok(class)
 }
 
 fn annotated_constructor_value_type(
@@ -7004,6 +7441,12 @@ fn plan_constructor(
                         }
                         PlannedConstructorParameter::Annotated(parameter) => {
                             (None, Some(parameter), None)
+                        }
+                        PlannedConstructorParameter::ClassReference(_) => {
+                            return Err(accessor_member_error(
+                                declaration,
+                                SyntaxKind::Constructor,
+                            ));
                         }
                     }
                 }
@@ -9547,6 +9990,27 @@ fn plan_property(
     instance_members: Option<SymbolTableId>,
     static_members: SymbolTableId,
 ) -> Result<ClassPropertyPlan, ClassError> {
+    plan_property_with_body_mode(
+        store,
+        host,
+        owner,
+        member,
+        instance_members,
+        static_members,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_property_with_body_mode(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    member: NodeRef,
+    instance_members: Option<SymbolTableId>,
+    static_members: SymbolTableId,
+    source_body: bool,
+) -> Result<ClassPropertyPlan, ClassError> {
     let record = preflight_node(store, host, member)?;
     let NodeData::PropertyDeclaration(property) = &record.data else {
         return Err(unsupported(ClassUnsupported::Member {
@@ -9667,6 +10131,11 @@ fn plan_property(
                 NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
                 NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
                 NodeData::AsExpression(_) if private => None,
+                NodeData::PropertyAccessExpression(_) | NodeData::ArrowFunction(_)
+                    if source_body && merged_auto_accessor.is_none() =>
+                {
+                    None
+                }
                 _ => {
                     return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                 }
@@ -9779,6 +10248,11 @@ fn plan_property(
                             annotation,
                         }),
                     )
+                }
+                NodeData::PropertyAccessExpression(_) | NodeData::ArrowFunction(_)
+                    if source_body && merged_auto_accessor.is_none() =>
+                {
+                    (None, None, None, None)
                 }
                 _ => unreachable!("unsupported initializer syntax was rejected above"),
             }
@@ -30920,7 +31394,10 @@ mod tests {
                 [bootstrap.undefined_type, bootstrap.number_type]
             );
             let parameter = &base_provenance.prepared.plan.bodies()[0].parameters[0];
-            assert_eq!(parameter.type_, bootstrap.number_type);
+            assert_eq!(
+                parameter.type_.resolved(store).unwrap(),
+                bootstrap.number_type
+            );
             assert_eq!(
                 store
                     .value_symbol_links(parameter.symbol)

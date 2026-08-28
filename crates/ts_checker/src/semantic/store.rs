@@ -829,7 +829,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
     }
 
-    #[cfg(test)]
     pub(super) const fn claimed_strict_builtin_iterator_return(&self) -> Option<bool> {
         self.claimed_strict_builtin_iterator_return
     }

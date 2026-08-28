@@ -586,6 +586,96 @@ pub(super) fn plan_top_level_object_binding_elements(
     binding: VariableBindingKind,
     exported: bool,
 ) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    let source = bound.source_file();
+    plan_object_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        exported,
+        ObjectBindingScope {
+            statement_parent: source,
+            container: source,
+            block_scope: source,
+        },
+    )
+}
+
+pub(super) fn plan_class_object_binding_elements(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    binding: VariableBindingKind,
+    container: NodeRef,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
+    let invalid = || VariableInvariant::InvalidBindingPattern(declaration);
+    if !matches!(
+        arena.get(container.node).map(|record| record.kind),
+        Some(SyntaxKind::Constructor | SyntaxKind::MethodDeclaration)
+    ) || bound.container(declaration) != Some(container)
+        || !matches!(
+            binding,
+            VariableBindingKind::Let | VariableBindingKind::Const
+        )
+    {
+        return Err(invalid().into());
+    }
+    let list = arena
+        .get(declaration.node)
+        .and_then(|record| record.parent)
+        .ok_or_else(invalid)?;
+    let statement = arena
+        .get(list)
+        .and_then(|record| record.parent)
+        .ok_or_else(invalid)?;
+    let parent = arena
+        .get(statement)
+        .and_then(|record| record.parent)
+        .ok_or_else(invalid)?;
+    let statement_parent = NodeRef::new(declaration.arena, declaration.file, parent);
+    let block_scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(invalid)?;
+    if arena
+        .get(parent)
+        .is_none_or(|record| record.kind != SyntaxKind::Block)
+    {
+        return Err(invalid().into());
+    }
+    plan_object_binding_elements_at_scope(
+        arena,
+        bound,
+        store,
+        declaration,
+        binding,
+        false,
+        ObjectBindingScope {
+            statement_parent,
+            container,
+            block_scope,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ObjectBindingScope {
+    statement_parent: NodeRef,
+    container: NodeRef,
+    block_scope: NodeRef,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_object_binding_elements_at_scope(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    binding: VariableBindingKind,
+    exported: bool,
+    scope: ObjectBindingScope,
+) -> Result<Vec<PlannedObjectBindingElement>, VariablePlanError> {
     if bound.node_arena_id() != arena.id()
         || bound.node_arena_revision() != arena.revision()
         || !declaration.is_for(arena.id(), bound.file_id())
@@ -611,8 +701,7 @@ pub(super) fn plan_top_level_object_binding_elements(
         .parent
         .map(|node| NodeRef::new(list.arena, list.file, node))
         .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
-    let source = bound.source_file();
-    let statement_record = binding_child_node(arena, store, statement, source)?;
+    let statement_record = binding_child_node(arena, store, statement, scope.statement_parent)?;
     let NodeData::VariableStatement(statement_data) = &statement_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(statement).into());
     };
@@ -680,6 +769,7 @@ pub(super) fn plan_top_level_object_binding_elements(
         &[],
         &mut names,
         &mut planned,
+        scope,
     )?;
     Ok(planned)
 }
@@ -695,6 +785,7 @@ fn plan_object_binding_pattern(
     parent_properties: &[PlannedObjectBindingProperty],
     names: &mut HashSet<SemanticSymbolId>,
     planned: &mut Vec<PlannedObjectBindingElement>,
+    scope: ObjectBindingScope,
 ) -> Result<(), VariablePlanError> {
     let pattern_record = arena
         .get(pattern.node)
@@ -715,7 +806,6 @@ fn plan_object_binding_pattern(
         ));
     }
 
-    let source = bound.source_file();
     let mut excluded_properties = Vec::with_capacity(pattern_data.elements.nodes.len());
     let mut has_dynamic_computed_property = false;
     for (index, element) in pattern_data.elements.nodes.iter().enumerate() {
@@ -912,6 +1002,7 @@ fn plan_object_binding_pattern(
                 &nested_properties,
                 names,
                 planned,
+                scope,
             )?;
             continue;
         }
@@ -940,10 +1031,10 @@ fn plan_object_binding_pattern(
         )?;
         let local = bound.local_symbol(element).unwrap_or(symbol);
         if !names.insert(symbol)
-            || bound.container(element) != Some(source)
-            || bound.block_scope_container(element) != Some(source)
+            || bound.container(element) != Some(scope.container)
+            || bound.block_scope_container(element) != Some(scope.block_scope)
             || bound
-                .locals(source)
+                .locals(scope.block_scope)
                 .and_then(|locals| store.symbol_table(locals))
                 .and_then(|locals| locals.get_source(&identifier.text))
                 != Some(local)

@@ -4709,6 +4709,7 @@ fn is_context_insensitive_primitive_binary_operand_syntax(
             })
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
+        SyntaxKind::PropertyAccessExpression => is_supported_call_argument_syntax(arena, node),
         SyntaxKind::BinaryExpression => is_context_insensitive_primitive_binary_syntax(arena, node),
         _ => false,
     }
@@ -4785,6 +4786,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_) => true,
         PlannedExpressionKind::Parenthesized(inner) => {
             is_context_insensitive_primitive_binary_operand_plan(inner)
@@ -4813,7 +4815,6 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
         | PlannedExpressionKind::Object { .. }
-        | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Arrow(_)

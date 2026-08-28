@@ -5274,72 +5274,29 @@ impl<'store> RelaterSession<'store> {
         {
             return Err(unsupported());
         }
-        let record = self
-            .store
-            .type_payload(owner_type)
-            .ok_or_else(unsupported)?;
-        let TypeData::Object(object) = record.data() else {
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(self.store, owner_type)
+        else {
             return Err(unsupported());
         };
-        let Some([signature]) = object.structured.signatures.as_deref() else {
+        let [callable] = projection.call_signatures.as_ref() else {
             return Err(unsupported());
         };
-        let signature = *signature;
-        let signature_record = self.store.signature(signature).ok_or_else(unsupported)?;
-        let return_type = signature_record
-            .resolved_return_type()
-            .ok_or_else(unsupported)?;
-        if record.flags() != TypeFlags::OBJECT
-            || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
-            || record.symbol() != Some(symbol)
-            || record.alias().is_some()
-            || object.target.is_some()
-            || object.mapper.is_some()
-            || object.instantiations != TypeCacheState::Unallocated
-            || object.structured.constrained != ConstrainedTypeData::default()
-            || object.structured.members.is_some()
-            || object.structured.properties.is_some()
-            || object.structured.call_signature_count != 1
-            || object.structured.index_infos.is_some()
-            || object
-                .structured
-                .object_type_without_abstract_construct_signatures
-                .is_some()
-            || signature_record.flags() != SignatureFlags::NONE
-            || signature_record.declaration() != Some(declaration)
-            || !signature_record.type_parameters().is_empty()
-            || !signature_record.parameters().is_empty()
-            || signature_record.this_parameter().is_some()
-            || signature_record.min_argument_count() != 0
-            || signature_record.resolved_min_argument_count() != -1
-            || signature_record.resolved_type_predicate().is_some()
-            || signature_record.target().is_some()
-            || signature_record.mapper().is_some()
-            || signature_record.isolated_signature_type().is_some()
-            || signature_record.composite().is_some()
-            || ![
-                self.bootstrap.void_type,
-                self.bootstrap.any_type,
-                self.bootstrap.undefined_type,
-            ]
-            .contains(&return_type)
-            || self.store.signature_links(declaration)
-                != Some(&SignatureLinks {
-                    resolved_signature: ResolvedSignatureState::Resolved(signature),
-                    ..SignatureLinks::default()
-                })
+        if !projection.construct_signatures.is_empty()
+            || self
+                .store
+                .type_payload(owner_type)
+                .and_then(TypeRecord::symbol)
+                != Some(symbol)
+            || self
+                .store
+                .signature(callable.signature)
+                .and_then(|signature| signature.declaration())
+                != Some(declaration)
         {
             return Err(unsupported());
         }
-        Ok(ValidatedSingleCallable {
-            owner: owner_type,
-            signature,
-            parameters: Vec::new(),
-            rest_parameter: None,
-            min_argument_count: 0,
-            return_type: Some(return_type),
-            strict_variance_exempt: true,
-        })
+        Ok(callable.clone())
     }
 
     fn is_canonical_object_literal_property(
