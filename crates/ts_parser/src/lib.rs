@@ -903,6 +903,7 @@ struct Parser<'a> {
     next_function_is_async: bool,
     next_function_is_default: bool,
     type_parse_context: TypeParseContext,
+    arrow_return_type_context: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -959,6 +960,7 @@ impl<'a> Parser<'a> {
             next_function_is_async: false,
             next_function_is_default: false,
             type_parse_context: TypeParseContext::Normal,
+            arrow_return_type_context: false,
         }
     }
 
@@ -1983,7 +1985,13 @@ impl<'a> Parser<'a> {
                     self.bump();
                     continue;
                 }
+                // Binding names admit contextual keywords, including await and yield.
+                // `of` still terminates the declaration list.
+                let recover_contextual_binding = self.current.kind.is_keyword()
+                    && (self.current.kind as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
+                    && self.current.kind != SyntaxKind::OfKeyword;
                 if (self.current.kind == SyntaxKind::Identifier
+                    || recover_contextual_binding
                     || recover_private_after_invalid_indexed_access)
                     && !self
                         .current
@@ -2142,14 +2150,12 @@ impl<'a> Parser<'a> {
         self.next_function_is_default = false;
         let previous_await_context = self.await_context;
         let previous_yield_context = self.yield_context;
-        self.await_context = is_async;
         let start = self.consume().range.start;
         let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
             Some(self.consume_token_node())
         } else {
             None
         };
-        self.yield_context = asterisk_token.is_some();
         let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
         {
             Some(self.parse_identifier_name("Expected a function name."))
@@ -2160,6 +2166,8 @@ impl<'a> Parser<'a> {
             None
         };
         let type_parameters = self.parse_type_parameters();
+        self.await_context = is_async;
+        self.yield_context = asterisk_token.is_some();
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
         let body = if self.current.kind == SyntaxKind::OpenBraceToken {
@@ -2658,11 +2666,12 @@ impl<'a> Parser<'a> {
                 },
                 flags: ts_ast::ModifierFlags::default(),
             });
-            // Contextual and reserved words are still identifier names for recovery here.  In
-            // particular, consuming them keeps a malformed list such as `<implements,
-            // interface>` synchronized through its closing `>` instead of abandoning the
-            // declaration at the first keyword.
-            let name = self.parse_identifier_name("Expected a type parameter name.");
+            if !self.token_is_identifier_in_current_context(self.current.kind)
+                && self.current.kind.is_keyword()
+            {
+                self.error_code_at(self.current.range, 1359, [token_value(&self.current)]);
+            }
+            let name = self.parse_identifier_in_current_context("Expected a type parameter name.");
             let constraint = if self.current.kind == SyntaxKind::ExtendsKeyword {
                 self.bump();
                 Some(self.parse_type())
@@ -2741,6 +2750,14 @@ impl<'a> Parser<'a> {
         } else {
             None
         }
+    }
+
+    fn parse_arrow_return_type_annotation(&mut self) -> Option<NodeId> {
+        let previous_context = self.arrow_return_type_context;
+        self.arrow_return_type_context = true;
+        let return_type = self.parse_optional_type_annotation();
+        self.arrow_return_type_context = previous_context;
+        return_type
     }
 
     fn parse_class_declaration(&mut self) -> NodeId {
@@ -3528,10 +3545,10 @@ impl<'a> Parser<'a> {
         let previous_await_context = self.await_context;
         let previous_yield_context = self.yield_context;
         let previous_await_identifier_context = self.await_identifier_context;
+        let type_parameters = self.parse_type_parameters();
         self.await_context = false;
         self.yield_context = false;
         self.await_identifier_context = false;
-        let type_parameters = self.parse_type_parameters();
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
         let fallback_end = return_type.map_or(parameters.range.end, |id| self.node_end(id));
@@ -4090,7 +4107,7 @@ impl<'a> Parser<'a> {
 
     fn parse_type_alias_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = self.parse_identifier("Expected a type alias name.");
+        let name = self.parse_identifier_in_current_context("Expected a type alias name.");
         let type_parameters = self.parse_type_parameters();
         let missing_type_anchor = if self.current.kind == SyntaxKind::EqualsToken {
             let equals = self.consume();
@@ -5665,13 +5682,21 @@ impl<'a> Parser<'a> {
         let export_token = self.consume();
         let start = export_token.range.start;
         let next = self.next_token_kind();
+        if self.current.kind == SyntaxKind::TypeKeyword
+            && !matches!(next, SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken)
+            && self.next_token_preceded_by_line_break()
+        {
+            // A line break before the name ends export/type-alias lookahead.
+            self.error_code_at(export_token.range, 1128, []);
+            return self.parse_expression_statement();
+        }
         let invalid_contextual_declaration_name = match self.current.kind {
             SyntaxKind::InterfaceKeyword | SyntaxKind::NamespaceKeyword => {
                 !is_module_name_token(next)
             }
             SyntaxKind::TypeKeyword => {
                 !matches!(next, SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken)
-                    && !is_module_name_token(next)
+                    && !self.token_is_identifier_in_current_context(next)
             }
             SyntaxKind::ModuleKeyword => {
                 next != SyntaxKind::StringLiteral && !is_module_name_token(next)
@@ -5727,10 +5752,11 @@ impl<'a> Parser<'a> {
             self.attach_modifiers(declaration, import_modifiers, start);
             return declaration;
         }
+        // Go's export-modifier lookahead excludes `as`, `{`, and `*`.
         let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
             && matches!(
                 self.next_token_kind(),
-                SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken
+                SyntaxKind::AsKeyword | SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken
             );
         if is_type_only {
             self.bump();
@@ -5783,7 +5809,7 @@ impl<'a> Parser<'a> {
                 &[expression],
             );
         }
-        if self.current.kind == SyntaxKind::AsKeyword {
+        if self.current.kind == SyntaxKind::AsKeyword && !is_type_only {
             self.bump();
             self.expect_and_bump(
                 SyntaxKind::NamespaceKeyword,
@@ -5850,7 +5876,9 @@ impl<'a> Parser<'a> {
                 &[expression],
             );
         }
-        let export_clause = if self.current.kind == SyntaxKind::OpenBraceToken {
+        let export_clause = if self.current.kind == SyntaxKind::OpenBraceToken
+            || (is_type_only && self.current.kind != SyntaxKind::AsteriskToken)
+        {
             Some(self.parse_named_exports())
         } else if self.current.kind == SyntaxKind::AsteriskToken {
             let star_start = self.consume().range.start;
@@ -5904,7 +5932,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_named_exports(&mut self) -> NodeId {
-        let start = self.consume().range.start;
+        let start = self.current.range.start;
+        if self.current.kind != SyntaxKind::OpenBraceToken {
+            self.error_current("Expected '{'.");
+            return self.missing_named_exports(start);
+        }
+        self.bump();
         let mut elements = Vec::new();
         let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
@@ -5971,6 +6004,23 @@ impl<'a> Parser<'a> {
                 facts: 0,
             })),
             &elements,
+        )
+    }
+
+    fn missing_named_exports(&mut self, position: TextPos) -> NodeId {
+        self.alloc_node_with_flags(
+            SyntaxKind::NamedExports,
+            NODE_FLAG_HAS_ERROR,
+            TextRange::new(position, position),
+            NodeData::NamedExports(Box::new(NamedExportsData {
+                elements: NodeList {
+                    range: TextRange::new(position, position),
+                    nodes: Vec::new(),
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &[],
         )
     }
 
@@ -6212,46 +6262,10 @@ impl<'a> Parser<'a> {
         let result = if first.kind == SyntaxKind::Identifier {
             self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken
         } else if first.kind == SyntaxKind::LessThanToken {
-            let mut angle_depth = 1_u32;
-            let mut token = self.scanner.scan();
-            while token.kind != SyntaxKind::EndOfFile && angle_depth != 0 {
-                match token.kind {
-                    SyntaxKind::LessThanToken => angle_depth += 1,
-                    SyntaxKind::GreaterThanToken => angle_depth -= 1,
-                    _ => {}
-                }
-                if angle_depth != 0 {
-                    token = self.scanner.scan();
-                }
-            }
-            if angle_depth != 0 || self.scanner.scan().kind != SyntaxKind::OpenParenToken {
-                false
-            } else {
-                let mut parenthesis_depth = 1_u32;
-                token = self.scanner.scan();
-                while token.kind != SyntaxKind::EndOfFile && parenthesis_depth != 0 {
-                    match token.kind {
-                        SyntaxKind::OpenParenToken => parenthesis_depth += 1,
-                        SyntaxKind::CloseParenToken => parenthesis_depth -= 1,
-                        _ => {}
-                    }
-                    if parenthesis_depth != 0 {
-                        token = self.scanner.scan();
-                    }
-                }
-                token = self.scanner.scan();
-                if token.kind == SyntaxKind::ColonToken {
-                    while !matches!(
-                        token.kind,
-                        SyntaxKind::EqualsGreaterThanToken
-                            | SyntaxKind::SemicolonToken
-                            | SyntaxKind::EndOfFile
-                    ) {
-                        token = self.scanner.scan();
-                    }
-                }
-                token.kind == SyntaxKind::EqualsGreaterThanToken
-            }
+            !first
+                .flags
+                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                && self.next_is_generic_arrow_function(first.range.start)
         } else if first.kind == SyntaxKind::OpenParenToken {
             let mut depth = 1_u32;
             let mut token = self.scanner.scan();
@@ -6298,15 +6312,38 @@ impl<'a> Parser<'a> {
 
     fn is_generic_arrow_function(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
+        let result = self.next_is_generic_arrow_function(self.current.range.start);
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn next_is_generic_arrow_function(&mut self, start: TextPos) -> bool {
         let mut token = self.scanner.scan();
-        if token.kind != SyntaxKind::Identifier {
-            self.scanner.rewind(checkpoint);
+        if !self.token_is_identifier_in_current_context(token.kind)
+            && token.kind != SyntaxKind::ConstKeyword
+        {
             return false;
         }
 
+        if self.language_variant == LanguageVariant::Jsx {
+            // A disambiguated TSX prefix also selects an arrow during error recovery.
+            if token.kind == SyntaxKind::ConstKeyword {
+                self.scanner.scan();
+            }
+            return match self.scanner.scan().kind {
+                SyntaxKind::ExtendsKeyword => !matches!(
+                    self.scanner.scan().kind,
+                    SyntaxKind::EqualsToken | SyntaxKind::GreaterThanToken | SyntaxKind::SlashToken
+                ),
+                SyntaxKind::CommaToken | SyntaxKind::EqualsToken => true,
+                _ => false,
+            };
+        }
+
+        let mut template_brace_depths = Vec::new();
         let mut angle_depth = 1_u32;
         while token.kind != SyntaxKind::EndOfFile {
-            token = self.scanner.scan();
+            token = self.scan_generic_arrow_token(&mut template_brace_depths);
             match token.kind {
                 SyntaxKind::LessThanToken => angle_depth += 1,
                 SyntaxKind::GreaterThanToken => {
@@ -6318,13 +6355,15 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        if angle_depth != 0 || self.scanner.scan().kind != SyntaxKind::OpenParenToken {
-            self.scanner.rewind(checkpoint);
+        if angle_depth != 0
+            || !self.generic_arrow_type_parameters_are_complete(start, token.range.end)
+            || self.scanner.scan().kind != SyntaxKind::OpenParenToken
+        {
             return false;
         }
 
         let mut parenthesis_depth = 1_u32;
-        token = self.scanner.scan();
+        token = self.scan_generic_arrow_token(&mut template_brace_depths);
         while token.kind != SyntaxKind::EndOfFile && parenthesis_depth != 0 {
             match token.kind {
                 SyntaxKind::OpenParenToken => parenthesis_depth += 1,
@@ -6332,53 +6371,158 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             if parenthesis_depth != 0 {
-                token = self.scanner.scan();
+                token = self.scan_generic_arrow_token(&mut template_brace_depths);
             }
         }
         if parenthesis_depth != 0 {
-            self.scanner.rewind(checkpoint);
             return false;
         }
 
-        token = self.scanner.scan();
-        let result = if token.kind == SyntaxKind::EqualsGreaterThanToken {
+        token = self.scan_generic_arrow_token(&mut template_brace_depths);
+        if matches!(
+            token.kind,
+            SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
+        ) {
             true
         } else if token.kind == SyntaxKind::ColonToken {
-            let mut delimiter_depth = 0_i32;
-            loop {
-                token = self.scanner.scan();
-                match token.kind {
-                    SyntaxKind::OpenParenToken
-                    | SyntaxKind::OpenBracketToken
-                    | SyntaxKind::OpenBraceToken
-                    | SyntaxKind::LessThanToken => delimiter_depth += 1,
-                    SyntaxKind::CloseParenToken
-                    | SyntaxKind::CloseBracketToken
-                    | SyntaxKind::CloseBraceToken
-                    | SyntaxKind::GreaterThanToken => delimiter_depth -= 1,
-                    SyntaxKind::GreaterThanGreaterThanToken => delimiter_depth -= 2,
-                    SyntaxKind::GreaterThanGreaterThanGreaterThanToken => delimiter_depth -= 3,
-                    SyntaxKind::EqualsGreaterThanToken if delimiter_depth == 0 => break true,
-                    SyntaxKind::EndOfFile => break false,
-                    SyntaxKind::SemicolonToken if delimiter_depth == 0 => break false,
-                    _ => {}
-                }
-            }
+            self.next_is_generic_arrow_after_return_type(
+                token.range.end,
+                &mut template_brace_depths,
+            )
         } else {
             false
+        }
+    }
+
+    fn next_is_generic_arrow_after_return_type(
+        &mut self,
+        start: TextPos,
+        template_brace_depths: &mut Vec<u32>,
+    ) -> bool {
+        let mut token = self.scan_generic_arrow_token(template_brace_depths);
+        if token.kind == SyntaxKind::EqualsGreaterThanToken {
+            return false;
+        }
+        // The type probe handles angle brackets, including a missing closing token.
+        let mut group_depth = 0_i32;
+        loop {
+            match token.kind {
+                SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
+                    if group_depth == 0
+                        && template_brace_depths.is_empty()
+                        && self.generic_arrow_return_type_ends_at(start, &token) =>
+                {
+                    return true;
+                }
+                SyntaxKind::OpenParenToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::OpenBraceToken => group_depth += 1,
+                SyntaxKind::CloseParenToken
+                | SyntaxKind::CloseBracketToken
+                | SyntaxKind::CloseBraceToken => group_depth -= 1,
+                SyntaxKind::EndOfFile => return false,
+                SyntaxKind::SemicolonToken if group_depth == 0 => return false,
+                _ => {}
+            }
+            token = self.scan_generic_arrow_token(template_brace_depths);
+        }
+    }
+
+    fn generic_arrow_return_type_ends_at(&self, start: TextPos, token: &Token<'_>) -> bool {
+        let Some(position) = token.range.start.get().checked_sub(start.get()) else {
+            return false;
         };
-        self.scanner.rewind(checkpoint);
-        result
+        // Include the candidate token so the type grammar decides whether it belongs to the type.
+        let Some(mut probe) = self.generic_arrow_lookahead_parser(start, token.range.end) else {
+            return false;
+        };
+        let type_node = probe.parse_type();
+        probe.current.kind == token.kind
+            && probe.current.range.start.get() == position
+            && !probe.generic_arrow_return_type_has_blocking_error(type_node)
+    }
+
+    fn generic_arrow_return_type_has_blocking_error(&self, type_node: NodeId) -> bool {
+        match &self.arena.get(type_node).unwrap().data {
+            NodeData::TypeReferenceNode(reference) => {
+                self.node_start(reference.type_name) == self.node_end(reference.type_name)
+            }
+            NodeData::FunctionTypeNode(function) => {
+                function.parameters.range.start == function.parameters.range.end
+                    || function.type_.is_none_or(|return_type| {
+                        self.generic_arrow_return_type_has_blocking_error(return_type)
+                    })
+            }
+            NodeData::ConstructorTypeNode(constructor) => {
+                constructor.parameters.range.start == constructor.parameters.range.end
+                    || constructor.type_.is_none_or(|return_type| {
+                        self.generic_arrow_return_type_has_blocking_error(return_type)
+                    })
+            }
+            NodeData::ParenthesizedTypeNode(parenthesized) => {
+                self.generic_arrow_return_type_has_blocking_error(parenthesized.type_)
+            }
+            _ => false,
+        }
+    }
+
+    fn generic_arrow_type_parameters_are_complete(&self, start: TextPos, end: TextPos) -> bool {
+        let Some(mut probe) = self.generic_arrow_lookahead_parser(start, end) else {
+            return false;
+        };
+        probe.parse_type_parameters().is_some() && probe.current.kind == SyntaxKind::EndOfFile
+    }
+
+    fn generic_arrow_lookahead_parser(&self, start: TextPos, end: TextPos) -> Option<Parser<'_>> {
+        let source = self
+            .arena
+            .source_text()?
+            .get(start.get() as usize..end.get() as usize)?;
+        // The bounded probe has its own arena, scanner, and diagnostics.
+        let mut probe =
+            Parser::new_with_context(source, self.language_variant, self.javascript_file, false);
+        probe.await_context = self.await_context;
+        probe.yield_context = self.yield_context;
+        probe.await_identifier_context = self.await_identifier_context;
+        probe.disallow_in = self.disallow_in;
+        probe.type_parse_context = self.type_parse_context;
+        probe.arrow_return_type_context = self.arrow_return_type_context;
+        Some(probe)
+    }
+
+    fn scan_generic_arrow_token(&mut self, template_brace_depths: &mut Vec<u32>) -> Token<'a> {
+        let mut token = self.scanner.scan();
+        match token.kind {
+            SyntaxKind::TemplateHead => template_brace_depths.push(0),
+            SyntaxKind::OpenBraceToken => {
+                if let Some(depth) = template_brace_depths.last_mut() {
+                    *depth += 1;
+                }
+            }
+            SyntaxKind::CloseBraceToken => {
+                if let Some(depth) = template_brace_depths.last_mut() {
+                    if *depth == 0 {
+                        // A substitution ends here. Its following text is not signature syntax.
+                        token = self.scanner.rescan_template_token();
+                        if token.kind == SyntaxKind::TemplateTail {
+                            template_brace_depths.pop();
+                        }
+                    } else {
+                        *depth -= 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        token
     }
 
     fn parse_generic_arrow_function(&mut self) -> NodeId {
         let start = self.current.range.start;
         let type_parameters = self.parse_type_parameters();
         let parameters = self.parse_parameter_list();
-        let return_type = self.parse_optional_type_annotation();
-        let arrow =
-            self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = self.parse_arrow_function_body_in_await_context(false);
+        let return_type = self.parse_arrow_return_type_annotation();
+        let (arrow, body) = self.parse_arrow_function_token_and_body(false);
         let mut children = Vec::new();
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -6412,8 +6556,8 @@ impl<'a> Parser<'a> {
         let async_modifier = self.consume_token_node();
         let start = self.node_start(async_modifier);
         let previous_await_context = self.await_context;
-        self.await_context = true;
         let type_parameters = self.parse_type_parameters();
+        self.await_context = true;
         let parameters = if self.current.kind == SyntaxKind::OpenParenToken {
             self.parse_parameter_list()
         } else {
@@ -6440,10 +6584,8 @@ impl<'a> Parser<'a> {
             }
         };
         self.await_context = previous_await_context;
-        let return_type = self.parse_optional_type_annotation();
-        let arrow =
-            self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = self.parse_arrow_function_body_in_await_context(true);
+        let return_type = self.parse_arrow_return_type_annotation();
+        let (arrow, body) = self.parse_arrow_function_token_and_body(true);
         let mut children = vec![async_modifier];
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -6881,7 +7023,12 @@ impl<'a> Parser<'a> {
                         &[expression],
                     );
                 }
-                SyntaxKind::AsKeyword | SyntaxKind::SatisfiesKeyword => {
+                SyntaxKind::AsKeyword | SyntaxKind::SatisfiesKeyword
+                    if !self
+                        .current
+                        .flags
+                        .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK) =>
+                {
                     let kind = self.consume().kind;
                     let previous_context = self.type_parse_context;
                     self.type_parse_context = TypeParseContext::ExpressionCast;
@@ -7413,7 +7560,12 @@ impl<'a> Parser<'a> {
         let checkpoint = self.scanner.mark();
         let mut depth = 1_u32;
         let mut token = self.scanner.scan();
-        if token.kind == SyntaxKind::OpenParenToken {
+        // These tokens start a nested type, not a parameter. An arrow after
+        // its closing parenthesis can belong to the outer signature.
+        if matches!(
+            token.kind,
+            SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken
+        ) {
             self.scanner.rewind(checkpoint);
             return false;
         }
@@ -7470,18 +7622,8 @@ impl<'a> Parser<'a> {
     fn parse_parenthesized_arrow_function(&mut self) -> NodeId {
         let start = self.current.range.start;
         let parameters = self.parse_parameter_list();
-        let return_type = self.parse_optional_type_annotation();
-        let has_body_token = matches!(
-            self.current.kind,
-            SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
-        );
-        let arrow =
-            self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = if has_body_token {
-            self.parse_arrow_function_body_in_await_context(false)
-        } else {
-            self.missing_identifier(self.current.range.start)
-        };
+        let return_type = self.parse_arrow_return_type_annotation();
+        let (arrow, body) = self.parse_arrow_function_token_and_body(false);
         let mut children = parameters.nodes.clone();
         children.extend(return_type);
         children.push(arrow);
@@ -7558,6 +7700,37 @@ impl<'a> Parser<'a> {
             })),
             &[parameter, arrow, body],
         )
+    }
+
+    fn parse_arrow_function_token_and_body(&mut self, await_context: bool) -> (NodeId, NodeId) {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
+        ) {
+            let arrow = self
+                .parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
+            let body = self.parse_arrow_function_body_in_await_context(await_context);
+            return (arrow, body);
+        }
+
+        // Recovery uses the enclosing identifier context and puts empty nodes
+        // before the next token's leading trivia.
+        let position = self.current.full_start;
+        self.error_current("Expected '=>'.");
+        let arrow = self.alloc_node_with_flags(
+            SyntaxKind::EqualsGreaterThanToken,
+            NODE_FLAG_HAS_ERROR,
+            TextRange::new(position, position),
+            NodeData::Token(Box::new(TokenData)),
+            &[],
+        );
+        let body = if self.token_is_identifier_in_current_context(self.current.kind) {
+            self.parse_identifier_name("Expected an identifier.")
+        } else {
+            self.error_current("Expected an identifier.");
+            self.missing_identifier(position)
+        };
+        (arrow, body)
     }
 
     fn parse_arrow_function_body(&mut self) -> NodeId {
@@ -8029,9 +8202,9 @@ impl<'a> Parser<'a> {
             ) {
                 let previous_await_context = self.await_context;
                 let previous_yield_context = self.yield_context;
+                let type_parameters = self.parse_type_parameters();
                 self.await_context = is_async_method;
                 self.yield_context = asterisk_token.is_some();
-                let type_parameters = self.parse_type_parameters();
                 let parameters = self.parse_parameter_list();
                 let return_type = self.parse_optional_type_annotation();
                 let body = if self.current.kind == SyntaxKind::OpenBraceToken {
@@ -9187,14 +9360,14 @@ impl<'a> Parser<'a> {
         self.next_function_is_async = false;
         let previous_await_context = self.await_context;
         let previous_yield_context = self.yield_context;
-        self.await_context = is_async;
         let start = self.consume().range.start;
         let asterisk_token =
             (self.current.kind == SyntaxKind::AsteriskToken).then(|| self.consume_token_node());
-        self.yield_context = asterisk_token.is_some();
         let name = (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
             .then(|| self.parse_identifier_name("Expected a function name."));
         let type_parameters = self.parse_type_parameters();
+        self.await_context = is_async;
+        self.yield_context = asterisk_token.is_some();
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
         let body = if self.current.kind == SyntaxKind::OpenBraceToken {
@@ -9292,7 +9465,30 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> NodeId {
-        if self.is_type_predicate() {
+        // Ordinary predicate names keep the enclosing value context.
+        if !matches!(
+            self.current.kind,
+            SyntaxKind::AssertsKeyword | SyntaxKind::ThisKeyword
+        ) && self.is_type_predicate()
+        {
+            return self.parse_type_predicate();
+        }
+        let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
+        self.await_context = false;
+        self.yield_context = false;
+        let type_node = self.parse_type_worker();
+        self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
+        type_node
+    }
+
+    fn parse_type_worker(&mut self) -> NodeId {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::AssertsKeyword | SyntaxKind::ThisKeyword
+        ) && self.is_type_predicate()
+        {
             return self.parse_type_predicate();
         }
         let check_type = self.parse_union_type();
@@ -9710,17 +9906,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_type_reference_name(&mut self, message: &str) -> NodeId {
+        if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword() {
+            return self.parse_identifier_name(message);
+        }
+        // Missing types must stay inside arrows that end before the next token's trivia.
+        let position = if self.arrow_return_type_context {
+            self.current.full_start
+        } else {
+            self.current.range.start
+        };
+        self.error_current(message);
+        self.missing_identifier(position)
+    }
+
     fn parse_type_reference(&mut self) -> NodeId {
-        let start = self.current.range.start;
-        let mut type_name =
-            if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword() {
-                self.parse_identifier_name("Expected a type name.")
-            } else {
-                self.parse_identifier("Expected a type name.")
-            };
+        let mut type_name = self.parse_type_reference_name("Expected a type name.");
+        let start = self.node_start(type_name);
         while self.current.kind == SyntaxKind::DotToken {
             self.bump();
-            let right = self.parse_identifier_name("Expected an identifier after '.'.");
+            let right = self.parse_type_reference_name("Expected an identifier after '.'.");
             type_name = self.alloc_node(
                 SyntaxKind::QualifiedName,
                 TextRange::new(self.node_start(type_name), self.node_end(right)),
@@ -10883,6 +11088,9 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
     };
     Some((precedence, right_associative))
 }
+
+#[cfg(test)]
+mod type_context_tests;
 
 #[cfg(test)]
 mod tests {
