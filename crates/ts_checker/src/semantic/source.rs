@@ -28814,7 +28814,14 @@ fn check_source_selected_method_property(
             | TypeFlags::BIG_INT_LIKE
             | TypeFlags::ES_SYMBOL_LIKE,
     );
+    let constructed_interface = matches!(
+        &plan.receiver.unparenthesized().kind,
+        PlannedExpressionKind::New(_)
+    ) && record.object_flags().contains(ObjectFlags::INTERFACE)
+        && matches!(record.data(), TypeData::Interface(interface)
+            if interface.all_type_parameters.as_ref().is_none_or(Vec::is_empty));
     if !(scalar
+        || constructed_interface
         || source_is_global_object_factory_method(host, plan.node)
             && matches!(record.data(), TypeData::Interface(_))
         || record.flags().intersects(TypeFlags::OBJECT)
