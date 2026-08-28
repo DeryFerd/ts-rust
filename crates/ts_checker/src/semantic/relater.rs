@@ -7512,11 +7512,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && target_flags.intersects(TypeFlags::OBJECT)
             && configured_array_concat_reference_targets(self, global_types, source, target)?
                 .is_some();
-        let supported_apparent_primitive_relation = relation != RelationKind::Identity
+        let supported_apparent_relation = relation != RelationKind::Identity
             && target_flags.intersects(TypeFlags::OBJECT)
-            && global_types
-                .and_then(|global_types| global_types.apparent_primitive_type(source_flags))
-                .is_some();
+            && (source_flags.intersects(TypeFlags::UNKNOWN)
+                || global_types
+                    .and_then(|global_types| global_types.apparent_primitive_type(source_flags))
+                    .is_some());
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && !supported_array_relation
@@ -7555,7 +7556,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 || supported_branded_conditional_relation
                 || supported_array_relation
                 || supported_array_concat_relation
-                || supported_apparent_primitive_relation
+                || supported_apparent_relation
             {
                 let mut session = RelaterSession::new_with_global_types_and_options(
                     self,
@@ -7575,7 +7576,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 return if supported_array_relation
                     || supported_tuple_array_relation
                     || supported_array_concat_relation
-                    || supported_apparent_primitive_relation
+                    || supported_apparent_relation
                     || supported_branded_conditional_relation
                 {
                     Ok(session.finish_without_specialized_root_cache(result))
