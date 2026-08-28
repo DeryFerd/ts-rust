@@ -5,12 +5,13 @@
 //! references. Artifact walkers normally visit the identifier inside those
 //! nodes, so these queries preserve the existing graph instead of constructing
 //! replacement symbols or types.
+//! Missing type names use the store's symbol-only unresolved-name cache.
 
 use std::collections::HashSet;
 
 use ts_ast::{FileId, Node, NodeArena, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, EscapedNameRef,
+    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, EscapedName, EscapedNameRef,
     InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_jsnum::PseudoBigInt;
@@ -192,6 +193,18 @@ enum LocationParent {
     QualifiedName(NodeRef),
 }
 
+struct ArtifactTypeName {
+    reference: NodeRef,
+    full_name: NodeRef,
+    parts: Vec<ArtifactTypeNamePart>,
+}
+
+struct ArtifactTypeNamePart {
+    entity: NodeRef,
+    identifier: NodeRef,
+    text: EscapedName,
+}
+
 impl CanonicalCheckerContext<'_> {
     /// Returns the canonical semantic type for one exact Program node.
     ///
@@ -340,6 +353,7 @@ impl CanonicalCheckerContext<'_> {
     /// A successful `None` represents a supported location with no symbol,
     /// such as a literal or a missing property. Imported names retain their
     /// alias identity rather than silently returning their target.
+    /// Type names do not demand their type, arguments, or source diagnostics.
     ///
     /// # Errors
     ///
@@ -349,6 +363,9 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        if let Some(symbol) = self.type_name_artifact_symbol(node)? {
+            return Ok(symbol);
+        }
         self.prepare_artifact_location(node)?;
 
         if matches!(
@@ -2401,6 +2418,324 @@ impl CanonicalCheckerContext<'_> {
         self.lexical_artifact_symbol(node, SymbolFlags::NAMESPACE | SymbolFlags::ALIAS)
     }
 
+    /// A type-name query does not need its type, arguments, or a source-file check.
+    fn type_name_artifact_symbol(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<Option<SemanticSymbolId>>, CanonicalArtifactQueryError> {
+        let Some(ArtifactTypeName {
+            reference,
+            full_name,
+            parts,
+        }) = self.type_name_artifact_path(node)?
+        else {
+            return Ok(None);
+        };
+        let name = parts.last().expect("a type name has an identifier").entity;
+        for part in &parts {
+            for cached_node in [part.entity, part.identifier] {
+                if self
+                    .store()
+                    .symbol_node_links(cached_node)
+                    .is_some_and(|links| links.resolved_symbol.is_some())
+                    && self.cached_artifact_symbol(cached_node)?.is_none()
+                    && (cached_node == part.entity || cached_node == node)
+                {
+                    return Ok(Some(None));
+                }
+            }
+        }
+        if name == full_name
+            && self
+                .store()
+                .symbol_node_links(reference)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+            && self.cached_artifact_symbol(reference)?.is_none()
+        {
+            return Ok(Some(None));
+        }
+        if parts
+            .iter()
+            .any(|part| part.text.as_utf8().is_none_or(str::is_empty))
+        {
+            return Ok(Some(None));
+        }
+        let mut symbols = Vec::with_capacity(parts.len());
+        let mut symbol = None;
+        for (index, part) in parts.iter().enumerate() {
+            let meaning = if part.entity == full_name {
+                SymbolFlags::TYPE
+            } else {
+                SymbolFlags::NAMESPACE
+            };
+            symbol = if index == 0 {
+                self.lexical_artifact_symbol(part.entity, meaning | SymbolFlags::ALIAS)?
+            } else if symbol.is_some() {
+                // Resolve namespace aliases, then read the actual bindings without node caches.
+                self.qualified_artifact_symbol(part.entity)?;
+                self.name_resolver_host(self.options().name_resolution)
+                    .map_err(DeclaredTypeError::from)?
+                    .resolve_entity_name(part.entity, meaning | SymbolFlags::ALIAS)
+                    .map_err(DeclaredTypeError::from)?
+            } else {
+                None
+            };
+            if let Some(candidate) = symbol {
+                let record = self.store().symbol(candidate).ok_or(
+                    CanonicalArtifactQueryError::InvalidSymbol {
+                        node: part.entity,
+                        symbol: candidate,
+                    },
+                )?;
+                if !record.flags().intersects(meaning)
+                    && !self.get_symbol_flags(candidate)?.flags.intersects(meaning)
+                {
+                    symbol = None;
+                }
+            }
+            symbols.push(symbol);
+        }
+        for (part, expected) in parts.iter().zip(symbols) {
+            for cached_node in [part.entity, part.identifier] {
+                self.validate_type_name_artifact_symbol_cache(cached_node, expected)?;
+                if expected.is_none()
+                    && let Some(links) = self.store().type_node_links(cached_node)
+                    && (links.resolved_type.is_some() || links.outer_type_parameters.is_some())
+                {
+                    return Err(DeclaredTypeError::TypeNodeUnavailable(
+                        super::type_nodes::TypeNodeUnavailable::InvalidTypeReference(reference),
+                    )
+                    .into());
+                }
+            }
+        }
+        if name == full_name {
+            self.validate_type_name_artifact_symbol_cache(reference, symbol)?;
+        }
+        if symbol.is_some() {
+            return Ok(Some(symbol));
+        }
+        if name == full_name
+            && let Some(links) = self.store().type_node_links(reference)
+            && (links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|type_| {
+                    !self.cached_root_missing_type_name_is_exact(reference, type_)
+                }))
+        {
+            return Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::type_nodes::TypeNodeUnavailable::InvalidTypeReference(reference),
+            )
+            .into());
+        }
+        let names = parts.into_iter().map(|part| part.text).collect::<Vec<_>>();
+        self.artifact_unresolved_type_symbol(&names)
+            .map(|symbol| Some(Some(symbol)))
+            .map_err(|error| match error {
+                super::store::UnresolvedTypeError::InvalidSymbol(symbol) => {
+                    CanonicalArtifactQueryError::InvalidSymbol {
+                        node: reference,
+                        symbol,
+                    }
+                }
+                _ => DeclaredTypeError::TypeNodeUnavailable(
+                    super::type_nodes::TypeNodeUnavailable::InvalidTypeReference(reference),
+                )
+                .into(),
+            })
+    }
+
+    fn validate_type_name_artifact_symbol_cache(
+        &self,
+        node: NodeRef,
+        expected: Option<SemanticSymbolId>,
+    ) -> Result<(), CanonicalArtifactQueryError> {
+        if let Some(cached) = self.cached_artifact_symbol(node)?
+            && Some(cached) != expected
+            && !expected.is_some_and(|alias| {
+                self.store().symbol(alias).is_some_and(|record| record.flags().contains(SymbolFlags::ALIAS))
+                    && matches!(self.store().alias_symbol_links(alias).map(|links| links.alias_target),
+                        Some(AliasTargetState::Resolved(target)) if self.store().get_merged_symbol(target) == Some(cached))
+            })
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol: cached });
+        }
+        Ok(())
+    }
+
+    /// Root still uses its intrinsic error type for the admitted missing-reference cases.
+    fn cached_root_missing_type_name_is_exact(&self, reference: NodeRef, type_: TypeId) -> bool {
+        if self
+            .store()
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.error_type != type_)
+        {
+            return false;
+        }
+        if self
+            .store()
+            .source_recovered_unresolved_type_reference_is_exact(reference, type_)
+        {
+            return true;
+        }
+        let Ok((arena, bound, record)) = self.validated_artifact_node(reference) else {
+            return false;
+        };
+        let NodeData::TypeReferenceNode(data) = &record.data else {
+            return false;
+        };
+        if data.type_arguments.is_some() {
+            return false;
+        }
+        let valid_name = match arena.get(data.type_name).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => identifier.flow_node.is_none(),
+            Some(NodeData::QualifiedName(qualified)) => [qualified.left, qualified.right].into_iter().all(|name| {
+                matches!(arena.get(name).map(|node| &node.data), Some(NodeData::Identifier(identifier)) if identifier.flow_node.is_none())
+            }),
+            _ => false,
+        };
+        if !valid_name {
+            return false;
+        }
+        let Some(declaration_id) = record.parent else {
+            return false;
+        };
+        let declaration = NodeRef::new(reference.arena, reference.file, declaration_id);
+        let Some(declaration_record) = arena.get(declaration_id) else {
+            return false;
+        };
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return false;
+        };
+        if variable.type_ != Some(reference.node) {
+            return false;
+        }
+        let Some(list_id) = declaration_record.parent else {
+            return false;
+        };
+        let Some(list) = arena.get(list_id) else {
+            return false;
+        };
+        let Some(statement_id) = list.parent else {
+            return false;
+        };
+        let Some(statement) = arena.get(statement_id) else {
+            return false;
+        };
+        declaration_record.kind == SyntaxKind::VariableDeclaration
+            && list.kind == SyntaxKind::VariableDeclarationList
+            && statement.kind == SyntaxKind::VariableStatement
+            && statement.parent == Some(bound.source_file().node)
+            && bound
+                .source_facts()
+                .is_some_and(|facts| !facts.is_javascript_file() && !facts.is_declaration_file())
+            && bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store().get_merged_symbol(symbol))
+                .and_then(|symbol| self.store().symbol(symbol))
+                .is_some_and(|symbol| symbol.flags().intersects(SymbolFlags::VARIABLE))
+    }
+
+    fn type_name_artifact_path(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<ArtifactTypeName>, CanonicalArtifactQueryError> {
+        let (arena, _, record) = self.validated_artifact_node(node)?;
+        if !matches!(
+            record.data,
+            NodeData::Identifier(_) | NodeData::QualifiedName(_)
+        ) {
+            return Ok(None);
+        }
+        let mut name = node;
+        let mut current = node;
+        let mut remaining = arena.len();
+        let reference = loop {
+            if remaining == 0 {
+                return Err(CanonicalArtifactQueryError::ForeignNode(current));
+            }
+            remaining -= 1;
+            let (_, _, record) = self.validated_artifact_node(current)?;
+            let Some(parent) = record.parent else {
+                return Ok(None);
+            };
+            let parent = NodeRef::new(node.arena, node.file, parent);
+            let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+            match &parent_record.data {
+                NodeData::QualifiedName(qualified) => {
+                    if qualified.left != current.node && qualified.right != current.node {
+                        return Err(CanonicalArtifactQueryError::ForeignNode(current));
+                    }
+                    if current == node && qualified.right == node.node {
+                        name = parent;
+                    }
+                    current = parent;
+                }
+                NodeData::TypeReferenceNode(reference)
+                    if parent_record.kind == SyntaxKind::TypeReference =>
+                {
+                    if reference.type_name != current.node {
+                        return Err(CanonicalArtifactQueryError::ForeignNode(current));
+                    }
+                    break parent;
+                }
+                NodeData::TypeReferenceNode(_) => {
+                    return Err(CanonicalArtifactQueryError::ForeignNode(parent));
+                }
+                _ => return Ok(None),
+            }
+        };
+        let full_name = current;
+        let mut parts = Vec::new();
+        loop {
+            if parts.len() >= arena.len() {
+                return Err(CanonicalArtifactQueryError::ForeignNode(current));
+            }
+            let (_, _, record) = self.validated_artifact_node(current)?;
+            match &record.data {
+                NodeData::Identifier(identifier) if record.kind == SyntaxKind::Identifier => {
+                    parts.push(ArtifactTypeNamePart {
+                        entity: current,
+                        identifier: current,
+                        text: EscapedName::source(&identifier.text),
+                    });
+                    break;
+                }
+                NodeData::QualifiedName(qualified) if record.kind == SyntaxKind::QualifiedName => {
+                    let left = NodeRef::new(node.arena, node.file, qualified.left);
+                    let right = NodeRef::new(node.arena, node.file, qualified.right);
+                    let (_, _, right_record) = self.validated_artifact_node(right)?;
+                    let NodeData::Identifier(identifier) = &right_record.data else {
+                        return Err(CanonicalArtifactQueryError::ForeignNode(right));
+                    };
+                    if right_record.kind != SyntaxKind::Identifier
+                        || right_record.parent != Some(current.node)
+                        || self.validated_artifact_node(left)?.2.parent != Some(current.node)
+                    {
+                        return Err(CanonicalArtifactQueryError::ForeignNode(current));
+                    }
+                    parts.push(ArtifactTypeNamePart {
+                        entity: current,
+                        identifier: right,
+                        text: EscapedName::source(&identifier.text),
+                    });
+                    current = left;
+                }
+                _ => return Err(CanonicalArtifactQueryError::ForeignNode(current)),
+            }
+        }
+        parts.reverse();
+        let end = parts
+            .iter()
+            .position(|part| part.entity == name)
+            .ok_or(CanonicalArtifactQueryError::ForeignNode(node))?;
+        parts.truncate(end + 1);
+        Ok(Some(ArtifactTypeName {
+            reference,
+            full_name,
+            parts,
+        }))
+    }
+
     fn uncached_artifact_reference_symbol(
         &self,
         node: NodeRef,
@@ -3557,6 +3892,10 @@ mod cold_merged_namespace_tests;
 
 #[cfg(test)]
 mod export_equals_final_invariant_tests;
+
+#[cfg(test)]
+#[path = "type_name_symbol_root_tests.rs"]
+mod type_name_symbol_root_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7886,17 +8225,26 @@ mod tests {
 
         for (name, left, right, text) in qualified {
             assert!(context.store().symbol_node_links(name).is_none());
+            let actual = context.get_symbol_at_location(name).unwrap();
             let expected = match text {
                 "Inner" => Some(inner),
                 "Shape" => Some(shape),
                 "Label" => Some(label),
-                "Missing" => None,
+                "Missing" => context
+                    .store()
+                    .unresolved_symbol_for_name_path(&[
+                        EscapedName::source("Outer"),
+                        EscapedName::source("Inner"),
+                        EscapedName::source("Missing"),
+                    ])
+                    .unwrap(),
                 _ => panic!("unexpected qualified member {text}"),
             };
             if text == "Inner" {
                 assert_eq!(context.get_symbol_at_location(left).unwrap(), Some(outer));
             }
-            assert_eq!(context.get_symbol_at_location(name).unwrap(), expected);
+            assert_eq!(actual, expected);
+            assert!(actual.is_some());
             assert_eq!(context.get_symbol_at_location(right).unwrap(), expected);
             assert!(context.store().symbol_node_links(name).is_none());
         }
@@ -8024,10 +8372,23 @@ mod tests {
             else {
                 unreachable!("qualified namespace members are identifiers")
             };
-            let expected = (identifier.text == "Item").then_some(item);
-
             assert_eq!(context.get_symbol_at_location(root).unwrap(), Some(alias));
-            assert_eq!(context.get_symbol_at_location(name).unwrap(), expected);
+            let actual = context.get_symbol_at_location(name).unwrap();
+            let expected = if identifier.text == "Item" {
+                Some(item)
+            } else {
+                let symbol = context
+                    .store()
+                    .unresolved_symbol_for_name_path(&[
+                        EscapedName::source("Types"),
+                        EscapedName::source("Missing"),
+                    ])
+                    .unwrap()
+                    .unwrap();
+                assert!(context.get_symbol_declarations(symbol).unwrap().is_empty());
+                Some(symbol)
+            };
+            assert_eq!(actual, expected);
             assert_eq!(context.get_symbol_at_location(member).unwrap(), expected);
         }
     }
@@ -8207,7 +8568,7 @@ mod tests {
         let importer = parse_source_file(concat!(
             "import { forwarded as local } from './target';\n",
             "import * as Types from './target';\n",
-            "declare const result: Types.Exposed;\n",
+            "declare const result: typeof Types.Exposed;\n",
         ));
         let target = parse_source_file(concat!(
             "declare const value: number;\n",

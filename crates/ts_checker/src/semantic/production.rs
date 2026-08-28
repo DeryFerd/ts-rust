@@ -1000,6 +1000,13 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             .map_err(SourceCheckError::from)
     }
 
+    pub(super) fn artifact_unresolved_type_symbol(
+        &mut self,
+        names: &[EscapedName],
+    ) -> Result<SemanticSymbolId, super::store::UnresolvedTypeError> {
+        self.store.get_or_create_unresolved_symbol(names)
+    }
+
     pub(super) fn artifact_type_reference_identity(
         &mut self,
         node: NodeRef,

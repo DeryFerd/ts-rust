@@ -132,6 +132,20 @@ struct CachedSignatureEntry {
     instantiated: SignatureId,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct UnresolvedSymbolKey {
+    parent: Option<SemanticSymbolId>,
+    name: EscapedName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UnresolvedTypeError {
+    MissingBootstrap,
+    InvalidName,
+    InvalidSymbol(SemanticSymbolId),
+    Capacity,
+}
+
 #[derive(Debug, Default)]
 struct RelationReadObservations {
     types: HashSet<TypeId>,
@@ -585,6 +599,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     /// Pinned checker `cachedSignatures`, keyed by generic target and the
     /// ordered type-argument hash.
     cached_signatures: HashMap<(SignatureId, CacheHashKey), CachedSignatureEntry>,
+    unresolved_symbols: HashMap<UnresolvedSymbolKey, SemanticSymbolId>,
+    unresolved_symbol_keys: HashMap<SemanticSymbolId, UnresolvedSymbolKey>,
     /// Pinned checker `propertiesTypes`, including its WIP unresolved-members
     /// discriminator and origin-preservation mode.
     properties_types: HashMap<PropertiesTypeCacheKey, TypeId>,
@@ -729,6 +745,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_overload_types_by_owner: HashMap::new(),
             source_overload_types_by_signature: HashMap::new(),
             cached_signatures: HashMap::new(),
+            unresolved_symbols: HashMap::new(),
+            unresolved_symbol_keys: HashMap::new(),
             properties_types: HashMap::new(),
             function_signature_return_annotations: HashMap::new(),
             callable_signature_parameter_types: HashMap::new(),
@@ -8042,6 +8060,161 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    fn validate_unresolved_symbol_request(
+        &self,
+        names: &[EscapedName],
+    ) -> Result<(), UnresolvedTypeError> {
+        if self.intrinsic_bootstrap.is_none() {
+            return Err(UnresolvedTypeError::MissingBootstrap);
+        }
+        if names.is_empty()
+            || names
+                .iter()
+                .any(|name| name.as_ref().is_internal() || name.as_utf8().is_none_or(str::is_empty))
+        {
+            return Err(UnresolvedTypeError::InvalidName);
+        }
+        Ok(())
+    }
+
+    fn unresolved_symbol_matches_key(
+        &self,
+        symbol: SemanticSymbolId,
+        key: &UnresolvedSymbolKey,
+    ) -> bool {
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let Some(record) = self.symbol(symbol) else {
+            return false;
+        };
+        self.unresolved_symbols.get(key) == Some(&symbol)
+            && self.unresolved_symbol_keys.get(&symbol) == Some(key)
+            && self.get_merged_symbol(symbol) == Some(symbol)
+            && record.flags() == SymbolFlags::TYPE_ALIAS | SymbolFlags::TRANSIENT
+            && record.check_flags() == CheckFlags::UNRESOLVED
+            && record.name() == key.name.as_ref()
+            && record.parent() == key.parent
+            && record.declarations().is_none()
+            && record.value_declaration().is_none()
+            && record.members().is_none()
+            && record.exports().is_none()
+            && record.export_symbol().is_none()
+            && self.type_alias_links(symbol)
+                == Some(&TypeAliasLinks {
+                    declared_type: Some(bootstrap.unresolved_type),
+                    ..TypeAliasLinks::default()
+                })
+    }
+
+    fn unresolved_path_prefix(
+        &self,
+        names: &[EscapedName],
+    ) -> Result<(Option<SemanticSymbolId>, usize), UnresolvedTypeError> {
+        let mut parent = None;
+        for (index, name) in names.iter().enumerate() {
+            let key = UnresolvedSymbolKey {
+                parent,
+                name: name.clone(),
+            };
+            let Some(symbol) = self.unresolved_symbols.get(&key).copied() else {
+                return Ok((parent, index));
+            };
+            if !self.unresolved_symbol_matches_key(symbol, &key) {
+                return Err(UnresolvedTypeError::InvalidSymbol(symbol));
+            }
+            parent = Some(symbol);
+        }
+        Ok((parent, names.len()))
+    }
+
+    /// Reads the exact symbol cache without allocating a type or repairing records.
+    pub(super) fn unresolved_symbol_for_name_path(
+        &self,
+        names: &[EscapedName],
+    ) -> Result<Option<SemanticSymbolId>, UnresolvedTypeError> {
+        self.validate_unresolved_symbol_request(names)?;
+        let (symbol, prefix) = self.unresolved_path_prefix(names)?;
+        Ok((prefix == names.len()).then_some(symbol).flatten())
+    }
+
+    /// Creates only the missing symbols after validating and reserving the full path.
+    pub(super) fn get_or_create_unresolved_symbol(
+        &mut self,
+        names: &[EscapedName],
+    ) -> Result<SemanticSymbolId, UnresolvedTypeError> {
+        if let Some(symbol) = self.unresolved_symbol_for_name_path(names)? {
+            return Ok(symbol);
+        }
+        let (mut parent, prefix) = self.unresolved_path_prefix(names)?;
+        let missing = names.len() - prefix;
+        if !self.try_reserve_checker_symbol_allocations(missing, 0)
+            || !self.links.type_alias.try_reserve(missing)
+            || self.unresolved_symbols.try_reserve(missing).is_err()
+            || self.unresolved_symbol_keys.try_reserve(missing).is_err()
+        {
+            return Err(UnresolvedTypeError::Capacity);
+        }
+        let unresolved = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .expect("validated symbol publication requires bootstrap")
+            .unresolved_type;
+        for name in &names[prefix..] {
+            let key = UnresolvedSymbolKey {
+                parent,
+                name: name.clone(),
+            };
+            let mut data = SymbolData::new(
+                SymbolFlags::TYPE_ALIAS | SymbolFlags::TRANSIENT,
+                name.clone(),
+            );
+            data.check_flags = CheckFlags::UNRESOLVED;
+            data.parent = parent;
+            let symbol = self
+                .alloc_symbol(data)
+                .expect("reserved unresolved symbol allocation must succeed");
+            assert!(self.set_type_alias_links(
+                symbol,
+                TypeAliasLinks {
+                    declared_type: Some(unresolved),
+                    ..TypeAliasLinks::default()
+                }
+            ));
+            assert!(
+                self.unresolved_symbols
+                    .insert(key.clone(), symbol)
+                    .is_none()
+            );
+            assert!(self.unresolved_symbol_keys.insert(symbol, key).is_none());
+            parent = Some(symbol);
+        }
+        Ok(parent.expect("a nonempty unresolved path has a symbol"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn authenticated_unresolved_symbol_chain(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<Vec<SemanticSymbolId>, UnresolvedTypeError> {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = Some(symbol);
+        while let Some(symbol) = current {
+            let key = self
+                .unresolved_symbol_keys
+                .get(&symbol)
+                .ok_or(UnresolvedTypeError::InvalidSymbol(symbol))?;
+            if !seen.insert(symbol) || !self.unresolved_symbol_matches_key(symbol, key) {
+                return Err(UnresolvedTypeError::InvalidSymbol(symbol));
+            }
+            chain.push(symbol);
+            current = key.parent;
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
     pub(super) fn record_source_callable_alias_resolution(
         &mut self,
         annotation: NodeRef,
