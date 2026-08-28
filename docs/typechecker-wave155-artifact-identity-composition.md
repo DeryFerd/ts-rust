@@ -88,3 +88,27 @@ observer nor the full artifact comparison has run on this combined source.
 The full corpus, modern projects, replay, performance, strict and generated-code
 checks, and the controlled upstream update remain required. This composition
 does not establish completion of the port.
+
+## Export-alias name check
+
+The next source is `7d6d539a`. Test commit `000f8783` was imported unchanged as
+`51379dd9`. The production commit adds only a requested-name comparison in
+`global_ambient_class_export_target` before its existing class proof.
+
+The reviewer identified the path by reading the source. If the global `Value`
+entry points to the real class `Other`, the old helper can prove `Other` under
+its unchanged `Other` entry without checking the requested name. The new check
+rejects that mismatch. Local lookup and the class proof stay unchanged.
+
+The original test checks healthy aliases, two rejected lookups, unchanged
+state, restoration, and a local class while the unused global entry is damaged.
+It is still queued on the original `e3ce5f70` review source in session `13003`.
+No runtime defect or successful repair is claimed before those tests complete.
+The root `72404` and `90172` sources are also unchanged.
+
+The earlier 29-check audit remains evidence for `41edaf0b`, not for this later
+alias-provider change. The new audit script is
+`target/wave156-audit-export-alias-name.mjs` in the primary checkout. It checks
+the exact three-line guard, both unchanged review files, and that no other
+file changed after `c6a47813`. Formatting and whitespace checks pass. The new
+worktree still has no queued Cargo job and no runtime result.
