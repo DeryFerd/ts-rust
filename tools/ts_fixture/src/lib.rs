@@ -2396,12 +2396,20 @@ fn run_fixed_variant_diagnostic_baselines(
 ///
 /// Returns an error when a case or baseline cannot be read, or when more than one error
 /// baseline matches the same case variant.
+/// Returns `InvalidInput` when semantic artifacts are requested without the
+/// canonical checker.
 #[allow(clippy::too_many_lines)]
 pub fn run_upstream_diagnostic_baselines(
     repository: &Path,
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
+    if options.semantic_artifacts && !options.canonical_checker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--semantic-artifacts requires --canonical-checker",
+        ));
+    }
     #[cfg(not(panic = "unwind"))]
     if options.canonical_checker {
         return Err(canonical_checker_unwind_isolation_error());

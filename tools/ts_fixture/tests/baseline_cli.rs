@@ -1289,6 +1289,100 @@ fn review_artifact_library_api_never_credits_unreached_requested_artifacts() {
 }
 
 #[test]
+fn artifact_library_mode_guard_matches_cli_before_repository_or_manifest_reads() {
+    for fixed_manifest in [false, true] {
+        let artifacts = TestArtifacts::new();
+        let repository = artifacts.path("missing-repository");
+        let manifest = artifacts.path("missing-manifest.json");
+        let scorecard = artifacts.path("existing-scorecard.json");
+        let sentinel = b"existing scorecard must not change\n";
+        fs::write(&scorecard, sentinel).unwrap();
+        let mut output = Vec::new();
+        let error = ts_fixture::run_upstream_diagnostic_baselines(
+            &repository,
+            &ts_fixture::RunnerOptions {
+                diagnostics: true,
+                semantic_artifacts: true,
+                canonical_checker: false,
+                variant_manifest: fixed_manifest.then(|| manifest.clone()),
+                scorecard_json: Some(scorecard.clone()),
+                ..ts_fixture::RunnerOptions::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "--semantic-artifacts requires --canonical-checker"
+        );
+        assert!(output.is_empty());
+        assert_eq!(fs::read(&scorecard).unwrap(), sentinel);
+
+        let mut arguments = vec![
+            "--diagnostics",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard.to_str().unwrap(),
+        ];
+        if fixed_manifest {
+            arguments.extend(["--variant-manifest", manifest.to_str().unwrap()]);
+        }
+        let cli = run(&repository, &arguments);
+        assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+        assert!(cli.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(cli.stderr).unwrap(),
+            format!("error: {error}\n")
+        );
+        assert_eq!(fs::read(&scorecard).unwrap(), sentinel);
+        assert!(!repository.exists());
+        assert!(!manifest.exists());
+    }
+}
+
+#[test]
+fn artifact_library_mode_guard_keeps_legacy_diagnostics_only_api_and_cli() {
+    let repository = TestRepository::new();
+    repository.write_case("legacyDiagnosticsOnly", "const value: number = 1;\n", None);
+    let api_scorecard = repository.0.join("api-diagnostics.json");
+    let mut output = Vec::new();
+    let summary = ts_fixture::run_upstream_diagnostic_baselines(
+        &repository.0,
+        &ts_fixture::RunnerOptions {
+            diagnostics: true,
+            scorecard_json: Some(api_scorecard.clone()),
+            ..ts_fixture::RunnerOptions::default()
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert!(summary.is_success());
+    assert_eq!(summary.executed_variants, 1);
+    assert_eq!(summary.matched, 1);
+    let api: serde_json::Value = serde_json::from_slice(&fs::read(api_scorecard).unwrap()).unwrap();
+    assert_eq!(api["checkerMode"], "legacy");
+    assert_eq!(api["summary"]["exactMatches"], 1);
+    assert!(api.get("semanticArtifacts").is_none());
+
+    let cli_scorecard = repository.0.join("cli-diagnostics.json");
+    let cli = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--scorecard-json",
+            cli_scorecard.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(cli.status.code(), Some(0), "{cli:?}");
+    let cli: serde_json::Value = serde_json::from_slice(&fs::read(cli_scorecard).unwrap()).unwrap();
+    assert_eq!(cli["checkerMode"], "legacy");
+    assert_eq!(cli["summary"], api["summary"]);
+    assert_eq!(cli["variants"], api["variants"]);
+    assert!(cli.get("semanticArtifacts").is_none());
+}
+
+#[test]
 fn semantic_artifact_mode_matches_real_type_and_symbol_baselines() {
     let repository = TestRepository::new();
     repository.write_case("semanticArtifacts", "const value: number = 1;\n", None);
