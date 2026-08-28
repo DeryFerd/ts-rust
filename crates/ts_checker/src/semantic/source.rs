@@ -98,6 +98,7 @@ use super::{
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, TypeResolutionTarget,
     TypeSystemPropertyName, ValueSymbolLinks, VariableInvariant, VariableUnsupported,
     alias::CanonicalAliasResolver,
+    alias_flags::CanonicalSymbolFlagsResolver,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
@@ -51765,6 +51766,13 @@ pub(super) fn check_source_file(
                     &namespace,
                 )?;
                 merge_source_ambient_module_exports(store, host, diagnostics, &namespace)?;
+                check_namespace_export_assignment_grammar(
+                    store,
+                    host,
+                    alias_host,
+                    diagnostics,
+                    &namespace,
+                )?;
                 publish_imported_namespace_augmentation_exports(
                     arena,
                     bound,
@@ -57148,6 +57156,8 @@ pub(super) fn check_source_file(
         &identifier_reads,
     )?;
 
+    check_external_module_exports(store, host, alias_host, diagnostics, source.node_ref())?;
+
     issue_unused_source_diagnostics(
         arena,
         bound,
@@ -57164,6 +57174,249 @@ pub(super) fn check_source_file(
     )?;
 
     Ok(())
+}
+
+fn check_namespace_export_assignment_grammar(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    namespace: &SourceNamespacePlan,
+) -> Result<(), SourceCheckError> {
+    let mut pending = vec![namespace];
+    while let Some(namespace) = pending.pop() {
+        check_external_module_exports(store, host, alias_host, diagnostics, namespace.declaration)?;
+        pending.extend(namespace.members.iter().rev().filter_map(|member| {
+            if let SourceNamespaceMemberPlan::Namespace(nested) = member {
+                Some(nested.as_ref())
+            } else {
+                None
+            }
+        }));
+    }
+    Ok(())
+}
+
+// Type-only exports can merge with export=. Other values and namespace shadows cannot.
+fn check_external_module_exports(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    declaration: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Import(declaration);
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let node = host.node(declaration).ok_or_else(invalid)?;
+    let is_module = match &node.data {
+        NodeData::SourceFile(_) => bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_external_or_common_js_module),
+        NodeData::ModuleDeclaration(module) => {
+            module.keyword == SyntaxKind::GlobalKeyword
+                || arena
+                    .get(module.name)
+                    .is_some_and(|name| name.kind == SyntaxKind::StringLiteral)
+        }
+        _ => return Err(invalid()),
+    };
+    if !is_module {
+        return Ok(());
+    }
+    let module = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let Some(exports) = store.symbol(module).ok_or_else(invalid)?.exports() else {
+        return Ok(());
+    };
+    let Some(export_equals) = store
+        .symbol_table(exports)
+        .ok_or_else(invalid)?
+        .get(ts_binder::InternalSymbolName::ExportEquals.as_ref())
+    else {
+        return Ok(());
+    };
+    let export_equals = store.get_merged_symbol(export_equals).ok_or_else(invalid)?;
+    if !has_exported_members_of_kind(store, alias_host, module, SymbolFlags::VALUE, declaration)?
+        && !has_shadowed_export_namespace(store, alias_host, module, export_equals, declaration)?
+    {
+        return Ok(());
+    }
+
+    let exported = store.symbol(export_equals).ok_or_else(invalid)?;
+    let assignment = if exported.flags().intersects(SymbolFlags::ALIAS) {
+        Some(
+            alias_host
+                .alias_declaration(store, export_equals)
+                .map_err(|_| invalid())?,
+        )
+    } else {
+        exported.value_declaration()
+    };
+    if let Some(assignment) = assignment {
+        let (arena, bound) = host.source(assignment).ok_or_else(invalid)?;
+        if !export_assignment_is_in_external_augmentation(arena, bound, assignment)? {
+            issue_node_diagnostic(diagnostics, assignment, 2309)?;
+        }
+    }
+    Ok(())
+}
+
+fn has_exported_members_of_kind(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    module: SemanticSymbolId,
+    meaning: SymbolFlags,
+    declaration: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let invalid = || SourceCheckError::Import(declaration);
+    let Some(exports) = store.symbol(module).ok_or_else(invalid)?.exports() else {
+        return Ok(false);
+    };
+    let members = store
+        .symbol_table(exports)
+        .ok_or_else(invalid)?
+        .iter()
+        .filter_map(|(name, symbol)| {
+            (name != ts_binder::InternalSymbolName::ExportEquals.as_ref()).then_some(symbol)
+        })
+        .collect::<Vec<_>>();
+    for member in members {
+        let resolved = CanonicalSymbolFlagsResolver::new(store, alias_host)
+            .get_symbol_flags(member)
+            .map_err(|_| invalid())?;
+        if !resolved.events.is_empty() {
+            return Err(SourcePlanner::import_plan_error(
+                declaration,
+                &SourceImportError::CircularAlias {
+                    alias: member,
+                    events: resolved.events,
+                },
+            ));
+        }
+        if resolved.flags.intersects(meaning) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_shadowed_export_namespace(
+    store: &mut CanonicalTypeMapperStore,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    module: SemanticSymbolId,
+    export_equals: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let invalid = || SourceCheckError::Import(declaration);
+    let flags = store.symbol(export_equals).ok_or_else(invalid)?.flags();
+    if !flags.intersects(SymbolFlags::ALIAS) {
+        return Ok(false);
+    }
+    let mut has_namespace = flags.intersects(SymbolFlags::NAMESPACE_MODULE);
+    if !has_namespace {
+        // Read Go's type-export promotion without changing the bound symbol.
+        let Some(exports) = store.symbol(module).ok_or_else(invalid)?.exports() else {
+            return Ok(false);
+        };
+        for (name, member) in store.symbol_table(exports).ok_or_else(invalid)?.iter() {
+            if name == ts_binder::InternalSymbolName::ExportEquals.as_ref() {
+                continue;
+            }
+            if store
+                .symbol(member)
+                .ok_or_else(invalid)?
+                .flags()
+                .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+            {
+                has_namespace = true;
+                break;
+            }
+        }
+    }
+    if !has_namespace {
+        return Ok(false);
+    }
+    let resolved = CanonicalAliasResolver::new(store, alias_host)
+        .resolve_alias(export_equals)
+        .map_err(|error| {
+            SourcePlanner::import_plan_error(declaration, &SourceImportError::Alias(error))
+        })?;
+    if !resolved.events.is_empty() {
+        return Err(SourcePlanner::import_plan_error(
+            declaration,
+            &SourceImportError::CircularAlias {
+                alias: export_equals,
+                events: resolved.events,
+            },
+        ));
+    }
+    let target = match resolved.target {
+        super::AliasTargetState::Resolved(target) => target,
+        super::AliasTargetState::Unknown => return Ok(false),
+        super::AliasTargetState::Unresolved => return Err(invalid()),
+    };
+    if !store
+        .symbol(target)
+        .ok_or_else(invalid)?
+        .flags()
+        .intersects(SymbolFlags::NAMESPACE)
+    {
+        return Ok(false);
+    }
+    has_exported_members_of_kind(
+        store,
+        alias_host,
+        target,
+        SymbolFlags::TYPE | SymbolFlags::NAMESPACE,
+        declaration,
+    )
+}
+
+fn export_assignment_is_in_external_augmentation(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    assignment: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let invalid = || SourceCheckError::Import(assignment);
+    if !assignment.is_for(arena.id(), bound.file_id()) || !bound.contains(assignment) {
+        return Err(invalid());
+    }
+    let node = arena.get(assignment.node).ok_or_else(invalid)?;
+    let Some(block) = node.parent.and_then(|parent| arena.get(parent)) else {
+        return Ok(false);
+    };
+    if block.kind != SyntaxKind::ModuleBlock {
+        return Ok(false);
+    }
+    let module = block
+        .parent
+        .and_then(|parent| arena.get(parent))
+        .ok_or_else(invalid)?;
+    let is_ambient = |node: &Node| {
+        matches!(&node.data, NodeData::ModuleDeclaration(module)
+            if module.keyword == SyntaxKind::GlobalKeyword
+                || arena.get(module.name).is_some_and(|name| name.kind == SyntaxKind::StringLiteral))
+    };
+    if !is_ambient(module) {
+        return Ok(false);
+    }
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    let Some(parent) = module.parent.and_then(|parent| arena.get(parent)) else {
+        return Ok(false);
+    };
+    if parent.kind == SyntaxKind::SourceFile {
+        return Ok(facts.is_external_module());
+    }
+    if parent.kind != SyntaxKind::ModuleBlock || facts.is_external_module() {
+        return Ok(false);
+    }
+    let outer = parent
+        .parent
+        .and_then(|parent| arena.get(parent))
+        .ok_or_else(invalid)?;
+    Ok(is_ambient(outer) && outer.parent == Some(bound.source_file().node))
 }
 
 #[allow(clippy::too_many_arguments)] // Uses the complete, already-published source reference set.
@@ -69770,6 +70023,166 @@ mod tests {
             mark_source_unchecked(&mut context, file);
             context.check_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn export_assignment_grammar_rejects_the_same_bound_named_value() {
+        let source = parsed("export const value = 1; export = value;");
+        let file = FileId::new(9_106);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&source.arena, &bound)]).unwrap();
+        let manifest =
+            crate::semantic::module_resolution::CanonicalModuleResolutionManifest::unavailable();
+        let mut aliases =
+            ProductionAliasTargetHost::new(context.store(), [(&source.arena, &bound)], &manifest)
+                .unwrap();
+        let before = observable_state(&context, file);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            super::check_external_module_exports(
+                context.store_mut_for_test(),
+                &host,
+                &mut aliases,
+                &mut diagnostics,
+                bound.source_file(),
+            )
+            .unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one export-assignment diagnostic");
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2309);
+            assert_eq!(
+                node_text(&source, diagnostic.node.unwrap()),
+                "export = value;",
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+    }
+
+    #[test]
+    fn export_assignment_grammar_checks_bound_type_and_namespace_merges() {
+        for (index, (text, error)) in [
+            (
+                "const value = 1; type Other = number; export { Other }; export = value;",
+                false,
+            ),
+            (
+                "export type Top = number; namespace value { export const member = 1; } export = value;",
+                false,
+            ),
+            (
+                "export type Top = number; namespace value { export type Inner = string; export const member = 1; } export = value;",
+                true,
+            ),
+            (
+                "type Top = number; export { Top }; namespace value { export type Inner = string; export const member = 1; } export = value;",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_110 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new([(&source.arena, &bound)]).unwrap();
+            let manifest =
+                crate::semantic::module_resolution::CanonicalModuleResolutionManifest::unavailable();
+            let mut aliases =
+                ProductionAliasTargetHost::new(context.store(), [(&source.arena, &bound)], &manifest)
+                    .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut previous = None;
+            for _ in 0..2 {
+                super::check_external_module_exports(
+                    context.store_mut_for_test(),
+                    &host,
+                    &mut aliases,
+                    &mut diagnostics,
+                    bound.source_file(),
+                )
+                .unwrap();
+                assert_eq!(diagnostics.as_slice().len(), usize::from(error), "{text}");
+                for diagnostic in diagnostics.as_slice() {
+                    assert_eq!(diagnostic.diagnostic.code(), 2309, "{text}");
+                    assert_eq!(
+                        node_text(&source, diagnostic.node.unwrap()),
+                        "export = value;",
+                        "{text}",
+                    );
+                }
+                let observed = observable_state(&context, file);
+                if let Some(previous) = &previous {
+                    assert_eq!(&observed, previous, "{text}");
+                }
+                previous = Some(observed);
+            }
+        }
+    }
+
+    #[test]
+    fn export_assignment_augmentation_exception_follows_the_actual_module_parents() {
+        for (index, (text, state, expected)) in [
+            (
+                "export {}; declare module 'pkg' { const value: number; export = value; }",
+                CanonicalModuleState::External,
+                true,
+            ),
+            (
+                "declare module 'pkg' { const value: number; export = value; }",
+                CanonicalModuleState::Script,
+                false,
+            ),
+            (
+                "declare module 'outer' { module 'inner' { const value: number; export = value; } }",
+                CanonicalModuleState::Script,
+                true,
+            ),
+            (
+                "namespace Ordinary { const value = 1; export = value; }",
+                CanonicalModuleState::Script,
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_100 + u32::try_from(index).unwrap());
+            let context = context_with_module_state(
+                &[(file, &source)],
+                state,
+                CanonicalCheckerOptions::default(),
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let assignment = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExportAssignment)
+                        .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .unwrap();
+            assert_eq!(
+                super::export_assignment_is_in_external_augmentation(
+                    &source.arena,
+                    bound,
+                    assignment,
+                ),
+                Ok(expected),
+                "{text}",
+            );
         }
     }
 

@@ -606,7 +606,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         Ok((node, source))
     }
 
-    fn alias_declaration<MapperPayload>(
+    pub(super) fn alias_declaration<MapperPayload>(
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         alias: SemanticSymbolId,
