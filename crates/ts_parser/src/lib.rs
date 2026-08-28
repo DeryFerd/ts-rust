@@ -2237,9 +2237,14 @@ impl<'a> Parser<'a> {
     fn parse_parameter_list(&mut self) -> NodeList {
         let start = self.current.range.start;
         if self.current.kind != SyntaxKind::OpenParenToken {
+            let position = if self.arrow_return_type_context {
+                self.current.full_start
+            } else {
+                start
+            };
             self.error_current("Expected '('.");
             return NodeList {
-                range: TextRange::new(start, start),
+                range: TextRange::new(position, position),
                 nodes: Vec::new(),
                 has_trailing_comma: false,
             };
@@ -2645,7 +2650,7 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::GreaterThanToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            let parameter_start = self.current.range.start;
+            let mut parameter_start = self.current.range.start;
             let mut modifier_nodes = Vec::new();
             loop {
                 let is_const = self.current.kind == SyntaxKind::ConstKeyword;
@@ -2658,20 +2663,32 @@ impl<'a> Parser<'a> {
                 }
                 modifier_nodes.push(self.consume_token_node());
             }
-            let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
-                list: NodeList {
-                    range: TextRange::new(parameter_start, self.current.range.start),
-                    nodes: modifier_nodes.clone(),
-                    has_trailing_comma: false,
-                },
-                flags: ts_ast::ModifierFlags::default(),
-            });
             if !self.token_is_identifier_in_current_context(self.current.kind)
                 && self.current.kind.is_keyword()
             {
                 self.error_code_at(self.current.range, 1359, [token_value(&self.current)]);
             }
-            let name = self.parse_identifier_in_current_context("Expected a type parameter name.");
+            let name = if self.arrow_return_type_context
+                && !self.token_is_identifier_in_current_context(self.current.kind)
+            {
+                // Missing signature children share the enclosing arrow's recovery position.
+                self.error_current("Expected a type parameter name.");
+                self.missing_identifier(self.current.full_start)
+            } else {
+                self.parse_identifier_in_current_context("Expected a type parameter name.")
+            };
+            let name_position = self.node_start(name);
+            let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
+                list: NodeList {
+                    range: TextRange::new(parameter_start, name_position),
+                    nodes: modifier_nodes.clone(),
+                    has_trailing_comma: false,
+                },
+                flags: ts_ast::ModifierFlags::default(),
+            });
+            if modifier_nodes.is_empty() {
+                parameter_start = name_position;
+            }
             let constraint = if self.current.kind == SyntaxKind::ExtendsKeyword {
                 self.bump();
                 Some(self.parse_type())
@@ -9970,13 +9987,19 @@ impl<'a> Parser<'a> {
             self.expect_and_bump(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
             self.parse_type()
         };
+        let end = type_parameters
+            .as_ref()
+            .map_or(parameters.range.end, |types| {
+                types.range.end.max(parameters.range.end)
+            })
+            .max(self.node_end(return_type));
         let mut children = Vec::new();
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
         children.push(return_type);
         self.alloc_node(
             SyntaxKind::FunctionType,
-            TextRange::new(start, self.node_end(return_type)),
+            TextRange::new(start, end),
             NodeData::FunctionTypeNode(Box::new(FunctionTypeNodeData {
                 full_signature: None,
                 locals: SymbolTable,
@@ -10020,6 +10043,12 @@ impl<'a> Parser<'a> {
         let parameters = self.parse_parameter_list();
         self.expect_and_bump(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
         let return_type = self.parse_type();
+        let end = type_parameters
+            .as_ref()
+            .map_or(parameters.range.end, |types| {
+                types.range.end.max(parameters.range.end)
+            })
+            .max(self.node_end(return_type));
         let mut children = Vec::new();
         if let Some(modifiers) = &modifiers {
             children.extend(modifiers.list.nodes.iter().copied());
@@ -10029,7 +10058,7 @@ impl<'a> Parser<'a> {
         children.push(return_type);
         self.alloc_node(
             SyntaxKind::ConstructorType,
-            TextRange::new(start, self.node_end(return_type)),
+            TextRange::new(start, end),
             NodeData::ConstructorTypeNode(Box::new(ConstructorTypeNodeData {
                 full_signature: None,
                 locals: SymbolTable,
