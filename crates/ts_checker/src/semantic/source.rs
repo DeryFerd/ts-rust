@@ -22518,6 +22518,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         match (&record.kind, &record.data) {
             (SyntaxKind::TrueKeyword, NodeData::KeywordExpression(_)) => Ok(Some(true)),
             (SyntaxKind::FalseKeyword, NodeData::KeywordExpression(_)) => Ok(Some(false)),
+            (SyntaxKind::PrefixUnaryExpression, NodeData::PrefixUnaryExpression(prefix))
+                if prefix.operator == SyntaxKind::ExclamationToken =>
+            {
+                let operand = self.reference(prefix.operand);
+                if self.node(operand)?.parent != Some(expression.node) {
+                    return Err(SourceCheckError::Conditional(expression));
+                }
+                Ok(self
+                    .conditional_boolean_initializer(operand)?
+                    .map(|value| !value))
+            }
             (
                 SyntaxKind::ParenthesizedExpression,
                 NodeData::ParenthesizedExpression(parenthesized),
@@ -23726,6 +23737,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             };
             (prefix.operator, prefix.operand)
         };
+        if operator == SyntaxKind::ExclamationToken
+            && let Some(value) = self.conditional_boolean_initializer(expression)?
+        {
+            return Ok(PlannedExpression::new(
+                expression,
+                PlannedExpressionKind::Boolean(value),
+            ));
+        }
         if operator != SyntaxKind::MinusToken {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::InvalidPrefixUnaryOperator {

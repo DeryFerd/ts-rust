@@ -4128,7 +4128,7 @@ fn function_array_parameter_type_node(
     Some(annotation)
 }
 
-/// Authenticates omitted positions in typed or default-inferred function array parameters.
+/// Authenticates typed array parameters and default-inferred patterns with omissions.
 pub(super) fn authenticated_function_array_parameter_bindings(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -4254,7 +4254,7 @@ pub(super) fn authenticated_function_array_parameter_bindings(
         bindings.push((element, symbol));
     }
 
-    (omitted && !bindings.is_empty()).then_some(bindings)
+    ((syntax.type_.is_some() || omitted) && !bindings.is_empty()).then_some(bindings)
 }
 
 fn source_array_sort_argument_arrow_is_exact(
