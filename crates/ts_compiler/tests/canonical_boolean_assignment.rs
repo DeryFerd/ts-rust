@@ -129,10 +129,11 @@ fn prototype_return_details_skip_compatible_void_methods() {
         Some((6, 9)),
     );
     assert_eq!(
-        diagnostic.message.lines().skip(1).collect::<Vec<_>>(),
-        [
-            "  The types returned by 'toLocaleString()' are incompatible between these types.",
+        diagnostic.message,
+        concat!(
+            "Type '{}' is not assignable to type '{ toString(): void; toLocaleString(): number; }'.\n",
+            "  The types returned by 'toLocaleString()' are incompatible between these types.\n",
             "    Type 'string' is not assignable to type 'number'.",
-        ],
+        ),
     );
 }

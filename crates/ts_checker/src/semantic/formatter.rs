@@ -1033,6 +1033,25 @@ enum StructuralObjectProof {
     DeclaredTypeLiteral(SemanticSymbolId),
 }
 
+enum StructuralPropertyDisplay {
+    Property {
+        name: String,
+        type_id: TypeId,
+        optional: bool,
+        readonly: bool,
+    },
+    Method {
+        name: String,
+        projection: CallableSetProjection,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum DeclaredMethodDisplayStyle {
+    Function,
+    Member,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_object_type(
     store: &CanonicalTypeMapperStore,
@@ -1238,6 +1257,7 @@ fn display_object_type(
             host,
             global_types,
             &projection,
+            DeclaredMethodDisplayStyle::Function,
             flags,
             state,
             visiting,
@@ -1578,6 +1598,7 @@ fn display_declared_method_signatures(
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
     projection: &CallableSetProjection,
+    style: DeclaredMethodDisplayStyle,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
@@ -1650,7 +1671,13 @@ fn display_declared_method_signatures(
                 visiting,
                 &mut result,
             )?;
-            result.push_str(if overloaded { ": " } else { " => " });
+            result.push_str(
+                if overloaded || matches!(style, DeclaredMethodDisplayStyle::Member) {
+                    ": "
+                } else {
+                    " => "
+                },
+            );
             let return_type = callable
                 .return_type
                 .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
@@ -4934,6 +4961,36 @@ fn validate_structural_object_shell(
         InternalSymbolName::Type,
         object.structured.members,
     )?;
+    if object
+        .structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|property| {
+            store
+                .symbol(*property)
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+        })
+    {
+        let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+        let host = host.ok_or_else(invalid)?;
+        let [declaration] = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .unwrap_or_default()
+        else {
+            return Err(invalid());
+        };
+        let plan = object_members::plan_type_literal(store, host, *declaration, None)
+            .map_err(|_| invalid())?;
+        if !matches!(
+            object_members::type_literal_state(store, &plan),
+            Ok(Some(object_members::PropertyObjectState::Resolved(resolved))) if resolved == type_id
+        ) {
+            return Err(invalid());
+        }
+    }
     Ok(StructuralObjectProof::DeclaredTypeLiteral(owner))
 }
 
@@ -5288,13 +5345,37 @@ fn append_structural_property(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
     global_types: Option<&CanonicalGlobalTypes>,
-    property: &(String, TypeId, bool, bool),
+    property: &StructuralPropertyDisplay,
     flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
     result: &mut String,
 ) -> Result<(), TypeDisplayUnavailable> {
-    let (name, property_type, optional, readonly) = property;
+    let (name, property_type, optional, readonly) = match property {
+        StructuralPropertyDisplay::Property {
+            name,
+            type_id,
+            optional,
+            readonly,
+        } => (name, type_id, optional, readonly),
+        StructuralPropertyDisplay::Method { name, projection } => {
+            let host = host.ok_or(TypeDisplayUnavailable::MalformedType(projection.owner))?;
+            result.push_str(name);
+            state.add(name.len());
+            result.push_str(&display_declared_method_signatures(
+                store,
+                host,
+                global_types,
+                projection,
+                DeclaredMethodDisplayStyle::Member,
+                flags,
+                state,
+                visiting,
+            )?);
+            result.push_str("; ");
+            return Ok(());
+        }
+    };
     if *readonly {
         result.push_str("readonly ");
     }
@@ -5488,7 +5569,7 @@ fn validated_property(
     type_id: TypeId,
     proof: StructuralObjectProof,
     property: SemanticSymbolId,
-) -> Result<(String, TypeId, bool, bool), TypeDisplayUnavailable> {
+) -> Result<StructuralPropertyDisplay, TypeDisplayUnavailable> {
     let record = store
         .symbol(property)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
@@ -5512,9 +5593,10 @@ fn validated_property(
         }
         StructuralObjectProof::DeclaredTypeLiteral(_) => {
             let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
-            record.flags().contains(SymbolFlags::PROPERTY)
+            (record.flags().contains(SymbolFlags::PROPERTY)
                 && record.flags().without(allowed) == SymbolFlags::NONE
-                && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+                && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0)
+                || record.flags() == SymbolFlags::METHOD && record.check_flags() == CheckFlags::NONE
         }
     };
     if !valid_flags_and_checks
@@ -5581,12 +5663,29 @@ fn validated_property(
         StructuralObjectProof::ConstObjectLiteral => true,
         StructuralObjectProof::DeclaredTypeLiteral(owner) => {
             let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            if record.flags() == SymbolFlags::METHOD {
+                let method = store
+                    .type_payload(property_type)
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                let projection = validated_declared_method_display(store, property_type, method)?
+                    .filter(|projection| projection.call_signatures.len() == 1)
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                return Ok(StructuralPropertyDisplay::Method {
+                    name: display_name,
+                    projection,
+                });
+            }
             validate_declared_property(
                 store, host, type_id, owner, property, record, name, optional,
             )?
         }
     };
-    Ok((display_name, property_type, optional, readonly))
+    Ok(StructuralPropertyDisplay::Property {
+        name: display_name,
+        type_id: property_type,
+        optional,
+        readonly,
+    })
 }
 
 fn structural_property_display_name(
@@ -5622,6 +5721,7 @@ fn structural_property_display_name(
         NodeData::PropertyAssignment(property) => property.name,
         NodeData::PropertyDeclaration(property) => property.name,
         NodeData::PropertySignatureDeclaration(property) => property.name,
+        NodeData::MethodSignatureDeclaration(method) => method.name,
         _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
     };
     let mut name_record = arena
@@ -7789,6 +7889,67 @@ mod tests {
                 .set_signature_resolved_return_type(signature, original_return,)
         );
         assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+    }
+
+    #[test]
+    fn method_type_literal_display_uses_member_syntax_and_rejects_changed_returns() {
+        let parsed =
+            parse_source_file("declare var item: { read(value: string): number; tag: string };");
+        let file = FileId::new(1_928);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let annotation = variable_type_node(&parsed, file, "item");
+        let type_ = context.get_type_from_type_node(annotation).unwrap();
+        let expected = "{ read(value: string): number; tag: string; }";
+        assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        let owner = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let member = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|table| context.store().symbol_table(table))
+            .and_then(|table| table.get_source("read"))
+            .unwrap();
+        let method_type = context
+            .store()
+            .value_symbol_links(member)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(method_type).unwrap(),
+            "(value: string) => number",
+        );
+        let TypeData::Object(callable) = context.store().type_payload(method_type).unwrap().data()
+        else {
+            panic!("read must retain its declared method type")
+        };
+        let [signature] = callable.structured.signatures.as_deref().unwrap() else {
+            panic!("read must have one signature")
+        };
+        let signature = *signature;
+        let original_return = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type();
+        let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(signature, Some(boolean),)
+        );
+        assert_malformed_display_without_writes(&context, type_);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(signature, original_return,)
+        );
+        assert_eq!(context.type_to_string(type_).unwrap(), expected);
     }
 
     #[test]
