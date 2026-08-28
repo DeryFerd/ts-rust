@@ -355,7 +355,8 @@ fn stable_common_spelling_suggestion_emits_ts2551_with_first_missing_detail() {
 }
 
 #[test]
-fn apparent_global_object_property_fails_closed_before_union_or_access_publication() {
+#[allow(clippy::too_many_lines)] // Global, constituent, and warm identities share one source check.
+fn apparent_global_object_property_keeps_declared_owner_and_union_identity() {
     let parsed = parse_source_file(concat!(
         "interface Object { toString: string }\n",
         "type Left = { left: string };\n",
@@ -368,21 +369,156 @@ fn apparent_global_object_property_fails_closed_before_union_or_access_publicati
     let (access, receiver, _) = access_parts(&parsed, file);
     let mut context = context(&parsed, file);
 
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Property(access)
-        ))
-    );
+    context.check_source_file(file).unwrap();
 
+    assert!(context.diagnostics().is_empty());
     let union = resolved_type(&context, receiver);
+    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    assert_eq!(resolved_type(&context, access), string);
     let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
         panic!("receiver must remain a union")
     };
+    let constituents = data.union.types.clone();
+    assert_eq!(constituents.len(), 2);
     assert!(data.union.property_cache.is_none());
-    assert!(context.store().type_node_links(access).is_none());
+
+    let object = context
+        .store()
+        .symbol_table(context.globals())
+        .unwrap()
+        .get_source("Object")
+        .unwrap();
+    let members = context.store().symbol(object).unwrap().members().unwrap();
+    let property = context
+        .store()
+        .symbol_table(members)
+        .unwrap()
+        .get_source("toString")
+        .unwrap();
+    let record = context.store().symbol(property).unwrap();
+    assert_eq!(record.parent(), Some(object));
+    assert_eq!(record.flags(), SymbolFlags::PROPERTY);
+    assert_eq!(record.check_flags(), CheckFlags::NONE);
+    assert_eq!(
+        context
+            .store()
+            .symbol_node_links(access)
+            .unwrap()
+            .resolved_symbol,
+        Some(property)
+    );
+    assert_eq!(
+        context.store().value_symbol_links(property),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(string),
+            ..ValueSymbolLinks::default()
+        })
+    );
+    let TypeData::Interface(object_type) = context
+        .store()
+        .type_payload(context.global_types().object_type)
+        .unwrap()
+        .data()
+    else {
+        panic!("Object must retain its declared interface")
+    };
+    assert!(!object_type.declared_members_resolved);
+    assert!(object_type.reference.object.structured.members.is_none());
+
+    let warm = observable_state(&context, access);
+    assert_eq!(context.type_to_string(union).unwrap(), "Both");
+    assert_eq!(context.type_to_string(string).unwrap(), "string");
+    let mut fields = Vec::new();
+    for (constituent, name, field, expected) in [
+        (constituents[0], "Left", "left", string),
+        (constituents[1], "Right", "right", number),
+    ] {
+        assert_eq!(context.type_to_string(constituent).unwrap(), name);
+        let type_record = context.store().type_payload(constituent).unwrap();
+        let TypeData::Object(object) = type_record.data() else {
+            panic!("each constituent must retain its own object type")
+        };
+        let [property] = object.structured.properties.as_deref().unwrap() else {
+            panic!("each constituent must retain exactly its own field")
+        };
+        let record = context.store().symbol(*property).unwrap();
+        assert_eq!(record.name().as_utf8(), Some(field));
+        assert_eq!(record.parent(), type_record.symbol());
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(*property)
+                .unwrap()
+                .resolved_type,
+            Some(expected)
+        );
+        fields.push((*property, expected));
+    }
+    assert_eq!(observable_state(&context, access), warm);
+
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(observable_state(&context, access), warm);
+    assert_eq!(resolved_type(&context, receiver), union);
+    let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
+        panic!("receiver must remain a union after recheck")
+    };
+    assert_eq!(data.union.types, constituents);
+    assert!(data.union.property_cache.is_none());
+    for (property, expected) in fields {
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(property)
+                .unwrap()
+                .resolved_type,
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn missing_global_object_member_keeps_the_union_diagnostic() {
+    let parsed = parse_source_file(concat!(
+        "interface Object { toString: string }\n",
+        "type Left = { left: string };\n",
+        "type Right = { right: number };\n",
+        "type Both = Left | Right;\n",
+        "function read(input: Both): any { return input.missing; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(7);
+    let (access, receiver, name) = access_parts(&parsed, file);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let union = resolved_type(&context, receiver);
+    assert_eq!(context.type_to_string(union).unwrap(), "Both");
+    assert_eq!(
+        resolved_type(&context, access),
+        context.store().intrinsic_bootstrap().unwrap().error_type
+    );
     assert!(context.store().symbol_node_links(access).is_none());
-    assert!(context.diagnostics().is_empty());
+    assert_eq!(cached_union_property(&context, union, "missing"), None);
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one TS2339")
+    };
+    assert_eq!(diagnostic.node, Some(name));
+    assert_eq!(diagnostic.diagnostic.code(), 2339);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        concat!(
+            "Property 'missing' does not exist on type 'Both'.\n",
+            "  Property 'missing' does not exist on type 'Left'.",
+        )
+    );
+    assert!(diagnostic.related_information.is_empty());
+
+    let warm = observable_state(&context, access);
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(observable_state(&context, access), warm);
+    assert_eq!(resolved_type(&context, receiver), union);
 }
 
 #[test]
