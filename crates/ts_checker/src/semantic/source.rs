@@ -33626,8 +33626,22 @@ fn issue_invalid_const_enum_value_diagnostic(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     expression: &PlannedExpression,
 ) -> Result<(), SourceCheckError> {
-    let PlannedExpressionKind::Identifier(read) = &expression.kind else {
-        return Ok(());
+    let read = match &expression.kind {
+        PlannedExpressionKind::Array(elements)
+        | PlannedExpressionKind::Object {
+            properties: elements,
+            ..
+        } => {
+            for element in elements {
+                issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, element)?;
+            }
+            return Ok(());
+        }
+        PlannedExpressionKind::Parenthesized(inner) => {
+            return issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, inner);
+        }
+        PlannedExpressionKind::Identifier(read) => read,
+        _ => return Ok(()),
     };
     if read.kind != PlannedIdentifierReadKind::DeclaredValue
         || !store
@@ -69322,6 +69336,88 @@ mod tests {
         assert_eq!(
             variable_value_type(&context, &source, file, "sum"),
             context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        let warm = observable_state(&context, file);
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn const_enum_value_arrays_and_call_arguments_retain_types_and_diagnostics() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "const enum E2 { A } ",
+            "var direct = E2; ",
+            "var values = [E2]; ",
+            "function foo(t: any): void {} ",
+            "foo(E2); ",
+            "const item = E2.A;",
+        ));
+        let library_file = FileId::new(9_395);
+        let file = FileId::new(9_396);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2475, 2475, 2475],
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| node_text(&source, diagnostic.node.unwrap()))
+                .collect::<Vec<_>>(),
+            ["E2", "E2", "E2"],
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let node = source.arena.get(diagnostic.node.unwrap().node).unwrap();
+                    source.arena.get(node.parent.unwrap()).unwrap().kind
+                })
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::VariableDeclaration,
+                SyntaxKind::ArrayLiteralExpression,
+                SyntaxKind::CallExpression,
+            ],
+        );
+        let owner = global_symbol(&context, "E2");
+        let value_type = context
+            .store()
+            .value_symbol_links(owner)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "direct"),
+            value_type
+        );
+        let array = variable_value_type(&context, &source, file, "values");
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_reference(context.global_types(), array)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            value_type,
+        );
+        let item = variable_value_type(&context, &source, file, "item");
+        assert_eq!(
+            super::super::enums::canonical_enum_type_owner(context.store(), item),
+            Some(owner)
         );
         let warm = observable_state(&context, file);
 

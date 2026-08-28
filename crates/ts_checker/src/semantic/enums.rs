@@ -2063,7 +2063,7 @@ fn validate_resolved_enum(
             value: member.value.clone(),
         });
     }
-    validate_declared_type(store, plan, declared_type, &members).ok_or_else(cache_error)?;
+    validate_declared_type(store, plan.symbol, declared_type, &members).ok_or_else(cache_error)?;
     Ok(CanonicalEnumSemantics {
         declaration: plan.declaration,
         symbol: plan.symbol,
@@ -2093,6 +2093,146 @@ fn validate_value_type(
         && object.mapper.is_none()
         && object.instantiations == TypeCacheState::Unallocated)
         .then_some(())
+}
+
+/// Checks a published enum value object and every member before union use.
+pub(super) fn validate_enum_value_union_constituent(
+    store: &CanonicalTypeMapperStore,
+    value_type: TypeId,
+) -> Option<()> {
+    let owner = store.type_payload(value_type)?.symbol()?;
+    let record = store.symbol(owner)?;
+    let [declaration] = record.declarations()? else {
+        return None;
+    };
+    let name = store.source_child_with_kind(*declaration, SyntaxKind::Identifier)?;
+    if !matches!(
+        record.flags(),
+        SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM
+    ) || store.source_symbol_flags(owner) != Some(record.flags())
+        || !store.source_symbol_declarations_match(owner)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(*declaration)
+        || record.members().is_some()
+        || record.export_symbol().is_some()
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::EnumDeclaration)
+        || record.name().as_utf8() != store.source_identifier_text(name)
+        || store.value_symbol_links(owner)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            })
+        || !store.node_links(*declaration).is_some_and(|links| {
+            links.flags.contains(NodeCheckFlags::ENUM_VALUES_COMPUTED)
+                && links.declaration_requires_scope_change
+                    == NodeLinks::default().declaration_requires_scope_change
+                && !links.has_reported_statement_in_ambient_context
+        })
+    {
+        return None;
+    }
+    validate_value_type(store, owner, value_type)?;
+    let declared_type = store
+        .declared_type_links(owner)
+        .filter(|links| {
+            !links.interface_checked
+                && !links.index_signatures_checked
+                && !links.type_parameters_checked
+        })?
+        .declared_type?;
+    let exports = match record.exports() {
+        Some(exports) => Some(store.symbol_table(exports)?),
+        None => None,
+    };
+    let mut declarations = store
+        .source_direct_children(*declaration)?
+        .into_iter()
+        .filter(|member| store.source_node_kind(*member) == Some(SyntaxKind::EnumMember))
+        .collect::<Vec<_>>();
+    declarations.sort_unstable_by_key(|member| store.source_node_start(*member));
+    let mut members = Vec::<CanonicalEnumMemberSemantics>::with_capacity(declarations.len());
+    let mut exported_members = Vec::new();
+    for declaration in declarations {
+        let symbol = store.source_declaration_symbol(declaration)?;
+        let record = store.symbol(symbol)?;
+        if record.flags() != SymbolFlags::ENUM_MEMBER
+            || store.source_symbol_flags(symbol) != Some(SymbolFlags::ENUM_MEMBER)
+            || !store.source_symbol_declarations_match(symbol)
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(&[declaration])
+            || record.value_declaration() != Some(declaration)
+            || record.parent() != Some(owner)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+        {
+            return None;
+        }
+        let exported = exports.and_then(|exports| exports.get(record.name()));
+        if record.name() == InternalSymbolName::Missing.as_ref()
+            || record.name() == InternalSymbolName::Computed.as_ref()
+        {
+            if exported.is_some() {
+                return None;
+            }
+        } else {
+            let expected = members
+                .iter()
+                .find(|member| {
+                    store
+                        .symbol(member.symbol)
+                        .is_some_and(|previous| previous.name() == record.name())
+                })
+                .map_or(symbol, |member| member.symbol);
+            if exported != Some(expected) {
+                return None;
+            }
+            if !exported_members.contains(&expected) {
+                exported_members.push(expected);
+            }
+        }
+        let fresh_type = store.declared_type_links(symbol)?.declared_type?;
+        if store.declared_type_links(symbol)
+            != Some(&DeclaredTypeLinks {
+                declared_type: Some(fresh_type),
+                ..DeclaredTypeLinks::default()
+            })
+            || store.value_symbol_links(symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(fresh_type),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        let TypeData::Literal(literal) = store.type_payload(fresh_type)?.data() else {
+            return None;
+        };
+        let value = enum_value_from_literal(&literal.value)?;
+        let previous = members
+            .iter()
+            .find(|member| enum_literal_values_share_cache_key(&member.value, &value));
+        let identity_symbol = previous.map_or(symbol, |member| member.symbol);
+        let regular_type = validate_literal_pair(store, fresh_type, identity_symbol, &value)?;
+        if previous.is_some_and(|member| {
+            member.regular_type != regular_type || member.fresh_type != fresh_type
+        }) || !evaluator_result_matches(&store.enum_member_links(declaration)?.value, &value)
+        {
+            return None;
+        }
+        members.push(CanonicalEnumMemberSemantics {
+            declaration,
+            symbol,
+            regular_type,
+            fresh_type,
+            value,
+        });
+    }
+    if exports.map_or(0, ts_binder::semantic::SymbolTable::len) != exported_members.len() {
+        return None;
+    }
+    validate_declared_type(store, owner, declared_type, &members)
 }
 
 /// Resolves one published enum value member without forcing object members.
@@ -2323,7 +2463,7 @@ pub(super) fn is_canonical_enum_union(store: &CanonicalTypeMapperStore, type_: T
 
 fn validate_declared_type(
     store: &CanonicalTypeMapperStore,
-    plan: &EnumPlan,
+    symbol: SemanticSymbolId,
     declared_type: TypeId,
     members: &[CanonicalEnumMemberSemantics],
 ) -> Option<()> {
@@ -2331,8 +2471,10 @@ fn validate_declared_type(
         .iter()
         .enumerate()
         .filter_map(|(index, member)| {
-            (first_member_identity_index(&plan.members, index) == index)
-                .then_some(member.regular_type)
+            (!members[..index].iter().any(|previous| {
+                enum_literal_values_share_cache_key(&previous.value, &member.value)
+            }))
+            .then_some(member.regular_type)
         })
         .collect::<Vec<_>>();
     match expected_types.as_slice() {
@@ -2342,12 +2484,8 @@ fn validate_declared_type(
                 return None;
             };
             let fresh = data.fresh_type?;
-            (validate_literal_pair(
-                store,
-                fresh,
-                plan.symbol,
-                &CanonicalEnumMemberValue::Computed,
-            )? == declared_type)
+            (validate_literal_pair(store, fresh, symbol, &CanonicalEnumMemberValue::Computed)?
+                == declared_type)
                 .then_some(())
         }
         [member] => (declared_type == *member).then_some(()),
@@ -2359,8 +2497,8 @@ fn validate_declared_type(
             let alias = record.alias().and_then(|alias| store.type_alias(alias))?;
             (record.flags() == TypeFlags::UNION | TypeFlags::ENUM_LITERAL
                 && record.object_flags() == ObjectFlags::PRIMITIVE_UNION
-                && record.symbol() == Some(plan.symbol)
-                && alias.symbol() == Some(plan.symbol)
+                && record.symbol() == Some(symbol)
+                && alias.symbol() == Some(symbol)
                 && alias.type_arguments().is_none()
                 && union
                     == &UnionTypeData {
@@ -2611,7 +2749,10 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
+        IntrinsicBootstrapOptions, SemanticStore,
+        bootstrap::{LiteralTypeCacheError, UnionReduction},
+        mapper::TypeMapper,
+        type_records::TypeRecord,
         type_to_string,
     };
 
@@ -2831,6 +2972,101 @@ mod tests {
             get_declared_enum_or_member(&mut fixture.store, &host, three.symbol),
             Ok(Some(three.fresh_type))
         );
+    }
+
+    #[test]
+    fn enum_value_union_constituents_keep_complete_published_identities() {
+        for source in [
+            "enum Status { A }",
+            "const enum Status { A = 1, B = 1, Word = 'ready' }",
+            "const enum Status { Forward = Later, Later = 1, Infinite = 1 / 0, NotNumber = 0 / 0 }",
+            "enum Status {}",
+        ] {
+            let mut fixture = fixture(source);
+            let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Status");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let published = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture
+                        .store
+                        .validate_union_constituent(published.value_type),
+                    Ok(()),
+                    "{source}",
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .expression_union_type(&[published.value_type], UnionReduction::Subtype,),
+                    Ok(published.value_type),
+                    "{source}",
+                );
+            }
+
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.type_alias_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert_eq!(
+                get_enum_semantics(&mut fixture.store, &host, owner)
+                    .unwrap()
+                    .value_type,
+                published.value_type,
+            );
+        }
+    }
+
+    #[test]
+    fn enum_value_union_constituents_reject_incomplete_or_counterfeit_caches() {
+        for corruption in 0..3 {
+            let mut fixture = fixture("const enum Status { A = 1, B = 2 }");
+            let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Status");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let published = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+            let mut value_type = published.value_type;
+            assert_eq!(fixture.store.validate_union_constituent(value_type), Ok(()));
+            match corruption {
+                0 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        published.members[0].symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(published.members[1].fresh_type),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                1 => {
+                    assert!(fixture.store.set_declared_type_links(
+                        owner,
+                        DeclaredTypeLinks {
+                            declared_type: Some(published.members[0].regular_type),
+                            ..DeclaredTypeLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    value_type = fixture
+                        .store
+                        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                fixture.store.validate_union_constituent(value_type),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(value_type)),
+            );
+        }
     }
 
     #[test]

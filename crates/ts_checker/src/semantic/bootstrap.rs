@@ -43,6 +43,7 @@ use super::{
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     declared::{cached_class_type, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
+    enums::validate_enum_value_union_constituent,
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
@@ -3440,6 +3441,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(object) => {
+                if record.symbol().is_some_and(|owner| {
+                    self.symbol(owner)
+                        .is_some_and(|owner| owner.flags().intersects(SymbolFlags::ENUM))
+                }) {
+                    return validate_enum_value_union_constituent(self, type_)
+                        .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                }
                 if self.validate_supported_unknown_empty_object(type_, record, object) {
                     return Ok(());
                 }
