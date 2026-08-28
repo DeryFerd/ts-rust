@@ -13757,6 +13757,24 @@ fn validate_global_date_interface_type_graph(
                     SyntaxKind::MethodSignature if expected_declarations.insert(child) => {
                         declaration_order.push(child);
                     }
+                    SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+                        if record
+                            .object_flags()
+                            .contains(ObjectFlags::MEMBERS_RESOLVED)
+                            && store.source_direct_children(child)?.len() == 2
+                            && store
+                                .source_child_with_kind(child, SyntaxKind::Identifier)
+                                .is_some()
+                            && store.source_direct_type_annotation(child).is_some_and(
+                                |annotation| {
+                                    store.source_node_kind(annotation)
+                                        == Some(SyntaxKind::FunctionType)
+                                },
+                            )
+                            && expected_declarations.insert(child) =>
+                    {
+                        declaration_order.push(child);
+                    }
                     SyntaxKind::TypeParameter
                     | SyntaxKind::HeritageClause
                     | SyntaxKind::PropertyDeclaration
@@ -13821,7 +13839,9 @@ fn validate_global_date_interface_type_graph(
             let method_record = store.symbol(source)?;
             let name = method_record.name();
             let method_declarations = method_record.declarations()?;
-            if method_record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
+            let function_property = method_record.flags() == SymbolFlags::PROPERTY;
+            if !function_property
+                && method_record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD
                 || method_record.check_flags() != CheckFlags::NONE
                 || store.get_parent_of_symbol(source) != Some(symbol)
                 || store.get_merged_symbol(source) != Some(source)
@@ -13861,8 +13881,27 @@ fn validate_global_date_interface_type_graph(
                     return None;
                 }
             }
+            if function_property {
+                if method_declarations != [declaration]
+                    || computed
+                    || table
+                        .get(name)
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        != Some(source)
+                    || !seen_methods.insert(source)
+                {
+                    return None;
+                }
+                edges.push(date_function_property_cached_value(
+                    store,
+                    source,
+                    declaration,
+                )?);
+                methods.push(source);
+                continue;
+            }
             let method = if computed {
-                unsupported = true;
+                unsupported |= !resolved;
                 if name != InternalSymbolName::Computed.as_ref() {
                     return None;
                 }
@@ -13947,6 +13986,30 @@ fn validate_global_date_interface_type_graph(
         })
     })();
     valid.unwrap_or(Malformed)
+}
+
+fn date_function_property_cached_value(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Option<TypeId> {
+    let annotation = store.source_direct_type_annotation(declaration)?;
+    let type_ = store.type_node_links(annotation)?.resolved_type?;
+    if store.source_node_kind(annotation) != Some(SyntaxKind::FunctionType)
+        || !store.source_direct_type_annotation_is_exact(annotation, type_)
+        || store.value_symbol_links(property)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return None;
+    }
+    matches!(
+        super::callable_sets::validate_stored_callable_set(store, type_),
+        super::callable_sets::StoredCallableSetValidation::Valid { .. }
+    )
+    .then_some(type_)
 }
 
 fn date_interface_marker(

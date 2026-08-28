@@ -4604,32 +4604,56 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<(SemanticSymbolId, &[TypeId])>,
         targets: Option<CanonicalArrayTargets>,
     ) -> Result<Option<TypeId>, LiteralTypeCacheError> {
+        self.cached_literal_union_type_with_alias_worker(
+            types,
+            alias,
+            Some(targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets)),
+        )
+    }
+
+    /// Reads an annotation union after its caller validates each source constituent.
+    /// Reuses normal reduction and cache checks without traversing unused member types.
+    pub(super) fn cached_annotation_union_type(
+        &self,
+        types: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+    ) -> Result<Option<TypeId>, LiteralTypeCacheError> {
+        self.cached_literal_union_type_with_alias_worker(types, alias, None)
+    }
+
+    fn cached_literal_union_type_with_alias_worker(
+        &self,
+        types: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+        validation: Option<UnionArrayValidation<'_>>,
+    ) -> Result<Option<TypeId>, LiteralTypeCacheError> {
         let alias = alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments));
         if !self.valid_union_alias_key(alias.as_ref()) {
             return Err(alias.map_or(LiteralTypeCacheError::InvalidValue, |alias| {
                 LiteralTypeCacheError::InvalidUnionAlias(alias.symbol)
             }));
         }
-        let validation = targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets);
-        if let Some(alias) = alias.as_ref() {
-            let mut visited = HashSet::new();
-            for argument in &alias.type_arguments {
-                self.validate_cached_array_capability_worker(
-                    *argument,
+        if let Some(validation) = validation {
+            if let Some(alias) = alias.as_ref() {
+                let mut visited = HashSet::new();
+                for argument in &alias.type_arguments {
+                    self.validate_cached_array_capability_worker(
+                        *argument,
+                        validation,
+                        &mut visited,
+                        &HashSet::new(),
+                    )?;
+                }
+            }
+            for type_ in types {
+                self.validate_union_constituent_worker(
+                    *type_,
                     validation,
-                    &mut visited,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
                     &HashSet::new(),
                 )?;
             }
-        }
-        for type_ in types {
-            self.validate_union_constituent_worker(
-                *type_,
-                validation,
-                &mut HashSet::new(),
-                &mut HashSet::new(),
-                &HashSet::new(),
-            )?;
         }
         if let [type_] = types {
             return Ok(Some(*type_));
@@ -4674,13 +4698,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .get(&key)
                     .copied();
                 if let Some(cached) = cached {
-                    self.validate_union_cache_entry(
-                        &key,
-                        cached,
-                        validation,
-                        &mut HashSet::new(),
-                        &HashSet::new(),
-                    )?;
+                    if let Some(validation) = validation {
+                        self.validate_union_cache_entry(
+                            &key,
+                            cached,
+                            validation,
+                            &mut HashSet::new(),
+                            &HashSet::new(),
+                        )?;
+                    } else {
+                        self.validate_union_cache_entry_metadata(&key, cached)?;
+                    }
                 }
                 Ok(cached)
             }

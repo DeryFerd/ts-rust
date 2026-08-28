@@ -5878,9 +5878,28 @@ pub(super) fn optional_constructor_parameter_type(
     if let [type_] = constituents.as_slice() {
         return Ok(Some(*type_));
     }
-    store
-        .cached_literal_union_type_with_alias(&constituents, None, None)
-        .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(declaration)))
+    // Stored constructor checks retain source bindings but not an array context.
+    let published_annotation = stored_constructor_parameter_annotation(store, declaration)
+        .map(|(node, _)| node)
+        .filter(|node| {
+            matches!(
+                store.source_node_kind(*node),
+                Some(
+                    SyntaxKind::TypeReference
+                        | SyntaxKind::UnionType
+                        | SyntaxKind::ParenthesizedType
+                )
+            )
+        })
+        .is_some_and(|node| {
+            stored_constructor_annotation_type(store, node, &mut HashSet::new()) == Some(annotation)
+        });
+    let cached = if published_annotation {
+        store.cached_annotation_union_type(&constituents, None)
+    } else {
+        store.cached_literal_union_type_with_alias(&constituents, None, None)
+    };
+    cached.map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(declaration)))
 }
 
 fn prepare_constructor_parameter_type(
@@ -21340,10 +21359,9 @@ fn stored_constructor_annotation_type_with_alias(
                     .map(|child| stored_constructor_annotation_type(store, child, active))
                     .collect::<Option<Vec<_>>>()?;
                 store
-                    .cached_literal_union_type_with_alias(
+                    .cached_annotation_union_type(
                         &constituents,
                         alias_owner.map(|owner| (owner, &[][..])),
-                        None,
                     )
                     .ok()??
             }
