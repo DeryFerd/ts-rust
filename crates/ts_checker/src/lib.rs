@@ -11149,7 +11149,7 @@ impl<'a> Checker<'a> {
                 value
             }
             NodeData::CallExpression(data) => {
-                if identifier_text(self.arena, data.expression) == Some("import")
+                if ts_ast::is_import_call(self.arena, node)
                     && let Some(specifier) = data
                         .arguments
                         .nodes
@@ -11195,7 +11195,7 @@ impl<'a> Checker<'a> {
                     self.result.node_types.insert(node_id, module_type);
                     return module_type;
                 }
-                if identifier_text(self.arena, data.expression) == Some("import") {
+                if ts_ast::is_import_call(self.arena, node) {
                     for argument in &data.arguments.nodes {
                         self.type_of_expression(*argument);
                     }
@@ -35702,12 +35702,7 @@ mod tests {
         let import_call = index
             .arena
             .iter()
-            .find_map(|(id, node)| {
-                let NodeData::CallExpression(call) = &node.data else {
-                    return None;
-                };
-                (identifier_text(&index.arena, call.expression) == Some("import")).then_some(id)
-            })
+            .find_map(|(id, node)| ts_ast::is_import_call(&index.arena, node).then_some(id))
             .unwrap();
         let import_call_type = checked.files()[2].type_of_node(import_call).unwrap();
         let TypeKind::Object(module) =
