@@ -13220,7 +13220,7 @@ mod tests {
     #[test]
     fn canonical_program_recovers_authenticated_strict_arguments_collisions() {
         type StrictCollisionCase = (&'static str, &'static str, &'static [(u32, u32)]);
-        let cases: [StrictCollisionCase; 3] = [
+        let cases: [StrictCollisionCase; 4] = [
             (
                 "function.ts",
                 concat!(
@@ -13238,6 +13238,36 @@ mod tests {
                     "var second = (...rest) => { var arguments: any[]; };\n",
                 ),
                 &[(1100, 13), (1100, 41), (1100, 91)],
+            ),
+            (
+                "collisionArgumentsArrowFunctions.ts",
+                concat!(
+                    "var f1 = (i: number, ...arguments) => { //arguments is error\n",
+                    "    var arguments: any[]; // no error\n",
+                    "}\n",
+                    "var f12 = (arguments: number, ...rest) => { //arguments is error\n",
+                    "    var arguments = 10; // no error\n",
+                    "}\n",
+                    "var f1NoError = (arguments: number) => { // no error\n",
+                    "    var arguments = 10; // no error\n",
+                    "}\n\n",
+                    "var f2 = (...restParameters) => {\n",
+                    "    var arguments = 10; // No Error\n",
+                    "}\n",
+                    "var f2NoError = () => {\n",
+                    "    var arguments = 10; // no error\n",
+                    "}",
+                ),
+                &[
+                    (1100, 24),
+                    (1100, 69),
+                    (1100, 112),
+                    (1100, 174),
+                    (1100, 221),
+                    (1100, 265),
+                    (1100, 338),
+                    (1100, 400),
+                ],
             ),
             (
                 "types.ts",
@@ -13285,6 +13315,11 @@ mod tests {
                             diagnostic.message,
                             "Type 'number' is not assignable to type 'IArguments'."
                         );
+                    } else {
+                        assert_eq!(
+                            diagnostic.message,
+                            "Invalid use of 'arguments' in strict mode."
+                        );
                     }
                     (diagnostic.code.unwrap(), range.start.get())
                 })
@@ -13294,24 +13329,30 @@ mod tests {
     }
 
     #[test]
-    fn strict_arguments_recovery_does_not_hide_unrelated_unsupported_source() {
+    fn strict_arguments_recovery_keeps_body_errors_and_unrelated_unsupported_source() {
         let sources = [
-            concat!(
-                "var first = (arguments: number) => {\n",
-                "    var arguments = 1;\n",
-                "    const unrelated: number = 'wrong';\n",
-                "};\n",
+            (
+                concat!(
+                    "var first = (arguments: number) => {\n",
+                    "    var arguments = 1;\n",
+                    "    const unrelated: number = 'wrong';\n",
+                    "};\n",
+                ),
+                Some([1100, 1100, 2322]),
             ),
-            concat!(
-                "var first: (arguments: number) => void;\n",
-                "var second: { (arguments: number): Missing; };\n",
+            (
+                concat!(
+                    "var first: (arguments: number) => void;\n",
+                    "var second: { (arguments: number): Missing; };\n",
+                ),
+                None,
             ),
         ];
 
-        for source in sources {
+        for (source, expected) in sources {
             let fs = MemoryFileSystem::new(true);
             fs.write_file("/project/input.ts", source).unwrap();
-            let error = Program::try_new_with_canonical_checker(
+            let result = Program::try_new_with_canonical_checker(
                 &fs,
                 "/project",
                 &["input.ts".to_owned()],
@@ -13324,9 +13365,31 @@ mod tests {
                     lib: Some(vec!["es5".to_owned()]),
                     ..CompilerOptions::default()
                 },
-            )
-            .unwrap_err();
-            assert!(error.is_unsupported_boundary(), "{source}: {error:?}");
+            );
+            if let Some(expected) = expected {
+                let program = result.unwrap();
+                let diagnostics = program.diagnostics();
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code.unwrap())
+                        .collect::<Vec<_>>(),
+                    expected,
+                );
+                let diagnostic = diagnostics.last().unwrap();
+                assert_eq!(
+                    diagnostic.message,
+                    "Type 'string' is not assignable to type 'number'."
+                );
+                let range = diagnostic.range.unwrap();
+                assert_eq!(
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                    "unrelated"
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is_unsupported_boundary(), "{source}: {error:?}");
+            }
         }
     }
 

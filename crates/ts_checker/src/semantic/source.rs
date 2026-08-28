@@ -12418,6 +12418,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let planned = self.finish_linear_function_statements(callable, syntax)?;
                 return Ok(PlannedFunctionBody::Linear(Box::new(planned)));
             }
+            Err(SourceFunctionStatementsError::Unsupported(_))
+                if callable.family == SourceCallableFamily::ArrowFunction
+                    && self.node(callable.declaration)?.kind == SyntaxKind::ArrowFunction =>
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Arrow(callable.body),
+                ));
+            }
             Err(SourceFunctionStatementsError::Unsupported(_)) => {}
             Err(error) => return Err(Self::function_statements_plan_error(callable, error)),
         }
