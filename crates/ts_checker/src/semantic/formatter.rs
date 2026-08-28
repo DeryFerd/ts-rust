@@ -11193,7 +11193,7 @@ mod tests {
     fn namespace_wrappers_keep_import_names_and_nested_default_display() {
         let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let target = parse_source_file("export const value: number = 1;");
-        let wrapped = parse_source_file(
+        let importer = parse_source_file(
             "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
         );
         let bare = parse_source_file(
@@ -11201,7 +11201,7 @@ mod tests {
         );
         for query_first in [false, true] {
             let (mut context, queries) =
-                namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+                namespace_wrapper_display_context(&library, &target, &importer, &bare);
             let cold = query_first.then(|| {
                 let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
                 let before = (
@@ -11352,14 +11352,14 @@ mod tests {
     fn namespace_wrapper_display_rejects_changed_origin_and_caches_without_repair() {
         let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let target = parse_source_file("export const value: number = 1;");
-        let wrapped = parse_source_file(
+        let importer = parse_source_file(
             "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
         );
         let bare = parse_source_file(
             "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
         );
         let (mut context, queries) =
-            namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+            namespace_wrapper_display_context(&library, &target, &importer, &bare);
         let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
         for query in queries {
             context.check_source_file(query.file).unwrap();
@@ -11485,13 +11485,16 @@ mod tests {
                 8 => assert!(store.set_type_symbol(types[1], Some(fake_owner))),
                 _ => unreachable!(),
             }
-            let type_ = types[usize::from(poison >= 7)];
+            let display_type = types[usize::from(poison >= 7)];
             let before = state(context.store());
-            assert!(context.type_to_string(type_).is_err(), "poison={poison}");
+            assert!(
+                context.type_to_string(display_type).is_err(),
+                "poison={poison}"
+            );
             assert_eq!(state(context.store()), before);
             assert!(
                 context
-                    .type_to_string_at_location(type_, queries[0])
+                    .type_to_string_at_location(display_type, queries[0])
                     .is_err(),
                 "poison={poison}"
             );
@@ -11582,7 +11585,7 @@ mod tests {
     fn namespace_wrapper_owner_loss_is_read_only_before_and_after_publication() {
         let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let target = parse_source_file("export interface Marker {}");
-        let wrapped = parse_source_file(
+        let importer = parse_source_file(
             "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
         );
         let bare = parse_source_file(
@@ -11590,7 +11593,7 @@ mod tests {
         );
         for published in [false, true] {
             let (mut context, queries) =
-                namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+                namespace_wrapper_display_context(&library, &target, &importer, &bare);
             let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
             if published {
                 for query in queries {
@@ -11816,14 +11819,14 @@ mod tests {
         let target = parse_source_file(
             "export const value: number = 1; function hidden(value: string): string { return value; }",
         );
-        let wrapped = parse_source_file(
+        let importer = parse_source_file(
             "import * as ns from './producer.cjs'; export type Copy = typeof ns; export const copied = ns;",
         );
         let bare = parse_source_file(
             "import * as bare from './producer.cjs'; export type Copy = typeof bare; export const copied = bare;",
         );
         let (mut context, queries) =
-            namespace_wrapper_display_context(&library, &target, &wrapped, &bare);
+            namespace_wrapper_display_context(&library, &target, &importer, &bare);
         let types = queries.map(|query| context.get_type_from_type_node(query).unwrap());
         for query in queries {
             context.check_source_file(query.file).unwrap();

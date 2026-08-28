@@ -29155,7 +29155,7 @@ mod query_tests {
                     context
                         .store()
                         .signature(signature)
-                        .map(|signature| signature.resolved_return_type()),
+                        .map(super::super::signatures::Signature::resolved_return_type),
                 )
             };
             let before = snapshot(&context);
@@ -30073,7 +30073,7 @@ mod tests {
         assert!(
             fixture
                 .store
-                .set_declared_type_links(derived, Default::default())
+                .set_declared_type_links(derived, crate::semantic::DeclaredTypeLinks::default())
         );
         assert!(
             fixture
@@ -30098,7 +30098,7 @@ mod tests {
         );
         assert_eq!(
             fixture.store.declared_type_links(derived),
-            Some(&Default::default())
+            Some(&crate::semantic::DeclaredTypeLinks::default())
         );
         assert_eq!(
             fixture.store.value_symbol_links(derived),

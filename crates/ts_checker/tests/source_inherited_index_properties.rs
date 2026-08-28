@@ -245,11 +245,7 @@ fn inherited_numeric_indexes_reject_incompatible_numeric_names_without_members()
                 kind: SyntaxKind::InterfaceDeclaration,
             },
         ));
-        assert_eq!(
-            context.check_source_file(file),
-            Err(expected.clone()),
-            "{property}"
-        );
+        assert_eq!(context.check_source_file(file), Err(expected), "{property}");
         let symbol = context
             .file(file)
             .unwrap()

@@ -243,7 +243,7 @@ fn property_recovery_wave148_parameter_return_and_callable_identity() {
                 assert!(store.set_signature_resolved_return_type(signature, Some(number)));
             }
             "this_parameter" => {
-                assert!(store.set_signature_this_parameter(signature, Some(parameter)))
+                assert!(store.set_signature_this_parameter(signature, Some(parameter)));
             }
             "signature_flags" => {
                 let flags =
@@ -255,7 +255,7 @@ fn property_recovery_wave148_parameter_return_and_callable_identity() {
                 assert!(store.set_signature_target_and_mapper(signature, Some(signature), mapper));
             }
             "isolated_callable" => {
-                assert!(store.set_signature_isolated_type(signature, Some(result)))
+                assert!(store.set_signature_isolated_type(signature, Some(result)));
             }
             "same_shape_signature_copy" => {
                 let record = store.signature(signature).unwrap();

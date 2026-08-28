@@ -5583,7 +5583,7 @@ mod tests {
             .store()
             .symbol(first)
             .filter(|record| record.flags().contains(SymbolFlags::PROPERTY))
-            .and_then(|record| record.value_declaration())
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
             .and_then(|declaration| context.store().source_direct_type_annotation(declaration));
         if let Some(annotation) = annotation
             && !matches!(
@@ -6568,7 +6568,7 @@ mod tests {
                     None
                 )),
                 "minimum" => {
-                    assert!(store.set_signature_resolved_min_argument_count(signature, 99))
+                    assert!(store.set_signature_resolved_min_argument_count(signature, 99));
                 }
                 "source_result" => {
                     let string = store.intrinsic_bootstrap().unwrap().string_type;
@@ -8706,13 +8706,13 @@ mod tests {
         let mapper = signature.mapper().unwrap();
         assert_eq!(signature.target(), Some(original_signature));
         let original = store.canonical_tuple_shape(template).unwrap().unwrap();
-        let mapped = store.canonical_tuple_shape(actual).unwrap().unwrap();
-        assert_eq!(mapped.target(), original.target());
-        assert_eq!(mapped.element_infos(), original.element_infos());
-        assert!(mapped.is_readonly());
-        assert_eq!(mapped.element_types()[0], number);
+        let result_shape = store.canonical_tuple_shape(actual).unwrap().unwrap();
+        assert_eq!(result_shape.target(), original.target());
+        assert_eq!(result_shape.element_infos(), original.element_infos());
+        assert!(result_shape.is_readonly());
+        assert_eq!(result_shape.element_types()[0], number);
         let TypeData::Union(optional) = store
-            .type_payload(mapped.element_types()[1])
+            .type_payload(result_shape.element_types()[1])
             .unwrap()
             .data()
         else {

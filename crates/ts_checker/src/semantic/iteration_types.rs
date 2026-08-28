@@ -44,6 +44,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, IntrinsicBootstrapOptions, production::GlobalMergeCompletion,
+        type_records::TypeRecord,
     };
 
     fn parsed(text: &str) -> ParseResult {
@@ -173,7 +174,7 @@ mod tests {
             name: EscapedNameRef<'_>,
         ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
             if matches!(
-                store.type_payload(receiver).map(|record| record.data()),
+                store.type_payload(receiver).map(TypeRecord::data),
                 Some(TypeData::Union(_))
             ) {
                 use crate::semantic::member_resolution::UnionPropertyError;

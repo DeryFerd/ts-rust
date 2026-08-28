@@ -56,6 +56,7 @@ fn context(parsed: &ParseResult, exact: bool) -> CanonicalCheckerContext<'_> {
     .unwrap()
 }
 
+#[allow(clippy::too_many_lines)] // Diagnostics, field types, and replay checks share one source case.
 fn assert_case(
     source: &str,
     exact: bool,

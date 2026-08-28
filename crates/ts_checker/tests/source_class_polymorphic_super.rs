@@ -104,6 +104,7 @@ fn member(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Cold and replay checks share class, member, and mapper identities.
 fn class_polymorphic_super_uses_base_members_and_derived_this_cold_and_warm() {
     let parsed = parse_source_file(concat!(
         "class Base { self(first: number, second: string) { return this; } ",
@@ -213,13 +214,14 @@ fn class_polymorphic_super_uses_base_members_and_derived_this_cold_and_warm() {
             Some(base_self)
         );
 
-        let mapped = node_type(&context, *access);
-        assert_ne!(mapped, base_self_type);
+        let method_type = node_type(&context, *access);
+        assert_ne!(method_type, base_self_type);
         assert_eq!(
-            context.type_to_string(mapped).unwrap(),
+            context.type_to_string(method_type).unwrap(),
             "(first: number, second: string) => this"
         );
-        let TypeData::Object(value) = context.store().type_payload(mapped).unwrap().data() else {
+        let TypeData::Object(value) = context.store().type_payload(method_type).unwrap().data()
+        else {
             panic!("the selected method has an instantiated callable value")
         };
         assert_eq!(value.target, Some(base_self_type));
@@ -352,6 +354,7 @@ fn class_polymorphic_super_uses_base_members_and_derived_this_cold_and_warm() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Return identity and replay checks share one source fixture.
 fn class_polymorphic_super_preserves_this_free_object_and_named_returns() {
     let parsed = parse_source_file(concat!(
         "class Named {} ",
@@ -463,6 +466,7 @@ fn class_polymorphic_super_preserves_this_free_object_and_named_returns() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Both derived classes share a checker to compare their mapped methods.
 fn class_polymorphic_super_maps_an_inherited_method_for_each_derived_class() {
     let parsed = parse_source_file(concat!(
         "class Base { self() { return this; } } ",

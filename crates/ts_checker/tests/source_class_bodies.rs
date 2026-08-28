@@ -144,6 +144,7 @@ fn counts(context: &CanonicalCheckerContext<'_>) -> (usize, usize, usize, usize)
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Constructor, method, and replay checks share the base class identities.
 fn constructors_and_overridden_methods_keep_base_identities() {
     let parsed = parse_source_file(concat!(
         "class Point {\n",
@@ -190,7 +191,7 @@ fn constructors_and_overridden_methods_keep_base_identities() {
     let point_method = context
         .store()
         .symbol(point)
-        .and_then(|owner| owner.members())
+        .and_then(ts_binder::semantic::Symbol::members)
         .and_then(|members| context.store().symbol_table(members))
         .and_then(|members| members.get_source("toString"))
         .unwrap();

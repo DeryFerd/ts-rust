@@ -20481,10 +20481,11 @@ mod selected_source_member_tests {
                         tables.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
                             match poison {
                                 Poison::Empty => Some(store.alloc_symbol_table()),
-                                Poison::Reduced => Some(
-                                    raw.map(|raw| store.clone_symbol_table(raw).unwrap())
-                                        .unwrap_or_else(|| store.alloc_symbol_table()),
-                                ),
+                                Poison::Reduced => Some(if let Some(raw) = raw {
+                                    store.clone_symbol_table(raw).unwrap()
+                                } else {
+                                    store.alloc_symbol_table()
+                                }),
                                 Poison::RawAlias => raw,
                                 Poison::MissingTable => None,
                                 _ => unreachable!(),
@@ -20492,7 +20493,13 @@ mod selected_source_member_tests {
                         assert!(store.set_members_and_exports_links(owner, tables));
                     }
                     Poison::WrongOwner => {
-                        assert!(store.set_symbol_relationships(late, None, None, Some(other), None))
+                        assert!(store.set_symbol_relationships(
+                            late,
+                            None,
+                            None,
+                            Some(other),
+                            None
+                        ));
                     }
                     Poison::WrongDeclaration => {
                         let foreign = store
@@ -20513,7 +20520,7 @@ mod selected_source_member_tests {
                         assert!(store.set_value_symbol_links(late, links));
                     }
                     Poison::ReverseLink => {
-                        assert!(store.set_late_bound_links(early, LateBoundLinks::default()))
+                        assert!(store.set_late_bound_links(early, LateBoundLinks::default()));
                     }
                     Poison::DeclarationLink => assert!(
                         store.set_symbol_node_links(declaration, SymbolNodeLinks::default())
@@ -20710,7 +20717,12 @@ mod selected_source_member_tests {
                     Some(vec![])
                 )),
                 5 => {
-                    assert!(store.set_interface_base_resolution(receiver, true, None, Some(vec![])))
+                    assert!(store.set_interface_base_resolution(
+                        receiver,
+                        true,
+                        None,
+                        Some(vec![])
+                    ));
                 }
                 _ => unreachable!(),
             }
@@ -25733,11 +25745,10 @@ mod generic_publication_tests {
                 .members_and_exports_links(owner)
                 .unwrap()
                 .clone();
-            assert!(
-                fixture
-                    .store
-                    .set_members_and_exports_links(owner, Default::default())
-            );
+            assert!(fixture.store.set_members_and_exports_links(
+                owner,
+                crate::semantic::MembersAndExportsLinks::default()
+            ));
             let before = snapshot(&fixture.store);
             assert!(publish_interface_method_values(&mut fixture.store, &plan, &types).is_err());
             assert_eq!(snapshot(&fixture.store), before);

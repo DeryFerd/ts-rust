@@ -262,12 +262,12 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
             .class_instance_super_member(view.reference, member)
             .unwrap()
             .clone();
-        let mapped = retained.callable.as_ref().unwrap().signature;
+        let instantiated_signature = retained.callable.as_ref().unwrap().signature;
         let original = retained.source_callable.as_ref().unwrap().signature;
         assert!(matches!(
             validate_stored_callable_set(context.store(), retained.type_),
             StoredCallableSetValidation::Valid { projection, .. }
-                if projection.call_signatures[0].signature == mapped,
+                if projection.call_signatures[0].signature == instantiated_signature,
         ));
         let bound = context.file(FILE).unwrap().1.clone();
         let host = host(&parsed, &bound);
@@ -275,7 +275,7 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
         let store = context.store_mut_for_test();
         match poison {
             Poison::ReceiverTarget => {
-                assert!(store.set_object_target_and_mapper(view.reference, Some(instance), None))
+                assert!(store.set_object_target_and_mapper(view.reference, Some(instance), None));
             }
             Poison::ThisArgument => assert!(store.set_type_reference_resolution(
                 view.reference,
@@ -302,8 +302,8 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
                 ));
             }
             Poison::SignatureTarget => assert!(store.set_signature_target_and_mapper(
-                mapped,
-                Some(mapped),
+                instantiated_signature,
+                Some(instantiated_signature),
                 Some(retained.mapper)
             )),
             Poison::SignatureMapper => {
@@ -311,14 +311,15 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
                     .new_type_mapper(vec![view.origin.base_this], vec![view.origin.base_this])
                     .unwrap();
                 assert!(store.set_signature_target_and_mapper(
-                    mapped,
+                    instantiated_signature,
                     Some(original),
                     Some(mapper)
                 ));
             }
-            Poison::SignatureReturn => assert!(
-                store.set_signature_resolved_return_type(mapped, Some(view.origin.base_this))
-            ),
+            Poison::SignatureReturn => assert!(store.set_signature_resolved_return_type(
+                instantiated_signature,
+                Some(view.origin.base_this)
+            )),
             Poison::ThisParameterDefault => assert!(store.set_type_parameter_resolution(
                 view.origin.this_type,
                 Some(instance),

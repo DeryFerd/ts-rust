@@ -693,7 +693,7 @@ fn check_declared_cache_changes(text: &str, class: bool) {
             let store = context.store_mut_for_test();
             match change {
                 CacheChange::MissingDeclared => {
-                    assert!(store.set_declared_type_links(owner, DeclaredTypeLinks::default()))
+                    assert!(store.set_declared_type_links(owner, DeclaredTypeLinks::default()));
                 }
                 CacheChange::OtherDeclared
                 | CacheChange::OtherDeclaredAndNode

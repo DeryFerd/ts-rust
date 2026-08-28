@@ -5905,7 +5905,7 @@ mod tests {
         let own = fixture
             .store
             .symbol(owner)
-            .and_then(|owner| owner.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .and_then(|members| fixture.store.symbol_table(members))
             .and_then(|members| members.get_source("own"))
             .unwrap();
@@ -5940,7 +5940,7 @@ mod tests {
             let own = fixture
                 .store
                 .symbol(owner)
-                .and_then(|owner| owner.members())
+                .and_then(ts_binder::semantic::Symbol::members)
                 .and_then(|members| fixture.store.symbol_table(members))
                 .and_then(|members| members.get_source("own"))
                 .unwrap();
@@ -5992,7 +5992,7 @@ mod tests {
             let own = fixture
                 .store
                 .symbol(owner)
-                .and_then(|owner| owner.members())
+                .and_then(ts_binder::semantic::Symbol::members)
                 .and_then(|members| fixture.store.symbol_table(members))
                 .and_then(|members| members.get_source("own"))
                 .unwrap();

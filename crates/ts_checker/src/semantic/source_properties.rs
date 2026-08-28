@@ -4835,10 +4835,7 @@ mod tests {
         store
     }
 
-    fn class_body_context<'arena>(
-        parsed: &'arena ParseResult,
-        file: FileId,
-    ) -> CanonicalCheckerContext<'arena> {
+    fn class_body_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -5581,7 +5578,7 @@ mod tests {
         let file = FileId::new(25_144);
         let mut context = class_body_context(&parsed, file);
         match context.check_source_file(file) {
-            Ok(_) => {
+            Ok(()) => {
                 assert!(
                     context.diagnostics().is_empty(),
                     "{:?}",
@@ -9039,7 +9036,7 @@ mod tests {
             .1
             .symbol(binding)
             .unwrap();
-        let wrapped = context
+        let receiver_type = context
             .store()
             .value_symbol_links(alias)
             .unwrap()
@@ -9063,7 +9060,7 @@ mod tests {
             .unwrap();
         let members = context
             .store()
-            .type_payload(wrapped)
+            .type_payload(receiver_type)
             .unwrap()
             .data()
             .structured()
@@ -9111,7 +9108,7 @@ mod tests {
                     store.alias_symbol_links(wrapper.default).cloned(),
                     store.value_symbol_links(default).cloned(),
                     store.export_type_links(wrapper.namespace).cloned(),
-                    store.type_payload(wrapped).unwrap().symbol(),
+                    store.type_payload(receiver_type).unwrap().symbol(),
                 ),
                 store
                     .source_file_namespace_identity(wrapper.namespace)
@@ -9138,7 +9135,7 @@ mod tests {
                     }
                 ));
                 match poison {
-                    0 => assert!(store.set_type_symbol(wrapped, None)),
+                    0 => assert!(store.set_type_symbol(receiver_type, None)),
                     1 => {
                         let mut links = default_alias.clone();
                         links.alias_target = AliasTargetState::Resolved(wrapper.namespace);
@@ -9164,18 +9161,18 @@ mod tests {
                 }
                 let before = state(store);
                 assert_eq!(
-                    check_direct_source_property(store, None, &plan, wrapped),
+                    check_direct_source_property(store, None, &plan, receiver_type),
                     Err(SourcePropertyError::InvalidCache(access)),
                     "warm={warm}, poison={poison}"
                 );
                 assert_eq!(state(store), before, "warm={warm}, poison={poison}");
-                assert!(store.set_type_symbol(wrapped, Some(wrapper.namespace)));
+                assert!(store.set_type_symbol(receiver_type, Some(wrapper.namespace)));
                 assert!(store.set_alias_symbol_links(wrapper.default, default_alias.clone()));
                 assert!(store.set_value_symbol_links(default, default_value.clone()));
                 assert!(store.set_value_symbol_links(alias, alias_value.clone()));
                 assert!(store.set_export_type_links(wrapper.namespace, exports.clone()));
                 assert_eq!(
-                    check_direct_source_property(store, None, &plan, wrapped),
+                    check_direct_source_property(store, None, &plan, receiver_type),
                     Ok(CheckedSourceProperty {
                         type_: bare,
                         diagnostics: Vec::new()
@@ -9275,7 +9272,7 @@ mod tests {
             .unwrap()
             .get_source("copied")
             .unwrap();
-        let wrapped = context
+        let receiver_type = context
             .store()
             .value_symbol_links(copied)
             .unwrap()
@@ -9283,7 +9280,7 @@ mod tests {
             .unwrap();
         let namespace = context
             .store()
-            .type_payload(wrapped)
+            .type_payload(receiver_type)
             .unwrap()
             .symbol()
             .unwrap();
@@ -9322,7 +9319,7 @@ mod tests {
                     [store.type_len(), store.symbol_len(), store.mapper_len()],
                     store.type_node_links(access).cloned(),
                     store.symbol_node_links(access).cloned(),
-                    store.type_payload(wrapped).unwrap().symbol(),
+                    store.type_payload(receiver_type).unwrap().symbol(),
                     store.source_file_namespace_identity(namespace).cloned(),
                     store.value_symbol_links(copied).cloned(),
                     store.relation_state_snapshot(),
@@ -9347,20 +9344,20 @@ mod tests {
                             SymbolNodeLinks::default()
                         }
                     ));
-                    assert!(store.set_type_symbol(wrapped, owner));
+                    assert!(store.set_type_symbol(receiver_type, owner));
                     let before = state(store);
-                    let result = check_direct_source_property(store, None, &plan, wrapped);
+                    let result = check_direct_source_property(store, None, &plan, receiver_type);
                     if result.is_ok() || state(store) != before {
                         failures.push(format!(
                             "property={}, warm={warm}, owner={owner:?}, result={result:?}, unchanged={}",
                             syntax.name, state(store) == before,
                         ));
                     }
-                    assert!(store.set_type_symbol(wrapped, Some(namespace)));
+                    assert!(store.set_type_symbol(receiver_type, Some(namespace)));
                     assert!(store.set_type_node_links(access, original_type.clone()));
                     assert!(store.set_symbol_node_links(access, original_symbol.clone()));
                     assert_eq!(
-                        check_direct_source_property(store, None, &plan, wrapped).unwrap(),
+                        check_direct_source_property(store, None, &plan, receiver_type).unwrap(),
                         CheckedSourceProperty {
                             type_: original_type.resolved_type.unwrap(),
                             diagnostics: Vec::new(),

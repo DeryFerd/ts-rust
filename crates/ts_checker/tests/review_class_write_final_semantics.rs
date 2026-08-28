@@ -4,7 +4,8 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+    CanonicalCheckerContext, CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions,
+    IntrinsicBootstrapOptions,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
@@ -184,7 +185,7 @@ fn diagnostic_records(
         .map(|entry| {
             let range = entry.range_override.map_or_else(
                 || parsed.arena.get(entry.node.unwrap().node).unwrap().range,
-                |range| range.range(),
+                CanonicalCheckerDiagnosticRange::range,
             );
             DiagnosticRecord {
                 code: entry.diagnostic.code(),

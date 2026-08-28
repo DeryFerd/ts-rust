@@ -484,6 +484,7 @@ fn unsupported_class_property_writes_fail_before_class_preparation() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Flow and replay checks share the same constructor and mapped call.
 fn constructor_write_flow_survives_a_mapped_instance_super_call() {
     let parsed = parse_source_file(concat!(
         "class Base { self() { return this; } } ",

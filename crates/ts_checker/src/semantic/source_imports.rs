@@ -10313,8 +10313,8 @@ mod tests {
                     .unwrap()
                     .symbol()
                     .unwrap();
-                let wrapped = usage_mode == Esm && target_mode == CommonJs;
-                if wrapped {
+                let needs_wrapper = usage_mode == Esm && target_mode == CommonJs;
+                if needs_wrapper {
                     assert_ne!(namespace, module);
                     assert_eq!(
                         context.store().export_type_links(namespace).unwrap().target,
@@ -10378,7 +10378,7 @@ mod tests {
                     .unwrap()
                     .resolved_type
                     .unwrap();
-                if wrapped {
+                if needs_wrapper {
                     assert_ne!(bare_type, type_);
                     let wrapper = context
                         .store()

@@ -7347,9 +7347,9 @@ mod tests {
                 .resolve_alias(namespace)
                 .unwrap();
 
-            let wrapped = usage_mode == CanonicalModuleResolutionMode::Esm
+            let needs_wrapper = usage_mode == CanonicalModuleResolutionMode::Esm
                 && target_mode == CanonicalModuleResolutionMode::CommonJs;
-            let expected = if wrapped {
+            let expected = if needs_wrapper {
                 let wrapper = store.source_file_namespace_wrapper(namespace).unwrap();
                 assert_eq!(wrapper.source.module, module);
                 assert!(source_file_namespace_wrapper_is_exact(&store, wrapper));
@@ -7358,15 +7358,15 @@ mod tests {
                 module
             };
             let allocations = (
-                symbols.0 + usize::from(wrapped) * 2,
-                symbols.1 + usize::from(wrapped),
+                symbols.0 + usize::from(needs_wrapper) * 2,
+                symbols.1 + usize::from(needs_wrapper),
             );
             assert_eq!(resolved.target, AliasTargetState::Resolved(expected));
             assert!(resolved.events.is_empty());
             assert_eq!(
                 store.alias_symbol_links(namespace),
                 Some(&AliasSymbolLinks {
-                    immediate_target: wrapped.then_some(expected),
+                    immediate_target: needs_wrapper.then_some(expected),
                     alias_target: AliasTargetState::Resolved(expected),
                     ..AliasSymbolLinks::default()
                 }),
@@ -7386,7 +7386,7 @@ mod tests {
                 store
                     .alias_symbol_links(namespace)
                     .and_then(|links| links.immediate_target),
-                wrapped.then_some(expected),
+                needs_wrapper.then_some(expected),
             );
             assert_eq!(
                 (store.symbol_len(), store.symbol_store().symbol_table_len()),
