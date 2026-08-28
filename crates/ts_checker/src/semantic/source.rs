@@ -1900,11 +1900,12 @@ enum SourceModuleSpecifierGrammar {
     Invalid(NodeRef),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct DeferredAssertion {
     node: NodeRef,
     operand_type: TypeId,
     target_type: TypeId,
+    array_operand: Option<(Box<PlannedExpression>, CheckedExpressionTypes)>,
 }
 
 #[derive(Clone, Debug)]
@@ -28958,6 +28959,26 @@ fn check_expression_type_with_class_context(
                 ));
             }
 
+            let literal_target = if !*const_assertion
+                && matches!(
+                    &operand.unparenthesized().kind,
+                    PlannedExpressionKind::Array(_) | PlannedExpressionKind::Object { .. }
+                ) {
+                let mut assertion_diagnostics = CanonicalCheckerDiagnostics::default();
+                let target = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut assertion_diagnostics,
+                )?
+                .get_type_from_type_node(*type_node);
+                merge_retry_diagnostics(diagnostics, assertion_diagnostics);
+                Some(target?)
+            } else {
+                None
+            };
             let operand_types = check_expression_type_with_class_context(
                 store,
                 host,
@@ -28969,7 +28990,7 @@ fn check_expression_type_with_class_context(
                 current_flow_types,
                 preflighted_type_import_value_uses,
                 operand,
-                None,
+                literal_target,
                 deferred,
                 class_flow.as_deref_mut(),
             )?;
@@ -29037,24 +29058,33 @@ fn check_expression_type_with_class_context(
                 publish_expression_type(store, expression.node, target)?;
                 return Ok(CheckedExpressionTypes::leaf(target, target));
             }
-            let mut assertion_diagnostics = CanonicalCheckerDiagnostics::default();
-            let target = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                &mut assertion_diagnostics,
-            )?
-            .get_type_from_type_node(*type_node);
-            merge_retry_diagnostics(diagnostics, assertion_diagnostics);
-            let target = target?;
+            let target = if let Some(target) = literal_target {
+                target
+            } else {
+                let mut assertion_diagnostics = CanonicalCheckerDiagnostics::default();
+                let target = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut assertion_diagnostics,
+                )?
+                .get_type_from_type_node(*type_node);
+                merge_retry_diagnostics(diagnostics, assertion_diagnostics);
+                target?
+            };
             publish_expression_type(store, expression.node, target)?;
             enqueue_deferred_assertion(store, source, expression.node)?;
             deferred.push(DeferredAssertion {
                 node: expression.node,
                 operand_type: operand_types.result,
                 target_type: target,
+                array_operand: matches!(
+                    &operand.unparenthesized().kind,
+                    PlannedExpressionKind::Array(_)
+                )
+                .then(|| (operand.clone(), operand_types)),
             });
             Ok(CheckedExpressionTypes::leaf(target, target))
         }
@@ -32374,6 +32404,25 @@ fn check_deferred_assertions(
             widened,
             global_types,
         )? {
+            continue;
+        }
+        if let Some((expression, checked)) = &assertion.array_operand
+            && let Some(elaborated) =
+                super::array_diagnostics::diagnostics_for_failed_array_assignment(
+                    store,
+                    host,
+                    global_types,
+                    expression,
+                    checked,
+                    assertion.target_type,
+                    options,
+                    session,
+                )?
+            && let Some(diagnostic) = elaborated.into_iter().next()
+            && matches!(diagnostic.diagnostic.code(), 2353 | 2561)
+        {
+            // The pinned relater keeps the excess-property error without a conversion header.
+            merge_retry_diagnostic(diagnostics, diagnostic);
             continue;
         }
         let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(

@@ -28,6 +28,9 @@ pub mod project;
 #[cfg(test)]
 mod artifact_classification_review;
 
+#[cfg(test)]
+mod array_cast_fixture;
+
 use artifacts::{
     ArtifactRenderError, GeneratedSemanticArtifacts, SemanticArtifactError, SemanticArtifactKind,
 };
