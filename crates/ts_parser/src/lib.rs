@@ -2002,7 +2002,33 @@ impl<'a> Parser<'a> {
                     self.error_current("Expected ','.");
                     continue;
                 }
-                if self.current.kind == SyntaxKind::LessThanToken {
+                // A stopped assertion leaves the declaration list expecting a comma.
+                let stopped_assertion = self
+                    .arena
+                    .get(declaration)
+                    .and_then(|node| match &node.data {
+                        NodeData::VariableDeclaration(declaration) => declaration.initializer,
+                        _ => None,
+                    })
+                    .and_then(|initializer| self.arena.get(initializer))
+                    .is_some_and(|node| {
+                        matches!(
+                            node.kind,
+                            SyntaxKind::AsExpression | SyntaxKind::SatisfiesExpression
+                        )
+                    });
+                let higher_operator =
+                    binary_precedence(self.current.kind).is_some_and(|(precedence, _)| {
+                        precedence > binary_precedence(SyntaxKind::AsKeyword).unwrap().0
+                    });
+                if self.current.kind == SyntaxKind::LessThanToken
+                    || stopped_assertion
+                        && higher_operator
+                        && !self
+                            .current
+                            .flags
+                            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                {
                     self.error_current("Expected ','.");
                 }
                 break;
@@ -6115,6 +6141,7 @@ impl<'a> Parser<'a> {
         {
             left = self.parse_single_parameter_arrow_function(left);
         }
+        let mut last_operand = left;
         loop {
             if self.disallow_in && self.current.kind == SyntaxKind::InKeyword {
                 break;
@@ -6132,6 +6159,63 @@ impl<'a> Parser<'a> {
                 && !self.expression_can_precede_assignment(left, self.current.kind)
             {
                 break;
+            }
+            if matches!(
+                self.current.kind,
+                SyntaxKind::AsKeyword | SyntaxKind::SatisfiesKeyword
+            ) {
+                if self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                {
+                    break;
+                }
+                let kind = self.consume().kind;
+                let last_precedence = match &self.arena.get(last_operand).unwrap().data {
+                    NodeData::BinaryExpression(binary) => {
+                        binary_precedence(self.arena.get(binary.operator_token).unwrap().kind)
+                            .map(|(precedence, _)| precedence)
+                    }
+                    _ => None,
+                };
+                let previous_context = self.type_parse_context;
+                self.type_parse_context = TypeParseContext::ExpressionCast;
+                let type_node = self.parse_type();
+                self.type_parse_context = previous_context;
+                let data = if kind == SyntaxKind::AsKeyword {
+                    NodeData::AsExpression(Box::new(AsExpressionData {
+                        expression: left,
+                        type_: type_node,
+                    }))
+                } else {
+                    NodeData::SatisfiesExpression(Box::new(SatisfiesExpressionData {
+                        expression: left,
+                        type_: type_node,
+                    }))
+                };
+                left = self.alloc_node(
+                    if kind == SyntaxKind::AsKeyword {
+                        SyntaxKind::AsExpression
+                    } else {
+                        SyntaxKind::SatisfiesExpression
+                    },
+                    TextRange::new(self.node_start(left), self.node_end(type_node)),
+                    data,
+                    &[left, type_node],
+                );
+                if self.current.kind == SyntaxKind::GreaterThanToken {
+                    self.current = self.scanner.rescan_greater_than_token();
+                }
+                // Keep the operand before the assertion chain. An operator with
+                // higher precedence would change its grouping after erasure.
+                if let Some(last_precedence) = last_precedence
+                    && binary_precedence(self.current.kind)
+                        .is_some_and(|(precedence, _)| precedence > last_precedence)
+                {
+                    break;
+                }
+                continue;
             }
             let operator = self.consume();
             let operator_node = self.alloc_node(
@@ -6177,6 +6261,7 @@ impl<'a> Parser<'a> {
                 })),
                 &[left, operator_node, right],
             );
+            last_operand = left;
         }
         let block_bodied_arrow = matches!(
             self.arena.get(left).map(|node| &node.data),
@@ -7038,39 +7123,6 @@ impl<'a> Parser<'a> {
                         TextRange::new(self.node_start(expression), end),
                         NodeData::NonNullExpression(Box::new(NonNullExpressionData { expression })),
                         &[expression],
-                    );
-                }
-                SyntaxKind::AsKeyword | SyntaxKind::SatisfiesKeyword
-                    if !self
-                        .current
-                        .flags
-                        .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK) =>
-                {
-                    let kind = self.consume().kind;
-                    let previous_context = self.type_parse_context;
-                    self.type_parse_context = TypeParseContext::ExpressionCast;
-                    let type_node = self.parse_type();
-                    self.type_parse_context = previous_context;
-                    let data = if kind == SyntaxKind::AsKeyword {
-                        NodeData::AsExpression(Box::new(AsExpressionData {
-                            expression,
-                            type_: type_node,
-                        }))
-                    } else {
-                        NodeData::SatisfiesExpression(Box::new(SatisfiesExpressionData {
-                            expression,
-                            type_: type_node,
-                        }))
-                    };
-                    expression = self.alloc_node(
-                        if kind == SyntaxKind::AsKeyword {
-                            SyntaxKind::AsExpression
-                        } else {
-                            SyntaxKind::SatisfiesExpression
-                        },
-                        TextRange::new(self.node_start(expression), self.node_end(type_node)),
-                        data,
-                        &[expression, type_node],
                     );
                 }
                 _ => break,
@@ -11104,7 +11156,9 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
         | SyntaxKind::GreaterThanToken
         | SyntaxKind::GreaterThanEqualsToken
         | SyntaxKind::InKeyword
-        | SyntaxKind::InstanceOfKeyword => (10, false),
+        | SyntaxKind::InstanceOfKeyword
+        | SyntaxKind::AsKeyword
+        | SyntaxKind::SatisfiesKeyword => (10, false),
         SyntaxKind::LessThanLessThanToken
         | SyntaxKind::GreaterThanGreaterThanToken
         | SyntaxKind::GreaterThanGreaterThanGreaterThanToken => (11, false),

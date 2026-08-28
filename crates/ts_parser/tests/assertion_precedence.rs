@@ -2,6 +2,7 @@ use ts_ast::{NodeData, NodeId, SyntaxKind};
 use ts_parser::{ParseResult, parse_source_file};
 
 const FIXTURE: &str = include_str!("fixtures/disallowUnerasableAssertion.ts");
+const CONTROLS: &str = include_str!("fixtures/assertion-precedence-controls.ts");
 
 fn initializer(parsed: &ParseResult, name: &str) -> NodeId {
     parsed
@@ -196,5 +197,92 @@ fn original_fixture_preserves_all_48_assertion_trees() {
                 "{name}",
             );
         }
+    }
+}
+
+#[test]
+fn mixed_assertions_track_the_last_binary_operand_and_rescan_operators() {
+    let parsed = parse_source_file(CONTROLS);
+    let expected = [(1, 56, 1), (2, 56, 1), (5, 39, 2), (6, 38, 2), (9, 52, 1)].map(
+        |(line, column, length)| {
+            let start = CONTROLS
+                .split_inclusive('\n')
+                .take(line - 1)
+                .map(str::len)
+                .sum::<usize>()
+                + column
+                - 1;
+            let start = u32::try_from(start).unwrap();
+            (Some(1005), start, start + length, "',' expected.")
+        },
+    );
+    assert_eq!(
+        parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.code,
+                diagnostic.range.start.get(),
+                diagnostic.range.end.get(),
+                diagnostic.message.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        expected,
+    );
+    for (name, expected) in [
+        ("mixed1", "(satisfies (as (+ 1 1) number) number)"),
+        ("mixed2", "(as (satisfies (+ 1 1) number) number)"),
+        ("shift", "(as (< 1 1) boolean)"),
+        ("power", "(as (+ 1 1) number)"),
+        ("later", "(as (+ (as (* 1 1) number) 2) number)"),
+        (
+            "grouped",
+            "(* (paren (satisfies (as (+ 1 1) number) number)) 2)",
+        ),
+        ("unary", "(* (satisfies (as 1 number) number) 2)"),
+        ("equal", "(* (as (* 1 1) number) 2)"),
+        ("lower", "(+ (as (* 1 1) number) 2)"),
+        ("equalPower", "(** (as (** 2 3) number) 2)"),
+    ] {
+        assert_eq!(
+            expression_shape(&parsed, initializer(&parsed, name)),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn assertion_keywords_after_line_breaks_remain_separate_calls() {
+    let parsed = parse_source_file(CONTROLS);
+    for (variable, callee, text) in [
+        ("line1", "as", "as(2)"),
+        ("line2", "satisfies", "satisfies(3)"),
+    ] {
+        let value = initializer(&parsed, variable);
+        assert_eq!(
+            parsed.arena.get(value).unwrap().kind,
+            SyntaxKind::NumericLiteral
+        );
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::CallExpression(call) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(call.expression)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == callee).then_some(node)
+            })
+            .unwrap();
+        assert_eq!(source_text(&parsed, call), text);
+        let statement = parsed.arena.get(call).unwrap().parent.unwrap();
+        assert_eq!(
+            parsed.arena.get(statement).unwrap().kind,
+            SyntaxKind::ExpressionStatement
+        );
     }
 }
