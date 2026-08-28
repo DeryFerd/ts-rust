@@ -163,9 +163,8 @@ fn upstream_bitwise_compound_assignments_keep_exact_diagnostics_and_spans() {
         .iter()
         .map(|diagnostic| {
             let node = diagnostic.node.unwrap();
-            let range = diagnostic
-                .range_override
-                .unwrap_or(parsed.arena.get(node.node).unwrap().range);
+            assert!(diagnostic.range_override.is_none());
+            let range = parsed.arena.get(node.node).unwrap().range;
             (
                 diagnostic.diagnostic.code(),
                 range.start.get(),
