@@ -66,6 +66,9 @@ const POSITION_SOURCE: &str = concat!(
     "const genericError = identity((11n - 12) + true);\n",
 );
 
+const BITWISE_COMPOUND_SOURCE: &str =
+    include_str!("fixtures/bitwiseCompoundAssignmentOperators.ts");
+
 fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
@@ -144,6 +147,171 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
         .source_file(file)
         .and_then(|source| context.store().source_file_links(source))
         .is_some_and(|links| links.type_checked)
+}
+
+#[test]
+fn upstream_bitwise_compound_assignments_keep_exact_diagnostics_and_spans() {
+    let parsed = parse_source_file(BITWISE_COMPOUND_SOURCE);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(10);
+    let mut context = context(&parsed, file);
+    context.check_source_file(file).unwrap();
+
+    let actual = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            let node = diagnostic.node.unwrap();
+            let range = diagnostic
+                .range_override
+                .unwrap_or(parsed.arena.get(node.node).unwrap().range);
+            (
+                diagnostic.diagnostic.code(),
+                range.start.get(),
+                range.end.get() - range.start.get(),
+                diagnostic
+                    .diagnostic
+                    .arguments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // The unchanged fixture retains its 19-byte target directive before the baseline source.
+    assert_eq!(
+        actual,
+        [
+            (2447, 46, 2, vec!["^=", "!=="]),
+            (2362, 77, 1, vec![]),
+            (2363, 100, 1, vec![]),
+            (2447, 139, 2, vec!["&=", "&&"]),
+            (2362, 171, 1, vec![]),
+            (2363, 195, 1, vec![]),
+            (2447, 226, 2, vec!["|=", "||"]),
+            (2362, 257, 1, vec![]),
+        ],
+    );
+
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    for (node, record) in parsed.arena.iter() {
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            continue;
+        };
+        if matches!(
+            parsed.arena.get(binary.operator_token).unwrap().kind,
+            SyntaxKind::CaretEqualsToken
+                | SyntaxKind::AmpersandEqualsToken
+                | SyntaxKind::BarEqualsToken
+        ) {
+            assert_eq!(
+                resolved_type(&context, NodeRef::new(parsed.arena.id(), file, node)),
+                number,
+            );
+        }
+    }
+
+    let diagnostics = context.diagnostics().as_slice().to_vec();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics().as_slice(), diagnostics);
+}
+
+#[test]
+fn compound_assignments_keep_numeric_bigint_results_and_valid_assignment_checks() {
+    let source = concat!(
+        "var n = 7; n ^= 2; n &= 3; n |= 4;\n",
+        "var b = 7n; b ^= 2n; b &= 3n; b |= 4n;\n",
+        "var exact: 1 = 1; exact ^= 2;\n",
+        "var count: number = 0; count += 'x';\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(11);
+    let mut context = context(&parsed, file);
+    context.check_source_file(file).unwrap();
+
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    for (expression, expected) in [
+        ("n ^= 2", bootstrap.number_type),
+        ("n &= 3", bootstrap.number_type),
+        ("n |= 4", bootstrap.number_type),
+        ("b ^= 2n", bootstrap.bigint_type),
+        ("b &= 3n", bootstrap.bigint_type),
+        ("b |= 4n", bootstrap.bigint_type),
+        ("exact ^= 2", bootstrap.number_type),
+        ("count += 'x'", bootstrap.string_type),
+    ] {
+        assert_eq!(
+            resolved_type(
+                &context,
+                expression_by_text(source, &parsed, file, expression)
+            ),
+            expected,
+            "{expression}",
+        );
+    }
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.diagnostic.code(),
+                node_text(source, &parsed, diagnostic.node.unwrap()),
+                diagnostic
+                    .diagnostic
+                    .arguments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (2322, "exact", vec!["number", "1"]),
+            (2322, "count", vec!["string", "number"]),
+        ],
+    );
+}
+
+#[test]
+fn boolean_bitwise_operators_use_token_suggestions_but_shifts_keep_operand_errors() {
+    let source = concat!(
+        "const xor = true ^ false;\n",
+        "const and = false & true;\n",
+        "const or = false | true;\n",
+        "const shift = true << false;\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(12);
+    let mut context = context(&parsed, file);
+    context.check_source_file(file).unwrap();
+
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.diagnostic.code(),
+                node_text(source, &parsed, diagnostic.node.unwrap()),
+                diagnostic
+                    .diagnostic
+                    .arguments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (2447, "^", vec!["^", "!=="]),
+            (2447, "&", vec!["&", "&&"]),
+            (2447, "|", vec!["|", "||"]),
+            (2362, "true", vec![]),
+            (2363, "false", vec![]),
+        ],
+    );
 }
 
 #[test]

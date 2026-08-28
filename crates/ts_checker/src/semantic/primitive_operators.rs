@@ -581,6 +581,38 @@ fn check_arithmetic(
     right: PrimitiveBinaryOperand,
     diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
 ) -> Result<PrimitiveBinaryValue, PrimitiveBinaryError> {
+    let suggested_boolean_operator = match kind {
+        SyntaxKind::BarToken => Some("||"),
+        SyntaxKind::CaretToken => Some("!=="),
+        SyntaxKind::AmpersandToken => Some("&&"),
+        _ => None,
+    };
+    if let Some(suggested) = suggested_boolean_operator
+        && left
+            .scalar()
+            .is_some_and(|scalar| scalar.family == PrimitiveScalarFamily::Boolean)
+        && right
+            .scalar()
+            .is_some_and(|scalar| scalar.family == PrimitiveScalarFamily::Boolean)
+    {
+        let number = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.number_type)
+            .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+        diagnostics.push(CanonicalCheckerDiagnostic {
+            node: Some(request.expression),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2447).ok_or(PrimitiveBinaryInvariant::MissingDiagnostic(2447))?,
+                [
+                    PrimitiveBinaryOperator::Arithmetic(kind).text().to_owned(),
+                    suggested.to_owned(),
+                ],
+            ),
+            related_information: Vec::new(),
+        });
+        return Ok(PrimitiveBinaryValue::plain(number));
+    }
     if left
         .scalar()
         .is_some_and(|scalar| !scalar.family.is_numeric())

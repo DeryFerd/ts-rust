@@ -28452,7 +28452,10 @@ fn check_expression_type_with_class_context(
                         },
                     )
                     .map_err(|error| primitive_binary_check_error(host, node, &error))?;
-                    for diagnostic in resolution.diagnostics {
+                    for mut diagnostic in resolution.diagnostics {
+                        if diagnostic.diagnostic.code() == 2447 {
+                            diagnostic.node = Some(primitive_binary_operator_node(host, node)?);
+                        }
                         merge_retry_diagnostic(diagnostics, diagnostic);
                     }
                     publish_expression_type(store, node, resolution.result_type)?;
@@ -32048,6 +32051,21 @@ fn logical_binary_check_error(
     }
 }
 
+fn primitive_binary_operator_node(
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<NodeRef, SourceCheckError> {
+    let Some(NodeData::BinaryExpression(binary)) = host.node(expression).map(|record| &record.data)
+    else {
+        return Err(SourceCheckError::PrimitiveOperator(expression));
+    };
+    Ok(NodeRef::new(
+        expression.arena,
+        expression.file,
+        binary.operator_token,
+    ))
+}
+
 fn primitive_binary_check_error(
     host: &DeclaredTypeHost<'_>,
     expression: NodeRef,
@@ -33120,26 +33138,35 @@ fn check_compound_assignment(
         },
     )
     .map_err(|error| primitive_binary_check_error(host, assignment.expression, &error))?;
+    let arithmetic_operands_failed = resolution
+        .diagnostics
+        .iter()
+        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2362 | 2363 | 2447));
     for mut diagnostic in resolution.diagnostics {
-        if diagnostic.diagnostic.code() == 2365
+        if matches!(diagnostic.diagnostic.code(), 2365 | 2447)
             && let Some(text) = primitive_binary_operator_text(operator)
             && let Some(argument) = diagnostic.diagnostic.arguments.first_mut()
         {
             *argument = format!("{text}=");
         }
+        if diagnostic.diagnostic.code() == 2447 {
+            diagnostic.node = Some(primitive_binary_operator_node(host, assignment.expression)?);
+        }
         merge_retry_diagnostic(diagnostics, diagnostic);
     }
     publish_expression_type(store, assignment.expression, resolution.result_type)?;
-    if !source_type_is_assignable_to(
-        store,
-        host,
-        global_types,
-        options,
-        session,
-        diagnostics,
-        resolution.result_type,
-        declared_type,
-    )? {
+    if !arithmetic_operands_failed
+        && !source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            resolution.result_type,
+            declared_type,
+        )?
+    {
         let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
         if options.no_error_truncation {
             flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
