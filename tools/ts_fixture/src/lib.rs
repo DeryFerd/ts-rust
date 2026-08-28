@@ -32,6 +32,9 @@ mod artifact_classification_review;
 mod array_cast_fixture;
 
 #[cfg(test)]
+mod js_conditional_array_fixture;
+
+#[cfg(test)]
 mod destructuring_contextual_fixture;
 
 use artifacts::{

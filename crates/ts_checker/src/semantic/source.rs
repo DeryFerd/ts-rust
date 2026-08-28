@@ -22497,6 +22497,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             {
                 (false, false)
             }
+            NodeData::ArrayLiteralExpression(array)
+                if owner_record.kind == SyntaxKind::ArrayLiteralExpression
+                    && !asserted
+                    && array.elements.nodes.contains(&root.node) =>
+            {
+                (false, false)
+            }
             NodeData::ReturnStatement(return_statement)
                 if owner_record.kind == SyntaxKind::ReturnStatement
                     && return_statement.expression == Some(root.node) =>
@@ -27372,6 +27379,23 @@ where
             PlannedExpressionKind::Assertion { .. },
             PreparedExpression::Assertion(contextual_type),
         ) => check_nested_expression(store, session, expression, *contextual_type),
+        (
+            PlannedExpressionKind::Conditional(_),
+            PreparedExpression::Conditional {
+                contextual_type,
+                widen_result,
+            },
+        ) => {
+            let mut checked =
+                check_nested_expression(store, session, expression, *contextual_type)?;
+            if *widen_result {
+                let global_types =
+                    global_types.ok_or(SourceCheckError::Conditional(expression.node))?;
+                checked.result =
+                    widened_fresh_literal_union_type(store, global_types, checked.result)?;
+            }
+            Ok(checked)
+        }
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
     }?;
     publish_expression_type(store, expression.node, types.raw)?;

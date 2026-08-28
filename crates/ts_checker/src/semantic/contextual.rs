@@ -64,6 +64,10 @@ pub(super) enum PreparedExpression {
     Property(Box<PreparedExpression>),
     Arrow(Option<TypeId>),
     Assertion(Option<TypeId>),
+    Conditional {
+        contextual_type: Option<TypeId>,
+        widen_result: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +507,10 @@ fn prepare_expression(
             )?))
         }
         PlannedExpressionKind::Assertion { .. } => PreparedExpression::Assertion(contextual_type),
+        PlannedExpressionKind::Conditional(_) => PreparedExpression::Conditional {
+            contextual_type,
+            widen_result: location == ExpressionLocation::Mutable && contextual_type.is_none(),
+        },
         PlannedExpressionKind::Array(elements) => {
             let element_context = match (global_types, contextual_type) {
                 (Some(global_types), Some(contextual_type)) => {
@@ -677,7 +685,6 @@ fn prepare_expression(
         }
         PlannedExpressionKind::Binary(_)
         | PlannedExpressionKind::Logical(_)
-        | PlannedExpressionKind::Conditional(_)
         | PlannedExpressionKind::Element(_) => {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Syntax {
