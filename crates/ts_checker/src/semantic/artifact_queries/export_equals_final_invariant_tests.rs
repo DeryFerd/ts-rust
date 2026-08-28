@@ -1247,3 +1247,314 @@ fn export_equals_type_only_locals_do_not_hide_a_global_class_value() {
         );
     }
 }
+
+#[test]
+fn review_merged_export_guard_keeps_cold_global_declarations_unpublished() {
+    for namespace_first in [false, true] {
+        let class = (
+            "declare class Value { value: number; }",
+            true,
+            CanonicalModuleState::Script,
+        );
+        let namespace = (
+            "declare namespace Value {}",
+            true,
+            CanonicalModuleState::Script,
+        );
+        let declarations = if namespace_first {
+            [namespace, class]
+        } else {
+            [class, namespace]
+        };
+        with_sources(
+            &[
+                declarations[0],
+                declarations[1],
+                ("export = Value;", true, CanonicalModuleState::External),
+            ],
+            2,
+            |context, fixture| {
+                let owner = fixture.owner(context, "Value");
+                assert!(
+                    crate::semantic::classes::global_class_namespace_declaration(
+                        context.store(),
+                        owner,
+                        context.store().symbol(owner).unwrap(),
+                    )
+                    .is_some()
+                );
+                assert!(context.store().declared_type_links(owner).is_none());
+                assert!(context.store().value_symbol_links(owner).is_none());
+                let before = snapshot(context, fixture);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.export_equals_declared_artifact_type(fixture.exported),
+                        Ok(None)
+                    );
+                    assert!(matches!(
+                        context.get_type_at_location(fixture.exported),
+                        Err(CanonicalArtifactQueryError::MissingType { node, .. })
+                            if node == fixture.exported
+                    ));
+                    assert_eq!(context.get_symbol_at_location(fixture.exported), Ok(None));
+                    assert_eq!(snapshot(context, fixture), before);
+                }
+                context.get_nongeneric_class_members(owner).unwrap();
+                let (declared, value) = identities(context, owner);
+                assert_healthy(context, fixture, owner, declared, value);
+            },
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Compare separate and paired changes, then restore the same source.
+fn review_merged_export_guard_rejects_redirect_and_flag_pairs_before_cache_reads() {
+    let mut failures = Vec::new();
+    with_sources(
+        &[
+            (
+                "declare class Value { value: number; }",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                "declare namespace Value {}",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                "const observed = Value; export = Value;",
+                false,
+                CanonicalModuleState::External,
+            ),
+        ],
+        2,
+        |context, fixture| {
+            let owner = fixture.owner(context, "Value");
+            let (declared, value) = identities(context, owner);
+            assert_healthy(context, fixture, owner, declared, value);
+            let record = context.store().symbol(owner).unwrap();
+            let flags = record.flags();
+            let check_flags = record.check_flags();
+            let class = record.value_declaration().unwrap();
+            let namespace = record
+                .declarations()
+                .unwrap()
+                .iter()
+                .copied()
+                .find(|node| {
+                    context.store().source_node_kind(*node)
+                        == Some(ts_ast::SyntaxKind::ModuleDeclaration)
+                })
+                .unwrap();
+            let raw_class = context.file(class.file).unwrap().1.symbol(class).unwrap();
+            let raw_namespace = context
+                .file(namespace.file)
+                .unwrap()
+                .1
+                .symbol(namespace)
+                .unwrap();
+            assert_ne!(raw_class, owner);
+            assert_ne!(raw_namespace, owner);
+            assert_eq!(context.store().get_merged_symbol(raw_class), Some(owner));
+            assert_eq!(
+                context.store().get_merged_symbol(raw_namespace),
+                Some(owner)
+            );
+            let original_node = context
+                .store()
+                .type_node_links(fixture.exported)
+                .cloned()
+                .unwrap_or_default();
+            let number = context.global_types().number_type;
+            assert_ne!(number, declared);
+            assert_ne!(number, value);
+
+            for mask in [1, 2, 3] {
+                let store = context.store_mut_for_test();
+                if mask & 1 != 0 {
+                    assert_eq!(
+                        store.record_merged_symbol(raw_namespace, raw_class),
+                        Ok(Some(owner))
+                    );
+                    assert_eq!(store.get_merged_symbol(raw_class), Some(raw_namespace));
+                }
+                if mask & 2 != 0 {
+                    assert!(store.set_symbol_flags(owner, SymbolFlags::NONE, check_flags));
+                }
+                assert!(store.set_type_node_links(
+                    fixture.exported,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..original_node.clone()
+                    },
+                ));
+                let source_flags = store.source_symbol_flags(owner).unwrap();
+                assert_eq!(source_flags.intersects(SymbolFlags::CLASS), mask & 1 == 0);
+                let before = snapshot(context, fixture);
+                for attempt in 0..2 {
+                    let route = context.export_equals_declared_artifact_type(fixture.exported);
+                    let actual = context.get_type_at_location(fixture.exported);
+                    if route.is_ok() || actual.is_ok() {
+                        failures.push(format!(
+                            "mask={mask}, attempt={attempt}, source_flags={source_flags:?}: route={route:?}, actual={actual:?}, planted={number:?}"
+                        ));
+                    }
+                    assert_eq!(snapshot(context, fixture), before);
+                }
+                let store = context.store_mut_for_test();
+                if mask & 1 != 0 {
+                    assert_eq!(
+                        store.record_merged_symbol(owner, raw_class),
+                        Ok(Some(raw_namespace))
+                    );
+                }
+                assert!(store.set_symbol_flags(owner, flags, check_flags));
+                assert!(store.set_type_node_links(fixture.exported, original_node.clone()));
+                assert_healthy(context, fixture, owner, declared, value);
+            }
+        },
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // The global entry and cached identities are tested alone and together.
+fn review_merged_export_guard_rejects_foreign_same_name_global_targets() {
+    let mut failures = Vec::new();
+    with_sources(
+        &[
+            (
+                "declare class Value { value: number; }",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                "declare namespace Value {}",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                "class Value { other: string = 'other'; } export = Value;",
+                false,
+                CanonicalModuleState::External,
+            ),
+            (
+                "const observed = Value; export = Value;",
+                false,
+                CanonicalModuleState::External,
+            ),
+        ],
+        3,
+        |context, fixture| {
+            let owner = fixture.owner(context, "Value");
+            let (declared, value) = identities(context, owner);
+            assert_healthy(context, fixture, owner, declared, value);
+            let foreign_declaration = fixture
+                .nodes
+                .iter()
+                .copied()
+                .find(|node| {
+                    node.file == fixture.files[2]
+                        && context.store().source_node_kind(*node)
+                            == Some(ts_ast::SyntaxKind::ClassDeclaration)
+                })
+                .unwrap();
+            let foreign = context
+                .file(foreign_declaration.file)
+                .unwrap()
+                .1
+                .symbol(foreign_declaration)
+                .unwrap();
+            assert_eq!(context.store().get_merged_symbol(foreign), Some(foreign));
+            assert_ne!(foreign, owner);
+            assert!(context.store().source_symbol_declarations_match(foreign));
+            assert!(
+                context
+                    .store()
+                    .source_merged_symbol_declarations_match(foreign)
+            );
+            let (foreign_declared, foreign_value) = identities(context, foreign);
+            assert_ne!(foreign_declared, declared);
+            assert_ne!(foreign_value, value);
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(globals)
+                    .unwrap()
+                    .get_source("Value"),
+                Some(owner)
+            );
+            let original_node = context
+                .store()
+                .type_node_links(fixture.exported)
+                .cloned()
+                .unwrap_or_default();
+            let original_symbol = context
+                .store()
+                .symbol_node_links(fixture.exported)
+                .cloned()
+                .unwrap_or_default();
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    snapshot(context, fixture),
+                    context
+                        .store()
+                        .symbol_table(globals)
+                        .unwrap()
+                        .iter()
+                        .map(|(name, symbol)| (name.to_owned(), symbol))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            for mask in [1, 2, 3] {
+                let store = context.store_mut_for_test();
+                if mask & 1 != 0 {
+                    assert_eq!(
+                        store.insert_symbol(globals, EscapedName::source("Value"), foreign),
+                        Some(Some(owner))
+                    );
+                }
+                if mask & 2 != 0 {
+                    assert!(store.set_type_node_links(
+                        fixture.exported,
+                        TypeNodeLinks {
+                            resolved_type: Some(foreign_declared),
+                            ..original_node.clone()
+                        },
+                    ));
+                    assert!(store.set_symbol_node_links(
+                        fixture.exported,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(foreign),
+                        },
+                    ));
+                }
+                let before = state(context);
+                for attempt in 0..2 {
+                    let route = context.export_equals_declared_artifact_type(fixture.exported);
+                    let actual = context.get_type_at_location(fixture.exported);
+                    if route.is_ok() || actual.is_ok() {
+                        failures.push(format!(
+                            "mask={mask}, attempt={attempt}: route={route:?}, actual={actual:?}, foreign={foreign_declared:?}"
+                        ));
+                    }
+                    assert_eq!(state(context), before);
+                }
+                let store = context.store_mut_for_test();
+                if mask & 1 != 0 {
+                    assert_eq!(
+                        store.insert_symbol(globals, EscapedName::source("Value"), owner),
+                        Some(Some(foreign))
+                    );
+                }
+                assert!(store.set_type_node_links(fixture.exported, original_node.clone()));
+                assert!(store.set_symbol_node_links(fixture.exported, original_symbol.clone()));
+                assert_healthy(context, fixture, owner, declared, value);
+            }
+        },
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
