@@ -42020,10 +42020,6 @@ fn non_module_value_augmentation_diagnostic(
             .symbol(symbol)
             .is_some_and(|record| record.flags().intersects(SymbolFlags::VALUE))
     });
-    if !has_value_export {
-        return Ok(None);
-    }
-
     for import in imports {
         let Some(specifier) = arena.get(import.module_specifier.node) else {
             return Err(SourceCheckError::Provenance(
@@ -42046,6 +42042,29 @@ fn non_module_value_augmentation_diagnostic(
             let Some(target) = store.symbol(resolved.target_symbol) else {
                 return Err(SourceCheckError::Import(binding.declaration));
             };
+            if !target.flags().intersects(SymbolFlags::NAMESPACE) {
+                let first_declaration = bound
+                    .symbol(namespace.declaration)
+                    .and_then(|symbol| store.symbol(symbol))
+                    .and_then(|symbol| symbol.declarations())
+                    .and_then(|declarations| declarations.first())
+                    .copied();
+                if first_declaration != Some(namespace.declaration) {
+                    return Ok(None);
+                }
+                return Ok(Some(CanonicalCheckerDiagnostic {
+                    node: Some(namespace.name),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2671).ok_or(SourceCheckError::MissingDiagnostic(2671))?,
+                        [module_name.text.clone()],
+                    ),
+                    related_information: Vec::new(),
+                }));
+            }
+            if !has_value_export {
+                continue;
+            }
             let Some(declaration) = target.value_declaration() else {
                 continue;
             };
