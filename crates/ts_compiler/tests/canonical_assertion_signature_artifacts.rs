@@ -1,5 +1,6 @@
 use ts_ast::{NodeData, NodeRef};
-use ts_compiler::{CanonicalTypeFormatFlags, Program};
+use ts_checker::semantic::{SourceCheckError, UnsupportedSourceSyntax};
+use ts_compiler::{CanonicalProgramCheckError, CanonicalTypeFormatFlags, Program};
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -150,11 +151,6 @@ fn predicate_display_uses_typed_source_and_function_type_signatures() {
             "(value: unknown) => asserts value is string",
         ),
         (
-            "export const check = (value?: string): asserts value => {};",
-            "(value?: string) => asserts value",
-            "(value?: string | undefined) => asserts value",
-        ),
-        (
             "export declare const check: (value?: string) => asserts value; check('hello');",
             "(value?: string) => asserts value",
             "(value?: string | undefined) => asserts value",
@@ -167,6 +163,36 @@ fn predicate_display_uses_typed_source_and_function_type_signatures() {
     ] {
         assert_signature_display(source, expected, context_free);
     }
+}
+
+#[test]
+fn unadmitted_assertion_arrow_does_not_reach_artifact_queries() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/input.ts",
+            "export const check = (value?: string): asserts value => {};",
+        )
+        .unwrap();
+    let mut queried = false;
+    let result = Program::try_new_with_canonical_checker_and_queries(
+        &filesystem,
+        "/project",
+        &["input.ts".to_owned()],
+        options(),
+        |_, _| queried = true,
+    );
+    let Err(error) = result else {
+        panic!("the unsupported arrow must stop before artifact queries");
+    };
+    assert!(matches!(
+        error,
+        CanonicalProgramCheckError::SourceCheck {
+            error: SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(_)),
+            ..
+        }
+    ));
+    assert!(!queried);
 }
 
 #[test]
