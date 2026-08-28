@@ -41633,20 +41633,46 @@ fn check_variable_redeclaration_type(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    session: &mut InstantiationSession,
     name_node: NodeRef,
     symbol: SemanticSymbolId,
     previous: TypeId,
     actual: TypeId,
     options: CanonicalCheckerOptions,
 ) -> Result<(), SourceCheckError> {
-    if previous == actual
-        || store.is_type_identical_to_with_global_types_and_strict_function_types(
+    if previous == actual {
+        return Ok(());
+    }
+    let mut resolved_signatures = HashSet::new();
+    let identical = loop {
+        match store.is_type_identical_to_with_global_types_and_strict_function_types(
             previous,
             actual,
             global_types,
             options.strict_function_types,
-        )?
-    {
+        ) {
+            Ok(identical) => break identical,
+            Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
+                if !resolved_signatures.insert(signature) {
+                    return Err(RelationUnavailable::UnresolvedSignatureReturn(signature).into());
+                }
+                let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut resolution_diagnostics,
+                )?
+                .get_return_type_of_signature(signature);
+                merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+                resolved?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if identical {
         return Ok(());
     }
     let Some(Node {
@@ -55944,6 +55970,7 @@ pub(super) fn check_source_file(
                         host,
                         global_types,
                         diagnostics,
+                        session,
                         variable.name,
                         variable.symbol,
                         expected,
@@ -56388,6 +56415,7 @@ pub(super) fn check_source_file(
                             host,
                             global_types,
                             diagnostics,
+                            session,
                             variable.name,
                             variable.symbol,
                             previous,
@@ -97704,7 +97732,13 @@ class Foo2 {
         {
             let file = FileId::new(8_950 + u32::try_from(index).unwrap());
             let source = parsed(text);
-            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
             let declaration = variable_declaration(&source, file, "shared");
             let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
 
