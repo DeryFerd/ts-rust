@@ -24,6 +24,7 @@ fn initializer(program: &Program, path: &str, name: &str) -> NodeRef {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Scope, owner, and replay checks share the same namespace identities.
 fn renamed_namespace_alias_obeys_value_scope_without_changing_owners() {
     let filesystem = MemoryFileSystem::new(true);
     for (path, source) in [

@@ -8,8 +8,8 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeFormatFlags,
-    SourceCheckError, TypeData, TypeId,
+    AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnosticRange,
+    CanonicalCheckerOptions, CanonicalTypeFormatFlags, SourceCheckError, TypeData, TypeId,
 };
 use ts_diagnostics::Diagnostic;
 use ts_options::ScriptTarget;
@@ -71,7 +71,7 @@ fn diagnostic_value(
     node: Option<NodeRef>,
     range: Option<ts_core::TextRange>,
     diagnostic: &Diagnostic,
-    related: Vec<Value>,
+    related: &[Value],
 ) -> Value {
     let range = range.or_else(|| {
         node.map(|node| {
@@ -111,17 +111,19 @@ fn diagnostics(context: &CanonicalCheckerContext<'_>, sources: &Sources) -> Vec<
                         related.node,
                         None,
                         &related.diagnostic,
-                        vec![],
+                        &[],
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>();
             diagnostic_value(
                 context,
                 sources,
                 record.node,
-                record.range_override.map(|range| range.range()),
+                record
+                    .range_override
+                    .map(CanonicalCheckerDiagnosticRange::range),
                 &record.diagnostic,
-                related,
+                &related,
             )
         })
         .collect::<Vec<_>>();
@@ -324,6 +326,7 @@ enum FirstQuery {
     Symbol(Result<Option<SemanticSymbolId>, String>),
 }
 
+#[allow(clippy::too_many_lines)] // First-query and replay observations share one checker state.
 fn observe(row: &Case, order: &str) -> Value {
     let mut result = json!({"name": row.name, "order": order, "expect": row.expect});
     let inputs = std::iter::once(CaseFile {
@@ -531,7 +534,7 @@ fn observe(row: &Case, order: &str) -> Value {
             first_value["stable"] = json!(repeated == symbol);
         }
         FirstQuery::Type(Err(error)) | FirstQuery::Symbol(Err(error)) => {
-            first_value["error"] = json!(error)
+            first_value["error"] = json!(error);
         }
     }
     result["first"] = first_value;

@@ -169,14 +169,14 @@ fn javascript_signature_semicolons_and_asi_keep_their_ranges() {
             parsed
                 .arena
                 .iter()
-                .filter_map(|(_, node)| {
+                .filter(|(_, node)| {
                     matches!(
                         node.data,
                         NodeData::FunctionDeclaration(_) | NodeData::MethodDeclaration(_)
                     )
-                    .then(|| {
-                        &source[node.range.start.get() as usize..node.range.end.get() as usize]
-                    })
+                })
+                .map(|(_, node)| {
+                    &source[node.range.start.get() as usize..node.range.end.get() as usize]
                 })
                 .collect::<Vec<_>>()
         };

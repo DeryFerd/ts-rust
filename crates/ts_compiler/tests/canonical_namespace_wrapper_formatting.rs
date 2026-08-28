@@ -9,10 +9,10 @@ fn identifier(program: &Program, path: &str, name: &str) -> NodeRef {
         .parse
         .arena
         .iter()
-        .filter_map(|(node, record)| {
+        .filter(|(_, record)| {
             matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == name)
-                .then(|| source.node_ref(node).unwrap())
         })
+        .map(|(node, _)| source.node_ref(node).unwrap())
         .max_by_key(|node| source.parse.arena.get(node.node).unwrap().range.start)
         .unwrap()
 }

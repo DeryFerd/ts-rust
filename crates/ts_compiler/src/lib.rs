@@ -13672,6 +13672,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Diagnostics and replay checks share the original source and checker.
     fn canonical_conditional_return_expression_matches_original_and_replays() {
         let source = concat!(
             "// @noEmit: true\n",
@@ -13714,7 +13715,7 @@ mod tests {
                 let owner = store.type_payload(wrapper).unwrap().symbol().unwrap();
                 let method = store
                     .symbol(owner)
-                    .and_then(|symbol| symbol.members())
+                    .and_then(ts_binder::semantic::Symbol::members)
                     .and_then(|members| store.symbol_table(members))
                     .and_then(|members| members.get_source("startsWith"))
                     .unwrap();

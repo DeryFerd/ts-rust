@@ -71,10 +71,8 @@ fn assertion_display_keeps_optional_value_types_call_results_and_symbols() {
                 .parse
                 .arena
                 .iter()
-                .filter_map(|(node, record)| {
-                    matches!(record.data, NodeData::CallExpression(_))
-                        .then(|| source.node_ref(node).unwrap())
-                })
+                .filter(|(_, record)| matches!(record.data, NodeData::CallExpression(_)))
+                .map(|(node, _)| source.node_ref(node).unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(calls.len(), 2);
             let cold = queries.cold_diagnostic_snapshot();

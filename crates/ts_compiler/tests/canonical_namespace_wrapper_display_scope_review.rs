@@ -39,10 +39,10 @@ fn namespace_wrapper_display_does_not_name_a_shadowing_local() {
                     .parse
                     .arena
                     .iter()
-                    .filter_map(|(id, record)| {
+                    .filter(|(_, record)| {
                         matches!(&record.data, NodeData::Identifier(identifier) if identifier.text == name)
-                            .then(|| source.node_ref(id).unwrap())
                     })
+                    .map(|(id, _)| source.node_ref(id).unwrap())
                     .max_by_key(|node| source.parse.arena.get(node.node).unwrap().range.start)
                     .unwrap()
             };

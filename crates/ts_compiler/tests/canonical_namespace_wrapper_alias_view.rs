@@ -24,6 +24,7 @@ fn initializer(program: &Program, path: &str, name: &str) -> NodeRef {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Alias display and replay checks share the same wrapped owner.
 fn namespace_display_uses_a_renamed_import_of_the_same_wrapped_owner() {
     let filesystem = MemoryFileSystem::new(true);
     for (path, source) in [
