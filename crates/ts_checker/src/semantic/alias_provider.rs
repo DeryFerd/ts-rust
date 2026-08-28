@@ -1764,7 +1764,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         Ok((resolved, module))
     }
 
-    fn direct_source_module<MapperPayload>(
+    pub(super) fn direct_source_module<MapperPayload>(
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
@@ -3036,7 +3036,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             || record.value_declaration().is_some()
             || record.members().is_some()
             || record.exports().is_some()
-            || record.parent() != Some(module)
+            || store.get_parent_of_symbol(star) != Some(module)
             || record.export_symbol().is_some()
             || store.get_merged_symbol(star) != Some(star)
             || store.alias_symbol_links(star).is_some()

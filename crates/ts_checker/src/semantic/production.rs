@@ -4,7 +4,7 @@
 //! checker-owned semantic store. Construction includes the dependency-closed
 //! prefix of typescript-go's `initializeChecker`: ordered global merging,
 //! deferred ambient-module collection, UMD globals, global-scope
-//! augmentations, authenticated named ambient-module augmentations, the
+//! augmentations, named ambient-module and star-reexport augmentations, the
 //! built-in `undefined` conflict rule, intrinsic value links, and eager
 //! standard-library type identities. Alias-dependent merging, general checker
 //! diagnostics, and unresolved named module augmentations remain explicit
@@ -30,7 +30,10 @@ use super::{
     DeclaredTypeHost, DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions,
     RelationUnavailable, ResolvedUnionProperty, SignatureId, SourceCheckError,
     SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
-    alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
+    alias::{
+        CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver,
+        CanonicalAliasTargetUnavailable,
+    },
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
     },
@@ -44,6 +47,7 @@ use super::{
     },
     global_types::initialize_global_library_types,
     instantiate::{InstantiationLimits, InstantiationSession},
+    merge::{CheckerDiagnosticMergeHost, SymbolMergeDiagnostic, SymbolMergeHost},
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     source,
@@ -497,6 +501,19 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             options.name_resolution,
         )
         .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut alias_host =
+            ProductionAliasTargetHost::from_registry(&store, &files, &module_resolutions)
+                .map_err(CanonicalCheckerContextError::AliasTargetHost)?;
+        merge_reexported_module_augmentations(
+            &mut store,
+            &file_order,
+            &files,
+            &module_resolutions,
+            &mut alias_host,
+            &mut diagnostics,
+        )
+        .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
         let error_type = store
             .intrinsic_bootstrap()
             .expect("successful checker bootstrap remains installed")
@@ -518,7 +535,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types: initialized.global_types,
             module_resolutions,
             module_display_specifiers: BTreeMap::new(),
-            diagnostics: CanonicalCheckerDiagnostics::default(),
+            diagnostics,
             source_diagnostic_staging: BTreeMap::new(),
             pending_ambient_modules: initialized.pending_ambient_modules,
             pattern_ambient_modules: initialized.pattern_ambient_modules,
@@ -1262,7 +1279,8 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     ///
     /// Pure modules retain one anonymous identity. Namespace-only declarations
     /// return the canonical error type, as in the upstream value-symbol query.
-    /// Source-file modules and bodyless ambient modules are not supported here.
+    /// TypeScript source modules use the same lazy identity as namespace type queries.
+    /// Bodyless ambient modules are not supported here.
     ///
     /// # Errors
     ///
@@ -1284,6 +1302,25 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )
         .map_err(DeclaredTypeError::from)?;
+        let module = store
+            .get_merged_symbol(symbol)
+            .ok_or(SourceCheckError::DeclaredType(
+                DeclaredTypeError::Unavailable(super::DeclaredTypeUnavailable::SymbolNotOwned(
+                    symbol,
+                )),
+            ))?;
+        if let Some(declaration) = store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .filter(|declaration| {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::SourceFile)
+            })
+        {
+            return super::source_imports::prepare_source_file_namespace_identity(
+                store, &host, module,
+            )
+            .map_err(|_| SourceCheckError::Import(declaration));
+        }
         super::source_namespaces::get_type_of_module_value(store, &host, symbol)
     }
 
@@ -2600,6 +2637,193 @@ fn merge_named_ambient_module_augmentation(
     Ok(())
 }
 
+struct ModuleAugmentationMergeHost<'borrow, 'arena> {
+    files: &'borrow ProductionAliasSourceRegistry<'arena>,
+    diagnostics: &'borrow mut CanonicalCheckerDiagnostics,
+}
+
+impl ModuleAugmentationMergeHost<'_, '_> {
+    fn declaration_name(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        declaration: NodeRef,
+    ) -> Result<NodeRef, SymbolMergeError> {
+        let invalid = || SymbolMergeError::StoreInvariant("merge declaration has no source");
+        let (arena, bound) = self.files.snapshot(declaration.file).ok_or_else(invalid)?;
+        if !declaration.is_for(arena.id(), bound.file_id())
+            || !bound.contains(declaration)
+            || !store.contains_node_ref(declaration)
+        {
+            return Err(invalid());
+        }
+        let record = arena.get(declaration.node).ok_or_else(invalid)?;
+        let name = match &record.data {
+            NodeData::ClassDeclaration(data) => data.name,
+            NodeData::ClassExpression(data) => data.name,
+            NodeData::FunctionDeclaration(data) => data.name,
+            NodeData::FunctionExpression(data) => data.name,
+            NodeData::BindingElement(data) => data.name,
+            NodeData::ImportClause(data) => data.name,
+            NodeData::EnumDeclaration(data) => Some(data.name),
+            NodeData::EnumMember(data) => Some(data.name),
+            NodeData::InterfaceDeclaration(data) => Some(data.name),
+            NodeData::ModuleDeclaration(data) => Some(data.name),
+            NodeData::TypeAliasDeclaration(data) => Some(data.name),
+            NodeData::TypeParameterDeclaration(data) => Some(data.name),
+            NodeData::VariableDeclaration(data) => Some(data.name),
+            NodeData::ParameterDeclaration(data) => Some(data.name),
+            NodeData::PropertyDeclaration(data) => Some(data.name),
+            NodeData::PropertySignatureDeclaration(data) => Some(data.name),
+            NodeData::MethodDeclaration(data) => Some(data.name),
+            NodeData::MethodSignatureDeclaration(data) => Some(data.name),
+            NodeData::GetAccessorDeclaration(data) => Some(data.name),
+            NodeData::SetAccessorDeclaration(data) => Some(data.name),
+            NodeData::ExportSpecifier(data) => Some(data.name),
+            NodeData::ImportSpecifier(data) => Some(data.name),
+            NodeData::ImportEqualsDeclaration(data) => Some(data.name),
+            NodeData::NamespaceImport(data) => Some(data.name),
+            NodeData::NamespaceExport(data) => Some(data.name),
+            _ => None,
+        };
+        let Some(name) = name else {
+            return Ok(declaration);
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, name);
+        if !bound.contains(name)
+            || !store.contains_node_ref(name)
+            || arena
+                .get(name.node)
+                .is_none_or(|record| record.parent != Some(declaration.node))
+        {
+            return Err(invalid());
+        }
+        Ok(name)
+    }
+}
+
+impl SymbolMergeHost<super::TypeRecord, super::TypeMapper> for ModuleAugmentationMergeHost<'_, '_> {
+    fn report_merge_diagnostic(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        diagnostic: SymbolMergeDiagnostic,
+    ) -> Result<(), SymbolMergeError> {
+        let mut reported = CanonicalCheckerDiagnostics::default();
+        CheckerDiagnosticMergeHost::new(&mut reported)
+            .report_merge_diagnostic(store, diagnostic)?;
+        for mut diagnostic in reported.into_vec() {
+            diagnostic.node = diagnostic
+                .node
+                .map(|node| self.declaration_name(store, node))
+                .transpose()?;
+            for related in &mut diagnostic.related_information {
+                related.node = related
+                    .node
+                    .map(|node| self.declaration_name(store, node))
+                    .transpose()?;
+            }
+            source::merge_retry_diagnostic(self.diagnostics, diagnostic);
+        }
+        Ok(())
+    }
+}
+
+/// Merges star-reexport targets before any source can cache their declared types.
+fn merge_reexported_module_augmentations<'arena>(
+    store: &mut CanonicalTypeMapperStore,
+    file_order: &[FileId],
+    files: &ProductionAliasSourceRegistry<'arena>,
+    resolutions: &CanonicalModuleResolutionManifest,
+    aliases: &mut ProductionAliasTargetHost<'_, 'arena, '_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), CanonicalGlobalInitializationError> {
+    for &file in file_order {
+        let (arena, bound) = files
+            .snapshot(file)
+            .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
+        for augmentation in bound.module_augmentations() {
+            let name = augmentation.name();
+            let declaration = validate_augmentation_name(arena, bound, file, name)?;
+            let CanonicalModuleResolutionLookup::Resolved(resolved) = resolutions.lookup(name)
+            else {
+                continue;
+            };
+            if resolved.is_ambient_module() {
+                continue;
+            }
+            let source = bound.symbol(declaration).ok_or(
+                CanonicalGlobalInitializationError::MissingAugmentationSymbol(declaration),
+            )?;
+            let source_record = store
+                .symbol(source)
+                .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(source))?;
+            if source_record
+                .declarations()
+                .and_then(|declarations| declarations.first())
+                .copied()
+                != Some(declaration)
+                || store.get_merged_symbol(source) != Some(source)
+            {
+                continue;
+            }
+            let Some(source_exports) = source_record.exports() else {
+                continue;
+            };
+            let target = store.get_merged_symbol(resolved.target_symbol()).ok_or(
+                CanonicalGlobalInitializationError::InvalidSymbol(resolved.target_symbol()),
+            )?;
+            let target_record = store
+                .symbol(target)
+                .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(target))?;
+            let Some(target_exports) = target_record.exports() else {
+                continue;
+            };
+            let exports = store.symbol_table(target_exports).ok_or(
+                CanonicalGlobalInitializationError::InvalidTable {
+                    file: resolved.target_file(),
+                    table: target_exports,
+                },
+            )?;
+            if exports
+                .get(InternalSymbolName::ExportStar.as_ref())
+                .is_none()
+                || exports
+                    .get(InternalSymbolName::ExportEquals.as_ref())
+                    .is_some()
+            {
+                continue;
+            }
+            aliases
+                .direct_source_module(store, declaration, resolved, true)
+                .map_err(CanonicalGlobalInitializationError::ModuleAugmentationTarget)?;
+            let members = ordered_table_entries(store, file, source_exports)?;
+            let mut reexports = Vec::new();
+            for (name, member) in members {
+                if exports.get(name.as_ref()).is_some() {
+                    continue;
+                }
+                let Some(name) = name.as_utf8() else {
+                    continue;
+                };
+                match aliases.direct_export(store, declaration, target, name, true) {
+                    Ok(previous) => reexports.push((previous, member)),
+                    Err(CanonicalAliasTargetUnavailable::MissingExport { .. }) => {}
+                    Err(error) => {
+                        return Err(
+                            CanonicalGlobalInitializationError::ModuleAugmentationTarget(error),
+                        );
+                    }
+                }
+            }
+            let mut host = ModuleAugmentationMergeHost { files, diagnostics };
+            for (previous, member) in reexports {
+                store.merge_symbol_with_host(&mut host, previous, member, false)?;
+            }
+            store.merge_symbol_with_host(&mut host, target, source, false)?;
+        }
+    }
+    Ok(())
+}
+
 fn table_symbol(
     store: &CanonicalTypeMapperStore,
     file: FileId,
@@ -2939,6 +3163,8 @@ pub enum CanonicalGlobalInitializationError {
     /// The exact symbol merge requires an unsupported dependency or rejected
     /// malformed provenance.
     Merge(SymbolMergeError),
+    /// A star-reexport augmentation could not resolve its retained target.
+    ModuleAugmentationTarget(CanonicalAliasTargetUnavailable),
 }
 
 impl std::fmt::Display for CanonicalGlobalInitializationError {
@@ -3020,6 +3246,12 @@ impl std::fmt::Display for CanonicalGlobalInitializationError {
                 write!(formatter, "global type initialization failed: {error}")
             }
             Self::Merge(error) => write!(formatter, "global symbol merge failed: {error}"),
+            Self::ModuleAugmentationTarget(error) => {
+                write!(
+                    formatter,
+                    "module augmentation target is unavailable: {error:?}"
+                )
+            }
         }
     }
 }

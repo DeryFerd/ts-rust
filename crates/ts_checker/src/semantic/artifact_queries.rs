@@ -3269,6 +3269,32 @@ impl CanonicalCheckerContext<'_> {
             return self.validate_artifact_type(node, read_type).map(Some);
         }
 
+        if super::source_namespaces::has_pure_module_flags(flags)
+            && self
+                .store()
+                .source_file_namespace_wrapper_for_module(symbol)
+                .is_none()
+            && let Some(source) = self
+                .store()
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .filter(|source| {
+                    self.store().source_node_kind(*source) == Some(SyntaxKind::SourceFile)
+                })
+            && self
+                .validated_artifact_node(source)?
+                .1
+                .source_facts()
+                .is_some_and(|facts| {
+                    facts.is_external_module()
+                        && !facts.is_javascript_file()
+                        && !facts.is_common_js_module()
+                })
+        {
+            let type_ = self.get_type_of_module_value(symbol)?;
+            return self.validate_artifact_type(node, type_).map(Some);
+        }
+
         if flags.intersects(SymbolFlags::PROPERTY)
             && let Some(type_) = self.object_literal_property_type(node, symbol)?
         {

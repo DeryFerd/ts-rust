@@ -1018,7 +1018,7 @@ fn validate_export_route(
             let local_record = store
                 .symbol(local)
                 .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
-            if owner_record.parent() == Some(source_owner)
+            if store.get_parent_of_symbol(owner) == Some(source_owner)
                 && local_record.flags() == SymbolFlags::EXPORT_VALUE
                 && local_record.check_flags() == CheckFlags::NONE
                 && local_record.name() == owner_record.name()

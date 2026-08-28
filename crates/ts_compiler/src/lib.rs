@@ -697,6 +697,9 @@ fn global_initialization_error_is_unsupported(error: &CanonicalGlobalInitializat
             global_type_initialization_error_is_unsupported(error)
         }
         CanonicalGlobalInitializationError::Merge(error) => merge_error_is_unsupported(error),
+        CanonicalGlobalInitializationError::ModuleAugmentationTarget(error) => {
+            alias_target_error_is_unsupported(*error)
+        }
         CanonicalGlobalInitializationError::MissingBootstrap
         | CanonicalGlobalInitializationError::MissingFile(_)
         | CanonicalGlobalInitializationError::MissingSourceFileFacts(_)

@@ -7513,11 +7513,15 @@ pub(super) fn declared_type_declaration_parent(
         || local_record.members().is_some()
         || local_record.exports().is_some()
         || local_record.parent().is_some()
-        || local_record.export_symbol() != Some(symbol)
+        || local_record
+            .export_symbol()
+            .and_then(|export| store.get_merged_symbol(export))
+            != Some(symbol)
         || source_symbol_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
             .and_then(|exports| exports.get_source(&identifier.text))
+            .and_then(|export| store.get_merged_symbol(export))
             != Some(symbol)
     {
         return Err(());
@@ -7576,8 +7580,28 @@ fn declared_namespace_type_parent(
         .and_then(|namespace| store.get_merged_symbol(namespace))
         .ok_or_else(invalid)?;
     let namespace_record = store.symbol(namespace).ok_or_else(invalid)?;
+    let symbol_parent = store.get_parent_of_symbol(symbol);
+    let reexported_augmentation = symbol_parent != Some(namespace)
+        && bound.module_augmentations().iter().any(|augmentation| {
+            augmentation.name() == NodeRef::new(module.arena, module.file, module_data.name)
+        })
+        && bound
+            .symbol(declaration)
+            .filter(|raw| *raw != symbol && store.get_merged_symbol(*raw) == Some(symbol))
+            .and_then(|raw| store.symbol(raw))
+            .and_then(ts_binder::semantic::Symbol::parent)
+            .and_then(|parent| store.get_merged_symbol(parent))
+            == Some(namespace)
+        && store.source_merged_symbol_declarations_match(symbol)
+        && symbol_parent
+            .and_then(|parent| store.symbol(parent))
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(name))
+            .and_then(|export| store.get_merged_symbol(export))
+            == Some(symbol);
     if !namespace_record.flags().intersects(SymbolFlags::MODULE)
-        || store.get_parent_of_symbol(symbol) != Some(namespace)
+        || symbol_parent != Some(namespace) && !reexported_augmentation
         || namespace_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
@@ -7658,7 +7682,7 @@ fn declared_namespace_type_parent(
             return Err(());
         }
     }
-    Ok(Some(namespace))
+    Ok(symbol_parent)
 }
 
 fn is_exact_export_modifier(

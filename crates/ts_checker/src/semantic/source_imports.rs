@@ -259,21 +259,27 @@ fn plan_source_file_namespace(
         return Ok(plan);
     }
     let record = store.symbol(module).ok_or_else(invalid)?;
-    let Some([declaration]) = record.declarations() else {
+    let Some(declarations) = record.declarations() else {
         return Err(invalid());
     };
-    let declaration = *declaration;
+    let Some(&declaration) = declarations.first() else {
+        return Err(invalid());
+    };
     let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
     let source = checked_node(arena, bound, store, declaration)?;
     let facts = bound.source_facts().ok_or_else(invalid)?;
     if source.kind != SyntaxKind::SourceFile
         || source.parent.is_some()
         || declaration != bound.source_file()
-        || bound.symbol(declaration) != Some(module)
+        || bound
+            .symbol(declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(module)
         || !facts.is_external_module()
         || facts.is_javascript_file()
         || facts.is_common_js_module()
-        || record.flags() != SymbolFlags::VALUE_MODULE
+        || !super::source_namespaces::has_pure_module_flags(record.flags())
+        || !record.flags().contains(SymbolFlags::VALUE_MODULE)
         || record.check_flags() != CheckFlags::NONE
         || record.name() != facts.source_file_symbol_name()
         || record.value_declaration() != Some(declaration)
@@ -281,9 +287,37 @@ fn plan_source_file_namespace(
         || record.members().is_some()
         || record.export_symbol().is_some()
         || store.get_merged_symbol(module) != Some(module)
-        || !store.source_symbol_declarations_match(module)
+        || !(record.flags() == SymbolFlags::VALUE_MODULE
+            && store.source_symbol_declarations_match(module)
+            || record.flags().contains(SymbolFlags::TRANSIENT)
+                && store.source_merged_symbol_declarations_match(module))
     {
         return Err(invalid());
+    }
+    for &augmentation in declarations.iter().skip(1) {
+        let (arena, bound) = host.source(augmentation).ok_or_else(invalid)?;
+        let record = checked_node(arena, bound, store, augmentation)?;
+        let NodeData::ModuleDeclaration(module_declaration) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(
+            augmentation.arena,
+            augmentation.file,
+            module_declaration.name,
+        );
+        if record.kind != SyntaxKind::ModuleDeclaration
+            || !host.symbol_matches(store, augmentation, module)
+            || !bound
+                .module_augmentations()
+                .iter()
+                .any(|augmentation| augmentation.name() == name)
+            || !matches!(
+                host.node(name).map(|name| &name.data),
+                Some(NodeData::StringLiteral(_))
+            )
+        {
+            return Err(invalid());
+        }
     }
     let entries = match record.exports() {
         Some(table) => store

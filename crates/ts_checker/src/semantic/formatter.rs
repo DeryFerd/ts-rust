@@ -716,6 +716,24 @@ fn display_type_worker(
     if type_flags.intersects(TypeFlags::ENUM_LIKE) {
         let name = enums::enum_type_display_name(store, type_id)
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        if state.location.is_some()
+            && let Some(host) = host
+        {
+            let owner = enums::canonical_enum_type_owner(store, type_id)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            let mut name =
+                display_location_symbol_name(store, host, owner, SymbolFlags::TYPE, state)?;
+            if let Some(member) = record.symbol().filter(|symbol| *symbol != owner) {
+                let member = store
+                    .symbol(member)
+                    .and_then(|member| member.name().as_utf8())
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                state.add(member.len().saturating_add(1));
+                name.push('.');
+                name.push_str(member);
+            }
+            return Ok(name);
+        }
         state.add(name.len());
         return Ok(name);
     }
@@ -1826,6 +1844,37 @@ fn append_declared_method_type_parameters(
     Ok(())
 }
 
+fn display_source_file_module_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    owner: SemanticSymbolId,
+    state: &mut DisplayState,
+) -> Result<String, TypeDisplayUnavailable> {
+    if state.location.is_some() {
+        let name = display_location_symbol_name(store, host, owner, SymbolFlags::VALUE, state)?;
+        state.add(7);
+        return Ok(format!("typeof {name}"));
+    }
+    let quoted_path = store
+        .symbol(owner)
+        .and_then(|owner| owner.name().as_utf8())
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let path = quoted_path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let specifier = ts_path::base_file_name(ts_path::remove_file_extension(path));
+    if specifier.is_empty() {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    state.add(specifier.len().saturating_add(10));
+    Ok(format!(
+        "typeof import({})",
+        quote_string_literal(specifier, '"')
+    ))
+}
+
 fn display_validated_module_namespace(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1923,6 +1972,15 @@ fn display_validated_module_namespace(
             .map_err(|_| invalid())?
             .ok_or_else(invalid)?;
         return Ok(Some(name));
+    }
+    if store.source_file_namespace_identity(owner).is_some() {
+        if super::source_imports::source_file_namespace_type(store, host, owner)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+            != Some(type_id)
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        return display_source_file_module_name(store, host, type_id, owner, state).map(Some);
     }
     if let Some(&declaration) = owner_record.declarations().and_then(|nodes| nodes.first())
         && let Some(NodeData::ModuleDeclaration(module)) =
@@ -2039,28 +2097,7 @@ fn display_validated_module_namespace(
         }
     }
 
-    if state.location.is_some() {
-        let name = display_location_symbol_name(store, host, owner, SymbolFlags::VALUE, state)?;
-        state.add(7);
-        return Ok(Some(format!("typeof {name}")));
-    }
-    let quoted_path = owner_record
-        .name()
-        .as_utf8()
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    let path = quoted_path
-        .strip_prefix('"')
-        .and_then(|path| path.strip_suffix('"'))
-        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    let specifier = ts_path::base_file_name(ts_path::remove_file_extension(path));
-    if specifier.is_empty() {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    }
-    state.add(specifier.len().saturating_add(10));
-    Ok(Some(format!(
-        "typeof import({})",
-        quote_string_literal(specifier, '"')
-    )))
+    display_source_file_module_name(store, host, type_id, owner, state).map(Some)
 }
 
 fn validate_source_function_namespace_origin(
@@ -4141,6 +4178,18 @@ fn validate_merged_interface_display_owner(
         .declarations()
         .filter(|nodes| !nodes.is_empty())
         .ok_or_else(invalid)?;
+    if symbol.parent().is_some() {
+        if symbol.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || !store.source_merged_symbol_declarations_match(owner)
+        {
+            return Err(invalid());
+        }
+        let plan = object_members::plan_interface(store, host, owner).map_err(|_| invalid())?;
+        if plan.symbol != owner || plan.node != declarations[0] {
+            return Err(invalid());
+        }
+        return validate_merged_interface_member_owners(store, host, type_id, owner, declarations);
+    }
     let globals = store
         .intrinsic_bootstrap()
         .and_then(|bootstrap| store.symbol_table(bootstrap.globals))

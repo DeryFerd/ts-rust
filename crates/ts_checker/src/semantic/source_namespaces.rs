@@ -1102,6 +1102,7 @@ fn modifier_flags(
 }
 
 fn validate_symbol_parent(
+    bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     symbol: SemanticSymbolId,
@@ -1119,14 +1120,26 @@ fn validate_symbol_parent(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
         ))?;
     let expected_parent = expected_parent.and_then(|parent| store.get_merged_symbol(parent));
-    if Some(parent) != expected_parent
-        || store
-            .symbol(parent)
+    // A reexport merge keeps the original parent. Its augmentation declaration
+    // must still belong to the expected namespace's retained export table.
+    let declaration_parent = bound
+        .symbol(declaration)
+        .filter(|raw| *raw != symbol && store.get_merged_symbol(*raw) == Some(symbol))
+        .and_then(|raw| store.symbol(raw))
+        .and_then(ts_binder::semantic::Symbol::parent)
+        .and_then(|raw| store.get_merged_symbol(raw));
+    let exported_symbol = |owner| {
+        store
+            .symbol(owner)
             .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| store.symbol_table(exports))
             .and_then(|exports| exports.get(record.name()))
             .and_then(|export| store.get_merged_symbol(export))
-            != Some(symbol)
+    };
+    if Some(parent) != expected_parent
+        && (expected_parent.is_none() || declaration_parent != expected_parent)
+        || exported_symbol(parent) != Some(symbol)
+        || expected_parent.is_some_and(|owner| exported_symbol(owner) != Some(symbol))
     {
         return Err(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
@@ -5253,7 +5266,7 @@ fn plan_interface_member(
         interface.modifiers.as_ref(),
     )?;
     let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::INTERFACE)?;
-    validate_symbol_parent(store, declaration, symbol, Some(owner))?;
+    validate_symbol_parent(bound, store, declaration, symbol, Some(owner))?;
 
     let mut annotations = Vec::new();
     let mut generic = interface
@@ -5837,7 +5850,7 @@ fn plan_type_alias_member(
     };
     modifier_flags(arena, bound, store, declaration, alias.modifiers.as_ref())?;
     let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::TYPE_ALIAS)?;
-    validate_symbol_parent(store, declaration, symbol, Some(owner))?;
+    validate_symbol_parent(bound, store, declaration, symbol, Some(owner))?;
     let annotation = child(declaration, alias.type_);
     let annotation_record = owned_node(arena, bound, store, annotation)?;
     if annotation_record.parent != Some(declaration.node) {
@@ -10483,7 +10496,7 @@ fn plan_namespace_variables(
             }
         }
         let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::VARIABLE)?;
-        validate_symbol_parent(store, declaration, symbol, Some(owner))?;
+        validate_symbol_parent(bound, store, declaration, symbol, Some(owner))?;
         if store.value_symbol_links(symbol).is_some_and(|links| {
             links.resolved_type.is_none() && links != &ValueSymbolLinks::default()
         }) {
@@ -11073,7 +11086,7 @@ fn plan_namespace(
             .then(|| bound.symbol(parent.node))
             .flatten()
     });
-    validate_symbol_parent(store, declaration, symbol, expected_parent)?;
+    validate_symbol_parent(bound, store, declaration, symbol, expected_parent)?;
 
     let mut diagnostics = Vec::new();
     if is_string_module && !ambient {
@@ -11208,7 +11221,13 @@ fn plan_namespace(
                         SyntaxKind::EnumDeclaration => {
                             let member_symbol =
                                 declaration_symbol(bound, store, statement, SymbolFlags::ENUM)?;
-                            validate_symbol_parent(store, statement, member_symbol, Some(symbol))?;
+                            validate_symbol_parent(
+                                bound,
+                                store,
+                                statement,
+                                member_symbol,
+                                Some(symbol),
+                            )?;
                             let enum_host = DeclaredTypeHost::new([(arena, bound)])
                                 .map_err(DeclaredTypeError::from)?;
                             super::enums::preflight_enum(store, &enum_host, member_symbol)
