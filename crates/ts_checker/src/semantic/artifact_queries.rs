@@ -248,6 +248,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.checked_conditional_literal_artifact_type(node)? {
+            return Ok(type_);
+        }
+
         if let Some(type_) = self.arrow_artifact_type(node)? {
             return Ok(type_);
         }
@@ -1636,6 +1640,114 @@ impl CanonicalCheckerContext<'_> {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
         Ok(())
+    }
+
+    fn checked_conditional_literal_artifact_type(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, CanonicalArtifactQueryError> {
+        let (_, _, record) = self.validated_artifact_node(node)?;
+        let scalar_literal = match record.data {
+            NodeData::StringLiteral(_)
+            | NodeData::NoSubstitutionTemplateLiteral(_)
+            | NodeData::NumericLiteral(_)
+            | NodeData::BigIntLiteral(_) => true,
+            NodeData::KeywordExpression(_) => matches!(
+                record.kind,
+                SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword | SyntaxKind::NullKeyword
+            ),
+            _ => false,
+        };
+        if !scalar_literal {
+            return Ok(None);
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        let parent = NodeRef::new(node.arena, node.file, parent);
+        let (_, _, parent_record) = self.validated_artifact_node(parent)?;
+        let NodeData::ConditionalExpression(conditional) = &parent_record.data else {
+            return Ok(None);
+        };
+        if [
+            conditional.condition,
+            conditional.when_true,
+            conditional.when_false,
+        ]
+        .into_iter()
+        .filter(|child| *child == node.node)
+        .count()
+            != 1
+        {
+            return Err(CanonicalArtifactQueryError::ForeignNode(node));
+        }
+        let source = self
+            .source_file(node.file)
+            .ok_or(CanonicalArtifactQueryError::MissingFile(node.file))?;
+        if !self
+            .store()
+            .source_file_links(source)
+            .is_some_and(|links| links.type_checked)
+        {
+            return Ok(None);
+        }
+        let parent_type =
+            self.cached_artifact_type(parent)?
+                .ok_or(CanonicalArtifactQueryError::MissingType {
+                    node: parent,
+                    kind: parent_record.kind,
+                })?;
+        if self
+            .store()
+            .type_node_links(parent)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+        {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node: parent,
+                type_: parent_type,
+            });
+        }
+
+        // Scalar conditional checking retains literal pairs without child links.
+        let regular = self.cached_literal_annotation_identity(node)?.ok_or(
+            CanonicalArtifactQueryError::MissingType {
+                node,
+                kind: record.kind,
+            },
+        )?;
+        let type_ = if record.kind == SyntaxKind::NullKeyword {
+            self.store()
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.null_widening_type)
+                .ok_or(CanonicalArtifactQueryError::MissingType {
+                    node,
+                    kind: record.kind,
+                })?
+        } else {
+            self.store()
+                .fresh_type_of_literal_type(regular)
+                .map_err(|_| CanonicalArtifactQueryError::InvalidType {
+                    node,
+                    type_: regular,
+                })?
+        };
+        if self.store().type_node_links(node).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) {
+            return Err(CanonicalArtifactQueryError::InvalidType {
+                node,
+                type_: self.cached_artifact_type(node)?.unwrap_or(type_),
+            });
+        }
+        if let Some(symbol) = self
+            .store()
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+        {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+        self.validate_artifact_type(node, type_).map(Some)
     }
 
     fn literal_annotation_artifact_type(
@@ -5857,6 +5969,244 @@ mod tests {
                 let instance = context.get_type_at_location(name).unwrap();
                 assert_eq!(context.type_to_string(instance).unwrap(), "Model");
                 assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+            }
+        }
+    }
+
+    #[test]
+    fn checked_conditional_literal_queries_reuse_pairs_without_child_links() {
+        for strict_null_checks in [false, true] {
+            for (expression, expected) in [
+                ("true ? 'left' : 'right'", ["true", "\"left\"", "\"right\""]),
+                ("true ? `left` : `right`", ["true", "\"left\"", "\"right\""]),
+                ("true ? 1_000 : 2", ["true", "1000", "2"]),
+                ("true ? 1n : 2n", ["true", "1n", "2n"]),
+                ("true ? true : false", ["true", "true", "false"]),
+                ("true ? null : null", ["true", "null", "null"]),
+            ] {
+                let parsed = parse_source_file(&format!("const value = {expression};"));
+                assert!(parsed.diagnostics.is_empty(), "{expression}");
+                let file = FileId::new(6_126);
+                let mut context = context_with_options(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions {
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks,
+                            ..IntrinsicBootstrapOptions::default()
+                        },
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                context.check_source_file(file).unwrap();
+                let children = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(_, record)| {
+                        let NodeData::ConditionalExpression(conditional) = &record.data else {
+                            return None;
+                        };
+                        Some(
+                            [
+                                conditional.condition,
+                                conditional.when_true,
+                                conditional.when_false,
+                            ]
+                            .map(|node| NodeRef::new(parsed.arena.id(), file, node)),
+                        )
+                    })
+                    .unwrap();
+                let source = context.source_file(file).unwrap();
+                let state = |context: &CanonicalCheckerContext<'_>| {
+                    let store = context.store();
+                    (
+                        [
+                            store.type_len(),
+                            store.symbol_len(),
+                            store.signature_len(),
+                            store.mapper_len(),
+                            store.symbol_store().symbol_table_len(),
+                            context.diagnostics().len(),
+                        ],
+                        store.checker_link_allocated_lengths(),
+                        store.source_file_links(source).cloned(),
+                        store.relation_state_snapshot(),
+                    )
+                };
+                let before = state(&context);
+                for _ in 0..2 {
+                    for (node, expected) in children.into_iter().zip(expected) {
+                        assert!(context.store().type_node_links(node).is_none());
+                        assert!(context.store().symbol_node_links(node).is_none());
+                        let type_ = context.get_type_at_location(node).unwrap();
+                        assert_eq!(context.type_to_string(type_).unwrap(), expected);
+                        if expected == "null" {
+                            assert_eq!(
+                                type_,
+                                context
+                                    .store()
+                                    .intrinsic_bootstrap()
+                                    .unwrap()
+                                    .null_widening_type,
+                            );
+                        } else {
+                            let TypeData::Literal(literal) =
+                                context.store().type_payload(type_).unwrap().data()
+                            else {
+                                panic!("the conditional child must keep its literal type")
+                            };
+                            assert_eq!(literal.fresh_type, Some(type_));
+                            assert_ne!(literal.regular_type, type_);
+                        }
+                        assert_eq!(context.get_symbol_at_location(node), Ok(None));
+                        assert!(context.store().type_node_links(node).is_none());
+                        assert!(context.store().symbol_node_links(node).is_none());
+                    }
+                    assert_eq!(state(&context), before, "{expression}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_literal_readback_requires_a_checked_owner() {
+        let parsed = parse_source_file("const value = true ? 'left' : 'right';");
+        let file = FileId::new(6_127);
+        let mut context = context(&parsed, file);
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ConditionalExpression(conditional) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, conditional.when_true))
+            })
+            .unwrap();
+        context
+            .store_mut_for_test()
+            .regular_string_literal_type("left".to_owned())
+            .unwrap();
+        let source = context.source_file(file).unwrap();
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [store.type_len(), store.symbol_len(), store.signature_len()],
+                store.checker_link_allocated_lengths(),
+                store.source_file_links(source).cloned(),
+                context.diagnostics().len(),
+            )
+        };
+        let before = state(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.checked_conditional_literal_artifact_type(node),
+                Ok(None)
+            );
+            assert_eq!(state(&context), before);
+            assert!(context.store().type_node_links(node).is_none());
+        }
+    }
+
+    #[test]
+    fn checked_conditional_literal_queries_reject_missing_or_conflicting_caches() {
+        for poison in 0..4 {
+            let parsed = parse_source_file("const value = true ? 'left' : 'right';");
+            let file = FileId::new(6_128);
+            let mut context = context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let (parent, node) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::ConditionalExpression(conditional) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, id),
+                        NodeRef::new(parsed.arena.id(), file, conditional.when_true),
+                    ))
+                })
+                .unwrap();
+            let regular_wrong = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_string_literal_type("right")
+                .unwrap();
+            let wrong = context
+                .store()
+                .fresh_type_of_literal_type(regular_wrong)
+                .unwrap();
+            let expected = context.get_type_at_location(node).unwrap();
+            let symbol = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .unknown_symbol;
+            let error = match poison {
+                0 => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_node_links(parent, TypeNodeLinks::default())
+                    );
+                    CanonicalArtifactQueryError::MissingType {
+                        node: parent,
+                        kind: SyntaxKind::ConditionalExpression,
+                    }
+                }
+                1 | 2 => {
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: (poison == 1).then_some(wrong),
+                            outer_type_parameters: (poison == 2).then(Vec::new),
+                        },
+                    ));
+                    CanonicalArtifactQueryError::InvalidType {
+                        node,
+                        type_: if poison == 1 { wrong } else { expected },
+                    }
+                }
+                3 => {
+                    assert!(context.store_mut_for_test().set_symbol_node_links(
+                        node,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol)
+                        },
+                    ));
+                    CanonicalArtifactQueryError::InvalidSymbol { node, symbol }
+                }
+                _ => unreachable!(),
+            };
+            let source = context.source_file(file).unwrap();
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                        store.symbol_store().symbol_table_len(),
+                        context.diagnostics().len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.source_file_links(source).cloned(),
+                    store.relation_state_snapshot(),
+                    [parent, node].map(|node| store.type_node_links(node).cloned()),
+                    store.symbol_node_links(node).cloned(),
+                )
+            };
+            let before = state(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_type_at_location(node),
+                    Err(error),
+                    "poison {poison}"
+                );
+                assert_eq!(state(&context), before, "poison {poison}");
             }
         }
     }
