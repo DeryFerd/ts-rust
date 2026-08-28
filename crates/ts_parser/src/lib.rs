@@ -6152,6 +6152,17 @@ impl<'a> Parser<'a> {
         {
             left = self.parse_single_parameter_arrow_function(left);
         }
+        if self.javascript_file
+            && self.current.kind == SyntaxKind::LessThanToken
+            && matches!(
+                self.arena.get(left).unwrap().kind,
+                SyntaxKind::JsxElement
+                    | SyntaxKind::JsxSelfClosingElement
+                    | SyntaxKind::JsxFragment
+            )
+        {
+            left = self.recover_adjacent_jsx_elements(left);
+        }
         let mut last_operand = left;
         loop {
             if self.disallow_in && self.current.kind == SyntaxKind::InKeyword {
@@ -7152,6 +7163,9 @@ impl<'a> Parser<'a> {
     }
 
     fn is_type_argument_expression_suffix(&mut self) -> bool {
+        if self.javascript_file {
+            return false;
+        }
         let checkpoint = self.scanner.mark();
         let mut depth = 1_u32;
         let mut delimiter_depth = 0_u32;
@@ -8992,6 +9006,10 @@ impl<'a> Parser<'a> {
                 &attribute_children,
             ));
         }
+        if self.current.kind == SyntaxKind::LessThanToken {
+            // Leave the next element for expression recovery after the attribute error.
+            self.error_code_at(self.current.range, 1003, []);
+        }
         if self.current.kind == SyntaxKind::ColonToken {
             self.error_current("Expected a JSX attribute name.");
             self.bump();
@@ -9050,7 +9068,11 @@ impl<'a> Parser<'a> {
             return None;
         }
 
-        let mut expression = self.parse_jsx_element(false, None);
+        let expression = self.parse_jsx_element(false, None);
+        Some(self.recover_adjacent_jsx_elements(expression))
+    }
+
+    fn recover_adjacent_jsx_elements(&mut self, mut expression: NodeId) -> NodeId {
         while self.current.kind == SyntaxKind::LessThanToken {
             let right = self.parse_jsx_element(false, None);
             let comma_position = self.node_start(right);
@@ -9077,7 +9099,7 @@ impl<'a> Parser<'a> {
                 &[expression, comma, right],
             );
         }
-        Some(expression)
+        expression
     }
 
     fn finish_jsx_tag(&mut self, resume_jsx: bool) -> TextPos {
