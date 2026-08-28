@@ -3432,8 +3432,7 @@ pub(super) fn check_class_index_constraints(
             if !local_property && !local_index {
                 continue;
             }
-            let applies = if key_type == number
-                && ts_jsnum::from_string(&name).to_string() == name
+            let applies = if key_type == number && ts_jsnum::from_string(&name).to_string() == name
             {
                 true
             } else {
