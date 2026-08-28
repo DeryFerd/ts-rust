@@ -1418,6 +1418,29 @@ enum PlannedLinearFunctionStatement {
     },
 }
 
+impl PlannedLinearFunctionStatement {
+    fn flow_point(&self, locals: &[PlannedVariable]) -> Option<NodeRef> {
+        match self {
+            Self::Local(index) => locals.get(*index).map(|local| local.name),
+            Self::Expression { statement, .. } => Some(*statement),
+            Self::ParameterAssignment(assignment) => Some(assignment.statement),
+            Self::Function(_) | Self::Enum(_) => None,
+        }
+    }
+
+    fn direct_call(&self) -> Option<NodeRef> {
+        let Self::Expression { expression, .. } = self else {
+            return None;
+        };
+        matches!(
+            &expression.kind,
+            PlannedExpressionKind::Call(call)
+                if !matches!(&call.callee.unparenthesized().kind, PlannedExpressionKind::Arrow(_))
+        )
+        .then_some(expression.node)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PlannedLinearParameterAssignment {
     statement: NodeRef,
@@ -1534,6 +1557,7 @@ struct PlannedSwitchArrayBinding {
 #[derive(Clone, Debug)]
 struct PlannedFunctionStatements {
     leading: Vec<PlannedVariable>,
+    leading_statements: Vec<PlannedLinearFunctionStatement>,
     condition: PlannedSourceCondition,
     then_branch: PlannedReturnBranch,
     else_branch: PlannedReturnBranch,
@@ -1543,6 +1567,7 @@ struct PlannedFunctionStatements {
 #[derive(Clone, Debug)]
 struct PlannedReturnBranch {
     locals: Vec<PlannedVariable>,
+    statements: Vec<PlannedLinearFunctionStatement>,
     return_statement: NodeRef,
     return_expression: PlannedExpression,
 }
@@ -1562,6 +1587,10 @@ struct PlannedJoinedFunctionStatements {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)] // Keeps ordinary truthiness expressions inline.
 enum PlannedSourceCondition {
+    Expression {
+        expression: PlannedExpression,
+        flow_point: NodeRef,
+    },
     Truthiness {
         expression: PlannedExpression,
         symbol: SemanticSymbolId,
@@ -1599,14 +1628,16 @@ struct PlannedEqualityCondition {
 impl PlannedSourceCondition {
     fn flow_point(&self) -> NodeRef {
         match self {
+            Self::Expression { flow_point, .. } => *flow_point,
             Self::Truthiness { expression, .. } => expression.unparenthesized().node,
             Self::Typeof(condition) => condition.identifier.node,
             Self::Equality(condition) => condition.identifier,
         }
     }
 
-    fn flow_condition(&self) -> SourceFlowCondition {
-        match self {
+    fn flow_condition(&self) -> Option<SourceFlowCondition> {
+        Some(match self {
+            Self::Expression { .. } => return None,
             Self::Truthiness { expression, symbol } => {
                 SourceFlowCondition::Truthiness(SourceTruthinessCondition {
                     expression: expression.node,
@@ -1627,7 +1658,7 @@ impl PlannedSourceCondition {
                 strict: condition.strict,
                 discriminant: condition.discriminant,
             }),
-        }
+        })
     }
 }
 
@@ -13709,6 +13740,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let SourceFunctionStatementsSyntax {
             body,
             leading: leading_syntax,
+            leading_statements: leading_statement_syntax,
             final_if,
         } = syntax;
         if body != callable.body {
@@ -13717,29 +13749,50 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
 
-        let mut leading = Vec::with_capacity(leading_syntax.len());
-        for local in leading_syntax {
-            leading.push(self.finish_local_declaration(local)?);
-        }
-
-        let condition = self.finish_source_condition(
+        let (leading, leading_statements) = self.finish_function_statement_prefix(
             callable,
-            final_if.condition,
-            final_if.condition_identifier,
-            final_if.typeof_condition,
-            final_if.equality_condition,
+            leading_syntax,
+            leading_statement_syntax,
         )?;
 
-        let then_branch = self.finish_return_branch(final_if.then_branch)?;
-        let else_branch = self.finish_return_branch(final_if.else_branch)?;
+        let condition = if let Some(identifier) = final_if.condition_identifier {
+            self.finish_source_condition(
+                callable,
+                final_if.condition,
+                identifier,
+                final_if.typeof_condition,
+                final_if.equality_condition,
+            )?
+        } else {
+            self.primitive_binary_position_roots
+                .insert(final_if.condition);
+            PlannedSourceCondition::Expression {
+                expression: self.plan_expression(final_if.condition)?,
+                // Computed expressions use the binder's statement entry.
+                flow_point: final_if.statement,
+            }
+        };
 
-        let points = leading
+        let then_branch = self.finish_return_branch(callable, final_if.then_branch)?;
+        let else_branch = self.finish_return_branch(callable, final_if.else_branch)?;
+
+        let points = leading_statements
             .iter()
-            .map(|local| local.name)
+            .filter_map(|statement| statement.flow_point(&leading))
             .chain(std::iter::once(condition.flow_point()))
-            .chain(then_branch.locals.iter().map(|local| local.name))
+            .chain(
+                then_branch
+                    .statements
+                    .iter()
+                    .filter_map(|statement| statement.flow_point(&then_branch.locals)),
+            )
             .chain(std::iter::once(then_branch.return_statement))
-            .chain(else_branch.locals.iter().map(|local| local.name))
+            .chain(
+                else_branch
+                    .statements
+                    .iter()
+                    .filter_map(|statement| statement.flow_point(&else_branch.locals)),
+            )
             .chain(std::iter::once(else_branch.return_statement))
             .collect::<Vec<_>>();
         let assignments = leading
@@ -13751,18 +13804,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 symbol: local.symbol,
             })
             .collect::<Vec<_>>();
-        let flow = SourceFlowPlan::preflight(
+        let calls = leading_statements
+            .iter()
+            .chain(&then_branch.statements)
+            .chain(&else_branch.statements)
+            .filter_map(PlannedLinearFunctionStatement::direct_call);
+        let flow = SourceFlowPlan::preflight_with_calls(
+            self.arena,
             self.bound,
             callable.declaration,
-            None,
             points,
-            [condition.flow_condition()],
+            condition.flow_condition(),
             assignments,
+            calls,
         )
         .map_err(|error| Self::source_flow_plan_error(callable, error))?;
 
         Ok(PlannedFunctionStatements {
             leading,
+            leading_statements,
             condition,
             then_branch,
             else_branch,
@@ -13966,17 +14026,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     fn finish_return_branch(
         &mut self,
+        callable: &SourceCallablePlan,
         syntax: SourceReturnBranchSyntax,
     ) -> Result<PlannedReturnBranch, SourceCheckError> {
         let branch_prior = self.prior_variables.clone();
         let branch_readable = self.readable_variables.clone();
         let result = (|| {
-            let mut locals = Vec::with_capacity(syntax.locals.len());
-            for local in syntax.locals {
-                locals.push(self.finish_local_declaration(local)?);
-            }
+            let (locals, statements) =
+                self.finish_function_statement_prefix(callable, syntax.locals, syntax.statements)?;
             Ok(PlannedReturnBranch {
                 locals,
+                statements,
                 return_statement: syntax.return_statement,
                 return_expression: self.plan_expression(syntax.return_expression)?,
             })
@@ -13984,6 +14044,46 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.prior_variables = branch_prior;
         self.readable_variables = branch_readable;
         result
+    }
+
+    fn finish_function_statement_prefix(
+        &mut self,
+        callable: &SourceCallablePlan,
+        local_syntax: Vec<SourceLocalDeclarationSyntax>,
+        statement_syntax: Vec<SourceLinearFunctionStatementSyntax>,
+    ) -> Result<(Vec<PlannedVariable>, Vec<PlannedLinearFunctionStatement>), SourceCheckError> {
+        let mut expected_locals = local_syntax.into_iter();
+        let mut locals = Vec::new();
+        let mut statements = Vec::with_capacity(statement_syntax.len());
+        for statement in statement_syntax {
+            match statement {
+                SourceLinearFunctionStatementSyntax::Local(local) => {
+                    if expected_locals.next() != Some(local) {
+                        return Err(Self::unsupported_function_body(callable));
+                    }
+                    statements.push(PlannedLinearFunctionStatement::Local(locals.len()));
+                    locals.push(self.finish_local_declaration(local)?);
+                }
+                SourceLinearFunctionStatementSyntax::Expression {
+                    statement,
+                    expression,
+                } => {
+                    self.primitive_binary_position_roots.insert(expression);
+                    statements.push(PlannedLinearFunctionStatement::Expression {
+                        statement,
+                        expression: Box::new(self.plan_expression(expression)?),
+                    });
+                }
+                SourceLinearFunctionStatementSyntax::Function(_)
+                | SourceLinearFunctionStatementSyntax::Enum(_) => {
+                    return Err(Self::unsupported_function_body(callable));
+                }
+            }
+        }
+        if expected_locals.next().is_some() {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        Ok((locals, statements))
     }
 
     fn finish_joined_function_statements(
@@ -14051,7 +14151,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             callable.declaration,
             None,
             points,
-            [condition.flow_condition()],
+            condition.flow_condition(),
             assignments,
         )
         .map_err(|error| Self::source_flow_plan_error(callable, error))?;
@@ -24858,6 +24958,8 @@ fn preflight_inferred_function_return_dependencies(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     functions: &[PlannedFunction],
+    ambient_variables: &[PlannedAmbientVariable],
+    cross_file_global_reads: &[PlannedCrossFileGlobalRead],
 ) -> Result<(), SourceCheckError> {
     fn expression_is_closed(
         expression: &PlannedExpression,
@@ -24958,19 +25060,26 @@ fn preflight_inferred_function_return_dependencies(
                     });
                 }
                 let callee = call.callee.unparenthesized();
-                let PlannedExpressionKind::Identifier(read) = &callee.kind else {
-                    return false;
+                let callee_is_closed = match &callee.kind {
+                    PlannedExpressionKind::Identifier(read) => {
+                        read.kind == PlannedIdentifierReadKind::Function
+                            && functions.iter().any(|function| {
+                                function.callable.owner_symbol == read.value_symbol
+                                    && !function.callable.return_type.is_inferred()
+                            })
+                            || read.kind == PlannedIdentifierReadKind::Variable
+                                && (locals.contains(&read.value_symbol)
+                                    || parameters.iter().any(|parameter| {
+                                        parameter.symbol == read.value_symbol
+                                            && parameter.has_jsdoc_function_type()
+                                    }))
+                    }
+                    PlannedExpressionKind::Property(property) => {
+                        expression_is_closed(&property.receiver, parameters, locals, functions)
+                    }
+                    _ => false,
                 };
-                (read.kind == PlannedIdentifierReadKind::Function
-                    && functions.iter().any(|function| {
-                        function.callable.owner_symbol == read.value_symbol
-                            && !function.callable.return_type.is_inferred()
-                    })
-                    || read.kind == PlannedIdentifierReadKind::Variable
-                        && parameters.iter().any(|parameter| {
-                            parameter.symbol == read.value_symbol
-                                && parameter.has_jsdoc_function_type()
-                        }))
+                callee_is_closed
                     && call.arguments.iter().all(|argument| {
                         expression_is_closed(argument, parameters, locals, functions)
                     })
@@ -25015,11 +25124,46 @@ fn preflight_inferred_function_return_dependencies(
         })
     }
 
+    fn statement_prefix_is_closed(
+        declarations: &[PlannedVariable],
+        statements: &[PlannedLinearFunctionStatement],
+        parameters: &[SourceCallableParameterPlan],
+        locals: &mut HashSet<SemanticSymbolId>,
+        functions: &[PlannedFunction],
+    ) -> bool {
+        statements.iter().all(|statement| match statement {
+            PlannedLinearFunctionStatement::Local(index) => {
+                declarations.get(*index).is_some_and(|local| {
+                    local_initializers_are_closed(
+                        std::slice::from_ref(local),
+                        parameters,
+                        locals,
+                        functions,
+                    )
+                })
+            }
+            PlannedLinearFunctionStatement::Expression { expression, .. } => {
+                expression_is_closed(expression, parameters, locals, functions)
+            }
+            _ => false,
+        })
+    }
+
     for function in functions {
         if !function.callable.return_type.is_inferred() {
             continue;
         }
-        let mut locals = HashSet::new();
+        // Annotated declared values are resolved before inferred function bodies run.
+        let mut locals = ambient_variables
+            .iter()
+            .filter(|variable| variable.type_node.is_some() && variable.initializer.is_none())
+            .map(|variable| variable.symbol)
+            .chain(
+                cross_file_global_reads
+                    .iter()
+                    .map(|read| read.read.value_symbol),
+            )
+            .collect::<HashSet<_>>();
         for parameter in &function.callable.parameters {
             if let Some(bindings) = authenticated_function_array_parameter_bindings(
                 store,
@@ -25333,18 +25477,22 @@ fn preflight_inferred_function_return_dependencies(
                 functions,
             ),
             PlannedFunctionBody::Statements(statements) => {
-                local_initializers_are_closed(
+                statement_prefix_is_closed(
                     &statements.leading,
+                    &statements.leading_statements,
                     &function.callable.parameters,
                     &mut locals,
                     functions,
                 ) && match &statements.condition {
-                    PlannedSourceCondition::Truthiness { expression, .. } => expression_is_closed(
-                        expression,
-                        &function.callable.parameters,
-                        &locals,
-                        functions,
-                    ),
+                    PlannedSourceCondition::Expression { expression, .. }
+                    | PlannedSourceCondition::Truthiness { expression, .. } => {
+                        expression_is_closed(
+                            expression,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        )
+                    }
                     PlannedSourceCondition::Typeof(condition) => {
                         expression_is_closed(
                             &condition.identifier,
@@ -25375,8 +25523,9 @@ fn preflight_inferred_function_return_dependencies(
                     .into_iter()
                     .all(|branch| {
                         let mut branch_locals = locals.clone();
-                        local_initializers_are_closed(
+                        statement_prefix_is_closed(
                             &branch.locals,
+                            &branch.statements,
                             &function.callable.parameters,
                             &mut branch_locals,
                             functions,
@@ -37565,7 +37714,7 @@ fn check_planned_function_statements(
         .flow
         .frame(bound, base_flow_types)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -37579,6 +37728,7 @@ fn check_planned_function_statements(
         deferred,
         callable,
         &statements.leading,
+        &statements.leading_statements,
         staged_value_types,
         value_order,
     )?;
@@ -37659,7 +37809,7 @@ fn check_planned_inferred_function_statements(
         .flow
         .frame(bound, base_flow_types)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -37673,6 +37823,7 @@ fn check_planned_inferred_function_statements(
         deferred,
         callable,
         &statements.leading,
+        &statements.leading_statements,
         staged_value_types,
         value_order,
     )?;
@@ -37693,7 +37844,7 @@ fn check_planned_inferred_function_statements(
 
     let mut return_types = Vec::with_capacity(2);
     for branch in [&statements.then_branch, &statements.else_branch] {
-        check_planned_function_locals(
+        check_planned_function_statement_prefix(
             store,
             host,
             global_types,
@@ -37707,6 +37858,7 @@ fn check_planned_inferred_function_statements(
             deferred,
             callable,
             &branch.locals,
+            &branch.statements,
             staged_value_types,
             value_order,
         )?;
@@ -37879,6 +38031,36 @@ fn check_planned_source_condition(
     condition: &PlannedSourceCondition,
 ) -> Result<(), SourceCheckError> {
     match condition {
+        PlannedSourceCondition::Expression {
+            expression,
+            flow_point,
+        } => {
+            let snapshot = frame
+                .snapshot_at(store, global_types, *flow_point)
+                .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+            let checked = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                snapshot.types(),
+                preflighted_type_import_value_uses,
+                expression,
+                None,
+                deferred,
+            )?;
+            emit_truthiness_operand_diagnostics(
+                store,
+                host,
+                diagnostics,
+                expression,
+                checked.result,
+                expression.node,
+            )
+        }
         PlannedSourceCondition::Truthiness { expression, symbol } => {
             check_planned_truthiness_condition(
                 store,
@@ -38392,6 +38574,77 @@ fn source_truthiness_condition_type_is_supported(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn check_planned_function_statement_prefix(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    frame: &mut SourceFlowFrame<'_, '_>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    locals: &[PlannedVariable],
+    statements: &[PlannedLinearFunctionStatement],
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<(), SourceCheckError> {
+    for statement in statements {
+        match statement {
+            PlannedLinearFunctionStatement::Local(index) => {
+                let local = locals
+                    .get(*index)
+                    .ok_or_else(|| SourcePlanner::unsupported_function_body(callable))?;
+                check_planned_function_locals(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    preflighted_type_import_value_uses,
+                    type_import_capabilities,
+                    deferred,
+                    callable,
+                    std::slice::from_ref(local),
+                    staged_value_types,
+                    value_order,
+                )?;
+            }
+            PlannedLinearFunctionStatement::Expression {
+                statement,
+                expression,
+            } => {
+                let snapshot = frame
+                    .snapshot_at(store, global_types, *statement)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    preflighted_type_import_value_uses,
+                    expression,
+                    None,
+                    deferred,
+                )?;
+            }
+            _ => return Err(SourcePlanner::unsupported_function_body(callable)),
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_planned_function_locals(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -38590,7 +38843,7 @@ fn check_planned_return_branch(
     staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
     value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -38604,6 +38857,7 @@ fn check_planned_return_branch(
         deferred,
         callable,
         &branch.locals,
+        &branch.statements,
         staged_value_types,
         value_order,
     )?;
@@ -51893,7 +52147,13 @@ pub(super) fn check_source_file(
     }
     let deferred_inferred_functions =
         deferred_inferred_javascript_functions(&statements, &functions, javascript_jsdoc.is_some());
-    preflight_inferred_function_return_dependencies(store, host, &functions)?;
+    preflight_inferred_function_return_dependencies(
+        store,
+        host,
+        &functions,
+        &ambient_variables,
+        &cross_file_global_reads,
+    )?;
 
     let mut reexport_aliases = HashSet::new();
     for reexport in &named_reexports {
@@ -98045,6 +98305,90 @@ class Foo2 {
         assert_eq!(diagnostic.diagnostic.arguments, ["+", "number", "boolean"]);
         assert_eq!(resolved_node_type(&context, binary), expected);
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn conditional_return_paths_check_conditions_calls_locals_and_both_returns() {
+        let source = parsed(concat!(
+            "declare function consume(value: number): void; ",
+            "function choose(value: number): number { ",
+            "if (value < 'limit') { consume('then'); return 'first'; } ",
+            "consume('else'); const fallback: number = 'local'; return 'second'; }",
+        ));
+        let file = FileId::new(11_420);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 6, "{diagnostics:?}");
+        for (diagnostic, (code, text)) in diagnostics.iter().zip([
+            (2365, "value < 'limit'"),
+            (2345, "'then'"),
+            (2322, "return 'first';"),
+            (2345, "'else'"),
+            (2322, "fallback"),
+            (2322, "return 'second';"),
+        ]) {
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), text);
+        }
+    }
+
+    #[test]
+    fn conditional_return_paths_infer_values_and_keep_false_branch_narrowing() {
+        let library =
+            parsed("interface Sampler { sample(): number; } declare const sampler: Sampler;");
+        let source = parsed(concat!(
+            "declare function sample(): number; ",
+            "declare function consume(value: number): void; ",
+            "function choose(value: number) { consume(value); ",
+            "if (sample() > 0.5) { const selected = value; consume(selected); ",
+            "return { value: selected }; } ",
+            "consume(value); const fallback = 0; return { value: fallback }; } ",
+            "function text(value: string | null) { ",
+            "if (value === null) { return 'missing'; } ",
+            "const present = value; return present; } ",
+            "function fromSampler() { if (sampler.sample() > 0.5) { return 1; } return 2; }",
+        ));
+        let file = FileId::new(11_421);
+        let library_file = FileId::new(11_422);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        for (name, expected) in [
+            ("choose", "(value: number) => { value: number; }"),
+            ("text", "(value: string | null) => string"),
+            ("fromSampler", "() => number"),
+        ] {
+            let owner = function_symbol(&context, &source, file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "present"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
     }
 
     #[test]

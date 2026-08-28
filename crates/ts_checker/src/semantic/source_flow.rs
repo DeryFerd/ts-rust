@@ -807,6 +807,40 @@ impl SourceFlowPlan {
         )
     }
 
+    /// Uses ordinary call statements with the existing branch-flow checks.
+    pub(super) fn preflight_with_calls(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+    ) -> Result<Self, SourceFlowError> {
+        if bound.node_arena_id() != arena.id()
+            || bound.node_arena_revision() != arena.revision()
+            || !container.is_for(arena.id(), bound.file_id())
+        {
+            return Err(SourceFlowInvariant::ForeignNode(container).into());
+        }
+        let mut effects = SourceFlowEffects::default();
+        for call in calls {
+            let statement = validate_direct_call(arena, bound, container, call)?;
+            if effects.calls.insert(call, statement).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        Self::preflight_with_effects(
+            bound,
+            container,
+            None,
+            points,
+            conditions,
+            assignments,
+            effects,
+        )
+    }
+
     /// Proves direct call statements and assignments to exact function parameters.
     pub(super) fn preflight_linear(
         arena: &NodeArena,
@@ -3180,7 +3214,6 @@ fn validate_direct_call(
     if !expression.is_for(arena.id(), bound.file_id())
         || !bound.contains(expression)
         || bound.container(expression) != Some(container)
-        || bound.block_scope_container(expression) != Some(container)
     {
         return Err(invalid().into());
     }
@@ -3209,28 +3242,36 @@ fn validate_direct_call(
     let NodeData::ExpressionStatement(statement_data) = &statement.data else {
         return Err(invalid().into());
     };
-    let body = statement
-        .parent
-        .and_then(|node| arena.get(node))
-        .ok_or_else(invalid)?;
+    let body_id = statement.parent.ok_or_else(invalid)?;
+    let body = arena.get(body_id).ok_or_else(invalid)?;
     let function = arena.get(container.node).ok_or_else(invalid)?;
     let NodeData::FunctionDeclaration(function_data) = &function.data else {
         return Err(invalid().into());
     };
+    let function_body = function_data.body.ok_or_else(invalid)?;
+    let scope = if body_id == function_body {
+        container
+    } else {
+        NodeRef::new(arena.id(), bound.file_id(), body_id)
+    };
+    let statement_ref = NodeRef::new(arena.id(), bound.file_id(), statement_id);
     if statement.kind != SyntaxKind::ExpressionStatement
         || statement.flags.0 != 0
         || statement_data.expression != expression.node
         || statement_data.flow_node.is_some()
         || body.kind != SyntaxKind::Block
-        || body.parent != Some(container.node)
         || function.kind != SyntaxKind::FunctionDeclaration
-        || function_data.body != statement.parent
+        || arena.get(function_body).is_none_or(|body| {
+            body.kind != SyntaxKind::Block || body.parent != Some(container.node)
+        })
+        || !source_node_is_descendant_of(arena, statement_ref, function_body)
+        || bound.block_scope_container(expression) != Some(scope)
+        || bound.block_scope_container(statement_ref) != Some(scope)
     {
         return Err(invalid().into());
     }
-    let statement = NodeRef::new(arena.id(), bound.file_id(), statement_id);
-    validate_node_container(bound, bound.flow_graph(), container, statement)?;
-    Ok(statement)
+    validate_node_container(bound, bound.flow_graph(), container, statement_ref)?;
+    Ok(statement_ref)
 }
 
 fn validate_call_container(
@@ -3242,7 +3283,9 @@ fn validate_call_container(
 ) -> Result<(), SourceFlowError> {
     if !bound.contains(call)
         || bound.container(call) != Some(container)
-        || bound.block_scope_container(call) != Some(container)
+        || bound.container(statement) != Some(container)
+        || bound.block_scope_container(call).is_none()
+        || bound.block_scope_container(call) != bound.block_scope_container(statement)
         || bound.flow_container(statement) != Some(container)
         || bound.flow_at(statement) != Some(antecedent)
     {

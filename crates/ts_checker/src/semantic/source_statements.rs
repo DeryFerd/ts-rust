@@ -1,15 +1,10 @@
-//! Exact syntax and binder proof for the first function-statement vertical.
+//! Source-ordered function statements and their binder identities.
 //!
-//! This leaf admits two additive annotated-function shapes. The first contains
-//! initialized identifier-named `var`/`let`/`const` declarations followed by
-//! one final two-arm `if`, with a value return in each arm. The second contains
-//! one fallthrough `if` between leading and trailing declarations, followed by
-//! one final value return. The fallthrough `else` arm may be absent. This leaf
-//! deliberately stops before expression planning,
-//! lexical admission-set mutation, flow narrowing, or checking. Direct
-//! identifier truthiness and the bounded strict `typeof` comparison form are
-//! proven here; their semantic execution remains a source-dispatch
-//! responsibility.
+//! Returning branches retain local declarations, expression statements, and
+//! their actual return nodes. A trailing return path can supply the false path
+//! of an if without an else. Joined fallthrough branches retain the existing
+//! declaration-only form. Expression checking, narrowing, and return inference
+//! stay in the source checker.
 
 use std::collections::HashSet;
 
@@ -161,16 +156,17 @@ pub(super) struct SourceLocalDeclarationSyntax {
 pub(super) struct SourceReturnBranchSyntax {
     pub(super) block: Option<NodeRef>,
     pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) statements: Vec<SourceLinearFunctionStatementSyntax>,
     pub(super) return_statement: NodeRef,
     pub(super) return_expression: NodeRef,
 }
 
-/// The exact final `if` and its authenticated identifier-based condition.
+/// One returning `if`, with an explicit else or the actual trailing return path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFinalIfSyntax {
     pub(super) statement: NodeRef,
     pub(super) condition: NodeRef,
-    pub(super) condition_identifier: NodeRef,
+    pub(super) condition_identifier: Option<NodeRef>,
     pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
     pub(super) equality_condition: Option<SourceEqualityConditionSyntax>,
     pub(super) then_branch: SourceReturnBranchSyntax,
@@ -405,11 +401,12 @@ pub(super) struct SourceEqualityConditionSyntax {
     pub(super) operand_on_left: bool,
 }
 
-/// Complete source-ordered syntax for the first closed function-body vertical.
+/// Source-ordered declarations and expressions before two returning paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFunctionStatementsSyntax {
     pub(super) body: NodeRef,
     pub(super) leading: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) leading_statements: Vec<SourceLinearFunctionStatementSyntax>,
     pub(super) final_if: SourceFinalIfSyntax,
 }
 
@@ -8374,24 +8371,31 @@ impl SyntaxPlanner<'_> {
         let body = self.callable.body;
         self.validate_range(body, declaration)?;
         let statements = self.plan_body(body, declaration)?;
-        let Some((&final_statement_id, leading_statement_ids)) = statements.split_last() else {
+        let Some(if_index) = statements.iter().position(|statement| {
+            self.arena
+                .get(*statement)
+                .is_some_and(|record| record.kind == SyntaxKind::IfStatement)
+        }) else {
             return Err(SourceFunctionStatementsError::Unsupported(
                 SourceFunctionStatementsUnsupported::MissingFinalIf(body),
             ));
         };
 
-        let mut leading = Vec::new();
-        for &statement_id in leading_statement_ids {
-            let statement = self.reference(statement_id);
-            leading.extend(self.plan_local_or_block_statement(statement, body, declaration)?);
-        }
+        let (leading, leading_statements) =
+            self.plan_return_prefix(&statements[..if_index], body, declaration)?;
 
-        let final_if = self.plan_final_if(self.reference(final_statement_id), body, declaration)?;
+        let final_if = self.plan_final_if(
+            self.reference(statements[if_index]),
+            body,
+            declaration,
+            &statements[if_index + 1..],
+        )?;
         self.validate_flow(&final_if)?;
 
         Ok(SourceFunctionStatementsSyntax {
             body,
             leading,
+            leading_statements,
             final_if,
         })
     }
@@ -8773,6 +8777,7 @@ impl SyntaxPlanner<'_> {
         statement: NodeRef,
         body: NodeRef,
         callable: NodeRef,
+        trailing: &[NodeId],
     ) -> Result<SourceFinalIfSyntax, SourceFunctionStatementsError> {
         let record = self.node(statement)?;
         let NodeData::IfStatement(if_statement) = &record.data else {
@@ -8812,28 +8817,39 @@ impl SyntaxPlanner<'_> {
             SourceFunctionStatementsRole::Condition,
         )?;
         self.validate_range(condition, statement)?;
-        let condition_syntax = self.plan_condition(condition, callable)?;
+        let condition_syntax = match self.plan_condition(condition, callable) {
+            Ok(condition) => Some(condition),
+            Err(SourceFunctionStatementsError::Unsupported(_)) => None,
+            Err(error) => return Err(error),
+        };
 
         let then_block = control.then_statement;
-        let else_block =
-            control
-                .else_statement
-                .ok_or(SourceFunctionStatementsError::Unsupported(
-                    SourceFunctionStatementsUnsupported::MissingElse(statement),
-                ))?;
         self.validate_range(then_block, statement)?;
-        self.validate_range(else_block, statement)?;
         self.validate_order(condition, then_block)?;
-        self.validate_order(then_block, else_block)?;
         let then_branch = self.plan_branch(then_block, statement, callable)?;
-        let else_branch = self.plan_branch(else_block, statement, callable)?;
+        let else_branch = match (control.else_statement, trailing) {
+            (Some(else_block), []) => {
+                self.validate_range(else_block, statement)?;
+                self.validate_order(then_block, else_block)?;
+                self.plan_branch(else_block, statement, callable)?
+            }
+            (None, [first, ..]) => {
+                self.validate_order(statement, self.reference(*first))?;
+                self.plan_return_sequence(trailing, body, callable)?
+            }
+            _ => {
+                return Err(SourceFunctionStatementsError::Unsupported(
+                    SourceFunctionStatementsUnsupported::MissingElse(statement),
+                ));
+            }
+        };
 
         Ok(SourceFinalIfSyntax {
             statement,
             condition,
-            condition_identifier: condition_syntax.identifier,
-            typeof_condition: condition_syntax.typeof_condition,
-            equality_condition: condition_syntax.equality_condition,
+            condition_identifier: condition_syntax.map(|condition| condition.identifier),
+            typeof_condition: condition_syntax.and_then(|condition| condition.typeof_condition),
+            equality_condition: condition_syntax.and_then(|condition| condition.equality_condition),
             then_branch,
             else_branch,
         })
@@ -9362,6 +9378,7 @@ impl SyntaxPlanner<'_> {
             return Ok(SourceReturnBranchSyntax {
                 block: None,
                 locals: Vec::new(),
+                statements: Vec::new(),
                 return_statement: block,
                 return_expression,
             });
@@ -9396,17 +9413,22 @@ impl SyntaxPlanner<'_> {
             &block_data.statements.nodes,
         )?;
 
-        let Some((&return_id, local_statement_ids)) = block_data.statements.nodes.split_last()
-        else {
+        self.plan_return_sequence(&block_data.statements.nodes, block, callable)
+    }
+
+    fn plan_return_sequence(
+        &self,
+        statements: &[NodeId],
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceReturnBranchSyntax, SourceFunctionStatementsError> {
+        let Some((&return_id, local_statement_ids)) = statements.split_last() else {
             return Err(SourceFunctionStatementsError::Unsupported(
-                SourceFunctionStatementsUnsupported::MissingReturn(block),
+                SourceFunctionStatementsUnsupported::MissingReturn(parent),
             ));
         };
-        let mut locals = Vec::new();
-        for &statement_id in local_statement_ids {
-            let statement = self.reference(statement_id);
-            locals.extend(self.plan_local_or_block_statement(statement, block, callable)?);
-        }
+        let (locals, statements) =
+            self.plan_return_prefix(local_statement_ids, parent, callable)?;
 
         let return_statement = self.reference(return_id);
         let return_record = self.node(return_statement)?;
@@ -9417,7 +9439,7 @@ impl SyntaxPlanner<'_> {
         };
         if return_record.kind != SyntaxKind::ReturnStatement
             || return_record.flags.0 != 0
-            || return_record.parent != Some(block.node)
+            || return_record.parent != Some(parent.node)
             || return_data.flow_node.is_some()
             || return_data.facts != 0
         {
@@ -9427,8 +9449,10 @@ impl SyntaxPlanner<'_> {
                 SourceFunctionStatementsRole::ReturnStatement,
             ));
         }
+        self.validate_range(return_statement, parent)?;
         self.validate_container(return_statement, callable)?;
-        self.validate_block_scope_container(return_statement, block)?;
+        let scope = self.statement_lexical_scope(parent, callable)?;
+        self.validate_block_scope_container(return_statement, scope)?;
         let return_expression = return_data
             .expression
             .map(|node| self.reference(node))
@@ -9442,14 +9466,51 @@ impl SyntaxPlanner<'_> {
         )?;
         self.validate_range(return_expression, return_statement)?;
         self.validate_container(return_expression, callable)?;
-        self.validate_block_scope_container(return_expression, block)?;
+        self.validate_block_scope_container(return_expression, scope)?;
 
         Ok(SourceReturnBranchSyntax {
-            block: Some(block),
+            block: Some(parent),
             locals,
+            statements,
             return_statement,
             return_expression,
         })
+    }
+
+    fn plan_return_prefix(
+        &self,
+        nodes: &[NodeId],
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<
+        (
+            Vec<SourceLocalDeclarationSyntax>,
+            Vec<SourceLinearFunctionStatementSyntax>,
+        ),
+        SourceFunctionStatementsError,
+    > {
+        let mut locals = Vec::new();
+        let mut statements = Vec::new();
+        for &node in nodes {
+            let statement = self.reference(node);
+            if self.node(statement)?.kind == SyntaxKind::ExpressionStatement {
+                let expression = if parent == self.callable.body {
+                    self.plan_linear_expression_statement(statement, parent, callable)?
+                } else {
+                    self.plan_loop_expression_statement(statement, parent, callable)?
+                };
+                statements.push(SourceLinearFunctionStatementSyntax::Expression {
+                    statement,
+                    expression,
+                });
+            } else {
+                for local in self.plan_local_or_block_statement(statement, parent, callable)? {
+                    locals.push(local);
+                    statements.push(SourceLinearFunctionStatementSyntax::Local(local));
+                }
+            }
+        }
+        Ok((locals, statements))
     }
 
     fn validate_flow(
