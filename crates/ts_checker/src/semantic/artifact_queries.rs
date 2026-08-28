@@ -8653,7 +8653,7 @@ mod tests {
         let members = context.get_nongeneric_class_members(owner).unwrap();
         assert_eq!(
             context.get_type_at_location(exported),
-            Ok(members.shells().instance_type)
+            Ok(members.shells().instance_type())
         );
         let owner_record = context.store().symbol(owner).unwrap();
         let flags = owner_record.flags();
@@ -8720,7 +8720,7 @@ mod tests {
         );
         assert_eq!(
             context.get_type_at_location(exported),
-            Ok(members.shells().instance_type)
+            Ok(members.shells().instance_type())
         );
         assert!(context.diagnostics().is_empty());
     }
