@@ -4461,10 +4461,22 @@ fn validate_resolved_named_interface(
         }
         object_members::StoredDeclaredCallSetValidation::NotDeclaredCallSet => {}
     }
+    let has_methods = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .is_some_and(|members| {
+            members.iter().any(|(_, member)| {
+                store
+                    .symbol(member)
+                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+            })
+        });
     if let Some(host) = host
-        && store
-            .symbol(owner)
-            .is_some_and(|symbol| symbol.flags() != SymbolFlags::INTERFACE)
+        && (has_methods
+            || store
+                .symbol(owner)
+                .is_some_and(|symbol| symbol.flags() != SymbolFlags::INTERFACE))
     {
         let plan = object_members::plan_interface(store, host, owner)
             .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
@@ -7728,6 +7740,55 @@ mod tests {
                 .set_value_symbol_links(member, original)
         );
         assert_eq!(context.type_to_string(type_).unwrap(), "Catalog");
+    }
+
+    #[test]
+    fn method_interface_display_rejects_changed_return_types() {
+        let parsed = parse_source_file("interface Clock { read(): string; }");
+        let file = FileId::new(1_927);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = merged_interface_display_global(&context, "Clock");
+        let interface = context.get_declared_type_of_symbol(owner).unwrap();
+        assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+        let member = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|table| context.store().symbol_table(table))
+            .and_then(|table| table.get_source("read"))
+            .unwrap();
+        let method_type = context
+            .store()
+            .value_symbol_links(member)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Object(callable) = context.store().type_payload(method_type).unwrap().data()
+        else {
+            panic!("read must retain its declared method type")
+        };
+        let [signature] = callable.structured.signatures.as_deref().unwrap() else {
+            panic!("read must have one signature")
+        };
+        let signature = *signature;
+        let original_return = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(signature, Some(number),)
+        );
+        assert_malformed_display_without_writes(&context, interface);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(signature, original_return,)
+        );
+        assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
     }
 
     #[test]
