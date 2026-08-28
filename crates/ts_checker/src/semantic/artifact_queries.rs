@@ -1860,7 +1860,30 @@ impl CanonicalCheckerContext<'_> {
         {
             return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
         }
-        if !super::source_namespaces::has_pure_module_flags(record.flags()) {
+        let flags = record.flags();
+        // A namespace declaration names the static side of its merged class.
+        if flags.contains(SymbolFlags::CLASS) && flags.intersects(SymbolFlags::MODULE) {
+            if self
+                .cached_artifact_symbol(node)?
+                .is_some_and(|cached| cached != symbol)
+            {
+                return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+            }
+            if let Some(cached) = self.cached_artifact_type(node)?
+                && self
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    != Some(cached)
+            {
+                return Err(CanonicalArtifactQueryError::InvalidType {
+                    node,
+                    type_: cached,
+                });
+            }
+            return self.type_of_artifact_symbol(node, symbol);
+        }
+        if !super::source_namespaces::has_pure_module_flags(flags) {
             return Ok(None);
         }
         let type_ = self.get_type_of_module_value(symbol)?;
@@ -2928,6 +2951,18 @@ impl CanonicalCheckerContext<'_> {
             };
         }
 
+        if flags.contains(SymbolFlags::CLASS) && flags.intersects(SymbolFlags::MODULE) {
+            let members =
+                self.get_nongeneric_class_members(symbol)
+                    .map_err(|error| match error {
+                        super::ClassError::DeclaredType(error) => error.into(),
+                        error => CanonicalArtifactQueryError::Class { node, error },
+                    })?;
+            return self
+                .validate_artifact_type(node, members.shells().value_type())
+                .map(Some);
+        }
+
         if flags.intersects(SymbolFlags::TYPE) {
             return self
                 .get_declared_type_of_symbol(symbol)
@@ -3516,6 +3551,9 @@ fn supports_symbol_location(data: &NodeData) -> bool {
                 | NodeData::SourceFile(_)
         )
 }
+
+#[cfg(test)]
+mod cold_merged_namespace_tests;
 
 #[cfg(test)]
 mod export_equals_final_invariant_tests;
