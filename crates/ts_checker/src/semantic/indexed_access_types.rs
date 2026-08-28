@@ -473,8 +473,15 @@ fn validate_member_domains(
         ));
     }
     for property in &object.properties {
+        let name =
+            property
+                .name
+                .as_utf8()
+                .ok_or(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+                    object.node,
+                ))?;
         let mut applicable_domain = string_domain;
-        if is_numeric_literal_name(&property.name)
+        if is_numeric_literal_name(name)
             && let Some(number) = number_domain
         {
             applicable_domain =
@@ -482,12 +489,7 @@ fn validate_member_domains(
         }
         for index in &object.indexes {
             if store.source_node_kind(index.key_type_node) != Some(SyntaxKind::TemplateLiteralType)
-                || !template_pattern_syntax_matches_name(
-                    store,
-                    host,
-                    index.key_type_node,
-                    &property.name,
-                )?
+                || !template_pattern_syntax_matches_name(store, host, index.key_type_node, name)?
             {
                 continue;
             }
@@ -1088,10 +1090,12 @@ fn select_concrete_member(
 
     let literal_property_name = key.literal_property_name();
     if let Some(property) = literal_property_name.as_ref().and_then(|name| {
-        object
-            .properties
-            .iter()
-            .find(|property| name.matches(&property.name))
+        object.properties.iter().find(|property| {
+            property
+                .name
+                .as_utf8()
+                .is_some_and(|candidate| name.matches(candidate))
+        })
     }) {
         if property.optional {
             return Err(ConcreteIndexedAccessError::OptionalProperty {

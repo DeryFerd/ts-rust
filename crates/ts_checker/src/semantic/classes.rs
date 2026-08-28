@@ -7805,7 +7805,7 @@ fn plan_derived_constructor(
         || member_record.parent != Some(argument.node)
         || member_record.range.start < receiver_record.range.end
         || member_name.flow_node.is_some()
-        || member_name.text != interface_property.name
+        || interface_property.name.as_utf8() != Some(member_name.text.as_str())
     {
         return Err(reject());
     }
@@ -10399,7 +10399,7 @@ fn plan_implemented_interface_method(
     }
     Ok(ImplementedClassMethodPlan {
         symbol: method.symbol,
-        name: property.name.clone(),
+        name: property.name.as_utf8().ok_or_else(reject)?.to_owned(),
         array_type,
     })
 }

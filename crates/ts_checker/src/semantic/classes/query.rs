@@ -208,7 +208,7 @@ pub(in crate::semantic) fn class_query_reference_symbol(
                 let object = plan_type_literal(store, host, value.annotation, None)
                     .map_err(|_| unsupported(ClassUnsupported::PropertyInitializer(property)))?;
                 object.properties.iter().find_map(|property| {
-                    (property.name == text).then_some(property.symbol)
+                    (property.name.as_utf8() == Some(text)).then_some(property.symbol)
                 })
             }
         } else {

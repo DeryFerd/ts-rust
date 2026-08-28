@@ -5571,7 +5571,7 @@ fn materialize_cold_async_arrow_object_target(
         || name_record.flags.0 != 0
         || name_record.parent != Some(access.node)
         || name_text.flow_node.is_some()
-        || name_text.text != property.name
+        || property.name.as_utf8() != Some(name_text.text.as_str())
         || receiver_symbol.is_none_or(|symbol| {
             store
                 .symbol(symbol)

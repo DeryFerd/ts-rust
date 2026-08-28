@@ -2687,7 +2687,7 @@ fn plan_declared_constructor(
     let authenticated_prototype = matches!(
         object.properties.as_slice(),
         [prototype]
-            if prototype.name == "prototype"
+            if prototype.name.as_utf8() == Some("prototype")
                 && prototype.readonly
                 && object.call_signatures.iter().any(|signature| {
                     host.node(signature.declaration).is_some_and(|record| {

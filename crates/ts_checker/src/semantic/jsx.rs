@@ -1167,7 +1167,11 @@ fn plan_jsx_object_spread(
         properties.push(JsxAttributePlan {
             node: property.declaration,
             name_node: property.name_node,
-            name: property.name.clone(),
+            name: property
+                .name
+                .as_utf8()
+                .ok_or(SourceCheckError::Property(object_node))?
+                .to_owned(),
             symbol: property.symbol,
             value: JsxAttributeValue::Expression {
                 wrapper: None,
