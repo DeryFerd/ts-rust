@@ -71,7 +71,9 @@ use super::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         resolve_nongeneric_keyof_type,
     },
-    links::{ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeNodeLinks},
+    links::{
+        ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
+    },
     mapped_types::{
         MappedTypeDeclarationPlan, MappedTypeError, MappedTypeKeys, MappedTypeModifiers,
         MappedTypeRequest, plan_mapped_type_declaration, plan_mapped_type_keys,
@@ -1318,16 +1320,26 @@ struct PlannedUniqueSymbolDiagnostic {
     code: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedConstructorType {
     node: NodeRef,
     symbol: SemanticSymbolId,
     members: SymbolTableId,
     construct_symbol: SemanticSymbolId,
+    parameters: Vec<PlannedConstructorTypeParameter>,
+    flags: SignatureFlags,
+    min_argument_count: i32,
     return_type: NodeRef,
     return_identity_node: NodeRef,
     return_null_literal_identity: bool,
     alias_symbol: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedConstructorTypeParameter {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    type_node: NodeRef,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6663,7 +6675,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || constructor.type_parameters.is_some()
             || constructor.modifiers.is_some()
             || constructor.parameters.has_trailing_comma
-            || !constructor.parameters.nodes.is_empty()
         {
             return Err(unsupported());
         }
@@ -6726,6 +6737,116 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             };
 
         let bound = self.host.bound_file(node).ok_or_else(&invalid)?;
+        let mut parameters = Vec::with_capacity(constructor.parameters.nodes.len());
+        let mut previous_end = constructor.parameters.range.start;
+        let mut flags = SignatureFlags::CONSTRUCT;
+        for parameter_id in &constructor.parameters.nodes {
+            let declaration = NodeRef::new(node.arena, node.file, *parameter_id);
+            let parameter_record = preflight_node(self.store, self.host, declaration)?;
+            let NodeData::ParameterDeclaration(parameter) = &parameter_record.data else {
+                return Err(invalid());
+            };
+            if parameter.initializer.is_some()
+                || parameter.modifiers.is_some()
+                || parameter.question_token.is_some()
+                || parameter.dot_dot_dot_token.is_some()
+                || parameter.type_.is_none()
+            {
+                return Err(unsupported());
+            }
+            if parameter_record.kind != SyntaxKind::Parameter
+                || parameter_record.flags.0 != 0
+                || parameter_record.parent != Some(node.node)
+                || parameter_record.range.start < previous_end
+                || parameter_record.range.end > constructor.parameters.range.end
+                || parameter.symbol.is_some()
+                || parameter.facts != 0
+                || parameters
+                    .iter()
+                    .any(|parameter: &PlannedConstructorTypeParameter| {
+                        parameter.declaration == declaration
+                    })
+                || bound.container(declaration) != Some(node)
+                || bound.block_scope_container(declaration) != Some(node)
+            {
+                return Err(invalid());
+            }
+            previous_end = parameter_record.range.end;
+            let name = NodeRef::new(node.arena, node.file, parameter.name);
+            let name_record = preflight_node(self.store, self.host, name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(unsupported());
+            };
+            if identifier.text == "this" {
+                return Err(unsupported());
+            }
+            let type_node = NodeRef::new(
+                node.arena,
+                node.file,
+                parameter
+                    .type_
+                    .expect("required constructor parameters retain an annotation"),
+            );
+            let annotation = preflight_node(self.store, self.host, type_node)?;
+            let symbol = bound.symbol(declaration).ok_or_else(&invalid)?;
+            let parameter_symbol = self.store.symbol(symbol).ok_or_else(&invalid)?;
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(declaration.node)
+                || name_record.range.start < parameter_record.range.start
+                || name_record.range.end > annotation.range.start
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || annotation.parent != Some(declaration.node)
+                || annotation.range.end > parameter_record.range.end
+                || parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || parameter_symbol.check_flags() != CheckFlags::NONE
+                || parameter_symbol.name().as_utf8() != Some(identifier.text.as_str())
+                || parameter_symbol.declarations() != Some(&[declaration])
+                || parameter_symbol.value_declaration() != Some(declaration)
+                || parameter_symbol.members().is_some()
+                || parameter_symbol.exports().is_some()
+                || parameter_symbol.parent().is_some()
+                || parameter_symbol.export_symbol().is_some()
+                || self.store.get_merged_symbol(symbol) != Some(symbol)
+                || bound
+                    .locals(node)
+                    .and_then(|locals| self.store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&identifier.text))
+                    != Some(symbol)
+                || self.store.value_symbol_links(symbol).is_some_and(|links| {
+                    links
+                        != &(ValueSymbolLinks {
+                            resolved_type: links.resolved_type,
+                            ..ValueSymbolLinks::default()
+                        })
+                        || links.resolved_type.is_some_and(|type_| {
+                            !self
+                                .store
+                                .source_direct_type_annotation_is_exact(type_node, type_)
+                        })
+                })
+            {
+                return Err(invalid());
+            }
+            if annotation.kind == SyntaxKind::LiteralType {
+                flags |= SignatureFlags::HAS_LITERAL_TYPES;
+            }
+            parameters.push(PlannedConstructorTypeParameter {
+                declaration,
+                symbol,
+                type_node,
+            });
+        }
+        if !parameters.is_empty()
+            && bound
+                .locals(node)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .is_none_or(|locals| locals.len() != parameters.len())
+        {
+            return Err(invalid());
+        }
+        let min_argument_count = i32::try_from(parameters.len()).map_err(|_| invalid())?;
         let symbol = bound.symbol(node).ok_or_else(&invalid)?;
         let owner = self.store.symbol(symbol).ok_or_else(&invalid)?;
         let members = owner.members().ok_or_else(&invalid)?;
@@ -6788,6 +6909,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .is_none_or(|signature| {
                         self.store.function_signature_return_annotation(signature)
                             != Some((return_identity_node, return_null_literal_identity))
+                            || self.store.signature(signature).is_none_or(|signature| {
+                                signature.flags() != flags
+                                    || signature.min_argument_count() != min_argument_count
+                                    || signature.parameters().len() != parameters.len()
+                                    || signature
+                                        .parameters()
+                                        .iter()
+                                        .zip(&parameters)
+                                        .any(|(symbol, parameter)| *symbol != parameter.symbol)
+                            })
                     })
                 {
                     return Err(invalid());
@@ -6808,15 +6939,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             symbol,
             members,
             construct_symbol,
+            parameters,
+            flags,
+            min_argument_count,
             return_type,
             return_identity_node,
             return_null_literal_identity,
             alias_symbol: alias_owner,
         };
-        if let Some(previous) = self.plan.constructors.insert(node, planned)
+        if let Some(previous) = self.plan.constructors.insert(node, planned.clone())
             && previous != planned
         {
             return Err(invalid());
+        }
+        for parameter in &planned.parameters {
+            self.plan_type_node_in_context(parameter.type_node, None, false)?;
         }
         self.plan_type_node_in_context(return_type, None, false)
     }
@@ -22858,7 +22995,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .iter()
             .filter(|constructor| constructor.alias_symbol.is_some())
             .count();
+        let constructor_parameter_links = cold_constructors
+            .iter()
+            .flat_map(|constructor| &constructor.parameters)
+            .filter(|parameter| self.store.value_symbol_links(parameter.symbol).is_none())
+            .count();
         if !self.store.try_reserve_signatures(cold_constructors.len())
+            || !self
+                .store
+                .try_reserve_value_symbol_links(constructor_parameter_links)
             || !self
                 .store
                 .try_reserve_signature_links(cold_constructors.len())
@@ -25910,7 +26055,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
         let constructor =
-            plan.constructors.get(&node).copied().ok_or_else(|| {
+            plan.constructors.get(&node).cloned().ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(node))
             })?;
         if self
@@ -25924,6 +26069,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         let return_type = self.execute_type_node(constructor.return_type, plan, prepared)?;
+        let mut parameter_types = Vec::with_capacity(constructor.parameters.len());
+        for parameter in &constructor.parameters {
+            let type_ = self.execute_type_node(parameter.type_node, plan, prepared)?;
+            if self
+                .store
+                .value_symbol_links(parameter.symbol)
+                .is_some_and(|links| {
+                    links
+                        != &(ValueSymbolLinks {
+                            resolved_type: links.resolved_type,
+                            ..ValueSymbolLinks::default()
+                        })
+                        || links.resolved_type.is_some_and(|cached| cached != type_)
+                })
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(node),
+                ));
+            }
+            parameter_types.push(type_);
+        }
         if let Some(cached) = self
             .store
             .type_node_links(node)
@@ -25973,16 +26139,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let signature = self
             .store
             .alloc_signature(
-                SignatureFlags::CONSTRUCT,
+                constructor.flags,
                 Some(node),
                 Vec::new(),
                 None,
-                Vec::new(),
+                constructor
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.symbol)
+                    .collect(),
                 Some(return_type),
                 None,
-                0,
+                constructor.min_argument_count,
             )
             .ok_or_else(&invalid)?;
+        for (parameter, type_) in constructor.parameters.iter().zip(&parameter_types) {
+            if !self.store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ) {
+                return Err(invalid());
+            }
+        }
         if !self.store.set_signature_links(
             node,
             SignatureLinks {
@@ -26007,7 +26188,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )
             || !self
                 .store
-                .set_callable_signature_parameter_types_batch(vec![(signature, Vec::new())])
+                .set_callable_signature_parameter_types_batch(vec![(signature, parameter_types)])
         {
             return Err(invalid());
         }
@@ -59096,9 +59277,87 @@ mod tests {
     }
 
     #[test]
+    fn typed_constructor_parameters_keep_types_arity_and_warm_identity() {
+        for (source, parameter_count) in [
+            ("declare const factory: new (value: string) => string;", 1),
+            (
+                "declare const factory: new (value: string, count: number) => string;",
+                2,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let constructor = variable_type_node(&fixture, "factory");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = query_node(&mut fixture, constructor, &mut diagnostics).unwrap();
+            let signature = function_signature(&fixture.store, constructor);
+            let record = fixture.store.signature(signature).unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let expected = [bootstrap.string_type, bootstrap.number_type];
+            assert_eq!(record.flags(), SignatureFlags::CONSTRUCT);
+            assert_eq!(record.parameters().len(), parameter_count);
+            assert_eq!(
+                record.min_argument_count(),
+                i32::try_from(parameter_count).unwrap()
+            );
+            assert_eq!(record.resolved_return_type(), Some(bootstrap.string_type));
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some(&expected[..parameter_count])
+            );
+            for (parameter, type_) in record.parameters().iter().zip(&expected) {
+                assert_eq!(
+                    fixture.store.value_symbol_links(*parameter),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(*type_),
+                        ..ValueSymbolLinks::default()
+                    })
+                );
+            }
+            assert!(matches!(
+                object_members::validate_stored_declared_call_set(&fixture.store, type_),
+                object_members::StoredDeclaredCallSetValidation::Valid(_)
+            ));
+            let warm = function_store_state(&fixture.store);
+            assert_eq!(
+                query_node(&mut fixture, constructor, &mut diagnostics),
+                Ok(type_)
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_constructor_parameters_reject_changed_value_caches() {
+        let mut fixture = fixture("declare const factory: new (value: string) => number;");
+        let constructor = variable_type_node(&fixture, "factory");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = query_node(&mut fixture, constructor, &mut diagnostics).unwrap();
+        let signature = function_signature(&fixture.store, constructor);
+        let parameter = fixture.store.signature(signature).unwrap().parameters()[0];
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let before = function_store_state(&fixture.store);
+        assert_eq!(
+            object_members::validate_stored_declared_call_set(&fixture.store, type_),
+            object_members::StoredDeclaredCallSetValidation::Malformed
+        );
+        assert!(query_node(&mut fixture, constructor, &mut diagnostics).is_err());
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn unsupported_constructor_type_families_remain_atomic() {
         for source in [
-            "declare const factory: new (value: string) => string;",
+            "declare const factory: new (value?: string) => string;",
+            "declare const factory: new (...value: string[]) => string;",
             "declare const factory: new <Value>() => Value;",
             "declare const factory: abstract new () => string;",
             "type Factory<Value> = new () => Value;",

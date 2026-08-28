@@ -2742,12 +2742,35 @@ impl<'store> RelaterSession<'store> {
                 self.strict_function_types,
             )?
         {
-            return self.compare_signatures_related(
+            let target_is_class = self
+                .store
+                .type_payload(target)
+                .and_then(TypeRecord::symbol)
+                .and_then(|owner| self.store.symbol(owner))
+                .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS));
+            let properties = if target_is_class {
+                let source_members = self.class_constructor_static_members(source)?;
+                let target_members = self.class_constructor_static_members(target)?;
+                self.properties_related_to(source, target, &source_members, &target_members)?
+            } else {
+                Ternary::True
+            };
+            if properties == Ternary::False {
+                return Ok(properties);
+            }
+            if !self.store.construct_signature_visibilities_are_compatible(
+                &source_signature,
+                &target_signature,
+            )? {
+                return Ok(Ternary::False);
+            }
+            let signatures = self.compare_signatures_related(
                 &source_signature,
                 &target_signature,
                 SignatureCheckMode::NONE,
                 intersection_state,
-            );
+            )?;
+            return Ok(properties & signatures);
         }
         let source_members = self.resolved_object_members(source, true)?;
         let allow_fresh_target = self.allows_fresh_object_target();
@@ -6408,23 +6431,55 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .signature(signature)
             .ok_or(RelationUnavailable::InvalidStructuredMembers(type_))?;
         if object.structured.call_signature_count != 0
-            || record.flags() != SignatureFlags::CONSTRUCT
+            || !record.flags().contains(SignatureFlags::CONSTRUCT)
+            || record.flags().bits()
+                & !(SignatureFlags::CONSTRUCT
+                    | SignatureFlags::ABSTRACT
+                    | SignatureFlags::HAS_LITERAL_TYPES)
+                    .bits()
+                != 0
             || !record.type_parameters().is_empty()
-            || !record.parameters().is_empty()
-            || record.min_argument_count() != 0
+            || record.this_parameter().is_some()
             || record.resolved_return_type() != Some(instance)
         {
             return Err(RelationUnavailable::StructuredSignatures(type_));
+        }
+        let parameters = record
+            .parameters()
+            .iter()
+            .map(|parameter| {
+                let links = self.value_symbol_links(*parameter)?;
+                let type_ = links.resolved_type?;
+                (links
+                    == &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+                    && self.type_payload(type_).is_some())
+                .then_some(type_)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_))?;
+        let min_argument_count = usize::try_from(record.min_argument_count())
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_))?;
+        if min_argument_count > parameters.len()
+            || self
+                .callable_signature_parameter_types(signature)
+                .is_some_and(|cached| cached != parameters.as_slice())
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_));
         }
 
         Ok(Some(ValidatedSingleCallable {
             owner: type_,
             signature,
-            parameters: Vec::new(),
+            parameters,
             rest_parameter: None,
-            min_argument_count: 0,
+            min_argument_count,
             return_type: Some(instance),
-            strict_variance_exempt: false,
+            strict_variance_exempt: record.declaration().is_some_and(|declaration| {
+                self.source_node_kind(declaration) == Some(SyntaxKind::Constructor)
+            }),
         }))
     }
 
@@ -6456,10 +6511,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let record = self
             .signature(signature)
             .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
-        let parameters = self
+        let mut parameters = self
             .callable_signature_parameter_types(signature)
             .ok_or(RelationUnavailable::MalformedFunctionType(type_))?
             .to_vec();
+        let rest_parameter = if record.has_rest_parameter() {
+            Some(
+                parameters
+                    .pop()
+                    .ok_or(RelationUnavailable::MalformedFunctionType(type_))?,
+            )
+        } else {
+            None
+        };
         let min_argument_count = usize::try_from(record.min_argument_count())
             .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
         let return_type = record
@@ -6469,7 +6533,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             owner: type_,
             signature,
             parameters,
-            rest_parameter: None,
+            rest_parameter,
             min_argument_count,
             return_type: Some(return_type),
             strict_variance_exempt: false,
@@ -6488,6 +6552,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.authenticated_declared_construct_signature(source)?,
             self.authenticated_declared_construct_signature(target)?,
         ) {
+            (None, None)
+                if relation == RelationKind::Assignable && strict_function_types.is_some() =>
+            {
+                match (
+                    self.authenticated_class_construct_signature(source)?,
+                    self.authenticated_class_construct_signature(target)?,
+                ) {
+                    (Some(source), Some(target)) => Ok(Some((source, target))),
+                    _ => Ok(None),
+                }
+            }
             (None, None) => Ok(None),
             (Some(source), Some(target))
                 if relation == RelationKind::Assignable && strict_function_types.is_some() =>
@@ -6520,6 +6595,99 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             (None, Some(target)) => Err(RelationUnavailable::StructuredSignatures(target.owner)),
         }
+    }
+
+    fn construct_signature_visibilities_are_compatible(
+        &self,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
+    ) -> Result<bool, RelationUnavailable> {
+        let source = self
+            .signature(source.signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(source.owner))?;
+        let target = self
+            .signature(target.signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(target.owner))?;
+        if source.flags().contains(SignatureFlags::ABSTRACT)
+            && !target.flags().contains(SignatureFlags::ABSTRACT)
+        {
+            return Ok(false);
+        }
+        let (Some(source), Some(target)) = (source.declaration(), target.declaration()) else {
+            return Ok(true);
+        };
+        Ok(matches!(
+            (
+                class_member_visibility(self, source),
+                class_member_visibility(self, target),
+            ),
+            (_, ClassConstructorVisibility::Private)
+                | (ClassConstructorVisibility::Public, _)
+                | (
+                    ClassConstructorVisibility::Protected,
+                    ClassConstructorVisibility::Protected
+                )
+        ))
+    }
+
+    /// Reports fixed-target arity only after constructor and static requirements are proven.
+    pub(super) fn constructor_arity_mismatch(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        strict_function_types: bool,
+    ) -> Result<Option<(usize, usize)>, RelationUnavailable> {
+        for type_ in [source, target] {
+            match validate_stored_callable_set(self, type_) {
+                StoredCallableSetValidation::Valid { projection, .. }
+                    if !projection.construct_signatures.is_empty() => {}
+                StoredCallableSetValidation::NotCallable
+                | StoredCallableSetValidation::Pending { .. }
+                | StoredCallableSetValidation::Valid { .. } => return Ok(None),
+                StoredCallableSetValidation::Malformed { .. } => {
+                    return Err(RelationUnavailable::MalformedFunctionType(type_));
+                }
+            }
+        }
+        let Some((source_signature, target_signature)) = self
+            .authenticated_declared_construct_pair(
+                source,
+                target,
+                RelationKind::Assignable,
+                Some(strict_function_types),
+            )?
+        else {
+            return Ok(None);
+        };
+        if !self
+            .construct_signature_visibilities_are_compatible(&source_signature, &target_signature)?
+            || target_signature.rest_parameter.is_some()
+            || source_signature.min_argument_count <= target_signature.parameters.len()
+        {
+            return Ok(None);
+        }
+        let structured = self
+            .type_payload(target)
+            .and_then(|record| record.data().structured())
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        // Static member errors precede arity errors. Targets with those requirements
+        // remain with the member diagnostic path until it can report the failure reason.
+        if structured.properties.as_deref().is_some_and(|properties| {
+            properties.iter().any(|property| {
+                self.symbol(*property)
+                    .is_none_or(|symbol| !symbol.flags().contains(SymbolFlags::PROTOTYPE))
+            })
+        }) || structured
+            .index_infos
+            .as_deref()
+            .is_some_and(|indexes| !indexes.is_empty())
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            source_signature.min_argument_count,
+            target_signature.parameters.len(),
+        )))
     }
 
     fn admit_callable_relation_type(
@@ -10541,6 +10709,122 @@ mod tests {
                 .is_type_assignable_to_with_strict_function_types(narrow, wide, false),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn class_constructor_parameters_check_arity_returns_and_warm_caches() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "class A { constructor(public x: string) {} } ",
+            "class B extends A { constructor(x: string, public data: string) { super(x); } } ",
+            "class C extends A { constructor(x: string) { super(x); } } ",
+            "declare const factory: { new(x: string): A };",
+        ));
+        let file = FileId::new(97_001);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let value_type = |name| {
+            let store = context.store();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            let symbol = store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            store
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        };
+        let a = value_type("A");
+        let b = value_type("B");
+        let c = value_type("C");
+        let factory = value_type("factory");
+        let globals = context.global_types().clone();
+        for (source, target, expected) in [
+            (b, a, false),
+            (b, factory, false),
+            (c, a, true),
+            (c, factory, true),
+            (a, b, false),
+        ] {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source, target, &globals, true,
+                    ),
+                Ok(expected)
+            );
+            let warm = context.store().relation_state_snapshot();
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source, target, &globals, true,
+                    ),
+                Ok(expected)
+            );
+            assert_eq!(context.store().relation_state_snapshot(), warm);
+        }
+        let signature = context
+            .store()
+            .authenticated_class_construct_signature(b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signature.parameters.len(), 2);
+        assert_eq!(signature.min_argument_count, 2);
+        assert_eq!(
+            context.store().constructor_arity_mismatch(b, a, true),
+            Ok(Some((2, 1)))
+        );
+        assert_eq!(
+            context.store().constructor_arity_mismatch(c, a, true),
+            Ok(None)
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context.store().constructor_arity_mismatch(number, a, true),
+            Ok(None)
+        );
+        assert_eq!(
+            context.store().constructor_arity_mismatch(b, number, true),
+            Ok(None)
+        );
+
+        let parameter = context
+            .store()
+            .signature(signature.signature)
+            .unwrap()
+            .parameters()[1];
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let poisoned = context.store().relation_state_snapshot();
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_assignable_to_with_global_types_and_strict_function_types(
+                    b, a, &globals, true
+                ),
+            Err(RelationUnavailable::InvalidStructuredMembers(b))
+        );
+        assert_eq!(context.store().relation_state_snapshot(), poisoned);
     }
 
     #[test]

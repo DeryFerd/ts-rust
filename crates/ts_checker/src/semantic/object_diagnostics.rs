@@ -1293,6 +1293,27 @@ pub(super) fn missing_mapped_index_signature_details(
     Ok(vec![format!("  {detail}")])
 }
 
+/// Explains required constructor arguments from authenticated signature records.
+fn constructor_assignability_details(
+    store: &CanonicalTypeMapperStore,
+    source_type: TypeId,
+    target_type: TypeId,
+    strict_function_types: bool,
+) -> Result<Vec<String>, SourceCheckError> {
+    let Some((required, available)) =
+        store.constructor_arity_mismatch(source_type, target_type, strict_function_types)?
+    else {
+        return Ok(Vec::new());
+    };
+    let detail = Diagnostic::with_arguments(
+        message_by_code(2849).ok_or(SourceCheckError::MissingDiagnostic(2849))?,
+        [required.to_string(), available.to_string()],
+    )
+    .render()
+    .expect("TS2849 has two formatting arguments");
+    Ok(vec![format!("  {detail}")])
+}
+
 /// Explains incompatible required callable parameters, arity, or return types.
 pub(super) fn callable_assignability_details(
     store: &mut CanonicalTypeMapperStore,
@@ -1590,6 +1611,14 @@ fn generic_assignability_diagnostic(
             options,
         )?
     };
+    if diagnostic.diagnostic.details.is_empty() {
+        diagnostic.diagnostic.details = constructor_assignability_details(
+            store,
+            source_type,
+            target_type,
+            options.strict_function_types,
+        )?;
+    }
     Ok(diagnostic)
 }
 

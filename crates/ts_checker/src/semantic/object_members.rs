@@ -3003,6 +3003,12 @@ pub(super) fn validate_stored_declared_call_set(
                         resolved_type: Some(*type_),
                         ..ValueSymbolLinks::default()
                     })
+                || store.source_node_kind(provider_declaration) == Some(SyntaxKind::ConstructorType)
+                    && store
+                        .source_direct_type_annotation(*parameter_declaration)
+                        .is_none_or(|annotation| {
+                            !store.source_direct_type_annotation_is_exact(annotation, *type_)
+                        })
                 || declared_signature_parameter_is_implicit_any_rest(
                     store,
                     *parameter_declaration,
