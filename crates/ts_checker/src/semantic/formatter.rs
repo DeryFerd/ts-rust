@@ -4080,7 +4080,21 @@ fn display_interface_name(
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
     } else if interface != &super::type_records::InterfaceTypeData::default() {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        let valid_no_base_shell = interface.base_types_resolved
+            && interface.resolved_base_constructor_type.is_none()
+            && interface.resolved_base_types.is_none()
+            && host.is_some_and(|host| {
+                object_members::plan_interface(store, host, symbol_id).is_ok_and(|plan| {
+                    plan.heritage.is_none()
+                        && matches!(
+                            object_members::interface_state(store, &plan, type_id),
+                            Ok(object_members::PropertyObjectState::Shell(shell)) if shell == type_id
+                        )
+                })
+            });
+        if !valid_no_base_shell {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
     }
     display_symbol_name(store, host, type_id, symbol_id, state)
 }
@@ -7545,6 +7559,55 @@ mod tests {
             Some(instance)
         );
         assert!(context.store().value_symbol_links(clock).is_none());
+    }
+
+    #[test]
+    fn interface_display_accepts_empty_base_cache_and_rejects_partial_members() {
+        let parsed = parse_source_file("interface Clock { read(): string; }");
+        let files = [(FileId::new(1_926), &parsed, false)];
+        let mut context = merged_interface_display_context(&files);
+        let owner = merged_interface_display_global(&context, "Clock");
+        let interface = merged_interface_display_identity(&mut context, &files, owner);
+        assert!(
+            context
+                .store_mut_for_test()
+                .publish_interface_no_base_resolution(interface)
+        );
+        assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+        assert_hostless_malformed_display_without_writes(&context, interface);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_declared_members(interface, true, None, None, None, None,)
+        );
+        assert_malformed_display_without_writes(&context, interface);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_declared_members(interface, false, None, None, None, None,)
+        );
+
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            interface,
+            true,
+            None,
+            Some(vec![interface]),
+        ));
+        assert_malformed_display_without_writes(&context, interface);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(interface, true, None, None,)
+        );
+        assert_eq!(context.type_to_string(interface).unwrap(), "Clock");
+        let record = context.store().type_payload(interface).unwrap();
+        assert_eq!(record.object_flags(), ObjectFlags::INTERFACE);
+        let TypeData::Interface(data) = record.data() else {
+            panic!("Clock must remain an interface")
+        };
+        assert!(data.base_types_resolved);
+        assert!(!data.declared_members_resolved);
     }
 
     #[test]
