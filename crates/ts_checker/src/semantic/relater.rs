@@ -1140,8 +1140,8 @@ impl<'store> RelaterSession<'store> {
     /// Reads mixed Array/object relations without preparing generic Array members.
     /// A negative result requires complete source names and an authenticated
     /// required target property absent from the source and global Object.
-    /// Cold targets without that proof stay unavailable. The existing empty-object
-    /// and exact length-property comparisons remain separate.
+    /// Cold targets without that proof stay unavailable. Resolved index-only
+    /// targets use their validated instantiated indexes.
     fn canonical_array_property_object_relation(
         &mut self,
         source: TypeId,
@@ -1196,6 +1196,19 @@ impl<'store> RelaterSession<'store> {
             if self.canonical_array_target_missing_required_property(array_target, &names)? {
                 return Ok(Some(Ternary::False));
             }
+            if let Some(target_members) =
+                self.canonical_array_index_only_members(array, array_target)?
+            {
+                return self
+                    .index_signatures_related_to(
+                        source,
+                        target,
+                        &members,
+                        &target_members,
+                        IntersectionState::NONE,
+                    )
+                    .map(Some);
+            }
             return Err(if members.properties.is_empty() {
                 RelationUnavailable::UnsupportedStructuredType(array_target)
             } else {
@@ -1219,6 +1232,54 @@ impl<'store> RelaterSession<'store> {
             });
         }
         Ok(Some(result))
+    }
+
+    fn canonical_array_index_only_members(
+        &self,
+        array: TypeId,
+        target: TypeId,
+    ) -> Result<Option<ResolvedObjectMembers>, RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(array);
+        let TypeData::Interface(interface) = self
+            .store
+            .type_payload(target)
+            .ok_or_else(invalid)?
+            .data()
+        else {
+            return Err(invalid());
+        };
+        if !interface.declared_members_resolved
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.resolved_base_types.is_some()
+            || interface
+                .declared_index_infos
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return Ok(None);
+        }
+        let members = validate_generic_interface_members(
+            self.store,
+            array,
+            self.global_types.map(|globals| globals.array_targets),
+        )
+        .map_err(|_| invalid())?
+        .ok_or(RelationUnavailable::UnresolvedStructuredMembers(array))?;
+        let structured = self
+            .store
+            .type_payload(array)
+            .and_then(|record| record.data().structured())
+            .ok_or_else(invalid)?;
+        Ok(Some(ResolvedObjectMembers {
+            members: members.members(),
+            properties: members.properties().to_vec(),
+            index_infos: structured.index_infos.clone().unwrap_or_default(),
+            property_origin: ObjectPropertyOrigin::GenericReference(array),
+            call_signature: None,
+            exact_callable: false,
+        }))
     }
 
     fn canonical_array_length_property_relation(

@@ -368,7 +368,7 @@ pub(super) fn check_direct_source_element_write(
     )
 }
 
-/// Reads a non-rest binding from a canonical array or an interface's own numeric index.
+/// Reads a non-rest binding from an array, a property object, or an own numeric index.
 /// The caller must first prove iteration and [`is_array_like_type`]. This query
 /// does not publish binding-node links or apply the binding's default value.
 pub(super) fn check_array_binding_element(
@@ -394,6 +394,45 @@ pub(super) fn check_array_binding_element(
     }
 
     let Some(array) = store.canonical_array_reference(global_types, receiver_type)? else {
+        let properties = if store
+            .type_payload(receiver_type)
+            .is_some_and(|record| record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED))
+        {
+            object_members::validate_resolved_declared_property_object(store, receiver_type)
+        } else {
+            object_members::DeclaredPropertyObjectValidation::NotDeclared
+        };
+        match properties {
+            object_members::DeclaredPropertyObjectValidation::Valid(_) => {
+                if let Some(property) =
+                    store.resolved_own_property(receiver_type, &index.to_string())?
+                {
+                    return Ok(CheckedSourceElement {
+                        type_: optional_element_read_type(
+                            store,
+                            Some(global_types),
+                            name,
+                            property.symbol,
+                            property.type_,
+                            property.optional,
+                        )?,
+                        diagnostic: None,
+                    });
+                }
+                return missing_array_binding_element(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    binding,
+                    receiver_type,
+                );
+            }
+            object_members::DeclaredPropertyObjectValidation::NotDeclared => {}
+            object_members::DeclaredPropertyObjectValidation::Malformed => {
+                return Err(SourceElementError::InvalidType(receiver_type));
+            }
+        }
         if let Some(index) = resolve_own_numeric_interface_index(
             store,
             host,
@@ -438,6 +477,22 @@ pub(super) fn check_array_binding_element(
         });
     }
 
+    missing_array_binding_element(store, host, global_types, options, binding, receiver_type)
+}
+
+pub(super) fn missing_array_binding_element(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    binding: NodeRef,
+    receiver_type: TypeId,
+) -> Result<CheckedSourceElement, SourceElementError> {
+    let (name, index) = array_binding_name_and_index(store, host, binding)?;
+    let error = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .error_type;
     let receiver = display_type(store, host, Some(global_types), options, receiver_type)?;
     Ok(CheckedSourceElement {
         type_: error,
@@ -457,7 +512,8 @@ pub(super) fn check_array_binding_element(
 ///
 /// This does not classify the receiver as array-like or select a literal
 /// property. The result has no unchecked-access widening. A missing own
-/// interface index remains unsupported until inherited lookup can prove it.
+/// interface index remains unsupported unless a complete property-only proof
+/// also establishes that inherited indexes are absent.
 #[cfg_attr(not(test), allow(dead_code))] // Source dispatch installs this provider separately.
 #[allow(clippy::too_many_lines)] // Keep numeric index selection separate from indexed properties.
 pub(super) fn numeric_index_type(
@@ -549,6 +605,18 @@ pub(super) fn numeric_index_type(
             receiver,
         )?;
         return Ok(indexes.number);
+    }
+    if store
+        .type_payload(receiver)
+        .is_some_and(|record| record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED))
+    {
+        match object_members::validate_resolved_declared_property_object(store, receiver) {
+            object_members::DeclaredPropertyObjectValidation::Valid(_) => return Ok(None),
+            object_members::DeclaredPropertyObjectValidation::NotDeclared => {}
+            object_members::DeclaredPropertyObjectValidation::Malformed => {
+                return Err(SourceElementError::InvalidType(receiver));
+            }
+        }
     }
     let index = resolve_own_numeric_interface_index(
         store,

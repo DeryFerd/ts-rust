@@ -39316,6 +39316,7 @@ fn source_array_binding_iteration_type(
                 global_types,
                 options,
                 session,
+                diagnostics,
                 pattern,
                 receiver,
             )?
@@ -39359,13 +39360,14 @@ fn source_array_binding_yield_type(
         .map_err(Into::into)
 }
 
-#[allow(clippy::too_many_lines)] // Empty generic member preparation and relation retries share one checked receiver.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Member preparation and relation retries share one checked receiver.
 fn source_array_binding_is_array_like(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     node: NodeRef,
     receiver: TypeId,
 ) -> Result<bool, SourceCheckError> {
@@ -39464,9 +39466,30 @@ fn source_array_binding_is_array_like(
     }
     let mut members = HashSet::new();
     let mut properties = HashSet::new();
+    let mut prepared_array_target = false;
     loop {
         match is_array_like_type(store, global_types, options, receiver) {
             Ok(array_like) => return Ok(array_like),
+            Err(SourceElementError::Relation(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                ..
+            })) if target == global_types.any_readonly_array_type
+                && store
+                    .type_payload(source)
+                    .is_some_and(|record| record.flags() == TypeFlags::OBJECT)
+                && !prepared_array_target
+                && prepare_source_index_only_array_target(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )? =>
+            {
+                prepared_array_target = true;
+            }
             Err(SourceElementError::Relation(
                 error @ (RelationUnavailable::UnresolvedStructuredMembers(_)
                 | RelationUnavailable::UnresolvedPropertyType(_)),
@@ -39482,6 +39505,113 @@ fn source_array_binding_is_array_like(
             Err(error) => return Err(SourcePlanner::element_plan_error(node, error)),
         }
     }
+}
+
+#[allow(clippy::too_many_lines)] // Validate cold caches before resolving the source index annotations.
+fn prepare_source_index_only_array_target(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<bool, SourceCheckError> {
+    let target = global_types.readonly_array_type;
+    let invalid = || {
+        SourceCheckError::RelationUnavailable(RelationUnavailable::InvalidStructuredMembers(target))
+    };
+    let record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Ok(false);
+    };
+    let owner = record.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if owner_record.flags() != SymbolFlags::INTERFACE
+        || !owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .is_some_and(|members| {
+                members
+                    .get(ts_binder::InternalSymbolName::Index.as_ref())
+                    .is_some()
+                    && members.iter().all(|(name, symbol)| {
+                        store.symbol(symbol).is_some_and(|record| {
+                            record.flags() == SymbolFlags::TYPE_PARAMETER
+                                || name == ts_binder::InternalSymbolName::Index.as_ref()
+                                    && record.flags() == SymbolFlags::SIGNATURE
+                        })
+                    })
+            })
+    {
+        return Ok(false);
+    }
+    let bases_resolved = interface.base_types_resolved;
+    preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
+    validate_direct_generic_reference(store, global_types.any_readonly_array_type)
+        .map_err(|_| invalid())?;
+    let plan = super::object_members::plan_generic_interface(store, host, owner)
+        .map_err(|_| invalid())?;
+    if plan.heritage.is_some()
+        || !plan.properties.is_empty()
+        || !plan.methods.is_empty()
+        || !plan.accessors.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.indexes.is_empty()
+    {
+        return Ok(false);
+    }
+    if interface.declared_members_resolved {
+        super::instantiated_members::validate_generic_interface_members(
+            store,
+            global_types.any_readonly_array_type,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )
+        .map_err(|_| invalid())?;
+        return Ok(true);
+    }
+    let reference = store
+        .type_payload(global_types.any_readonly_array_type)
+        .ok_or_else(invalid)?;
+    if interface.declared_members.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || interface.resolved_base_types.is_some()
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.reference.object.structured
+            != super::type_records::StructuredTypeData::default()
+        || record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+        || reference.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+        || reference.data().structured()
+            != Some(&super::type_records::StructuredTypeData::default())
+    {
+        return Err(invalid());
+    }
+    for (key, value) in plan.index_type_nodes() {
+        for annotation in [key, value] {
+            session.reset_query();
+            let mut query_diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut query_diagnostics,
+            )?
+            .get_type_from_type_node(annotation);
+            merge_retry_diagnostics(diagnostics, query_diagnostics);
+            result?;
+        }
+    }
+    if !bases_resolved && !store.publish_interface_no_base_resolution(target) {
+        return Err(invalid());
+    }
+    super::object_members::publish_generic_interface_declared_members_with_global_types(
+        store, &plan, target, &[], global_types,
+    )
+    .map_err(|_| invalid())?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)] // Flat callable and loop bindings share the same dispatch.
@@ -39518,6 +39648,7 @@ fn check_source_array_binding_element(
             global_types,
             options,
             session,
+            diagnostics,
             binding,
             receiver,
         )?
@@ -39697,6 +39828,7 @@ fn source_for_of_fallback_type(
         global_types,
         options,
         session,
+        diagnostics,
         node,
         array,
     )? {
@@ -40919,6 +41051,7 @@ fn check_planned_array_binding_element(
             global_types,
             options,
             session,
+            diagnostics,
             binding.element,
             receiver,
         )?
@@ -41086,6 +41219,17 @@ fn check_planned_array_binding_element(
                 iteration_type,
             )?;
             if let Some(diagnostic) = checked.diagnostic {
+                if diagnostic.diagnostic.code() == 2339 {
+                    return super::source_elements::missing_array_binding_element(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        binding.element,
+                        receiver,
+                    )
+                    .map_err(|error| SourcePlanner::element_plan_error(binding.element, error));
+                }
                 merge_retry_diagnostic(diagnostics, diagnostic);
             }
             types.push(checked.type_);
@@ -63429,20 +63573,123 @@ mod tests {
         context.check_source_file(file).unwrap();
 
         let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 4);
-        for (diagnostic, (code, text)) in diagnostics.iter().zip([
-            (2488, "data"),
-            (2488, "data"),
-            (2488, "[el]"),
-            (7053, "data[0]"),
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, (code, text, start, end, message)) in diagnostics.iter().zip([
+            (
+                2339,
+                "el",
+                172,
+                174,
+                "Property '0' does not exist on type 'A[] | B'.",
+            ),
+            (
+                7053,
+                "data[0]",
+                202,
+                209,
+                concat!(
+                    "Element implicitly has an 'any' type because expression of type '0' ",
+                    "can't be used to index type 'A[] | B'.\n",
+                    "  Property '0' does not exist on type 'A[] | B'.",
+                ),
+            ),
         ]) {
             assert_eq!(diagnostic.diagnostic.code(), code);
             assert_eq!(node_text(&source, diagnostic.node.unwrap()), text);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+            let range = source.arena.get(diagnostic.node.unwrap().node).unwrap().range;
+            assert_eq!((range.start.get(), range.end.get()), (start, end));
+            assert!(diagnostic.range_override.is_none());
+            assert!(diagnostic.related_information.is_empty());
         }
 
-        let warm = observable_state(&context, file);
+        for name in ["item", "ignoredItem", "el2"] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, name))
+                    .unwrap(),
+                "any",
+            );
+        }
+        assert_eq!(
+            context
+                .type_to_string(object_binding_value_type(&context, &source, file, "el"))
+                .unwrap(),
+            "any",
+        );
+        let mut reads = 0;
+        for (node, record) in source.arena.iter() {
+            let NodeData::Identifier(identifier) = &record.data else {
+                continue;
+            };
+            if ["item", "ignoredItem", "el", "el2"].contains(&identifier.text.as_str())
+                && record
+                    .parent
+                    .and_then(|parent| source.arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::PropertyAccessExpression)
+            {
+                let reference = NodeRef::new(source.arena.id(), file, node);
+                assert_eq!(
+                    context
+                        .type_to_string(resolved_node_type(&context, reference))
+                        .unwrap(),
+                    "any",
+                );
+                reads += 1;
+            }
+        }
+        assert_eq!(reads, 4);
+
+        let warm = (
+            observable_state(&context, file),
+            context.store().index_info_len(),
+        );
+        let expected_diagnostics = context.diagnostics().as_slice().to_vec();
         context.recheck_source_file(file).unwrap();
-        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            (observable_state(&context, file), context.store().index_info_len()),
+            warm,
+        );
+        assert_eq!(context.diagnostics().as_slice(), expected_diagnostics);
+
+        let globals = context.global_types().clone();
+        let array = globals.any_readonly_array_type;
+        let indexes = context
+            .store()
+            .type_payload(array)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.clone())
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+        let index = context.store().index_info(indexes[0]).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(index.key_type(), bootstrap.number_type);
+        assert_eq!(index.value_type(), bootstrap.any_type);
+
+        let receiver = variable_value_type(&context, &source, file, "data");
+        let options = context.options();
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            array, None, None, None, None, None,
+        ));
+        let poisoned = (
+            observable_state(&context, file),
+            context.store().index_info_len(),
+        );
+        assert_eq!(
+            is_array_like_type(context.store_mut_for_test(), &globals, options, receiver),
+            Err(SourceElementError::Relation(
+                RelationUnavailable::InvalidStructuredMembers(array),
+            )),
+        );
+        assert_eq!(
+            (observable_state(&context, file), context.store().index_info_len()),
+            poisoned,
+        );
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            array, None, None, None, None, Some(indexes),
+        ));
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics().as_slice(), expected_diagnostics);
     }
 
     #[test]
