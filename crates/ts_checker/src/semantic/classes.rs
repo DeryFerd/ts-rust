@@ -89,8 +89,9 @@ use ts_jsnum::Number;
 
 use super::{
     CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeMapperId,
+    CanonicalGlobalTypes, CanonicalSemanticStore, CanonicalTypeMapperStore, DeclaredTypeError,
+    DeclaredTypeHost, IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
+    TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
@@ -10514,8 +10515,8 @@ pub(super) fn is_merged_auto_accessor_interface(
 }
 
 /// Proves a global ambient class and every empty namespace merged into it.
-fn global_class_namespace_declaration(
-    store: &CanonicalTypeMapperStore,
+pub(super) fn global_class_namespace_declaration<MapperPayload>(
+    store: &CanonicalSemanticStore<MapperPayload>,
     symbol: SemanticSymbolId,
     owner: &Symbol,
 ) -> Option<NodeRef> {
@@ -10528,7 +10529,8 @@ fn global_class_namespace_declaration(
         || store.source_symbol_declarations_match(symbol)
         || !store.source_merged_symbol_declarations_match(symbol)
         || store
-            .intrinsic_bootstrap()
+            .intrinsic_bootstrap
+            .as_ref()
             .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
             .and_then(|globals| globals.get(owner.name()))
             != Some(symbol)

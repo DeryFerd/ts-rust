@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_parser::parse_source_file;
 
-use crate::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions};
+use crate::semantic::{AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions};
 
 fn with_sources(
     texts: &[(&str, bool)],
@@ -213,6 +213,59 @@ fn class_namespace_source_global_reads_preserve_members_exports_and_replay() {
             }
         },
     );
+}
+
+#[test]
+fn class_namespace_global_alias_lookup_preserves_local_shadowing_and_replay() {
+    for (consumer, target_file) in [
+        ("export = Value;", 0),
+        ("class Value {} export = Value;", 2),
+    ] {
+        with_sources(
+            &[
+                ("declare class Value { value: number; }", true),
+                ("declare namespace Value {}", true),
+                (consumer, false),
+            ],
+            |context, files| {
+                let global = owner(context, files[0]);
+                let expected = owner(context, files[target_file]);
+                let (arena, bound) = context.file(files[2]).unwrap();
+                let alias = arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        matches!(record.data, NodeData::ExportAssignment(_)).then(|| {
+                            bound
+                                .symbol(NodeRef::new(arena.id(), files[2], node))
+                                .unwrap()
+                        })
+                    })
+                    .unwrap();
+                let resolved = context.resolve_alias(alias).unwrap();
+                assert_eq!(resolved.target, AliasTargetState::Resolved(expected));
+                assert!(resolved.events.is_empty());
+                assert!(
+                    context
+                        .store()
+                        .declared_type_links(global)
+                        .is_none_or(|links| { links.declared_type.is_none() })
+                );
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(global)
+                        .is_none_or(|links| { links.resolved_type.is_none() })
+                );
+                let links = context.store().alias_symbol_links(alias).cloned();
+                let before = snapshot(context, global);
+                for _ in 0..2 {
+                    assert_eq!(context.resolve_alias(alias).unwrap(), resolved);
+                    assert_eq!(context.store().alias_symbol_links(alias), links.as_ref());
+                    assert_eq!(snapshot(context, global), before);
+                }
+            },
+        );
+    }
 }
 
 #[test]

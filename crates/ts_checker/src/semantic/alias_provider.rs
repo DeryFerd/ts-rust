@@ -1028,7 +1028,19 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         };
         match &record.data {
             NodeData::Identifier(_) => {
-                Self::local_module_member(store, source, declaration, expression)
+                match Self::local_module_member(store, source, declaration, expression) {
+                    Ok(target) => Ok(target),
+                    Err(error @ CanonicalAliasTargetUnavailable::UnsupportedLocalExport(_)) => {
+                        Self::global_class_namespace_export_target(
+                            store,
+                            source,
+                            declaration,
+                            expression,
+                        )
+                        .ok_or(error)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             NodeData::ClassExpression(_) if record.kind == SyntaxKind::ClassExpression => {
                 let reference = NodeRef::new(declaration.arena, declaration.file, expression);
@@ -1062,6 +1074,64 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 declaration,
             )),
         }
+    }
+
+    fn global_class_namespace_export_target<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        source: ProductionAliasTargetSource<'_>,
+        declaration: NodeRef,
+        expression: NodeId,
+    ) -> Option<SemanticSymbolId> {
+        let assignment = source.arena.get(declaration.node)?;
+        let NodeData::ExportAssignment(export) = &assignment.data else {
+            return None;
+        };
+        let reference = NodeRef::new(declaration.arena, declaration.file, expression);
+        let record = source.arena.get(expression)?;
+        let NodeData::Identifier(identifier) = &record.data else {
+            return None;
+        };
+        let source_file = source.bound.source_file();
+        let facts = source.bound.source_facts()?;
+        if assignment.kind != SyntaxKind::ExportAssignment
+            || assignment.flags.0 != 0
+            || assignment.parent != Some(source_file.node)
+            || !export.is_export_equals
+            || export.expression != expression
+            || export.flow_node.is_some()
+            || export.symbol.is_some()
+            || export.type_.is_some()
+            || export.modifiers.is_some()
+            || export.facts != 0
+            || record.kind != SyntaxKind::Identifier
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+            || !source.bound.contains(reference)
+            || source
+                .bound
+                .container(declaration)
+                .is_some_and(|scope| scope != source_file)
+            || !facts.is_external_module()
+            || facts.is_common_js_module()
+            || facts.is_javascript_file()
+        {
+            return None;
+        }
+        if let Some(locals) = source.bound.locals(source_file)
+            && store
+                .symbol_table(locals)?
+                .get_source(&identifier.text)
+                .is_some()
+        {
+            return None;
+        }
+        let globals = store.symbol_table(store.intrinsic_bootstrap.as_ref()?.globals)?;
+        let symbol = globals.get_source(&identifier.text)?;
+        let owner = store.symbol(symbol)?;
+        super::classes::global_class_namespace_declaration(store, symbol, owner)?;
+        Some(symbol)
     }
 
     fn commonjs_assignment_alias_target<MapperPayload>(
