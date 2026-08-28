@@ -39556,7 +39556,11 @@ fn source_for_of_fallback_type(
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(RelationUnavailable::MissingBootstrap)?;
-    let (any, string) = (bootstrap.any_type, bootstrap.string_type);
+    let (any, string, empty_object) = (
+        bootstrap.any_type,
+        bootstrap.string_type,
+        bootstrap.empty_object_type,
+    );
     let use_ = SynchronousIterationUse::ForOf;
     let mut array = input;
     let mut has_string = false;
@@ -39682,8 +39686,53 @@ fn source_for_of_fallback_type(
         );
         return Ok(if has_string { string } else { any });
     }
-    let element = numeric_index_type(store, host, global_types, options, diagnostics, array)
-        .map_err(|error| SourcePlanner::element_plan_error(node, error))?;
+    let flags = store
+        .type_payload(array)
+        .ok_or(RelationUnavailable::Type(array))?
+        .flags();
+    let index_receiver = if flags.intersects(TypeFlags::NUMBER_LIKE) {
+        global_types.number_type
+    } else if flags.intersects(TypeFlags::BOOLEAN_LIKE) {
+        global_types.boolean_type
+    } else {
+        array
+    };
+    if index_receiver != array {
+        store.validate_union_constituent_with_global_types(global_types, array)?;
+    }
+    // Missing globals use a resolved empty object, which has no numeric index.
+    let missing_index = if index_receiver == empty_object {
+        let record = store
+            .type_payload(index_receiver)
+            .ok_or(RelationUnavailable::Type(index_receiver))?;
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || !matches!(record.data(), TypeData::Object(object)
+                if object == &super::type_records::ObjectTypeData::default())
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(index_receiver).into());
+        }
+        true
+    } else {
+        match super::object_members::validate_resolved_declared_property_object(
+            store,
+            index_receiver,
+        ) {
+            super::object_members::DeclaredPropertyObjectValidation::Valid(_) => true,
+            super::object_members::DeclaredPropertyObjectValidation::NotDeclared => false,
+            super::object_members::DeclaredPropertyObjectValidation::Malformed => {
+                return Err(RelationUnavailable::InvalidStructuredMembers(index_receiver).into());
+            }
+        }
+    };
+    let element = if missing_index {
+        None
+    } else {
+        numeric_index_type(store, host, global_types, options, diagnostics, index_receiver)
+            .map_err(|error| SourcePlanner::element_plan_error(node, error))?
+    };
     if has_string && let Some(element) = element {
         return store
             .expression_union_type_with_global_types(
@@ -60882,6 +60931,83 @@ mod tests {
             variable_value_type(&context, &source, file, "item"),
             context.store().intrinsic_bootstrap().unwrap().error_type,
         );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn no_lib_for_of_fallback_checks_each_operand_and_keeps_global_diagnostics() {
+        let source = parsed(concat!(
+            "declare function log(message?: any): void;\n\n",
+            "for (const x of [1, 2, 3]) {\n    log(x);\n}\n\n",
+            "declare const aString: string;\n\n",
+            "for (const x of aString) {\n    log(x);\n}\n\n",
+            "declare const aNumber: number;\n\n",
+            "for (const x of aNumber) {\n    log(x);\n}\n\n",
+            "declare const anObject: { foo: string };\n\n",
+            "for (const x of anObject) {\n    log(x);\n}\n",
+        ));
+        let file = FileId::new(10_250);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_bind_call_apply: true,
+                strict_builtin_iterator_return: true,
+                strict_function_types: true,
+                no_implicit_any: true,
+                no_implicit_this: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let global_diagnostics = &context.global_types().diagnostics;
+        assert!(
+            global_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2318)
+        );
+        let mut missing_globals = global_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.arguments[0].as_str())
+            .collect::<Vec<_>>();
+        missing_globals.sort_unstable();
+        assert_eq!(
+            missing_globals,
+            [
+                "Array",
+                "Boolean",
+                "CallableFunction",
+                "Function",
+                "IArguments",
+                "NewableFunction",
+                "Number",
+                "Object",
+                "RegExp",
+                "String",
+            ],
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = [
+            bootstrap.any_type,
+            bootstrap.string_type,
+            bootstrap.any_type,
+            bootstrap.any_type,
+        ];
+        let mut reads = identifier_expressions(&source, file, "x");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        assert_eq!(reads.len(), expected.len());
+        for (read, type_) in reads.into_iter().zip(expected) {
+            assert_eq!(resolved_node_type(&context, read), type_);
+        }
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
