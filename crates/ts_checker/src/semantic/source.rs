@@ -32155,6 +32155,22 @@ fn check_planned_arrow_argument(
     {
         return Err(SourceCheckError::Arrow(expression));
     }
+    let captured_flow_types = class_flow
+        .as_deref()
+        .map(|context| {
+            let mut mutable_variables = context
+                .flow
+                .captured_variables_with_later_writes(host, expression)
+                .map_err(|error| class_body_flow_error(expression, error))?;
+            mutable_variables.retain(|symbol| current_flow_types.contains_key(symbol));
+            captured_callable_flow_types(
+                current_flow_types,
+                &context.state.value_types,
+                &mutable_variables,
+            )
+        })
+        .transpose()?;
+    let current_flow_types = captured_flow_types.as_ref().unwrap_or(current_flow_types);
     if host
         .node(expression)
         .is_some_and(|record| record.kind == SyntaxKind::FunctionExpression)
@@ -32478,10 +32494,18 @@ fn check_planned_arrow_argument(
                 expression: body,
             } => {
                 if let Some(context) = class_flow.as_deref_mut() {
-                    let target = store
-                        .type_node_links(return_type)
-                        .and_then(|links| links.resolved_type)
-                        .ok_or(SourceCheckError::Arrow(expression))?;
+                    let mut type_diagnostics = CanonicalCheckerDiagnostics::default();
+                    let target = CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut type_diagnostics,
+                    )?
+                    .get_type_from_type_node(return_type);
+                    merge_retry_diagnostics(diagnostics, type_diagnostics);
+                    let target = target?;
                     check_assignment_to_type_with_class_context(
                         store,
                         host,
@@ -102126,6 +102150,80 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn source_class_arrows_check_captures_after_the_last_local_write() {
+        for (text, errors) in [
+            (
+                concat!(
+                    "class Captured { value?: string; constructor() { ",
+                    "let value: string | undefined = 'set'; ",
+                    "const later = (): string => value; ({ value } = this); } }",
+                ),
+                1,
+            ),
+            (
+                concat!(
+                    "class Last { value?: string; constructor() { ",
+                    "let value: string | undefined = 'set'; ",
+                    "const later = (): string => value; } }",
+                ),
+                0,
+            ),
+            (
+                concat!(
+                    "class Before { value = 'set'; constructor() { ",
+                    "let value: string | undefined = undefined; ({ value } = this); ",
+                    "const later = (): string => value; } }",
+                ),
+                0,
+            ),
+            (
+                concat!(
+                    "class Branch { value = 'set'; constructor(flag: boolean) { ",
+                    "let value: string | undefined = 'set'; ",
+                    "if (flag) { ({ value } = this); ",
+                    "const later = (): string => value; } } }",
+                ),
+                1,
+            ),
+            (
+                concat!(
+                    "class AfterBranch { value = 'set'; constructor(flag: boolean) { ",
+                    "let value: string | undefined = 'set'; ",
+                    "if (flag) { ({ value } = this); } ",
+                    "const later = (): string => value; } }",
+                ),
+                0,
+            ),
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(174_2716);
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert_eq!(context.diagnostics().len(), errors, "{text}");
+            for diagnostic in context.diagnostics().as_slice() {
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "value");
+                assert_eq!(
+                    diagnostic.diagnostic.arguments,
+                    ["string | undefined", "string"]
+                );
+            }
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

@@ -1402,6 +1402,54 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         &self.access
     }
 
+    /// A deferred capture keeps narrowing only after its last enclosing write.
+    pub(super) fn captured_variables_with_later_writes(
+        &self,
+        host: &DeclaredTypeHost<'_>,
+        location: NodeRef,
+    ) -> Result<HashSet<SemanticSymbolId>, SourceFlowError> {
+        let location_start = host
+            .node(location)
+            .ok_or(SourceFlowInvariant::InvalidClassBody(self.body.declaration))?
+            .range
+            .start
+            .get();
+        let mut captured = HashSet::new();
+        for (&target, &declaration) in &self.flow.plan.assignment_declarations {
+            let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
+            let assignment = self.flow.plan.assignments.get(&target).ok_or_else(invalid)?;
+            let declaration_start = host.node(declaration).ok_or_else(invalid)?.range.start.get();
+            let mut position = host.node(target).ok_or_else(invalid)?.range.start.get();
+            let mut current = target;
+            let mut visited = HashSet::new();
+            loop {
+                if !visited.insert(current) {
+                    return Err(invalid().into());
+                }
+                let record = host.node(current).ok_or_else(invalid)?;
+                if record.range.start.get() <= declaration_start {
+                    break;
+                }
+                if matches!(
+                    record.kind,
+                    SyntaxKind::VariableStatement
+                        | SyntaxKind::ExpressionStatement
+                        | SyntaxKind::IfStatement
+                ) {
+                    position = record.range.end.get();
+                }
+                let Some(parent) = record.parent else {
+                    break;
+                };
+                current = NodeRef::new(current.arena, current.file, parent);
+            }
+            if position >= location_start {
+                captured.insert(assignment.symbol);
+            }
+        }
+        Ok(captured)
+    }
+
     pub(super) fn snapshot_at(
         &mut self,
         store: &mut CanonicalTypeMapperStore,
