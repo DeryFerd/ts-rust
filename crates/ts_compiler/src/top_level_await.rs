@@ -43,10 +43,14 @@ impl Program {
             {
                 continue;
             }
+            let spelling = source
+                .source_text
+                .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                .ok_or(CanonicalProgramCheckError::InvalidDiagnosticNode(name))?;
             diagnostics.push(self.canonical_program_diagnostic(
                 Some(name),
                 None,
-                &Diagnostic::with_arguments(message, [identifier.text.as_str()]),
+                &Diagnostic::with_arguments(message, [spelling]),
                 std::iter::empty(),
             )?);
         }
@@ -255,6 +259,63 @@ mod tests {
                 "{source}: {:?}",
                 program.diagnostics()
             );
+        }
+    }
+
+    #[test]
+    fn ts1262_preserves_escaped_identifier_spelling_and_parse_error_gate() {
+        for module in [ModuleKind::Es2022, ModuleKind::EsNext] {
+            for spelling in [r"\u0061wait", r"\u{61}wait"] {
+                let source = format!("export {{}}; var {spelling} = 1;");
+                assert!(parse_source_file(&source).diagnostics.is_empty());
+                let program = check(
+                    &source,
+                    "input.ts",
+                    CompilerOptions {
+                        module,
+                        ..options()
+                    },
+                );
+                let [diagnostic] = program.diagnostics() else {
+                    panic!("{source}: {:?}", program.diagnostics());
+                };
+                assert_eq!(diagnostic.code, Some(1_262));
+                assert_eq!(
+                    diagnostic.message,
+                    format!(
+                        "Identifier expected. '{spelling}' is a reserved word at the top-level of a module."
+                    ),
+                );
+                let range = diagnostic.range.unwrap();
+                assert_eq!(range.start.get(), 15);
+                assert_eq!(
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                    spelling,
+                );
+
+                let invalid = format!("export {{}}; var before = 1 var {spelling} = 1;");
+                assert!(!parse_source_file(&invalid).diagnostics.is_empty());
+                let program = check(
+                    &invalid,
+                    "input.ts",
+                    CompilerOptions {
+                        module,
+                        ..options()
+                    },
+                );
+                assert!(
+                    program
+                        .diagnostics()
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == Some(1_005))
+                );
+                assert!(
+                    !program
+                        .diagnostics()
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == Some(1_262))
+                );
+            }
         }
     }
 
