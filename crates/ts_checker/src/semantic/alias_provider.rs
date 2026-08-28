@@ -1130,6 +1130,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let globals = store.symbol_table(store.intrinsic_bootstrap.as_ref()?.globals)?;
         let symbol = globals.get_source(&identifier.text)?;
         let owner = store.symbol(symbol)?;
+        if owner.name().as_utf8() != Some(identifier.text.as_str()) {
+            return None;
+        }
         super::classes::global_ambient_class_declaration(store, symbol, owner)?;
         Some(symbol)
     }
