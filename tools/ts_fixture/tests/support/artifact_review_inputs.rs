@@ -1,11 +1,11 @@
 pub const MISSING_TYPE: &str = "// @filename: a.ts\nenum E { A = 0 / 0, B }\n";
 
-pub const CALLABLE_DISPLAY: &str = r#"// @noEmit: true
+pub const CALLABLE_DISPLAY: &str = r"// @noEmit: true
 const example: { (): void; items?: string[] } = () => undefined;
 example.items = [];
-"#;
+";
 
-pub const FATAL_WITH_DIAGNOSTICS: &str = r#"// @target: es2015
+pub const FATAL_WITH_DIAGNOSTICS: &str = r"// @target: es2015
 // @lib: es5
 // @noEmit: true
 // @Filename: /node_modules/foo/index.d.ts
@@ -25,6 +25,6 @@ const items = foo.items;
 const result: string = items.customMethod();
 const fresh: string[] = [];
 const result2: string = fresh.customMethod();
-"#;
+";
 
 pub const DISABLED_CHECKER: &str = "// @noCheck: true\nconst value: number = 1;\n";

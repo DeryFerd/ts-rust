@@ -63,6 +63,7 @@ fn original_date_and_native_library_controls_match_complete_error_artifacts() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the original source and replay checks together.
 fn original_date_parameter_properties_keep_real_types_and_replay_identities() {
     let Ok(repository) = env::var("TS_GO_REPO") else {
         return;
@@ -114,17 +115,17 @@ fn original_date_parameter_properties_keep_real_types_and_replay_identities() {
                     panic!("the constructor has a parameter property");
                 };
                 let name = source.node_ref(parameter.name).unwrap();
-                let type_ = queries.get_type_at_location(name).unwrap();
+                let parameter_type = queries.get_type_at_location(name).unwrap();
                 let symbol = queries.get_symbol_at_location(name).unwrap().unwrap();
                 assert_eq!(
                     queries.get_symbol_declarations(symbol).unwrap(),
                     &[parameter_node]
                 );
-                assert_eq!(queries.intrinsic_any_name(type_).unwrap(), None);
+                assert_eq!(queries.intrinsic_any_name(parameter_type).unwrap(), None);
                 assert!(!property_symbols.contains(&symbol));
-                property_types.push(type_);
+                property_types.push(parameter_type);
                 property_symbols.push(symbol);
-                types.push((name, type_));
+                types.push((name, parameter_type));
                 symbols.push((name, symbol));
                 if let Some(initializer) = parameter.initializer {
                     let initializer_node = source.node_ref(initializer).unwrap();

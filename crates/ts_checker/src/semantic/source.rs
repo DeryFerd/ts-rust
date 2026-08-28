@@ -1480,7 +1480,7 @@ fn planned_array_mutation(
     }
     let declaration = store
         .symbol(read.value_symbol)
-        .and_then(|symbol| symbol.value_declaration())
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
         .ok_or(SourceCheckError::Variable(
             VariableInvariant::InvalidSymbolShape(read.value_symbol),
         ))?;
@@ -1697,8 +1697,7 @@ impl PlannedSourceCondition {
 
     fn flow_condition(&self) -> Option<SourceFlowCondition> {
         Some(match self {
-            Self::Logical { .. } => return None,
-            Self::Expression { .. } => return None,
+            Self::Logical { .. } | Self::Expression { .. } => return None,
             Self::Truthiness { expression, symbol } => {
                 SourceFlowCondition::Truthiness(SourceTruthinessCondition {
                     expression: expression.node,
@@ -27977,7 +27976,6 @@ fn check_source_selected_method_property(
     preflight_source_expression_cache(store, plan.node, property.type_)?;
     let expected = SymbolNodeLinks {
         resolved_symbol: Some(property.symbol),
-        ..SymbolNodeLinks::default()
     };
     if store
         .symbol_node_links(plan.node)
@@ -39323,11 +39321,11 @@ fn check_planned_function_statement_prefix(
                         };
                         let mut elements = vec![store.evolving_array_element_type(prior)?];
                         for argument in &call.arguments {
-                            let type_ = store
+                            let argument_type = store
                                 .type_node_links(argument.node)
                                 .and_then(|links| links.resolved_type)
                                 .ok_or(SourceCheckError::Call(expression.node))?;
-                            let base = widened_fresh_literal_type(store, type_)?;
+                            let base = widened_fresh_literal_type(store, argument_type)?;
                             elements.push(store.get_regular_type_of_object_literal(base)?);
                         }
                         let element = store.expression_union_type_with_global_types(

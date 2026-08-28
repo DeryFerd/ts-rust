@@ -809,6 +809,7 @@ impl SourceFlowPlan {
 
     /// Freezes and validates every flow chain that the source executor may
     /// request. No semantic store state is read or written during preflight.
+    #[cfg(test)]
     pub(super) fn preflight(
         bound: &BoundFile,
         container: NodeRef,
