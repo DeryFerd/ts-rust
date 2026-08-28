@@ -57233,7 +57233,7 @@ pub(super) fn check_source_file(
     )?;
 
     check_external_module_exports(store, host, alias_host, diagnostics, source.node_ref())?;
-
+    issue_class_name_diagnostics(arena, bound, diagnostics)?;
     issue_unused_source_diagnostics(
         arena,
         bound,
@@ -57493,6 +57493,123 @@ fn export_assignment_is_in_external_augmentation(
         .and_then(|parent| arena.get(parent))
         .ok_or_else(invalid)?;
     Ok(is_ambient(outer) && outer.parent == Some(bound.source_file().node))
+}
+
+fn issue_class_name_diagnostics(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    for (node, record) in arena.iter() {
+        if !bound.contains(NodeRef::new(arena.id(), bound.file_id(), node)) {
+            continue;
+        }
+        let name = match &record.data {
+            NodeData::ClassDeclaration(class) => class.name,
+            NodeData::ClassExpression(class) => class.name,
+            _ => continue,
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let Some(NodeData::Identifier(identifier)) = arena.get(name).map(|node| &node.data) else {
+            continue;
+        };
+        // The pinned checkTypeNameIsReserved rule uses the decoded identifier text.
+        if !matches!(
+            identifier.text.as_str(),
+            "any"
+                | "unknown"
+                | "never"
+                | "number"
+                | "bigint"
+                | "boolean"
+                | "string"
+                | "symbol"
+                | "void"
+                | "object"
+                | "undefined"
+        ) {
+            continue;
+        }
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(NodeRef::new(arena.id(), bound.file_id(), name)),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2414).ok_or(SourceCheckError::MissingDiagnostic(2414))?,
+                    [identifier.text.clone()],
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod class_name_grammar_tests {
+    use super::*;
+    use ts_binder::CanonicalBinder;
+    use ts_parser::parse_source_file;
+
+    #[test]
+    fn reserved_names_use_real_class_like_identifier_nodes() {
+        for text in [
+            "class any {}",
+            "class any<T> {}",
+            "export default class any {}",
+            "const C = class any {};",
+            "const C = class \\u0061ny {};",
+        ] {
+            let parsed = parse_source_file(text);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{text}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(159);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            issue_class_name_diagnostics(
+                &parsed.arena,
+                binder.file(file).unwrap(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("{text}: {diagnostics:?}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2414);
+            assert!(diagnostic.range_override.is_none());
+            let node = diagnostic.node.unwrap();
+            let NodeData::Identifier(name) = &parsed.arena.get(node.node).unwrap().data else {
+                panic!("class name must remain an identifier")
+            };
+            assert_eq!(name.text, "any");
+        }
+    }
+
+    #[test]
+    fn anonymous_classes_and_nonreserved_names_do_not_report_2414() {
+        let parsed = parse_source_file(
+            "class Any {} class intrinsic {} const C = class {}; export default class {}",
+        );
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(160);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        issue_class_name_diagnostics(&parsed.arena, binder.file(file).unwrap(), &mut diagnostics)
+            .unwrap();
+        assert!(diagnostics.is_empty());
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Uses the complete, already-published source reference set.
