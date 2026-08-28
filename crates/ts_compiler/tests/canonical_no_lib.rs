@@ -48,6 +48,32 @@ fn assert_missing_global_types(program: &Program) {
 }
 
 #[test]
+fn canonical_skip_lib_check_keeps_global_no_lib_diagnostics() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/types.d.ts",
+        concat!(
+            "/// <reference types=\"missing-types\" />\n",
+            "import { Missing } from './missing-binding';\n",
+            "export { Missing };\n",
+        ),
+    )
+    .unwrap();
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["types.d.ts".to_owned()],
+        CompilerOptions {
+            no_lib: true,
+            skip_lib_check: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+    assert_missing_global_types(&program);
+}
+
+#[test]
 fn canonical_no_lib_skips_default_explicit_and_reference_libraries() {
     let fs = MemoryFileSystem::new(true);
     for (file, source) in [

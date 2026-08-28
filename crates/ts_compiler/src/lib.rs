@@ -6849,10 +6849,13 @@ impl Program {
                                 kind: SourceLoadKind::TypeReference(directive.range.start),
                             },
                         );
-                    } else if !source_ignores_processing_diagnostic(
-                        &self.source_files[file_index],
-                        directive.range,
-                    ) {
+                    } else if !(self.options.skip_lib_check
+                        && ts_path::is_declaration_file(&containing_file))
+                        && !source_ignores_processing_diagnostic(
+                            &self.source_files[file_index],
+                            directive.range,
+                        )
+                    {
                         let mut diagnostic = type_definition_not_found(&directive.value);
                         diagnostic.file_name = Some(containing_file.clone());
                         diagnostic.range = Some(directive.range);
@@ -18757,7 +18760,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_lib_check_preserves_missing_explicit_type_reference_diagnostics() {
+    fn skip_lib_check_suppresses_rooted_declaration_type_reference_diagnostics() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/types.d.ts",
@@ -18779,18 +18782,60 @@ mod tests {
                 ..CompilerOptions::default()
             },
         );
-        assert_eq!(
-            program
-                .diagnostics()
-                .iter()
-                .filter_map(|diagnostic| diagnostic.code)
-                .collect::<Vec<_>>(),
-            [2688]
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
         );
-        assert_eq!(
-            program.diagnostics()[0].file_name.as_deref(),
-            Some("/project/types.d.ts")
+    }
+
+    #[test]
+    fn skip_lib_check_preserves_type_references_in_typescript_sources() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.ts",
+            "/// <reference types=\"missing-types\" />\nexport {};\n",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                skip_lib_check: true,
+                ..CompilerOptions::default()
+            },
         );
+        let [diagnostic] = program.diagnostics() else {
+            panic!("{:?}", program.diagnostics());
+        };
+        assert_eq!(diagnostic.code, Some(2688));
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.ts"));
+    }
+
+    #[test]
+    fn skip_lib_check_preserves_global_missing_type_directive_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/types.d.ts", "export {};\n")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["types.d.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                skip_lib_check: true,
+                types: Some(vec!["missing-types".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        );
+        let [diagnostic] = program.diagnostics() else {
+            panic!("{:?}", program.diagnostics());
+        };
+        assert_eq!(diagnostic.code, Some(2688));
+        assert_eq!(diagnostic.file_name, None);
+        assert_eq!(diagnostic.range, None);
     }
 
     #[test]
