@@ -27741,11 +27741,7 @@ fn source_global_wrapper_method_name(host: &DeclaredTypeHost<'_>, node: NodeRef)
     let NodeData::Identifier(identifier) = &host.node(name)?.data else {
         return None;
     };
-    matches!(
-        identifier.text.as_str(),
-        "toFixed" | "toLowerCase" | "startsWith"
-    )
-    .then(|| identifier.text.clone())
+    matches!(identifier.text.as_str(), "toFixed" | "toLowerCase").then(|| identifier.text.clone())
 }
 
 fn source_is_global_array_concat_method(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
@@ -28654,41 +28650,14 @@ fn check_expression_type_with_class_context(
                 class_flow.as_deref_mut(),
             )?;
             if let Some(name) = source_global_wrapper_method_name(host, property.node) {
-                let selected_string_method = (name == "startsWith"
-                    && store
-                        .type_payload(receiver.result)
-                        .is_some_and(|record| record.flags().intersects(TypeFlags::STRING_LIKE)))
-                .then(|| {
-                    store
-                        .type_payload(global_types.string_type)
-                        .and_then(TypeRecord::symbol)
-                        .and_then(|owner| store.get_merged_symbol(owner))
-                        .and_then(|owner| store.symbol(owner))
-                        .and_then(ts_binder::semantic::Symbol::members)
-                        .and_then(|members| store.symbol_table(members))
-                        .and_then(|members| members.get_source(&name))
-                })
-                .flatten();
-                if let Some(symbol) = selected_string_method {
-                    CanonicalTypeQuery::new_with_global_types_and_session(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        diagnostics,
-                    )?
-                    .get_type_of_interface_method(symbol)?;
-                } else {
-                    materialize_global_wrapper_method(
-                        store,
-                        host,
-                        global_types,
-                        receiver.result,
-                        &name,
-                    )
-                    .map_err(SourcePlanner::callable_plan_error)?;
-                }
+                materialize_global_wrapper_method(
+                    store,
+                    host,
+                    global_types,
+                    receiver.result,
+                    &name,
+                )
+                .map_err(SourcePlanner::callable_plan_error)?;
             }
             if source_is_global_array_concat_method(host, property.node) {
                 super::object_members::materialize_global_array_concat_method(
