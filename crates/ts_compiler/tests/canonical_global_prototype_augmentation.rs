@@ -14,7 +14,7 @@ const ORIGINAL: &str = concat!(
     "var r4 = f['data'];\n",
 );
 
-fn check(source: &str, no_implicit_any: bool, codes: &[u32], types: &[(&str, &str)]) {
+fn check(source: &str, no_implicit_any: bool, codes: &[u32], expected_types: &[(&str, &str)]) {
     let filesystem = MemoryFileSystem::new(true);
     filesystem.write_file("/project/input.ts", source).unwrap();
     let (program, checked) = Program::try_new_with_canonical_checker_and_queries(
@@ -39,7 +39,7 @@ fn check(source: &str, no_implicit_any: bool, codes: &[u32], types: &[(&str, &st
             );
             let file = program.source_file("/project/input.ts").unwrap();
             let mut identities = Vec::new();
-            for (name, expected) in types {
+            for (name, expected) in expected_types {
                 let node = file
                     .parse
                     .arena

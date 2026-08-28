@@ -56231,7 +56231,6 @@ pub(super) fn check_source_file(
                     }
                 }
             }
-            PlannedStatement::GlobalPrototypePropertyAugmentation(_) => {}
             PlannedStatement::GlobalArrayCallAugmentation(augmentation) => {
                 if augmentation.target != global_types.array_type
                     || augmentation.any_array_type != global_types.any_array_type
@@ -56894,6 +56893,7 @@ pub(super) fn check_source_file(
             | PlannedStatement::NamedReexport
             | PlannedStatement::DefaultAlias(_)
             | PlannedStatement::AmbientNamespaceExport
+            | PlannedStatement::GlobalPrototypePropertyAugmentation(_)
             | PlannedStatement::AmbientOverload => {}
             PlannedStatement::RecoveredBigIntNamedExport(name) => {
                 let record = host.node(name).ok_or(SourceCheckError::Provenance(
