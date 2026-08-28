@@ -60877,7 +60877,7 @@ mod tests {
                 .store()
                 .value_symbol_links(number_symbol)
                 .and_then(|links| links.resolved_type),
-            Some(bootstrap.number_type),
+            Some(bootstrap.any_type),
         );
         assert_eq!(
             context
@@ -60894,7 +60894,7 @@ mod tests {
             panic!("expected three numeric captures and two string captures")
         };
         for read in [*first, *arrow, *function] {
-            assert_eq!(resolved_node_type(&context, read), bootstrap.number_type);
+            assert_eq!(resolved_node_type(&context, read), bootstrap.any_type);
         }
         for read in [*second, *second_arrow] {
             assert_eq!(resolved_node_type(&context, read), bootstrap.string_type);
@@ -60981,7 +60981,7 @@ mod tests {
         assert!(context.diagnostics().is_empty());
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         for (name, expected) in [
-            ("savedValue", bootstrap.number_type),
+            ("savedValue", bootstrap.any_type),
             ("savedKey", bootstrap.string_type),
             ("savedCount", bootstrap.number_type),
             ("savedRepeat", bootstrap.number_type),
@@ -61082,7 +61082,7 @@ mod tests {
         context.check_source_file(file).unwrap();
         let saved = variable_symbol(&context, &source, file, "saved");
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-        let expected = bootstrap.number_type;
+        let expected = bootstrap.any_type;
         let wrong = bootstrap.string_type;
         mark_source_unchecked(&mut context, file);
         assert!(context.store_mut_for_test().set_value_symbol_links(
@@ -63316,7 +63316,7 @@ mod tests {
             .store()
             .intrinsic_bootstrap()
             .unwrap()
-            .string_or_number_type;
+            .any_type;
         assert_eq!(
             variable_value_type(&context, &source, file, "item"),
             expected
@@ -63481,9 +63481,9 @@ mod tests {
             .value_symbol_links(binding)
             .cloned()
             .unwrap();
-        let (number, string) = {
+        let (any, string) = {
             let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-            (bootstrap.number_type, bootstrap.string_type)
+            (bootstrap.any_type, bootstrap.string_type)
         };
         mark_source_unchecked(&mut context, file);
         assert!(context.store_mut_for_test().set_value_symbol_links(
@@ -63501,7 +63501,7 @@ mod tests {
                 VariableInvariant::CachedValueTypeMismatch {
                     symbol: binding,
                     cached: string,
-                    expected: number,
+                    expected: any,
                 },
             )),
         );
@@ -63902,7 +63902,7 @@ mod tests {
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         assert_eq!(
             resolved_node_type(&context, *number_read),
-            bootstrap.number_type
+            bootstrap.any_type
         );
         assert_eq!(
             resolved_node_type(&context, *string_read),
