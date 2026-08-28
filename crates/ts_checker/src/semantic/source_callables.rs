@@ -10777,12 +10777,14 @@ pub(super) fn source_callable_display_projection(
             parameters.push(ValidatedSingleCallParameterDisplay {
                 name: identifier.text.clone(),
                 value_type: *value_type,
+                annotation_type: None,
                 optional: parameter_data.question_token.is_some(),
                 rest: false,
             });
         }
         return Ok(ValidatedSingleCallSignatureDisplay {
             owner: type_,
+            signature: provenance.signature,
             parameters,
             return_type: signature.resolved_return_type(),
         });
@@ -10895,12 +10897,22 @@ pub(super) fn source_callable_display_projection(
         parameters.push(ValidatedSingleCallParameterDisplay {
             name,
             value_type,
+            annotation_type: if optional && parameter_data.type_.is_some() {
+                Some(
+                    parameter
+                        .base_type(store)
+                        .ok_or(SourceCallableDisplayError::Malformed)?,
+                )
+            } else {
+                None
+            },
             optional,
             rest: parameter_data.dot_dot_dot_token.is_some(),
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
         owner: type_,
+        signature,
         parameters,
         return_type,
     })

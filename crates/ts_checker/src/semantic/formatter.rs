@@ -49,7 +49,7 @@ use super::{
     mapped_types::plan_mapped_type_declaration,
     object_members,
     reference_types::validate_direct_generic_reference,
-    signatures::{ElementFlags, IndexFlags, SignatureFlags},
+    signatures::{ElementFlags, IndexFlags, SignatureFlags, TypePredicateKind},
     source_callables::{
         SourceCallableDisplayError, SourceCallableUnsupported, StoredSourceCallableValidation,
         validate_stored_source_callable,
@@ -3804,11 +3804,16 @@ fn display_single_call_signature(
         }
         result.push_str(": ");
         state.add(parameter.name.len().saturating_add(3));
+        let value_type = if state.location.is_some() && parameter.optional {
+            parameter.annotation_type.unwrap_or(parameter.value_type)
+        } else {
+            parameter.value_type
+        };
         result.push_str(&display_type_worker(
             store,
             host,
             global_types,
-            parameter.value_type,
+            value_type,
             flags,
             state,
             visiting,
@@ -3821,15 +3826,85 @@ fn display_single_call_signature(
             type_id: projection.owner,
             reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
         })?;
-    result.push_str(&display_type_worker(
+    result.push_str(&display_signature_return(
         store,
         host,
         global_types,
+        projection.owner,
+        projection.signature,
         return_type,
         flags,
         state,
         visiting,
     )?);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_signature_return(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    signature: SignatureId,
+    return_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let signature = store
+        .signature(signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    if signature.resolved_return_type() != Some(return_type) {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    }
+    let Some(predicate) = signature.resolved_type_predicate() else {
+        return display_type_worker(
+            store,
+            host,
+            global_types,
+            return_type,
+            flags,
+            state,
+            visiting,
+        );
+    };
+    let predicate = store
+        .type_predicate(predicate)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let asserts = matches!(
+        predicate.kind(),
+        TypePredicateKind::AssertsIdentifier | TypePredicateKind::AssertsThis
+    );
+    if !asserts && predicate.type_id().is_none() {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    }
+    let mut result = String::new();
+    if asserts {
+        result.push_str("asserts ");
+        state.add(8);
+    }
+    let parameter_name = match predicate.kind() {
+        TypePredicateKind::Identifier | TypePredicateKind::AssertsIdentifier => {
+            predicate.parameter_name()
+        }
+        TypePredicateKind::This | TypePredicateKind::AssertsThis => "this",
+    };
+    result.push_str(parameter_name);
+    state.add(parameter_name.len());
+    if let Some(narrowed) = predicate.type_id() {
+        result.push_str(" is ");
+        state.add(4);
+        result.push_str(&display_type_worker(
+            store,
+            host,
+            global_types,
+            narrowed,
+            flags,
+            state,
+            visiting,
+        )?);
+    }
     Ok(result)
 }
 
@@ -13518,6 +13593,89 @@ mod tests {
             diagnostic.render().unwrap(),
             "Type 'number' is not assignable to type 'string'."
         );
+    }
+
+    #[test]
+    fn assertion_signature_display_rejects_changed_predicate_records() {
+        let parsed =
+            parse_source_file("function check(value: unknown): asserts value is string {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(250);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::FunctionDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(symbol)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let original = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_type_predicate()
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let expected = "(value: unknown) => asserts value is string";
+        assert_eq!(context.type_to_string(callable).unwrap(), expected);
+
+        for (kind, index, name, narrowed) in [
+            (
+                TypePredicateKind::AssertsIdentifier,
+                1,
+                "value",
+                Some(string),
+            ),
+            (
+                TypePredicateKind::AssertsIdentifier,
+                0,
+                "other",
+                Some(string),
+            ),
+            (
+                TypePredicateKind::AssertsIdentifier,
+                0,
+                "value",
+                Some(number),
+            ),
+            (TypePredicateKind::Identifier, 0, "value", Some(string)),
+            (TypePredicateKind::AssertsIdentifier, 0, "value", None),
+        ] {
+            let forged = context
+                .store_mut_for_test()
+                .alloc_type_predicate(kind, index, name, narrowed)
+                .unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_type_predicate(signature, Some(forged),)
+            );
+            assert_malformed_display_without_writes(&context, callable);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_type_predicate(signature, Some(original),)
+            );
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+        }
     }
 
     #[test]

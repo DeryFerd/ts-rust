@@ -84,11 +84,13 @@ pub(super) enum StoredSingleCallableValidation {
 
 /// Syntax-neutral display data for one parameter of a validated single-call
 /// signature. The semantic value type includes optional `undefined`; the
-/// syntactic question mark and rest marker remain independent display facts.
+/// checked annotation can omit that implicit constituent in location-aware
+/// display. The question mark and rest marker remain separate facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ValidatedSingleCallParameterDisplay {
     pub(super) name: String,
     pub(super) value_type: TypeId,
+    pub(super) annotation_type: Option<TypeId>,
     pub(super) optional: bool,
     pub(super) rest: bool,
 }
@@ -97,6 +99,7 @@ pub(super) struct ValidatedSingleCallParameterDisplay {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ValidatedSingleCallSignatureDisplay {
     pub(super) owner: TypeId,
+    pub(super) signature: SignatureId,
     pub(super) parameters: Vec<ValidatedSingleCallParameterDisplay>,
     pub(super) return_type: Option<TypeId>,
 }

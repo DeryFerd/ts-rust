@@ -1976,6 +1976,7 @@ pub(super) fn function_type_display_projection(
                 parameters.push(ValidatedSingleCallParameterDisplay {
                     name: format!("{}_{element_index}", identifier.text),
                     value_type: *element,
+                    annotation_type: None,
                     optional: false,
                     rest: false,
                 });
@@ -1985,12 +1986,25 @@ pub(super) fn function_type_display_projection(
         parameters.push(ValidatedSingleCallParameterDisplay {
             name: identifier.text.clone(),
             value_type,
+            annotation_type: if parameter.optional && parameter.rest_tuple_element.is_none() {
+                Some(
+                    cached_annotation_identity(
+                        store,
+                        parameter.identity_node,
+                        parameter.null_literal_identity,
+                    )
+                    .ok_or(FunctionTypeDisplayError::Malformed)?,
+                )
+            } else {
+                None
+            },
             optional: parameter.optional,
             rest,
         });
     }
     Ok(ValidatedSingleCallSignatureDisplay {
         owner: type_,
+        signature: signature_id,
         parameters,
         return_type,
     })
@@ -2052,6 +2066,7 @@ fn source_jsdoc_function_type_display_projection(
             |(parameter, value_type)| ValidatedSingleCallParameterDisplay {
                 name: parameter.name().to_owned(),
                 value_type: *value_type,
+                annotation_type: None,
                 optional: parameter.is_optional(),
                 rest: parameter.is_rest(),
             },
@@ -2059,6 +2074,7 @@ fn source_jsdoc_function_type_display_projection(
         .collect();
     Ok(ValidatedSingleCallSignatureDisplay {
         owner: type_,
+        signature,
         parameters,
         return_type: record.resolved_return_type(),
     })

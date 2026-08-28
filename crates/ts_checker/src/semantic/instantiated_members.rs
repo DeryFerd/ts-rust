@@ -3028,6 +3028,7 @@ pub(super) fn instantiated_function_member_display(
         }
         Ok(ValidatedSingleCallSignatureDisplay {
             owner: type_,
+            signature: callable.signature,
             parameters: source_display
                 .parameters
                 .into_iter()
@@ -3036,6 +3037,7 @@ pub(super) fn instantiated_function_member_display(
                     |(source, &value_type)| ValidatedSingleCallParameterDisplay {
                         name: source.name,
                         value_type,
+                        annotation_type: None,
                         optional: source.optional,
                         rest: source.rest,
                     },
