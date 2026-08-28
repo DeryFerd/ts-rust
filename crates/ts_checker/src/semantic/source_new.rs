@@ -15,6 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+mod global_error;
+
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
@@ -181,6 +183,7 @@ enum SourceNewTarget {
     GlobalObject(SourceGlobalObjectConstructorPlan),
     GlobalArray(SourceGlobalArrayConstructorPlan),
     GlobalDate(SourceGlobalDateConstructorPlan),
+    GlobalError(global_error::ErrorConstructorPlan),
     GlobalPromise(SourceGlobalPromiseConstructorPlan),
 }
 
@@ -983,6 +986,24 @@ pub(super) fn plan_direct_default_new(
         }
         let global = plan_global_date_constructor(store, host, constructor, symbol)?;
         (SourceNewTarget::GlobalDate(global), None)
+    } else if identifier.text == "Error"
+        && symbol_record
+            .value_declaration()
+            .is_some_and(|declaration| store.source_is_default_library_declaration(declaration))
+        && store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Error"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(symbol)
+    {
+        if argument.is_some() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+        }
+        (
+            SourceNewTarget::GlobalError(global_error::plan(store, host, constructor, symbol)?),
+            None,
+        )
     } else if global_promise {
         let Some(executor) = executor else {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -3834,6 +3855,14 @@ pub(super) fn preflight_direct_default_new(
                 )));
             }
         }
+        SourceNewTarget::GlobalError(expected) => {
+            let actual = global_error::plan(store, host, plan.constructor, plan.resolved_symbol)?;
+            if actual != *expected || plan.argument.is_some() || plan.parameter.is_some() {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+        }
         SourceNewTarget::GlobalPromise(expected) => {
             let actual = plan_global_promise_constructor(
                 store,
@@ -3894,6 +3923,9 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
+            SourceNewTarget::GlobalError(global) => {
+                global_error::prepare(store, host, global_types, options, plan, global)?;
+            }
             SourceNewTarget::GlobalObject(global)
                 if resolved_global_object_constructor(store, plan, global)?.is_none() =>
             {
@@ -5042,6 +5074,12 @@ pub(super) fn check_direct_default_new(
                 ))
             })?
         }
+        SourceNewTarget::GlobalError(global) => global_error::resolve(store, plan, global)?
+            .ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?,
         SourceNewTarget::GlobalPromise(global) => {
             resolved_global_promise_constructor(store, plan, global)?.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
@@ -6416,6 +6454,20 @@ fn preflight_default_new_cache(
         }
         SourceNewTarget::GlobalDate(global) => {
             let resolved = resolved_global_date_constructor(store, plan, global)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::GlobalError(global) => {
+            let resolved = global_error::resolve(store, plan, global)?;
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
