@@ -6719,6 +6719,7 @@ impl Program {
         if is_javascript {
             self.diagnostics.extend(javascript_syntax_diagnostics(
                 file_name,
+                &source_text,
                 &parse,
                 !source_check_js_directive(&source_text).unwrap_or(self.options.check_js)
                     && !self.options.experimental_decorators,
@@ -10976,10 +10977,42 @@ fn check_js_requires_allow_js_diagnostic() -> ProgramDiagnostic {
     }
 }
 
+fn unchecked_javascript_parameter_decorator_range(
+    source: &str,
+    parse: &ParseResult,
+    parameter: &Node,
+    decorator: &Node,
+) -> TextRange {
+    let Some(parent) = parameter.parent.and_then(|parent| parse.arena.get(parent)) else {
+        return decorator.range;
+    };
+    // Start after the nearest preceding child, outside earlier parameter initializers.
+    let mut start = parent.range.start;
+    parent.for_each_child(|child| {
+        if let Some(child) = parse.arena.get(child)
+            && child.range.end <= parameter.range.start
+        {
+            start = start.max(child.range.end);
+        }
+    });
+    let mut scanner = ts_scanner::Scanner::new(source);
+    scanner.reset_pos(start.get() as usize);
+    loop {
+        let token = scanner.scan();
+        if token.kind == SyntaxKind::AtToken && token.range.start == decorator.range.start {
+            return TextRange::new(token.full_start, decorator.range.end);
+        }
+        if token.kind == SyntaxKind::EndOfFile || token.range.start >= decorator.range.start {
+            return decorator.range;
+        }
+    }
+}
+
 /// Reports TypeScript-only syntax from the original JavaScript AST.
 #[allow(clippy::too_many_lines)] // Keep the related syntax rules in one AST walk.
 fn javascript_syntax_diagnostics(
     file_name: &str,
+    source_text: &str,
     parse: &ParseResult,
     report_parameter_decorators: bool,
 ) -> Vec<ProgramDiagnostic> {
@@ -11048,7 +11081,16 @@ fn javascript_syntax_diagnostics(
                             .iter()
                             .find(|node| node.kind == SyntaxKind::Decorator)
                     {
-                        report(decorator.range, 1206, &[]);
+                        report(
+                            unchecked_javascript_parameter_decorator_range(
+                                source_text,
+                                parse,
+                                node,
+                                decorator,
+                            ),
+                            1206,
+                            &[],
+                        );
                     }
                 }
             }
@@ -20390,12 +20432,12 @@ export function create() { return new M.Value(); }"#,
                 assert_eq!(ranges[0].start.get() as usize, source.find("@dec").unwrap());
                 assert_eq!(
                     ranges[1].start.get() as usize,
-                    source.rfind("@dec").unwrap()
+                    source.rfind("@dec").unwrap() - 1
                 );
-                for range in ranges {
+                for (range, expected) in ranges.into_iter().zip(["@dec", " @dec"]) {
                     assert_eq!(
                         &source[range.start.get() as usize..range.end.get() as usize],
-                        "@dec"
+                        expected
                     );
                 }
             } else {
@@ -20411,13 +20453,19 @@ export function create() { return new M.Value(); }"#,
     fn canonical_javascript_parameter_decorators_follow_the_checking_phase() {
         let original = "function dec() {} class Foo { method(@dec @dec x, @dec y) {} }";
         for (prefix, check_js, experimental_decorators, no_check, expected) in [
-            ("", false, false, false, Some("@dec")),
+            ("", false, false, false, Some(["@dec", " @dec"])),
             ("", false, true, false, None),
-            ("", true, false, false, Some("@")),
-            ("// @ts-check\n", false, false, false, Some("@")),
-            ("// @ts-nocheck\n", true, false, false, Some("@dec")),
+            ("", true, false, false, Some(["@", "@"])),
+            ("// @ts-check\n", false, false, false, Some(["@", "@"])),
+            (
+                "// @ts-nocheck\n",
+                true,
+                false,
+                false,
+                Some(["@dec", " @dec"]),
+            ),
             ("", true, false, true, None),
-            ("", false, false, true, Some("@dec")),
+            ("", false, false, true, Some(["@dec", " @dec"])),
         ] {
             let fs = MemoryFileSystem::new(true);
             let source = format!("{prefix}{original}");
@@ -20444,7 +20492,7 @@ export function create() { return new M.Value(); }"#,
                 .collect::<Vec<_>>();
             if let Some(expected) = expected {
                 assert_eq!(ranges.len(), 2);
-                for range in ranges {
+                for (range, expected) in ranges.into_iter().zip(expected) {
                     assert_eq!(
                         &source[range.start.get() as usize..range.end.get() as usize],
                         expected,
@@ -20487,6 +20535,115 @@ export function create() { return new M.Value(); }"#,
                 vec![1206, 7006, 2339]
             };
             assert_eq!(codes, expected, "noCheck={no_check}");
+        }
+    }
+
+    #[test]
+    fn unchecked_javascript_parameter_decorators_keep_leading_trivia() {
+        for (source, expected) in [
+            (
+                "function dec() {} class Foo { method( /* first */ @dec x,\n // second\n @dec y) { this.missing; } }",
+                vec![" /* first */ @dec", "\n // second\n @dec"],
+            ),
+            (
+                "function dec() {} class Foo { method(seed = /[,)]@dec/, /* actual */ @dec x) {} }",
+                vec![" /* actual */ @dec"],
+            ),
+            (
+                "function dec() {}\nclass Foo {\n// @ts-expect-error\nmethod(@dec x) {\nthis.missing;\n}\n}",
+                vec!["@dec"],
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/a.js", source).unwrap();
+            let program = Program::new_unchecked_with_options_and_checker(
+                &fs,
+                "/",
+                &["a.js".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+                super::ProgramChecker::Canonical,
+            );
+            let diagnostics = program.diagnostics();
+            assert_eq!(diagnostics.len(), expected.len(), "{source}");
+            for (diagnostic, expected) in diagnostics.iter().zip(expected) {
+                assert_eq!(diagnostic.code, Some(1206));
+                let range = diagnostic.range.unwrap();
+                assert_eq!(range.start.get() as usize, source.find(expected).unwrap());
+                assert_eq!(range.len() as usize, expected.len());
+                assert_eq!(
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                    expected
+                );
+            }
+            let file = program.source_file("/a.js").unwrap();
+            for (_, node) in file.parse.arena.iter() {
+                if matches!(node.data, NodeData::Decorator(_)) {
+                    assert_eq!(
+                        &source[node.range.start.get() as usize..node.range.end.get() as usize],
+                        "@dec"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_javascript_parameter_decorators_preserve_trivia_and_directive_controls() {
+        for (source, no_check, expected) in [
+            (
+                "function dec() {} class Foo { method( /* first */ @dec x,\n // second\n @dec y) { this.missing; } }",
+                false,
+                vec![1206, 7006, 1206, 7006, 2339],
+            ),
+            (
+                "function dec() {} class Foo { method( /* first */ @dec x,\n // second\n @dec y) { this.missing; } }",
+                true,
+                vec![],
+            ),
+            (
+                "function dec() {}\nclass Foo {\n// @ts-expect-error\nmethod(@dec x) {\nthis.missing;\n}\n}",
+                false,
+                vec![2339],
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/a.js", source).unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/",
+                &["a.js".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    check_js: true,
+                    no_check,
+                    no_implicit_any: true,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.code.unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}"
+            );
+            for diagnostic in program.diagnostics() {
+                if diagnostic.code == Some(1206) {
+                    let range = diagnostic.range.unwrap();
+                    assert_eq!(
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                        "@"
+                    );
+                }
+            }
         }
     }
 
