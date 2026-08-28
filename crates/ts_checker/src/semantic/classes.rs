@@ -85,12 +85,14 @@ use ts_binder::{
     InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol},
 };
+use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::Number;
 
 use super::{
-    CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-    CanonicalGlobalTypes, CanonicalSemanticStore, CanonicalTypeMapperStore, DeclaredTypeError,
-    DeclaredTypeHost, IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
+    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalSemanticStore,
+    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
+    IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, SourceCheckError, TypeId,
     TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
@@ -100,6 +102,7 @@ use super::{
         cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference,
         preflight_node, type_list_key,
     },
+    formatter::type_to_string_with_host_global_types_and_flags,
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
@@ -1145,6 +1148,20 @@ fn source_class_entries(
     ))
 }
 
+fn source_class_inherited_indexes(
+    store: &CanonicalTypeMapperStore,
+    base: Option<&ClassMembers>,
+) -> Result<Option<Vec<IndexInfoId>>, ClassError> {
+    let Some(base) = base else {
+        return Ok(None);
+    };
+    let structured = store
+        .type_payload(base.shells.instance_type)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceMembers(base.shells.symbol)))?;
+    Ok(structured.index_infos.clone())
+}
+
 fn source_declaration_is_within(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
@@ -1493,6 +1510,7 @@ fn validate_source_class_stored_layout(
                 members: members.instance_members,
                 properties: (!members.instance_properties.is_empty())
                     .then(|| members.instance_properties.clone()),
+                index_infos: source_class_inherited_indexes(store, base)?,
                 ..StructuredTypeData::default()
             })
     {
@@ -1697,6 +1715,7 @@ pub(super) fn prepare_source_class_members(
         })
         .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(plan.declaration())))?;
     let inherited_values = source_inherited_values(store, base.as_ref())?;
+    let inherited_indexes = source_class_inherited_indexes(store, base.as_ref())?;
     let old_value = resolved_class_value_type(store, plan.symbol());
     if old_value.is_some_and(|value| has_static_member_publication(store, value)) {
         // Reuse legacy identities, but require source-body receipts for this path.
@@ -2166,7 +2185,7 @@ pub(super) fn prepare_source_class_members(
         (!instance_properties.is_empty()).then(|| instance_properties.clone()),
         None,
         None,
-        None
+        inherited_indexes
     ));
     let mut all_static_properties = static_properties.clone();
     all_static_properties.push(prototype);
@@ -3329,6 +3348,141 @@ pub(super) fn finish_source_class_members(
             .complete = true;
     }
     Ok(members)
+}
+
+/// Checks local members against declared or inherited class index signatures.
+#[allow(clippy::too_many_lines)] // Keep property ownership, applicability, and the diagnostic together.
+pub(super) fn check_class_index_constraints(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    members: &ClassMembers,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Class(members.shells.declaration);
+    let indexes = store
+        .type_payload(members.shells.instance_type)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?
+        .index_infos
+        .clone()
+        .unwrap_or_default();
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    if validate_class_heritage_members(store, members.shells.instance_type)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let number = bootstrap.number_type;
+    let undefined = bootstrap.undefined_type;
+    let mut format_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        format_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+
+    for &property in members.instance_properties() {
+        let record = store.symbol(property).ok_or_else(invalid)?;
+        // Private identifiers and symbol keys do not match the supported string indexes.
+        if record.name().is_private_identifier() || record.name().is_late_bound() {
+            continue;
+        }
+        let name = record.name().as_utf8().ok_or_else(invalid)?.to_owned();
+        let declaration = record.value_declaration().ok_or_else(invalid)?;
+        let optional = record.flags().contains(SymbolFlags::OPTIONAL);
+        let local_property = store.get_parent_of_symbol(property) == Some(members.shells.symbol);
+        let property_record = host.node(declaration).ok_or_else(invalid)?;
+        let name_node = match &property_record.data {
+            NodeData::PropertyDeclaration(data) => data.name,
+            NodeData::MethodDeclaration(data) => data.name,
+            NodeData::GetAccessorDeclaration(data) => data.name,
+            NodeData::SetAccessorDeclaration(data) => data.name,
+            NodeData::ParameterDeclaration(data) => data.name,
+            _ => return Err(invalid()),
+        };
+        let name_node = NodeRef::new(declaration.arena, declaration.file, name_node);
+        let mut property_type = store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        if optional
+            && options.intrinsic.strict_null_checks
+            && !options.intrinsic.exact_optional_property_types
+        {
+            let mut prepared = store
+                .prepare_type_query_types(&[], &[], &[], 1, 0)
+                .map_err(|_| invalid())?;
+            property_type = store
+                .literal_union_type_prepared(&[property_type, undefined], None, &mut prepared)
+                .map_err(|_| invalid())?;
+        }
+        let name_type = store
+            .regular_string_literal_type(name.clone())
+            .map_err(|_| invalid())?;
+        for &index in &indexes {
+            let info = store.index_info(index).ok_or_else(invalid)?;
+            let (key_type, value_type) = (info.key_type(), info.value_type());
+            let index_declaration = info.declaration().ok_or_else(invalid)?;
+            let local_index = bound_symbol(store, host, index_declaration)
+                .and_then(|symbol| store.get_parent_of_symbol(symbol))
+                == Some(members.shells.symbol);
+            if !local_property && !local_index {
+                continue;
+            }
+            let applies = if key_type == number
+                && ts_jsnum::from_string(&name).to_string() == name
+            {
+                true
+            } else {
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    name_type,
+                    key_type,
+                    global_types,
+                    options.strict_function_types,
+                )?
+            };
+            if !applies
+                || store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    property_type,
+                    value_type,
+                    global_types,
+                    options.strict_function_types,
+                )?
+            {
+                continue;
+            }
+            let mut arguments = vec![name.clone()];
+            for type_ in [property_type, key_type, value_type] {
+                arguments.push(type_to_string_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    global_types,
+                    type_,
+                    format_flags,
+                )?);
+            }
+            super::source::merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(if local_property {
+                        name_node
+                    } else {
+                        index_declaration
+                    }),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2411).ok_or(SourceCheckError::MissingDiagnostic(2411))?,
+                        arguments,
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn class_member_source(

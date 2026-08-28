@@ -29429,6 +29429,9 @@ fn check_planned_source_class(
             .ok_or(SourceCheckError::Class(declaration))?;
         stage_value_type(store, staged_value_types, value_order, *symbol, type_)?;
     }
+    super::classes::check_class_index_constraints(
+        store, host, global_types, options, &members, diagnostics,
+    )?;
     Ok(members)
 }
 
@@ -53502,6 +53505,9 @@ pub(super) fn check_source_file(
                 let declaration = class.declaration();
                 let materialized = execute_nongeneric_class_member_query(store, host, &class)
                     .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+                super::classes::check_class_index_constraints(
+                    store, host, global_types, options, &materialized, diagnostics,
+                )?;
                 if let Some(local) = class.export_local() {
                     stage_value_type(
                         store,
