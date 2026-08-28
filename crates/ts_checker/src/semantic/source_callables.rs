@@ -19534,7 +19534,7 @@ mod tests {
             (
                 "function accept(first, second) {}",
                 SourceCallableFamily::FunctionDeclaration,
-                false,
+                true,
             ),
             (
                 "function accept() {}",
