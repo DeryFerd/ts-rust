@@ -59,6 +59,7 @@
 //! retain the upstream error-recovery `any` type for the source diagnostic.
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
+//! Ambient script classes also admit empty namespaces from other source files.
 //! Class namespace augmentations preserve private static visibility and reject
 //! unqualified references to class members.
 //! Inherited arrow fields retain exact inaccessible `super` property diagnostics.

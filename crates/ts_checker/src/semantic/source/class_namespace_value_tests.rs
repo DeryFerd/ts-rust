@@ -216,6 +216,31 @@ fn class_namespace_source_global_reads_preserve_members_exports_and_replay() {
 }
 
 #[test]
+fn class_namespace_source_global_export_prepares_its_class_dependency() {
+    with_sources(
+        &[
+            ("declare class Value { value: number; }", true),
+            ("declare namespace Value {}", true),
+            ("export = Value;", false),
+        ],
+        |context, files| {
+            let symbol = owner(context, files[0]);
+            context.check_source_file(files[2]).unwrap();
+            let members = context.get_nongeneric_class_members(symbol).unwrap();
+            assert_eq!(members.declared_instance_properties().len(), 1);
+            assert!(context.diagnostics().is_empty());
+            let before = snapshot(context, symbol);
+            context.recheck_source_file(files[2]).unwrap();
+            assert_eq!(
+                context.get_nongeneric_class_members(symbol).unwrap(),
+                members
+            );
+            assert_eq!(snapshot(context, symbol), before);
+        },
+    );
+}
+
+#[test]
 fn class_namespace_source_local_reads_keep_namespace_exports() {
     with_sources(
         &[(

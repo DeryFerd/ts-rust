@@ -15841,12 +15841,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     }
 
     fn plan_default_alias_export(
-        &self,
+        &mut self,
         declaration: NodeRef,
         expression: NodeRef,
         export_equals: bool,
     ) -> Result<PlannedDefaultAliasExport, SourceCheckError> {
-        let Some((store, _)) = self.semantic else {
+        let Some((store, host)) = self.semantic else {
             return Err(self.unsupported(
                 declaration,
                 SyntaxKind::ExportAssignment,
@@ -15873,19 +15873,58 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::Statement,
             ));
         }
+        let name = identifier.text.clone();
         let local_symbol = self
             .bound
             .locals(self.source.node_ref())
             .and_then(|locals| store.symbol_table(locals))
-            .and_then(|locals| locals.get_source(&identifier.text))
-            .and_then(|symbol| store.get_merged_symbol(symbol))
-            .ok_or_else(|| {
-                self.unsupported(
-                    expression,
-                    SyntaxKind::Identifier,
-                    SourceSyntaxRole::Statement,
-                )
-            })?;
+            .and_then(|locals| locals.get_source(&name))
+            .and_then(|symbol| store.get_merged_symbol(symbol));
+        let local_symbol =
+            match local_symbol {
+                Some(symbol) => symbol,
+                None if export_equals => {
+                    let Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::NonVariableSymbol { symbol, flags, .. },
+                    )) = plan_identifier_read(
+                        self.arena,
+                        self.bound,
+                        store,
+                        host,
+                        &self.prior_variables,
+                        &self.readable_variables,
+                        expression,
+                        &name,
+                    )
+                    else {
+                        return Err(self.unsupported(
+                            expression,
+                            SyntaxKind::Identifier,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    };
+                    if !flags.contains(SymbolFlags::CLASS)
+                        || !flags.intersects(SymbolFlags::MODULE)
+                        || self
+                            .plan_ambient_class_value_read(expression, &name, symbol)?
+                            .is_none()
+                    {
+                        return Err(self.unsupported(
+                            expression,
+                            SyntaxKind::Identifier,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    }
+                    symbol
+                }
+                None => {
+                    return Err(self.unsupported(
+                        expression,
+                        SyntaxKind::Identifier,
+                        SourceSyntaxRole::Statement,
+                    ));
+                }
+            };
         let target_symbol = if export_equals {
             local_symbol
         } else {
@@ -15945,7 +15984,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::Statement,
             )
         })?;
-        let target_record = self.node(target_declaration)?;
+        let ambient_class = self.ambient_class_reads.iter().find(|class| {
+            class.symbol() == target_symbol && class.declaration() == target_declaration
+        });
+        let target_record = if ambient_class.is_some() {
+            super::declared::preflight_node(store, host, target_declaration)?
+        } else {
+            self.node(target_declaration)?
+        };
         let declaration_start = self.node(declaration)?.range.start;
         let imported_enum_alias = !export_equals
             && target.flags() == SymbolFlags::ALIAS
@@ -15953,8 +15999,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .value_import_bindings
                 .get(&target_symbol)
                 .is_some_and(|binding| {
-                    binding.local_text == identifier.text
-                        && binding.imported_text == identifier.text
+                    binding.local_text == name
+                        && binding.imported_text == name
                         && binding.declaration == target_declaration
                         && target_record.kind == SyntaxKind::ImportSpecifier
                         && target_record.range.end <= declaration_start
@@ -15962,7 +16008,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let export_equals_import_alias = export_equals
             && target.flags() == SymbolFlags::ALIAS
             && target.check_flags() == CheckFlags::NONE
-            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.name().as_utf8() == Some(name.as_str())
             && target.value_declaration().is_none()
             && target.members().is_none()
             && target.exports().is_none()
@@ -15974,7 +16020,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .get(&target_symbol)
                 .is_some_and(|binding| {
                     binding.alias_symbol == target_symbol
-                        && binding.local_text == identifier.text
+                        && binding.local_text == name
                         && binding.declaration == target_declaration
                         && target_declaration.is_for(declaration.arena, declaration.file)
                         && matches!(
@@ -16005,7 +16051,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .without(SymbolFlags::FUNCTION | SymbolFlags::MODULE)
                 == SymbolFlags::NONE
             && target.check_flags() == CheckFlags::NONE
-            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.name().as_utf8() == Some(name.as_str())
             && target.members().is_none()
             && target.parent().is_none()
             && target.export_symbol().is_none()
@@ -16036,7 +16082,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     | SymbolFlags::MODULE,
             ) == SymbolFlags::NONE
             && target.check_flags() == CheckFlags::NONE
-            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.name().as_utf8() == Some(name.as_str())
             && target.members().is_none()
             && target.parent().is_none()
             && target.export_symbol().is_none()
@@ -16081,7 +16127,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .without(SymbolFlags::CLASS | SymbolFlags::MODULE)
                 == SymbolFlags::NONE
             && target.check_flags() == CheckFlags::NONE
-            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.name().as_utf8() == Some(name.as_str())
             && target.parent().is_none()
             && target.export_symbol().is_none()
             && self.planned_classes.contains(&target_symbol)
@@ -16093,7 +16139,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             record.kind,
                             SyntaxKind::ClassDeclaration | SyntaxKind::ModuleDeclaration
                         ) && record.parent == Some(self.source.node_ref().node)
-                            && record.range.end <= declaration_start
+                            && (record.range.end <= declaration_start
+                                || self.prior_classes.get(&target_symbol).is_some_and(|class| {
+                                    class.declaration() == target_declaration
+                                        && record.kind == SyntaxKind::ModuleDeclaration
+                                        && store
+                                            .source_child_with_kind(
+                                                *candidate,
+                                                SyntaxKind::ModuleBlock,
+                                            )
+                                            .and_then(|body| store.source_direct_children(body))
+                                            .is_some_and(|children| children.is_empty())
+                                }))
                     })
                     && self
                         .bound
@@ -16101,11 +16158,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .and_then(|candidate| store.get_merged_symbol(candidate))
                         == Some(target_symbol)
             });
+        let export_equals_ambient_class = export_equals
+            && ambient_class.is_some()
+            && target.flags().contains(SymbolFlags::CLASS)
+            && target.flags().intersects(SymbolFlags::MODULE)
+            && target.check_flags() == CheckFlags::NONE
+            && target.name().as_utf8() == Some(name.as_str())
+            && target.parent().is_none()
+            && target.export_symbol().is_none()
+            && target_record.kind == SyntaxKind::ClassDeclaration
+            && !target_declaration.is_for(declaration.arena, declaration.file)
+            && store.source_merged_symbol_declarations_match(target_symbol);
         let export_equals_namespace = export_equals
             && target.flags().intersects(SymbolFlags::MODULE)
             && target.flags().without(SymbolFlags::MODULE) == SymbolFlags::NONE
             && target.check_flags() == CheckFlags::NONE
-            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.name().as_utf8() == Some(name.as_str())
             && target.members().is_none()
             && target.parent().is_none()
             && target.export_symbol().is_none()
@@ -16128,7 +16196,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let export_equals_type_alias = export_equals
             && target.flags() == SymbolFlags::TYPE_ALIAS
             && target.check_flags() == CheckFlags::NONE
-            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.name().as_utf8() == Some(name.as_str())
             && target.value_declaration().is_none()
             && target.members().is_none()
             && target.exports().is_none()
@@ -16162,14 +16230,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || export_equals_callable
             || export_equals_variable
             || export_equals_class
+            || export_equals_ambient_class
             || export_equals_namespace
             || export_equals_type_alias;
         if !supported_target
             || !imported_enum_alias
                 && !export_equals_import_alias
                 && !export_equals_variable
+                && !export_equals_ambient_class
                 && target_record.parent != Some(self.source.node_ref().node)
-            || !export_equals_namespace && target_record.range.end > declaration_start
+            || !export_equals_namespace
+                && !export_equals_ambient_class
+                && target_record.range.end > declaration_start
             || matches!(
                 target.flags(),
                 SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS
