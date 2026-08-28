@@ -14099,6 +14099,26 @@ mod tests {
                 .then(|| scope.node_ref(node).unwrap())
             })
             .unwrap();
+        let Some(super::SourceNodeParent::Parent(interface)) =
+            store.source_node_parent(declaration)
+        else {
+            panic!("expected the parsed interface owner");
+        };
+        assert_eq!(
+            store.source_node_kind(interface),
+            Some(SyntaxKind::InterfaceDeclaration)
+        );
+        let owner = store.symbol(target.symbol).unwrap();
+        let mut declarations = owner.declarations().unwrap_or_default().to_vec();
+        let value_declaration = owner.value_declaration();
+        if !declarations.contains(&interface) {
+            declarations.push(interface);
+        }
+        assert!(store.set_symbol_declarations(
+            target.symbol,
+            Some(declarations),
+            value_declaration,
+        ));
         let mut data = SymbolData::new(SymbolFlags::PROPERTY, EscapedName::source(name));
         data.declarations = Some(vec![declaration]);
         data.value_declaration = Some(declaration);
