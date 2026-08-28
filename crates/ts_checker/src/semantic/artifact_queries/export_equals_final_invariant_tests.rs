@@ -1562,3 +1562,6 @@ fn review_merged_export_guard_rejects_foreign_same_name_global_targets() {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[path = "global_binding_capture_review_tests.rs"]
+mod global_binding_capture_review_tests;
