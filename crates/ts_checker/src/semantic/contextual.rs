@@ -654,7 +654,9 @@ fn prepare_expression(
                 ExpressionLocation::Cached,
             )?))
         }
-        PlannedExpressionKind::Call(_) | PlannedExpressionKind::SuperCall(_) => {
+        PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::SuperCall(_)
+        | PlannedExpressionKind::ImportCall(_) => {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Call(expression.node),
             ));

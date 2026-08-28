@@ -10,6 +10,29 @@ pub use flow::*;
 pub use js_string::{append_js_string, decode_js_string, encode_js_string, normalize_js_string};
 pub use syntax_kind::SyntaxKind;
 
+/// Recognizes dynamic import calls without treating ordinary property calls as imports.
+#[must_use]
+pub fn is_import_call(arena: &NodeArena, node: &Node) -> bool {
+    let NodeData::CallExpression(call) = &node.data else {
+        return false;
+    };
+    if node.kind != SyntaxKind::CallExpression {
+        return false;
+    }
+    let Some(callee) = arena.get(call.expression) else {
+        return false;
+    };
+    match (&callee.data, callee.kind) {
+        (NodeData::KeywordExpression(_) | NodeData::Token(_), SyntaxKind::ImportKeyword) => true,
+        (NodeData::MetaProperty(meta), SyntaxKind::MetaProperty)
+            if meta.keyword_token == SyntaxKind::ImportKeyword =>
+        {
+            matches!(arena.get(meta.name), Some(Node { kind: SyntaxKind::Identifier, data: NodeData::Identifier(name), .. }) if name.text == "defer")
+        }
+        _ => false,
+    }
+}
+
 impl NodeData {
     /// Whether this generated node payload is structurally compatible with a
     /// syntax kind. Most schema names match directly; shared payloads and the

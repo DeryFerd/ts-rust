@@ -96,6 +96,15 @@ impl CanonicalJsxRuntimeEvidence<'_> {
     }
 }
 
+/// Import-call forms allowed by the configured module emit kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CanonicalImportCallMode {
+    Unsupported,
+    #[default]
+    Dynamic,
+    Deferred,
+}
+
 /// Compiler options consumed by the installed production-construction slice.
 ///
 /// The intrinsic pair controls bootstrap identity. `strict_bind_call_apply`
@@ -119,6 +128,7 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// `jsx_runtime` retains classic or automatic JSX factory requirements.
 /// `emit_common_js` and `no_emit` preserve the emission conditions needed for
 /// module-scope reserved-name diagnostics.
+/// `import_call_mode` retains dynamic and deferred import grammar restrictions.
 /// `uses_wildcard_types` selects the upstream missing-type-definition message.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
 /// cutoff.
@@ -144,6 +154,7 @@ pub struct CanonicalCheckerOptions {
     pub isolated_modules: bool,
     pub jsx_runtime: CanonicalJsxRuntime,
     pub emit_common_js: bool,
+    pub import_call_mode: CanonicalImportCallMode,
     pub no_emit: bool,
     pub uses_wildcard_types: bool,
     pub no_error_truncation: bool,
@@ -170,6 +181,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             isolated_modules: false,
             jsx_runtime: CanonicalJsxRuntime::Preserve,
             emit_common_js: false,
+            import_call_mode: CanonicalImportCallMode::Dynamic,
             no_emit: false,
             uses_wildcard_types: false,
             no_error_truncation: false,

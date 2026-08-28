@@ -103,10 +103,10 @@ impl CanonicalModuleResolutionMode {
             NodeData::CallExpression(call)
                 if call.arguments.nodes.first().copied() == Some(specifier) =>
             {
+                if ts_ast::is_import_call(arena, parent) {
+                    return Some(Self::Esm);
+                }
                 match &arena.get(call.expression)?.data {
-                    NodeData::Identifier(identifier) if identifier.text == "import" => {
-                        Some(Self::Esm)
-                    }
                     NodeData::Identifier(identifier) if identifier.text == "require" => {
                         Some(Self::CommonJs)
                     }

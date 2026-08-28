@@ -4724,6 +4724,7 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Arrow(_) => true,
@@ -4814,6 +4815,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Conditional(_) => false,

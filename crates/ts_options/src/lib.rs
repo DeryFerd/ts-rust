@@ -26,6 +26,30 @@ pub enum ModuleKind {
     Preserve,
 }
 
+impl ModuleKind {
+    /// Derives the global module format without replacing the configured value.
+    #[must_use]
+    pub const fn effective_for_target(self, target: ScriptTarget) -> Self {
+        if !matches!(self, Self::None) {
+            return self;
+        }
+        match target {
+            ScriptTarget::Es3 | ScriptTarget::Es5 => Self::CommonJs,
+            ScriptTarget::Es2015
+            | ScriptTarget::Es2016
+            | ScriptTarget::Es2017
+            | ScriptTarget::Es2018
+            | ScriptTarget::Es2019 => Self::Es2015,
+            ScriptTarget::Es2020 | ScriptTarget::Es2021 => Self::Es2020,
+            ScriptTarget::Es2022
+            | ScriptTarget::Es2023
+            | ScriptTarget::Es2024
+            | ScriptTarget::Es2025 => Self::Es2022,
+            ScriptTarget::EsNext => Self::EsNext,
+        }
+    }
+}
+
 /// Algorithm used to resolve module specifiers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ModuleResolutionKind {

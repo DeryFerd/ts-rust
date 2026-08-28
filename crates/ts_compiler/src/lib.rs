@@ -5246,6 +5246,17 @@ impl Program {
                 CanonicalJsxRuntime::Preserve
             },
             emit_common_js: self.options.module == ModuleKind::CommonJs,
+            import_call_mode: match self
+                .options
+                .module
+                .effective_for_target(self.options.target)
+            {
+                ModuleKind::EsNext | ModuleKind::Preserve => {
+                    ts_checker::semantic::CanonicalImportCallMode::Deferred
+                }
+                ModuleKind::Es2015 => ts_checker::semantic::CanonicalImportCallMode::Unsupported,
+                _ => ts_checker::semantic::CanonicalImportCallMode::Dynamic,
+            },
             no_emit: self.options.no_emit,
             uses_wildcard_types: self
                 .options
@@ -9807,6 +9818,13 @@ fn canonical_static_module_specifiers(
             specifiers.push(specifier);
         }
     }
+    for (_, node) in source.parse.arena.iter() {
+        if ts_ast::is_import_call(&source.parse.arena, node)
+            && let Some(specifier) = canonical_static_module_specifier(source, node)?
+        {
+            specifiers.push(specifier);
+        }
+    }
     Ok(specifiers)
 }
 
@@ -9938,6 +9956,18 @@ fn canonical_static_module_specifier(
                 Some(CanonicalModuleResolutionMode::CommonJs),
             )
         }
+        NodeData::CallExpression(call) if ts_ast::is_import_call(&source.parse.arena, node) => (
+            call.arguments.nodes.first().copied().filter(|specifier| {
+                source
+                    .parse
+                    .arena
+                    .get(*specifier)
+                    .is_some_and(|node| node.kind == SyntaxKind::StringLiteral)
+            }),
+            None,
+            false,
+            Some(CanonicalModuleResolutionMode::Esm),
+        ),
         _ => return Ok(None),
     };
     let Some(specifier) = specifier else {
@@ -10215,18 +10245,12 @@ fn parsed_module_specifier(
             string_literal(&parse.arena, argument)
                 .map(|(specifier, range)| (specifier, range, true, false))
         }
-        NodeData::CallExpression(data)
-            if matches!(
-                parse.arena.get(data.expression).map(|node| &node.data),
-                Some(NodeData::Identifier(identifier)) if identifier.text == "import"
-            ) =>
-        {
-            data.arguments
-                .nodes
-                .first()
-                .and_then(|argument| string_literal(&parse.arena, *argument))
-                .map(|(specifier, range)| (specifier, range, true, false))
-        }
+        NodeData::CallExpression(data) if ts_ast::is_import_call(&parse.arena, node) => data
+            .arguments
+            .nodes
+            .first()
+            .and_then(|argument| string_literal(&parse.arena, *argument))
+            .map(|(specifier, range)| (specifier, range, true, false)),
         NodeData::VariableStatement(_) if include_javascript_requires => {
             javascript_require_module_specifier(parse, node)
                 .and_then(|specifier| string_literal(&parse.arena, specifier))
@@ -10436,9 +10460,7 @@ fn module_specifier_is_emittable(parse: &ParseResult, range: TextRange) -> bool 
                 .nodes
                 .first()
                 .is_some_and(|argument| matches_range(*argument))
-                && parse.arena.get(call.expression).is_some_and(|node| {
-                    matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == "import")
-                })
+                && ts_ast::is_import_call(&parse.arena, node)
         }
         _ => false,
     })
@@ -10660,6 +10682,7 @@ fn source_contains_import_meta(parse: &ParseResult) -> bool {
         matches!(
             &node.data,
             NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword
+                && matches!(parse.arena.get(meta.name).map(|node| &node.data), Some(NodeData::Identifier(name)) if name.text == "meta")
         )
     })
 }

@@ -71,6 +71,7 @@ mod source_elements;
 mod source_enums;
 mod source_flow;
 mod source_functions;
+mod source_import_calls;
 mod source_imports;
 mod source_namespaces;
 mod source_new;
@@ -166,7 +167,7 @@ pub use module_resolution::{
 pub use name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError};
 pub use production::{
     CanonicalAliasQueryError, CanonicalCheckerContext, CanonicalCheckerContextError,
-    CanonicalCheckerOptions, CanonicalGlobalInitializationError,
+    CanonicalCheckerOptions, CanonicalGlobalInitializationError, CanonicalImportCallMode,
 };
 pub use reference_types::DirectGenericReferenceError;
 pub use relater::RelationUnavailable;

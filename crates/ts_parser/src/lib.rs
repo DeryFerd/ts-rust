@@ -1884,11 +1884,8 @@ impl<'a> Parser<'a> {
     fn import_meta_follows(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
         let dot = self.scanner.scan();
-        let name = self.scanner.scan();
         self.scanner.rewind(checkpoint);
         dot.kind == SyntaxKind::DotToken
-            && name.kind == SyntaxKind::Identifier
-            && name.text == "meta"
     }
 
     fn declare_precedes_invalid_namespace_name(&mut self) -> bool {
@@ -7359,7 +7356,7 @@ impl<'a> Parser<'a> {
     fn parse_import_meta_property(&mut self) -> NodeId {
         let start = self.consume().range.start;
         self.expect_and_bump(SyntaxKind::DotToken, "Expected '.'.");
-        let name = self.parse_identifier_name("Expected 'meta'.");
+        let name = self.parse_identifier_name("Expected an import property name.");
         self.alloc_node(
             SyntaxKind::MetaProperty,
             TextRange::new(start, self.node_end(name)),
@@ -7979,7 +7976,7 @@ impl<'a> Parser<'a> {
                 if self.import_meta_follows() {
                     self.parse_import_meta_property()
                 } else {
-                    self.parse_identifier_name("Expected an expression.")
+                    self.parse_keyword_expression()
                 }
             }
             SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken => {
@@ -17718,15 +17715,7 @@ export as namespace GlobalName;
         let dynamic_imports = result
             .arena
             .iter()
-            .filter(|(_, node)| {
-                let NodeData::CallExpression(call) = &node.data else {
-                    return false;
-                };
-                matches!(
-                    result.arena.get(call.expression).map(|node| &node.data),
-                    Some(NodeData::Identifier(identifier)) if identifier.text == "import"
-                )
-            })
+            .filter(|(_, node)| ts_ast::is_import_call(&result.arena, node))
             .count();
         assert_eq!(dynamic_imports, 2);
         assert_eq!(
@@ -20988,29 +20977,62 @@ export as namespace GlobalName;
     }
 
     #[test]
-    fn parses_import_meta_without_reclassifying_longer_properties() {
-        let result = parse_source_file(
-            "const meta = import.meta; import.meta = meta; const longer = import.metal;",
-        );
-        let import_meta = result
+    fn parses_import_meta_names_for_grammar_without_changing_import_calls() {
+        let result = parse_source_file(concat!(
+            "const wrong = import.wrong; import.wrong();\n",
+            "const longer = import.metal; const keyword = import.default;\n",
+            "const deferred = import.defer; import.defer('./dep.js');\n",
+            "const meta = import.meta; import.meta = meta; import('./dep.js');\n",
+            "function create() { return new.target; }",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let meta_properties = result
             .arena
             .iter()
-            .filter(|(_, node)| {
-                matches!(
-                    &node.data,
-                    NodeData::MetaProperty(meta)
-                        if meta.keyword_token == SyntaxKind::ImportKeyword
-                )
+            .filter_map(|(node, record)| {
+                let NodeData::MetaProperty(meta) = &record.data else {
+                    return None;
+                };
+                let name = result.arena.get(meta.name).unwrap();
+                let NodeData::Identifier(identifier) = &name.data else {
+                    panic!("meta-property name must remain an identifier");
+                };
+                assert_eq!(name.parent, Some(node));
+                Some((meta.keyword_token, identifier.text.as_str()))
             })
-            .count();
-        assert_eq!(import_meta, 2);
-        assert!(result.arena.iter().any(|(_, node)| {
-            let NodeData::PropertyAccessExpression(access) = &node.data else {
+            .collect::<Vec<_>>();
+        assert_eq!(
+            meta_properties,
+            [
+                (SyntaxKind::ImportKeyword, "wrong"),
+                (SyntaxKind::ImportKeyword, "wrong"),
+                (SyntaxKind::ImportKeyword, "metal"),
+                (SyntaxKind::ImportKeyword, "default"),
+                (SyntaxKind::ImportKeyword, "defer"),
+                (SyntaxKind::ImportKeyword, "defer"),
+                (SyntaxKind::ImportKeyword, "meta"),
+                (SyntaxKind::ImportKeyword, "meta"),
+                (SyntaxKind::NewKeyword, "target"),
+            ]
+        );
+        let import_calls = result
+            .arena
+            .iter()
+            .filter(|(_, node)| node.kind == SyntaxKind::CallExpression)
+            .map(|(_, node)| ts_ast::is_import_call(&result.arena, node))
+            .collect::<Vec<_>>();
+        assert_eq!(import_calls, [false, true, true]);
+        assert!(result.arena.iter().any(|(_, record)| {
+            let NodeData::CallExpression(call) = &record.data else {
                 return false;
             };
             matches!(
-                result.arena.get(access.name).map(|node| &node.data),
-                Some(NodeData::Identifier(identifier)) if identifier.text == "metal"
+                result.arena.get(call.expression),
+                Some(ts_ast::Node {
+                    kind: SyntaxKind::ImportKeyword,
+                    data: NodeData::KeywordExpression(_),
+                    ..
+                })
             )
         }));
     }

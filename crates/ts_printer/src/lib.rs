@@ -740,6 +740,7 @@ pub fn emit_source_file_with_context(
         matches!(
             &node.data,
             NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword
+                && matches!(arena.get(meta.name).map(|node| &node.data), Some(NodeData::Identifier(name)) if name.text == "meta")
         )
     });
     let is_external_module = has_explicit_module_indicator
@@ -2318,8 +2319,12 @@ fn source_has_dynamic_import(arena: &NodeArena) -> bool {
             return false;
         };
         matches!(
-            arena.get(call.expression).map(|node| &node.data),
-            Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+            arena.get(call.expression),
+            Some(Node {
+                kind: SyntaxKind::ImportKeyword,
+                data: NodeData::KeywordExpression(_) | NodeData::Token(_),
+                ..
+            })
         )
     })
 }
@@ -66416,8 +66421,12 @@ impl Printer<'_> {
 
     fn is_dynamic_import_call(&self, call: &ts_ast::CallExpressionData) -> bool {
         matches!(
-            self.arena.get(call.expression).map(|node| &node.data),
-            Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+            self.arena.get(call.expression),
+            Some(Node {
+                kind: SyntaxKind::ImportKeyword,
+                data: NodeData::KeywordExpression(_) | NodeData::Token(_),
+                ..
+            })
         )
     }
 
@@ -67665,6 +67674,7 @@ impl Printer<'_> {
         match &node.data {
             NodeData::MetaProperty(data) => {
                 if data.keyword_token == SyntaxKind::ImportKeyword
+                    && declaration_name_text(self.arena, data.name) == Some("meta")
                     && let Some(context) = self.system_context_object.clone()
                 {
                     self.writer.write(&context);

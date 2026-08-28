@@ -223,6 +223,7 @@ use super::{
         SourceFunctionUnsupported, plan_function_identifier_read, plan_nested_function,
         plan_top_level_function, valid_source_javascript_duplicate_function_owner_shape,
     },
+    source_import_calls::{PlannedImportCall, check_import_call, plan_import_call},
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
@@ -861,6 +862,7 @@ pub(super) enum PlannedExpressionKind {
     Element(Box<SourceElementPlan>),
     Call(Box<SourceCallPlan>),
     SuperCall(Box<SourceSuperCallPlan>),
+    ImportCall(Box<PlannedImportCall>),
     Arrow(Box<PlannedArrowExpression>),
     New(Box<SourceDefaultNewPlan>),
     Binary(Box<PrimitiveBinaryPlan>),
@@ -6848,7 +6850,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(())
     }
 
-    /// Plans a top-level identifier or property call expression statement.
+    /// Plans a top-level call or tagged-template expression statement.
     fn plan_top_level_direct_call_statement(
         &mut self,
         statement: NodeRef,
@@ -6911,30 +6913,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             (node.range, self.reference(callee))
         };
         let callee_node = self.node(callee)?;
-        let supported_callee = match &callee_node.data {
-            NodeData::Identifier(identifier) => {
-                callee_node.kind == SyntaxKind::Identifier
-                    && !identifier.text.is_empty()
-                    && identifier.flow_node.is_none()
-            }
-            NodeData::CallExpression(_) => callee_node.kind == SyntaxKind::CallExpression,
-            NodeData::PropertyAccessExpression(_) => {
-                callee_node.kind == SyntaxKind::PropertyAccessExpression
-            }
-            NodeData::ParenthesizedExpression(_) | NodeData::FunctionExpression(_) => {
-                if is_immediately_invoked_source_callable(self.arena, expression) {
-                    true
-                } else {
-                    let Some((store, _)) = self.semantic else {
-                        return Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Call(expression),
-                        ));
-                    };
-                    plan_direct_source_call_syntax(self.arena, store, expression)?.callee_form()
-                        == SourceCallCalleeForm::ParenthesizedAsyncArrow
+        let supported_callee = if ts_ast::is_import_call(self.arena, self.node(expression)?) {
+            true
+        } else {
+            match &callee_node.data {
+                NodeData::Identifier(identifier) => {
+                    callee_node.kind == SyntaxKind::Identifier
+                        && !identifier.text.is_empty()
+                        && identifier.flow_node.is_none()
                 }
+                NodeData::CallExpression(_) => callee_node.kind == SyntaxKind::CallExpression,
+                NodeData::PropertyAccessExpression(_) => {
+                    callee_node.kind == SyntaxKind::PropertyAccessExpression
+                }
+                NodeData::ParenthesizedExpression(_) | NodeData::FunctionExpression(_) => {
+                    if is_immediately_invoked_source_callable(self.arena, expression) {
+                        true
+                    } else {
+                        let Some((store, _)) = self.semantic else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Call(expression),
+                            ));
+                        };
+                        plan_direct_source_call_syntax(self.arena, store, expression)?.callee_form()
+                            == SourceCallCalleeForm::ParenthesizedAsyncArrow
+                    }
+                }
+                _ => false,
             }
-            _ => false,
         };
         if !supported_callee
             || callee_node.flags.0 != 0
@@ -6947,7 +6953,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         let planned = self.plan_expression(expression)?;
-        if planned.node != expression || !matches!(&planned.kind, PlannedExpressionKind::Call(_)) {
+        if planned.node != expression
+            || !matches!(
+                &planned.kind,
+                PlannedExpressionKind::Call(_) | PlannedExpressionKind::ImportCall(_)
+            )
+        {
             return Err(SourceCheckError::Call(expression));
         }
         Ok(Some(planned))
@@ -20821,6 +20832,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     ));
                 }
                 if kind == SyntaxKind::CallExpression
+                    && ts_ast::is_import_call(self.arena, self.node(expression)?)
+                {
+                    let Some((store, host)) = self.semantic else {
+                        return Err(SourceCheckError::Import(expression));
+                    };
+                    let import = plan_import_call(self.arena, store, host, expression)?
+                        .ok_or(SourceCheckError::Import(expression))?;
+                    self.strings.push(import.text.clone());
+                    return Ok(PlannedExpression::new(
+                        expression,
+                        PlannedExpressionKind::ImportCall(Box::new(import)),
+                    ));
+                }
+                if kind == SyntaxKind::CallExpression
                     && let Some(promise) = self.plan_global_promise_call(expression)?
                 {
                     return Ok(promise);
@@ -24380,6 +24405,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         | PlannedExpressionKind::Boolean(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Assertion { .. } => true,
         PlannedExpressionKind::Parenthesized(inner) => {
@@ -24438,6 +24464,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Binary(_)
@@ -24523,6 +24550,7 @@ fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::SuperCall(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::New(_) => false,
     }
 }
@@ -24681,7 +24709,7 @@ fn preflight_uncached_conditional_operand_links(
                 .map_err(source_object_execution_error)?;
             return Ok(());
         }
-        PlannedExpressionKind::Call(_) => return Ok(()),
+        PlannedExpressionKind::Call(_) | PlannedExpressionKind::ImportCall(_) => return Ok(()),
         _ => {}
     }
     if store
@@ -24732,6 +24760,7 @@ fn preflight_inferred_function_return_dependencies(
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
             | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::ImportCall(_)
             | PlannedExpressionKind::GlobalUndefined => true,
             PlannedExpressionKind::Identifier(read) => match read.kind {
                 PlannedIdentifierReadKind::Variable => {
@@ -27074,6 +27103,7 @@ fn emit_uninitialized_variable_read_diagnostics(
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_) => {}
     }
@@ -28524,6 +28554,48 @@ fn check_expression_type_with_class_context(
                 checked.return_type,
                 checked.return_type,
             ))
+        }
+        PlannedExpressionKind::ImportCall(import) => {
+            if options.emit_common_js && options.name_resolution.verbatim_module_syntax {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(expression.node),
+                ));
+            }
+            let result = check_import_call(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                import,
+            )?;
+            let code = if import.deferred_name.is_some()
+                && options.import_call_mode != super::CanonicalImportCallMode::Deferred
+            {
+                Some(18060)
+            } else if import.deferred_name.is_none()
+                && options.import_call_mode == super::CanonicalImportCallMode::Unsupported
+            {
+                Some(1323)
+            } else {
+                None
+            };
+            if let Some(code) = code {
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(expression.node),
+                        range_override: None,
+                        diagnostic: Diagnostic::new(
+                            message_by_code(code)
+                                .ok_or(SourceCheckError::MissingDiagnostic(code))?,
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+            }
+            Ok(CheckedExpressionTypes::leaf(result, result))
         }
         PlannedExpressionKind::Call(call) => {
             if let Some(promise) = expression.promise_call {
@@ -31778,6 +31850,7 @@ fn syntactic_truthiness(
         | PlannedExpressionKind::Call(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::SuperCall(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Binary(_)
         | PlannedExpressionKind::Logical(_)
         | PlannedExpressionKind::Number { .. } => PredicateSemantics::Sometimes,
@@ -31821,6 +31894,7 @@ fn syntactic_nullishness(
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::SuperCall(_) => PredicateSemantics::Sometimes,
         PlannedExpressionKind::ClassReceiver(_) => {
             if host
@@ -56959,7 +57033,9 @@ pub(super) fn check_source_file(
             | PlannedStatement::ExpressionElement(expression) => {
                 if !matches!(
                     &expression.kind,
-                    PlannedExpressionKind::Call(_) | PlannedExpressionKind::Element(_)
+                    PlannedExpressionKind::Call(_)
+                        | PlannedExpressionKind::ImportCall(_)
+                        | PlannedExpressionKind::Element(_)
                 ) {
                     return Err(SourceCheckError::Call(expression.node));
                 }
