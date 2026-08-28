@@ -3146,7 +3146,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if let Some(grammar) = plan_class_grammar_diagnostics(store, host, symbol)
                             && grammar.declaration == statement
                             && grammar.symbol == symbol
-                            && matches!(grammar.diagnostics.as_slice(), [diagnostic] if diagnostic.code == 2502)
+                            && !grammar.diagnostics.is_empty()
+                            && grammar
+                                .diagnostics
+                                .iter()
+                                .all(|diagnostic| matches!(diagnostic.code, 1183 | 2369 | 2502))
                         {
                             statements.push(PlannedStatement::ClassGrammar(grammar));
                             continue;
@@ -14896,6 +14900,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 type_parameters,
                 members,
                 annotations,
+                diagnostics,
             }) = planned_namespace.members.iter().find(|planned| {
                 matches!(
                     planned,
@@ -14928,6 +14933,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || !type_parameters.is_empty()
                 || !members.is_empty()
                 || !annotations.is_empty()
+                || !diagnostics.is_empty()
                 || member_declaration.file != declaration.file
                 || member_record.kind != SyntaxKind::ClassDeclaration
                 || member_record.parent != module.body

@@ -96,6 +96,7 @@ pub(super) enum SourceNamespaceMemberPlan {
         type_parameters: Vec<SemanticSymbolId>,
         members: Vec<SemanticSymbolId>,
         annotations: Vec<NodeRef>,
+        diagnostics: Vec<super::classes::ClassGrammarDiagnostic>,
     },
     AmbientVariable {
         declaration: NodeRef,
@@ -9332,6 +9333,7 @@ fn plan_deferred_ambient_class(
     )?;
 
     let mut members = Vec::with_capacity(class.members.nodes.len());
+    let mut accessor_diagnostics = Vec::new();
     for member in &class.members.nodes {
         let member = child(declaration, *member);
         let member_record = validator.visit(declaration, member)?;
@@ -9470,6 +9472,21 @@ fn plan_deferred_ambient_class(
                 validator.type_node(member, annotation)?;
                 member_symbol
             }
+            NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
+                let host =
+                    DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+                let accessor = super::classes::plan_ambient_class_accessor_grammar(
+                    store,
+                    &host,
+                    symbol,
+                    declaration,
+                    member,
+                )
+                .ok_or(SourceCheckError::Class(member))?;
+                validator.annotations.extend(accessor.annotations);
+                accessor_diagnostics.extend(accessor.diagnostics);
+                accessor.symbol
+            }
             _ => return Err(SourceCheckError::Class(member)),
         };
         members.push(symbol);
@@ -9481,6 +9498,7 @@ fn plan_deferred_ambient_class(
         type_parameters,
         members,
         annotations: validator.annotations,
+        diagnostics: accessor_diagnostics,
     })
 }
 
@@ -12582,6 +12600,22 @@ pub(super) fn execute_source_namespace(
         &mut declarations,
         &mut planned_diagnostics,
     );
+    let accessor_diagnostics = declarations
+        .iter()
+        .filter_map(|declaration| match declaration {
+            SourceNamespaceMemberPlan::DeferredAmbientClass { diagnostics, .. } => {
+                Some(diagnostics.as_slice())
+            }
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    for diagnostic in &accessor_diagnostics {
+        if message_by_code(diagnostic.code).is_none() {
+            return Err(SourceCheckError::MissingDiagnostic(diagnostic.code));
+        }
+    }
     for declaration in &declarations {
         match declaration {
             SourceNamespaceMemberPlan::TypeAlias {
@@ -13427,6 +13461,19 @@ pub(super) fn execute_source_namespace(
                 node: Some(diagnostic.node),
                 range_override: None,
                 diagnostic: Diagnostic::new(message),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    for diagnostic in accessor_diagnostics {
+        let message = message_by_code(diagnostic.code)
+            .ok_or(SourceCheckError::MissingDiagnostic(diagnostic.code))?;
+        super::source::merge_retry_diagnostic(
+            diagnostics,
+            super::CanonicalCheckerDiagnostic {
+                node: Some(diagnostic.node),
+                range_override: diagnostic.range_override,
+                diagnostic: Diagnostic::with_arguments(message, diagnostic.arguments),
                 related_information: Vec::new(),
             },
         );
@@ -15416,6 +15463,7 @@ mod tests {
                 type_parameters: component_parameters,
                 members: component_members,
                 annotations: component_annotations,
+                ..
             },
             SourceNamespaceMemberPlan::DeferredAmbientClass {
                 declaration: pure_declaration,
@@ -15423,6 +15471,7 @@ mod tests {
                 type_parameters: pure_parameters,
                 members: pure_members,
                 annotations: pure_annotations,
+                ..
             },
         ] = namespace.members.as_slice()
         else {

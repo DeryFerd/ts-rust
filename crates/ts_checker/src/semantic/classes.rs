@@ -16428,6 +16428,255 @@ fn plan_static_member_name_grammar_diagnostic(
     })
 }
 
+pub(super) struct AmbientClassAccessorGrammar {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) annotations: Vec<NodeRef>,
+    pub(super) diagnostics: Vec<ClassGrammarDiagnostic>,
+}
+
+/// Checks an accessor in an already validated ambient class without publishing a type.
+#[allow(clippy::too_many_lines)] // Keep the accessor, paired symbol, parameters, and real body together.
+pub(super) fn plan_ambient_class_accessor_grammar(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    accessor: NodeRef,
+) -> Option<AmbientClassAccessorGrammar> {
+    let record = preflight_node(store, host, accessor).ok()?;
+    // The generated getter and setter structs have distinct Rust types.
+    macro_rules! accessor_fields {
+        ($data:ident, $getter:expr) => {{
+            if $data.asterisk_token.is_some()
+                || $data.end_flow_node.is_some()
+                || $data.flow_node.is_some()
+                || $data.full_signature.is_some()
+                || $data.next_container.is_some()
+                || $data.postfix_token.is_some()
+                || $data.symbol.is_some()
+                || $data.type_parameters.is_some()
+                || $data.facts != 0
+            {
+                return None;
+            }
+            (
+                $data.name,
+                $data.type_,
+                &$data.parameters,
+                $data.body,
+                $data.modifiers.as_ref(),
+                $getter,
+            )
+        }};
+    }
+    let (name_node, return_type, parameters, body_node, modifiers, getter) = match &record.data {
+        NodeData::GetAccessorDeclaration(data) if record.kind == SyntaxKind::GetAccessor => {
+            accessor_fields!(data, true)
+        }
+        NodeData::SetAccessorDeclaration(data) if record.kind == SyntaxKind::SetAccessor => {
+            accessor_fields!(data, false)
+        }
+        _ => return None,
+    };
+    if record.parent != Some(declaration.node)
+        || record.flags.0 != 0
+        || parameters.has_trailing_comma
+        || parameters.nodes.len() != usize::from(!getter)
+        || !getter && return_type.is_some()
+    {
+        return None;
+    }
+    let (_, name) = accessor_name(store, host, accessor, name_node).ok()?;
+    if name == "constructor" {
+        return None;
+    }
+    let is_static = if let Some(modifiers) = modifiers {
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return None;
+        };
+        let modifier = NodeRef::new(accessor.arena, accessor.file, *modifier);
+        let modifier_record = preflight_node(store, host, modifier).ok()?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier_record.kind != SyntaxKind::StaticKeyword
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(accessor.node)
+        {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+    let symbol = bound_symbol(store, host, accessor)?;
+    let symbol_record = store.symbol(symbol)?;
+    let owner_record = store.symbol(owner)?;
+    let table = if is_static {
+        owner_record.exports()
+    } else {
+        owner_record.members()
+    }
+    .and_then(|table| store.symbol_table(table))?;
+    let declarations = symbol_record.declarations()?;
+    let mut flags = SymbolFlags::NONE;
+    for &paired in declarations {
+        let paired_record = preflight_node(store, host, paired).ok()?;
+        let flag = match paired_record.kind {
+            SyntaxKind::GetAccessor => SymbolFlags::GET_ACCESSOR,
+            SyntaxKind::SetAccessor => SymbolFlags::SET_ACCESSOR,
+            _ => return None,
+        };
+        if paired_record.parent != Some(declaration.node)
+            || bound_symbol(store, host, paired) != Some(symbol)
+            || flags.intersects(flag)
+        {
+            return None;
+        }
+        flags |= flag;
+    }
+    if !declarations.contains(&accessor)
+        || symbol_record.flags() != flags
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(name.as_str())
+        || !symbol_record
+            .value_declaration()
+            .is_some_and(|value| declarations.contains(&value))
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.get_source(&name) != Some(symbol)
+    {
+        return None;
+    }
+
+    let mut annotations = Vec::new();
+    for &parameter in &parameters.nodes {
+        let parameter = NodeRef::new(accessor.arena, accessor.file, parameter);
+        let parameter_record = preflight_node(store, host, parameter).ok()?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(accessor.node)
+            || parameter_data.dot_dot_dot_token.is_some()
+            || parameter_data.initializer.is_some()
+            || parameter_data.question_token.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_data.facts != 0
+        {
+            return None;
+        }
+        let (_, parameter_name) =
+            accessor_name(store, host, parameter, parameter_data.name).ok()?;
+        let parameter_symbol = bound_symbol(store, host, parameter)?;
+        let parameter_owner = store.symbol(parameter_symbol)?;
+        if parameter_name == "this"
+            || parameter_owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_owner.declarations() != Some(&[parameter])
+            || parameter_owner.value_declaration() != Some(parameter)
+            || host
+                .bound_file(accessor)?
+                .locals(accessor)
+                .and_then(|locals| store.symbol_table(locals))?
+                .get_source(&parameter_name)
+                != Some(parameter_symbol)
+        {
+            return None;
+        }
+        if let Some(annotation) = parameter_data.type_ {
+            let annotation = NodeRef::new(accessor.arena, accessor.file, annotation);
+            let annotation_record = preflight_node(store, host, annotation).ok()?;
+            if annotation_record.parent != Some(parameter.node)
+                || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+            {
+                return None;
+            }
+            annotations.push(annotation);
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut annotation_kind = None;
+    if let Some(annotation) = return_type {
+        let annotation = NodeRef::new(accessor.arena, accessor.file, annotation);
+        let annotation_record = preflight_node(store, host, annotation).ok()?;
+        if annotation_record.parent != Some(accessor.node) {
+            return None;
+        }
+        if annotation_record.kind == SyntaxKind::TypeQuery {
+            diagnostics.push(plan_circular_ambient_getter_grammar_diagnostic(
+                store,
+                host,
+                owner,
+                declaration,
+                accessor,
+            )?);
+        } else if !matches!(annotation_record.data, NodeData::KeywordTypeNode(_)) {
+            return None;
+        }
+        annotation_kind = Some(annotation_record.kind);
+        annotations.push(annotation);
+    }
+    if let Some(body) = body_node {
+        let body = NodeRef::new(accessor.arena, accessor.file, body);
+        let body_record = preflight_node(store, host, body).ok()?;
+        let NodeData::Block(block) = &body_record.data else {
+            return None;
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(accessor.node)
+            || body_record.range.end != record.range.end
+            || block.facts != 0
+            || block.statements.has_trailing_comma
+        {
+            return None;
+        }
+        if !block.statements.nodes.is_empty() {
+            if !getter
+                || annotation_kind.is_some_and(|kind| {
+                    !matches!(
+                        kind,
+                        SyntaxKind::NumberKeyword
+                            | SyntaxKind::AnyKeyword
+                            | SyntaxKind::UnknownKeyword
+                            | SyntaxKind::TypeQuery
+                    )
+                })
+            {
+                return None;
+            }
+            plan_numeric_getter_return(store, host, accessor, body).ok()?;
+        }
+        let start = body_record.range.start.get();
+        let source = host.source(body)?.0.source_text()?;
+        if source.as_bytes().get(usize::try_from(start).ok()?) != Some(&b'{') {
+            return None;
+        }
+        diagnostics.push(ClassGrammarDiagnostic {
+            node: body,
+            range_override: Some(CanonicalCheckerDiagnosticRange::new(
+                body,
+                ts_core::TextRange::new(
+                    body_record.range.start,
+                    ts_core::TextPos::new(start.checked_add(1)?),
+                ),
+            )),
+            code: 1183,
+            arguments: Vec::new(),
+        });
+    }
+    Some(AmbientClassAccessorGrammar {
+        symbol,
+        annotations,
+        diagnostics,
+    })
+}
+
 fn plan_circular_ambient_getter_grammar_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -16439,15 +16688,6 @@ fn plan_circular_ambient_getter_grammar_diagnostic(
     let members = owner_record
         .members()
         .and_then(|members| store.symbol_table(members))?;
-    if members.len() != 1
-        || owner_record
-            .exports()
-            .and_then(|exports| store.symbol_table(exports))?
-            .len()
-            != 1
-    {
-        return None;
-    }
     let record = preflight_node(store, host, getter).ok()?;
     let NodeData::GetAccessorDeclaration(data) = &record.data else {
         return None;
@@ -16456,7 +16696,6 @@ fn plan_circular_ambient_getter_grammar_diagnostic(
         || record.flags.0 != 0
         || record.parent != Some(declaration.node)
         || data.asterisk_token.is_some()
-        || data.body.is_some()
         || data.end_flow_node.is_some()
         || data.flow_node.is_some()
         || data.full_signature.is_some()
@@ -19908,17 +20147,19 @@ pub(super) fn plan_class_grammar_diagnostics(
         if class.heritage_clauses.is_some() {
             return None;
         }
-        let [getter] = class.members.nodes.as_slice() else {
+        for &member in &class.members.nodes {
+            let accessor = plan_ambient_class_accessor_grammar(
+                store,
+                host,
+                symbol,
+                declaration,
+                NodeRef::new(declaration.arena, declaration.file, member),
+            )?;
+            diagnostics.extend(accessor.diagnostics);
+        }
+        if diagnostics.is_empty() {
             return None;
-        };
-        diagnostics.try_reserve_exact(1).ok()?;
-        diagnostics.push(plan_circular_ambient_getter_grammar_diagnostic(
-            store,
-            host,
-            symbol,
-            declaration,
-            NodeRef::new(declaration.arena, declaration.file, *getter),
-        )?);
+        }
     } else if let Some(clauses) = class.heritage_clauses.as_ref() {
         if let Some(diagnostic) = plan_super_class_field_grammar_diagnostic(
             store,
