@@ -136,8 +136,8 @@ impl std::error::Error for SourceElementError {
         match self {
             Self::Relation(error) => Some(error),
             Self::Array(error) => Some(error),
-            Self::Declared(error) => Some(error),
-            Self::InterfaceIndex(InterfaceIndexError::DeclaredType(error)) => Some(error),
+            Self::Declared(error)
+            | Self::InterfaceIndex(InterfaceIndexError::DeclaredType(error)) => Some(error),
             Self::Display(error) => Some(error),
             Self::Unsupported(_)
             | Self::InterfaceIndex(_)
@@ -573,17 +573,21 @@ pub(super) fn numeric_index_type(
     if let TypeData::Union(union) = record.data() {
         let constituents = union.union.types.clone();
         store.validate_union_constituent_with_global_types(global_types, receiver)?;
-        let mut types = Vec::with_capacity(constituents.len());
+        let mut index_types = Vec::with_capacity(constituents.len());
         for constituent in constituents {
             let Some(type_) =
                 numeric_index_type(store, host, global_types, options, diagnostics, constituent)?
             else {
                 return Ok(None);
             };
-            types.push(type_);
+            index_types.push(type_);
         }
         return store
-            .expression_union_type_with_global_types(global_types, &types, UnionReduction::Literal)
+            .expression_union_type_with_global_types(
+                global_types,
+                &index_types,
+                UnionReduction::Literal,
+            )
             .map(Some)
             .map_err(Into::into);
     }

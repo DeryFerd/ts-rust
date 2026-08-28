@@ -38952,10 +38952,10 @@ impl SourceIterationProperties<'_, '_, '_> {
         use super::callable_sets::{StoredCallableSetValidation, validate_stored_callable_set};
 
         let mut pending = Vec::new();
-        let mut types = vec![type_];
+        let mut worklist = vec![type_];
         let mut seen_types = HashSet::new();
         let mut seen_signatures = HashSet::new();
-        while let Some(type_) = types.pop() {
+        while let Some(type_) = worklist.pop() {
             if !seen_types.insert(type_) {
                 continue;
             }
@@ -38964,7 +38964,7 @@ impl SourceIterationProperties<'_, '_, '_> {
                 .ok_or(RelationUnavailable::Type(type_))?;
             if let TypeData::Union(union) = record.data() {
                 store.validate_union_constituent_with_global_types(self.global_types, type_)?;
-                types.extend_from_slice(&union.union.types);
+                worklist.extend_from_slice(&union.union.types);
                 continue;
             }
             match validate_stored_callable_set(store, type_) {

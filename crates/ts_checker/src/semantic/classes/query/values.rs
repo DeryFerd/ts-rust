@@ -1,6 +1,19 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
-use super::*;
+use super::{
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, CanonicalTypeQuery, CheckFlags, ClassError, ClassInvariant,
+    ClassQueryPlan, ClassUnsupported, DeclaredTypeError, DeclaredTypeHost, HashSet, NodeData,
+    NodeRef, PreparedClassMethodSignatures, SelectedMember, SemanticSymbolId, SignatureFlags,
+    SignatureLinks, StaticShellState, Symbol, SymbolFlags, SyntaxKind, TypeId, TypeNodeLinks,
+    TypeRecord, ValueSymbolLinks, bound_symbol, class_member_symbol_name_matches,
+    class_property_modifiers, class_query_reference_symbol, class_query_shell_state,
+    enclosing_query_class, exact_class_instance_identity, exact_method_value,
+    execute_class_query_shells, execute_selected_class_member, invariant,
+    lexical_class_query_symbol, plan_class_query, plan_selected_class_member,
+    preflight_class_or_interface_reference, preflight_node, primitive_keyword_type,
+    publish_class_method_identity, unsupported, validate_query_reference_cache,
+};
 use crate::semantic::{
     instantiate::InstantiationSession,
     logical_operators::{LogicalBinaryError, LogicalBinaryRequest, check_logical_binary},

@@ -1083,16 +1083,15 @@ fn plan_source_member_names(
                     } else {
                         None
                     };
-                    match static_name {
-                        Some(name) => (Some(name), None),
-                        None => {
-                            let key = plan_computed_member_key(store, host, name_node)
-                                .map_err(source_computed_key_error)?;
-                            let cached = resolved_computed_member_key(store, &key)
-                                .map_err(source_computed_key_error)?
-                                .map(|(_, name)| name);
-                            (cached, Some(key))
-                        }
+                    if let Some(name) = static_name {
+                        (Some(name), None)
+                    } else {
+                        let key = plan_computed_member_key(store, host, name_node)
+                            .map_err(source_computed_key_error)?;
+                        let cached = resolved_computed_member_key(store, &key)
+                            .map_err(source_computed_key_error)?
+                            .map(|(_, name)| name);
+                        (cached, Some(key))
                     }
                 }
                 _ => (source_static_member_name(store, host, name_node)?, None),
@@ -1800,15 +1799,19 @@ pub(super) fn resolved_computed_member_key(
     {
         return Err(invalid());
     }
-    let types = [
+    let candidates = [
         annotation.resolved_type,
         value.resolved_type,
         expression.resolved_type,
     ];
-    let Some(type_) = types.into_iter().flatten().next() else {
+    let Some(type_) = candidates.into_iter().flatten().next() else {
         return Ok(None);
     };
-    if types.into_iter().flatten().any(|cached| cached != type_) {
+    if candidates
+        .into_iter()
+        .flatten()
+        .any(|cached| cached != type_)
+    {
         return Err(invalid());
     }
     let record = store.type_payload(type_).ok_or_else(invalid)?;
@@ -9427,10 +9430,11 @@ pub(super) fn plan_interface_method(
         locals,
         SyntaxKind::MethodSignature,
     )?;
-    if method.parameters.nodes.is_empty() && type_parameters.is_empty() {
-        if locals.is_some_and(|locals| !locals.is_empty()) {
-            return Err(unsupported());
-        }
+    if method.parameters.nodes.is_empty()
+        && type_parameters.is_empty()
+        && locals.is_some_and(|locals| !locals.is_empty())
+    {
+        return Err(unsupported());
     }
     let mut parameters = Vec::new();
     parameters
@@ -10401,10 +10405,10 @@ pub(super) fn preflight_computed_method_group(
         late = resolved;
         sources.push(source);
     }
-    if let Some(late) = late {
-        if store.late_bound_method_sources(late).as_deref() != Some(sources.as_slice()) {
-            return Err(invalid());
-        }
+    if let Some(late) = late
+        && store.late_bound_method_sources(late).as_deref() != Some(sources.as_slice())
+    {
+        return Err(invalid());
     }
     if let Some((_, name)) = resolved_computed_member_key(store, &key).map_err(|_| invalid())? {
         let entry = cached
@@ -13905,43 +13909,39 @@ fn validate_global_date_interface_type_graph(
                 if name != InternalSymbolName::Computed.as_ref() {
                     return None;
                 }
-                match store
+                if let Some(late) = store
                     .late_bound_links(source)
                     .and_then(|links| links.late_symbol)
                 {
-                    Some(late) => {
-                        if store.symbol(late)?.check_flags() != CheckFlags::LATE
-                            || store
-                                .late_bound_method_sources(late)
-                                .is_none_or(|sources| !sources.contains(&source))
-                            || store.authenticated_interface_method_owner(late)
-                                != Some((symbol, type_))
-                            || declared_method_value_links(store, late, None).is_none()
-                        {
-                            return None;
-                        }
-                        Some(late)
+                    if store.symbol(late)?.check_flags() != CheckFlags::LATE
+                        || store
+                            .late_bound_method_sources(late)
+                            .is_none_or(|sources| !sources.contains(&source))
+                        || store.authenticated_interface_method_owner(late) != Some((symbol, type_))
+                        || declared_method_value_links(store, late, None).is_none()
+                    {
+                        return None;
                     }
-                    None => {
-                        if resolved
-                            || store
-                                .value_symbol_links(source)
-                                .is_some_and(|links| links != &ValueSymbolLinks::default())
-                            || method_declarations.iter().any(|declaration| {
-                                store
-                                    .signature_links(*declaration)
-                                    .is_some_and(|links| links != &SignatureLinks::default())
-                                    || store.symbol_node_links(*declaration).is_some_and(|links| {
-                                        links.resolved_symbol.is_some_and(|symbol| {
-                                            store.get_merged_symbol(symbol) != Some(source)
-                                        })
+                    Some(late)
+                } else {
+                    if resolved
+                        || store
+                            .value_symbol_links(source)
+                            .is_some_and(|links| links != &ValueSymbolLinks::default())
+                        || method_declarations.iter().any(|declaration| {
+                            store
+                                .signature_links(*declaration)
+                                .is_some_and(|links| links != &SignatureLinks::default())
+                                || store.symbol_node_links(*declaration).is_some_and(|links| {
+                                    links.resolved_symbol.is_some_and(|symbol| {
+                                        store.get_merged_symbol(symbol) != Some(source)
                                     })
-                            })
-                        {
-                            return None;
-                        }
-                        None
+                                })
+                        })
+                    {
+                        return None;
                     }
+                    None
                 }
             } else {
                 if name.as_utf8().is_none()
@@ -14052,6 +14052,7 @@ fn date_interface_marker(
     Some(marker)
 }
 
+#[allow(clippy::option_option)] // Distinguishes invalid state, a valid pending value, and a ready value.
 fn date_method_cached_value(
     store: &CanonicalTypeMapperStore,
     method: SemanticSymbolId,

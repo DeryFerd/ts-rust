@@ -758,7 +758,10 @@ pub(super) fn plan_class_access_context(
                 child = parent;
                 continue;
             }
-            NodeData::FunctionDeclaration(_) | NodeData::FunctionExpression(_) => return Ok(None),
+            NodeData::FunctionDeclaration(_)
+            | NodeData::FunctionExpression(_)
+            | NodeData::ClassDeclaration(_)
+            | NodeData::ClassExpression(_) => return Ok(None),
             NodeData::ConstructorDeclaration(constructor) => (
                 constructor.body,
                 Some(&constructor.parameters),
@@ -795,7 +798,6 @@ pub(super) fn plan_class_access_context(
                 ClassPropertySide::Static,
                 ClassAccessPhase::StaticBlock,
             ),
-            NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_) => return Ok(None),
             _ => {
                 child = parent;
                 continue;
@@ -1709,7 +1711,7 @@ fn class_context_member(
                 }
                 let owner = store
                     .symbol(symbol)
-                    .and_then(|symbol| symbol.parent())
+                    .and_then(ts_binder::semantic::Symbol::parent)
                     .ok_or_else(invalid)?;
                 if classes::authenticated_private_class_symbol_name(store, owner, symbol)
                     != Some(plan.name.as_str())
@@ -1719,7 +1721,7 @@ fn class_context_member(
                 candidates.push(symbol);
                 if store
                     .symbol(owner)
-                    .and_then(|owner| owner.value_declaration())
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
                     == enclosing_class
                 {
                     lexical = Some(symbol);
@@ -1731,7 +1733,7 @@ fn class_context_member(
             } else {
                 let container = store
                     .type_payload(lookup_type)
-                    .and_then(|record| record.symbol())
+                    .and_then(TypeRecord::symbol)
                     .ok_or_else(invalid)?;
                 let mut selected = None;
                 for candidate in candidates {
@@ -1806,7 +1808,7 @@ fn compare_private_fallback_members(
     let is_contained = |symbol: SemanticSymbolId| -> Result<bool, SourcePropertyError> {
         let declaration = store
             .symbol(symbol)
-            .and_then(|record| record.value_declaration())
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
             .ok_or_else(invalid)?;
         let range = class_access_node(store, host, declaration)?.range;
         for declaration in declarations {
@@ -1817,9 +1819,9 @@ fn compare_private_fallback_members(
         }
         Ok(false)
     };
-    let contained = is_contained(right)?.cmp(&is_contained(left)?);
-    if contained != Ordering::Equal {
-        return Ok(contained);
+    let containment_order = is_contained(right)?.cmp(&is_contained(left)?);
+    if containment_order != Ordering::Equal {
+        return Ok(containment_order);
     }
     let first_declaration = |symbol: SemanticSymbolId| {
         store
@@ -1868,11 +1870,7 @@ fn class_context_has_member_owner(
         if !visited.insert(instance) {
             return false;
         }
-        if store
-            .type_payload(instance)
-            .and_then(|record| record.symbol())
-            == Some(owner)
-        {
+        if store.type_payload(instance).and_then(TypeRecord::symbol) == Some(owner) {
             return true;
         }
         base = store
@@ -1915,7 +1913,7 @@ fn class_accessibility_diagnostic(
     if let SourcePropertyPrivacy::Private { enclosing_class } = privacy {
         let declaration = store
             .symbol(member.declaring_class)
-            .and_then(|owner| owner.value_declaration())
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
             .ok_or(SourcePropertyError::InvalidCache(member.declaration))?;
         return Ok((enclosing_class != Some(declaration))
             .then_some(ClassAccessDiagnosticKind::PrivateIdentifier));
@@ -1946,7 +1944,7 @@ fn class_accessibility_diagnostic(
     if member.visibility == ClassConstructorVisibility::Private {
         let declaration = store
             .symbol(member.declaring_class)
-            .and_then(|owner| owner.value_declaration())
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
             .ok_or(SourcePropertyError::InvalidCache(member.declaration))?;
         let mut current = context.receiver;
         while let Some(parent) = class_access_node(store, host, current)?.parent {
@@ -1973,7 +1971,7 @@ fn class_property_used_before_initialization(
     if host
         .bound_file(context.receiver)
         .and_then(|bound| bound.source_facts())
-        .is_some_and(|facts| facts.is_declaration_file())
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
     {
         return Ok(false);
     }

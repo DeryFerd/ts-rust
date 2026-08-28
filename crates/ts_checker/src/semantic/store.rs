@@ -3450,12 +3450,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             );
             let name =
                 self.source_child_with_kind(declaration, SyntaxKind::ComputedPropertyName)?;
-            let expression = match (
+            let ((Some(expression), None) | (None, Some(expression))) = (
                 self.source_child_with_kind(name, SyntaxKind::Identifier),
                 self.source_child_with_kind(name, SyntaxKind::PropertyAccessExpression),
-            ) {
-                (Some(expression), None) | (None, Some(expression)) => expression,
-                _ => return None,
+            ) else {
+                return None;
             };
             if !seen.insert(source)
                 || self.source_declaration_symbol(declaration) != Some(source)
@@ -9273,7 +9272,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 ..ValueSymbolLinks::default()
             }
         ));
-        for &source in sources.iter() {
+        for &source in &sources {
             let declaration = self
                 .symbol(source)
                 .and_then(Symbol::value_declaration)

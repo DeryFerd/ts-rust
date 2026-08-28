@@ -2410,6 +2410,7 @@ fn authenticated_recursive_arrow_name(
     .then_some(variable_name)
 }
 
+#[allow(clippy::struct_excessive_bools)] // These options and traversal modes are independent flags.
 struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     store: &'store CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
@@ -6893,14 +6894,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(());
         }
         let result = (|| {
-            if !has_lazy_default_library_interface_base(&planned) {
-                if let Some(heritage) = &planned.heritage {
-                    for base in &heritage.bases {
-                        if base.type_arguments.is_empty() {
-                            self.plan_property_interface(base.symbol)?;
-                        } else {
-                            self.plan_concrete_generic_interface_base(base)?;
-                        }
+            if !has_lazy_default_library_interface_base(&planned)
+                && let Some(heritage) = &planned.heritage
+            {
+                for base in &heritage.bases {
+                    if base.type_arguments.is_empty() {
+                        self.plan_property_interface(base.symbol)?;
+                    } else {
+                        self.plan_concrete_generic_interface_base(base)?;
                     }
                 }
             }
@@ -23324,7 +23325,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.execute_type_node(key, plan, prepared)?;
             self.execute_type_node(value, plan, prepared)?;
         }
-        let mut types = Vec::with_capacity(members.properties.len());
+        let mut property_types = Vec::with_capacity(members.properties.len());
         for property in &members.properties {
             let mut type_ = self.execute_type_node(property.type_node, plan, prepared)?;
             if property.optional
@@ -23360,7 +23361,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .map_err(Self::literal_cache_error)?;
                 }
             }
-            types.push(type_);
+            property_types.push(type_);
         }
         let resolved = matches!(self.store.type_payload(target).map(TypeRecord::data), Some(TypeData::Interface(interface)) if interface.base_types_resolved);
         if !resolved
@@ -23370,7 +23371,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(invalid());
         }
         object_members::publish_generic_interface_declared_members(
-            self.store, &members, target, &types,
+            self.store,
+            &members,
+            target,
+            &property_types,
         )
         .map_err(property_object_error)?;
         Ok(())
@@ -23518,7 +23522,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                                         property_object_error(
                                             PropertyObjectError::InvalidCachedInterface {
                                                 symbol: base.symbol,
-                                                type_: type_,
+                                                type_,
                                             },
                                         )
                                     })?,
@@ -23543,7 +23547,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                             .map_err(|_| {
                                 property_object_error(PropertyObjectError::InvalidCachedInterface {
                                     symbol: base.symbol,
-                                    type_: type_,
+                                    type_,
                                 })
                             })?;
                         }

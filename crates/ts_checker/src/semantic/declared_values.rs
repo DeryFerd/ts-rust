@@ -433,9 +433,8 @@ fn plan_property_owner(
     let record = store.symbol(symbol).ok_or_else(invalid)?;
     let owner = store.get_parent_of_symbol(symbol).ok_or_else(invalid)?;
     let owner_record = store.symbol(owner).ok_or_else(invalid)?;
-    let parent = match store.source_node_parent(declaration) {
-        Some(SourceNodeParent::Parent(parent)) => parent,
-        _ => return Err(invalid()),
+    let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
     };
     let parent_node = preflight_node(store, host, parent)?;
     let NodeData::InterfaceDeclaration(interface) = &parent_node.data else {

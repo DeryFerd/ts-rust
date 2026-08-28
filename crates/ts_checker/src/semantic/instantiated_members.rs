@@ -2286,7 +2286,7 @@ fn instantiate_generic_member_type_inner(
         let elements = tuple.element_types().to_vec();
         let infos = tuple.element_infos().to_vec();
         let readonly = tuple.is_readonly();
-        let mapped = elements
+        let instantiated_elements = elements
             .iter()
             .map(|element| {
                 instantiate_generic_member_type_worker(
@@ -2299,11 +2299,15 @@ fn instantiate_generic_member_type_inner(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if mapped == elements {
+        if instantiated_elements == elements {
             return Ok(template);
         }
         return store
-            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&mapped, &infos, readonly))
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &instantiated_elements,
+                &infos,
+                readonly,
+            ))
             .map_err(|error| match error {
                 TupleTypeError::Capacity => GenericInterfaceMemberError::Capacity(template),
                 _ => GenericInterfaceMemberError::UnsupportedPropertyType(template),
@@ -2311,7 +2315,7 @@ fn instantiate_generic_member_type_inner(
     }
     if let Some(constituents) = method_tuple_union_members(store, template)? {
         let constituents = constituents.to_vec();
-        let mapped = constituents
+        let instantiated_constituents = constituents
             .iter()
             .map(|constituent| {
                 instantiate_generic_member_type_worker(
@@ -2324,11 +2328,15 @@ fn instantiate_generic_member_type_inner(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if mapped == constituents {
+        if instantiated_constituents == constituents {
             return Ok(template);
         }
         return store
-            .literal_union_type_with_alias_and_array_targets(&mapped, None, array_targets)
+            .literal_union_type_with_alias_and_array_targets(
+                &instantiated_constituents,
+                None,
+                array_targets,
+            )
             .map_err(|error| match error {
                 super::bootstrap::LiteralTypeCacheError::Capacity => {
                     GenericInterfaceMemberError::Capacity(template)
@@ -2460,9 +2468,8 @@ fn instantiated_tuple_member_type_matches_worker(
     array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<(TypeId, TypeId)>,
 ) -> Option<bool> {
-    let tuple = match store.canonical_tuple_shape(template) {
-        Ok(tuple) => tuple,
-        Err(_) => return Some(false),
+    let Ok(tuple) = store.canonical_tuple_shape(template) else {
+        return Some(false);
     };
     let union = if tuple.is_none() {
         match method_tuple_union_members(store, template) {
@@ -3817,21 +3824,20 @@ fn member_type_requires_instantiation_inner(
         }
         return Ok(requires);
     }
-    if classify_only {
-        if let Some(targets) = array_targets
-            && let Some(array) = store
-                .canonical_array_reference_with_targets(targets, type_)
-                .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
-        {
-            return member_type_requires_instantiation_worker(
-                store,
-                array.element_type,
-                mapper_parameters,
-                array_targets,
-                active,
-                true,
-            );
-        }
+    if classify_only
+        && let Some(targets) = array_targets
+        && let Some(array) = store
+            .canonical_array_reference_with_targets(targets, type_)
+            .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(type_))?
+    {
+        return member_type_requires_instantiation_worker(
+            store,
+            array.element_type,
+            mapper_parameters,
+            array_targets,
+            active,
+            true,
+        );
     }
     if store.type_has_function_type_provenance(type_) {
         let (_, signature, parameters) = function_member_parameters(store, type_)

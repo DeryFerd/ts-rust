@@ -1389,7 +1389,7 @@ impl<'store> RelaterSession<'store> {
                 })
                 .transpose()?;
             if owner_declarations.is_some()
-                && record.declarations().is_none_or(|nodes| nodes.is_empty())
+                && record.declarations().is_none_or(<[NodeRef]>::is_empty)
             {
                 return Err(invalid());
             }

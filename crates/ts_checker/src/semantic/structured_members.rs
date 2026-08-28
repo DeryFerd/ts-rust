@@ -946,6 +946,7 @@ fn validate_property_interface(
 }
 
 /// Reads a key only after the complete nongeneric interface has been validated.
+#[allow(clippy::option_option)] // Distinguishes unavailable validation, a missing property, and a value.
 pub(super) fn validated_interface_property_by_key(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -2020,12 +2021,11 @@ pub(super) fn valid_late_bound_unique_symbol_member(
         else {
             return false;
         };
-        let expression = match (
+        let ((Some(expression), None) | (None, Some(expression))) = (
             store.source_child_with_kind(name, SyntaxKind::Identifier),
             store.source_child_with_kind(name, SyntaxKind::PropertyAccessExpression),
-        ) {
-            (Some(expression), None) | (None, Some(expression)) => expression,
-            _ => return false,
+        ) else {
+            return false;
         };
         if (method || key_property)
             && (store

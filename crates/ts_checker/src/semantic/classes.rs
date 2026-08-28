@@ -6403,7 +6403,7 @@ fn materialize_annotated_constructor_parameter(
     if let Some(type_) = annotated_constructor_value_type(store, context, parameter, annotation)? {
         return Ok((type_, proof));
     }
-    let types = constructor_parameter_type_constituents(
+    let constituents = constructor_parameter_type_constituents(
         store,
         annotation,
         parameter.optional,
@@ -6411,7 +6411,7 @@ fn materialize_annotated_constructor_parameter(
     )?;
     let type_ = store
         .literal_union_type_with_alias_and_array_targets(
-            &types,
+            &constituents,
             None,
             Some(CanonicalArrayTargets::from_global_types(
                 &context.global_types,
@@ -23235,7 +23235,7 @@ pub(super) fn class_query_type_side(
     host: &DeclaredTypeHost<'_>,
     type_: TypeId,
 ) -> Result<Option<ClassQueryTypeSide>, ClassError> {
-    let Some(symbol) = store.type_payload(type_).and_then(|record| record.symbol()) else {
+    let Some(symbol) = store.type_payload(type_).and_then(TypeRecord::symbol) else {
         return Ok(None);
     };
     if store

@@ -2419,6 +2419,7 @@ impl CanonicalCheckerContext<'_> {
     }
 
     /// A type-name query does not need its type, arguments, or a source-file check.
+    #[allow(clippy::option_option)] // Distinguishes a non-type-name, no symbol, and a resolved symbol.
     fn type_name_artifact_symbol(
         &mut self,
         node: NodeRef,
@@ -3218,8 +3219,7 @@ impl CanonicalCheckerContext<'_> {
                 {
                     return self.validate_artifact_type(node, type_).map(Some);
                 }
-                Ok(_) => {}
-                Err(super::ClassError::Unsupported(_)) => {}
+                Ok(_) | Err(super::ClassError::Unsupported(_)) => {}
                 Err(super::ClassError::DeclaredType(error)) => return Err(error.into()),
                 Err(error) => return Err(CanonicalArtifactQueryError::Class { node, error }),
             }

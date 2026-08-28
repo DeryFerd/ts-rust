@@ -1,6 +1,22 @@
 //! Selected class members use canonical values without publishing a class member table.
 
-use super::*;
+use super::{
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalNameResolver, CanonicalResolutionLocation, CanonicalTypeMapperStore,
+    CanonicalTypeQuery, CheckFlags, ClassError, ClassInvariant, ClassMethodPlan, ClassPropertyPlan,
+    ClassQueryPlan, ClassUnsupported, DeclaredTypeError, DeclaredTypeHost, HashSet,
+    LiteralTypeCacheError, NodeData, NodeRef, PreparedClassMethodSignatures, SemanticSymbolId,
+    SignatureFlags, SignatureLinks, StaticShellState, Symbol, SymbolFlags, SymbolNodeLinks,
+    SyntaxKind, TypeId, TypeNodeLinks, TypeRecord, ValueSymbolLinks,
+    authenticated_private_class_symbol_name, bound_symbol, class_member_symbol_name_matches,
+    class_property_modifiers, class_query_shell_state, exact_class_instance_identity,
+    exact_method_callable, exact_method_value, execute_class_query_shells, invariant,
+    method_return_type, plan_class_query, plan_method, plan_property, plan_type_literal,
+    planned_property_type, preflight_class_or_interface_reference, preflight_node,
+    prepare_class_method_signature, primitive_keyword_type, property_initializer_number,
+    publish_class_method_callable, publish_class_method_identity, publish_class_property,
+    unsupported, validate_method_cache_state, validate_query_property_cache_state,
+};
 
 mod values;
 pub(in crate::semantic) use values::ClassValueQuery;
@@ -239,6 +255,7 @@ pub(in crate::semantic) fn class_query_reference_symbol(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Keep owned plans without adding per-selection allocations.
 enum SelectedMember {
     Property(ClassPropertyPlan),
     Method(ClassMethodPlan),

@@ -26,6 +26,7 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)] // Yield and return are Rust keywords. Keep the protocol type names.
 pub(super) struct IterationTypes {
     pub(super) yield_type: Option<TypeId>,
     pub(super) return_type: Option<TypeId>,
@@ -1270,8 +1271,12 @@ impl IterationTypes {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SynchronousIterationUse {
     ForOf,
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Protocol tests cover spread before production dispatch.
     Spread,
     Destructuring,
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Protocol tests cover yield* before production dispatch.
     YieldStar,
 }
 
@@ -1780,7 +1785,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             .map_err(|error| self.call_error(error))?
                 == 0
             {
-                returns.push(self.return_type(signature)?);
+                returns.push(Self::return_type(signature)?);
             }
         }
         if returns.is_empty() {
@@ -1914,7 +1919,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         }
     }
 
-    fn return_type(&self, signature: &ValidatedSingleCallable) -> Result<TypeId, SourceCheckError> {
+    fn return_type(signature: &ValidatedSingleCallable) -> Result<TypeId, SourceCheckError> {
         signature
             .return_type
             .ok_or_else(|| RelationUnavailable::UnresolvedFunctionType(signature.owner).into())
@@ -1949,11 +1954,11 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         let TypeData::Union(union) = record.data() else {
             return Ok(type_);
         };
-        let types = union.union.types.clone();
+        let constituents = union.union.types.clone();
         self.validate_union_metadata(type_)?;
-        let original_len = types.len();
+        let original_len = constituents.len();
         let mut retained = Vec::new();
-        for type_ in types {
+        for type_ in constituents {
             if !self
                 .store
                 .type_payload(type_)
@@ -2035,7 +2040,7 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             {
                 parameter_types.push(parameter);
             }
-            return_types.push(self.return_type(signature)?);
+            return_types.push(Self::return_type(signature)?);
         }
         let parameter_type = self
             .union(&parameter_types)?
