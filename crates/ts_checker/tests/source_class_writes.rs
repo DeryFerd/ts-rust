@@ -432,9 +432,91 @@ fn constructor_property_writes_keep_exact_optional_write_types() {
 }
 
 #[test]
+fn method_property_writes_do_not_initialize_required_fields() {
+    let parsed = parse_source_file("class Model { value: number; method() { this.value = 1; } }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut context = context(&parsed, false);
+    context.check_source_file(FILE).unwrap();
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one uninitialized-field diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2564);
+    assert_eq!(diagnostic.diagnostic.arguments, ["value"]);
+    assert!(diagnostic.related_information.is_empty());
+    assert!(diagnostic.range_override.is_none());
+    let name = parsed.arena.get(diagnostic.node.unwrap().node).unwrap();
+    assert!(matches!(&name.data, NodeData::Identifier(name) if name.text == "value"));
+
+    let field = property(&context, "Model", "value");
+    assert_eq!(
+        name.parent,
+        context
+            .store()
+            .symbol(field)
+            .unwrap()
+            .value_declaration()
+            .map(|node| node.node)
+    );
+    let field_links = context.store().value_symbol_links(field).unwrap().clone();
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    assert_eq!(field_links.resolved_type, Some(number));
+    let method = property(&context, "Model", "method");
+    let method_type = context
+        .store()
+        .value_symbol_links(method)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    assert_eq!(context.type_to_string(method_type).unwrap(), "() => void");
+    let nodes = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return None;
+            };
+            Some(
+                [node, binary.left, binary.right]
+                    .map(|node| NodeRef::new(parsed.arena.id(), FILE, node)),
+            )
+        })
+        .unwrap();
+    let types = nodes.map(|node| resolved_type(&context, node));
+    for (type_, expected) in types.into_iter().zip(["1", "number", "1"]) {
+        assert_eq!(context.type_to_string(type_).unwrap(), expected);
+    }
+    assert_eq!(
+        context
+            .store()
+            .symbol_node_links(nodes[1])
+            .unwrap()
+            .resolved_symbol,
+        Some(field)
+    );
+
+    let diagnostics = context.diagnostics().clone();
+    let warm = counts(&context);
+    context.recheck_source_file(FILE).unwrap();
+    assert_eq!(counts(&context), warm);
+    assert_eq!(context.diagnostics(), &diagnostics);
+    assert_eq!(
+        context.store().value_symbol_links(field),
+        Some(&field_links)
+    );
+    assert_eq!(nodes.map(|node| resolved_type(&context, node)), types);
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type,
+        Some(method_type)
+    );
+}
+
+#[test]
 fn unsupported_class_property_writes_fail_before_class_preparation() {
     for source in [
-        "class Model { value: number; method() { this.value = 1; } }",
         "class Model { static value = 1; constructor() { Model.value = 2; } }",
         "class Model { value: number; constructor() { this['value'] = 1; } }",
         "class Model { value: number; constructor() { this.value += 1; } }",
