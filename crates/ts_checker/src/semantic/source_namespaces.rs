@@ -12853,7 +12853,7 @@ pub(super) fn execute_source_namespace(
         )?;
         match declaration {
             SourceNamespaceMemberPlan::Function { declaration, .. } => {
-                query.preflight_type_of_source_callable(*declaration, symbol)?
+                query.preflight_type_of_source_callable(*declaration, symbol)?;
             }
             SourceNamespaceMemberPlan::GlobalVariableRead { .. } => {
                 query.preflight_type_of_declared_value(symbol)?;

@@ -15117,20 +15117,19 @@ mod tests {
                 boolean_wrapper: wrapper,
             };
             let before = fixture.store.relation_state_snapshot();
-            let expected = match object {
-                Some(object) => RelationUnavailable::UnresolvedStructuredMembers(object),
-                None => {
-                    let property = fixture
-                        .store
-                        .type_payload(wrapper)
-                        .and_then(TypeRecord::symbol)
-                        .and_then(|owner| fixture.store.symbol(owner))
-                        .and_then(ts_binder::semantic::Symbol::members)
-                        .and_then(|members| fixture.store.symbol_table(members))
-                        .and_then(|members| members.get_source("id"))
-                        .unwrap();
-                    RelationUnavailable::UnresolvedPropertyType(property)
-                }
+            let expected = if let Some(object) = object {
+                RelationUnavailable::UnresolvedStructuredMembers(object)
+            } else {
+                let property = fixture
+                    .store
+                    .type_payload(wrapper)
+                    .and_then(TypeRecord::symbol)
+                    .and_then(|owner| fixture.store.symbol(owner))
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| fixture.store.symbol_table(members))
+                    .and_then(|members| members.get_source("id"))
+                    .unwrap();
+                RelationUnavailable::UnresolvedPropertyType(property)
             };
 
             assert_eq!(
