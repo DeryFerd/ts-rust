@@ -93,6 +93,7 @@ pub struct SourceFile {
     pub checking: CheckResult,
     pub is_default_library: bool,
     implied_node_format: ModuleKind,
+    node_mode_mismatch_details: Option<Diagnostic>,
 }
 
 impl SourceFile {
@@ -5313,6 +5314,7 @@ impl Program {
                 context,
                 &mut diagnostics,
             )?;
+            self.add_canonical_node_import_diagnostics(checked.source, context, &mut diagnostics)?;
         }
 
         // Program.GetGlobalDiagnostics skips checker diagnostics without source files.
@@ -5536,6 +5538,79 @@ impl Program {
                     ));
                 }
             };
+            diagnostics.push(self.canonical_program_diagnostic(
+                Some(specifier),
+                None,
+                &diagnostic,
+                std::iter::empty(),
+            )?);
+        }
+        Ok(())
+    }
+
+    fn add_canonical_node_import_diagnostics(
+        &self,
+        source: &SourceFile,
+        context: &CanonicalCheckerContext<'_>,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        if self.options.no_check
+            || !matches!(self.options.module, ModuleKind::Node16 | ModuleKind::Node18)
+            || self.canonical_emit_module_mode(source) != CanonicalModuleResolutionMode::CommonJs
+        {
+            return Ok(());
+        }
+        for (specifier, text, _) in canonical_static_module_specifiers(source, &self.options)? {
+            let parent = self
+                .node(specifier)
+                .and_then(|node| node.parent)
+                .and_then(|parent| source.parse.arena.get(parent))
+                .ok_or(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ))?;
+            let NodeData::ImportDeclaration(import) = &parent.data else {
+                continue;
+            };
+            if let Some(clause) = import.import_clause {
+                let Some(NodeData::ImportClause(clause)) =
+                    source.parse.arena.get(clause).map(|node| &node.data)
+                else {
+                    return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                        specifier,
+                    ));
+                };
+                if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+                    continue;
+                }
+            } else if !self.options.no_unchecked_side_effect_imports {
+                continue;
+            }
+            let resolved = match context.module_resolution(specifier) {
+                CanonicalModuleResolutionLookup::Resolved(resolved) => resolved,
+                CanonicalModuleResolutionLookup::Unresolved => continue,
+                CanonicalModuleResolutionLookup::Unavailable
+                | CanonicalModuleResolutionLookup::EntryAbsent => {
+                    return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                        specifier,
+                    ));
+                }
+            };
+            if resolved.usage_mode() != CanonicalModuleResolutionMode::CommonJs
+                || resolved.target_mode() != CanonicalModuleResolutionMode::Esm
+                || resolved.is_ambient_module()
+            {
+                continue;
+            }
+            let mut diagnostic = Diagnostic::with_arguments(
+                message_by_code(1479).expect("TS1479 must be in the generated catalog"),
+                [text],
+            );
+            if let Some(detail) = &source.node_mode_mismatch_details {
+                let detail = detail
+                    .render()
+                    .map_err(CanonicalProgramCheckError::DiagnosticFormat)?;
+                diagnostic = diagnostic.with_details([format!("  {detail}")]);
+            }
             diagnostics.push(self.canonical_program_diagnostic(
                 Some(specifier),
                 None,
@@ -6850,7 +6925,7 @@ impl Program {
         let index = self.source_files.len();
         let file_id =
             FileId::new(u32::try_from(index).expect("Program exceeds u32::MAX source files"));
-        let implied_node_format = implied_node_format(
+        let (implied_node_format, node_mode_mismatch_details) = implied_node_format(
             file_system,
             file_name,
             file_id,
@@ -6943,6 +7018,7 @@ impl Program {
                 checking,
                 is_default_library: false,
                 implied_node_format,
+                node_mode_mismatch_details,
             },
         );
     }
@@ -7152,6 +7228,7 @@ impl Program {
                 checking,
                 is_default_library: true,
                 implied_node_format: ModuleKind::CommonJs,
+                node_mode_mismatch_details: None,
             },
         );
     }
@@ -7271,7 +7348,7 @@ fn implied_node_format(
     file_name: &str,
     file_id: FileId,
     observation: &mut project_graph::PackageScopeObservationRecorder,
-) -> ModuleKind {
+) -> (ModuleKind, Option<Diagnostic>) {
     let extension = Path::new(file_name)
         .extension()
         .and_then(|value| value.to_str());
@@ -7283,7 +7360,7 @@ fn implied_node_format(
             ModuleKind::EsNext,
             ProgramGraphPackageScopeDecision::FixedExtension,
         );
-        return ModuleKind::EsNext;
+        return (ModuleKind::EsNext, None);
     }
     if extension.is_some_and(|extension| {
         extension.eq_ignore_ascii_case("cts") || extension.eq_ignore_ascii_case("cjs")
@@ -7293,7 +7370,7 @@ fn implied_node_format(
             ModuleKind::CommonJs,
             ProgramGraphPackageScopeDecision::FixedExtension,
         );
-        return ModuleKind::CommonJs;
+        return (ModuleKind::CommonJs, None);
     }
     let mut directory = directory_path(file_name);
     loop {
@@ -7301,20 +7378,23 @@ fn implied_node_format(
         let exists = file_system.file_exists(&package_json);
         observation.file_exists(file_id, &package_json, exists);
         if exists {
-            let (format, reason) = match file_system.read_file(&package_json) {
+            let (format, reason, empty_package_type) = match file_system.read_file(&package_json) {
                 Ok(contents) => {
                     observation.read_text(file_id, &package_json, &contents);
                     match parse_package_json(&contents) {
                         Ok(package) => (
                             package
                                 .package_type
-                                .filter(|package_type| package_type == "module")
+                                .as_deref()
+                                .filter(|package_type| *package_type == "module")
                                 .map_or(ModuleKind::CommonJs, |_| ModuleKind::EsNext),
                             ProgramGraphPackageScopeDecision::PackageJson,
+                            package.package_type.as_deref().is_none_or(str::is_empty),
                         ),
                         Err(_) => (
                             ModuleKind::CommonJs,
                             ProgramGraphPackageScopeDecision::InvalidPackageJson,
+                            true,
                         ),
                     }
                 }
@@ -7323,11 +7403,20 @@ fn implied_node_format(
                     (
                         ModuleKind::CommonJs,
                         ProgramGraphPackageScopeDecision::ReadFailure,
+                        true,
                     )
                 }
             };
             observation.decision(file_id, format, reason);
-            return format;
+            let details = if format == ModuleKind::CommonJs {
+                node_mode_mismatch_details(
+                    file_name,
+                    empty_package_type.then_some(package_json.as_str()),
+                )
+            } else {
+                None
+            };
+            return (format, details);
         }
         let parent = directory_path(&directory);
         if parent == directory {
@@ -7340,7 +7429,36 @@ fn implied_node_format(
         ModuleKind::CommonJs,
         ProgramGraphPackageScopeDecision::NoPackage,
     );
-    ModuleKind::CommonJs
+    (
+        ModuleKind::CommonJs,
+        node_mode_mismatch_details(file_name, None),
+    )
+}
+
+fn node_mode_mismatch_details(
+    file_name: &str,
+    package_without_type: Option<&str>,
+) -> Option<Diagnostic> {
+    if ts_path::is_declaration_file(file_name) {
+        return None;
+    }
+    let extension = Path::new(file_name).extension()?.to_str()?;
+    let target = match extension.to_ascii_lowercase().as_str() {
+        "ts" => Some(".mts"),
+        "js" => Some(".mjs"),
+        "tsx" | "jsx" => None,
+        _ => return None,
+    };
+    let (code, arguments) = match (target, package_without_type) {
+        (Some(target), Some(package)) => (1481, vec![target, package]),
+        (None, Some(package)) => (1482, vec![package]),
+        (Some(target), None) => (1480, vec![target]),
+        (None, None) => (1483, Vec::new()),
+    };
+    Some(Diagnostic::with_arguments(
+        message_by_code(code).expect("Node module format details must be in the generated catalog"),
+        arguments,
+    ))
 }
 
 fn package_display_name(directory: &str, declared_name: Option<&str>) -> Option<String> {
@@ -15978,6 +16096,7 @@ mod tests {
             checking: empty_check_result(),
             is_default_library: false,
             implied_node_format: ModuleKind::None,
+            node_mode_mismatch_details: None,
         };
 
         assert_eq!(source.node_ref(source.parse.source_file), None);
