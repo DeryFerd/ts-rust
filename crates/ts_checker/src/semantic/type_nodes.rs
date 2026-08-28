@@ -22426,10 +22426,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.pending_function_parameters.clear();
         prepared.clear_pending_function_types();
         if cycle_free {
-            if let Some(proof) = callable
+            for proof in callable
                 .alias_annotations()
                 .iter()
-                .find(|proof| proof.owner() == callable.owner_symbol)
+                .filter(|proof| proof.owner() == callable.owner_symbol)
             {
                 let parameters = self
                     .store
@@ -22441,8 +22441,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     })?
                     .type_parameters()
                     .to_vec();
+                let alias_result = self
+                    .store
+                    .type_node_links(proof.annotation())
+                    .and_then(|links| links.resolved_type)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                            proof.annotation(),
+                        ))
+                    })?;
                 let resolution =
-                    self.source_callable_alias_resolution(proof, resolved, &parameters)?;
+                    self.source_callable_alias_resolution(proof, alias_result, &parameters)?;
                 if !self
                     .store
                     .record_source_callable_alias_resolution(proof.annotation(), resolution)

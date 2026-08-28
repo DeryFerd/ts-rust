@@ -57,7 +57,8 @@ use super::{
     },
     source_callables::{
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot,
-        SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
+        SourceCallableTypeParameterSyntaxProof, source_generic_index_map_syntax,
+        source_type_parameter_default_is_assignable, valid_source_generic_index_map,
     },
     source_imports::SourceFileNamespaceIdentity,
     source_namespaces::ModuleValueIdentity,
@@ -9887,6 +9888,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 prepared.return_annotation,
                 prepared.generic_return_type_parameter,
                 &prepared.type_parameters,
+                prepared.array_targets,
             );
         let owner = self.symbol(prepared.owner_symbol)?;
         let owner_valid = owner.flags() == SymbolFlags::FUNCTION
@@ -9969,14 +9971,14 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 && !self
                     .source_callable_alias_owners
                     .contains_key(&alias.owner())
-                && (prepared.return_annotation == Some(alias.annotation())
+                && (prepared.return_annotation == Some(alias.owner_annotation())
                     || prepared.parameters.iter().any(|parameter| {
                         self.symbol(*parameter)
                             .and_then(Symbol::value_declaration)
                             .is_some_and(|declaration| {
                                 self.source_return_annotation_belongs_to(
                                     declaration,
-                                    alias.annotation(),
+                                    alias.owner_annotation(),
                                 )
                             })
                     }))
@@ -10237,6 +10239,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         annotation: Option<NodeRef>,
         return_type_parameter: Option<TypeId>,
         resolved: &[ResolvedSourceCallableTypeParameter],
+        array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
         let Some(annotation) = annotation else {
             return syntax.inferred_empty_body_is_exact()
@@ -10258,7 +10261,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     .iter()
                     .any(|alias| alias.annotation() == annotation && alias.source_is_exact(self))
                     || self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
-                    || self.source_named_generic_return_annotation_is_exact(annotation, resolved)
+                    || self.source_named_generic_return_annotation_is_exact(
+                        annotation,
+                        resolved,
+                        syntax.alias_annotations(),
+                        array_targets,
+                    )
             }
             (Some(declaration), Some(type_parameter), false) => {
                 let Some(row) = resolved.iter().find(|row| {
@@ -10293,6 +10301,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         &self,
         annotation: NodeRef,
         resolved: &[ResolvedSourceCallableTypeParameter],
+        aliases: &[SourceCallableAliasAnnotation],
+        array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
         if self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference) {
             return false;
@@ -10305,7 +10315,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             return type_links
                 .and_then(|links| links.resolved_type)
                 .is_some_and(|result| {
-                    self.source_named_generic_type_reference_is_exact(annotation, result, resolved)
+                    self.source_named_generic_type_reference_with_arguments_is_exact(
+                        annotation,
+                        result,
+                        |argument, expected| {
+                            self.source_generic_return_argument_is_exact(
+                                argument,
+                                Some(expected),
+                                resolved,
+                                aliases,
+                                array_targets,
+                            )
+                        },
+                    )
                 });
         }
 
@@ -10329,48 +10351,173 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 return false;
             };
             let argument = NodeRef::new(annotation.arena, annotation.file, NodeId::new(index));
-            if child.kind != SyntaxKind::TypeReference {
-                return false;
-            }
-            let argument_symbol = self.symbol_node_links(argument);
-            let argument_type = self.type_node_links(argument);
-            let argument_cold = argument_symbol
-                .is_none_or(|links| links == &SymbolNodeLinks::default())
-                && argument_type.is_none_or(|links| links == &TypeNodeLinks::default());
-            let naked = facts
-                .iter()
-                .flatten()
-                .filter(|facts| {
-                    facts.parent == Some(argument.node) && facts.kind == SyntaxKind::Identifier
-                })
-                .count()
-                == 1
-                && facts.iter().flatten().all(|facts| {
-                    facts.parent != Some(argument.node) || facts.kind == SyntaxKind::Identifier
-                });
-            let valid_argument = if naked {
-                argument_cold
-                    || resolved.iter().any(|row| {
-                        argument_symbol
-                            == Some(&SymbolNodeLinks {
-                                resolved_symbol: Some(row.provenance.symbol),
-                            })
-                            && argument_type
-                                == Some(&TypeNodeLinks {
-                                    resolved_type: Some(row.provenance.type_parameter),
-                                    outer_type_parameters: None,
-                                })
-                    })
-            } else {
-                self.source_named_generic_return_annotation_is_exact(argument, resolved)
-            };
-            if !valid_argument {
+            if !self.source_generic_return_argument_is_exact(
+                argument,
+                None,
+                resolved,
+                aliases,
+                array_targets,
+            ) {
                 return false;
             }
             arguments += 1;
         }
 
         names == 1 && arguments != 0
+    }
+
+    fn source_generic_return_argument_is_exact(
+        &self,
+        annotation: NodeRef,
+        expected: Option<TypeId>,
+        resolved: &[ResolvedSourceCallableTypeParameter],
+        aliases: &[SourceCallableAliasAnnotation],
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        let symbol_links = self.symbol_node_links(annotation);
+        let type_links = self.type_node_links(annotation);
+        if expected.is_some_and(|expected| {
+            type_links
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    outer_type_parameters: None,
+                })
+        }) {
+            return false;
+        }
+        if let Some(alias) = aliases
+            .iter()
+            .find(|alias| alias.annotation() == annotation)
+        {
+            let parameters = resolved
+                .iter()
+                .map(|row| row.provenance.type_parameter)
+                .collect::<Vec<_>>();
+            return alias.source_is_exact(self)
+                && (expected.is_none() && alias.has_cold_value(self)
+                    || alias.snapshot(self, &parameters).is_some_and(|snapshot| {
+                        expected.is_none_or(|expected| expected == snapshot.result())
+                            && self.source_callable_alias_resolution_matches(alias, &snapshot)
+                    }));
+        }
+        let symbol_cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default());
+        let cold = symbol_cold && type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+        let Some(children) = self.source_direct_children(annotation) else {
+            return false;
+        };
+        match self.source_node_kind(annotation) {
+            Some(SyntaxKind::TypeReference) => {
+                if matches!(children.as_slice(), [name]
+                    if self.source_node_kind(*name) == Some(SyntaxKind::Identifier))
+                {
+                    cold || resolved.iter().any(|row| {
+                        symbol_links
+                            == Some(&SymbolNodeLinks {
+                                resolved_symbol: Some(row.provenance.symbol),
+                            })
+                            && type_links
+                                == Some(&TypeNodeLinks {
+                                    resolved_type: Some(row.provenance.type_parameter),
+                                    outer_type_parameters: None,
+                                })
+                    })
+                } else {
+                    self.source_named_generic_return_annotation_is_exact(
+                        annotation,
+                        resolved,
+                        aliases,
+                        array_targets,
+                    )
+                }
+            }
+            Some(SyntaxKind::ArrayType) => {
+                let (Some(targets), [element]) = (array_targets, children.as_slice()) else {
+                    return false;
+                };
+                if cold {
+                    return self.source_generic_return_argument_is_exact(
+                        *element,
+                        None,
+                        resolved,
+                        aliases,
+                        array_targets,
+                    );
+                }
+                let Some(result) = type_links.and_then(|links| links.resolved_type) else {
+                    return false;
+                };
+                let Some(record) = self.type_payload(result) else {
+                    return false;
+                };
+                let TypeData::TypeReference(reference) = record.data() else {
+                    return false;
+                };
+                let Some([element_type]) = reference.resolved_type_arguments.as_deref() else {
+                    return false;
+                };
+                let Some(target) = self.type_payload(targets.array_type()) else {
+                    return false;
+                };
+                let TypeData::Interface(interface) = target.data() else {
+                    return false;
+                };
+                let TypeCacheState::Allocated(instantiations) =
+                    &interface.reference.object.instantiations
+                else {
+                    return false;
+                };
+                symbol_cold
+                    && type_links
+                        == Some(&TypeNodeLinks {
+                            resolved_type: Some(result),
+                            outer_type_parameters: None,
+                        })
+                    && record.flags() == TypeFlags::OBJECT
+                    && record.object_flags().contains(ObjectFlags::REFERENCE)
+                    && record.symbol() == target.symbol()
+                    && target.symbol().is_some()
+                    && target.flags() == TypeFlags::OBJECT
+                    && target
+                        .object_flags()
+                        .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+                    && record.alias().is_none()
+                    && reference.object.target == Some(targets.array_type())
+                    && reference.object.mapper.is_none()
+                    && reference.node.is_none()
+                    && instantiations.get(&type_list_key(&[*element_type])) == Some(&result)
+                    && self.source_generic_return_argument_is_exact(
+                        *element,
+                        Some(*element_type),
+                        resolved,
+                        aliases,
+                        array_targets,
+                    )
+            }
+            Some(SyntaxKind::MappedType) => {
+                let Some(syntax) = source_generic_index_map_syntax(self, annotation) else {
+                    return false;
+                };
+                if cold {
+                    return self.source_generic_return_argument_is_exact(
+                        syntax.template,
+                        None,
+                        resolved,
+                        aliases,
+                        array_targets,
+                    );
+                }
+                let parameters = resolved
+                    .iter()
+                    .map(|row| row.provenance.type_parameter)
+                    .collect::<Vec<_>>();
+                type_links
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|result| {
+                        valid_source_generic_index_map(self, annotation, result, &parameters)
+                    })
+            }
+            _ => false,
+        }
     }
 
     fn validate_source_generic_type_parameters(
@@ -10659,6 +10806,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         result: TypeId,
         earlier: &[ResolvedSourceCallableTypeParameter],
     ) -> bool {
+        self.source_named_generic_type_reference_with_arguments_is_exact(
+            node,
+            result,
+            |node, result| self.source_type_node_result_is_exact(node, result, earlier),
+        )
+    }
+
+    fn source_named_generic_type_reference_with_arguments_is_exact(
+        &self,
+        node: NodeRef,
+        result: TypeId,
+        mut validate_argument: impl FnMut(NodeRef, TypeId) -> bool,
+    ) -> bool {
         if self.source_node_kind(node) != Some(SyntaxKind::TypeReference)
             || self.type_node_links(node)
                 != Some(&TypeNodeLinks {
@@ -10790,7 +10950,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 return false;
             };
             let argument = NodeRef::new(node.arena, node.file, NodeId::new(index));
-            if !self.source_type_node_result_is_exact(argument, expected, earlier) {
+            if !validate_argument(argument, expected) {
                 return false;
             }
             argument_count += 1;
@@ -11203,7 +11363,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 })
     }
 
-    fn source_return_annotation_belongs_to(
+    pub(super) fn source_return_annotation_belongs_to(
         &self,
         declaration: NodeRef,
         annotation: NodeRef,
