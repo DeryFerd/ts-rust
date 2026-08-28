@@ -72778,6 +72778,58 @@ mod tests {
     }
 
     #[test]
+    fn default_library_builtin_interfaces_reject_corrupt_named_method_values() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface SymbolConstructor {} ",
+            "interface Symbol { toString(): string; valueOf(): symbol; } ",
+            "declare var Symbol: SymbolConstructor; ",
+            "interface Symbol { [Symbol.toPrimitive](hint: string): symbol; ",
+            "readonly [Symbol.toStringTag]: string; }",
+        ));
+        let source = parsed("type SymbolValue = Symbol;");
+        let library_file = FileId::new(9_485);
+        let file = FileId::new(9_486);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(file).unwrap();
+        let owner = global_symbol(&context, "Symbol");
+        context.get_declared_type_of_symbol(owner).unwrap();
+        let method = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("toString"))
+            .unwrap();
+        let original = context.store().value_symbol_links(method).unwrap().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        let poisoned = observable_state(&context, file);
+        assert!(context.get_declared_type_of_symbol(owner).is_err());
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(method, original)
+        );
+        let restored = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), restored);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn cross_file_ambient_globals_reject_poisoned_value_links_before_publication() {
         let declaration = parsed("declare const shared: number;");
         let source = parsed("const observed = shared;");

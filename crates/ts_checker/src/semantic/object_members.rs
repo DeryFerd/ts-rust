@@ -15051,7 +15051,7 @@ fn valid_object_tail(object: &ObjectTypeData) -> bool {
         && object.instantiations == TypeCacheState::Unallocated
 }
 
-fn valid_thisless_interface_identity(interface: &InterfaceTypeData) -> bool {
+pub(super) fn valid_thisless_interface_identity(interface: &InterfaceTypeData) -> bool {
     interface.all_type_parameters.is_none()
         && interface.outer_type_parameter_count == 0
         && interface.this_type.is_none()

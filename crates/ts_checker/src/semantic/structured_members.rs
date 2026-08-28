@@ -833,7 +833,7 @@ fn validate_no_heritage_property_interface(
     validate_property_interface(store, type_, false, array_targets)
 }
 
-/// Reuses complete member checks for published library interfaces without a base.
+/// Reuses complete member checks for published library interface references without a base.
 pub(super) fn validate_default_library_interface_type_graph(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -846,6 +846,12 @@ pub(super) fn validate_default_library_interface_type_graph(
     let TypeData::Interface(interface) = record.data() else {
         return Opaque;
     };
+    // Plain identities retain their existing checks, including detached builtin members.
+    if !record.object_flags().contains(ObjectFlags::REFERENCE)
+        && super::object_members::valid_thisless_interface_identity(interface)
+    {
+        return Opaque;
+    }
     let Some(owner) = record.symbol() else {
         return Opaque;
     };
