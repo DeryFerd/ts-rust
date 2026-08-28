@@ -394,10 +394,11 @@ pub(super) fn check_array_binding_element(
     }
 
     let Some(array) = store.canonical_array_reference(global_types, receiver_type)? else {
-        let properties = if store
-            .type_payload(receiver_type)
-            .is_some_and(|record| record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED))
-        {
+        let properties = if store.type_payload(receiver_type).is_some_and(|record| {
+            record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        }) {
             object_members::validate_resolved_declared_property_object(store, receiver_type)
         } else {
             object_members::DeclaredPropertyObjectValidation::NotDeclared
@@ -606,10 +607,11 @@ pub(super) fn numeric_index_type(
         )?;
         return Ok(indexes.number);
     }
-    if store
-        .type_payload(receiver)
-        .is_some_and(|record| record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED))
-    {
+    if store.type_payload(receiver).is_some_and(|record| {
+        record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+    }) {
         match object_members::validate_resolved_declared_property_object(store, receiver) {
             object_members::DeclaredPropertyObjectValidation::Valid(_) => return Ok(None),
             object_members::DeclaredPropertyObjectValidation::NotDeclared => {}
@@ -3395,6 +3397,7 @@ mod tests {
                 (bootstrap.any_type, true),
                 (bootstrap.error_type, true),
                 (bootstrap.never_type, true),
+                (bootstrap.unknown_type, false),
                 (bootstrap.undefined_type, false),
                 (bootstrap.undefined_widening_type, false),
                 (bootstrap.null_type, false),
@@ -3403,7 +3406,6 @@ mod tests {
                 (bootstrap.number_type, false),
             ];
             let number = bootstrap.number_type;
-            let unknown = bootstrap.unknown_type;
             let mutable = store
                 .create_canonical_array_type(&global_types, number, false)
                 .unwrap();
@@ -3439,14 +3441,6 @@ mod tests {
                         "receiver {receiver:?}, strictNullChecks {strict_null_checks}",
                     );
                 }
-                assert!(matches!(
-                    is_array_like_type(store, &global_types, options, unknown),
-                    Err(SourceElementError::Relation(RelationUnavailable::StructuralRelation {
-                        source,
-                        target,
-                        ..
-                    })) if source == unknown && target == global_types.any_readonly_array_type
-                ));
             }
             assert_eq!(
                 (

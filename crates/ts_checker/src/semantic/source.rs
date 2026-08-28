@@ -39473,14 +39473,26 @@ fn source_array_binding_is_array_like(
         .is_some_and(|members| {
             !members.is_empty()
                 && members.iter().all(|(_, symbol)| {
-                    store.symbol(symbol)
+                    store
+                        .symbol(symbol)
                         .is_some_and(|record| record.flags() == SymbolFlags::TYPE_PARAMETER)
                 })
         });
-    if parameter_only_array_target {
-        // Prepare the actual empty declaration before the primitive relation shortcut.
+    let unknown_receiver = store
+        .type_payload(receiver)
+        .is_some_and(|record| record.flags().intersects(TypeFlags::UNKNOWN));
+    if unknown_receiver {
+        store.validate_union_constituent_with_global_types(global_types, receiver)?;
+    }
+    if parameter_only_array_target || unknown_receiver && !options.intrinsic.strict_null_checks {
+        // Resolve the declared array shape before primitive and unknown comparisons.
         prepare_source_propertyless_array_target(
-            store, host, global_types, options, session, diagnostics,
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
         )?;
     }
     let mut members = HashSet::new();
@@ -39566,8 +39578,8 @@ fn prepare_source_propertyless_array_target(
     preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
     validate_direct_generic_reference(store, global_types.any_readonly_array_type)
         .map_err(|_| invalid())?;
-    let plan = super::object_members::plan_generic_interface(store, host, owner)
-        .map_err(|_| invalid())?;
+    let plan =
+        super::object_members::plan_generic_interface(store, host, owner).map_err(|_| invalid())?;
     if plan.heritage.is_some()
         || !plan.properties.is_empty()
         || !plan.methods.is_empty()
@@ -39596,8 +39608,12 @@ fn prepare_source_propertyless_array_target(
         || interface.resolved_base_constructor_type.is_some()
         || interface.reference.object.structured
             != super::type_records::StructuredTypeData::default()
-        || record.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
-        || reference.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED)
+        || record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        || reference
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
         || reference.data().structured()
             != Some(&super::type_records::StructuredTypeData::default())
     {
@@ -39624,7 +39640,11 @@ fn prepare_source_propertyless_array_target(
         return Err(invalid());
     }
     super::object_members::publish_generic_interface_declared_members_with_global_types(
-        store, &plan, target, &[], global_types,
+        store,
+        &plan,
+        target,
+        &[],
+        global_types,
     )
     .map_err(|_| invalid())?;
     Ok(true)
@@ -40677,7 +40697,7 @@ fn object_binding_property_type(
     property_name: &str,
     allow_missing: bool,
 ) -> Result<TypeId, SourceCheckError> {
-    let (any, error, undefined, unknown) = store
+    let (any, error, undefined, unknown, empty) = store
         .intrinsic_bootstrap()
         .map(|bootstrap| {
             (
@@ -40685,6 +40705,7 @@ fn object_binding_property_type(
                 bootstrap.error_type,
                 bootstrap.undefined_or_missing_type,
                 bootstrap.unknown_type,
+                bootstrap.empty_object_type,
             )
         })
         .ok_or(SourceCheckError::LiteralCache(
@@ -40694,6 +40715,12 @@ fn object_binding_property_type(
         return Ok(receiver);
     }
 
+    let receiver = if receiver == unknown && !options.intrinsic.strict_null_checks {
+        store.validate_union_constituent_with_global_types(global_types, receiver)?;
+        empty
+    } else {
+        receiver
+    };
     let nullable_object = if options.intrinsic.strict_null_checks {
         let record = store
             .type_payload(receiver)
@@ -63488,11 +63515,7 @@ mod tests {
         context.check_source_file(file).unwrap();
 
         assert!(context.diagnostics().is_empty());
-        let expected = context
-            .store()
-            .intrinsic_bootstrap()
-            .unwrap()
-            .any_type;
+        let expected = context.store().intrinsic_bootstrap().unwrap().any_type;
         assert_eq!(
             variable_value_type(&context, &source, file, "item"),
             expected
@@ -63537,7 +63560,11 @@ mod tests {
             diagnostic.diagnostic.render().unwrap(),
             "Property '0' does not exist on type 'A[] | B'.",
         );
-        let range = source.arena.get(diagnostic.node.unwrap().node).unwrap().range;
+        let range = source
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .range;
         assert_eq!((range.start.get(), range.end.get()), (84, 88));
         assert!(diagnostic.range_override.is_none());
         assert!(diagnostic.related_information.is_empty());
@@ -63606,7 +63633,11 @@ mod tests {
             assert_eq!(diagnostic.diagnostic.code(), code);
             assert_eq!(node_text(&source, diagnostic.node.unwrap()), text);
             assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
-            let range = source.arena.get(diagnostic.node.unwrap().node).unwrap().range;
+            let range = source
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
             assert_eq!((range.start.get(), range.end.get()), (start, end));
             assert!(diagnostic.range_override.is_none());
             assert!(diagnostic.related_information.is_empty());
@@ -63656,7 +63687,10 @@ mod tests {
         let expected_diagnostics = context.diagnostics().as_slice().to_vec();
         context.recheck_source_file(file).unwrap();
         assert_eq!(
-            (observable_state(&context, file), context.store().index_info_len()),
+            (
+                observable_state(&context, file),
+                context.store().index_info_len()
+            ),
             warm,
         );
         assert_eq!(context.diagnostics().as_slice(), expected_diagnostics);
@@ -63677,9 +63711,11 @@ mod tests {
 
         let receiver = variable_value_type(&context, &source, file, "data");
         let options = context.options();
-        assert!(context.store_mut_for_test().set_structured_type_members(
-            array, None, None, None, None, None,
-        ));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_structured_type_members(array, None, None, None, None, None,)
+        );
         let poisoned = (
             observable_state(&context, file),
             context.store().index_info_len(),
@@ -63691,11 +63727,19 @@ mod tests {
             )),
         );
         assert_eq!(
-            (observable_state(&context, file), context.store().index_info_len()),
+            (
+                observable_state(&context, file),
+                context.store().index_info_len()
+            ),
             poisoned,
         );
         assert!(context.store_mut_for_test().set_structured_type_members(
-            array, None, None, None, None, Some(indexes),
+            array,
+            None,
+            None,
+            None,
+            None,
+            Some(indexes),
         ));
         context.recheck_source_file(file).unwrap();
         assert_eq!(context.diagnostics().as_slice(), expected_diagnostics);
@@ -94004,12 +94048,12 @@ class Foo2 {
                 &[
                     (2571, "{}"),
                     (2339, "p1"),
-                    (2488, "[]"),
+                    (2461, "[]"),
                     (2571, "[]"),
-                    (2488, "[e1, e2]"),
+                    (2461, "[e1, e2]"),
                 ]
             } else {
-                &[(2339, "p1"), (2488, "[]"), (2488, "[e1, e2]")]
+                &[(2339, "p1"), (2461, "[]"), (2461, "[e1, e2]")]
             };
             let diagnostics = context.diagnostics().as_slice();
             assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
@@ -94018,13 +94062,26 @@ class Foo2 {
                 assert_eq!(node_text(&source, diagnostic.node.unwrap()), *text);
                 let message = match code {
                     2571 => "Object is of type 'unknown'.",
-                    2339 => "Property 'p1' does not exist on type 'unknown'.",
-                    2488 => {
-                        "Type 'unknown' must have a '[Symbol.iterator]()' method that returns an iterator."
-                    }
+                    2339 if strict_null_checks => "Property 'p1' does not exist on type 'unknown'.",
+                    2339 => "Property 'p1' does not exist on type '{}'.",
+                    2461 => "Type 'unknown' is not an array type.",
                     _ => unreachable!("the test only expects unknown-binding diagnostics"),
                 };
                 assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+                let (start, end) = match *text {
+                    "{}" => (37, 39),
+                    "p1" => (58, 60),
+                    "[]" => (79, 81),
+                    "[e1, e2]" => (98, 106),
+                    _ => unreachable!("the test only expects binding nodes"),
+                };
+                let range = source
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .range;
+                assert_eq!((range.start.get(), range.end.get()), (start, end));
+                assert!(diagnostic.range_override.is_none());
                 assert!(diagnostic.related_information.is_empty());
             }
 
@@ -94046,8 +94103,10 @@ class Foo2 {
             }
 
             let warm = observable_state(&context, file);
+            let expected_diagnostics = context.diagnostics().as_slice().to_vec();
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(context.diagnostics().as_slice(), expected_diagnostics);
         }
     }
 

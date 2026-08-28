@@ -1158,8 +1158,7 @@ impl<'store> RelaterSession<'store> {
         }
         let source_array = self.configured_array_reference_target(source)?;
         let target_array = self.configured_array_reference_target(target)?;
-        let (array, object, result, object_to_array) = match (source_array, target_array)
-        {
+        let (array, object, result, object_to_array) = match (source_array, target_array) {
             (Some(_), None) => (source, target, Ternary::True, false),
             (None, Some(_))
                 if matches!(
@@ -1240,11 +1239,8 @@ impl<'store> RelaterSession<'store> {
         target: TypeId,
     ) -> Result<Option<ResolvedObjectMembers>, RelationUnavailable> {
         let invalid = || RelationUnavailable::InvalidStructuredMembers(array);
-        let TypeData::Interface(interface) = self
-            .store
-            .type_payload(target)
-            .ok_or_else(invalid)?
-            .data()
+        let TypeData::Interface(interface) =
+            self.store.type_payload(target).ok_or_else(invalid)?.data()
         else {
             return Err(invalid());
         };
@@ -2143,6 +2139,27 @@ impl<'store> RelaterSession<'store> {
                 || target_flags.intersects(TypeFlags::INTERSECTION)
             {
                 return self.union_or_intersection_related_to(source, target, intersection_state);
+            }
+            if source_flags.intersects(TypeFlags::UNKNOWN)
+                && target_flags.intersects(TypeFlags::OBJECT)
+            {
+                self.store
+                    .validate_union_constituent(source)
+                    .map_err(|error| union_validation_unavailable(source, error))?;
+                if self.bootstrap.strict_null_checks {
+                    return Ok(Ternary::False);
+                }
+                let apparent = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .ok_or(RelationUnavailable::MissingBootstrap)?
+                    .empty_object_type;
+                return self.is_related_to_ex(
+                    apparent,
+                    target,
+                    recursion_flags,
+                    intersection_state,
+                );
             }
             if source_flags.intersects(TypeFlags::PRIMITIVE)
                 && target_flags.intersects(TypeFlags::OBJECT)
