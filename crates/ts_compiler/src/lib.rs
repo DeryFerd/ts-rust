@@ -12260,7 +12260,7 @@ mod tests {
 
         let manifest = program.canonical_module_resolution_manifest().unwrap();
         let entries = manifest.entries();
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         let entry_texts = entries
             .iter()
             .map(
@@ -12272,15 +12272,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             entry_texts,
-            ["./target", "./target", "./target", "./missing"]
+            ["./target", "./target", "./target", "./missing", "./target"]
         );
 
         let resolved_specifiers = entries[..3]
             .iter()
+            .chain(&entries[4..])
             .map(|entry| entry.specifier())
             .collect::<BTreeSet<_>>();
-        assert_eq!(resolved_specifiers.len(), 3);
-        for entry in &entries[..3] {
+        assert_eq!(resolved_specifiers.len(), 4);
+        for entry in entries[..3].iter().chain(&entries[4..]) {
             let CanonicalModuleResolutionInput::Resolved(resolved) = entry.resolution() else {
                 panic!("static target import should resolve");
             };
@@ -12292,6 +12293,16 @@ mod tests {
             entries[3].resolution(),
             CanonicalModuleResolutionInput::Unresolved
         );
+
+        let dynamic = entries[4].specifier();
+        let parent = program.node(dynamic).unwrap().parent.unwrap();
+        let parent = ts_ast::NodeRef::new(dynamic.arena, dynamic.file, parent);
+        let call_node = program.node(parent).unwrap();
+        let NodeData::CallExpression(call) = &call_node.data else {
+            panic!("the dynamic import specifier must retain its original call");
+        };
+        assert!(ts_ast::is_import_call(&importer.parse.arena, call_node));
+        assert_eq!(call.arguments.nodes.as_slice(), &[dynamic.node]);
 
         let all_target_literals = importer
             .parse
