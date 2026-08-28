@@ -40156,6 +40156,50 @@ struct ObjectBindingContext {
     nested: Vec<(String, Self)>,
 }
 
+fn object_binding_context_is_needed(
+    store: &CanonicalTypeMapperStore,
+    variable: &PlannedObjectVariable,
+) -> Result<bool, SourceCheckError> {
+    if variable.type_node.is_some() || variable.elements.is_empty() {
+        return Ok(false);
+    }
+    let PlannedExpressionKind::Object { plan, .. } = &variable.initializer.unparenthesized().kind
+    else {
+        return Ok(false);
+    };
+    if variable
+        .elements
+        .iter()
+        .any(|element| !element.binding.parent_properties.is_empty())
+    {
+        return Ok(true);
+    }
+    let mut names = Vec::with_capacity(variable.elements.len());
+    for element in &variable.elements {
+        if element.binding.rest {
+            return Ok(false);
+        }
+        if let Some(key) = &element.computed_key {
+            let type_ = store
+                .type_node_links(key.node)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(element.binding.element),
+                ))?;
+            let Some(name) = literal_computed_property_name(store, type_) else {
+                return Ok(false);
+            };
+            names.push(name);
+        } else {
+            names.push(element.binding.property_name.clone());
+        }
+    }
+    Ok(plan
+        .properties
+        .iter()
+        .any(|property| !names.contains(&property.name)))
+}
+
 fn implied_object_binding_context(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -56294,13 +56338,7 @@ pub(super) fn check_source_file(
                         ));
                     }
                 }
-                if variable.type_node.is_none()
-                    && !variable.elements.is_empty()
-                    && matches!(
-                        variable.initializer.unparenthesized().kind,
-                        PlannedExpressionKind::Object { .. }
-                    )
-                {
+                if object_binding_context_is_needed(store, &variable)? {
                     let context = implied_object_binding_context(
                         store,
                         host,
