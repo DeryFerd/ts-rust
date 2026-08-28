@@ -38929,10 +38929,13 @@ impl IterationPropertyResolver for SourceIterationProperties<'_, '_, '_> {
                     })
                 })
                 .map_err(|error| {
-                    SourcePlanner::property_plan_error(SourcePropertyError::Union {
-                        node: self.node,
-                        error,
-                    })
+                    SourcePlanner::property_plan_error(
+                        self.node,
+                        SourcePropertyError::Union {
+                            node: self.node,
+                            error,
+                        },
+                    )
                 })?;
             if let Some(property) = &property {
                 self.resolve_callable_returns(store, property.type_)?;
