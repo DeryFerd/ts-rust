@@ -33,8 +33,8 @@ use super::{
     },
     classes::{
         ClassConstructorVisibility, ClassHeritageMembersValidation,
-        authenticated_class_constructor_value, class_member_visibility,
-        validate_class_heritage_members, validated_class_derives_from,
+        authenticated_class_constructor_value, class_constructor_call_parameter_type,
+        class_member_visibility, validate_class_heritage_members, validated_class_derives_from,
     },
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
@@ -6469,6 +6469,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(RelationUnavailable::InvalidStructuredMembers(type_));
         }
+        let parameters = record
+            .parameters()
+            .iter()
+            .zip(parameters)
+            .map(|(parameter, body_type)| {
+                class_constructor_call_parameter_type(self, owner, *parameter, body_type)
+                    .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_))?
+                    .ok_or(RelationUnavailable::StructuredSignatures(type_))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Some(ValidatedSingleCallable {
             owner: type_,
@@ -10709,6 +10719,86 @@ mod tests {
                 .is_type_assignable_to_with_strict_function_types(narrow, wide, false),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn defaulted_class_constructor_call_types_keep_body_and_property_types() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "class A { constructor(public value: number = 1) {} } ",
+            "declare const factory: new (x: undefined) => A;",
+        ));
+        let file = FileId::new(97_002);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let undefined = bootstrap.undefined_type;
+        let globals = store.symbol_table(bootstrap.globals).unwrap();
+        let owner = globals.get_source("A").unwrap();
+        let factory = globals.get_source("factory").unwrap();
+        let a = store
+            .value_symbol_links(owner)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let target = store
+            .value_symbol_links(factory)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let property = store
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let callable = store
+            .authenticated_class_construct_signature(a)
+            .unwrap()
+            .unwrap();
+        assert_eq!(callable.min_argument_count, 0);
+        let TypeData::Union(union) = store.type_payload(callable.parameters[0]).unwrap().data()
+        else {
+            panic!("a defaulted call parameter must include undefined");
+        };
+        assert_eq!(union.union.types, [undefined, number]);
+        let parameter = store.signature(callable.signature).unwrap().parameters()[0];
+        let globals = context.global_types().clone();
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_global_types_and_strict_function_types(
+                        a, target, &globals, true
+                    ),
+                Ok(true)
+            );
+            for symbol in [parameter, property] {
+                assert_eq!(
+                    context.store().value_symbol_links(symbol),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    })
+                );
+            }
+        }
     }
 
     #[test]

@@ -4378,6 +4378,55 @@ fn source_constructor_call_parameter(
     ))
 }
 
+/// Reads the call type after the caller validates the complete constructor graph.
+/// A default value permits undefined at calls but does not widen the body symbol.
+pub(super) fn class_constructor_call_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    parameter: SemanticSymbolId,
+    body_type: TypeId,
+) -> Result<Option<TypeId>, ClassError> {
+    let declaration = store
+        .symbol(parameter)
+        .and_then(Symbol::value_declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(parameter)))?;
+    let mut owner = owner;
+    let mut visited = HashSet::new();
+    while visited.insert(owner) {
+        let Some(provenance) = store.source_class_provenance_for_symbol(owner) else {
+            break;
+        };
+        if let Some(retained) = provenance
+            .prepared
+            .plan
+            .bodies
+            .iter()
+            .filter(|body| body.kind == ClassBodyKind::Constructor)
+            .flat_map(|body| &body.parameters)
+            .find(|candidate| candidate.symbol == parameter && candidate.declaration == declaration)
+        {
+            return optional_constructor_parameter_type(
+                store,
+                body_type,
+                retained.optional || retained.initializer.is_some(),
+                declaration,
+            );
+        }
+        let Some(base) = provenance.base_members.as_ref() else {
+            break;
+        };
+        owner = base.shells.symbol;
+    }
+    let (_, initializer) = stored_constructor_parameter_annotation(store, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(parameter)))?;
+    optional_constructor_parameter_type(
+        store,
+        body_type,
+        initializer.is_some() || stored_constructor_parameter_is_optional(store, declaration),
+        declaration,
+    )
+}
+
 fn prepare_source_constructor_call_types(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6303,12 +6352,16 @@ fn prepare_constructor_parameter_type(
     store: &mut CanonicalTypeMapperStore,
     parameter: ClassConstructorParameterPlan,
 ) -> Result<TypeId, ClassError> {
-    prepare_constructor_optional_type(
+    let body_type = prepare_constructor_optional_type(
         store,
         parameter.type_,
         parameter.optional,
         parameter.declaration,
-    )
+    )?;
+    if parameter.initializer.is_some() {
+        prepare_constructor_optional_type(store, body_type, true, parameter.declaration)?;
+    }
+    Ok(body_type)
 }
 
 fn prepare_constructor_optional_type(
@@ -24775,6 +24828,9 @@ pub(super) fn execute_nongeneric_class_members(
                 })
         })
         .transpose()?;
+    if let (Some(parameter), Some(body_type)) = (inferred_date_parameter, inferred_date_type) {
+        prepare_constructor_optional_type(store, body_type, true, parameter.declaration)?;
+    }
     let base_constructor = planned_class_base_constructor(store, &plan.class)?;
     let shell = shell_state(store, host, &plan.class)?;
     let cold_instance = shell.instance.is_none();

@@ -64,6 +64,41 @@ var r3: typeof A = C;"#;
 }
 
 #[test]
+fn defaulted_constructor_relations_accept_undefined_without_widening_the_body() {
+    let source = "class A {\n    constructor(public value: number = 1) {}\n}\nconst ctor: new (x: undefined) => A = A;";
+    let program = check(source);
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    for source in [
+        "class A { constructor(public value: string = '') {} } const ctor: new (x: undefined) => A = A;",
+        "class A { constructor(public value = new Date()) {} } const ctor: new (x: undefined) => A = A;",
+    ] {
+        let program = check(source);
+        assert!(
+            program.diagnostics().is_empty(),
+            "{source}: {:?}",
+            program.diagnostics()
+        );
+    }
+    for source in [
+        "class A { constructor(public value: number) {} } const ctor: new (x: undefined) => A = A;",
+        "class A { constructor(public value: number = 1) {} } const ctor: new (x: string) => A = A;",
+    ] {
+        let program = check(source);
+        assert_eq!(
+            program.diagnostics().len(),
+            1,
+            "{:?}",
+            program.diagnostics()
+        );
+        assert_eq!(program.diagnostics()[0].code, Some(2322));
+    }
+}
+
+#[test]
 fn constructor_relations_keep_parameter_return_and_static_checks() {
     for (source, expected) in [
         (
