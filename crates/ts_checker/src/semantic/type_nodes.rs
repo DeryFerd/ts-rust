@@ -21079,7 +21079,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             {
                 self.execute_type_node(key.type_node, &plan, &mut prepared)?;
             }
-            object_members::publish_interface_method_names(self.store, &mut method)
+            object_members::publish_interface_method_names(self.store, self.host, &mut method)
                 .map_err(property_object_error)?;
             self.execute_interface_method_type_parameters(
                 &method.methods,
@@ -23285,7 +23285,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 declared_type: target,
             })
         };
-        let members = plan
+        let mut members = plan
             .generic_member_plans
             .get(&symbol)
             .cloned()
@@ -23307,6 +23307,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )?;
         for annotation in members.call_type_nodes() {
             self.execute_type_node(annotation, plan, prepared)?;
+        }
+        if members
+            .methods
+            .iter()
+            .any(|method| method.computed_key.is_some())
+        {
+            object_members::publish_full_interface_method_names(
+                self.store,
+                self.host,
+                &mut members,
+            )
+            .map_err(property_object_error)?;
         }
         for (key, value) in members.index_type_nodes() {
             self.execute_type_node(key, plan, prepared)?;
@@ -23371,7 +23383,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
-        let interface =
+        let mut interface =
             plan.interfaces
                 .get(&symbol)
                 .cloned()
@@ -23441,6 +23453,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             unreachable!("the active-interface check and insertion are adjacent")
         }
         let result = (|| {
+            if interface
+                .methods
+                .iter()
+                .any(|method| method.computed_key.is_some())
+            {
+                for key in interface
+                    .methods
+                    .iter()
+                    .filter_map(|method| method.computed_key)
+                {
+                    self.execute_type_node(key.type_node, plan, prepared)?;
+                }
+                object_members::publish_full_interface_method_names(
+                    self.store,
+                    self.host,
+                    &mut interface,
+                )
+                .map_err(property_object_error)?;
+            }
             let mut base_types = Vec::new();
             if let Some(heritage) = &interface.heritage {
                 base_types.reserve(heritage.bases.len());
@@ -23455,13 +23486,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .as_ref()
                         .map(CanonicalArrayTargets::from_global_types);
                     for property in &interface.properties {
+                        let key =
+                            object_members::planned_declared_property_key(self.store, property)
+                                .ok_or_else(|| {
+                                    property_object_error(
+                                        PropertyObjectError::InvalidCachedInterface {
+                                            symbol,
+                                            type_: declared_type,
+                                        },
+                                    )
+                                })?;
                         let inherited = self
                             .store
                             .type_payload(type_)
                             .and_then(|record| record.data().structured())
                             .and_then(|structured| structured.members)
                             .and_then(|members| self.store.symbol_table(members))
-                            .and_then(|members| members.get(property.name.as_ref()));
+                            .and_then(|members| members.get(key));
                         if let Some(inherited) = inherited {
                             let reference = if !base.type_arguments.is_empty() {
                                 Some(type_)
@@ -26048,7 +26089,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, DeclaredTypeError> {
-        let literal =
+        let mut literal =
             plan.type_literals.get(&node).cloned().ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node))
             })?;
@@ -26056,6 +26097,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map_err(property_object_error)?;
         if matches!(state, PropertyObjectState::EmptyBootstrap(_)) {
             return Ok(state.type_id());
+        }
+        if literal
+            .methods
+            .iter()
+            .any(|method| method.computed_key.is_some())
+        {
+            for key in literal
+                .methods
+                .iter()
+                .filter_map(|method| method.computed_key)
+            {
+                self.execute_type_node(key.type_node, plan, prepared)?;
+            }
+            object_members::publish_full_interface_method_names(
+                self.store,
+                self.host,
+                &mut literal,
+            )
+            .map_err(property_object_error)?;
         }
         self.execute_interface_method_type_parameters(
             &literal.methods,

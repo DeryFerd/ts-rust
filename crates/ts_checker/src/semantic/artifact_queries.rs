@@ -3496,9 +3496,15 @@ impl CanonicalCheckerContext<'_> {
         {
             let selected_record = self.store().symbol(selected).ok_or_else(invalid)?;
             if self.store().get_merged_symbol(selected) != Some(selected)
-                || self.store().late_bound_method_source(selected) != Some(symbol)
+                || self
+                    .store()
+                    .late_bound_method_sources(selected)
+                    .is_none_or(|sources| !sources.contains(&symbol))
+                || self.store().source_declaration_symbol(declaration) != Some(symbol)
                 || self.store().get_parent_of_symbol(selected) != Some(owner)
-                || selected_record.declarations() != method_record.declarations()
+                || selected_record
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&declaration))
             {
                 return Err(invalid());
             }

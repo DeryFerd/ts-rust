@@ -127,6 +127,25 @@ impl SourceGlobalBindings {
 }
 
 #[derive(Debug)]
+struct ComputedMethodNameGroup {
+    owner: SemanticSymbolId,
+    key_type: TypeId,
+    key_symbol: SemanticSymbolId,
+    sources: Box<[SemanticSymbolId]>,
+}
+
+pub(super) struct PreparedComputedMethodNameGroup {
+    owner: SemanticSymbolId,
+    key_type: TypeId,
+    sources: Box<[SemanticSymbolId]>,
+    declarations: Vec<NodeRef>,
+    keys: Box<[super::object_members::PlannedComputedMemberKey]>,
+    flags: SymbolFlags,
+    name: EscapedName,
+    existing: Option<SemanticSymbolId>,
+}
+
+#[derive(Debug)]
 struct CachedSignatureEntry {
     type_arguments: Box<[TypeId]>,
     instantiated: SignatureId,
@@ -551,6 +570,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
     source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
     source_global_bindings: Option<SourceGlobalBindings>,
+    computed_method_name_groups: HashMap<SemanticSymbolId, ComputedMethodNameGroup>,
     source_declaration_owners: HashMap<NodeRef, Vec<SemanticSymbolId>>,
     type_alias_declared_type_owners: HashMap<TypeId, HashSet<SemanticSymbolId>>,
     merged_symbols: HashMap<SemanticSymbolId, SemanticSymbolId>,
@@ -707,6 +727,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_node_facts: BTreeMap::new(),
             source_symbol_declarations,
             source_global_bindings: None,
+            computed_method_name_groups: HashMap::new(),
             source_declaration_owners,
             type_alias_declared_type_owners: HashMap::new(),
             merged_symbols: HashMap::new(),
@@ -3363,31 +3384,167 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .then_some(*source)
     }
 
+    /// Returns every original symbol of a published computed method group.
+    /// The retained record owns names only. Signature result records stay separate.
+    pub(super) fn late_bound_method_sources(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<Vec<SemanticSymbolId>> {
+        let method = self.symbol(symbol)?;
+        let flags = method.flags().without(SymbolFlags::TRANSIENT);
+        if !method
+            .flags()
+            .contains(SymbolFlags::METHOD | SymbolFlags::TRANSIENT)
+            || flags.without(SymbolFlags::METHOD | SymbolFlags::OPTIONAL) != SymbolFlags::NONE
+            || method.check_flags() != CheckFlags::LATE
+            || !method.name().is_late_bound()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+        {
+            return None;
+        }
+        let Some(group) = self.computed_method_name_groups.get(&symbol) else {
+            return self
+                .late_bound_method_source(symbol)
+                .map(|source| vec![source]);
+        };
+        let declarations = method.declarations()?;
+        let key = self.symbol(group.key_symbol)?;
+        let key_id = self
+            .symbol_store()
+            .assigned_global_symbol_id(group.key_symbol)?;
+        let suffix = method
+            .name()
+            .as_bytes()
+            .strip_prefix(b"\xFE@")?
+            .strip_prefix(key.name().as_bytes())?
+            .strip_prefix(b"@")?;
+        if group.sources.len() < 2
+            || declarations.len() != group.sources.len()
+            || self.get_parent_of_symbol(symbol) != Some(group.owner)
+            || method.value_declaration() != declarations.first().copied()
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || self.types.get(group.key_type).is_none()
+            || self.value_symbol_links(symbol)?.name_type != Some(group.key_type)
+            || self.get_merged_symbol(group.key_symbol) != Some(group.key_symbol)
+            || suffix != key_id.to_string().as_bytes()
+            || self.value_symbol_links(group.key_symbol)?.resolved_type != Some(group.key_type)
+            || !self.source_merged_symbol_declarations_match(group.owner)
+        {
+            return None;
+        }
+        let mut seen = HashSet::with_capacity(group.sources.len());
+        let mut previous_position = None;
+        for (&source, &declaration) in group.sources.iter().zip(declarations) {
+            let early = self.symbol(source)?;
+            let original = self.source_symbol_declarations.get(&source)?;
+            let SourceNodeParent::Parent(owner_declaration) =
+                self.source_node_parent(declaration)?
+            else {
+                return None;
+            };
+            let position = (
+                self.source_file_rank(declaration.file)?,
+                self.source_node_start(declaration)?,
+            );
+            let name =
+                self.source_child_with_kind(declaration, SyntaxKind::ComputedPropertyName)?;
+            let expression = match (
+                self.source_child_with_kind(name, SyntaxKind::Identifier),
+                self.source_child_with_kind(name, SyntaxKind::PropertyAccessExpression),
+            ) {
+                (Some(expression), None) | (None, Some(expression)) => expression,
+                _ => return None,
+            };
+            if !seen.insert(source)
+                || self.source_declaration_symbol(declaration) != Some(source)
+                || !self.source_symbol_declarations_match(source)
+                || original.flags != flags
+                || early.flags() != flags
+                || early.check_flags() != CheckFlags::NONE
+                || early.name() != InternalSymbolName::Computed.as_ref()
+                || early.declarations() != Some(&[declaration])
+                || early.value_declaration() != Some(declaration)
+                || early.members().is_some()
+                || early.exports().is_some()
+                || early.export_symbol().is_some()
+                || self.get_parent_of_symbol(source) != Some(group.owner)
+                || self.get_merged_symbol(source) != Some(source)
+                || self
+                    .value_symbol_links(source)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                || self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+                || !self.source_declaration_belongs_to_symbol(owner_declaration, group.owner)
+                || previous_position.is_some_and(|previous| previous >= position)
+                || self.late_bound_links(source)?.late_symbol != Some(symbol)
+                || self.symbol_node_links(declaration)?.resolved_symbol != Some(symbol)
+                || self.symbol_node_links(expression)?.resolved_symbol != Some(group.key_symbol)
+                || self.type_node_links(expression)?.resolved_type != Some(group.key_type)
+            {
+                return None;
+            }
+            previous_position = Some(position);
+        }
+        if self
+            .links
+            .late_bound
+            .find_key(|source| {
+                !seen.contains(source)
+                    && self
+                        .links
+                        .late_bound
+                        .try_get(source)
+                        .and_then(|links| links.late_symbol)
+                        == Some(symbol)
+            })
+            .is_some()
+        {
+            return None;
+        }
+        Some(group.sources.to_vec())
+    }
+
+    pub(super) fn has_computed_method_name_origin(&self, source: SemanticSymbolId) -> bool {
+        self.computed_method_name_groups
+            .values()
+            .any(|group| group.sources.contains(&source))
+    }
+
     /// Checks the method's optional flag against each source declaration.
     pub(super) fn declared_method_optional_flag(&self, symbol: SemanticSymbolId) -> Option<bool> {
         let method = self.symbol(symbol)?;
-        let source = if method.flags().contains(SymbolFlags::TRANSIENT)
+        let sources = if method.flags().contains(SymbolFlags::TRANSIENT)
             || method.check_flags().contains(CheckFlags::LATE)
             || method.name().is_late_bound()
         {
-            self.late_bound_method_source(symbol)?
+            self.late_bound_method_sources(symbol)?
         } else {
-            symbol
+            vec![symbol]
         };
-        let source_method = self.symbol(source)?;
-        if source_method.flags() != method.flags().without(SymbolFlags::TRANSIENT)
-            || source_method.declarations() != method.declarations()
-            || source_method.value_declaration() != method.value_declaration()
-            || source_method.check_flags() != CheckFlags::NONE
-        {
-            return None;
-        }
-        let method = source_method;
-        if method.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD {
+        let flags = method.flags().without(SymbolFlags::TRANSIENT);
+        if flags.without(SymbolFlags::OPTIONAL) != SymbolFlags::METHOD {
             return None;
         }
         let declarations = method.declarations()?;
-        let optional = method.flags().contains(SymbolFlags::OPTIONAL);
+        let mut source_declarations = Vec::new();
+        for source in sources {
+            let source_method = self.symbol(source)?;
+            let original = source_method.declarations()?;
+            if source_method.flags() != flags
+                || source_method.value_declaration() != original.first().copied()
+                || source_method.check_flags() != CheckFlags::NONE
+            {
+                return None;
+            }
+            source_declarations.extend_from_slice(original);
+        }
+        if source_declarations != declarations
+            || method.value_declaration() != declarations.first().copied()
+        {
+            return None;
+        }
+        let optional = flags.contains(SymbolFlags::OPTIONAL);
         if declarations.is_empty()
             || declarations.iter().any(|declaration| {
                 self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
@@ -3412,6 +3569,55 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some(optional)
     }
 
+    pub(super) fn late_bound_method_has_exact_sources(
+        &self,
+        symbol: SemanticSymbolId,
+        owner: SemanticSymbolId,
+    ) -> bool {
+        let Some(method) = self.symbol(symbol) else {
+            return false;
+        };
+        let Some(declarations) = method.declarations() else {
+            return false;
+        };
+        let Some(sources) = self.late_bound_method_sources(symbol) else {
+            return false;
+        };
+        let mut original_declarations = Vec::new();
+        for source in sources {
+            let Some(early) = self.symbol(source) else {
+                return false;
+            };
+            let Some(original) = early.declarations() else {
+                return false;
+            };
+            if early.flags() != method.flags().without(SymbolFlags::TRANSIENT)
+                || early.check_flags() != CheckFlags::NONE
+                || early.name() != InternalSymbolName::Computed.as_ref()
+                || early.value_declaration() != original.first().copied()
+                || self.get_parent_of_symbol(source) != Some(owner)
+                || self.get_merged_symbol(source) != Some(source)
+                || early.members().is_some()
+                || early.exports().is_some()
+                || early.export_symbol().is_some()
+            {
+                return false;
+            }
+            original_declarations.extend_from_slice(original);
+        }
+        original_declarations == declarations
+            && method.value_declaration() == declarations.first().copied()
+            && declarations.iter().all(|declaration| {
+                self.symbol_node_links(*declaration)
+                    .and_then(|links| links.resolved_symbol)
+                    == Some(symbol)
+            })
+            && self
+                .value_symbol_links(symbol)
+                .and_then(|links| links.name_type)
+                .is_some_and(|type_| self.types.get(type_).is_some())
+    }
+
     /// Authenticates a declared or late-bound method against its interface owner.
     pub(super) fn authenticated_interface_method_owner(
         &self,
@@ -3428,28 +3634,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let late = method.check_flags().contains(CheckFlags::LATE)
             || method.flags().contains(SymbolFlags::TRANSIENT)
             || method.name().is_late_bound();
-        let valid_late = !late
-            || self.late_bound_method_source(symbol).is_some_and(|source| {
-                self.symbol(source).is_some_and(|early| {
-                    early.flags() == method.flags().without(SymbolFlags::TRANSIENT)
-                        && early.check_flags() == CheckFlags::NONE
-                        && early.name() == InternalSymbolName::Computed.as_ref()
-                        && early.declarations() == method.declarations()
-                        && early.value_declaration() == method.value_declaration()
-                        && self.get_parent_of_symbol(source) == Some(owner)
-                        && self.get_merged_symbol(source) == Some(source)
-                        && early.members().is_none()
-                        && early.exports().is_none()
-                        && early.export_symbol().is_none()
-                }) && declarations.iter().all(|declaration| {
-                    self.symbol_node_links(*declaration)
-                        .and_then(|links| links.resolved_symbol)
-                        == Some(symbol)
-                }) && self
-                    .value_symbol_links(symbol)
-                    .and_then(|links| links.name_type)
-                    .is_some_and(|type_| self.types.get(type_).is_some())
-            });
+        let valid_late = !late || self.late_bound_method_has_exact_sources(symbol, owner);
         let members = if late {
             self.members_and_exports_links(owner).and_then(|links| {
                 links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
@@ -3566,28 +3751,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let late = method.check_flags().contains(CheckFlags::LATE)
             || method.flags().contains(SymbolFlags::TRANSIENT)
             || method.name().is_late_bound();
-        let valid_late = !late
-            || self.late_bound_method_source(symbol).is_some_and(|source| {
-                self.symbol(source).is_some_and(|early| {
-                    early.flags() == method.flags().without(SymbolFlags::TRANSIENT)
-                        && early.check_flags() == CheckFlags::NONE
-                        && early.name() == InternalSymbolName::Computed.as_ref()
-                        && early.declarations() == method.declarations()
-                        && early.value_declaration() == method.value_declaration()
-                        && self.get_parent_of_symbol(source) == Some(owner)
-                        && self.get_merged_symbol(source) == Some(source)
-                        && early.members().is_none()
-                        && early.exports().is_none()
-                        && early.export_symbol().is_none()
-                }) && declarations.iter().all(|declaration| {
-                    self.symbol_node_links(*declaration)
-                        .and_then(|links| links.resolved_symbol)
-                        == Some(symbol)
-                }) && self
-                    .value_symbol_links(symbol)
-                    .and_then(|links| links.name_type)
-                    .is_some_and(|type_| self.types.get(type_).is_some())
-            });
+        let valid_late = !late || self.late_bound_method_has_exact_sources(symbol, owner);
         let members = if late {
             self.members_and_exports_links(owner).and_then(|links| {
                 links.table(super::links::MembersOrExportsResolutionKind::ResolvedMembers)
@@ -8962,6 +9126,188 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Allocates the complete source-name record before any key or name is written.
+    pub(super) fn prepare_late_bound_method_group_symbol(
+        &self,
+        host: &super::DeclaredTypeHost<'_>,
+        owner: SemanticSymbolId,
+        sources: &[SemanticSymbolId],
+        key_type: TypeId,
+    ) -> Option<PreparedComputedMethodNameGroup> {
+        let first = *sources.first()?;
+        let plan = super::object_members::plan_selected_interface_method(self, host, first).ok()?;
+        if plan.symbol != owner
+            || super::object_members::preflight_computed_method_group(self, host, &plan).ok()?
+                != sources
+        {
+            return None;
+        }
+        let mut declarations = Vec::new();
+        declarations.try_reserve_exact(sources.len()).ok()?;
+        let mut retained_sources = Vec::new();
+        retained_sources.try_reserve_exact(sources.len()).ok()?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(sources.len()).ok()?;
+        let mut name = None;
+        for (&source, method) in sources.iter().zip(&plan.methods) {
+            let key = method.computed_key?;
+            let (type_, resolved_name) =
+                super::object_members::resolved_computed_member_key(self, &key).ok()??;
+            if type_ != key_type || name.as_ref().is_some_and(|name| name != &resolved_name) {
+                return None;
+            }
+            name = Some(resolved_name);
+            declarations.push(method.declaration);
+            retained_sources.push(source);
+            keys.push(key);
+        }
+        Some(PreparedComputedMethodNameGroup {
+            owner,
+            key_type,
+            sources: retained_sources.into_boxed_slice(),
+            declarations,
+            keys: keys.into_boxed_slice(),
+            flags: self.symbol(first)?.flags(),
+            name: name?,
+            existing: self
+                .late_bound_links(first)
+                .and_then(|links| links.late_symbol),
+        })
+    }
+
+    pub(super) fn try_reserve_computed_method_names(
+        &mut self,
+        groups: usize,
+        sources: usize,
+        keys: usize,
+        tables: usize,
+    ) -> bool {
+        let Some(nodes) = sources.checked_add(keys) else {
+            return false;
+        };
+        let Some(values) = groups.checked_add(keys) else {
+            return false;
+        };
+        self.try_reserve_checker_symbol_allocations(groups, tables)
+            && self.computed_method_name_groups.try_reserve(groups).is_ok()
+            && self.links.late_bound.try_reserve(sources)
+            && self.links.symbol_node.try_reserve(nodes)
+            && self.links.type_node.try_reserve(keys)
+            && self.links.value_symbol.try_reserve(values)
+            && self.links.members_and_exports.try_reserve(1)
+            && self.try_reserve_declared_value_provenance(keys)
+    }
+
+    /// Publishes one name while retaining each original overload symbol.
+    pub(super) fn create_late_bound_method_group_symbol(
+        &mut self,
+        prepared: PreparedComputedMethodNameGroup,
+        members: SymbolTableId,
+    ) -> Option<SemanticSymbolId> {
+        let PreparedComputedMethodNameGroup {
+            owner,
+            key_type,
+            sources,
+            declarations,
+            keys,
+            flags,
+            name,
+            existing,
+        } = prepared;
+        let first = *sources.first()?;
+        let owner_record = self.symbol(owner)?;
+        let raw = owner_record.members();
+        let table = self.symbol_table(members)?;
+        if raw == Some(members)
+            || table.get(name.as_ref()) != existing
+            || self.get_merged_symbol(owner) != Some(owner)
+            || !self.source_merged_symbol_declarations_match(owner)
+            || raw.is_none() && !self.source_symbol_has_only_computed_members(owner)
+            || raw.is_some_and(|raw| {
+                self.symbol_table(raw).is_none_or(|raw| {
+                    raw.iter()
+                        .any(|(name, source)| table.get(name) != Some(source))
+                })
+            })
+        {
+            return None;
+        }
+        for ((&source, &declaration), key) in sources.iter().zip(&declarations).zip(keys.iter()) {
+            let early = self.symbol(source)?;
+            if early.flags() != flags
+                || !self.source_symbol_declarations_match(source)
+                || self.source_declaration_symbol(declaration) != Some(source)
+                || self.get_parent_of_symbol(source) != Some(owner)
+                || self
+                    .late_bound_links(source)
+                    .and_then(|links| links.late_symbol)
+                    != existing
+                || self
+                    .symbol_node_links(declaration)
+                    .and_then(|links| links.resolved_symbol)
+                    != existing
+                || self.symbol_node_links(key.expression)?.resolved_symbol != Some(key.key_symbol)
+                || self.type_node_links(key.expression)?.resolved_type != Some(key_type)
+                || super::object_members::resolved_computed_member_key(self, key).ok()??
+                    != (key_type, name.clone())
+            {
+                return None;
+            }
+        }
+        if let Some(late) = existing {
+            return (self.late_bound_method_sources(late).as_deref() == Some(sources.as_ref())
+                && self.value_symbol_links(late)?.name_type == Some(key_type))
+            .then_some(late);
+        }
+        if sources.len() == 1 {
+            return self.create_late_bound_property_symbol(owner, first, key_type, members);
+        }
+        let first_declaration = declarations[0];
+        let late = self.alloc_transient_symbol(flags, name.clone(), CheckFlags::LATE);
+        assert!(self.set_symbol_declarations(late, Some(declarations), Some(first_declaration)));
+        assert!(self.set_symbol_relationships(late, None, None, Some(owner), None));
+        assert!(self.set_value_symbol_links(
+            late,
+            ValueSymbolLinks {
+                name_type: Some(key_type),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        for &source in sources.iter() {
+            let declaration = self
+                .symbol(source)
+                .and_then(Symbol::value_declaration)
+                .expect("computed method source was prevalidated");
+            assert!(self.set_late_bound_links(
+                source,
+                LateBoundLinks {
+                    late_symbol: Some(late)
+                }
+            ));
+            assert!(self.set_symbol_node_links(
+                declaration,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(late)
+                }
+            ));
+        }
+        assert!(
+            self.computed_method_name_groups
+                .insert(
+                    late,
+                    ComputedMethodNameGroup {
+                        owner,
+                        key_type,
+                        key_symbol: keys[0].key_symbol,
+                        sources,
+                    },
+                )
+                .is_none()
+        );
+        assert_eq!(self.insert_symbol(members, name, late), Some(None));
+        Some(late)
+    }
+
     /// Publishes one or two source-planned direct-base edges exactly once.
     ///
     /// Callers reserve the map slot before beginning their semantic transaction.

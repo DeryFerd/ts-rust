@@ -8798,7 +8798,8 @@ mod tests {
         .unwrap();
         context.get_type_from_type_node(key_plan.type_node).unwrap();
         let (key_type, _) =
-            publish_computed_member_key_links(context.store_mut_for_test(), &key_plan).unwrap();
+            publish_computed_member_key_links(context.store_mut_for_test(), &host, &key_plan)
+                .unwrap();
         let early = bound.symbol(declaration).unwrap();
         let parameter_node = NodeRef::new(parsed.arena.id(), file, method_data.parameters.nodes[0]);
         let parameter = bound.symbol(parameter_node).unwrap();
@@ -9622,7 +9623,8 @@ mod tests {
             }
             let key_type = context.get_type_from_type_node(plan.type_node).unwrap();
             let (published_key, escaped_name) =
-                publish_computed_member_key_links(context.store_mut_for_test(), &plan).unwrap();
+                publish_computed_member_key_links(context.store_mut_for_test(), &host, &plan)
+                    .unwrap();
             assert_eq!(published_key, key_type);
             let owner = source_symbol(&parsed, file, &context, "Box");
             let early = bound.symbol(declaration).unwrap();
@@ -9732,7 +9734,7 @@ mod tests {
             Err(ComputedMemberKeyError::Invalid(plan.expression))
         );
         assert_eq!(
-            publish_computed_member_key_links(store, &plan),
+            publish_computed_member_key_links(store, &host, &plan),
             Err(ComputedMemberKeyError::Invalid(plan.expression))
         );
         assert_eq!(
@@ -9745,7 +9747,9 @@ mod tests {
         );
         assert!(store.set_type_node_links(plan.expression, TypeNodeLinks::default()));
         assert_eq!(
-            publish_computed_member_key_links(store, &plan).unwrap().0,
+            publish_computed_member_key_links(store, &host, &plan)
+                .unwrap()
+                .0,
             key_type
         );
 
@@ -10146,7 +10150,8 @@ mod tests {
             let key_plan = plan_computed_member_key(context.store(), &host, name).unwrap();
             context.get_type_from_type_node(key_plan.type_node).unwrap();
             let (key_type, key_name) =
-                publish_computed_member_key_links(context.store_mut_for_test(), &key_plan).unwrap();
+                publish_computed_member_key_links(context.store_mut_for_test(), &host, &key_plan)
+                    .unwrap();
             let early = bound.symbol(declaration).unwrap();
             let derived =
                 (!parameters.is_empty()).then(|| source_symbol(&parsed, file, &context, "Derived"));

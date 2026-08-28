@@ -25,9 +25,10 @@ use super::{
     object_members::{
         DirectInterfaceDeclaredState, PlannedComputedMemberKey, PropertyObjectError,
         PropertyObjectKind, PropertyObjectPlan, PropertyObjectState, ResolvedCallSignatureTypes,
-        StoredDeclaredCallSetValidation, prepare_direct_interface_declared_properties,
-        publish_declared_members, publish_prepared_direct_interface_declared_properties,
-        resolved_computed_member_key, validate_stored_declared_call_set,
+        StoredDeclaredCallSetValidation, planned_declared_property_key,
+        prepare_direct_interface_declared_properties, publish_declared_members,
+        publish_prepared_direct_interface_declared_properties, resolved_computed_member_key,
+        valid_declared_property_check_flags, validate_stored_declared_call_set,
     },
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
@@ -304,7 +305,7 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
         let record = store
             .symbol(property.symbol)
             .ok_or_else(|| invalid(plan, type_))?;
-        if record.name() != property.name.as_ref()
+        if planned_declared_property_key(store, property) != Some(record.name())
             || record.parent() != Some(plan.symbol)
             || !inherited_index_infos.is_empty()
                 && (record.flags().contains(SymbolFlags::OPTIONAL) != property.optional
@@ -359,7 +360,14 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
     }
 
     for (index, property) in plan.properties.iter().enumerate() {
-        let Some(base_property) = inherited_by_name.get(&property.name).copied() else {
+        let Some(base_property) = inherited_by_name
+            .get(
+                &planned_declared_property_key(store, property)
+                    .ok_or_else(|| invalid(plan, type_))?
+                    .to_owned(),
+            )
+            .copied()
+        else {
             continue;
         };
         let own_type = *property_types
@@ -772,16 +780,10 @@ pub(super) fn validate_planned_interface_heritage_members_with_array_targets(
     surface.owner == plan.symbol
         && surface.declared_properties == planned_properties
         && surface.declared_call_signatures == planned_calls
-        && plan.properties.iter().all(|property| {
-            store.symbol(property.symbol).is_some_and(|record| {
-                record.check_flags()
-                    == if property.readonly && !record.flags().intersects(SymbolFlags::ACCESSOR) {
-                        CheckFlags::READONLY
-                    } else {
-                        CheckFlags::NONE
-                    }
-            })
-        })
+        && plan
+            .properties
+            .iter()
+            .all(|property| valid_declared_property_check_flags(store, property))
 }
 
 /// Semantic-only exact proof consumed by structural relations.
@@ -1253,7 +1255,7 @@ pub(super) fn valid_declared_member_table(
         return false;
     };
     if declared.len() != resolved.len()
-        || raw.map_or(0, ts_binder::semantic::SymbolTable::len) >= resolved.len()
+        || computed_count == 0
         || raw
             .into_iter()
             .flat_map(ts_binder::semantic::SymbolTable::iter)
@@ -1267,6 +1269,8 @@ pub(super) fn valid_declared_member_table(
         return false;
     }
     let mut actual_computed = 0usize;
+    let mut computed_groups = 0usize;
+    let mut source_declarations = HashSet::new();
     let valid = declared.iter().all(|(name, symbol)| {
         if resolved.get(name) != Some(symbol) {
             return false;
@@ -1286,7 +1290,17 @@ pub(super) fn valid_declared_member_table(
         let Some(count) = actual_computed.checked_add(declarations.len()) else {
             return false;
         };
+        let Some(groups) = computed_groups.checked_add(1) else {
+            return false;
+        };
+        if declarations
+            .iter()
+            .any(|declaration| !source_declarations.insert(*declaration))
+        {
+            return false;
+        }
         actual_computed = count;
+        computed_groups = groups;
         valid_late_bound_unique_symbol_member(
             store,
             owner,
@@ -1296,7 +1310,12 @@ pub(super) fn valid_declared_member_table(
             Some(resolved),
         )
     });
-    valid && actual_computed == computed_count
+    valid
+        && actual_computed == computed_count
+        && raw
+            .map_or(0, ts_binder::semantic::SymbolTable::len)
+            .checked_add(computed_groups)
+            == Some(resolved.len())
 }
 
 fn declared_members(
@@ -1985,30 +2004,8 @@ pub(super) fn valid_late_bound_unique_symbol_member(
     {
         return false;
     }
-    if method {
-        let Some(source) = store.late_bound_method_source(symbol) else {
-            return false;
-        };
-        let Some(early) = store.symbol(source) else {
-            return false;
-        };
-        if early.flags() != member.flags().without(SymbolFlags::TRANSIENT)
-            || early.check_flags() != CheckFlags::NONE
-            || early.name() != InternalSymbolName::Computed.as_ref()
-            || early.declarations() != Some(declarations)
-            || early.value_declaration() != member.value_declaration()
-            || store.get_parent_of_symbol(source) != Some(owner)
-            || early.members().is_some()
-            || early.exports().is_some()
-            || early.export_symbol().is_some()
-            || store.get_merged_symbol(source) != Some(source)
-            || store
-                .late_bound_links(source)
-                .and_then(|links| links.late_symbol)
-                != Some(symbol)
-        {
-            return false;
-        }
+    if method && !store.late_bound_method_has_exact_sources(symbol, owner) {
+        return false;
     }
     declarations.iter().all(|declaration| {
         if store
