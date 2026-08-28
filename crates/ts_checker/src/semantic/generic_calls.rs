@@ -31,13 +31,15 @@ use super::{
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     inference::{
         InferenceLiteralTreatment, NakedTypeCandidateError, NakedTypeInferenceError,
-        infer_naked_type_parameter, infer_naked_type_parameter_candidates,
+        infer_call_type_parameter_candidates, infer_naked_type_parameter,
+        infer_naked_type_parameter_candidates,
         infer_naked_type_parameter_candidates_with_array_targets,
         infer_naked_type_parameter_variance_candidates, is_non_inferrable_inference_source,
-        validate_inference_leaf, validate_inference_leaf_with_array_targets,
+        validate_call_inference_candidate, validate_inference_leaf,
+        validate_inference_leaf_with_array_targets,
     },
     instantiate::{
-        InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
+        InstantiationError, InstantiationLimits, InstantiationSession,
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
@@ -426,6 +428,7 @@ pub(super) fn resolve_generic_call_vector_with_session(
         request,
         &callable,
         Some(CanonicalArrayTargets::from_global_types(global_types)),
+        Some(global_types),
         existing_call_signature,
         session,
         |store, source, target| {
@@ -562,6 +565,7 @@ pub(super) fn instantiate_generic_signature_in_context_of(
         store,
         &inference_shape,
         &contextual_arguments,
+        None,
         &mut |_, left, right| Ok(left == right),
         &mut |_, left, right| Ok(left == right),
         &mut |_, left, right| Ok(left == right),
@@ -941,6 +945,7 @@ fn project_validated_generic_call_vector(
         callable,
         array_targets,
         None,
+        None,
         &mut session,
         is_assignable,
         is_strict_subtype,
@@ -954,6 +959,7 @@ fn project_validated_generic_call_vector_with_session(
     request: GenericCallVectorRequest<'_>,
     callable: &ValidatedSingleCallable,
     array_targets: Option<CanonicalArrayTargets>,
+    global_types: Option<&CanonicalGlobalTypes>,
     existing_call_signature: Option<SignatureId>,
     session: &mut InstantiationSession,
     mut is_assignable: impl FnMut(
@@ -1020,6 +1026,7 @@ fn project_validated_generic_call_vector_with_session(
             store,
             &shape,
             request,
+            global_types,
             &mut is_assignable,
             &mut is_strict_subtype,
             &mut is_subtype,
@@ -1059,6 +1066,7 @@ fn project_validated_generic_call_vector_with_session(
             store,
             &shape,
             request.arguments,
+            global_types,
             &mut is_assignable,
             &mut is_strict_subtype,
             &mut is_subtype,
@@ -2087,10 +2095,12 @@ fn explicit_recovery_type_arguments(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn failure_type_arguments(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericCallSignatureShape,
     request: GenericCallVectorRequest<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -2114,6 +2124,7 @@ fn failure_type_arguments(
             store,
             shape,
             request.arguments,
+            global_types,
             is_assignable,
             is_strict_subtype,
             is_subtype,
@@ -2122,10 +2133,12 @@ fn failure_type_arguments(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_generic_call_type_arguments(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericCallSignatureShape,
     arguments: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
     is_assignable: &mut impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -2180,6 +2193,7 @@ fn infer_generic_call_type_arguments(
         collect_generic_call_inferences(
             store,
             shape.array_targets,
+            global_types,
             argument,
             parameter,
             &type_parameters,
@@ -2220,7 +2234,18 @@ fn infer_generic_call_type_arguments(
         } else {
             InferenceLiteralTreatment::Widen
         };
-        let candidate = if contravariant_buckets[index].is_empty() {
+        let candidate = if let Some(global_types) = global_types {
+            infer_call_type_parameter_candidates(
+                store,
+                &buckets[index],
+                &contravariant_buckets[index],
+                treatment,
+                global_types,
+                |store, source, target| is_assignable(store, source, target),
+                |store, source, target| is_strict_subtype(store, source, target),
+                |store, source, target| is_subtype(store, source, target),
+            )?
+        } else if contravariant_buckets[index].is_empty() {
             match shape.array_targets {
                 Some(array_targets) => infer_naked_type_parameter_candidates_with_array_targets(
                     store,
@@ -2296,6 +2321,7 @@ fn infer_generic_call_type_arguments(
 fn collect_generic_call_inferences(
     store: &mut CanonicalTypeMapperStore,
     array_targets: Option<CanonicalArrayTargets>,
+    global_types: Option<&CanonicalGlobalTypes>,
     source: TypeId,
     target: TypeId,
     type_parameters: &[TypeId],
@@ -2314,11 +2340,14 @@ fn collect_generic_call_inferences(
         .iter()
         .position(|type_parameter| *type_parameter == target)
     {
-        match array_targets {
-            Some(array_targets) => {
+        match (global_types, array_targets) {
+            (Some(global_types), _) => {
+                validate_call_inference_candidate(store, source, global_types)
+            }
+            (None, Some(array_targets)) => {
                 validate_inference_leaf_with_array_targets(store, source, array_targets)
             }
-            None => validate_inference_leaf(store, source),
+            (None, None) => validate_inference_leaf(store, source),
         }
         .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
         let bucket = if contravariant {
@@ -2344,11 +2373,14 @@ fn collect_generic_call_inferences(
             .map(super::type_records::TypeRecord::data)
         {
             Some(TypeData::Union(union)) => {
-                match array_targets {
-                    Some(targets) => {
+                match (global_types, array_targets) {
+                    (Some(global_types), _) => {
+                        validate_call_inference_candidate(store, source, global_types)
+                    }
+                    (None, Some(targets)) => {
                         validate_inference_leaf_with_array_targets(store, source, targets)
                     }
-                    None => validate_inference_leaf(store, source),
+                    (None, None) => validate_inference_leaf(store, source),
                 }
                 .map_err(|error| GenericCallVectorError::Inference(error.into()))?;
                 union.union.types.clone()
@@ -2372,12 +2404,14 @@ fn collect_generic_call_inferences(
         let candidate = match unmatched.as_slice() {
             [] => source,
             [candidate] => *candidate,
-            candidates => canonical_anonymous_union(store, candidates)
+            candidates => store
+                .literal_union_type_with_alias_and_array_targets(candidates, None, array_targets)
                 .map_err(|error| GenericCallVectorError::Inference(error.into()))?,
         };
         return collect_generic_call_inferences(
             store,
             array_targets,
+            global_types,
             candidate,
             template.parameter,
             type_parameters,
@@ -2442,6 +2476,7 @@ fn collect_generic_call_inferences(
             let result = collect_generic_call_inferences(
                 store,
                 Some(array_targets),
+                global_types,
                 source_reference.element_type,
                 target_reference.element_type,
                 type_parameters,
@@ -2508,6 +2543,7 @@ fn collect_generic_call_inferences(
             collect_generic_call_inferences(
                 store,
                 array_targets,
+                global_types,
                 source,
                 target,
                 type_parameters,
@@ -6892,6 +6928,7 @@ mod tests {
             collect_generic_call_inferences(
                 &mut store,
                 None,
+                None,
                 argument,
                 callable.parameters[0],
                 &[parameter],
@@ -7229,6 +7266,137 @@ mod tests {
                 &resolution.projection.instantiation,
             ),
             array,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn source_array_literal_inference_reuses_checked_signature_and_arity_recovery() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "declare function equal<T>(actual: T, expected: T): void; ",
+            "const literal: any = [{ log: 'value' }, { log: 1, highlighted: true }];",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(163_003);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-array-literal.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let node = |kind| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap()
+        };
+        let literal = context
+            .store()
+            .type_node_links(node(SyntaxKind::ArrayLiteralExpression))
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let symbol = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(node(SyntaxKind::FunctionDeclaration))
+            .unwrap();
+        let callee = context
+            .store()
+            .source_callable_type_for_owner(symbol)
+            .unwrap();
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let widened = store
+            .get_widened_type_with_global_types(literal, &globals)
+            .unwrap();
+        assert_ne!(literal, widened);
+        let arguments = [widened, literal];
+        let request = vector_request(callee, None, &arguments);
+        let first = resolve_generic_call_vector(store, &globals, true, request).unwrap();
+        assert_eq!(
+            first.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(first.projection.instantiation.type_arguments, [widened]);
+        assert!(!first.projection.recovery);
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+            )
+        };
+        let warm = counts(store);
+        assert_eq!(
+            resolve_generic_call_vector(store, &globals, true, request),
+            Ok(first.clone())
+        );
+        assert_eq!(counts(store), warm);
+
+        let explicit = resolve_generic_call_vector(
+            store,
+            &globals,
+            true,
+            vector_request(callee, Some(&[widened]), &arguments),
+        )
+        .unwrap();
+        assert_eq!(explicit.projection, first.projection);
+        assert_eq!(counts(store), warm);
+
+        let too_few = resolve_generic_call_vector(
+            store,
+            &globals,
+            true,
+            vector_request(callee, None, &[literal]),
+        )
+        .unwrap();
+        assert_eq!(
+            too_few.applicability,
+            GenericCallVectorApplicability::TooFewArguments {
+                expected: 2,
+                actual: 1,
+            }
+        );
+        assert_eq!(too_few.projection.instantiation.type_arguments, [widened]);
+        assert!(too_few.projection.recovery);
+        assert!(too_few.checked_instantiation.is_none());
+        assert_ne!(
+            too_few.projection.instantiation.signature,
+            first.projection.instantiation.signature
         );
     }
 
@@ -9401,6 +9569,7 @@ mod tests {
             &callable,
             Some(targets),
             None,
+            None,
             &mut session,
             |_, _, _| Ok(true),
             CanonicalTypeMapperStore::is_type_strict_subtype_of,
@@ -9452,6 +9621,7 @@ mod tests {
             vector_request(callable.owner, Some(&[number]), &[number]),
             &callable,
             Some(targets),
+            None,
             None,
             &mut session,
             |_, _, _| Ok(true),

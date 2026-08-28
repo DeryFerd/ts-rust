@@ -15,18 +15,19 @@
 //! candidates that do not require widening, including fresh literals.
 //! Authenticated internal placeholders are skipped so binding patterns cannot
 //! become the only source of a public type argument.
-//! Widening sentinels remain a typed boundary until the exact final
-//! `getWidenedType` step is available.
+//! Strict leaf APIs reject candidates that require widening. Call inference
+//! with authoritative globals accepts authenticated fresh literal graphs and
+//! applies `getWidenedType` after covariant selection.
 
 #![allow(dead_code)] // Installed ahead of the generic-call dispatch consumer.
 
 use std::collections::HashSet;
 
 use super::{
-    RelationUnavailable, TypeId,
+    CanonicalGlobalTypes, RelationUnavailable, TypeId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    bootstrap::LiteralTypeCacheError,
-    derived_types::DerivedObjectLiteralValidation,
+    bootstrap::{LiteralTypeCacheError, UnionReduction},
+    derived_types::{DerivedObjectLiteralValidation, DerivedTypeError},
     instantiate::canonical_anonymous_union,
     mapper::CanonicalTypeMapperStore,
     object_members::{
@@ -56,6 +57,7 @@ pub(super) enum NakedTypeCandidateError {
     Candidate(NakedTypeInferenceError),
     Union(LiteralTypeCacheError),
     Relation(RelationUnavailable),
+    Widening(DerivedTypeError),
 }
 
 impl From<NakedTypeInferenceError> for NakedTypeCandidateError {
@@ -73,6 +75,12 @@ impl From<LiteralTypeCacheError> for NakedTypeCandidateError {
 impl From<RelationUnavailable> for NakedTypeCandidateError {
     fn from(error: RelationUnavailable) -> Self {
         Self::Relation(error)
+    }
+}
+
+impl From<DerivedTypeError> for NakedTypeCandidateError {
+    fn from(error: DerivedTypeError) -> Self {
+        Self::Widening(error)
     }
 }
 
@@ -300,6 +308,7 @@ pub(super) fn infer_naked_type_parameter_candidates(
         candidates,
         treatment,
         None,
+        None,
         is_strict_subtype,
         is_subtype,
     )
@@ -326,6 +335,7 @@ pub(super) fn infer_naked_type_parameter_candidates_with_array_targets(
         candidates,
         treatment,
         Some(array_targets),
+        None,
         is_strict_subtype,
         is_subtype,
     )
@@ -343,6 +353,80 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
     contravariant: &[TypeId],
     treatment: InferenceLiteralTreatment,
     array_targets: Option<CanonicalArrayTargets>,
+    is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+    infer_type_parameter_variance_candidates(
+        store,
+        covariant,
+        contravariant,
+        treatment,
+        array_targets,
+        None,
+        is_assignable,
+        is_strict_subtype,
+        is_subtype,
+    )
+}
+
+/// Finalizes call candidates, widening only the selected covariant result.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn infer_call_type_parameter_candidates(
+    store: &mut CanonicalTypeMapperStore,
+    covariant: &[TypeId],
+    contravariant: &[TypeId],
+    treatment: InferenceLiteralTreatment,
+    global_types: &CanonicalGlobalTypes,
+    is_assignable: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_strict_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+    is_subtype: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+    infer_type_parameter_variance_candidates(
+        store,
+        covariant,
+        contravariant,
+        treatment,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        Some(global_types),
+        is_assignable,
+        is_strict_subtype,
+        is_subtype,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_type_parameter_variance_candidates(
+    store: &mut CanonicalTypeMapperStore,
+    covariant: &[TypeId],
+    contravariant: &[TypeId],
+    treatment: InferenceLiteralTreatment,
+    array_targets: Option<CanonicalArrayTargets>,
+    global_types: Option<&CanonicalGlobalTypes>,
     mut is_assignable: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -363,7 +447,14 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
         if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
             continue;
         }
-        validate_inference_leaf_with_optional_array_targets(store, *candidate, array_targets)?;
+        validate_inference_candidate(
+            store,
+            *candidate,
+            true,
+            array_targets,
+            global_types.is_some(),
+            &mut HashSet::new(),
+        )?;
     }
 
     let covariant = infer_naked_type_parameter_candidates_with_optional_array_targets(
@@ -371,6 +462,7 @@ pub(super) fn infer_naked_type_parameter_variance_candidates(
         covariant,
         treatment,
         array_targets,
+        global_types,
         |store, source, target| is_strict_subtype(store, source, target),
         |store, source, target| is_subtype(store, source, target),
     )?;
@@ -419,6 +511,7 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
     candidates: &[TypeId],
     treatment: InferenceLiteralTreatment,
     array_targets: Option<CanonicalArrayTargets>,
+    global_types: Option<&CanonicalGlobalTypes>,
     mut is_strict_subtype: impl FnMut(
         &mut CanonicalTypeMapperStore,
         TypeId,
@@ -430,13 +523,47 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
         TypeId,
     ) -> Result<bool, RelationUnavailable>,
 ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
-    let mut prepared = Vec::with_capacity(candidates.len());
+    let mut validated = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if is_non_inferrable_inference_source(store, *candidate, array_targets)? {
             continue;
         }
-        validate_inference_leaf_with_optional_array_targets(store, *candidate, array_targets)?;
-        let candidate = inference_candidate_literal_treatment(store, *candidate, treatment)?;
+        validate_inference_candidate(
+            store,
+            *candidate,
+            true,
+            array_targets,
+            global_types.is_some(),
+            &mut HashSet::new(),
+        )?;
+        if !validated.contains(candidate) {
+            validated.push(*candidate);
+        }
+    }
+    if let Some(global_types) = global_types
+        && validated.len() > 1
+    {
+        let (literal, mut nonliteral): (Vec<_>, Vec<_>) =
+            validated.into_iter().partition(|candidate| {
+                store.type_payload(*candidate).is_some_and(|record| {
+                    record
+                        .object_flags()
+                        .intersects(ObjectFlags::OBJECT_LITERAL | ObjectFlags::ARRAY_LITERAL)
+                })
+            });
+        if !literal.is_empty() {
+            nonliteral.push(store.expression_union_type_with_global_types(
+                global_types,
+                &literal,
+                UnionReduction::Subtype,
+            )?);
+        }
+        validated = nonliteral;
+    }
+    let mut prepared = Vec::with_capacity(validated.len());
+    for candidate in validated {
+        let candidate =
+            inference_candidate_literal_treatment(store, candidate, treatment, global_types)?;
         if !prepared.contains(&candidate) {
             prepared.push(candidate);
         }
@@ -453,7 +580,11 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
     let primary = if strict_null_checks {
         let mut primary = Vec::with_capacity(prepared.len());
         for candidate in &prepared {
-            primary.push(remove_nullable_from_candidate(store, *candidate)?);
+            primary.push(remove_nullable_from_candidate(
+                store,
+                *candidate,
+                global_types,
+            )?);
         }
         primary
     } else {
@@ -462,14 +593,36 @@ fn infer_naked_type_parameter_candidates_with_optional_array_targets(
     let common = if primary.len() == 1 {
         primary[0]
     } else if literal_candidates_have_same_base(store, &primary) {
-        canonical_anonymous_union(store, &primary)?
+        inference_union(store, &primary, global_types)?
     } else {
         single_common_supertype(store, &primary, &mut is_strict_subtype, &mut is_subtype)?
     };
-    if strict_null_checks && nullable != TypeFlags::NONE {
-        add_nullable_to_candidate(store, common, nullable).map(Some)
+    let common = if strict_null_checks && nullable != TypeFlags::NONE {
+        add_nullable_to_candidate(store, common, nullable, global_types)?
     } else {
-        Ok(Some(common))
+        common
+    };
+    match global_types {
+        Some(global_types) => store
+            .get_widened_type_with_global_types(common, global_types)
+            .map(Some)
+            .map_err(Into::into),
+        None => Ok(Some(common)),
+    }
+}
+
+fn inference_union(
+    store: &mut CanonicalTypeMapperStore,
+    types: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+) -> Result<TypeId, LiteralTypeCacheError> {
+    match global_types {
+        Some(global_types) => store.expression_union_type_with_global_types(
+            global_types,
+            types,
+            UnionReduction::Literal,
+        ),
+        None => canonical_anonymous_union(store, types),
     }
 }
 
@@ -541,6 +694,7 @@ fn combined_nullable_flags(
 fn remove_nullable_from_candidate(
     store: &mut CanonicalTypeMapperStore,
     candidate: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
 ) -> Result<TypeId, NakedTypeCandidateError> {
     let record =
         store
@@ -561,12 +715,12 @@ fn remove_nullable_from_candidate(
     let mut filtered = Vec::with_capacity(constituents.len());
     let mut changed = false;
     for constituent in constituents {
-        let primary = remove_nullable_from_candidate(store, constituent)?;
+        let primary = remove_nullable_from_candidate(store, constituent, global_types)?;
         changed |= primary != constituent;
         filtered.push(primary);
     }
     if changed {
-        canonical_anonymous_union(store, &filtered).map_err(Into::into)
+        inference_union(store, &filtered, global_types).map_err(Into::into)
     } else {
         Ok(candidate)
     }
@@ -576,6 +730,7 @@ fn add_nullable_to_candidate(
     store: &mut CanonicalTypeMapperStore,
     candidate: TypeId,
     nullable: TypeFlags,
+    global_types: Option<&CanonicalGlobalTypes>,
 ) -> Result<TypeId, NakedTypeCandidateError> {
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -590,13 +745,14 @@ fn add_nullable_to_candidate(
     if nullable.intersects(TypeFlags::NULL) {
         types.push(null);
     }
-    canonical_anonymous_union(store, &types).map_err(Into::into)
+    inference_union(store, &types, global_types).map_err(Into::into)
 }
 
 fn inference_candidate_literal_treatment(
     store: &mut CanonicalTypeMapperStore,
     candidate: TypeId,
     treatment: InferenceLiteralTreatment,
+    global_types: Option<&CanonicalGlobalTypes>,
 ) -> Result<TypeId, LiteralTypeCacheError> {
     if treatment == InferenceLiteralTreatment::Preserve {
         return Ok(candidate);
@@ -639,12 +795,17 @@ fn inference_candidate_literal_treatment(
             let mut treated = Vec::with_capacity(constituents.len());
             let mut changed = false;
             for constituent in constituents {
-                let mapped = inference_candidate_literal_treatment(store, constituent, treatment)?;
+                let mapped = inference_candidate_literal_treatment(
+                    store,
+                    constituent,
+                    treatment,
+                    global_types,
+                )?;
                 changed |= mapped != constituent;
                 treated.push(mapped);
             }
             if changed {
-                canonical_anonymous_union(store, &treated)
+                inference_union(store, &treated, global_types)
             } else {
                 Ok(candidate)
             }
@@ -724,12 +885,35 @@ pub(super) fn validate_inference_leaf_with_array_targets(
     validate_inference_leaf_with_optional_array_targets(store, candidate, Some(array_targets))
 }
 
+/// Admits authenticated literal graphs before call inference selects a result.
+pub(super) fn validate_call_inference_candidate(
+    store: &CanonicalTypeMapperStore,
+    candidate: TypeId,
+    global_types: &CanonicalGlobalTypes,
+) -> Result<(), NakedTypeInferenceError> {
+    validate_inference_candidate(
+        store,
+        candidate,
+        true,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        true,
+        &mut HashSet::new(),
+    )
+}
+
 fn validate_inference_leaf_with_optional_array_targets(
     store: &CanonicalTypeMapperStore,
     candidate: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), NakedTypeInferenceError> {
-    validate_inference_candidate(store, candidate, true, array_targets, &mut HashSet::new())
+    validate_inference_candidate(
+        store,
+        candidate,
+        true,
+        array_targets,
+        false,
+        &mut HashSet::new(),
+    )
 }
 
 fn validate_inference_candidate(
@@ -737,14 +921,16 @@ fn validate_inference_candidate(
     candidate: TypeId,
     allow_declared_object: bool,
     array_targets: Option<CanonicalArrayTargets>,
+    allow_widening: bool,
     active_candidates: &mut HashSet<TypeId>,
 ) -> Result<(), NakedTypeInferenceError> {
     let record = store
         .type_payload(candidate)
         .ok_or(NakedTypeInferenceError::InvalidCandidate(candidate))?;
-    if record
-        .object_flags()
-        .intersects(ObjectFlags::REQUIRES_WIDENING)
+    if !allow_widening
+        && record
+            .object_flags()
+            .intersects(ObjectFlags::REQUIRES_WIDENING)
     {
         return Err(NakedTypeInferenceError::RequiresWidening(candidate));
     }
@@ -776,6 +962,7 @@ fn validate_inference_candidate(
                     reference.element_type,
                     true,
                     Some(array_targets),
+                    allow_widening,
                     active_candidates,
                 );
                 active_candidates.remove(&candidate);
@@ -804,6 +991,7 @@ fn validate_inference_candidate(
                     *element,
                     true,
                     array_targets,
+                    allow_widening,
                     active_candidates,
                 )
             });
@@ -830,7 +1018,11 @@ fn validate_inference_candidate(
         }
         DeclaredPropertyObjectValidation::NotDeclared => {}
     }
-    match store.validate_union_constituent(candidate) {
+    let validation = match array_targets.filter(|_| allow_widening) {
+        Some(targets) => store.validate_union_constituent_with_array_targets(targets, candidate),
+        None => store.validate_union_constituent(candidate),
+    };
+    match validation {
         Ok(()) => {}
         Err(LiteralTypeCacheError::UnsupportedUnionConstituent(_)) => {
             return Err(NakedTypeInferenceError::UnsupportedCandidate(candidate));
@@ -843,6 +1035,11 @@ fn validate_inference_candidate(
         TypeData::Intrinsic(_) if intrinsic_leaf_flags(record.flags()) => Ok(()),
         TypeData::Literal(_) if literal_leaf_flags(record.flags()) => Ok(()),
         TypeData::UniqueEsSymbol(_) if record.flags() == TypeFlags::UNIQUE_ES_SYMBOL => Ok(()),
+        TypeData::Object(_)
+            if allow_widening && store.validate_fresh_object_literal_for_relation(candidate) =>
+        {
+            Ok(())
+        }
         TypeData::Object(_)
             if matches!(
                 array_targets.map_or_else(
@@ -882,7 +1079,14 @@ fn validate_inference_candidate(
                         constituent: *constituent,
                     });
                 }
-                validate_inference_candidate(store, *constituent, false, None, active_candidates)?;
+                validate_inference_candidate(
+                    store,
+                    *constituent,
+                    false,
+                    array_targets.filter(|_| allow_widening),
+                    allow_widening,
+                    active_candidates,
+                )?;
             }
             Ok(())
         }
@@ -1023,6 +1227,31 @@ mod tests {
             CanonicalTypeMapperStore::is_type_assignable_to,
             CanonicalTypeMapperStore::is_type_strict_subtype_of,
             CanonicalTypeMapperStore::is_type_subtype_of,
+        )
+    }
+
+    fn infer_call(
+        store: &mut CanonicalTypeMapperStore,
+        global_types: &CanonicalGlobalTypes,
+        covariant: &[TypeId],
+        contravariant: &[TypeId],
+        treatment: InferenceLiteralTreatment,
+    ) -> Result<Option<TypeId>, NakedTypeCandidateError> {
+        infer_call_type_parameter_candidates(
+            store,
+            covariant,
+            contravariant,
+            treatment,
+            global_types,
+            |store, source, target| {
+                store.is_type_assignable_to_with_global_types(source, target, global_types)
+            },
+            |store, source, target| {
+                store.is_type_strict_subtype_of_with_global_types(source, target, global_types)
+            },
+            |store, source, target| {
+                store.is_type_subtype_of_with_global_types(source, target, global_types)
+            },
         )
     }
 
@@ -1824,6 +2053,233 @@ mod tests {
                 Ok(Some(array)),
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn call_inference_groups_literals_before_widening_and_preserves_contravariance() {
+        let source = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "const marked: any = { log: 'value', highlighted: true }; ",
+            "const numeric: any = { log: 1 }; ",
+            "const values: any = [{ log: 'value' }, ",
+            "{ log: 'value', highlighted: true }, { log: 1 }];",
+        ));
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(163_002);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/call-inference-widening.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &source.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let mut literals = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::ObjectLiteralExpression | SyntaxKind::ArrayLiteralExpression,
+                )
+                .then_some((
+                    record.range.start,
+                    NodeRef::new(source.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        literals.sort_by_key(|(start, _)| *start);
+        let types = literals
+            .iter()
+            .map(|(_, node)| {
+                context
+                    .store()
+                    .type_node_links(*node)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [marked, numeric, array, ..] = types.as_slice() else {
+            panic!("expected the source objects and array")
+        };
+        let (marked, numeric, array) = (*marked, *numeric, *array);
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+
+        for candidate in [marked, numeric, array] {
+            assert_eq!(
+                validate_inference_leaf_with_array_targets(store, candidate, targets),
+                Err(NakedTypeInferenceError::RequiresWidening(candidate)),
+            );
+            assert_eq!(
+                validate_call_inference_candidate(store, candidate, &globals),
+                Ok(())
+            );
+            let before = (store.type_len(), store.symbol_len());
+            assert_eq!(
+                infer_call(
+                    store,
+                    &globals,
+                    &[],
+                    &[candidate],
+                    InferenceLiteralTreatment::Widen
+                ),
+                Ok(Some(candidate)),
+            );
+            assert_eq!((store.type_len(), store.symbol_len()), before);
+        }
+
+        let grouped = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[marked, numeric],
+                UnionReduction::Subtype,
+            )
+            .unwrap();
+        let expected = store
+            .get_widened_type_with_global_types(grouped, &globals)
+            .unwrap();
+        for candidates in [[marked, numeric], [numeric, marked]] {
+            assert_eq!(
+                infer_call(
+                    store,
+                    &globals,
+                    &candidates,
+                    &[],
+                    InferenceLiteralTreatment::Preserve
+                ),
+                Ok(Some(expected)),
+            );
+        }
+        let TypeData::Union(union) = store.type_payload(expected).unwrap().data() else {
+            panic!("both object shapes must remain in the inferred union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.iter().any(|member| {
+            store
+                .type_payload(*member)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("highlighted"))
+                .and_then(|property| store.symbol(property))
+                .is_some_and(|property| property.flags().contains(SymbolFlags::OPTIONAL))
+        }));
+        assert_eq!(
+            infer_call(
+                store,
+                &globals,
+                &[marked, string],
+                &[],
+                InferenceLiteralTreatment::Preserve
+            ),
+            Ok(Some(string)),
+            "nonliteral candidates precede the grouped literal candidate",
+        );
+
+        let widened_array = store
+            .get_widened_type_with_global_types(array, &globals)
+            .unwrap();
+        assert_ne!(array, widened_array);
+        assert_eq!(
+            infer_call(
+                store,
+                &globals,
+                &[array],
+                &[],
+                InferenceLiteralTreatment::Preserve
+            ),
+            Ok(Some(widened_array)),
+        );
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+        );
+        for candidates in [[array, widened_array], [widened_array, array]] {
+            assert_eq!(
+                infer_call(
+                    store,
+                    &globals,
+                    &candidates,
+                    &[],
+                    InferenceLiteralTreatment::Widen
+                ),
+                Ok(Some(widened_array)),
+            );
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len()
+            ),
+            before,
+        );
+
+        let forged = store
+            .alloc_plain_object_type(
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+                None,
+            )
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+        );
+        assert!(
+            infer_call(
+                store,
+                &globals,
+                &[marked, forged],
+                &[],
+                InferenceLiteralTreatment::Preserve,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len()
+            ),
+            before,
+        );
     }
 
     #[test]
