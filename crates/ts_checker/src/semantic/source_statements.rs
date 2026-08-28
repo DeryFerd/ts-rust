@@ -420,6 +420,10 @@ pub(super) enum SourceLinearFunctionStatementSyntax {
         statement: NodeRef,
         expression: NodeRef,
     },
+    Throw {
+        statement: NodeRef,
+        expression: NodeRef,
+    },
 }
 
 /// One function-owned enum, including the binder's reachability classification.
@@ -431,7 +435,7 @@ pub(super) struct SourceLocalEnumStatementSyntax {
     pub(super) unreachable: bool,
 }
 
-/// Ordered local statements with a return that can precede one unreachable enum.
+/// Ordered local statements with a final return or a throw and unreachable expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceLinearFunctionStatementsSyntax {
     pub(super) body: NodeRef,
@@ -439,6 +443,7 @@ pub(super) struct SourceLinearFunctionStatementsSyntax {
     pub(super) statements: Vec<SourceLinearFunctionStatementSyntax>,
     pub(super) return_statement: Option<NodeRef>,
     pub(super) return_expression: Option<NodeRef>,
+    pub(super) unreachable_ranges: Vec<CanonicalCheckerDiagnosticRange>,
 }
 
 /// One initialized lexical declaration or expression inside a loop body.
@@ -3455,6 +3460,7 @@ fn switch_clause_unreachable_ranges(
                     | SyntaxKind::ImportDeclaration
                     | SyntaxKind::TypeAliasDeclaration
                     | SyntaxKind::InterfaceDeclaration
+                    | SyntaxKind::FunctionDeclaration
             ) =>
             {
                 false
@@ -6346,8 +6352,21 @@ impl SyntaxPlanner<'_> {
         let mut statements = Vec::new();
         let mut return_statement = None;
         let mut return_expression = None;
+        let mut has_throw = false;
         for (index, statement_id) in body_statements.iter().copied().enumerate() {
             let statement = self.reference(statement_id);
+            if has_throw
+                && !matches!(
+                    self.node(statement)?.kind,
+                    SyntaxKind::ExpressionStatement | SyntaxKind::ThrowStatement
+                )
+            {
+                return Err(self.unsupported(
+                    statement,
+                    self.node(statement)?.kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
             match self.node(statement)?.kind {
                 SyntaxKind::VariableStatement
                 | SyntaxKind::Block
@@ -6385,6 +6404,16 @@ impl SyntaxPlanner<'_> {
                         expression,
                     });
                 }
+                SyntaxKind::ThrowStatement
+                    if self.callable.family == SourceCallableFamily::FunctionDeclaration =>
+                {
+                    let expression = self.plan_linear_throw(statement, body, declaration)?;
+                    statements.push(SourceLinearFunctionStatementSyntax::Throw {
+                        statement,
+                        expression,
+                    });
+                    has_throw = true;
+                }
                 SyntaxKind::ReturnStatement
                     if index + 1 == body_statements.len()
                         || index + 2 == body_statements.len()
@@ -6420,7 +6449,7 @@ impl SyntaxPlanner<'_> {
         if flow.container_start(declaration).is_none() {
             return Err(SourceFunctionStatementsInvariant::MissingFlowStart(declaration).into());
         }
-        if return_statement.is_some() && flow.container_end(declaration).is_some() {
+        if (return_statement.is_some() || has_throw) && flow.container_end(declaration).is_some() {
             return Err(SourceFunctionStatementsInvariant::UnexpectedFlowEnd(declaration).into());
         }
         if flow.container_return(declaration).is_some() {
@@ -6435,6 +6464,15 @@ impl SyntaxPlanner<'_> {
             statements,
             return_statement,
             return_expression,
+            unreachable_ranges: if has_throw {
+                let body_statements = body_statements
+                    .iter()
+                    .map(|statement| self.reference(*statement))
+                    .collect::<Vec<_>>();
+                switch_clause_unreachable_ranges(self.arena, self.bound, body, &body_statements)?
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -8097,6 +8135,47 @@ impl SyntaxPlanner<'_> {
             ));
         }
         Ok(())
+    }
+
+    fn plan_linear_throw(
+        &self,
+        statement: NodeRef,
+        body: NodeRef,
+        callable: NodeRef,
+    ) -> Result<NodeRef, SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::ThrowStatement(thrown) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::ThrowStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.node)
+            || thrown.flow_node.is_some()
+            || thrown.facts != 0
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_range(statement, body)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+        let expression = self.reference(thrown.expression);
+        self.validate_parent(
+            expression,
+            Some(statement.node),
+            SourceFunctionStatementsRole::BodyStatement,
+        )?;
+        self.validate_range(expression, statement)?;
+        self.validate_container(expression, callable)?;
+        self.validate_block_scope_container(expression, callable)?;
+        Ok(expression)
     }
 
     fn plan_linear_return(
@@ -11384,6 +11463,46 @@ mod joined_tests {
                 [SourceLinearFunctionStatementSyntax::Expression { .. }],
             ));
         }
+    }
+
+    #[test]
+    fn linear_body_retains_throw_and_grouped_unreachable_calls() {
+        let source = "function fail() { throw 0; log(1); log(2); }";
+        let fixture = JoinedFixture::new(source, FileId::new(1_295));
+        let syntax = fixture.linear_plan().unwrap();
+        let [
+            SourceLinearFunctionStatementSyntax::Throw {
+                statement: thrown, ..
+            },
+            SourceLinearFunctionStatementSyntax::Expression {
+                statement: first, ..
+            },
+            SourceLinearFunctionStatementSyntax::Expression {
+                statement: second, ..
+            },
+        ] = syntax.statements.as_slice()
+        else {
+            panic!("expected the throw and both calls in source order")
+        };
+        assert_eq!(
+            fixture.bound.flow_graph().is_unreachable(*thrown),
+            Some(false)
+        );
+        for call in [*first, *second] {
+            assert_eq!(fixture.bound.flow_graph().is_unreachable(call), Some(true));
+            assert!(fixture.bound.flow_at(call).is_none());
+        }
+        let [range] = syntax.unreachable_ranges.as_slice() else {
+            panic!("expected one grouped unreachable range")
+        };
+        let range = range.range();
+        assert_eq!(
+            &source[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "log(1); log(2);",
+        );
+        assert!(syntax.return_statement.is_none());
+        assert!(syntax.return_expression.is_none());
     }
 
     #[test]

@@ -1413,6 +1413,7 @@ struct PlannedLinearFunctionStatements {
     statements: Vec<PlannedLinearFunctionStatement>,
     return_statement: Option<NodeRef>,
     return_expression: Option<PlannedExpression>,
+    unreachable_ranges: Vec<CanonicalCheckerDiagnosticRange>,
     flow: SourceFlowPlan,
 }
 
@@ -1460,13 +1461,17 @@ enum PlannedLinearFunctionStatement {
         statement: NodeRef,
         expression: Box<PlannedExpression>,
     },
+    Throw {
+        statement: NodeRef,
+        expression: Box<PlannedExpression>,
+    },
 }
 
 impl PlannedLinearFunctionStatement {
     fn flow_point(&self, locals: &[PlannedVariable]) -> Option<NodeRef> {
         match self {
             Self::Local(index) => locals.get(*index).map(|local| local.name),
-            Self::Expression { statement, .. } => Some(*statement),
+            Self::Expression { statement, .. } | Self::Throw { statement, .. } => Some(*statement),
             Self::ParameterAssignment(assignment) => Some(assignment.statement),
             Self::Function(_) | Self::Enum(_) => None,
         }
@@ -7889,7 +7894,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(Some(function.type_.is_some()))
     }
 
-    /// Proves that constructor evaluation remains inside an admitted top-level expression.
+    /// Proves that constructor evaluation remains inside an admitted source expression.
     fn is_top_level_constructor_expression(
         &self,
         expression: NodeRef,
@@ -7999,6 +8004,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if current == expression && statement.expression == Some(current.node) =>
                 {
                     return self.is_direct_top_level_function_return(current);
+                }
+                (NodeData::ThrowStatement(statement), SyntaxKind::ThrowStatement)
+                    if current == expression && statement.expression == current.node =>
+                {
+                    let Some(body) = record.parent.map(|node| self.reference(node)) else {
+                        return Ok(false);
+                    };
+                    let body_record = self.node(body)?;
+                    let NodeData::Block(block) = &body_record.data else {
+                        return Ok(false);
+                    };
+                    let Some(function) = body_record.parent.map(|node| self.reference(node)) else {
+                        return Ok(false);
+                    };
+                    let function_record = self.node(function)?;
+                    let NodeData::FunctionDeclaration(declaration) = &function_record.data else {
+                        return Ok(false);
+                    };
+                    return Ok(record.flags.0 == 0
+                        && statement.flow_node.is_none()
+                        && statement.facts == 0
+                        && body_record.kind == SyntaxKind::Block
+                        && body_record.flags.0 == 0
+                        && block.statements.nodes.contains(&parent.node)
+                        && function_record.kind == SyntaxKind::FunctionDeclaration
+                        && declaration.body == Some(body.node)
+                        && self.bound.container(current) == Some(function)
+                        && self.bound.flow_container(parent) == Some(function));
                 }
                 _ => return Ok(false),
             }
@@ -13051,6 +13084,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             statements: statement_syntax,
             return_statement,
             return_expression,
+            unreachable_ranges,
         } = syntax;
         if body != callable.body {
             return Err(SourceCheckError::Function(
@@ -13058,6 +13092,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         if return_expression.is_none()
+            && !statement_syntax.iter().any(|statement| {
+                matches!(statement, SourceLinearFunctionStatementSyntax::Throw { .. })
+            })
             && !self.function_empty_body_return_supported(callable.return_type)?
         {
             return Err(Self::unsupported_function_body(callable));
@@ -13098,7 +13135,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 }
                 SourceLinearFunctionStatementSyntax::Local(_)
-                | SourceLinearFunctionStatementSyntax::Expression { .. } => {}
+                | SourceLinearFunctionStatementSyntax::Expression { .. }
+                | SourceLinearFunctionStatementSyntax::Throw { .. } => {}
             }
         }
 
@@ -13170,6 +13208,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression: Box::new(expression),
                     });
                 }
+                SourceLinearFunctionStatementSyntax::Throw {
+                    statement,
+                    expression,
+                } => {
+                    statements.push(PlannedLinearFunctionStatement::Throw {
+                        statement,
+                        expression: Box::new(self.plan_expression(expression)?),
+                    });
+                }
             }
         }
         if expected_locals.next().is_some()
@@ -13194,7 +13241,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                     Some(assignment.statement)
                 }
-                PlannedLinearFunctionStatement::Expression { statement, .. } => Some(*statement),
+                PlannedLinearFunctionStatement::Expression { statement, .. }
+                | PlannedLinearFunctionStatement::Throw { statement, .. } => Some(*statement),
             })
             .chain(return_statement)
             .collect::<Vec<_>>();
@@ -13207,8 +13255,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .collect::<Vec<_>>();
         // Parenthesized async IIFEs do not create binder CALL flow nodes.
         let calls = statements.iter().filter_map(|statement| match statement {
-            PlannedLinearFunctionStatement::Expression { expression, .. }
-                if matches!(
+            PlannedLinearFunctionStatement::Expression {
+                statement,
+                expression,
+            } if self.bound.flow_graph().is_unreachable(*statement) != Some(true)
+                && matches!(
                     &expression.kind,
                     PlannedExpressionKind::Call(call)
                         if !matches!(
@@ -13243,6 +13294,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             statements,
             return_statement,
             return_expression,
+            unreachable_ranges,
             flow,
         })
     }
@@ -14658,7 +14710,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     });
                 }
                 SourceLinearFunctionStatementSyntax::Function(_)
-                | SourceLinearFunctionStatementSyntax::Enum(_) => {
+                | SourceLinearFunctionStatementSyntax::Enum(_)
+                | SourceLinearFunctionStatementSyntax::Throw { .. } => {
                     return Err(Self::unsupported_function_body(callable));
                 }
             }
@@ -21807,7 +21860,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                     )));
                 };
-                let function_return = self.is_direct_top_level_function_return(expression)?;
+                let early_preparation = self.is_direct_top_level_function_return(expression)?
+                    || self.node(expression)?.parent.is_some_and(|parent| {
+                        self.arena
+                            .get(parent)
+                            .is_some_and(|record| record.kind == SyntaxKind::ThrowStatement)
+                    });
                 let mut construction = plan_direct_default_new(
                     self.arena,
                     self.bound,
@@ -21816,7 +21874,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     &self.prior_classes,
                     &self.value_import_bindings,
                     expression,
-                    function_return,
+                    early_preparation,
                 )
                 .map_err(|error| Self::new_plan_error(expression, error))?;
                 if let Some(binding) = self
@@ -39258,7 +39316,8 @@ fn check_planned_linear_function_statements(
             }
             PlannedLinearFunctionStatement::Local(_)
             | PlannedLinearFunctionStatement::ParameterAssignment(_)
-            | PlannedLinearFunctionStatement::Expression { .. } => {}
+            | PlannedLinearFunctionStatement::Expression { .. }
+            | PlannedLinearFunctionStatement::Throw { .. } => {}
         }
     }
 
@@ -39267,7 +39326,31 @@ fn check_planned_linear_function_statements(
         .frame(bound, base_flow_types.clone())
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
     let mut nested_flow_types = base_flow_types.clone();
+    let mut unreachable_ranges = statements.unreachable_ranges.iter().peekable();
     for statement in &statements.statements {
+        if let Some(point) = statement.flow_point(&statements.locals)
+            && let Some(range) = unreachable_ranges.peek()
+            && host
+                .node(point)
+                .is_some_and(|record| record.range.start == range.range().start)
+        {
+            let range = **range;
+            if options.allow_unreachable_code == Some(false) {
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(range.anchor()),
+                        range_override: Some(range),
+                        diagnostic: Diagnostic::new(
+                            message_by_code(7027)
+                                .ok_or(SourceCheckError::MissingDiagnostic(7027))?,
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+            }
+            unreachable_ranges.next();
+        }
         match statement {
             PlannedLinearFunctionStatement::Local(index) => {
                 let local = statements
@@ -39504,6 +39587,10 @@ fn check_planned_linear_function_statements(
             PlannedLinearFunctionStatement::Expression {
                 statement,
                 expression,
+            }
+            | PlannedLinearFunctionStatement::Throw {
+                statement,
+                expression,
             } => {
                 let snapshot = frame
                     .snapshot_at(store, global_types, *statement)
@@ -39524,6 +39611,11 @@ fn check_planned_linear_function_statements(
                 )?;
             }
         }
+    }
+    if unreachable_ranges.next().is_some() {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(callable.body),
+        ));
     }
 
     let Some(return_statement) = statements.return_statement else {
@@ -54891,7 +54983,8 @@ pub(super) fn check_source_file(
                         PlannedLinearFunctionStatement::Local(_)
                         | PlannedLinearFunctionStatement::Enum(_)
                         | PlannedLinearFunctionStatement::ParameterAssignment(_)
-                        | PlannedLinearFunctionStatement::Expression { .. } => None,
+                        | PlannedLinearFunctionStatement::Expression { .. }
+                        | PlannedLinearFunctionStatement::Throw { .. } => None,
                         PlannedLinearFunctionStatement::Function(function) => {
                             Some(function.as_ref())
                         }

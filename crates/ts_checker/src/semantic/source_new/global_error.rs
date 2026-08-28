@@ -42,7 +42,7 @@ fn reference_names(
             == Some(symbol)
 }
 
-// Select a real Error overload that accepts no arguments.
+// Select a real Error overload with optional parameters.
 pub(super) fn plan(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -68,7 +68,21 @@ pub(super) fn plan(
     let owner_record = store.symbol(owner).ok_or_else(reject)?;
     let declarations = owner_record.declarations().ok_or_else(reject)?;
     if globals.get_source("Error").and_then(|raw| store.get_merged_symbol(raw)) != Some(symbol)
-        || !super::super::instantiated_members::valid_generic_interface_value_merge(store, symbol)
+        || !super::super::object_members::authenticated_default_library_interface_owner(
+            store, symbol,
+        )
+        || error.flags().without(SymbolFlags::TRANSIENT)
+            != SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || error.declarations().is_none_or(|declarations| {
+            declarations.iter().any(|declaration| {
+                !matches!(
+                    store.source_node_kind(*declaration),
+                    Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::VariableDeclaration)
+                )
+            }) || declarations.iter().copied().find(|declaration| {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::VariableDeclaration)
+            }) != Some(declaration)
+        })
         || !store.source_is_default_library_declaration(declaration)
         || error.parent().is_some()
         || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
@@ -233,6 +247,24 @@ pub(super) fn plan(
         .flat_map(|(_, candidates)| candidates)
         .next()
         .ok_or_else(reject)
+}
+
+pub(super) fn message_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global: &ErrorConstructorPlan,
+) -> Result<SourceNewParameter, SourceNewError> {
+    let reject = || unsupported(SourceNewUnsupported::Arguments(global.declaration));
+    let &(_, symbol, annotation) = global.parameters.first().ok_or_else(reject)?;
+    let record = host.node(annotation).ok_or_else(reject)?;
+    if record.kind != SyntaxKind::StringKeyword || record.flags.0 != 0 {
+        return Err(reject());
+    }
+    let type_ = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.string_type)
+        .ok_or_else(reject)?;
+    Ok(SourceNewParameter { symbol, type_ })
 }
 
 pub(super) fn resolve(

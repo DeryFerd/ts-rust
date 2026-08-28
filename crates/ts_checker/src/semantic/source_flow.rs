@@ -4057,6 +4057,9 @@ fn insert_flow_point(
     validate_node_container(bound, graph, container, point)?;
     let flow = bound
         .flow_at(point)
+        .or_else(|| {
+            (graph.is_unreachable(point) == Some(true)).then(|| graph.nodes().unreachable())
+        })
         .ok_or(SourceFlowInvariant::MissingFlowPoint(point))?;
     if points.contains_key(&point) {
         return if reject_duplicate {

@@ -55,7 +55,7 @@ use super::{
     source_imports::SourceImportBindingPlan,
     store::{CachedSignatureLookup, SourceNodeParent},
     type_nodes::{CanonicalTypeQuery, normalize_numeric_separators},
-    type_records::{StructuredTypeData, TypeCacheState, TypeRecord, type_list_key},
+    type_records::{LiteralValue, StructuredTypeData, TypeCacheState, TypeRecord, type_list_key},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -166,7 +166,7 @@ pub(super) struct SourceDefaultNewPlan {
     constructor: NodeRef,
     resolved_symbol: SemanticSymbolId,
     target: SourceNewTarget,
-    function_return: bool,
+    early_preparation: bool,
     type_arguments: Vec<SourceNewTypeArgument>,
     argument: Option<SourceNewArgument>,
     additional_arguments: Vec<SourceNewArgument>,
@@ -261,7 +261,7 @@ impl SourceGlobalDateInitializerPlan {
             constructor: self.constructor,
             resolved_symbol: self.symbol,
             target: SourceNewTarget::GlobalDate(self.global),
-            function_return: false,
+            early_preparation: false,
             type_arguments: Vec::new(),
             argument: None,
             additional_arguments: Vec::new(),
@@ -350,7 +350,7 @@ impl SourceDefaultNewPlan {
     }
 
     pub(super) const fn requires_early_preparation(&self) -> bool {
-        self.function_return
+        self.early_preparation
     }
 
     pub(super) fn is_imported_class(&self) -> bool {
@@ -678,7 +678,7 @@ pub(super) fn plan_direct_default_new(
     prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
     import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     node: NodeRef,
-    function_return: bool,
+    early_preparation: bool,
 ) -> Result<SourceDefaultNewPlan, SourceNewError> {
     let record = arena
         .get(node.node)
@@ -997,13 +997,12 @@ pub(super) fn plan_direct_default_new(
             .and_then(|symbol| store.get_merged_symbol(symbol))
             == Some(symbol)
     {
-        if argument.is_some() {
-            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
-        }
-        (
-            SourceNewTarget::GlobalError(global_error::plan(store, host, constructor, symbol)?),
-            None,
-        )
+        let global = global_error::plan(store, host, constructor, symbol)?;
+        let parameter = argument
+            .as_ref()
+            .map(|_| global_error::message_parameter(store, host, &global))
+            .transpose()?;
+        (SourceNewTarget::GlobalError(global), parameter)
     } else if global_promise {
         let Some(executor) = executor else {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -1150,7 +1149,7 @@ pub(super) fn plan_direct_default_new(
         constructor,
         resolved_symbol,
         target,
-        function_return,
+        early_preparation,
         type_arguments,
         argument,
         additional_arguments,
@@ -3857,7 +3856,12 @@ pub(super) fn preflight_direct_default_new(
         }
         SourceNewTarget::GlobalError(expected) => {
             let actual = global_error::plan(store, host, plan.constructor, plan.resolved_symbol)?;
-            if actual != *expected || plan.argument.is_some() || plan.parameter.is_some() {
+            let parameter = plan
+                .argument
+                .as_ref()
+                .map(|_| global_error::message_parameter(store, host, &actual))
+                .transpose()?;
+            if actual != *expected || plan.parameter != parameter {
                 return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 )));
@@ -6576,13 +6580,42 @@ fn cached_argument_type(
                 .map_err(|_| invariant(SourceNewInvariant::InvalidExpressionCache(argument.node)));
         }
     };
-    regular
-        .map(|regular| {
-            store
-                .fresh_type_of_literal_type(regular)
-                .map_err(|error| literal_cache_error(argument.node, error))
-        })
-        .transpose()
+    let Some(regular) = regular else {
+        return Ok(None);
+    };
+    store
+        .validate_union_constituent(regular)
+        .map_err(|error| literal_cache_error(argument.node, error))?;
+    let Some(TypeData::Literal(literal)) = store.type_payload(regular).map(TypeRecord::data) else {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            argument.node,
+        )));
+    };
+    let matches_value = match (&argument.value, &literal.value) {
+        (SourceNewArgumentValue::String(expected), LiteralValue::String(actual)) => {
+            expected == actual
+        }
+        (SourceNewArgumentValue::Number(expected), LiteralValue::Number(actual)) => {
+            expected == actual
+        }
+        (SourceNewArgumentValue::Boolean(expected), LiteralValue::Boolean(actual)) => {
+            expected == actual
+        }
+        _ => false,
+    };
+    if !matches_value || literal.regular_type != regular {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            argument.node,
+        )));
+    }
+    // Bootstrap literals can exist before expression checking creates their fresh type.
+    if literal.fresh_type.is_none() {
+        return Ok(None);
+    }
+    store
+        .fresh_type_of_literal_type(regular)
+        .map(Some)
+        .map_err(|error| literal_cache_error(argument.node, error))
 }
 
 fn literal_cache_error(node: NodeRef, error: LiteralTypeCacheError) -> SourceNewError {
@@ -11216,6 +11249,51 @@ mod tests {
         assert!(context.store().symbol_node_links(constructor).is_none());
         assert!(context.store().value_symbol_links(owner).is_none());
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn constructor_arguments_prepare_cold_bootstrap_literals() {
+        for (annotation, argument) in [
+            ("string", "\"\""),
+            ("string", "\"string\""),
+            ("number", "0"),
+        ] {
+            let source = format!(
+                "class Model {{ constructor(value: {annotation}) {{}} }} const model = new Model({argument});"
+            );
+            let parsed = parse_source_file(&source);
+            let file = FileId::new(1_808);
+            let mut context = context(&parsed, file);
+            let (construction, _) = variable_new(&parsed, file, "model");
+            let argument = constructor_argument(&parsed, construction);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let fresh = context
+                .store()
+                .type_node_links(argument)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let TypeData::Literal(literal) = context.store().type_payload(fresh).unwrap().data()
+            else {
+                panic!("expected the checked argument's literal type")
+            };
+            assert_eq!(literal.fresh_type, Some(fresh));
+            assert_ne!(literal.regular_type, fresh);
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
     }
 
     #[test]
