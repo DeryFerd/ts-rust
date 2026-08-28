@@ -1156,7 +1156,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .copied()
             .collect::<HashSet<_>>();
         for (key, union) in unions {
-            self.validate_union_cache_entry(&key, union, array_validation, &allowed_pending)?;
+            self.validate_union_cache_entry(
+                &key,
+                union,
+                array_validation,
+                &mut HashSet::new(),
+                &allowed_pending,
+            )?;
         }
         for (key, result) in unions_of_unions {
             self.validate_union_of_union_cache_entry(
@@ -1174,6 +1180,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         key: &UnionTypeCacheKey,
         union: TypeId,
         array_validation: UnionArrayValidation<'_>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_cache_entry_metadata(key, union)?;
@@ -1190,16 +1197,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *constituent,
                 array_validation,
                 &mut visiting,
+                array_visited,
                 allowed_pending,
             )?;
         }
         if let Some(alias) = key.alias.as_ref() {
-            let mut visited = HashSet::new();
             for argument in &alias.type_arguments {
                 self.validate_cached_array_capability_worker(
                     *argument,
                     array_validation,
-                    &mut visited,
+                    array_visited,
                     allowed_pending,
                 )?;
             }
@@ -1266,6 +1273,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 candidate,
                 array_validation,
                 &mut HashSet::new(),
+                &mut HashSet::new(),
                 allowed_pending,
             )?;
         }
@@ -1303,6 +1311,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     &expected_key,
                     expected,
                     array_validation,
+                    &mut HashSet::new(),
                     allowed_pending,
                 )?;
                 expected
@@ -1710,6 +1719,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::None,
             &mut HashSet::new(),
+            &mut HashSet::new(),
             &HashSet::new(),
         )
     }
@@ -1723,6 +1733,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::GlobalTypes(global_types),
             &mut HashSet::new(),
+            &mut HashSet::new(),
             &HashSet::new(),
         )
     }
@@ -1735,6 +1746,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_union_constituent_worker(
             type_,
             UnionArrayValidation::Targets(targets),
+            &mut HashSet::new(),
             &mut HashSet::new(),
             &HashSet::new(),
         )
@@ -1838,11 +1850,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             base,
             array_validation,
             &mut HashSet::new(),
+            &mut HashSet::new(),
             &HashSet::new(),
         )?;
         self.validate_union_constituent_worker(
             undefined,
             array_validation,
+            &mut HashSet::new(),
             &mut HashSet::new(),
             &HashSet::new(),
         )?;
@@ -1946,6 +1960,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_union_constituent_worker(
             type_,
             array_validation,
+            &mut HashSet::new(),
             &mut HashSet::new(),
             allowed_pending,
         )?;
@@ -2131,10 +2146,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         record: &TypeRecord,
         data: &super::type_records::UnionTypeData,
         array_validation: UnionArrayValidation<'_>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let key = self.validated_union_cache_key(union, record, data)?;
-        self.validate_union_cache_entry(&key, union, array_validation, allowed_pending)
+        self.validate_union_cache_entry(
+            &key,
+            union,
+            array_validation,
+            array_visited,
+            allowed_pending,
+        )
     }
 
     fn validated_union_cache_key(
@@ -2178,6 +2200,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(key)
     }
 
+    #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
     fn validate_supported_fresh_property_object(
         &self,
         type_: TypeId,
@@ -2185,6 +2208,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         object: &ObjectTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         if !visiting.insert(type_) {
@@ -2327,6 +2351,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     property_type,
                     array_validation,
                     visiting,
+                    array_visited,
                     allowed_pending,
                 )?;
                 expected_flags |=
@@ -2361,6 +2386,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
     fn validate_supported_derived_property_object(
         &self,
         type_: TypeId,
@@ -2368,6 +2394,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         object: &ObjectTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<bool, LiteralTypeCacheError> {
         let derived = match array_validation {
@@ -2406,6 +2433,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             property_type,
                             array_validation,
                             visiting,
+                            array_visited,
                             allowed_pending,
                         )
                     });
@@ -2455,6 +2483,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 type_,
                 array_validation,
                 &mut HashSet::new(),
+                visited,
                 allowed_pending,
             ),
             TypeData::TypeReference(reference) => {
@@ -2468,6 +2497,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         type_,
                         array_validation,
                         &mut HashSet::new(),
+                        visited,
                         allowed_pending,
                     )
                 } else {
@@ -2740,6 +2770,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let reference = match array_validation {
@@ -2766,6 +2797,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             reference.element_type,
             array_validation,
             visiting,
+            array_visited,
             allowed_pending,
         );
         visiting.remove(&type_);
@@ -2777,6 +2809,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let reference = super::reference_types::validate_direct_generic_reference(self, type_)
@@ -2789,6 +2822,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *argument,
                 array_validation,
                 visiting,
+                array_visited,
                 allowed_pending,
             )
         });
@@ -2801,6 +2835,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let tuple = self
@@ -2810,11 +2845,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if !visiting.insert(type_) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
         }
+        // Declared members can refer back to this tuple. Direct containment
+        // cycles still fail through the separate structural visiting set.
+        array_visited.insert(type_);
         let result = tuple.element_types().iter().try_for_each(|element| {
             self.validate_union_constituent_worker(
                 *element,
                 array_validation,
                 visiting,
+                array_visited,
                 allowed_pending,
             )
         });
@@ -3117,6 +3156,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         .then_some(symbol)
     }
 
+    #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
     fn validate_supported_record_mapped_union_constituent(
         &self,
         type_: TypeId,
@@ -3124,6 +3164,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         mapped: &super::type_records::MappedTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
@@ -3189,6 +3230,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         *key,
                         array_validation,
                         visiting,
+                        array_visited,
                         allowed_pending,
                     )
                     .and_then(|()| {
@@ -3196,6 +3238,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             *value,
                             array_validation,
                             visiting,
+                            array_visited,
                             allowed_pending,
                         )
                     });
@@ -3229,6 +3272,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 nested,
                 array_validation,
                 visiting,
+                array_visited,
                 allowed_pending,
             )
         });
@@ -3241,6 +3285,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(type_) else {
@@ -3377,7 +3422,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             self.validate_cached_array_capability_worker(
                                 edge,
                                 array_validation,
-                                visiting,
+                                array_visited,
                                 allowed_pending,
                             )?;
                         }
@@ -3406,7 +3451,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         .validate_cached_array_capability_worker(
                             type_,
                             array_validation,
-                            &mut HashSet::new(),
+                            array_visited,
                             allowed_pending,
                         ),
                     object_members::DeclaredPropertyObjectValidation::NotDeclared => {
@@ -3417,7 +3462,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                 self.validate_cached_array_capability_worker(
                                     type_,
                                     array_validation,
-                                    &mut HashSet::new(),
+                                    array_visited,
                                     allowed_pending,
                                 )
                             }
@@ -3428,6 +3473,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                     object,
                                     array_validation,
                                     visiting,
+                                    array_visited,
                                     allowed_pending,
                                 )? {
                                     Ok(())
@@ -3438,6 +3484,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                         object,
                                         array_validation,
                                         visiting,
+                                        array_visited,
                                         allowed_pending,
                                     )
                                 }
@@ -3462,7 +3509,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             self.validate_cached_array_capability_worker(
                                 edge,
                                 array_validation,
-                                visiting,
+                                array_visited,
                                 allowed_pending,
                             )?;
                         }
@@ -3491,7 +3538,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         return self.validate_cached_array_capability_worker(
                             type_,
                             array_validation,
-                            &mut HashSet::new(),
+                            array_visited,
                             allowed_pending,
                         );
                     }
@@ -3518,7 +3565,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return self.validate_cached_array_capability_worker(
                         type_,
                         array_validation,
-                        &mut HashSet::new(),
+                        array_visited,
                         allowed_pending,
                     );
                 }
@@ -3527,7 +3574,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         .validate_cached_array_capability_worker(
                             type_,
                             array_validation,
-                            &mut HashSet::new(),
+                            array_visited,
                             allowed_pending,
                         ),
                     object_members::DeclaredPropertyObjectValidation::NotDeclared => {
@@ -3538,7 +3585,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                 self.validate_cached_array_capability_worker(
                                     type_,
                                     array_validation,
-                                    &mut HashSet::new(),
+                                    array_visited,
                                     allowed_pending,
                                 )
                             }
@@ -3559,6 +3606,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 type_,
                 array_validation,
                 visiting,
+                array_visited,
                 allowed_pending,
             ),
             TypeData::TypeReference(reference) => {
@@ -3573,6 +3621,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         type_,
                         array_validation,
                         visiting,
+                        array_visited,
                         allowed_pending,
                     )
                 } else if target
@@ -3589,6 +3638,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         type_,
                         array_validation,
                         visiting,
+                        array_visited,
                         allowed_pending,
                     )
                 } else {
@@ -3596,6 +3646,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         type_,
                         array_validation,
                         visiting,
+                        array_visited,
                         allowed_pending,
                     )
                 }
@@ -3606,6 +3657,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 mapped,
                 array_validation,
                 visiting,
+                array_visited,
                 allowed_pending,
             ),
             TypeData::Union(data) => {
@@ -3618,6 +3670,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         *constituent,
                         array_validation,
                         visiting,
+                        array_visited,
                         allowed_pending,
                     )?;
                 }
@@ -3643,6 +3696,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         &data.union.types,
                         array_validation,
                         visiting,
+                        array_visited,
                         allowed_pending,
                     )?;
                 }
@@ -3651,6 +3705,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     record,
                     data,
                     array_validation,
+                    array_visited,
                     allowed_pending,
                 )?;
                 visiting.remove(&type_);
@@ -3701,6 +3756,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .is_none_or(|links| links == &ValueSymbolLinks::default())
     }
 
+    #[allow(clippy::too_many_arguments)] // Structural cycles and member visits need separate sets.
     fn validate_supported_union_origin(
         &self,
         union: TypeId,
@@ -3708,6 +3764,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         normalized: &[TypeId],
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_origin_structure(union, origin)?;
@@ -3726,6 +3783,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *constituent,
                 array_validation,
                 visiting,
+                array_visited,
                 allowed_pending,
             )?;
         }
@@ -4476,6 +4534,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::from_global_types(globals),
             &mut HashSet::new(),
+            &mut HashSet::new(),
             &prepared.pending_function_types,
         )
     }
@@ -4568,6 +4627,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *type_,
                 validation,
                 &mut HashSet::new(),
+                &mut HashSet::new(),
                 &HashSet::new(),
             )?;
         }
@@ -4614,7 +4674,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .get(&key)
                     .copied();
                 if let Some(cached) = cached {
-                    self.validate_union_cache_entry(&key, cached, validation, &HashSet::new())?;
+                    self.validate_union_cache_entry(
+                        &key,
+                        cached,
+                        validation,
+                        &mut HashSet::new(),
+                        &HashSet::new(),
+                    )?;
                 }
                 Ok(cached)
             }
@@ -4646,6 +4712,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.validate_union_constituent_worker(
                 *type_,
                 UnionArrayValidation::None,
+                &mut HashSet::new(),
                 &mut HashSet::new(),
                 &prepared.pending_function_types,
             )?;
@@ -4696,6 +4763,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.validate_union_constituent_worker(
                 *type_,
                 array_validation,
+                &mut HashSet::new(),
                 &mut HashSet::new(),
                 &prepared.pending_function_types,
             )?;
@@ -5032,7 +5100,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .and_then(|bootstrap| bootstrap.union_types.get(&key))
             .copied()
         {
-            self.validate_union_cache_entry(&key, cached, array_validation, allowed_pending)?;
+            self.validate_union_cache_entry(
+                &key,
+                cached,
+                array_validation,
+                &mut HashSet::new(),
+                allowed_pending,
+            )?;
             return Ok(cached);
         }
 
@@ -5938,6 +6012,7 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
+        declared::type_list_key,
         signatures::ElementFlags,
         tuple_types::CanonicalTupleTypeRequest,
         type_records::{LiteralTypeData, TypeData},
@@ -9600,6 +9675,163 @@ mod tests {
             ),
             Ok(union),
         );
+    }
+
+    #[test]
+    fn recursive_tuple_members_keep_structural_and_member_visits_separate() {
+        for children in ["[Tree2, Tree1]", "[Tree2, Tree2]", "[Array<Tree2>, Tree1]"] {
+            let parsed = parse_source_file(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 interface Tree1 {{ children: [Tree1, Tree2]; }} \
+                 interface Tree2 {{ children: {children}; }}"
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(196);
+            let mut context = CanonicalCheckerContext::new(
+                completed_bindings(file, &parsed),
+                [(file, &parsed.arena)].into_iter().collect(),
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+            )
+            .unwrap();
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{children}: {error:?}"));
+            let interfaces = ["Tree1", "Tree2"].map(|name| {
+                let store = context.store();
+                let owner = store
+                    .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                    .and_then(|globals| globals.get_source(name))
+                    .and_then(|owner| store.get_merged_symbol(owner))
+                    .unwrap();
+                context.get_declared_type_of_symbol(owner).unwrap()
+            });
+            let globals = context.global_types().clone();
+            let targets = CanonicalArrayTargets::from_global_types(&globals);
+            let store = context.store_mut_for_test();
+            let tuples = interfaces.map(|interface| {
+                object_members::resolved_declared_property_types(store, interface).unwrap()[0]
+            });
+            for root in interfaces.into_iter().chain(tuples) {
+                assert_eq!(
+                    store.validate_union_constituent_with_global_types(&globals, root),
+                    Ok(()),
+                    "{children}: {root:?}",
+                );
+                assert_eq!(
+                    store.validate_cached_array_capability_with_array_targets(targets, root),
+                    Ok(()),
+                    "{children}: {root:?}",
+                );
+            }
+            let union = store
+                .expression_union_type_with_global_types(&globals, &tuples, UnionReduction::None)
+                .unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    store.validate_cached_union_result_with_array_targets(targets, union, None),
+                    Ok(()),
+                    "{children}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tuple_validation_rejects_direct_containment_cycles() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let info = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let seed = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[number], &[info], false))
+            .unwrap();
+        let target = store.canonical_tuple_shape(seed).unwrap().unwrap().target();
+        let cyclic = store.alloc_type_reference(ObjectFlags::NONE, None).unwrap();
+        assert!(store.set_object_target_and_mapper(cyclic, Some(target), None));
+        assert!(store.set_type_reference_resolution(cyclic, None, Some(vec![cyclic])));
+        assert!(store.try_reserve_object_instantiations(target, 1));
+        assert_eq!(
+            store.insert_object_instantiation(target, type_list_key(&[cyclic]), cyclic),
+            Some(cyclic),
+        );
+        assert_eq!(
+            store
+                .canonical_tuple_shape(cyclic)
+                .unwrap()
+                .unwrap()
+                .element_types(),
+            [cyclic],
+        );
+        assert_eq!(
+            store.validate_union_constituent(cyclic),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(cyclic)),
+        );
+        assert_eq!(
+            store.validate_cached_array_capability(cyclic),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(cyclic)),
+        );
+    }
+
+    #[test]
+    fn recursive_tuple_members_still_validate_later_array_elements() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Tree { children: [Tree, Array<number>]; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(197);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let owner = context
+            .store()
+            .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source("Tree"))
+            .and_then(|owner| context.store().get_merged_symbol(owner))
+            .unwrap();
+        let tree = context.get_declared_type_of_symbol(owner).unwrap();
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let store = context.store_mut_for_test();
+        let tuple = object_members::resolved_declared_property_types(store, tree).unwrap()[0];
+        let array = store
+            .canonical_tuple_shape(tuple)
+            .unwrap()
+            .unwrap()
+            .element_types()[1];
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        assert!(store.set_type_reference_resolution(array, None, Some(vec![string])));
+        for root in [tree, tuple] {
+            for result in [
+                store.validate_union_constituent_with_global_types(&globals, root),
+                store.validate_cached_array_capability_with_array_targets(targets, root),
+            ] {
+                assert!(
+                    matches!(
+                        result,
+                        Err(LiteralTypeCacheError::ArrayType { type_, .. }) if type_ == array
+                    ),
+                    "the recursive first element must not hide the invalid sibling: {result:?}",
+                );
+            }
+        }
+        assert!(store.set_type_reference_resolution(array, None, Some(vec![number])));
+        for root in [tree, tuple] {
+            assert_eq!(
+                store.validate_union_constituent_with_global_types(&globals, root),
+                Ok(()),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, root),
+                Ok(()),
+            );
+        }
     }
 
     #[test]
