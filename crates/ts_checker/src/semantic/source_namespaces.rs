@@ -58,7 +58,7 @@ const ALSO_DECLARED_HERE: u32 = 6_203;
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
 
-/// One checked declaration inside a namespace or ambient module.
+/// One checked statement inside a namespace or ambient module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceNamespaceMemberPlan {
     Namespace(Box<SourceNamespacePlan>),
@@ -102,6 +102,9 @@ pub(super) enum SourceNamespaceMemberPlan {
         declaration: NodeRef,
         symbol: SemanticSymbolId,
         annotation: NodeRef,
+    },
+    GlobalVariableRead {
+        expression: NodeRef,
     },
 }
 
@@ -11011,6 +11014,84 @@ fn plan_ambient_export_assignment(
     }))
 }
 
+fn plan_namespace_global_variable_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: NodeRef,
+    statement: NodeRef,
+) -> Result<SourceNamespaceMemberPlan, SourceCheckError> {
+    let record = owned_node(arena, bound, store, statement)?;
+    let invalid = || unsupported(statement, record.kind, SourceSyntaxRole::Statement);
+    let NodeData::ExpressionStatement(read) = &record.data else {
+        return Err(invalid());
+    };
+    let expression = child(statement, read.expression);
+    let expression_record = owned_node(arena, bound, store, expression)?;
+    let NodeData::Identifier(identifier) = &expression_record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::ExpressionStatement
+        || record.flags.0 != 0
+        || read.flow_node.is_some()
+        || expression_record.kind != SyntaxKind::Identifier
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(statement.node)
+        || expression_record.range.start < record.range.start
+        || expression_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || bound.container(statement) != Some(namespace)
+        || bound.block_scope_container(statement) != Some(namespace)
+        || bound.container(expression) != Some(namespace)
+        || bound.block_scope_container(expression) != Some(namespace)
+    {
+        return Err(invalid());
+    }
+    Ok(SourceNamespaceMemberPlan::GlobalVariableRead { expression })
+}
+
+/// Resolves a namespace capture after global merging has completed.
+pub(super) fn namespace_global_variable_read_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let (arena, bound) = host
+        .source(expression)
+        .ok_or_else(|| missing_node(expression))?;
+    let record = owned_node(arena, bound, store, expression)?;
+    let invalid = || unsupported(expression, record.kind, SourceSyntaxRole::Statement);
+    let symbol = host
+        .name_resolver_host(store)?
+        .resolve_entity_name(expression, SymbolFlags::VALUE)
+        .map_err(DeclaredTypeError::from)?
+        .ok_or_else(invalid)?;
+    let value = store.symbol(symbol).ok_or_else(invalid)?;
+    let declaration = value.value_declaration().ok_or_else(invalid)?;
+    // Local and block-scoped reads need namespace flow or declaration-order checks.
+    if value.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || !declaration.is_for(expression.arena, expression.file)
+        || bound.container(declaration) != Some(bound.source_file())
+    {
+        return Err(invalid());
+    }
+    let value = super::declared_values::plan_declared_value(store, host, symbol)?;
+    if store
+        .symbol_node_links(expression)
+        .is_some_and(|links| links.resolved_symbol.is_some_and(|cached| cached != symbol))
+        || store.type_node_links(expression).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|cached| Some(cached) != value.cached_type)
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(symbol)
+}
+
 fn plan_namespace(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -11350,6 +11431,40 @@ fn plan_namespace(
                                 )?);
                             }
                         }
+                        SyntaxKind::ExpressionStatement if !ambient => {
+                            members.push(plan_namespace_global_variable_read(
+                                arena,
+                                bound,
+                                store,
+                                declaration,
+                                statement,
+                            )?);
+                        }
+                        SyntaxKind::Block if !ambient => {
+                            let NodeData::Block(empty) = &statement_record.data else {
+                                return Err(unsupported(
+                                    statement,
+                                    statement_record.kind,
+                                    SourceSyntaxRole::Statement,
+                                ));
+                            };
+                            if statement_record.flags.0 != 0
+                                || empty.flow_node.is_some()
+                                || empty.next_container.is_some()
+                                || !empty.statements.nodes.is_empty()
+                                || empty.statements.has_trailing_comma
+                                || empty.facts != 0
+                                || bound.container(statement) != Some(declaration)
+                                || bound.block_scope_container(statement) != Some(declaration)
+                                || bound.locals(statement).is_some()
+                            {
+                                return Err(unsupported(
+                                    statement,
+                                    statement_record.kind,
+                                    SourceSyntaxRole::Statement,
+                                ));
+                            }
+                        }
                         SyntaxKind::EmptyStatement => {}
                         kind => {
                             return Err(unsupported(statement, kind, SourceSyntaxRole::Statement));
@@ -11448,6 +11563,7 @@ fn namespace_annotations<'plan>(
             SourceNamespaceMemberPlan::TypeAlias { deferred: true, .. }
             | SourceNamespaceMemberPlan::EmptyEnum { .. }
             | SourceNamespaceMemberPlan::Function { .. }
+            | SourceNamespaceMemberPlan::GlobalVariableRead { .. }
             | SourceNamespaceMemberPlan::DeferredAmbientFunction { .. }
             | SourceNamespaceMemberPlan::DeferredAmbientClass { .. } => {
                 declarations.push(member);
@@ -12718,25 +12834,56 @@ pub(super) fn execute_source_namespace(
         ));
     }
     for declaration in &declarations {
-        let SourceNamespaceMemberPlan::Function {
-            declaration,
-            symbol,
-        } = declaration
-        else {
-            continue;
+        let symbol = match declaration {
+            SourceNamespaceMemberPlan::Function { symbol, .. } => *symbol,
+            SourceNamespaceMemberPlan::GlobalVariableRead { expression } => {
+                namespace_global_variable_read_symbol(store, host, *expression)?
+            }
+            _ => continue,
         };
         session.reset_query();
         let mut staged = CanonicalCheckerDiagnostics::default();
-        CanonicalTypeQuery::new_with_global_types_and_session(
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
             session,
             &mut staged,
-        )?
-        .preflight_type_of_source_callable(*declaration, *symbol)?;
+        )?;
+        match declaration {
+            SourceNamespaceMemberPlan::Function { declaration, .. } => {
+                query.preflight_type_of_source_callable(*declaration, symbol)?
+            }
+            SourceNamespaceMemberPlan::GlobalVariableRead { .. } => {
+                query.preflight_type_of_declared_value(symbol)?;
+            }
+            _ => unreachable!("only callable declarations and global reads are preflighted here"),
+        }
         debug_assert!(staged.is_empty());
+    }
+
+    let global_reads = declarations
+        .iter()
+        .filter_map(|member| match member {
+            SourceNamespaceMemberPlan::GlobalVariableRead { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !store.try_reserve_type_node_links(
+        global_reads
+            .iter()
+            .filter(|node| store.type_node_links(**node).is_none())
+            .count(),
+    ) || !store.try_reserve_symbol_node_links(
+        global_reads
+            .iter()
+            .filter(|node| store.symbol_node_links(**node).is_none())
+            .count(),
+    ) {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::Capacity,
+        ));
     }
 
     let mut values = Vec::<PendingNamespaceValue>::new();
@@ -13163,6 +13310,34 @@ pub(super) fn execute_source_namespace(
                 )?
                 .get_type_from_type_node(*annotation)?;
                 stage_namespace_value(store, &mut values, *declaration, *symbol, type_)?;
+            }
+            SourceNamespaceMemberPlan::GlobalVariableRead { expression } => {
+                let symbol = namespace_global_variable_read_symbol(store, host, *expression)?;
+                let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .get_type_of_declared_value(symbol)?;
+                if !store.set_type_node_links(
+                    *expression,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    },
+                ) || !store.set_symbol_node_links(
+                    *expression,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    },
+                ) {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidValueLinks(symbol),
+                    ));
+                }
             }
             SourceNamespaceMemberPlan::Namespace(_) => {
                 unreachable!("nested namespaces are expanded before semantic execution")
@@ -13787,6 +13962,139 @@ mod tests {
                 CanonicalCheckerOptions::default(),
             )
             .unwrap(),
+        }
+    }
+
+    #[test]
+    fn namespace_global_var_reads_publish_declared_types_and_keep_warm_caches() {
+        for (source, index) in [
+            ("var value: number; namespace n { value; {} }", 1),
+            ("namespace n { value; {} } var value: number;", 0),
+        ] {
+            let mut fixture = fixture(source, CanonicalModuleState::Script);
+            let namespace = plan(&fixture, index);
+            let [SourceNamespaceMemberPlan::GlobalVariableRead { expression }] =
+                namespace.members.as_slice()
+            else {
+                panic!("expected one global variable read");
+            };
+            let expression = *expression;
+            assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+            let store = fixture.context.store();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let symbol = store
+                .symbol_node_links(expression)
+                .unwrap()
+                .resolved_symbol
+                .unwrap();
+            let value = store.symbol(symbol).unwrap();
+            assert_eq!(value.name().as_utf8(), Some("value"));
+            assert_eq!(value.flags(), SymbolFlags::FUNCTION_SCOPED_VARIABLE);
+            assert_eq!(
+                store.type_node_links(expression),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                })
+            );
+            assert_eq!(
+                store.symbol_node_links(expression),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(symbol)
+                })
+            );
+            let before = (store.type_len(), store.checker_link_allocated_lengths());
+            assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+            let store = fixture.context.store();
+            assert_eq!(
+                (store.type_len(), store.checker_link_allocated_lengths()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_global_var_reads_keep_other_expressions_unsupported() {
+        for (source, index) in [
+            ("namespace n { absent; }", 0),
+            ("namespace n { var value: number; value; }", 0),
+            ("let value: number; namespace n { value; }", 1),
+            ("var value: number; namespace n { value + 1; }", 1),
+            ("var value: number; namespace n { { value; } }", 1),
+            ("var value: number; declare namespace n { value; }", 1),
+        ] {
+            let mut fixture = fixture(source, CanonicalModuleState::Script);
+            let declaration = declaration(&fixture, index);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            let store = fixture.context.store();
+            let before = (store.type_len(), store.checker_link_allocated_lengths());
+            let result = plan_source_namespace(arena, bound, store, declaration)
+                .and_then(|namespace| execute(&mut fixture, &namespace));
+            assert!(
+                matches!(result, Err(SourceCheckError::Unsupported(_))),
+                "{source}: {result:?}"
+            );
+            let store = fixture.context.store();
+            assert_eq!(
+                (store.type_len(), store.checker_link_allocated_lengths()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_global_var_reads_reject_changed_expression_caches() {
+        for warm in [false, true] {
+            for change_symbol in [false, true] {
+                let mut fixture = fixture(
+                    "var value: number; namespace n { value; }",
+                    CanonicalModuleState::Script,
+                );
+                let namespace = plan(&fixture, 1);
+                let [SourceNamespaceMemberPlan::GlobalVariableRead { expression, .. }] =
+                    namespace.members.as_slice()
+                else {
+                    panic!("expected one global variable read");
+                };
+                let expression = *expression;
+                if warm {
+                    assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+                }
+                let store = fixture.context.store_mut_for_test();
+                if change_symbol {
+                    assert!(store.set_symbol_node_links(
+                        expression,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(namespace.symbol)
+                        }
+                    ));
+                } else {
+                    assert!(store.set_type_node_links(
+                        expression,
+                        TypeNodeLinks {
+                            resolved_type: Some(store.intrinsic_bootstrap().unwrap().string_type),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                let before = (
+                    store.type_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.type_node_links(expression).cloned(),
+                    store.symbol_node_links(expression).cloned(),
+                );
+                assert!(execute(&mut fixture, &namespace).is_err());
+                let store = fixture.context.store();
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.type_node_links(expression).cloned(),
+                        store.symbol_node_links(expression).cloned(),
+                    ),
+                    before
+                );
+            }
         }
     }
 

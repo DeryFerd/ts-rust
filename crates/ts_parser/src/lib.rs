@@ -1648,6 +1648,11 @@ impl<'a> Parser<'a> {
     }
 
     fn current_token_starts_contextual_type_declaration(&mut self) -> bool {
+        if self.current.kind == SyntaxKind::InterfaceKeyword
+            && self.next_token_preceded_by_line_break()
+        {
+            return false;
+        }
         matches!(
             self.current.kind,
             SyntaxKind::InterfaceKeyword | SyntaxKind::TypeKeyword

@@ -250,8 +250,8 @@ use super::{
     },
     source_namespaces::{
         SourceNamespaceMemberPlan, SourceNamespacePlan, execute_source_namespace,
-        merge_source_ambient_module_exports, plan_source_namespace,
-        resolve_source_namespace_external_imports,
+        merge_source_ambient_module_exports, namespace_global_variable_read_symbol,
+        plan_source_namespace, resolve_source_namespace_external_imports,
     },
     source_new::{
         SourceDefaultNewPlan, SourceNewError, SourceNewInvariant, SourceNewUnsupported,
@@ -2984,6 +2984,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statements.push(PlannedStatement::Namespace(Box::new(namespace)));
                 }
                 SyntaxKind::Block => {
+                    let node = self.node(statement)?;
+                    if let NodeData::Block(block) = &node.data
+                        && block.statements.nodes.is_empty()
+                    {
+                        if node.flags.0 != 0
+                            || node.parent != Some(self.source.node_ref().node)
+                            || block.flow_node.is_some()
+                            || block.next_container.is_some()
+                            || block.statements.has_trailing_comma
+                            || block.facts != 0
+                            || self.bound.container(statement) != Some(self.source.node_ref())
+                            || self.bound.block_scope_container(statement)
+                                != Some(self.source.node_ref())
+                            || self.bound.locals(statement).is_some()
+                        {
+                            return Err(self.unsupported(
+                                statement,
+                                node.kind,
+                                SourceSyntaxRole::Statement,
+                            ));
+                        }
+                        continue;
+                    }
                     let follows_module_identifier = statements.last().is_some_and(|previous| {
                         let PlannedStatement::ExpressionValue(expression) = previous else {
                             return false;
@@ -44349,6 +44372,19 @@ fn preflight_source_namespace_annotations(
                 )?
                 .preflight_type_of_source_callable(*declaration, *symbol)?;
             }
+            SourceNamespaceMemberPlan::GlobalVariableRead { expression } => {
+                let symbol = namespace_global_variable_read_symbol(store, host, *expression)?;
+                session.reset_query();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .preflight_type_of_declared_value(symbol)?;
+            }
             SourceNamespaceMemberPlan::DeferredAmbientClass { .. }
             | SourceNamespaceMemberPlan::DeferredAmbientFunction { .. }
             | SourceNamespaceMemberPlan::EmptyEnum { .. } => {}
@@ -44834,6 +44870,7 @@ fn non_module_value_augmentation_diagnostic(
 
     let has_value_export = namespace.members.iter().any(|member| {
         let symbol = match member {
+            SourceNamespaceMemberPlan::GlobalVariableRead { .. } => return false,
             SourceNamespaceMemberPlan::Namespace(nested) => nested.symbol,
             SourceNamespaceMemberPlan::TypeAlias { symbol, .. }
             | SourceNamespaceMemberPlan::Interface { symbol, .. }
