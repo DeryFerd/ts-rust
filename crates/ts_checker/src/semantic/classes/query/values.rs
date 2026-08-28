@@ -863,7 +863,7 @@ impl ClassValueQuery<'_, '_, '_> {
                             self.session,
                         )
                         .map_err(property_error)?;
-                        if checked.diagnostic.is_some() {
+                        if !checked.diagnostics.is_empty() {
                             return Err(reject());
                         }
                         validate_query_reference_cache(self.store, node, symbol)?;

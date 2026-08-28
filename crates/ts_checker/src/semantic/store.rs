@@ -22,6 +22,7 @@ use super::{
     alias_provider::SourceFileNamespaceWrapper,
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
+    classes::{ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassProvenance},
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
@@ -527,6 +528,11 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
+    source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
+    source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
+    class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
+    class_instance_super_views_by_instance: HashMap<TypeId, TypeId>,
+    class_instance_super_members: HashMap<(TypeId, SemanticSymbolId), ClassInstanceSuperMember>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
     source_callable_alias_annotations: HashMap<
         NodeRef,
@@ -675,6 +681,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
+            source_class_provenance: HashMap::new(),
+            source_classes_by_symbol: HashMap::new(),
+            class_instance_super_views: HashMap::new(),
+            class_instance_super_views_by_instance: HashMap::new(),
+            class_instance_super_members: HashMap::new(),
             source_callable_provenance: HashMap::new(),
             source_callable_alias_annotations: HashMap::new(),
             source_callable_alias_owners: HashMap::new(),
@@ -8905,6 +8916,170 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             self.mark_relation_inputs_dirty();
         }
         true
+    }
+
+    pub(super) fn try_reserve_source_class_provenance(&mut self, additional: usize) -> bool {
+        self.source_class_provenance.try_reserve(additional).is_ok()
+            && self
+                .source_classes_by_symbol
+                .try_reserve(additional)
+                .is_ok()
+    }
+
+    pub(super) fn source_class_provenance(
+        &self,
+        instance: TypeId,
+    ) -> Option<&SourceClassProvenance> {
+        self.observe_relation_type_read(instance);
+        self.source_class_provenance.get(&instance)
+    }
+
+    pub(super) fn source_class_provenance_for_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&SourceClassProvenance> {
+        self.observe_relation_symbol_read(symbol);
+        self.source_classes_by_symbol
+            .get(&symbol)
+            .and_then(|instance| self.source_class_provenance(*instance))
+    }
+
+    pub(super) fn publish_source_class_provenance(
+        &mut self,
+        instance: TypeId,
+        provenance: SourceClassProvenance,
+    ) -> bool {
+        let symbol = provenance.symbol();
+        if provenance.instance_type() != instance
+            || self.types.get(instance).is_none()
+            || self
+                .source_classes_by_symbol
+                .get(&symbol)
+                .is_some_and(|existing| *existing != instance)
+        {
+            return false;
+        }
+        match self.source_class_provenance.entry(instance) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &provenance,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(provenance);
+                self.source_classes_by_symbol.insert(symbol, instance);
+                self.mark_relation_inputs_dirty();
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
+    }
+
+    pub(super) fn source_class_provenance_mut(
+        &mut self,
+        instance: TypeId,
+    ) -> Option<&mut SourceClassProvenance> {
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        self.source_class_provenance.get_mut(&instance)
+    }
+
+    pub(super) fn class_instance_super_view(
+        &self,
+        reference: TypeId,
+    ) -> Option<ClassInstanceSuperView> {
+        self.observe_relation_type_read(reference);
+        self.class_instance_super_views.get(&reference).copied()
+    }
+
+    pub(super) fn class_instance_super_view_for_instance(
+        &self,
+        instance: TypeId,
+    ) -> Option<ClassInstanceSuperView> {
+        self.observe_relation_type_read(instance);
+        self.class_instance_super_views_by_instance
+            .get(&instance)
+            .and_then(|reference| self.class_instance_super_view(*reference))
+    }
+
+    pub(super) fn try_reserve_class_instance_super_views(&mut self) -> bool {
+        self.class_instance_super_views.try_reserve(1).is_ok()
+            && self
+                .class_instance_super_views_by_instance
+                .try_reserve(1)
+                .is_ok()
+    }
+
+    pub(super) fn publish_class_instance_super_view(
+        &mut self,
+        view: ClassInstanceSuperView,
+    ) -> bool {
+        let reference = view.receiver_type();
+        let instance = view.instance_type();
+        if self.types.get(reference).is_none()
+            || self.types.get(instance).is_none()
+            || self
+                .class_instance_super_views_by_instance
+                .get(&instance)
+                .is_some_and(|current| *current != reference)
+        {
+            return false;
+        }
+        match self.class_instance_super_views.entry(reference) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &view,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(view);
+                self.class_instance_super_views_by_instance
+                    .insert(instance, reference);
+                self.mark_relation_inputs_dirty();
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
+    }
+
+    pub(super) fn class_instance_super_member(
+        &self,
+        view: TypeId,
+        member: SemanticSymbolId,
+    ) -> Option<&ClassInstanceSuperMember> {
+        self.observe_relation_type_read(view);
+        self.observe_relation_symbol_read(member);
+        self.class_instance_super_members.get(&(view, member))
+    }
+
+    pub(super) fn class_instance_super_member_for_type(
+        &self,
+        type_: TypeId,
+    ) -> Option<&ClassInstanceSuperMember> {
+        self.observe_relation_type_read(type_);
+        self.class_instance_super_members
+            .values()
+            .find(|member| member.type_() == type_ && member.is_instantiated_callable())
+    }
+
+    pub(super) fn try_reserve_class_instance_super_members(&mut self) -> bool {
+        self.class_instance_super_members.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn publish_class_instance_super_member(
+        &mut self,
+        member: ClassInstanceSuperMember,
+    ) -> bool {
+        if !self.class_instance_super_views.contains_key(&member.view())
+            || self.symbol(member.member()).is_none()
+            || self.types.get(member.type_()).is_none()
+        {
+            return false;
+        }
+        match self
+            .class_instance_super_members
+            .entry((member.view(), member.member()))
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get() == &member,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(member);
+                self.mark_relation_inputs_dirty();
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
     }
 
     pub(super) fn direct_class_heritage_provenance(

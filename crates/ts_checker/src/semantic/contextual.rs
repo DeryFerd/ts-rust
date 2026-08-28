@@ -56,6 +56,7 @@ pub(super) enum LiteralTreatment {
 pub(super) enum PreparedExpression {
     Literal(LiteralTreatment),
     Identifier(LiteralTreatment),
+    ClassReceiver,
     Template(Option<TypeId>),
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
@@ -432,6 +433,7 @@ fn prepare_expression(
     location: ExpressionLocation,
 ) -> Result<PreparedExpression, SourceCheckError> {
     let prepared = match &expression.kind {
+        PlannedExpressionKind::ClassReceiver(_) => PreparedExpression::ClassReceiver,
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::RegularExpression(_) => {
@@ -652,7 +654,7 @@ fn prepare_expression(
                 ExpressionLocation::Cached,
             )?))
         }
-        PlannedExpressionKind::Call(_) => {
+        PlannedExpressionKind::Call(_) | PlannedExpressionKind::SuperCall(_) => {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Call(expression.node),
             ));

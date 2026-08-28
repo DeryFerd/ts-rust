@@ -89,12 +89,18 @@ use ts_jsnum::Number;
 use super::{
     CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
+    IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callables::ValidatedSingleCallable,
     declared::{
         cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference,
         preflight_node, type_list_key,
+    },
+    instantiate::{
+        InstantiationError, InstantiationLimits, InstantiationSession,
+        instantiate_type_with_vector_and_session, instantiated_member_type_matches,
     },
     interface_heritage::{DirectInterfaceBaseKind, plan_direct_interface_heritage},
     jsdoc::{JsDocIntrinsicType, JsDocType, leading_jsdoc_comment},
@@ -104,7 +110,7 @@ use super::{
         plan_type_literal, validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
-    signatures::SignatureFlags,
+    signatures::{SignatureFlags, SignatureKind},
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     source_calls::{SourceCallCalleeForm, plan_direct_source_call_syntax},
     source_new::{
@@ -129,6 +135,10 @@ const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
 const PROTOTYPE_NAME: &str = "prototype";
 
+#[cfg(test)]
+#[path = "classes/polymorphic_super_tests.rs"]
+mod polymorphic_super_tests;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClassPropertySide {
     Instance,
@@ -140,6 +150,3580 @@ pub(super) enum ClassConstructorVisibility {
     Public,
     Protected,
     Private,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClassBodyKind {
+    Constructor,
+    Method {
+        symbol: SemanticSymbolId,
+        side: ClassPropertySide,
+    },
+    StaticBlock,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassBodyParameterPlan {
+    pub(super) declaration: NodeRef,
+    pub(super) name_node: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) property_symbol: Option<SemanticSymbolId>,
+    pub(super) annotation: Option<NodeRef>,
+    pub(super) initializer: Option<NodeRef>,
+    pub(super) type_: TypeId,
+    pub(super) optional: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassBodyPlan {
+    pub(super) class_declaration: NodeRef,
+    pub(super) class_symbol: SemanticSymbolId,
+    pub(super) declaration: NodeRef,
+    pub(super) body: NodeRef,
+    pub(super) kind: ClassBodyKind,
+    pub(super) parameters: Vec<ClassBodyParameterPlan>,
+    pub(super) return_annotation: Option<NodeRef>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClassMemberOrigin {
+    Method,
+    Field { initializer: Option<NodeRef> },
+    AutoAccessor { initializer: Option<NodeRef> },
+    Accessor,
+    ParameterProperty { parameter: NodeRef },
+    JavaScriptAssignment { assignment: NodeRef },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassMemberSource {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) declaring_class: SemanticSymbolId,
+    pub(super) declaration: NodeRef,
+    pub(super) origin: ClassMemberOrigin,
+    pub(super) side: ClassPropertySide,
+    pub(super) visibility: ClassConstructorVisibility,
+    pub(super) readonly: bool,
+    pub(super) abstract_: bool,
+}
+
+/// A source-body plan keeps inferred returns separate from declaration types.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassPlan {
+    header: ClassDeclarationHeader,
+    revision: ts_ast::NodeArenaRevision,
+    properties: Vec<(ClassPropertyPlan, TypeId)>,
+    methods: Vec<SourceClassMethodPlan>,
+    constructor: Option<SourceClassConstructorPlan>,
+    bodies: Vec<ClassBodyPlan>,
+    sources: Vec<ClassMemberSource>,
+    bindings: Vec<SourceClassBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceClassBinding {
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+    check_flags: CheckFlags,
+    name: EscapedName,
+    declarations: Option<Vec<NodeRef>>,
+    value_declaration: Option<NodeRef>,
+    parent: Option<SemanticSymbolId>,
+    export_symbol: Option<SemanticSymbolId>,
+    members: Option<SymbolTableId>,
+    exports: Option<SymbolTableId>,
+    merged: Option<SemanticSymbolId>,
+}
+
+fn source_class_binding(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Result<SourceClassBinding, ClassError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(symbol)))?;
+    Ok(SourceClassBinding {
+        symbol,
+        flags: record.flags(),
+        check_flags: record.check_flags(),
+        name: record.name().to_owned(),
+        declarations: record.declarations().map(<[NodeRef]>::to_vec),
+        value_declaration: record.value_declaration(),
+        parent: record.parent(),
+        export_symbol: record.export_symbol(),
+        members: record.members(),
+        exports: record.exports(),
+        merged: store.get_merged_symbol(symbol),
+    })
+}
+
+fn capture_source_class_bindings(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceClassPlan,
+) -> Result<Vec<SourceClassBinding>, ClassError> {
+    let mut symbols = vec![plan.symbol()];
+    symbols.extend(plan.header.export_local);
+    symbols.extend(plan.sources.iter().map(|source| source.symbol));
+    if let Some(constructor) = &plan.constructor {
+        symbols.push(constructor.symbol);
+        symbols.extend(
+            constructor
+                .parameters
+                .iter()
+                .map(|parameter| parameter.symbol),
+        );
+    }
+    symbols.extend(plan.methods.iter().flat_map(|method| {
+        method
+            .method
+            .parameters
+            .iter()
+            .map(|parameter| parameter.symbol)
+    }));
+    symbols.sort_unstable();
+    symbols.dedup();
+    symbols
+        .into_iter()
+        .map(|symbol| {
+            let mut binding = source_class_binding(store, symbol)?;
+            if plan
+                .sources
+                .iter()
+                .any(|source| source.symbol == symbol && source.readonly)
+            {
+                binding.check_flags = CheckFlags::READONLY;
+            }
+            Ok(binding)
+        })
+        .collect()
+}
+
+impl SourceClassPlan {
+    pub(super) const fn declaration(&self) -> NodeRef {
+        self.header.declaration
+    }
+
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.header.symbol
+    }
+
+    pub(super) fn bodies(&self) -> &[ClassBodyPlan] {
+        &self.bodies
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceClassMethodPlan {
+    method: ClassMethodPlan,
+    return_type: Option<TypeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceClassConstructorPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    visibility: ClassConstructorVisibility,
+    parameters: Vec<ClassConstructorParameterPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreparedSourceClass {
+    plan: SourceClassPlan,
+    instance_type: TypeId,
+    value_type: TypeId,
+    construct_signature: SignatureId,
+    methods: Vec<(TypeId, SignatureId)>,
+}
+
+/// Only a prepared class can issue a token for one of its retained bodies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassBodyAccessToken {
+    class_symbol: SemanticSymbolId,
+    class_declaration: NodeRef,
+    declaration: NodeRef,
+    body: NodeRef,
+    instance_type: TypeId,
+    value_type: TypeId,
+    signature: Option<SignatureId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ClassBodyIdentities {
+    pub(super) class_declaration: NodeRef,
+    pub(super) class_symbol: SemanticSymbolId,
+    pub(super) body_declaration: NodeRef,
+    pub(super) instance_type: TypeId,
+    pub(super) this_type: TypeId,
+    pub(super) value_type: TypeId,
+    pub(super) base: Option<ClassBaseIdentities>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassBodyCallable {
+    kind: SignatureKind,
+    class_symbol: SemanticSymbolId,
+    declaration: Option<NodeRef>,
+    callable: ValidatedSingleCallable,
+    pending_return_body: Option<NodeRef>,
+}
+
+impl ClassBodyCallable {
+    pub(super) const fn kind(&self) -> SignatureKind {
+        self.kind
+    }
+
+    pub(super) const fn class_symbol(&self) -> SemanticSymbolId {
+        self.class_symbol
+    }
+
+    pub(super) const fn declaration(&self) -> Option<NodeRef> {
+        self.declaration
+    }
+
+    pub(super) const fn callable(&self) -> &ValidatedSingleCallable {
+        &self.callable
+    }
+
+    pub(super) const fn pending_return_body(&self) -> Option<NodeRef> {
+        self.pending_return_body
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassInstanceSuperOrigin {
+    class_symbol: SemanticSymbolId,
+    instance_type: TypeId,
+    this_type: TypeId,
+    base_symbol: SemanticSymbolId,
+    base_instance: TypeId,
+    base_this: TypeId,
+}
+
+/// A canonical base reference with the derived class's synthetic this argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ClassInstanceSuperView {
+    origin: ClassInstanceSuperOrigin,
+    reference: TypeId,
+    mapper: TypeMapperId,
+}
+
+impl ClassInstanceSuperView {
+    pub(super) const fn receiver_type(self) -> TypeId {
+        self.reference
+    }
+
+    pub(super) const fn lookup_type(self) -> TypeId {
+        self.origin.base_instance
+    }
+
+    pub(super) const fn instance_type(self) -> TypeId {
+        self.origin.instance_type
+    }
+}
+
+/// A selected base member retains both its original and instantiated callable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClassInstanceSuperMember {
+    view: TypeId,
+    member: SemanticSymbolId,
+    source: ClassMemberSource,
+    declaring_this: TypeId,
+    mapper: TypeMapperId,
+    source_type: TypeId,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    source_callable: Option<ValidatedSingleCallable>,
+    callable: Option<ValidatedSingleCallable>,
+}
+
+impl ClassInstanceSuperMember {
+    pub(super) const fn view(&self) -> TypeId {
+        self.view
+    }
+
+    pub(super) const fn member(&self) -> SemanticSymbolId {
+        self.member
+    }
+
+    pub(super) const fn type_(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) fn is_instantiated_callable(&self) -> bool {
+        self.type_ != self.source_type && self.callable.is_some()
+    }
+}
+
+/// Return and completion evidence is independent of mutable signature caches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceClassProvenance {
+    prepared: PreparedSourceClass,
+    members: ClassMembers,
+    this_type: TypeId,
+    constructor_parameters: Vec<SemanticSymbolId>,
+    constructor_declaration: Option<NodeRef>,
+    constructor_minimum: i32,
+    base_members: Option<ClassMembers>,
+    inherited_values: Vec<(SemanticSymbolId, TypeId, Option<SignatureId>)>,
+    method_returns: Vec<Option<TypeId>>,
+    completed_bodies: Vec<bool>,
+    complete: bool,
+}
+
+impl SourceClassProvenance {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.prepared.plan.symbol()
+    }
+
+    pub(super) const fn instance_type(&self) -> TypeId {
+        self.prepared.instance_type
+    }
+}
+
+fn source_class_body(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    body: ts_ast::NodeId,
+) -> Result<NodeRef, ClassError> {
+    let body = NodeRef::new(declaration.arena, declaration.file, body);
+    let record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(body)));
+    };
+    let owner = preflight_node(store, host, declaration)?;
+    if record.kind != SyntaxKind::Block
+        || record.parent != Some(declaration.node)
+        || record.flags.0 != 0
+        || record.range.start < owner.range.start
+        || record.range.end != owner.range.end
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+    {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(body)));
+    }
+    let mut previous_end = record.range.start;
+    for &statement in &block.statements.nodes {
+        let statement = NodeRef::new(body.arena, body.file, statement);
+        let child = preflight_node(store, host, statement)?;
+        if child.parent != Some(body.node)
+            || child.range.start < previous_end
+            || child.range.end > record.range.end
+        {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(statement)));
+        }
+        previous_end = child.range.end;
+    }
+    Ok(body)
+}
+
+fn source_constructor_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: ClassConstructorParameterPlan,
+) -> Result<ClassBodyParameterPlan, ClassError> {
+    let record = preflight_node(store, host, parameter.declaration)?;
+    let NodeData::ParameterDeclaration(data) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidProperty(
+            parameter.declaration,
+        )));
+    };
+    let type_ = optional_constructor_parameter_type(
+        store,
+        parameter.type_,
+        parameter.optional,
+        parameter.declaration,
+    )?
+    .ok_or_else(|| {
+        unsupported(ClassUnsupported::PropertyType {
+            node: parameter.type_node,
+            kind: SyntaxKind::Parameter,
+        })
+    })?;
+    Ok(ClassBodyParameterPlan {
+        declaration: parameter.declaration,
+        name_node: NodeRef::new(
+            parameter.declaration.arena,
+            parameter.declaration.file,
+            data.name,
+        ),
+        symbol: parameter.symbol,
+        property_symbol: parameter.property.map(|property| property.symbol),
+        annotation: Some(parameter.type_node),
+        initializer: parameter.initializer,
+        type_,
+        optional: parameter.optional,
+    })
+}
+
+fn source_parameter_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: ClassConstructorParameterPlan,
+) -> Result<Option<ClassPropertyPlan>, ClassError> {
+    let Some(property) = parameter.property else {
+        return Ok(None);
+    };
+    let record = preflight_node(store, host, parameter.declaration)?;
+    let NodeData::ParameterDeclaration(data) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidProperty(
+            parameter.declaration,
+        )));
+    };
+    let name_node = NodeRef::new(
+        parameter.declaration.arena,
+        parameter.declaration.file,
+        data.name,
+    );
+    let name_record = preflight_node(store, host, name_node)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invariant(ClassInvariant::InvalidName(name_node)));
+    };
+    let (initializer_text, initializer_string) = match parameter.initializer {
+        None => (None, None),
+        Some(initializer) => match &preflight_node(store, host, initializer)?.data {
+            NodeData::NumericLiteral(literal) => (Some(literal.text.clone()), None),
+            NodeData::StringLiteral(literal) => (None, Some(literal.text.clone())),
+            _ => return Err(invariant(ClassInvariant::InvalidProperty(initializer))),
+        },
+    };
+    Ok(Some(ClassPropertyPlan {
+        declaration: parameter.declaration,
+        symbol: property.symbol,
+        name_node,
+        type_node: parameter.type_node,
+        initializer_node: parameter.initializer,
+        initializer_text,
+        initializer_string,
+        initializer_parameter_name: None,
+        initializer_assertion: None,
+        merged_interface_annotation: None,
+        auto_accessor: false,
+        name: identifier.text.clone(),
+        side: ClassPropertySide::Instance,
+        optional: parameter.optional,
+        definite: false,
+        abstract_property: false,
+        readonly: property.readonly,
+        ambient_private_modifier: None,
+        parameter_property: true,
+        javascript_constructor_assignment: false,
+    }))
+}
+
+fn plan_source_class_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    header: &ClassDeclarationHeader,
+    declaration: NodeRef,
+) -> Result<(SourceClassConstructorPlan, Option<ClassBodyPlan>), ClassError> {
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ConstructorDeclaration(data) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    };
+    if record.kind != SyntaxKind::Constructor
+        || record.flags.0 != 0
+        || record.parent != Some(header.declaration.node)
+        || data.asterisk_token.is_some()
+        || data.end_flow_node.is_some()
+        || data.full_signature.is_some()
+        || data.next_container.is_some()
+        || data.return_flow_node.is_some()
+        || data.symbol.is_some()
+        || data.type_.is_some()
+        || data.type_parameters.is_some()
+        || data.facts != 0
+        || data.parameters.has_trailing_comma
+    {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    }
+    let visibility = class_constructor_visibility(
+        store,
+        host,
+        declaration,
+        data.parameters.range.start,
+        data.modifiers.as_ref(),
+    )?;
+    let symbol = bound_symbol(store, host, declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(header.symbol)))?;
+    let owner = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(header.symbol)))?;
+    if owner.flags() != SymbolFlags::CONSTRUCTOR
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name() != InternalSymbolName::Constructor.as_ref()
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration().is_some()
+        || owner.parent() != Some(header.symbol)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || header
+            .instance_members
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(InternalSymbolName::Constructor.as_ref()))
+            != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidConstructSignature(
+            header.symbol,
+        )));
+    }
+    let mut parameters = Vec::new();
+    let mut body_parameters = Vec::new();
+    let mut previous_end = data.parameters.range.start;
+    let mut names = HashSet::new();
+    for &parameter in &data.parameters.nodes {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+        let parameter_record = preflight_node(store, host, parameter)?;
+        if parameter_record.range.start < previous_end
+            || parameter_record.range.end > data.parameters.range.end
+        {
+            return Err(invariant(ClassInvariant::InvalidProperty(parameter)));
+        }
+        previous_end = parameter_record.range.end;
+        let PlannedConstructorParameter::Primitive(planned) =
+            plan_constructor_parameter_with_body_mode(
+                store,
+                host,
+                header.symbol,
+                declaration,
+                parameter,
+                header.instance_members,
+                None,
+                true,
+            )?
+        else {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: parameter,
+                kind: SyntaxKind::Parameter,
+            }));
+        };
+        if !names.insert(planned.symbol)
+            || planned.decorator.is_some()
+            || header.ambient && planned.initializer.is_some()
+        {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: parameter,
+                kind: SyntaxKind::Parameter,
+            }));
+        }
+        body_parameters.push(source_constructor_parameter(store, host, planned)?);
+        parameters.push(planned);
+    }
+    i32::try_from(parameters.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    let body = match (data.body, header.ambient) {
+        (None, true) => None,
+        (Some(body), false) => {
+            let body = source_class_body(store, host, declaration, body)?;
+            if preflight_node(store, host, body)?.range.start < data.parameters.range.end {
+                return Err(invariant(ClassInvariant::InvalidDeclaration(body)));
+            }
+            Some(ClassBodyPlan {
+                class_declaration: header.declaration,
+                class_symbol: header.symbol,
+                declaration,
+                body,
+                kind: ClassBodyKind::Constructor,
+                parameters: body_parameters,
+                return_annotation: None,
+            })
+        }
+        _ => {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: SyntaxKind::Constructor,
+            }));
+        }
+    };
+    Ok((
+        SourceClassConstructorPlan {
+            declaration,
+            symbol,
+            visibility,
+            parameters,
+        },
+        body,
+    ))
+}
+
+fn source_property_origin(
+    store: &CanonicalTypeMapperStore,
+    class: SemanticSymbolId,
+    property: &ClassPropertyPlan,
+) -> ClassMemberSource {
+    let origin = if property.parameter_property {
+        ClassMemberOrigin::ParameterProperty {
+            parameter: property.declaration,
+        }
+    } else if property.javascript_constructor_assignment {
+        ClassMemberOrigin::JavaScriptAssignment {
+            assignment: property.declaration,
+        }
+    } else if property.auto_accessor {
+        ClassMemberOrigin::AutoAccessor {
+            initializer: property.initializer_node,
+        }
+    } else {
+        ClassMemberOrigin::Field {
+            initializer: property.initializer_node,
+        }
+    };
+    ClassMemberSource {
+        symbol: property.symbol,
+        declaring_class: class,
+        declaration: property.declaration,
+        origin,
+        side: property.side,
+        visibility: if store
+            .symbol(property.symbol)
+            .is_some_and(|symbol| symbol.name().is_private_identifier())
+        {
+            ClassConstructorVisibility::Private
+        } else {
+            class_member_visibility(store, property.declaration)
+        },
+        readonly: property.readonly,
+        abstract_: property.abstract_property,
+    }
+}
+
+/// Plans owned members and body nodes. Body expressions are planned by the source provider.
+pub(super) fn plan_source_class_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<SourceClassPlan, ClassError> {
+    let header = plan_class_declaration_header(store, host, symbol, true)?;
+    let record = preflight_node(store, host, header.declaration)?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(
+            header.declaration,
+        )));
+    };
+    if class.type_parameters.is_some()
+        || !header.namespace_exports.is_empty()
+        || !header.implementations.is_empty()
+        || header.null_base.is_some()
+        || header
+            .base
+            .as_ref()
+            .is_some_and(|base| !base.type_arguments.is_empty())
+    {
+        return Err(unsupported(ClassUnsupported::Generic(header.declaration)));
+    }
+    if let Some(base) = &header.base {
+        preflight_class_override_visibility(store, header.symbol, base.symbol, base.expression)?;
+    }
+    let revision = host
+        .source(header.declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(header.declaration)))?
+        .0
+        .revision();
+    let mut plan = SourceClassPlan {
+        header,
+        revision,
+        properties: Vec::new(),
+        methods: Vec::new(),
+        constructor: None,
+        bodies: Vec::new(),
+        sources: Vec::new(),
+        bindings: Vec::new(),
+    };
+    let mut previous_end = class.members.range.start;
+    for &member in &class.members.nodes {
+        let member = NodeRef::new(plan.declaration().arena, plan.declaration().file, member);
+        let record = preflight_node(store, host, member)?;
+        if record.parent != Some(plan.declaration().node)
+            || record.range.start < previous_end
+            || record.range.end > class.members.range.end
+        {
+            return Err(invariant(ClassInvariant::InvalidProperty(member)));
+        }
+        previous_end = record.range.end;
+        match &record.data {
+            NodeData::ConstructorDeclaration(_) => {
+                if plan.constructor.is_some() {
+                    return Err(unsupported(ClassUnsupported::Member {
+                        node: member,
+                        kind: record.kind,
+                    }));
+                }
+                let (constructor, body) =
+                    plan_source_class_constructor(store, host, &plan.header, member)?;
+                for &parameter in &constructor.parameters {
+                    if let Some(property) = source_parameter_property(store, host, parameter)? {
+                        plan.sources
+                            .push(source_property_origin(store, symbol, &property));
+                        plan.properties.push((property, parameter.type_));
+                    }
+                }
+                if let Some(body) = body {
+                    plan.bodies.push(body);
+                }
+                plan.constructor = Some(constructor);
+            }
+            NodeData::MethodDeclaration(_) => {
+                let method = plan_method_with_body_mode(
+                    store,
+                    host,
+                    symbol,
+                    member,
+                    (plan.header.instance_members, plan.header.static_members),
+                    plan.header.ambient,
+                    true,
+                )?;
+                let return_type = method
+                    .return_type_node
+                    .map(|annotation| {
+                        let record = preflight_node(store, host, annotation)?;
+                        if record.flags.0 != 0
+                            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+                        {
+                            return Err(unsupported(ClassUnsupported::PropertyType {
+                                node: annotation,
+                                kind: record.kind,
+                            }));
+                        }
+                        let type_ = primitive_keyword_type(store, annotation, record.kind)?;
+                        validate_index_type_cache(store, annotation, type_)?;
+                        Ok(type_)
+                    })
+                    .transpose()?;
+                let (arena, _) = host
+                    .source(member)
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(member)))?;
+                plan.sources.push(ClassMemberSource {
+                    symbol: method.symbol,
+                    declaring_class: symbol,
+                    declaration: member,
+                    origin: ClassMemberOrigin::Method,
+                    side: method.side,
+                    visibility: if store
+                        .symbol(method.symbol)
+                        .is_some_and(|symbol| symbol.name().is_private_identifier())
+                    {
+                        ClassConstructorVisibility::Private
+                    } else {
+                        class_member_visibility(store, member)
+                    },
+                    readonly: false,
+                    abstract_: ts_binder::canonical_has_syntactic_modifier(
+                        arena,
+                        member.node,
+                        SyntaxKind::AbstractKeyword,
+                    ),
+                });
+                if let Some(body) = method.body {
+                    let mut parameters = Vec::new();
+                    for parameter in &method.parameters {
+                        let record = preflight_node(store, host, parameter.declaration)?;
+                        let NodeData::ParameterDeclaration(data) = &record.data else {
+                            return Err(invariant(ClassInvariant::InvalidProperty(
+                                parameter.declaration,
+                            )));
+                        };
+                        parameters.push(ClassBodyParameterPlan {
+                            declaration: parameter.declaration,
+                            name_node: NodeRef::new(member.arena, member.file, data.name),
+                            symbol: parameter.symbol,
+                            property_symbol: None,
+                            annotation: Some(parameter.type_node),
+                            initializer: None,
+                            type_: parameter.type_,
+                            optional: false,
+                        });
+                    }
+                    plan.bodies.push(ClassBodyPlan {
+                        class_declaration: plan.declaration(),
+                        class_symbol: symbol,
+                        declaration: member,
+                        body,
+                        kind: ClassBodyKind::Method {
+                            symbol: method.symbol,
+                            side: method.side,
+                        },
+                        parameters,
+                        return_annotation: method.return_type_node,
+                    });
+                }
+                plan.methods.push(SourceClassMethodPlan {
+                    method,
+                    return_type,
+                });
+            }
+            NodeData::PropertyDeclaration(_) => {
+                let property = plan_property(
+                    store,
+                    host,
+                    symbol,
+                    member,
+                    plan.header.instance_members,
+                    plan.header.static_members,
+                )?;
+                if property.initializer_parameter_name.is_some()
+                    || property.initializer_assertion.is_some()
+                {
+                    return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+                }
+                let type_ = planned_property_type(store, host, &property)?;
+                validate_property_cache_state(store, &property, type_)?;
+                plan.sources
+                    .push(source_property_origin(store, symbol, &property));
+                plan.properties.push((property, type_));
+            }
+            NodeData::ClassStaticBlockDeclaration(data) => {
+                if record.kind != SyntaxKind::ClassStaticBlockDeclaration
+                    || record.flags.0 != 0
+                    || data.facts != 0
+                    || data.symbol.is_some()
+                    || data.next_container.is_some()
+                    || data.return_flow_node.is_some()
+                {
+                    return Err(invariant(ClassInvariant::InvalidDeclaration(member)));
+                }
+                if let Some(modifiers) = &data.modifiers {
+                    let [modifier] = modifiers.list.nodes.as_slice() else {
+                        return Err(invariant(ClassInvariant::InvalidDeclaration(member)));
+                    };
+                    let modifier = NodeRef::new(member.arena, member.file, *modifier);
+                    let token = preflight_node(store, host, modifier)?;
+                    if modifiers.flags.0 != 0
+                        || modifiers.list.has_trailing_comma
+                        || token.kind != SyntaxKind::StaticKeyword
+                        || token.flags.0 != 0
+                        || token.parent != Some(member.node)
+                        || !matches!(token.data, NodeData::Token(_))
+                    {
+                        return Err(invariant(ClassInvariant::InvalidDeclaration(member)));
+                    }
+                } else {
+                    return Err(invariant(ClassInvariant::InvalidDeclaration(member)));
+                }
+                let body = source_class_body(store, host, member, data.body)?;
+                plan.bodies.push(ClassBodyPlan {
+                    class_declaration: plan.declaration(),
+                    class_symbol: symbol,
+                    declaration: member,
+                    body,
+                    kind: ClassBodyKind::StaticBlock,
+                    parameters: Vec::new(),
+                    return_annotation: None,
+                });
+            }
+            _ => {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: member,
+                    kind: record.kind,
+                }));
+            }
+        }
+    }
+    plan_source_class_expandos(store, host, &mut plan)?;
+    validate_source_class_member_tables(store, &plan)?;
+    plan.bindings = capture_source_class_bindings(store, &plan)?;
+    Ok(plan)
+}
+
+fn source_class_base_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceClassPlan,
+) -> Result<Option<ClassMembers>, ClassError> {
+    let Some(base) = &plan.header.base else {
+        return Ok(None);
+    };
+    let instance = store
+        .declared_type_links(base.symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| unsupported(ClassUnsupported::Heritage(base.expression)))?;
+    if let Some(provenance) = store.source_class_provenance_for_symbol(base.symbol) {
+        validate_source_class_header(store, host, provenance)?;
+        if !provenance.complete {
+            return Err(unsupported(ClassUnsupported::Heritage(base.expression)));
+        }
+        return Ok(Some(provenance.members.clone()));
+    }
+    let query = plan_nongeneric_class_member_query(store, host, base.symbol)?;
+    let members = match &query {
+        ClassMemberQueryPlan::Direct(class) => class_member_state(store, host, class)?,
+        ClassMemberQueryPlan::Derived { class, base } => {
+            let base_instance = store
+                .declared_type_links(base.class.symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or_else(|| unsupported(ClassUnsupported::Heritage(base.class.declaration)))?;
+            let base_value = resolved_class_value_type(store, base.class.symbol)
+                .ok_or_else(|| unsupported(ClassUnsupported::Heritage(base.class.declaration)))?;
+            let base_members =
+                completed_class_members(store, host, base, base_instance, base_value).ok_or_else(
+                    || invariant(ClassInvariant::InvalidHeritageCache(base.class.symbol)),
+                )?;
+            let value = resolved_class_value_type(store, class.class.symbol)
+                .ok_or_else(|| unsupported(ClassUnsupported::Heritage(class.class.declaration)))?;
+            let surfaces = prepare_derived_member_surfaces(store, class, base)?;
+            completed_derived_class_members(store, class, &base_members, instance, value, &surfaces)
+        }
+    }
+    .ok_or_else(|| unsupported(ClassUnsupported::Heritage(base.expression)))?;
+    Ok(Some(members))
+}
+
+fn source_class_entries(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceClassPlan,
+    side: ClassPropertySide,
+    base: Option<&ClassMembers>,
+) -> Result<(Vec<(EscapedName, SemanticSymbolId)>, usize), ClassError> {
+    let table = match side {
+        ClassPropertySide::Instance => plan.header.instance_members,
+        ClassPropertySide::Static => Some(plan.header.static_members),
+    };
+    let owned = plan
+        .sources
+        .iter()
+        .filter(|source| source.side == side)
+        .map(|source| source.symbol)
+        .collect::<HashSet<_>>();
+    let mut entries = table
+        .and_then(|table| store.symbol_table(table))
+        .into_iter()
+        .flat_map(ts_binder::semantic::SymbolTable::iter)
+        .filter(|(_, symbol)| owned.contains(symbol))
+        .map(|(name, symbol)| (name.to_owned(), symbol))
+        .collect::<Vec<_>>();
+    let mut names = entries
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    if let Some(base) = base {
+        let inherited = match side {
+            ClassPropertySide::Instance => base.instance_properties(),
+            ClassPropertySide::Static => base.static_properties(),
+        };
+        for &symbol in inherited {
+            let record = store
+                .symbol(symbol)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(plan.symbol())))?;
+            if names.insert(record.name().to_owned()) {
+                entries.push((record.name().to_owned(), symbol));
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(entries.len());
+    for (name, symbol) in entries {
+        let record = store
+            .symbol(symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(plan.symbol())))?;
+        let first = record
+            .declarations()
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+        let declaration = record
+            .value_declaration()
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+        let contained = source_declaration_is_within(store, declaration, plan.declaration());
+        let file = store
+            .source_file_rank(first.file)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(first)))?;
+        let start = store
+            .source_node_start(first)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(first)))?;
+        ordered.push((!contained, file, start, name, symbol));
+    }
+    ordered.sort();
+    let contained_count = ordered.iter().take_while(|entry| !entry.0).count();
+    Ok((
+        ordered
+            .into_iter()
+            .map(|(_, _, _, name, symbol)| (name, symbol))
+            .collect(),
+        contained_count,
+    ))
+}
+
+fn source_declaration_is_within(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    container: NodeRef,
+) -> bool {
+    let mut current = Some(declaration);
+    let mut seen = HashSet::new();
+    while let Some(node) = current {
+        if node == container {
+            return true;
+        }
+        if !seen.insert(node) {
+            return false;
+        }
+        current = match store.source_node_parent(node) {
+            Some(SourceNodeParent::Parent(parent)) => Some(parent),
+            _ => None,
+        };
+    }
+    false
+}
+
+fn source_inherited_values(
+    store: &CanonicalTypeMapperStore,
+    base: Option<&ClassMembers>,
+) -> Result<Vec<(SemanticSymbolId, TypeId, Option<SignatureId>)>, ClassError> {
+    let Some(base) = base else {
+        return Ok(Vec::new());
+    };
+    base.instance_properties()
+        .iter()
+        .chain(base.static_properties())
+        .map(|&symbol| {
+            let type_ = store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+            let signature = if store
+                .symbol(symbol)
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+            {
+                let record = store
+                    .type_payload(type_)
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+                let TypeData::Object(object) = record.data() else {
+                    return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+                };
+                let [signature] = object.structured.signatures.as_deref().unwrap_or_default()
+                else {
+                    return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+                };
+                Some(*signature)
+            } else {
+                None
+            };
+            Ok((symbol, type_, signature))
+        })
+        .collect()
+}
+
+fn source_class_minimum(parameters: &[ClassConstructorParameterPlan]) -> Result<i32, ClassError> {
+    parameters
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, parameter)| !parameter.optional && parameter.initializer.is_none())
+        .map_or(Ok(0), |(index, parameter)| {
+            i32::try_from(index + 1)
+                .map_err(|_| invariant(ClassInvariant::Capacity(parameter.declaration)))
+        })
+}
+
+fn source_class_signature_valid(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    declaration: Option<NodeRef>,
+    flags: SignatureFlags,
+    parameters: &[SemanticSymbolId],
+    return_type: Option<TypeId>,
+    minimum: i32,
+) -> bool {
+    let parameter_types = parameters
+        .iter()
+        .map(|symbol| {
+            store
+                .value_symbol_links(*symbol)
+                .and_then(|links| links.resolved_type)
+        })
+        .collect::<Option<Vec<_>>>();
+    store.signature(signature).is_some_and(|record| {
+        record.declaration() == declaration
+            && record.flags() == flags
+            && record.parameters() == parameters
+            && record.type_parameters().is_empty()
+            && record.this_parameter().is_none()
+            && record.min_argument_count() == minimum
+            && (record.resolved_min_argument_count() == -1
+                || record.resolved_min_argument_count() == minimum)
+            && record.resolved_return_type() == return_type
+            && record.resolved_type_predicate().is_none()
+            && record.target().is_none()
+            && record.mapper().is_none()
+            && record.isolated_signature_type().is_none()
+            && record.composite().is_none()
+            && store
+                .callable_signature_parameter_types(signature)
+                .is_none_or(|cached| parameter_types.as_deref() == Some(cached))
+    })
+}
+
+fn source_class_object_valid(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    symbol: SemanticSymbolId,
+    structured: &StructuredTypeData,
+) -> bool {
+    store.type_payload(type_).is_some_and(|record| {
+        record.flags() == TypeFlags::OBJECT
+            && record.object_flags() == (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+            && record.symbol() == Some(symbol)
+            && record.alias().is_none()
+            && matches!(record.data(), TypeData::Object(object) if object == &ObjectTypeData {
+                structured: structured.clone(), ..ObjectTypeData::default()
+            })
+    })
+}
+
+fn source_table_matches(
+    store: &CanonicalTypeMapperStore,
+    table: Option<SymbolTableId>,
+    entries: &[(EscapedName, SemanticSymbolId)],
+) -> bool {
+    match table {
+        None => entries.is_empty(),
+        Some(table) => store.symbol_table(table).is_some_and(|table| {
+            table.len() == entries.len()
+                && entries
+                    .iter()
+                    .all(|(name, symbol)| table.get(name.as_ref()) == Some(*symbol))
+        }),
+    }
+}
+
+fn validate_source_class_header(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    provenance: &SourceClassProvenance,
+) -> Result<(), ClassError> {
+    let prepared = &provenance.prepared;
+    let plan = &prepared.plan;
+    if plan_source_class_members(store, host, plan.symbol())? != *plan {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    if source_class_base_members(store, host, plan)? != provenance.base_members {
+        return Err(invariant(ClassInvariant::InvalidHeritageCache(
+            plan.symbol(),
+        )));
+    }
+    validate_source_class_stored_header(store, provenance)
+}
+
+fn validate_source_class_stored_header(
+    store: &CanonicalTypeMapperStore,
+    provenance: &SourceClassProvenance,
+) -> Result<(), ClassError> {
+    validate_source_class_stored_layout(store, provenance)?;
+    let plan = &provenance.prepared.plan;
+    let reject = || invariant(ClassInvariant::InvalidInstanceMembers(plan.symbol()));
+    for (index, method) in plan.methods.iter().enumerate() {
+        let returned = provenance.method_returns[index];
+        let body_complete = plan
+            .bodies
+            .iter()
+            .position(|body| body.declaration == method.method.declaration)
+            .is_some_and(|body| provenance.completed_bodies[body]);
+        if store
+            .signature(provenance.prepared.methods[index].1)
+            .is_none_or(|signature| signature.resolved_return_type() != returned)
+            || method
+                .return_type
+                .is_some_and(|annotation| returned != Some(annotation))
+            || method.return_type.is_none() && (returned.is_some() != body_complete)
+        {
+            return Err(reject());
+        }
+    }
+    if provenance.complete
+        && (!provenance.completed_bodies.iter().all(|complete| *complete)
+            || provenance.method_returns.iter().any(Option::is_none))
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
+/// Authenticates synthetic this without completing the source class's bodies.
+pub(super) fn source_class_this_type_owner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<SemanticSymbolId> {
+    let symbol = store.type_payload(type_)?.symbol()?;
+    let provenance = store.source_class_provenance_for_symbol(symbol)?;
+    (provenance.symbol() == symbol
+        && provenance.this_type == type_
+        && validate_source_class_stored_header(store, provenance).is_ok())
+    .then_some(symbol)
+}
+
+fn completed_source_class_header_is_valid(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    instance_type: Option<TypeId>,
+) -> bool {
+    let instance = instance_type.and_then(|instance| store.source_class_provenance(instance));
+    let owner = store.source_class_provenance_for_symbol(symbol);
+    match (instance, owner) {
+        (None, None) => true,
+        (Some(provenance), Some(owner)) => {
+            provenance.symbol() == symbol
+                && provenance.instance_type() == owner.instance_type()
+                && provenance.complete
+                && validate_source_class_stored_header(store, provenance).is_ok()
+        }
+        _ => false,
+    }
+}
+
+// Adoption checks the complete legacy layout before changing its return lifecycle.
+fn validate_source_class_stored_layout(
+    store: &CanonicalTypeMapperStore,
+    provenance: &SourceClassProvenance,
+) -> Result<(), ClassError> {
+    let prepared = &provenance.prepared;
+    let plan = &prepared.plan;
+    let members = &provenance.members;
+    let reject = || invariant(ClassInvariant::InvalidInstanceMembers(plan.symbol()));
+    let owner = store.symbol(plan.symbol()).ok_or_else(reject)?;
+    if stored_class_owner_declaration(store, plan.symbol(), owner) != Some(plan.declaration())
+        || owner.members() != plan.header.instance_members
+        || owner.exports() != Some(plan.header.static_members)
+        || plan
+            .bindings
+            .iter()
+            .any(|expected| source_class_binding(store, expected.symbol).as_ref() != Ok(expected))
+    {
+        return Err(reject());
+    }
+    if prepared.instance_type != members.shells.instance_type
+        || prepared.value_type != members.shells.value_type
+        || prepared.construct_signature != members.default_construct_signature
+        || members.shells.symbol != plan.symbol()
+        || members.shells.declaration != plan.declaration()
+        || prepared.methods.len() != plan.methods.len()
+        || provenance.method_returns.len() != plan.methods.len()
+        || provenance.completed_bodies.len() != plan.bodies.len()
+        || store
+            .declared_type_links(plan.symbol())
+            .and_then(|links| links.declared_type)
+            != Some(prepared.instance_type)
+        || store.value_symbol_links(plan.symbol())
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(prepared.value_type),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(reject());
+    }
+    validate_source_class_member_tables(store, plan)?;
+    validate_prototype(store, plan.symbol(), plan.header.static_members)?;
+    let instance = exact_class_instance_identity(store, plan.symbol(), prepared.instance_type)
+        .ok_or_else(reject)?;
+    let base = provenance.base_members.as_ref();
+    if base.map(|base| base.shells.symbol) != plan.header.base.as_ref().map(|base| base.symbol) {
+        return Err(reject());
+    }
+    let expected_base = base.map(|base| base.shells.value_type).or_else(|| {
+        store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.undefined_type)
+    });
+    if instance.this_type != Some(provenance.this_type)
+        || store
+            .type_payload(prepared.instance_type)
+            .is_none_or(|record| {
+                record.object_flags()
+                    != (ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED)
+            })
+        || !instance.declared_members_resolved
+        || instance.declared_members != plan.header.instance_members
+        || instance.declared_call_signatures.is_some()
+        || instance.declared_construct_signatures.is_some()
+        || instance.declared_index_infos.is_some()
+        || !instance.base_types_resolved
+        || instance.resolved_base_constructor_type != expected_base
+        || instance.resolved_base_types != base.map(|base| vec![base.shells.instance_type])
+    {
+        return Err(reject());
+    }
+    let expected_heritage = base.map(|base| DirectClassHeritageProvenance {
+        owner_symbol: plan.symbol(),
+        owner_value_type: prepared.value_type,
+        base_symbol: base.shells.symbol,
+        base_instance_type: base.shells.instance_type,
+        base_value_type: base.shells.value_type,
+    });
+    if store.direct_class_heritage_provenance(prepared.instance_type) != expected_heritage
+        || members.base
+            != base.map(|base| ClassBaseIdentities {
+                symbol: base.shells.symbol,
+                instance_type: base.shells.instance_type,
+                value_type: base.shells.value_type,
+            })
+    {
+        return Err(reject());
+    }
+    if let Some(base) = base
+        && (base.shells.instance_type == prepared.instance_type
+            || validate_class_heritage_members(store, base.shells.instance_type) != ClassHeritageMembersValidation::Valid
+            || store.value_symbol_links(base.shells.symbol).and_then(|links| links.resolved_type) != Some(base.shells.value_type)
+            || store.type_payload(base.shells.value_type).is_none_or(|record| {
+                !matches!(record.data(), TypeData::Object(object)
+                    if object.structured.signatures.as_deref() == Some(&[base.default_construct_signature]))
+            }))
+    {
+        return Err(reject());
+    }
+    let (instance_entries, instance_count) =
+        source_class_entries(store, plan, ClassPropertySide::Instance, base)?;
+    let (mut static_entries, static_count) =
+        source_class_entries(store, plan, ClassPropertySide::Static, base)?;
+    if members.declared_instance_property_count != instance_count
+        || members.declared_static_property_count != static_count
+        || members.instance_properties
+            != instance_entries
+                .iter()
+                .map(|(_, symbol)| *symbol)
+                .collect::<Vec<_>>()
+        || members.static_properties
+            != static_entries
+                .iter()
+                .map(|(_, symbol)| *symbol)
+                .collect::<Vec<_>>()
+        || !source_table_matches(store, members.instance_members, &instance_entries)
+        || instance.reference.object.structured
+            != (StructuredTypeData {
+                members: members.instance_members,
+                properties: (!members.instance_properties.is_empty())
+                    .then(|| members.instance_properties.clone()),
+                ..StructuredTypeData::default()
+            })
+    {
+        return Err(reject());
+    }
+    static_entries.push((
+        store
+            .symbol(members.prototype)
+            .ok_or_else(reject)?
+            .name()
+            .to_owned(),
+        members.prototype,
+    ));
+    let mut static_properties = members.static_properties.clone();
+    static_properties.push(members.prototype);
+    if !source_table_matches(store, Some(members.static_members), &static_entries)
+        || !source_class_object_valid(
+            store,
+            prepared.value_type,
+            plan.symbol(),
+            &StructuredTypeData {
+                members: Some(members.static_members),
+                properties: Some(static_properties),
+                signatures: Some(vec![prepared.construct_signature]),
+                call_signature_count: 0,
+                ..StructuredTypeData::default()
+            },
+        )
+        || !source_class_signature_valid(
+            store,
+            prepared.construct_signature,
+            provenance.constructor_declaration,
+            SignatureFlags::CONSTRUCT
+                | if plan.header.abstract_class {
+                    SignatureFlags::ABSTRACT
+                } else {
+                    SignatureFlags::NONE
+                },
+            &provenance.constructor_parameters,
+            Some(prepared.instance_type),
+            provenance.constructor_minimum,
+        )
+        || source_inherited_values(store, base)? != provenance.inherited_values
+    {
+        return Err(reject());
+    }
+    if let Some(constructor) = &plan.constructor {
+        if store.signature_links(constructor.declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(prepared.construct_signature),
+                ..SignatureLinks::default()
+            })
+        {
+            return Err(reject());
+        }
+        for parameter in &constructor.parameters {
+            let type_ = optional_constructor_parameter_type(
+                store,
+                parameter.type_,
+                parameter.optional,
+                parameter.declaration,
+            )?
+            .ok_or_else(reject)?;
+            if store.value_symbol_links(parameter.symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+                || store.type_node_links(parameter.type_node)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(parameter.type_),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(reject());
+            }
+        }
+    }
+    for (property, type_) in &plan.properties {
+        if !exact_property_type_links(store, property, *type_)
+            || store.symbol(property.symbol).is_none_or(|symbol| {
+                symbol.check_flags()
+                    != if property.readonly {
+                        CheckFlags::READONLY
+                    } else {
+                        CheckFlags::NONE
+                    }
+            })
+            || resolved_property_value_type(store, property, *type_)?.is_none_or(|expected| {
+                store.value_symbol_links(property.symbol)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(expected),
+                        ..ValueSymbolLinks::default()
+                    })
+            })
+        {
+            return Err(reject());
+        }
+    }
+    for (index, method) in plan.methods.iter().enumerate() {
+        let (type_, signature) = prepared.methods[index];
+        let parameters = method
+            .method
+            .parameters
+            .iter()
+            .map(|parameter| parameter.symbol)
+            .collect::<Vec<_>>();
+        let returned = store
+            .signature(signature)
+            .and_then(super::signatures::Signature::resolved_return_type);
+        if store.value_symbol_links(method.method.symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || store.signature_links(method.method.declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                })
+            || !source_class_signature_valid(
+                store,
+                signature,
+                Some(method.method.declaration),
+                SignatureFlags::NONE,
+                &parameters,
+                returned,
+                i32::try_from(parameters.len()).map_err(|_| reject())?,
+            )
+            || !source_class_object_valid(
+                store,
+                type_,
+                method.method.symbol,
+                &StructuredTypeData {
+                    signatures: Some(vec![signature]),
+                    call_signature_count: 1,
+                    ..StructuredTypeData::default()
+                },
+            )
+        {
+            return Err(reject());
+        }
+        for parameter in &method.method.parameters {
+            if store.value_symbol_links(parameter.symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..ValueSymbolLinks::default()
+                })
+                || store.type_node_links(parameter.type_node)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(parameter.type_),
+                        ..TypeNodeLinks::default()
+                    })
+            {
+                return Err(reject());
+            }
+        }
+        if let Some(annotation) = method.method.return_type_node
+            && store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                != method.return_type
+        {
+            return Err(reject());
+        }
+    }
+    if plan.bodies.iter().any(|body| {
+        body.kind == ClassBodyKind::StaticBlock
+            && store
+                .signature_links(body.declaration)
+                .is_some_and(|links| links != &SignatureLinks::default())
+    }) {
+        return Err(reject());
+    }
+    Ok(())
+}
+
+/// Publishes a header with real signatures. Inferred method returns stay absent.
+pub(super) fn prepare_source_class_members(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceClassPlan,
+) -> Result<PreparedSourceClass, ClassError> {
+    if plan_source_class_members(store, host, plan.symbol())? != *plan {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    let instance = store
+        .declared_type_links(plan.symbol())
+        .and_then(|links| links.declared_type);
+    if let Some(provenance) = store.source_class_provenance_for_symbol(plan.symbol()) {
+        validate_source_class_header(store, host, provenance)?;
+        return Ok(provenance.prepared.clone());
+    }
+    let base = source_class_base_members(store, host, plan)?;
+    let base_constructor = base
+        .as_ref()
+        .map(|base| base.shells.value_type)
+        .or_else(|| {
+            store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.undefined_type)
+        })
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(plan.declaration())))?;
+    let inherited_values = source_inherited_values(store, base.as_ref())?;
+    let old_value = resolved_class_value_type(store, plan.symbol());
+    if old_value.is_some_and(|value| has_static_member_publication(store, value)) {
+        // Reuse legacy identities, but require source-body receipts for this path.
+        let legacy = plan_nongeneric_class_member_query(store, host, plan.symbol())?;
+        preflight_nongeneric_class_member_query(store, host, &legacy)?;
+        let members = execute_nongeneric_class_member_query(store, host, &legacy)?;
+        let mut methods = Vec::new();
+        let mut returns = Vec::new();
+        for method in &plan.methods {
+            let type_ = store
+                .value_symbol_links(method.method.symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(|| {
+                    invariant(ClassInvariant::InvalidPropertyValueCache(
+                        method.method.symbol,
+                    ))
+                })?;
+            let signature = store
+                .signature_links(method.method.declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .ok_or_else(|| {
+                    invariant(ClassInvariant::InvalidPropertyValueCache(
+                        method.method.symbol,
+                    ))
+                })?;
+            methods.push((type_, signature));
+            returns.push(method.return_type);
+        }
+        let prepared = PreparedSourceClass {
+            plan: plan.clone(),
+            instance_type: members.shells.instance_type,
+            value_type: members.shells.value_type,
+            construct_signature: members.default_construct_signature,
+            methods,
+        };
+        let constructor = store
+            .signature(prepared.construct_signature)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(plan.symbol())))?;
+        let provenance = SourceClassProvenance {
+            prepared: prepared.clone(),
+            this_type: exact_class_instance_identity(store, plan.symbol(), prepared.instance_type)
+                .and_then(|instance| instance.this_type)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(plan.symbol())))?,
+            constructor_parameters: constructor.parameters().to_vec(),
+            constructor_declaration: constructor.declaration(),
+            constructor_minimum: constructor.min_argument_count(),
+            members,
+            base_members: base,
+            inherited_values,
+            method_returns: returns,
+            completed_bodies: vec![false; plan.bodies.len()],
+            complete: false,
+        };
+        validate_source_class_stored_layout(store, &provenance)?;
+        prepare_source_constructor_call_types(store, host, plan, provenance.base_members.as_ref())?;
+        if !store.try_reserve_source_class_provenance(1)
+            || !store.publish_source_class_provenance(prepared.instance_type, provenance)
+        {
+            return Err(invariant(ClassInvariant::Publication(plan.declaration())));
+        }
+        for (index, method) in plan.methods.iter().enumerate() {
+            if method.return_type.is_none() {
+                assert!(store.set_signature_resolved_return_type(prepared.methods[index].1, None));
+            }
+        }
+        validate_source_class_stored_header(
+            store,
+            store
+                .source_class_provenance(prepared.instance_type)
+                .expect("source class provenance was registered"),
+        )?;
+        return Ok(prepared);
+    }
+    if store
+        .value_symbol_links(plan.symbol())
+        .is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && old_value.is_none_or(|type_| !exact_static_shell(store, plan.symbol(), type_))
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol())));
+    }
+    if let Some(instance) = instance {
+        let data = exact_class_instance_identity(store, plan.symbol(), instance)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(plan.symbol())))?;
+        if store.type_payload(instance).is_none_or(|record| {
+            record.object_flags() != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+        }) || data
+            .resolved_base_constructor_type
+            .is_some_and(|cached| cached != base_constructor)
+            || data.declared_members_resolved
+            || data.base_types_resolved
+            || data.reference.object.structured != StructuredTypeData::default()
+            || data.declared_members.is_some()
+            || data.declared_call_signatures.is_some()
+            || data.declared_construct_signatures.is_some()
+            || data.declared_index_infos.is_some()
+            || data.resolved_base_types.is_some()
+            || store.direct_class_heritage_provenance(instance).is_some()
+        {
+            return Err(invariant(ClassInvariant::InvalidInstanceCache(
+                plan.symbol(),
+            )));
+        }
+    }
+    for method in &plan.methods {
+        if store
+            .value_symbol_links(method.method.symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || store
+                .signature_links(method.method.declaration)
+                .is_some_and(|links| links != &SignatureLinks::default())
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                method.method.symbol,
+            )));
+        }
+    }
+    if plan.constructor.as_ref().is_some_and(|constructor| {
+        store
+            .signature_links(constructor.declaration)
+            .is_some_and(|links| links != &SignatureLinks::default())
+    }) {
+        return Err(invariant(ClassInvariant::InvalidConstructSignature(
+            plan.symbol(),
+        )));
+    }
+    if plan.bodies.iter().any(|body| {
+        body.kind == ClassBodyKind::StaticBlock
+            && store
+                .signature_links(body.declaration)
+                .is_some_and(|links| links != &SignatureLinks::default())
+    }) {
+        return Err(invariant(ClassInvariant::InvalidConstructSignature(
+            plan.symbol(),
+        )));
+    }
+    let (instance_entries, instance_count) =
+        source_class_entries(store, plan, ClassPropertySide::Instance, base.as_ref())?;
+    let (mut static_entries, static_count) =
+        source_class_entries(store, plan, ClassPropertySide::Static, base.as_ref())?;
+    let prototype = store
+        .symbol_table(plan.header.static_members)
+        .and_then(|table| table.get_source(PROTOTYPE_NAME))
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPrototype(plan.symbol())))?;
+    let instance_properties = instance_entries
+        .iter()
+        .map(|(_, symbol)| *symbol)
+        .collect::<Vec<_>>();
+    let static_properties = static_entries
+        .iter()
+        .map(|(_, symbol)| *symbol)
+        .collect::<Vec<_>>();
+    static_entries.push((
+        store
+            .symbol(prototype)
+            .expect("the prototype was authenticated")
+            .name()
+            .to_owned(),
+        prototype,
+    ));
+    let prepared_instance = if instance_entries.is_empty() {
+        None
+    } else {
+        Some(
+            PreparedSymbolTable::new(instance_entries.len())
+                .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration())))?,
+        )
+    };
+    let prepared_static = if base.is_some() {
+        Some(
+            PreparedSymbolTable::new(static_entries.len())
+                .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration())))?,
+        )
+    } else {
+        None
+    };
+    let (constructor_parameters, constructor_declaration, constructor_minimum) =
+        if let Some(constructor) = &plan.constructor {
+            (
+                constructor
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.symbol)
+                    .collect::<Vec<_>>(),
+                Some(constructor.declaration),
+                source_class_minimum(&constructor.parameters)?,
+            )
+        } else if let Some(base) = &base {
+            let signature = store
+                .signature(base.default_construct_signature)
+                .ok_or_else(|| {
+                    invariant(ClassInvariant::InvalidConstructSignature(
+                        base.shells.symbol,
+                    ))
+                })?;
+            (
+                signature.parameters().to_vec(),
+                signature.declaration(),
+                signature.min_argument_count(),
+            )
+        } else {
+            (Vec::new(), None, 0)
+        };
+    let mut methods = Vec::new();
+    methods
+        .try_reserve_exact(plan.methods.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.declaration())))?;
+    let method_returns = plan
+        .methods
+        .iter()
+        .map(|method| method.return_type)
+        .collect::<Vec<_>>();
+    let completed_bodies = vec![false; plan.bodies.len()];
+    let retained_plan = plan.clone();
+    let mut numbers = Vec::new();
+    let mut strings = Vec::new();
+    for (property, type_) in &plan.properties {
+        validate_property_cache_state(store, property, *type_)?;
+        numbers.extend(property_initializer_number(property));
+        strings.extend(property.initializer_string.clone());
+    }
+    let count = plan.properties.len() + plan.methods.len() + constructor_parameters.len() + 4;
+    if !store.try_reserve_types(count * 3)
+        || !store.try_reserve_signatures(plan.methods.len() + 1)
+        || !store.try_reserve_checker_symbol_allocations(0, 2)
+        || !store.try_reserve_type_node_links(count * 4)
+        || !store.try_reserve_value_symbol_links(count * 2)
+        || !store.try_reserve_symbol_node_links(4)
+        || !store.try_reserve_signature_links(plan.methods.len() + 1)
+        || !store.try_reserve_source_class_provenance(1)
+        || !store.try_reserve_direct_class_heritage_provenance(usize::from(base.is_some()))
+    {
+        return Err(invariant(ClassInvariant::Capacity(plan.declaration())));
+    }
+    store
+        .prepare_regular_literal_types(&strings, &numbers, &[])
+        .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(plan.declaration())))?;
+    prepare_source_constructor_call_types(store, host, plan, base.as_ref())?;
+    let base_constructor = base
+        .as_ref()
+        .map(|base| base.shells.value_type)
+        .or_else(|| {
+            store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.undefined_type)
+        })
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(plan.declaration())))?;
+    let instance_type = store.get_declared_type_of_symbol(host, plan.symbol())?;
+    let this_type = exact_class_instance_identity(store, plan.symbol(), instance_type)
+        .and_then(|instance| instance.this_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(plan.symbol())))?;
+    let value_type = old_value.unwrap_or_else(|| {
+        store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol()))
+            .expect("source class value capacity was reserved")
+    });
+    let instance_members = prepared_instance.map(|prepared| {
+        let table = store.alloc_prepared_symbol_table(prepared);
+        for (name, symbol) in instance_entries {
+            assert_eq!(store.insert_symbol(table, name, symbol), Some(None));
+        }
+        table
+    });
+    let static_members = prepared_static.map_or(plan.header.static_members, |prepared| {
+        let table = store.alloc_prepared_symbol_table(prepared);
+        for (name, symbol) in static_entries {
+            assert_eq!(store.insert_symbol(table, name, symbol), Some(None));
+        }
+        table
+    });
+    let construct_signature = store
+        .alloc_signature(
+            SignatureFlags::CONSTRUCT
+                | if plan.header.abstract_class {
+                    SignatureFlags::ABSTRACT
+                } else {
+                    SignatureFlags::NONE
+                },
+            constructor_declaration,
+            Vec::new(),
+            None,
+            constructor_parameters.clone(),
+            Some(instance_type),
+            None,
+            constructor_minimum,
+        )
+        .expect("source constructor signature capacity was reserved");
+    if let Some(constructor) = &plan.constructor {
+        assert!(store.set_signature_links(
+            constructor.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(construct_signature),
+                ..SignatureLinks::default()
+            }
+        ));
+        for &parameter in &constructor.parameters {
+            let type_ = prepare_constructor_parameter_type(store, parameter)?;
+            assert!(store.set_type_node_links(
+                parameter.type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+        }
+    }
+    for (property, type_) in &plan.properties {
+        if plan.sources.iter().any(|source| {
+            source.symbol == property.symbol
+                && source.origin
+                    == (ClassMemberOrigin::JavaScriptAssignment {
+                        assignment: property.declaration,
+                    })
+        }) {
+            publish_source_assignment_property(store, property, *type_);
+        } else {
+            publish_class_property(store, property, *type_);
+        }
+    }
+    for method in &plan.methods {
+        let type_ = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.method.symbol))
+            .expect("source method value capacity was reserved");
+        let parameters = method
+            .method
+            .parameters
+            .iter()
+            .map(|parameter| parameter.symbol)
+            .collect::<Vec<_>>();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(method.method.declaration),
+                Vec::new(),
+                None,
+                parameters,
+                method.return_type,
+                None,
+                i32::try_from(method.method.parameters.len()).expect("method arity was bounded"),
+            )
+            .expect("source method signature capacity was reserved");
+        for parameter in &method.method.parameters {
+            assert!(store.set_type_node_links(
+                parameter.type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter.type_),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+        }
+        if let (Some(annotation), Some(type_)) =
+            (method.method.return_type_node, method.return_type)
+        {
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(type_),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+        }
+        assert!(store.set_signature_links(
+            method.method.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            }
+        ));
+        assert!(store.set_value_symbol_links(
+            method.method.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None
+        ));
+        methods.push((type_, signature));
+    }
+    let members = ClassMembers {
+        shells: ClassShells {
+            declaration: plan.declaration(),
+            symbol: plan.symbol(),
+            instance_type,
+            value_type,
+        },
+        base: base.as_ref().map(|base| ClassBaseIdentities {
+            symbol: base.shells.symbol,
+            instance_type: base.shells.instance_type,
+            value_type: base.shells.value_type,
+        }),
+        instance_members,
+        static_members,
+        instance_properties: instance_properties.clone(),
+        declared_instance_property_count: instance_count,
+        static_properties: static_properties.clone(),
+        declared_static_property_count: static_count,
+        prototype,
+        default_construct_signature: construct_signature,
+    };
+    let prepared = PreparedSourceClass {
+        plan: retained_plan,
+        instance_type,
+        value_type,
+        construct_signature,
+        methods,
+    };
+    let provenance = SourceClassProvenance {
+        prepared: prepared.clone(),
+        members,
+        this_type,
+        constructor_parameters,
+        constructor_declaration,
+        constructor_minimum,
+        base_members: base.clone(),
+        inherited_values,
+        method_returns,
+        completed_bodies,
+        complete: false,
+    };
+    assert!(store.publish_source_class_provenance(instance_type, provenance));
+    assert!(store.set_value_symbol_links(
+        plan.symbol(),
+        ValueSymbolLinks {
+            resolved_type: Some(value_type),
+            ..ValueSymbolLinks::default()
+        }
+    ));
+    assert!(store.set_interface_declared_members(
+        instance_type,
+        true,
+        plan.header.instance_members,
+        None,
+        None,
+        None
+    ));
+    assert!(store.set_interface_base_resolution(
+        instance_type,
+        true,
+        Some(base_constructor),
+        base.as_ref().map(|base| vec![base.shells.instance_type])
+    ));
+    assert!(store.set_structured_type_members(
+        instance_type,
+        instance_members,
+        (!instance_properties.is_empty()).then(|| instance_properties.clone()),
+        None,
+        None,
+        None
+    ));
+    let mut all_static_properties = static_properties.clone();
+    all_static_properties.push(prototype);
+    assert!(store.set_structured_type_members(
+        value_type,
+        Some(static_members),
+        Some(all_static_properties),
+        None,
+        Some(vec![construct_signature]),
+        None
+    ));
+    if let (Some(base), Some(edge)) = (&base, &plan.header.base) {
+        assert!(store.publish_direct_class_heritage_provenance(
+            instance_type,
+            DirectClassHeritageProvenance {
+                owner_symbol: plan.symbol(),
+                owner_value_type: value_type,
+                base_symbol: base.shells.symbol,
+                base_instance_type: base.shells.instance_type,
+                base_value_type: base.shells.value_type,
+            }
+        ));
+        assert!(store.set_symbol_node_links(
+            edge.expression,
+            SymbolNodeLinks {
+                resolved_symbol: Some(base.shells.symbol)
+            }
+        ));
+        assert!(store.set_type_node_links(
+            edge.expression,
+            TypeNodeLinks {
+                resolved_type: Some(base.shells.value_type),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(store.set_type_node_links(
+            edge.node,
+            TypeNodeLinks {
+                resolved_type: Some(base.shells.instance_type),
+                ..TypeNodeLinks::default()
+            }
+        ));
+    }
+    validate_source_class_stored_header(
+        store,
+        store
+            .source_class_provenance(instance_type)
+            .expect("source class provenance was registered"),
+    )?;
+    Ok(prepared)
+}
+
+fn source_class_body_token(
+    prepared: &PreparedSourceClass,
+    body: &ClassBodyPlan,
+) -> Result<ClassBodyAccessToken, ClassError> {
+    if !prepared.plan.bodies.contains(body) {
+        return Err(invariant(ClassInvariant::InvalidPlan(body.declaration)));
+    }
+    let signature = match body.kind {
+        ClassBodyKind::Constructor => Some(prepared.construct_signature),
+        ClassBodyKind::StaticBlock => None,
+        ClassBodyKind::Method { symbol, .. } => {
+            let index = prepared
+                .plan
+                .methods
+                .iter()
+                .position(|method| method.method.symbol == symbol)
+                .ok_or_else(|| {
+                    invariant(ClassInvariant::InvalidPropertySymbol(body.declaration))
+                })?;
+            Some(prepared.methods[index].1)
+        }
+    };
+    Ok(ClassBodyAccessToken {
+        class_symbol: prepared.plan.symbol(),
+        class_declaration: prepared.plan.declaration(),
+        declaration: body.declaration,
+        body: body.body,
+        instance_type: prepared.instance_type,
+        value_type: prepared.value_type,
+        signature,
+    })
+}
+
+impl PreparedSourceClass {
+    pub(super) fn body_access(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        body: &ClassBodyPlan,
+    ) -> Result<ClassBodyAccessToken, ClassError> {
+        let provenance = store
+            .source_class_provenance(self.instance_type)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(self.plan.declaration())))?;
+        if provenance.prepared != *self {
+            return Err(invariant(ClassInvariant::InvalidPlan(
+                self.plan.declaration(),
+            )));
+        }
+        validate_source_class_header(store, host, provenance)?;
+        source_class_body_token(self, body)
+    }
+}
+
+fn source_class_access<'a>(
+    store: &'a CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    access: &ClassBodyAccessToken,
+) -> Result<(&'a SourceClassProvenance, usize), ClassError> {
+    let provenance = store
+        .source_class_provenance(access.instance_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(access.class_declaration)))?;
+    validate_source_class_header(store, host, provenance)?;
+    let index = provenance
+        .prepared
+        .plan
+        .bodies
+        .iter()
+        .position(|body| body.declaration == access.declaration && body.body == access.body)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(access.declaration)))?;
+    if source_class_body_token(
+        &provenance.prepared,
+        &provenance.prepared.plan.bodies[index],
+    )? != *access
+    {
+        return Err(invariant(ClassInvariant::InvalidPlan(access.declaration)));
+    }
+    Ok((provenance, index))
+}
+
+pub(super) fn class_body_identities(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    access: &ClassBodyAccessToken,
+) -> Result<ClassBodyIdentities, ClassError> {
+    let (provenance, _) = source_class_access(store, host, access)?;
+    Ok(ClassBodyIdentities {
+        class_declaration: access.class_declaration,
+        class_symbol: access.class_symbol,
+        body_declaration: access.declaration,
+        instance_type: access.instance_type,
+        this_type: provenance.this_type,
+        value_type: access.value_type,
+        base: provenance.members.base,
+    })
+}
+
+fn class_instance_super_origin(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class_symbol: SemanticSymbolId,
+    access: Option<&ClassBodyAccessToken>,
+) -> Result<ClassInstanceSuperOrigin, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidHeritageCache(class_symbol));
+    let (instance_type, this_type, base) = if let Some(access) = access {
+        let identities = class_body_identities(store, host, access)?;
+        if identities.class_symbol != class_symbol {
+            return Err(invalid());
+        }
+        (
+            identities.instance_type,
+            identities.this_type,
+            identities.base.ok_or_else(invalid)?,
+        )
+    } else {
+        let instance_type = store
+            .declared_type_links(class_symbol)
+            .and_then(|links| links.declared_type)
+            .ok_or_else(invalid)?;
+        if validate_class_heritage_members(store, instance_type)
+            != ClassHeritageMembersValidation::Valid
+        {
+            return Err(invalid());
+        }
+        let class = exact_class_instance_identity(store, class_symbol, instance_type)
+            .ok_or_else(invalid)?;
+        let base = store
+            .direct_class_heritage_provenance(instance_type)
+            .ok_or_else(invalid)?;
+        (
+            instance_type,
+            class.this_type.ok_or_else(invalid)?,
+            ClassBaseIdentities {
+                symbol: base.base_symbol,
+                instance_type: base.base_instance_type,
+                value_type: base.base_value_type,
+            },
+        )
+    };
+    let declaration = store
+        .symbol(class_symbol)
+        .and_then(Symbol::value_declaration)
+        .ok_or_else(invalid)?;
+    if !host.symbol_matches(store, declaration, class_symbol)
+        || validate_class_heritage_members(store, base.instance_type())
+            != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    let derived =
+        exact_class_instance_identity(store, class_symbol, instance_type).ok_or_else(invalid)?;
+    let base_type = exact_class_instance_identity(store, base.symbol(), base.instance_type())
+        .ok_or_else(invalid)?;
+    if derived.reference.resolved_type_arguments.as_deref() != Some(&[])
+        || base_type.reference.resolved_type_arguments.as_deref() != Some(&[])
+    {
+        return Err(unsupported(ClassUnsupported::Generic(declaration)));
+    }
+    let base_this = base_type.this_type.ok_or_else(invalid)?;
+    if instance_type == base.instance_type() || this_type == base_this {
+        return Err(invalid());
+    }
+    Ok(ClassInstanceSuperOrigin {
+        class_symbol,
+        instance_type,
+        this_type,
+        base_symbol: base.symbol(),
+        base_instance: base.instance_type(),
+        base_this,
+    })
+}
+
+fn class_super_this_identity_is_valid(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    instance: TypeId,
+    this_type: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(instance) else {
+        return false;
+    };
+    let TypeData::Interface(class) = record.data() else {
+        return false;
+    };
+    let Some(this) = store.type_payload(this_type) else {
+        return false;
+    };
+    record.flags() == TypeFlags::OBJECT
+        && record
+            .object_flags()
+            .contains(ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+        && record.symbol() == Some(symbol)
+        && record.alias().is_none()
+        && class.this_type == Some(this_type)
+        && class.reference.object.target == Some(instance)
+        && store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            == Some(instance)
+        && this.flags() == TypeFlags::TYPE_PARAMETER
+        && this.object_flags() == ObjectFlags::NONE
+        && this.symbol() == Some(symbol)
+        && this.alias().is_none()
+        && matches!(this.data(), TypeData::TypeParameter(data)
+        if data == &TypeParameterData {
+            constraint: Some(instance),
+            is_this_type: true,
+            ..TypeParameterData::default()
+        })
+}
+
+// This check must not recurse through complete class validation: a base cache
+// can contain a view whose derived class is still checking its body.
+fn class_instance_super_view_shell_is_valid(
+    store: &CanonicalTypeMapperStore,
+    view: ClassInstanceSuperView,
+) -> bool {
+    let origin = view.origin;
+    let Some(record) = store.type_payload(view.reference) else {
+        return false;
+    };
+    let TypeData::TypeReference(reference) = record.data() else {
+        return false;
+    };
+    let Some(base) = store.type_payload(origin.base_instance) else {
+        return false;
+    };
+    let expected_key = type_list_key(&[origin.this_type]);
+    let cache_matches = matches!(base.data(), TypeData::Interface(base)
+        if matches!(&base.reference.object.instantiations, TypeCacheState::Allocated(cache)
+            if cache.get(&expected_key) == Some(&view.reference)));
+    store.class_instance_super_view(view.reference) == Some(view)
+        && store.class_instance_super_view_for_instance(origin.instance_type) == Some(view)
+        && origin.instance_type != origin.base_instance
+        && class_super_this_identity_is_valid(
+            store,
+            origin.class_symbol,
+            origin.instance_type,
+            origin.this_type,
+        )
+        && class_super_this_identity_is_valid(
+            store,
+            origin.base_symbol,
+            origin.base_instance,
+            origin.base_this,
+        )
+        && store
+            .direct_class_heritage_provenance(origin.instance_type)
+            .is_some_and(|base| {
+                base.owner_symbol == origin.class_symbol
+                    && base.base_symbol == origin.base_symbol
+                    && base.base_instance_type == origin.base_instance
+            })
+        && cache_matches
+        && record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::REFERENCE
+        && record.symbol() == Some(origin.base_symbol)
+        && record.alias().is_none()
+        && reference.object.target == Some(origin.base_instance)
+        && reference.object.mapper.is_none()
+        && reference.object.instantiations == TypeCacheState::Unallocated
+        && reference.object.structured == StructuredTypeData::default()
+        && reference.node.is_none()
+        && reference.resolved_type_arguments.as_deref() == Some(&[origin.this_type])
+        && store.type_mapper_has_exact_endpoints(
+            view.mapper,
+            &[origin.base_this],
+            &[origin.this_type],
+        ) == Some(true)
+}
+
+pub(super) fn validate_class_instance_super_view(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class_symbol: SemanticSymbolId,
+    access: Option<&ClassBodyAccessToken>,
+    reference: TypeId,
+) -> Result<ClassInstanceSuperView, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidHeritageCache(class_symbol));
+    let origin = class_instance_super_origin(store, host, class_symbol, access)?;
+    let view = store
+        .class_instance_super_view(reference)
+        .ok_or_else(invalid)?;
+    if view.origin != origin || !class_instance_super_view_shell_is_valid(store, view) {
+        return Err(invalid());
+    }
+    Ok(view)
+}
+
+pub(super) fn prepare_class_instance_super_view(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class_symbol: SemanticSymbolId,
+    access: Option<&ClassBodyAccessToken>,
+) -> Result<ClassInstanceSuperView, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidHeritageCache(class_symbol));
+    let origin = class_instance_super_origin(store, host, class_symbol, access)?;
+    if let Some(view) = store.class_instance_super_view_for_instance(origin.instance_type) {
+        return validate_class_instance_super_view(
+            store,
+            host,
+            class_symbol,
+            access,
+            view.reference,
+        );
+    }
+    let key = type_list_key(&[origin.this_type]);
+    let base = store
+        .type_payload(origin.base_instance)
+        .ok_or_else(invalid)?;
+    let TypeData::Interface(base) = base.data() else {
+        return Err(invalid());
+    };
+    let TypeCacheState::Allocated(cache) = &base.reference.object.instantiations else {
+        return Err(invalid());
+    };
+    if cache.contains_key(&key) {
+        return Err(invalid());
+    }
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_mappers(1)
+        || !store.try_reserve_object_instantiations(origin.base_instance, 1)
+        || !store.try_reserve_class_instance_super_views()
+    {
+        return Err(invariant(ClassInvariant::Capacity(
+            store
+                .symbol(class_symbol)
+                .and_then(Symbol::value_declaration)
+                .ok_or_else(invalid)?,
+        )));
+    }
+    let mapper = store
+        .new_type_mapper(vec![origin.base_this], vec![origin.this_type])
+        .ok_or_else(invalid)?;
+    let reference = store
+        .alloc_type_reference(ObjectFlags::NONE, Some(origin.base_symbol))
+        .ok_or_else(invalid)?;
+    assert!(store.set_object_target_and_mapper(reference, Some(origin.base_instance), None));
+    assert!(store.set_type_reference_resolution(reference, None, Some(vec![origin.this_type])));
+    let view = ClassInstanceSuperView {
+        origin,
+        reference,
+        mapper,
+    };
+    assert!(store.publish_class_instance_super_view(view));
+    assert_eq!(
+        store.insert_object_instantiation(origin.base_instance, key, reference),
+        Some(reference),
+    );
+    debug_assert!(class_instance_super_view_shell_is_valid(store, view));
+    Ok(view)
+}
+
+fn validate_stored_class_instance_super_view(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    view: ClassInstanceSuperView,
+) -> Result<(), ClassError> {
+    let invalid = || {
+        invariant(ClassInvariant::InvalidHeritageCache(
+            view.origin.class_symbol,
+        ))
+    };
+    if !class_instance_super_view_shell_is_valid(store, view) {
+        return Err(invalid());
+    }
+    if let Some(provenance) = store.source_class_provenance(view.origin.instance_type) {
+        validate_source_class_header(store, host, provenance)?;
+        if provenance.symbol() != view.origin.class_symbol {
+            return Err(invalid());
+        }
+    } else if validate_class_heritage_members(store, view.origin.instance_type)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    if validate_class_heritage_members(store, view.origin.base_instance)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn class_instance_super_view_graph_is_valid(
+    store: &CanonicalTypeMapperStore,
+    view: ClassInstanceSuperView,
+) -> bool {
+    class_instance_super_view_shell_is_valid(store, view)
+        && match store.source_class_provenance(view.origin.instance_type) {
+            Some(provenance) => {
+                provenance.symbol() == view.origin.class_symbol
+                    && validate_source_class_stored_header(store, provenance).is_ok()
+            }
+            None => {
+                validate_class_heritage_members(store, view.origin.instance_type)
+                    == ClassHeritageMembersValidation::Valid
+            }
+        }
+        && validate_class_heritage_members(store, view.origin.base_instance)
+            == ClassHeritageMembersValidation::Valid
+}
+
+pub(super) fn class_instance_super_display_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Result<Option<SemanticSymbolId>, ClassError> {
+    let Some(view) = store.class_instance_super_view(type_) else {
+        return Ok(None);
+    };
+    validate_stored_class_instance_super_view(store, host, view)?;
+    Ok(Some(view.origin.base_symbol))
+}
+
+pub(super) fn class_instance_super_display_callable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Result<Option<ValidatedSingleCallable>, ClassError> {
+    let Some(cached) = store.class_instance_super_member_for_type(type_) else {
+        return Ok(None);
+    };
+    let view = store
+        .class_instance_super_view(cached.view)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(cached.member)))?;
+    let cached = validated_class_instance_super_member(store, host, view, cached.member)?;
+    Ok(cached.callable)
+}
+
+pub(super) fn stored_class_instance_super_callable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Result<ValidatedSingleCallable, ()>> {
+    let cached = store.class_instance_super_member_for_type(type_)?;
+    Some((|| {
+        let view = store.class_instance_super_view(cached.view).ok_or(())?;
+        let member = store.symbol(cached.member).ok_or(())?;
+        let structured = store
+            .type_payload(view.lookup_type())
+            .and_then(|record| record.data().structured())
+            .ok_or(())?;
+        let declaring = store
+            .declared_type_links(cached.source.declaring_class)
+            .and_then(|links| links.declared_type)
+            .ok_or(())?;
+        if !class_instance_super_view_graph_is_valid(store, view)
+            || cached.source.symbol != cached.member
+            || cached.source.origin != ClassMemberOrigin::Method
+            || cached.source.side != ClassPropertySide::Instance
+            || member.parent() != Some(cached.source.declaring_class)
+            || member.value_declaration() != Some(cached.source.declaration)
+            || structured
+                .members
+                .and_then(|table| store.symbol_table(table))
+                .and_then(|table| table.get(member.name()))
+                != Some(cached.member)
+            || structured
+                .properties
+                .as_deref()
+                .is_none_or(|members| !members.contains(&cached.member))
+            || !class_super_this_identity_is_valid(
+                store,
+                cached.source.declaring_class,
+                declaring,
+                cached.declaring_this,
+            )
+        {
+            return Err(());
+        }
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, cached.source_type)
+        else {
+            return Err(());
+        };
+        let [source] = projection.call_signatures.as_ref() else {
+            return Err(());
+        };
+        if !projection.construct_signatures.is_empty() {
+            return Err(());
+        }
+        let template = ClassSuperMemberTemplate {
+            source: cached.source.clone(),
+            declaring_this: cached.declaring_this,
+            type_: cached.source_type,
+            callable: Some(source.clone()),
+        };
+        if !class_super_member_cache_is_valid(store, view, &template, cached) {
+            return Err(());
+        }
+        cached.callable.clone().ok_or(())
+    })())
+}
+
+struct ClassSuperMemberTemplate {
+    source: ClassMemberSource,
+    declaring_this: TypeId,
+    type_: TypeId,
+    callable: Option<ValidatedSingleCallable>,
+}
+
+fn class_super_member_template(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    view: ClassInstanceSuperView,
+    member: SemanticSymbolId,
+) -> Result<ClassSuperMemberTemplate, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(member));
+    validate_stored_class_instance_super_view(store, host, view)?;
+    let source = class_member_source(store, host, member)?;
+    let property = store.symbol(member).ok_or_else(invalid)?;
+    let structured = store
+        .type_payload(view.lookup_type())
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    if source.side != ClassPropertySide::Instance
+        || structured
+            .members
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(property.name()))
+            != Some(member)
+        || structured
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&member))
+    {
+        return Err(invalid());
+    }
+    let declaring_instance = store
+        .declared_type_links(source.declaring_class)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let declaring =
+        exact_class_instance_identity(store, source.declaring_class, declaring_instance)
+            .ok_or_else(invalid)?;
+    if declaring.reference.resolved_type_arguments.as_deref() != Some(&[]) {
+        return Err(unsupported(ClassUnsupported::Generic(source.declaration)));
+    }
+    let declaring_this = declaring.this_type.ok_or_else(invalid)?;
+    let type_ = store
+        .value_symbol_links(member)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let callable = if source.origin == ClassMemberOrigin::Method {
+        let signature = store
+            .signature_links(source.declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or_else(invalid)?;
+        let callable = if store.source_class_provenance(declaring_instance).is_some() {
+            source_class_callable_projection(store, type_, signature, member)?
+        } else {
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, type_)
+            else {
+                return Err(invalid());
+            };
+            let [callable] = projection.call_signatures.as_ref() else {
+                return Err(invalid());
+            };
+            if !projection.construct_signatures.is_empty() || callable.signature != signature {
+                return Err(invalid());
+            }
+            callable.clone()
+        };
+        if callable.return_type.is_none() {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: source.declaration,
+                kind: SyntaxKind::MethodDeclaration,
+            }));
+        }
+        Some(callable)
+    } else {
+        None
+    };
+    Ok(ClassSuperMemberTemplate {
+        source,
+        declaring_this,
+        type_,
+        callable,
+    })
+}
+
+fn class_super_parameter_is_valid(
+    store: &CanonicalTypeMapperStore,
+    source: SemanticSymbolId,
+    actual: SemanticSymbolId,
+    type_: TypeId,
+    mapper: TypeMapperId,
+) -> bool {
+    let Some(source_record) = store.symbol(source) else {
+        return false;
+    };
+    let Some(source_links) = store.value_symbol_links(source) else {
+        return false;
+    };
+    if source == actual {
+        return source_links.resolved_type == Some(type_);
+    }
+    let Some(record) = store.symbol(actual) else {
+        return false;
+    };
+    record.flags() == source_record.flags() | SymbolFlags::TRANSIENT
+        && record.check_flags()
+            == CheckFlags::INSTANTIATED
+                | (source_record.check_flags()
+                    & (CheckFlags::READONLY
+                        | CheckFlags::LATE
+                        | CheckFlags::OPTIONAL_PARAMETER
+                        | CheckFlags::REST_PARAMETER))
+        && record.name() == source_record.name()
+        && record.declarations() == source_record.declarations()
+        && record.value_declaration() == source_record.value_declaration()
+        && record.parent() == source_record.parent()
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.export_symbol().is_none()
+        && store.get_merged_symbol(actual) == Some(actual)
+        && store.value_symbol_links(actual)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                target: Some(source),
+                mapper: Some(mapper),
+                name_type: source_links.name_type,
+                ..ValueSymbolLinks::default()
+            })
+}
+
+// Anonymous object returns can be outside the instantiator's admitted domain.
+// Keep their identity only after proving that no mapped this occurs in them.
+fn class_super_member_type_is_unchanged(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    this_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    if !store.type_payload(type_).is_some_and(|record| {
+        matches!(
+            record.data(),
+            TypeData::Object(_)
+                | TypeData::Interface(_)
+                | TypeData::TypeReference(_)
+                | TypeData::Union(_)
+        )
+    }) {
+        return false;
+    }
+    let mut pending = vec![type_];
+    let mut visited = HashSet::new();
+    while let Some(type_) = pending.pop() {
+        if type_ == this_type {
+            return false;
+        }
+        if !visited.insert(type_) {
+            continue;
+        }
+        let valid = match array_targets {
+            Some(targets) => store.validate_union_constituent_with_array_targets(targets, type_),
+            None => store.validate_union_constituent(type_),
+        };
+        if valid.is_err() {
+            return false;
+        }
+        let Some(record) = store.type_payload(type_) else {
+            return false;
+        };
+        if let Some(alias) = record.alias() {
+            let Some(alias) = store.type_alias(alias) else {
+                return false;
+            };
+            pending.extend(alias.type_arguments().unwrap_or_default());
+        }
+        match record.data() {
+            TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::TypeParameter(_) => {}
+            TypeData::Interface(interface) => {
+                // A named reference substitutes its arguments, not its members.
+                pending.extend(
+                    interface
+                        .reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+            }
+            TypeData::TypeReference(reference) => {
+                let Some(arguments) = &reference.resolved_type_arguments else {
+                    return false;
+                };
+                pending.extend(arguments);
+            }
+            TypeData::Union(union) => {
+                pending.extend(&union.union.types);
+                pending.extend(union.origin);
+            }
+            TypeData::Object(object) => {
+                match validate_stored_callable_set(store, type_) {
+                    StoredCallableSetValidation::Valid { edges, .. } => pending.extend(edges),
+                    StoredCallableSetValidation::NotCallable => {}
+                    StoredCallableSetValidation::Pending { .. }
+                    | StoredCallableSetValidation::Malformed { .. } => return false,
+                }
+                if object.structured.index_infos.is_some() {
+                    return false;
+                }
+                for property in object.structured.properties.as_deref().unwrap_or_default() {
+                    let Some(type_) = store
+                        .value_symbol_links(*property)
+                        .and_then(|links| links.resolved_type)
+                    else {
+                        return false;
+                    };
+                    pending.push(type_);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn class_super_member_cache_is_valid(
+    store: &CanonicalTypeMapperStore,
+    view: ClassInstanceSuperView,
+    template: &ClassSuperMemberTemplate,
+    cached: &ClassInstanceSuperMember,
+) -> bool {
+    if cached.view != view.reference
+        || cached.member != template.source.symbol
+        || cached.source != template.source
+        || cached.source_type != template.type_
+        || cached.declaring_this != template.declaring_this
+        || cached.source_callable != template.callable
+        || store.type_mapper_has_exact_endpoints(
+            cached.mapper,
+            &[template.declaring_this],
+            &[view.origin.this_type],
+        ) != Some(true)
+    {
+        return false;
+    }
+    let mapped = |source, actual| {
+        source == actual
+            && class_super_member_type_is_unchanged(
+                store,
+                source,
+                template.declaring_this,
+                cached.array_targets,
+            )
+            || instantiated_member_type_matches(
+                store,
+                source,
+                actual,
+                cached.mapper,
+                cached.array_targets,
+            ) == Ok(true)
+    };
+    let Some(source) = &template.callable else {
+        return cached.callable.is_none() && mapped(template.type_, cached.type_);
+    };
+    let Some(callable) = &cached.callable else {
+        return false;
+    };
+    if callable.owner != cached.type_
+        || callable.parameters.len() != source.parameters.len()
+        || callable.rest_parameter.is_some() != source.rest_parameter.is_some()
+        || callable.min_argument_count != source.min_argument_count
+        || callable.strict_variance_exempt != source.strict_variance_exempt
+        || !source
+            .parameters
+            .iter()
+            .chain(source.rest_parameter.iter())
+            .zip(
+                callable
+                    .parameters
+                    .iter()
+                    .chain(callable.rest_parameter.iter()),
+            )
+            .all(|(source, actual)| mapped(*source, *actual))
+        || !source
+            .return_type
+            .zip(callable.return_type)
+            .is_some_and(|(source, actual)| mapped(source, actual))
+    {
+        return false;
+    }
+    if cached.type_ == template.type_ {
+        return callable == source;
+    }
+    let Some(original) = store.signature(source.signature) else {
+        return false;
+    };
+    let Some(signature) = store.signature(callable.signature) else {
+        return false;
+    };
+    let Some(record) = store.type_payload(cached.type_) else {
+        return false;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        && record.symbol() == Some(cached.member)
+        && record.alias().is_none()
+        && object
+            == &ObjectTypeData {
+                target: Some(template.type_),
+                mapper: Some(cached.mapper),
+                structured: StructuredTypeData {
+                    signatures: Some(vec![callable.signature]),
+                    call_signature_count: 1,
+                    ..StructuredTypeData::default()
+                },
+                ..ObjectTypeData::default()
+            }
+        && callable.signature != source.signature
+        && signature.target() == Some(source.signature)
+        && signature.mapper() == Some(cached.mapper)
+        && signature.declaration() == original.declaration()
+        && signature.flags() == original.flags() & SignatureFlags::PROPAGATING_FLAGS
+        && signature.type_parameters().is_empty()
+        && signature.this_parameter().is_none()
+        && signature.parameters().len() == original.parameters().len()
+        && signature.min_argument_count() == original.min_argument_count()
+        && (signature.resolved_min_argument_count() == -1
+            || signature.resolved_min_argument_count() == original.min_argument_count())
+        && signature.resolved_return_type() == callable.return_type
+        && signature.resolved_type_predicate().is_none()
+        && signature.isolated_signature_type().is_none()
+        && signature.composite().is_none()
+        && original
+            .parameters()
+            .iter()
+            .zip(signature.parameters())
+            .zip(
+                callable
+                    .parameters
+                    .iter()
+                    .chain(callable.rest_parameter.iter()),
+            )
+            .all(|((source, actual), type_)| {
+                class_super_parameter_is_valid(store, *source, *actual, *type_, cached.mapper)
+            })
+}
+
+pub(super) fn validated_class_instance_super_member(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    view: ClassInstanceSuperView,
+    member: SemanticSymbolId,
+) -> Result<ClassInstanceSuperMember, ClassError> {
+    let template = class_super_member_template(store, host, view, member)?;
+    let cached = store
+        .class_instance_super_member(view.reference, member)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(member)))?;
+    if !class_super_member_cache_is_valid(store, view, &template, cached) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
+    }
+    Ok(cached.clone())
+}
+
+pub(super) fn prepare_class_instance_super_member_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: Option<&CanonicalGlobalTypes>,
+    view: ClassInstanceSuperView,
+    member: SemanticSymbolId,
+) -> Result<TypeId, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertyValueCache(member));
+    let template = class_super_member_template(store, host, view, member)?;
+    if store
+        .class_instance_super_member(view.reference, member)
+        .is_some()
+    {
+        return validated_class_instance_super_member(store, host, view, member)
+            .map(|cached| cached.type_);
+    }
+    let array_targets = globals.map(CanonicalArrayTargets::from_global_types);
+    let sources = [template.declaring_this];
+    let targets = [view.origin.this_type];
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let originals = match &template.callable {
+        Some(callable) => callable
+            .parameters
+            .iter()
+            .copied()
+            .chain(callable.rest_parameter)
+            .chain(callable.return_type)
+            .collect::<Vec<_>>(),
+        None => vec![template.type_],
+    };
+    let instantiated = originals
+        .iter()
+        .map(|type_| {
+            if class_super_member_type_is_unchanged(
+                store,
+                *type_,
+                template.declaring_this,
+                array_targets,
+            ) {
+                return Ok(*type_);
+            }
+            instantiate_type_with_vector_and_session(
+                store,
+                *type_,
+                &sources,
+                &targets,
+                array_targets,
+                &mut session,
+            )
+            .map_err(|error| match error {
+                InstantiationError::UnsupportedType(_) => host
+                    .node(template.source.declaration)
+                    .map_or_else(invalid, |node| {
+                        unsupported(ClassUnsupported::Member {
+                            node: template.source.declaration,
+                            kind: node.kind,
+                        })
+                    }),
+                _ => invalid(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !store.try_reserve_class_instance_super_members()
+        || !store.try_reserve_mappers(usize::from(
+            template.declaring_this != view.origin.base_this,
+        ))
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+    {
+        return Err(invariant(ClassInvariant::Capacity(
+            template.source.declaration,
+        )));
+    }
+    let mapper = if template.declaring_this == view.origin.base_this {
+        view.mapper
+    } else {
+        store
+            .new_type_mapper(sources.to_vec(), targets.to_vec())
+            .ok_or_else(invalid)?
+    };
+    let (type_, callable) = match &template.callable {
+        Some(source) if instantiated == originals => (template.type_, Some(source.clone())),
+        Some(source) => {
+            let signature = store
+                .instantiate_signature(source.signature, mapper)
+                .map_err(|_| invalid())?;
+            let parameters = store
+                .signature(signature)
+                .ok_or_else(invalid)?
+                .parameters()
+                .to_vec();
+            let returned = instantiated.last().copied().ok_or_else(invalid)?;
+            if parameters.len() + 1 != instantiated.len() {
+                return Err(invalid());
+            }
+            for (parameter, type_) in parameters.iter().zip(&instantiated) {
+                let mut links = store
+                    .value_symbol_links(*parameter)
+                    .cloned()
+                    .ok_or_else(invalid)?;
+                if links.resolved_type.is_some_and(|cached| cached != *type_) {
+                    return Err(invalid());
+                }
+                if links.resolved_type.is_none() {
+                    links.resolved_type = Some(*type_);
+                    assert!(store.set_value_symbol_links(*parameter, links));
+                }
+            }
+            assert!(store.set_signature_resolved_return_type(signature, Some(returned)));
+            let type_ = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(member))
+                .ok_or_else(invalid)?;
+            assert!(store.set_object_target_and_mapper(type_, Some(template.type_), Some(mapper)));
+            assert!(store.set_structured_type_members(
+                type_,
+                None,
+                None,
+                Some(vec![signature]),
+                None,
+                None,
+            ));
+            (
+                type_,
+                Some(ValidatedSingleCallable {
+                    owner: type_,
+                    signature,
+                    parameters: instantiated[..source.parameters.len()].to_vec(),
+                    rest_parameter: source
+                        .rest_parameter
+                        .map(|_| instantiated[source.parameters.len()]),
+                    min_argument_count: source.min_argument_count,
+                    return_type: Some(returned),
+                    strict_variance_exempt: source.strict_variance_exempt,
+                }),
+            )
+        }
+        None => (instantiated[0], None),
+    };
+    let cached = ClassInstanceSuperMember {
+        view: view.reference,
+        member,
+        source: template.source.clone(),
+        declaring_this: template.declaring_this,
+        mapper,
+        source_type: template.type_,
+        type_,
+        array_targets,
+        source_callable: template.callable.clone(),
+        callable,
+    };
+    if !class_super_member_cache_is_valid(store, view, &template, &cached) {
+        return Err(invalid());
+    }
+    assert!(store.publish_class_instance_super_member(cached));
+    Ok(type_)
+}
+
+pub(super) fn complete_source_class_body(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prepared: &PreparedSourceClass,
+    body: &ClassBodyPlan,
+    checked: &super::source::CheckedClassBody,
+) -> Result<(), ClassError> {
+    let token = prepared.body_access(store, host, body)?;
+    if checked.declaration() != body.declaration
+        || checked.body() != body.body
+        || checked.access_token() != &token
+    {
+        return Err(invariant(ClassInvariant::InvalidPlan(body.declaration)));
+    }
+    let (provenance, body_index) = source_class_access(store, host, &token)?;
+    let inferred = match body.kind {
+        ClassBodyKind::Method { symbol, .. } if body.return_annotation.is_none() => {
+            let index = prepared
+                .plan
+                .methods
+                .iter()
+                .position(|method| method.method.symbol == symbol)
+                .ok_or_else(|| {
+                    invariant(ClassInvariant::InvalidPropertySymbol(body.declaration))
+                })?;
+            let returned = checked
+                .inferred_return_type()
+                .filter(|type_| store.type_payload(*type_).is_some())
+                .ok_or_else(|| {
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(body.declaration))
+                })?;
+            if provenance.completed_bodies[body_index]
+                && provenance.method_returns[index] != Some(returned)
+            {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    body.declaration,
+                )));
+            }
+            Some((index, returned))
+        }
+        _ => None,
+    };
+    if provenance.completed_bodies[body_index] {
+        return Ok(());
+    }
+    if let Some((index, returned)) = inferred
+        && !store.set_signature_resolved_return_type(prepared.methods[index].1, Some(returned))
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            body.declaration,
+        )));
+    }
+    let provenance = store
+        .source_class_provenance_mut(prepared.instance_type)
+        .expect("the prepared class record was authenticated");
+    if let Some((index, returned)) = inferred {
+        provenance.method_returns[index] = Some(returned);
+    }
+    provenance.completed_bodies[body_index] = true;
+    Ok(())
+}
+
+pub(super) fn finish_source_class_members(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceClassPlan,
+    prepared: &PreparedSourceClass,
+) -> Result<ClassMembers, ClassError> {
+    if prepared.plan != *plan {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    let provenance = store
+        .source_class_provenance(prepared.instance_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(plan.declaration())))?;
+    if provenance.prepared != *prepared {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    validate_source_class_header(store, host, provenance)?;
+    if !provenance.completed_bodies.iter().all(|complete| *complete)
+        || provenance.method_returns.iter().any(Option::is_none)
+    {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: plan.declaration(),
+            kind: SyntaxKind::ClassDeclaration,
+        }));
+    }
+    let members = provenance.members.clone();
+    if !provenance.complete {
+        store
+            .source_class_provenance_mut(prepared.instance_type)
+            .expect("the prepared class record was authenticated")
+            .complete = true;
+    }
+    Ok(members)
+}
+
+pub(super) fn class_member_source(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: SemanticSymbolId,
+) -> Result<ClassMemberSource, ClassError> {
+    let record = store
+        .symbol(member)
+        .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(member)))?;
+    let class = record
+        .parent()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(member)))?;
+    let instance = store
+        .declared_type_links(class)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class)))?;
+    if let Some(provenance) = store.source_class_provenance_for_symbol(class) {
+        validate_source_class_header(store, host, provenance)?;
+        return provenance
+            .prepared
+            .plan
+            .sources
+            .iter()
+            .find(|source| source.symbol == member)
+            .cloned()
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(member)));
+    }
+    if validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid {
+        return Err(invariant(ClassInvariant::InvalidInstanceMembers(class)));
+    }
+    let declaration = record
+        .value_declaration()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(member)))?;
+    let node = preflight_node(store, host, declaration)?;
+    let (arena, _) = host
+        .source(declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(declaration)))?;
+    let origin = match &node.data {
+        NodeData::MethodDeclaration(_) => ClassMemberOrigin::Method,
+        NodeData::ParameterDeclaration(_) => ClassMemberOrigin::ParameterProperty {
+            parameter: declaration,
+        },
+        NodeData::PropertyDeclaration(property) => {
+            let initializer = property
+                .initializer
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node));
+            if ts_binder::canonical_has_syntactic_modifier(
+                arena,
+                declaration.node,
+                SyntaxKind::AccessorKeyword,
+            ) {
+                ClassMemberOrigin::AutoAccessor { initializer }
+            } else {
+                ClassMemberOrigin::Field { initializer }
+            }
+        }
+        NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
+            ClassMemberOrigin::Accessor
+        }
+        NodeData::BinaryExpression(_) => ClassMemberOrigin::JavaScriptAssignment {
+            assignment: declaration,
+        },
+        _ => {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: node.kind,
+            }));
+        }
+    };
+    let is_static = store
+        .symbol(class)
+        .and_then(Symbol::exports)
+        .and_then(|table| store.symbol_table(table))
+        .and_then(|table| table.get(record.name()))
+        == Some(member);
+    Ok(ClassMemberSource {
+        symbol: member,
+        declaring_class: class,
+        declaration,
+        origin,
+        side: if is_static {
+            ClassPropertySide::Static
+        } else {
+            ClassPropertySide::Instance
+        },
+        visibility: if record.name().is_private_identifier() {
+            ClassConstructorVisibility::Private
+        } else {
+            class_member_visibility(store, declaration)
+        },
+        readonly: record.check_flags().contains(CheckFlags::READONLY),
+        abstract_: ts_binder::canonical_has_syntactic_modifier(
+            arena,
+            declaration.node,
+            SyntaxKind::AbstractKeyword,
+        ),
+    })
+}
+
+fn source_class_callable_projection(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    owner_symbol: SemanticSymbolId,
+) -> Result<ValidatedSingleCallable, ClassError> {
+    let record = store
+        .signature(signature)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidValueCache(owner_symbol)))?;
+    let parameters = record
+        .parameters()
+        .iter()
+        .map(|symbol| {
+            store
+                .value_symbol_links(*symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(*symbol)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ValidatedSingleCallable {
+        owner,
+        signature,
+        parameters,
+        rest_parameter: None,
+        min_argument_count: usize::try_from(record.min_argument_count())
+            .map_err(|_| invariant(ClassInvariant::InvalidValueCache(owner_symbol)))?,
+        return_type: record.resolved_return_type(),
+        strict_variance_exempt: true,
+    })
+}
+
+fn source_constructor_call_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<(NodeRef, TypeId, bool), ClassError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(symbol)))?;
+    let declaration = record
+        .value_declaration()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+    let node = preflight_node(store, host, declaration)?;
+    let NodeData::ParameterDeclaration(parameter) = &node.data else {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            declaration,
+        )));
+    };
+    let type_ = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))?;
+    Ok((
+        declaration,
+        type_,
+        parameter.initializer.is_some() || parameter.question_token.is_some(),
+    ))
+}
+
+fn prepare_source_constructor_call_types(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceClassPlan,
+    base: Option<&ClassMembers>,
+) -> Result<(), ClassError> {
+    if let Some(constructor) = &plan.constructor {
+        for parameter in &constructor.parameters {
+            prepare_constructor_optional_type(
+                store,
+                parameter.type_,
+                parameter.optional || parameter.initializer.is_some(),
+                parameter.declaration,
+            )?;
+        }
+    }
+    if let Some(base) = base {
+        let parameters = store
+            .signature(base.default_construct_signature)
+            .ok_or_else(|| {
+                invariant(ClassInvariant::InvalidConstructSignature(
+                    base.shells.symbol,
+                ))
+            })?
+            .parameters()
+            .to_vec();
+        for symbol in parameters {
+            let (declaration, type_, optional) =
+                source_constructor_call_parameter(store, host, symbol)?;
+            prepare_constructor_optional_type(store, type_, optional, declaration)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn class_body_super_constructor_callable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    access: &ClassBodyAccessToken,
+) -> Result<ClassBodyCallable, ClassError> {
+    let (provenance, body_index) = source_class_access(store, host, access)?;
+    if provenance.prepared.plan.bodies[body_index].kind != ClassBodyKind::Constructor {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: access.declaration,
+            kind: SyntaxKind::SuperKeyword,
+        }));
+    }
+    let base = provenance
+        .base_members
+        .as_ref()
+        .ok_or_else(|| unsupported(ClassUnsupported::Heritage(access.class_declaration)))?;
+    let mut callable = source_class_callable_projection(
+        store,
+        base.shells.value_type,
+        base.default_construct_signature,
+        base.shells.symbol,
+    )?;
+    callable.parameters = store
+        .signature(base.default_construct_signature)
+        .ok_or_else(|| {
+            invariant(ClassInvariant::InvalidConstructSignature(
+                base.shells.symbol,
+            ))
+        })?
+        .parameters()
+        .iter()
+        .map(|&symbol| {
+            let (declaration, type_, optional) =
+                source_constructor_call_parameter(store, host, symbol)?;
+            optional_constructor_parameter_type(store, type_, optional, declaration)?.ok_or_else(
+                || {
+                    unsupported(ClassUnsupported::PropertyType {
+                        node: declaration,
+                        kind: SyntaxKind::Parameter,
+                    })
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, ClassError>>()?;
+    let declaration = store
+        .signature(callable.signature)
+        .and_then(super::signatures::Signature::declaration);
+    if callable.return_type != Some(base.shells.instance_type)
+        || declaration.is_some_and(|declaration| {
+            class_member_visibility(store, declaration) == ClassConstructorVisibility::Private
+        })
+    {
+        return Err(unsupported(ClassUnsupported::Heritage(
+            access.class_declaration,
+        )));
+    }
+    Ok(ClassBodyCallable {
+        kind: SignatureKind::Construct,
+        class_symbol: base.shells.symbol,
+        declaration,
+        callable,
+        pending_return_body: None,
+    })
+}
+
+pub(super) fn class_body_method_callable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    access: &ClassBodyAccessToken,
+    receiver_type: TypeId,
+    member: SemanticSymbolId,
+) -> Result<ClassBodyCallable, ClassError> {
+    let (provenance, _) = source_class_access(store, host, access)?;
+    if store.class_instance_super_view(receiver_type).is_some() {
+        let view = validate_class_instance_super_view(
+            store,
+            host,
+            access.class_symbol,
+            Some(access),
+            receiver_type,
+        )?;
+        let member_value = validated_class_instance_super_member(store, host, view, member)?;
+        let source = class_member_source(store, host, member)?;
+        let callable = member_value.callable.ok_or_else(|| {
+            unsupported(ClassUnsupported::Member {
+                node: source.declaration,
+                kind: SyntaxKind::MethodDeclaration,
+            })
+        })?;
+        return Ok(ClassBodyCallable {
+            kind: SignatureKind::Call,
+            class_symbol: source.declaring_class,
+            declaration: Some(source.declaration),
+            callable,
+            pending_return_body: None,
+        });
+    }
+    let receiver = if receiver_type == provenance.this_type {
+        access.instance_type
+    } else {
+        receiver_type
+    };
+    let side = if receiver == access.instance_type
+        || provenance
+            .members
+            .base
+            .is_some_and(|base| receiver == base.instance_type)
+    {
+        ClassPropertySide::Instance
+    } else if receiver == access.value_type
+        || provenance
+            .members
+            .base
+            .is_some_and(|base| receiver == base.value_type)
+    {
+        ClassPropertySide::Static
+    } else {
+        return Err(invariant(ClassInvariant::InvalidPlan(access.declaration)));
+    };
+    let source = class_member_source(store, host, member)?;
+    if source.origin != ClassMemberOrigin::Method || source.side != side {
+        return Err(unsupported(ClassUnsupported::Member {
+            node: source.declaration,
+            kind: SyntaxKind::MethodDeclaration,
+        }));
+    }
+    let record = store
+        .symbol(member)
+        .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(member)))?;
+    let members = store
+        .type_payload(receiver)
+        .and_then(|record| match record.data() {
+            TypeData::Interface(data) => data.reference.object.structured.members,
+            TypeData::Object(data) => data.structured.members,
+            _ => None,
+        })
+        .and_then(|members| store.symbol_table(members));
+    if members.and_then(|members| members.get(record.name())) != Some(member) {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            source.declaration,
+        )));
+    }
+    let owner = store
+        .value_symbol_links(member)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(member)))?;
+    let signature = store
+        .signature_links(source.declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(member)))?;
+    let class_instance = store
+        .declared_type_links(source.declaring_class)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(source.declaring_class)))?;
+    let pending_return_body = if let Some(origin) = store.source_class_provenance(class_instance) {
+        let method_index = origin
+            .prepared
+            .plan
+            .methods
+            .iter()
+            .position(|method| method.method.symbol == member)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(source.declaration)))?;
+        if origin.prepared.methods[method_index] != (owner, signature) {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
+        }
+        if origin.prepared.plan.methods[method_index]
+            .return_type
+            .is_none()
+            && origin.method_returns[method_index].is_none()
+        {
+            origin.prepared.plan.methods[method_index].method.body
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let callable = if store.source_class_provenance(class_instance).is_some() {
+        source_class_callable_projection(store, owner, signature, member)?
+    } else {
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, owner)
+        else {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
+        };
+        if !projection.construct_signatures.is_empty() || callable.signature != signature {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
+        }
+        callable.clone()
+    };
+    if callable.return_type.is_none() != pending_return_body.is_some() {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(member)));
+    }
+    Ok(ClassBodyCallable {
+        kind: SignatureKind::Call,
+        class_symbol: source.declaring_class,
+        declaration: Some(source.declaration),
+        callable,
+        pending_return_body,
+    })
 }
 
 /// Reads visibility only after the caller validates the declaration's class graph.
@@ -353,6 +3937,7 @@ struct ClassMethodPlan {
     name: String,
     side: ClassPropertySide,
     ambient: bool,
+    body: Option<NodeRef>,
     return_type_node: Option<NodeRef>,
     private_return: Option<ClassMethodPrivateReturnPlan>,
     private_tagged_call: Option<ClassMethodPrivateTaggedCallPlan>,
@@ -531,6 +4116,21 @@ impl ClassPropertyPlan {
     pub(super) const fn readonly(&self) -> bool {
         self.readonly
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClassDeclarationHeader {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    ambient: bool,
+    abstract_class: bool,
+    export_local: Option<SemanticSymbolId>,
+    base: Option<DirectClassBasePlan>,
+    null_base: Option<NullClassBasePlan>,
+    implementations: Vec<DirectClassImplementationPlan>,
+    instance_members: Option<SymbolTableId>,
+    static_members: SymbolTableId,
+    namespace_exports: Vec<ClassNamespaceExportPlan>,
 }
 
 /// Opaque, read-only syntax and binder proof for one admitted class.
@@ -1775,30 +5375,31 @@ fn prepare_constructor_parameter_type(
     store: &mut CanonicalTypeMapperStore,
     parameter: ClassConstructorParameterPlan,
 ) -> Result<TypeId, ClassError> {
-    if let Some(type_) = optional_constructor_parameter_type(
+    prepare_constructor_optional_type(
         store,
         parameter.type_,
         parameter.optional,
         parameter.declaration,
-    )? {
+    )
+}
+
+fn prepare_constructor_optional_type(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    optional: bool,
+    declaration: NodeRef,
+) -> Result<TypeId, ClassError> {
+    if let Some(type_) = optional_constructor_parameter_type(store, type_, optional, declaration)? {
         return Ok(type_);
     }
-    let types = constructor_parameter_type_constituents(
-        store,
-        parameter.type_,
-        parameter.optional,
-        parameter.declaration,
-    )?;
+    let constituents =
+        constructor_parameter_type_constituents(store, type_, optional, declaration)?;
     let mut prepared = store
         .prepare_type_query_types(&[], &[], &[], 1, 0)
-        .map_err(|_| invariant(ClassInvariant::Capacity(parameter.declaration)))?;
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
     store
-        .literal_union_type_prepared(&types, None, &mut prepared)
-        .map_err(|_| {
-            invariant(ClassInvariant::InvalidPropertyTypeCache(
-                parameter.declaration,
-            ))
-        })
+        .literal_union_type_prepared(&constituents, None, &mut prepared)
+        .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(declaration)))
 }
 
 #[allow(clippy::too_many_lines)] // The local and property share one binder/cache proof.
@@ -1810,6 +5411,29 @@ fn plan_constructor_parameter(
     parameter: NodeRef,
     instance_members: Option<SymbolTableId>,
     type_context: Option<&ClassTypeQueryContext>,
+) -> Result<PlannedConstructorParameter, ClassError> {
+    plan_constructor_parameter_with_body_mode(
+        store,
+        host,
+        owner,
+        constructor,
+        parameter,
+        instance_members,
+        type_context,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Preserves annotation context while selecting the body owner.
+fn plan_constructor_parameter_with_body_mode(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    constructor: NodeRef,
+    parameter: NodeRef,
+    instance_members: Option<SymbolTableId>,
+    type_context: Option<&ClassTypeQueryContext>,
+    source_body: bool,
 ) -> Result<PlannedConstructorParameter, ClassError> {
     let reject = || accessor_member_error(constructor, SyntaxKind::Constructor);
     let record = preflight_node(store, host, parameter)?;
@@ -1988,7 +5612,7 @@ fn plan_constructor_parameter(
         || symbol_record.parent().is_some()
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || locals.len() != 1
+        || !source_body && locals.len() != 1
         || locals.get_source(&identifier.text) != Some(symbol)
     {
         return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
@@ -3904,13 +7528,14 @@ fn plan_class_method_rest_parameter(
     })
 }
 
-fn plan_ambient_class_method_parameter(
+fn plan_class_method_parameter_with_body_mode(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     method: NodeRef,
     parameter: NodeRef,
     parameters: &ts_ast::NodeList,
     previous_end: ts_core::TextPos,
+    source_body: bool,
 ) -> Result<ClassMethodParameterPlan, ClassError> {
     let reject = || accessor_member_error(method, SyntaxKind::MethodDeclaration);
     let record = preflight_node(store, host, parameter)?;
@@ -3992,7 +7617,7 @@ fn plan_ambient_class_method_parameter(
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
         || locals.is_none_or(|locals| {
-            locals.len() != parameters.nodes.len()
+            !source_body && locals.len() != parameters.nodes.len()
                 || locals.get_source(&identifier.text) != Some(symbol)
         })
     {
@@ -4521,6 +8146,27 @@ fn plan_method(
     static_members: SymbolTableId,
     ambient: bool,
 ) -> Result<ClassMethodPlan, ClassError> {
+    plan_method_with_body_mode(
+        store,
+        host,
+        owner,
+        declaration,
+        (instance_members, static_members),
+        ambient,
+        false,
+    )
+}
+
+fn plan_method_with_body_mode(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    member_tables: (Option<SymbolTableId>, SymbolTableId),
+    ambient: bool,
+    source_body: bool,
+) -> Result<ClassMethodPlan, ClassError> {
+    let (instance_members, static_members) = member_tables;
     let record = preflight_node(store, host, declaration)?;
     let NodeData::MethodDeclaration(method) = &record.data else {
         return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
@@ -4552,27 +8198,30 @@ fn plan_method(
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
-    if !ambient && method.parameters.nodes.len() > 1 || method.parameters.has_trailing_comma {
+    if !ambient && !source_body && method.parameters.nodes.len() > 1
+        || method.parameters.has_trailing_comma
+    {
         return Err(unsupported(ClassUnsupported::Member {
             node: declaration,
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
     let mut parameters = Vec::new();
-    let rest_parameter = if ambient {
+    let rest_parameter = if ambient || source_body {
         parameters
             .try_reserve_exact(method.parameters.nodes.len())
             .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
         let mut previous_end = method.parameters.range.start;
         for parameter in &method.parameters.nodes {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
-            let planned = plan_ambient_class_method_parameter(
+            let planned = plan_class_method_parameter_with_body_mode(
                 store,
                 host,
                 declaration,
                 parameter,
                 &method.parameters,
                 previous_end,
+                source_body,
             )?;
             previous_end = preflight_node(store, host, parameter)?.range.end;
             parameters.push(planned);
@@ -4699,7 +8348,7 @@ fn plan_method(
         {
             return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
         }
-        if !block.statements.nodes.is_empty() {
+        if !source_body && !block.statements.nodes.is_empty() {
             let [statement] = block.statements.nodes.as_slice() else {
                 return Err(unsupported(ClassUnsupported::Member {
                     node: declaration,
@@ -4829,6 +8478,9 @@ fn plan_method(
         name: method_name.to_owned(),
         side,
         ambient,
+        body: method
+            .body
+            .map(|body| NodeRef::new(declaration.arena, declaration.file, body)),
         return_type_node,
         private_return,
         private_tagged_call,
@@ -7015,14 +10667,43 @@ fn authenticated_javascript_class_expando(
     static_members: SymbolTableId,
     declared_names: &HashSet<String>,
 ) -> Option<NodeRef> {
+    let source_header = if let Some(provenance) = store.source_class_provenance_for_symbol(owner) {
+        if !provenance.complete || validate_source_class_header(store, host, provenance).is_err() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+    authenticated_javascript_class_expando_with_cache_mode(
+        store,
+        host,
+        owner,
+        declaration,
+        static_members,
+        declared_names,
+        source_header,
+    )
+}
+
+fn authenticated_javascript_class_expando_with_cache_mode(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    static_members: SymbolTableId,
+    declared_names: &HashSet<String>,
+    source_header: bool,
+) -> Option<NodeRef> {
     let bound = host.bound_file(declaration)?;
     if !bound
         .source_facts()
         .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
-        || store.declared_type_links(owner).is_some()
-        || store
-            .value_symbol_links(owner)
-            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || !source_header && store.declared_type_links(owner).is_some()
+        || !source_header
+            && store
+                .value_symbol_links(owner)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
     {
         return None;
     }
@@ -7053,9 +10734,10 @@ fn authenticated_javascript_class_expando(
             || record.parent() != Some(owner)
             || record.export_symbol().is_some()
             || store.get_merged_symbol(symbol) != Some(symbol)
-            || store
-                .value_symbol_links(symbol)
-                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || !source_header
+                && store
+                    .value_symbol_links(symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
         {
             return None;
         }
@@ -7095,9 +10777,6 @@ fn authenticated_javascript_class_expando(
             let operator_record = host.node(operator)?;
             let right = NodeRef::new(assignment.arena, assignment.file, binary.right);
             let right_record = host.node(right)?;
-            let NodeData::NumericLiteral(literal) = &right_record.data else {
-                return None;
-            };
 
             if assignment_record.kind != SyntaxKind::BinaryExpression
                 || assignment_record.flags.0 != 0
@@ -7131,11 +10810,14 @@ fn authenticated_javascript_class_expando(
                 || operator_record.flags.0 != 0
                 || operator_record.parent != Some(assignment.node)
                 || !matches!(operator_record.data, NodeData::Token(_))
-                || right_record.kind != SyntaxKind::NumericLiteral
                 || right_record.flags.0 != 0
                 || right_record.parent != Some(assignment.node)
-                || literal.token_flags.0 != 0
-                || ts_jsnum::from_string(&literal.text).is_nan()
+                || matches!(
+                    &right_record.data,
+                    NodeData::NumericLiteral(literal)
+                        if literal.token_flags.0 != 0
+                            || ts_jsnum::from_string(&literal.text).is_nan()
+                )
             {
                 return None;
             }
@@ -7144,6 +10826,197 @@ fn authenticated_javascript_class_expando(
     }
 
     first_assignment
+}
+
+fn plan_source_class_expandos(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &mut SourceClassPlan,
+) -> Result<(), ClassError> {
+    let declared_symbols = plan
+        .sources
+        .iter()
+        .filter(|source| source.side == ClassPropertySide::Static)
+        .map(|source| source.symbol)
+        .collect::<HashSet<_>>();
+    let declared_names = plan
+        .sources
+        .iter()
+        .filter(|source| source.side == ClassPropertySide::Static)
+        .filter_map(|source| {
+            store
+                .symbol(source.symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                .map(str::to_owned)
+        })
+        .collect::<HashSet<_>>();
+    let table = store
+        .symbol_table(plan.header.static_members)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidStaticMembers(plan.symbol())))?;
+    let extra = table
+        .iter()
+        .filter(|(name, symbol)| {
+            !declared_symbols.contains(symbol) && name.as_utf8() != Some(PROTOTYPE_NAME)
+        })
+        .collect::<Vec<_>>();
+    if extra.is_empty() {
+        return Ok(());
+    }
+    authenticated_javascript_class_expando_with_cache_mode(
+        store,
+        host,
+        plan.symbol(),
+        plan.declaration(),
+        plan.header.static_members,
+        &declared_names,
+        true,
+    )
+    .ok_or_else(|| invariant(ClassInvariant::InvalidStaticMembers(plan.symbol())))?;
+    let number = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(plan.declaration())))?
+        .number_type;
+    for (name, symbol) in extra {
+        let member_record = store
+            .symbol(symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(plan.declaration())))?;
+        // Ownership does not make every assignment value part of the numeric provider.
+        for &assignment in member_record
+            .declarations()
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(plan.declaration())))?
+        {
+            let record = preflight_node(store, host, assignment)?;
+            let NodeData::BinaryExpression(data) = &record.data else {
+                return Err(invariant(ClassInvariant::InvalidDeclaration(assignment)));
+            };
+            let initializer = NodeRef::new(assignment.arena, assignment.file, data.right);
+            if !matches!(
+                preflight_node(store, host, initializer)?.data,
+                NodeData::NumericLiteral(_)
+            ) {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: assignment,
+                    kind: SyntaxKind::BinaryExpression,
+                }));
+            }
+        }
+        let declaration = member_record
+            .value_declaration()
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(plan.declaration())))?;
+        let record = preflight_node(store, host, declaration)?;
+        let NodeData::BinaryExpression(data) = &record.data else {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+        };
+        let left = NodeRef::new(declaration.arena, declaration.file, data.left);
+        let left_record = preflight_node(store, host, left)?;
+        let NodeData::PropertyAccessExpression(access) = &left_record.data else {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(left)));
+        };
+        let initializer = NodeRef::new(declaration.arena, declaration.file, data.right);
+        let right = preflight_node(store, host, initializer)?;
+        let NodeData::NumericLiteral(literal) = &right.data else {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(initializer)));
+        };
+        let property = ClassPropertyPlan {
+            declaration,
+            symbol,
+            name_node: NodeRef::new(declaration.arena, declaration.file, access.name),
+            type_node: initializer,
+            initializer_node: Some(initializer),
+            initializer_text: Some(literal.text.clone()),
+            initializer_string: None,
+            initializer_parameter_name: None,
+            initializer_assertion: None,
+            merged_interface_annotation: None,
+            auto_accessor: false,
+            name: name
+                .as_utf8()
+                .ok_or_else(|| invariant(ClassInvariant::InvalidName(left)))?
+                .to_owned(),
+            side: ClassPropertySide::Static,
+            optional: false,
+            definite: false,
+            abstract_property: false,
+            readonly: false,
+            ambient_private_modifier: None,
+            parameter_property: false,
+            javascript_constructor_assignment: false,
+        };
+        plan.sources.push(ClassMemberSource {
+            symbol,
+            declaring_class: plan.symbol(),
+            declaration,
+            origin: ClassMemberOrigin::JavaScriptAssignment {
+                assignment: declaration,
+            },
+            side: ClassPropertySide::Static,
+            visibility: ClassConstructorVisibility::Public,
+            readonly: false,
+            abstract_: false,
+        });
+        plan.properties.push((property, number));
+    }
+    Ok(())
+}
+
+fn validate_source_class_member_tables(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceClassPlan,
+) -> Result<(), ClassError> {
+    let mut instance = HashSet::new();
+    let mut static_ = HashSet::new();
+    for source in &plan.sources {
+        let table = match source.side {
+            ClassPropertySide::Instance => plan.header.instance_members,
+            ClassPropertySide::Static => Some(plan.header.static_members),
+        };
+        let record = store
+            .symbol(source.symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(source.declaration)))?;
+        let seen = match source.side {
+            ClassPropertySide::Instance => &mut instance,
+            ClassPropertySide::Static => &mut static_,
+        };
+        if !seen.insert(source.symbol)
+            || record.parent() != Some(plan.symbol())
+            || record.value_declaration() != Some(source.declaration)
+            || table
+                .and_then(|table| store.symbol_table(table))
+                .and_then(|table| table.get(record.name()))
+                != Some(source.symbol)
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+                source.declaration,
+            )));
+        }
+    }
+    if let Some(constructor) = &plan.constructor {
+        if plan
+            .header
+            .instance_members
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(InternalSymbolName::Constructor.as_ref()))
+            != Some(constructor.symbol)
+        {
+            return Err(invariant(ClassInvariant::InvalidConstructSignature(
+                plan.symbol(),
+            )));
+        }
+        instance.insert(constructor.symbol);
+    }
+    let instance_table = plan
+        .header
+        .instance_members
+        .and_then(|table| store.symbol_table(table));
+    if plan.header.instance_members.is_some() == instance.is_empty()
+        || instance_table.is_some_and(|table| table.len() != instance.len())
+        || store
+            .symbol_table(plan.header.static_members)
+            .is_none_or(|table| table.len() != static_.len() + 1)
+    {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(plan.symbol())));
+    }
+    Ok(())
 }
 
 fn plan_class_declaration_modifiers(
@@ -7611,13 +11484,12 @@ fn validate_plain_class_type_parameters(
 
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
-fn plan_class_declaration(
+fn plan_class_declaration_header(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
     allow_direct_base: bool,
-    type_context: Option<&ClassTypeQueryContext>,
-) -> Result<ClassDeclarationPlan, ClassError> {
+) -> Result<ClassDeclarationHeader, ClassError> {
     let merged = store
         .get_merged_symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(symbol)))?;
@@ -7785,6 +11657,45 @@ fn plan_class_declaration(
     reject_reserved_static_prototype(store, host, declaration, &class.members)?;
     validate_prototype(store, symbol, static_members)?;
 
+    Ok(ClassDeclarationHeader {
+        declaration,
+        symbol,
+        ambient,
+        abstract_class,
+        export_local,
+        base,
+        null_base,
+        implementations,
+        instance_members,
+        static_members,
+        namespace_exports,
+    })
+}
+
+fn plan_class_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    allow_direct_base: bool,
+    type_context: Option<&ClassTypeQueryContext>,
+) -> Result<ClassDeclarationPlan, ClassError> {
+    let ClassDeclarationHeader {
+        declaration,
+        symbol,
+        ambient,
+        abstract_class,
+        export_local,
+        base,
+        null_base,
+        implementations,
+        instance_members,
+        static_members,
+        namespace_exports,
+    } = plan_class_declaration_header(store, host, symbol, allow_direct_base)?;
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::ClassDeclaration(class) = &declaration_record.data else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    };
     let mut instance_properties = Vec::new();
     let mut static_properties = Vec::new();
     let mut properties = Vec::with_capacity(class.members.nodes.len());
@@ -8495,6 +12406,10 @@ impl ClassMemberQueryPlan {
                 .or(base.class.constructor)
                 .and_then(ClassConstructorPlan::signature_parameter),
         }
+    }
+
+    pub(super) fn constructor_parameter_symbols(&self) -> Vec<SemanticSymbolId> {
+        self.constructor_parameter_symbol().into_iter().collect()
     }
 
     pub(super) fn constructor_minimum_argument_count(&self) -> i32 {
@@ -10278,33 +14193,45 @@ fn plan_nongeneric_class_members_with_type_context(
 
 fn preflight_class_override_visibility(
     store: &CanonicalTypeMapperStore,
-    class: &ClassDeclarationPlan,
-    base: &ClassDeclarationPlan,
+    class: SemanticSymbolId,
+    base: SemanticSymbolId,
     heritage: NodeRef,
 ) -> Result<(), ClassError> {
+    let class_record = store
+        .symbol(class)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class)))?;
+    let base_record = store
+        .symbol(base)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base)))?;
+    let class_exports = class_record
+        .exports()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class)))?;
+    let base_exports = base_record
+        .exports()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base)))?;
     for (own, inherited) in [
-        (class.instance_members, base.instance_members),
-        (Some(class.static_members), Some(base.static_members)),
+        (class_record.members(), base_record.members()),
+        (Some(class_exports), Some(base_exports)),
     ] {
         let (Some(own), Some(inherited)) = (own, inherited) else {
             continue;
         };
         let own = store
             .symbol_table(own)
-            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class)))?;
         let inherited = store
             .symbol_table(inherited)
-            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base.symbol)))?;
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base)))?;
         for (name, property) in own.iter() {
             let Some(base_property) = inherited.get(name) else {
                 continue;
             };
             let property = store
                 .symbol(property)
-                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class.symbol)))?;
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(class)))?;
             let base_property = store
                 .symbol(base_property)
-                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base.symbol)))?;
+                .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(base)))?;
             if !property
                 .flags()
                 .intersects(SymbolFlags::PROPERTY | SymbolFlags::METHOD | SymbolFlags::ACCESSOR)
@@ -10359,7 +14286,12 @@ pub(super) fn plan_nongeneric_class_member_query_with_type_context(
     };
     let base_plan =
         plan_nongeneric_class_members_with_type_context(store, host, base.symbol, type_context)?;
-    preflight_class_override_visibility(store, &class, &base_plan.class, base.expression)?;
+    preflight_class_override_visibility(
+        store,
+        class.symbol,
+        base_plan.class.symbol,
+        base.expression,
+    )?;
     if base_plan.constructor_visibility() == ClassConstructorVisibility::Private
         || base_plan.class.null_base.is_some()
         || base_plan
@@ -15332,6 +19264,58 @@ fn plan_clodule_static_grammar_diagnostics(
     })
 }
 
+/// Reuses the static-name check after validating the exported class and local alias.
+pub(super) fn plan_exported_static_member_name_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<ClassGrammarDiagnosticPlan> {
+    let header = plan_class_declaration_header(store, host, symbol, false).ok()?;
+    if header.export_local.is_none()
+        || header.ambient
+        || header.abstract_class
+        || !header.namespace_exports.is_empty()
+    {
+        return None;
+    }
+    let record = preflight_node(store, host, header.declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let [modifier] = class.modifiers.as_ref()?.list.nodes.as_slice() else {
+        return None;
+    };
+    if class.type_parameters.is_some()
+        || class.heritage_clauses.is_some()
+        || preflight_node(
+            store,
+            host,
+            NodeRef::new(header.declaration.arena, header.declaration.file, *modifier),
+        )
+        .ok()?
+        .kind
+            != SyntaxKind::ExportKeyword
+    {
+        return None;
+    }
+    let [field, method] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    let diagnostic = plan_static_member_name_grammar_diagnostic(
+        store,
+        host,
+        symbol,
+        header.declaration,
+        NodeRef::new(header.declaration.arena, header.declaration.file, *field),
+        NodeRef::new(header.declaration.arena, header.declaration.file, *method),
+    )?;
+    Some(ClassGrammarDiagnosticPlan {
+        declaration: header.declaration,
+        symbol,
+        diagnostics: vec![diagnostic],
+    })
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -15893,7 +19877,19 @@ fn exact_class_instance_identity(
         && instance.this_type == Some(*this_type)
         && instance.reference.object.target == Some(instance_type)
         && instance.reference.object.mapper.is_none()
-        && (type_parameters.is_empty() && instantiations.len() == 1
+        && (type_parameters.is_empty()
+            && instantiations.iter().all(|(key, cached)| {
+                if *key == type_list_key(&[]) {
+                    return *cached == instance_type;
+                }
+                store
+                    .class_instance_super_view(*cached)
+                    .is_some_and(|view| {
+                        view.origin.base_instance == instance_type
+                            && *key == type_list_key(&[view.origin.this_type])
+                            && class_instance_super_view_shell_is_valid(store, view)
+                    })
+            })
             || !type_parameters.is_empty() && !instantiations.is_empty())
         && instantiations.get(&type_list_key(type_parameters)) == Some(&instance_type)
         && instance.reference.node.is_none()
@@ -16427,6 +20423,9 @@ fn completed_class_members(
     instance_type: TypeId,
     value_type: TypeId,
 ) -> Option<ClassMembers> {
+    if !completed_source_class_header_is_valid(store, plan.class.symbol, Some(instance_type)) {
+        return None;
+    }
     if plan.class.base.is_some()
         || store
             .direct_class_heritage_provenance(instance_type)
@@ -17004,6 +21003,9 @@ fn completed_derived_class_members(
     value_type: TypeId,
     surfaces: &DerivedMemberSurfaces,
 ) -> Option<ClassMembers> {
+    if !completed_source_class_header_is_valid(store, plan.class.symbol, Some(instance_type)) {
+        return None;
+    }
     let base_plan = plan.class.base.as_ref()?;
     let base_instance =
         forwarded_class_base_instance(store, base_plan, instance_type, base.shells.instance_type)?;
@@ -18241,6 +22243,11 @@ fn class_member_state(
         .declared_type_links(plan.class.symbol)
         .and_then(|links| links.declared_type);
     let value = resolved_class_value_type(store, plan.class.symbol);
+    if !completed_source_class_header_is_valid(store, plan.class.symbol, instance) {
+        return Err(invariant(ClassInvariant::InvalidInstanceMembers(
+            plan.class.symbol,
+        )));
+    }
     if let (Some(instance), Some(value)) = (instance, value)
         && let Some(members) = completed_class_members(store, host, plan, instance, value)
     {
@@ -18693,6 +22700,36 @@ fn prepare_class_literal_types(
                 invariant(ClassInvariant::InvalidPropertyTypeCache(node))
             }
         })
+}
+
+fn publish_source_assignment_property(
+    store: &mut CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    property_type: TypeId,
+) {
+    // Literal reservation does not create the regular and fresh literal pair.
+    if let Some(number) = property_initializer_number(property) {
+        store
+            .regular_number_literal_type(number)
+            .expect("the source assignment literal was preflighted");
+    }
+    let initializer_type = property_initializer_fresh_literal_type(store, property)
+        .expect("the assignment initializer was validated")
+        .expect("the assignment literal was prepared");
+    assert!(store.set_type_node_links(
+        property.type_node,
+        TypeNodeLinks {
+            resolved_type: Some(initializer_type),
+            ..TypeNodeLinks::default()
+        }
+    ));
+    assert!(store.set_value_symbol_links(
+        property.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(property_type),
+            ..ValueSymbolLinks::default()
+        }
+    ));
 }
 
 fn publish_class_property(
@@ -19486,6 +23523,11 @@ fn derived_class_member_state(
     let instance = store
         .declared_type_links(plan.class.symbol)
         .and_then(|links| links.declared_type);
+    if !completed_source_class_header_is_valid(store, plan.class.symbol, instance) {
+        return Err(invariant(ClassInvariant::InvalidHeritageCache(
+            plan.class.symbol,
+        )));
+    }
     let value = exact_optional_class_value(store, plan.class.symbol)?;
     if let (Some(instance), Some(value), Some(base)) = (instance, value, base)
         && let Some(members) =
@@ -23229,6 +27271,18 @@ pub(super) fn validate_class_heritage_members(
     store: &CanonicalTypeMapperStore,
     instance_type: TypeId,
 ) -> ClassHeritageMembersValidation {
+    // Check saved instance ownership before reading mutable type flags or symbols.
+    if let Some(provenance) = store.source_class_provenance(instance_type) {
+        return if completed_source_class_header_is_valid(
+            store,
+            provenance.symbol(),
+            Some(instance_type),
+        ) {
+            ClassHeritageMembersValidation::Valid
+        } else {
+            ClassHeritageMembersValidation::Malformed
+        };
+    }
     let Some(record) = store.type_payload(instance_type) else {
         return ClassHeritageMembersValidation::NotClass;
     };
@@ -23236,6 +27290,12 @@ pub(super) fn validate_class_heritage_members(
         != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
     {
         return ClassHeritageMembersValidation::NotClass;
+    }
+    if record
+        .symbol()
+        .is_some_and(|symbol| store.source_class_provenance_for_symbol(symbol).is_some())
+    {
+        return ClassHeritageMembersValidation::Malformed;
     }
     let valid = match store.direct_class_heritage_provenance(instance_type) {
         Some(provenance) => {
@@ -24035,7 +28095,9 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
+    use ts_parser::{
+        ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
+    };
 
     use super::*;
     use crate::semantic::{
@@ -24107,6 +28169,20 @@ mod tests {
         module_state: CanonicalModuleState,
         options: IntrinsicBootstrapOptions,
     ) -> Fixture {
+        fixture_from_parsed_with_language_and_options(
+            parsed,
+            module_state,
+            CanonicalSourceLanguage::TypeScript,
+            options,
+        )
+    }
+
+    fn fixture_from_parsed_with_language_and_options(
+        parsed: ParseResult,
+        module_state: CanonicalModuleState,
+        language: CanonicalSourceLanguage,
+        options: IntrinsicBootstrapOptions,
+    ) -> Fixture {
         let file = FileId::new(91);
         let mut binder = CanonicalBinder::new();
         binder
@@ -24116,15 +28192,21 @@ mod tests {
                 file,
                 CanonicalSourceFileFacts::new(
                     EscapedName::source("\"/classes.ts\""),
-                    CanonicalSourceLanguage::TypeScript,
+                    language,
                     false,
                     module_state,
                 ),
             )
             .unwrap();
-        binder
-            .bind_typescript_declaration_slice(&parsed.arena, file)
-            .unwrap();
+        if language == CanonicalSourceLanguage::JavaScript {
+            binder
+                .bind_javascript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        } else {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
         let (symbols, files) = binder.finish().try_into_parts().unwrap();
         let mut store = TestStore::from_symbol_store(symbols);
         assert!(
@@ -24189,6 +28271,1495 @@ mod tests {
         fixture.files[&fixture.file]
             .symbol(class_node(fixture, name))
             .unwrap()
+    }
+
+    macro_rules! source_class_snapshot {
+        ($store:expr, $instance:expr) => {
+            (
+                $store.type_len(),
+                $store.symbol_len(),
+                $store.signature_len(),
+                $store.mapper_len(),
+                $store.index_info_len(),
+                $store.symbol_store().symbol_table_len(),
+                $store.checker_link_allocated_lengths(),
+                $store.relation_state_snapshot(),
+                $store.source_class_provenance($instance).cloned(),
+            )
+        };
+    }
+
+    #[test]
+    fn source_body_header_keeps_ordered_parameters_and_static_block_identity() {
+        let mut fixture = fixture(concat!(
+            "class Subject { constructor(public x: number, public y: string) {} ",
+            "first() {} second(): void {} static {} }",
+        ));
+        let symbol = class_symbol(&fixture, "Subject");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let constructor = plan
+            .bodies()
+            .iter()
+            .find(|body| body.kind == ClassBodyKind::Constructor)
+            .unwrap();
+        assert_eq!(constructor.parameters.len(), 2);
+        assert!(
+            constructor
+                .parameters
+                .iter()
+                .all(|parameter| parameter.property_symbol != Some(parameter.symbol))
+        );
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let signature = fixture
+            .store
+            .signature(prepared.construct_signature)
+            .unwrap();
+        assert_eq!(
+            signature.parameters(),
+            constructor
+                .parameters
+                .iter()
+                .map(|parameter| parameter.symbol)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(signature.min_argument_count(), 2);
+        assert_eq!(signature.flags(), SignatureFlags::CONSTRUCT);
+        assert_eq!(
+            signature.resolved_return_type(),
+            Some(prepared.instance_type)
+        );
+        let access = prepared
+            .body_access(&fixture.store, &host, constructor)
+            .unwrap();
+        let identities = class_body_identities(&fixture.store, &host, &access).unwrap();
+        assert_ne!(identities.this_type, identities.instance_type);
+        let block = plan
+            .bodies()
+            .iter()
+            .find(|body| body.kind == ClassBodyKind::StaticBlock)
+            .unwrap();
+        let access = prepared.body_access(&fixture.store, &host, block).unwrap();
+        assert_eq!(access.signature, None);
+        assert!(fixture.store.signature_links(block.declaration).is_none());
+        assert_eq!(
+            fixture
+                .store
+                .signature(prepared.methods[0].1)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        let mut reordered = constructor.clone();
+        reordered.parameters.reverse();
+        assert!(
+            prepared
+                .body_access(&fixture.store, &host, &reordered)
+                .is_err()
+        );
+        let mut wrong_kind = constructor.clone();
+        wrong_kind.kind = ClassBodyKind::StaticBlock;
+        assert!(
+            prepared
+                .body_access(&fixture.store, &host, &wrong_kind)
+                .is_err()
+        );
+        assert!(finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).is_err());
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+        assert_eq!(
+            prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap(),
+            prepared
+        );
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+    }
+
+    #[test]
+    fn source_body_raw_void_cannot_complete_through_legacy_query() {
+        let mut fixture = fixture("class LegacyShape { inferred() {} }");
+        let symbol = class_symbol(&fixture, "LegacyShape");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let legacy = plan_nongeneric_class_member_query(&fixture.store, &host, symbol).unwrap();
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let signature = prepared.methods[0].1;
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(void))
+        );
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        assert!(finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).is_err());
+        assert!(execute_nongeneric_class_member_query(&mut fixture.store, &host, &legacy).is_err());
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, prepared.instance_type),
+            ClassHeritageMembersValidation::Malformed
+        );
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(void)
+        );
+    }
+
+    #[test]
+    fn source_body_same_shaped_signature_replacement_is_rejected() {
+        let mut fixture = fixture("class Subject { inferred() {} }");
+        let symbol = class_symbol(&fixture, "Subject");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let body = &plan.bodies()[0];
+        let access = prepared.body_access(&fixture.store, &host, body).unwrap();
+        let (method_type, original) = prepared.methods[0];
+        let replacement = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(body.declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        assert_ne!(replacement, original);
+        assert!(fixture.store.set_signature_links(
+            body.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(replacement),
+                ..SignatureLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            method_type,
+            None,
+            None,
+            Some(vec![replacement]),
+            None,
+            None
+        ));
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        assert!(prepared.body_access(&fixture.store, &host, body).is_err());
+        assert!(class_body_identities(&fixture.store, &host, &access).is_err());
+        assert!(finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).is_err());
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+    }
+
+    #[test]
+    fn source_body_token_rejects_another_store_with_the_same_arena() {
+        let mut fixture = fixture("class Subject { inferred() {} }");
+        let symbol = class_symbol(&fixture, "Subject");
+        let original_host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let plan = plan_source_class_members(&fixture.store, &original_host, symbol).unwrap();
+        let prepared =
+            prepare_source_class_members(&mut fixture.store, &original_host, &plan).unwrap();
+        let access = prepared
+            .body_access(&fixture.store, &original_host, &plan.bodies()[0])
+            .unwrap();
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &fixture.parsed.arena,
+                fixture.parsed.source_file,
+                fixture.file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/classes.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&fixture.parsed.arena, fixture.file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut foreign = TestStore::from_symbol_store(symbols);
+        foreign
+            .register_source_file(
+                &fixture.parsed.arena,
+                fixture.parsed.source_file,
+                fixture.file,
+            )
+            .unwrap();
+        foreign
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let foreign_bound = &files[&fixture.file];
+        let locals = foreign_bound.locals(foreign_bound.source_file()).unwrap();
+        let globals = foreign.intrinsic_bootstrap().unwrap().globals;
+        let symbols = foreign
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            foreign.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let foreign_host = host(&fixture.parsed.arena, foreign_bound);
+        assert_eq!(
+            foreign_bound.source_file(),
+            fixture.files[&fixture.file].source_file()
+        );
+        let before = source_class_snapshot!(foreign, prepared.instance_type);
+        assert!(class_body_identities(&foreign, &foreign_host, &access).is_err());
+        assert!(prepare_source_class_members(&mut foreign, &foreign_host, &plan).is_err());
+        assert_eq!(
+            source_class_snapshot!(foreign, prepared.instance_type),
+            before
+        );
+    }
+
+    #[test]
+    fn source_body_completed_legacy_readers_reject_replaced_constructor_ids() {
+        for derived in [false, true] {
+            let mut fixture = fixture(if derived {
+                "class Base {} class CompleteShape extends Base {}"
+            } else {
+                "class CompleteShape {}"
+            });
+            let symbol = class_symbol(&fixture, "CompleteShape");
+            let base = derived.then(|| class_symbol(&fixture, "Base"));
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            if let Some(base) = base {
+                let query =
+                    plan_nongeneric_class_member_query(&fixture.store, &host, base).unwrap();
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &query).unwrap();
+            }
+            let legacy = plan_nongeneric_class_member_query(&fixture.store, &host, symbol).unwrap();
+            let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+            let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+            let members =
+                finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &legacy),
+                Ok(members.clone())
+            );
+            let signature = fixture
+                .store
+                .signature(prepared.construct_signature)
+                .unwrap();
+            let replacement = fixture
+                .store
+                .alloc_signature(
+                    signature.flags(),
+                    signature.declaration(),
+                    Vec::new(),
+                    None,
+                    signature.parameters().to_vec(),
+                    signature.resolved_return_type(),
+                    None,
+                    signature.min_argument_count(),
+                )
+                .unwrap();
+            assert_ne!(replacement, prepared.construct_signature);
+            let mut properties = members.static_properties.clone();
+            properties.push(members.prototype);
+            assert!(fixture.store.set_structured_type_members(
+                prepared.value_type,
+                Some(members.static_members),
+                Some(properties),
+                None,
+                Some(vec![replacement]),
+                None,
+            ));
+            let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+            assert!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &legacy).is_err()
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, prepared.instance_type),
+                ClassHeritageMembersValidation::Malformed
+            );
+            assert!(
+                finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).is_err()
+            );
+            assert_eq!(
+                source_class_snapshot!(fixture.store, prepared.instance_type),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn source_body_finish_rejects_changed_prepared_identities() {
+        for completed in [false, true] {
+            let mut fixture = fixture("class First {} class Second {}");
+            let first = class_symbol(&fixture, "First");
+            let second = class_symbol(&fixture, "Second");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let first_plan = plan_source_class_members(&fixture.store, &host, first).unwrap();
+            let first_prepared =
+                prepare_source_class_members(&mut fixture.store, &host, &first_plan).unwrap();
+            let second_plan = plan_source_class_members(&fixture.store, &host, second).unwrap();
+            let second_prepared =
+                prepare_source_class_members(&mut fixture.store, &host, &second_plan).unwrap();
+            let classes = [
+                (&first_plan, &first_prepared),
+                (&second_plan, &second_prepared),
+            ];
+            if completed {
+                for (plan, prepared) in classes {
+                    finish_source_class_members(&mut fixture.store, &host, plan, prepared).unwrap();
+                }
+            }
+
+            let mut changed_instance = first_prepared.clone();
+            changed_instance.instance_type = second_prepared.instance_type;
+            let mut changed_value = first_prepared.clone();
+            changed_value.value_type = second_prepared.value_type;
+            let mut changed_signature = first_prepared.clone();
+            changed_signature.construct_signature = second_prepared.construct_signature;
+            for (case, prepared) in [
+                ("instance", changed_instance),
+                ("value", changed_value),
+                ("constructor signature", changed_signature),
+            ] {
+                let before = (
+                    source_class_snapshot!(fixture.store, first_prepared.instance_type),
+                    source_class_snapshot!(fixture.store, second_prepared.instance_type),
+                );
+                assert_eq!(
+                    finish_source_class_members(&mut fixture.store, &host, &first_plan, &prepared),
+                    Err(invariant(ClassInvariant::InvalidPlan(
+                        first_plan.declaration()
+                    ))),
+                    "changed {case}, completed={completed}"
+                );
+                assert_eq!(
+                    (
+                        source_class_snapshot!(fixture.store, first_prepared.instance_type),
+                        source_class_snapshot!(fixture.store, second_prepared.instance_type),
+                    ),
+                    before,
+                );
+            }
+
+            for (plan, prepared) in classes {
+                let members =
+                    finish_source_class_members(&mut fixture.store, &host, plan, prepared).unwrap();
+                assert_eq!(
+                    (
+                        members.shells.symbol,
+                        members.shells.instance_type,
+                        members.shells.value_type,
+                        members.default_construct_signature
+                    ),
+                    (
+                        plan.symbol(),
+                        prepared.instance_type,
+                        prepared.value_type,
+                        prepared.construct_signature
+                    ),
+                );
+                let before = (
+                    source_class_snapshot!(fixture.store, first_prepared.instance_type),
+                    source_class_snapshot!(fixture.store, second_prepared.instance_type),
+                );
+                assert_eq!(
+                    prepare_source_class_members(&mut fixture.store, &host, plan).unwrap(),
+                    *prepared
+                );
+                assert_eq!(
+                    finish_source_class_members(&mut fixture.store, &host, plan, prepared).unwrap(),
+                    members
+                );
+                assert_eq!(
+                    (
+                        source_class_snapshot!(fixture.store, first_prepared.instance_type),
+                        source_class_snapshot!(fixture.store, second_prepared.instance_type),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_body_instance_origin_cannot_move_to_another_class() {
+        let mut fixture = fixture("class First {} class Second {}");
+        let first = class_symbol(&fixture, "First");
+        let second = class_symbol(&fixture, "Second");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let second_query =
+            plan_nongeneric_class_member_query(&fixture.store, &host, second).unwrap();
+        let plan = plan_source_class_members(&fixture.store, &host, first).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+        let this_type = fixture
+            .store
+            .source_class_provenance(prepared.instance_type)
+            .unwrap()
+            .this_type;
+        let second_exports = fixture.store.symbol(second).unwrap().exports().unwrap();
+        let second_prototype = fixture
+            .store
+            .symbol_table(second_exports)
+            .unwrap()
+            .get_source(PROTOTYPE_NAME)
+            .unwrap();
+        let declared_links = fixture.store.declared_type_links(first).unwrap().clone();
+        let value_links = fixture.store.value_symbol_links(first).unwrap().clone();
+
+        for type_ in [prepared.instance_type, this_type, prepared.value_type] {
+            assert!(fixture.store.set_type_symbol(type_, Some(second)));
+        }
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(second, declared_links)
+        );
+        assert!(fixture.store.set_value_symbol_links(second, value_links));
+        let replacement = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(prepared.instance_type),
+                None,
+                0,
+            )
+            .unwrap();
+        assert_ne!(replacement, prepared.construct_signature);
+        assert!(fixture.store.set_structured_type_members(
+            prepared.value_type,
+            Some(second_exports),
+            Some(vec![second_prototype]),
+            None,
+            Some(vec![replacement]),
+            None,
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .source_class_provenance(prepared.instance_type)
+                .unwrap()
+                .symbol(),
+            first
+        );
+        assert!(
+            fixture
+                .store
+                .source_class_provenance_for_symbol(second)
+                .is_none()
+        );
+
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        let stored = validate_class_heritage_members(&fixture.store, prepared.instance_type);
+        let legacy =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &second_query);
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+        assert_eq!(stored, ClassHeritageMembersValidation::Malformed);
+        assert!(
+            legacy.is_err(),
+            "source-owned identities cannot enter the legacy path"
+        );
+    }
+
+    #[test]
+    fn source_body_origin_guard_preserves_ordinary_legacy_classes() {
+        let mut fixture = fixture("class Base {} class Derived extends Base {}");
+        let base = class_symbol(&fixture, "Base");
+        let derived = class_symbol(&fixture, "Derived");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        for symbol in [base, derived] {
+            let query = plan_nongeneric_class_member_query(&fixture.store, &host, symbol).unwrap();
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &query).unwrap();
+            assert!(
+                fixture
+                    .store
+                    .source_class_provenance(members.shells.instance_type)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_class_provenance_for_symbol(symbol)
+                    .is_none()
+            );
+            let before = source_class_snapshot!(fixture.store, members.shells.instance_type);
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells.instance_type),
+                ClassHeritageMembersValidation::Valid
+            );
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &query),
+                Ok(members.clone())
+            );
+            assert_eq!(
+                source_class_snapshot!(fixture.store, members.shells.instance_type),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn source_body_cleared_derived_links_reject_legacy_rebuild_without_writes() {
+        let mut fixture = fixture("class Base {} class Derived extends Base {}");
+        let base = class_symbol(&fixture, "Base");
+        let derived = class_symbol(&fixture, "Derived");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let query = plan_nongeneric_class_member_query(&fixture.store, &host, derived).unwrap();
+        let base_plan = plan_source_class_members(&fixture.store, &host, base).unwrap();
+        let prepared_base =
+            prepare_source_class_members(&mut fixture.store, &host, &base_plan).unwrap();
+        finish_source_class_members(&mut fixture.store, &host, &base_plan, &prepared_base).unwrap();
+        let plan = plan_source_class_members(&fixture.store, &host, derived).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(derived, Default::default())
+        );
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(derived, ValueSymbolLinks::default())
+        );
+        let retained = fixture
+            .store
+            .source_class_provenance_for_symbol(derived)
+            .unwrap();
+        assert!(retained.complete);
+        assert_eq!(retained.instance_type(), prepared.instance_type);
+
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &query),
+            Err(invariant(ClassInvariant::InvalidHeritageCache(derived)))
+        );
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+        assert_eq!(
+            fixture.store.declared_type_links(derived),
+            Some(&Default::default())
+        );
+        assert_eq!(
+            fixture.store.value_symbol_links(derived),
+            Some(&ValueSymbolLinks::default())
+        );
+    }
+
+    #[test]
+    fn source_body_origin_guard_allows_a_cold_derived_legacy_query() {
+        let mut fixture = fixture("class Base {} class Derived extends Base {}");
+        let base = class_symbol(&fixture, "Base");
+        let derived = class_symbol(&fixture, "Derived");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let query = plan_nongeneric_class_member_query(&fixture.store, &host, derived).unwrap();
+        for symbol in [base, derived] {
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_class_provenance_for_symbol(symbol)
+                    .is_none()
+            );
+        }
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &query).unwrap();
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells.instance_type),
+            ClassHeritageMembersValidation::Valid
+        );
+        let before = source_class_snapshot!(fixture.store, members.shells.instance_type);
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &query),
+            Ok(members.clone())
+        );
+        assert_eq!(
+            source_class_snapshot!(fixture.store, members.shells.instance_type),
+            before
+        );
+    }
+
+    #[test]
+    fn source_body_stored_validation_rechecks_class_and_member_bindings() {
+        for target in ["class", "member"] {
+            for change in [
+                "flags",
+                "declarations",
+                "value declaration",
+                "parent",
+                "members",
+                "exports",
+            ] {
+                let mut fixture =
+                    fixture("class Subject { value: number; } class Other { other: number; }");
+                let symbol = class_symbol(&fixture, "Subject");
+                let other = class_symbol(&fixture, "Other");
+                let other_declaration = class_node(&fixture, "Other");
+                let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+                let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+                let prepared =
+                    prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+                finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+                assert_eq!(
+                    validate_class_heritage_members(&fixture.store, prepared.instance_type),
+                    ClassHeritageMembersValidation::Valid
+                );
+                let target_symbol = if target == "class" {
+                    symbol
+                } else {
+                    plan.sources[0].symbol
+                };
+                let binding = source_class_binding(&fixture.store, target_symbol).unwrap();
+                let other_members = fixture.store.symbol(other).unwrap().members();
+                let changed = match change {
+                    "flags" => fixture.store.set_symbol_flags(
+                        target_symbol,
+                        SymbolFlags::FUNCTION,
+                        CheckFlags::NONE,
+                    ),
+                    "declarations" => fixture.store.set_symbol_declarations(
+                        target_symbol,
+                        Some(vec![other_declaration]),
+                        binding.value_declaration,
+                    ),
+                    "value declaration" => fixture.store.set_symbol_declarations(
+                        target_symbol,
+                        binding.declarations,
+                        Some(other_declaration),
+                    ),
+                    "parent" => fixture.store.set_symbol_relationships(
+                        target_symbol,
+                        binding.members,
+                        binding.exports,
+                        Some(other),
+                        binding.export_symbol,
+                    ),
+                    "members" => fixture.store.set_symbol_relationships(
+                        target_symbol,
+                        other_members,
+                        binding.exports,
+                        binding.parent,
+                        binding.export_symbol,
+                    ),
+                    "exports" => fixture.store.set_symbol_relationships(
+                        target_symbol,
+                        binding.members,
+                        other_members,
+                        binding.parent,
+                        binding.export_symbol,
+                    ),
+                    _ => unreachable!(),
+                };
+                assert!(changed, "{target} {change}");
+                let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+                assert_eq!(
+                    validate_class_heritage_members(&fixture.store, prepared.instance_type),
+                    ClassHeritageMembersValidation::Malformed,
+                    "{target} {change}"
+                );
+                assert_eq!(
+                    source_class_snapshot!(fixture.store, prepared.instance_type),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_body_member_order_is_stable_across_bound_stores() {
+        for _ in 0..8 {
+            let mut fixture = fixture(concat!(
+                "class Subject { first: number; middle() {} ",
+                "constructor(public value: number) {} last: string; final() {} }",
+            ));
+            let symbol = class_symbol(&fixture, "Subject");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+            let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+            let members = &fixture
+                .store
+                .source_class_provenance(prepared.instance_type)
+                .unwrap()
+                .members;
+            let names = members
+                .instance_properties()
+                .iter()
+                .map(|symbol| {
+                    fixture
+                        .store
+                        .symbol(*symbol)
+                        .unwrap()
+                        .name()
+                        .as_utf8()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["first", "middle", "value", "last", "final"]);
+            assert_eq!(members.declared_instance_property_count, 5);
+        }
+    }
+
+    #[test]
+    fn source_body_stored_validation_rechecks_constructor_table_identity() {
+        let mut fixture =
+            fixture("class Subject { constructor() {} } class Other { constructor() {} }");
+        let subject = class_symbol(&fixture, "Subject");
+        let other = class_symbol(&fixture, "Other");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let plan = plan_source_class_members(&fixture.store, &host, subject).unwrap();
+        let other_plan = plan_source_class_members(&fixture.store, &host, other).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let provenance = fixture
+            .store
+            .source_class_provenance(prepared.instance_type)
+            .unwrap();
+        assert!(validate_source_class_stored_header(&fixture.store, provenance).is_ok());
+        assert_eq!(
+            fixture.store.insert_symbol(
+                plan.header.instance_members.unwrap(),
+                EscapedName::internal(InternalSymbolName::Constructor),
+                other_plan.constructor.as_ref().unwrap().symbol,
+            ),
+            Some(Some(plan.constructor.as_ref().unwrap().symbol))
+        );
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        let provenance = fixture
+            .store
+            .source_class_provenance(prepared.instance_type)
+            .unwrap();
+        assert!(validate_source_class_stored_header(&fixture.store, provenance).is_err());
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+    }
+
+    #[test]
+    fn source_body_adoption_preserves_ids_and_rejection_preserves_legacy_state() {
+        for reject in [false, true] {
+            let mut fixture = fixture(concat!(
+                "class Subject { first: number; middle() {} ",
+                "constructor(public value: number) {} last: string; final() {} }",
+            ));
+            let symbol = class_symbol(&fixture, "Subject");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let legacy = plan_nongeneric_class_member_query(&fixture.store, &host, symbol).unwrap();
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &legacy).unwrap();
+            let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+            let methods = plan
+                .methods
+                .iter()
+                .map(|method| {
+                    (
+                        fixture
+                            .store
+                            .value_symbol_links(method.method.symbol)
+                            .unwrap()
+                            .resolved_type
+                            .unwrap(),
+                        fixture
+                            .store
+                            .signature_links(method.method.declaration)
+                            .unwrap()
+                            .resolved_signature
+                            .signature()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if reject {
+                let mut properties = members.instance_properties.clone();
+                properties.reverse();
+                assert!(fixture.store.set_structured_type_members(
+                    members.shells.instance_type,
+                    members.instance_members,
+                    Some(properties),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            let before = source_class_snapshot!(fixture.store, members.shells.instance_type);
+            let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan);
+            if reject {
+                assert!(prepared.is_err());
+                assert_eq!(
+                    source_class_snapshot!(fixture.store, members.shells.instance_type),
+                    before
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_class_provenance_for_symbol(symbol)
+                        .is_none()
+                );
+                for (_, signature) in methods {
+                    assert_eq!(
+                        fixture
+                            .store
+                            .signature(signature)
+                            .unwrap()
+                            .resolved_return_type(),
+                        Some(fixture.store.intrinsic_bootstrap().unwrap().void_type)
+                    );
+                }
+            } else {
+                let prepared = prepared.unwrap();
+                assert_eq!(prepared.instance_type, members.shells.instance_type);
+                assert_eq!(prepared.value_type, members.shells.value_type);
+                assert_eq!(
+                    prepared.construct_signature,
+                    members.default_construct_signature
+                );
+                assert_eq!(prepared.methods, methods);
+                assert_eq!(
+                    fixture
+                        .store
+                        .source_class_provenance(prepared.instance_type)
+                        .unwrap()
+                        .members,
+                    members
+                );
+                assert_eq!(fixture.store.type_len(), before.0);
+                assert_eq!(fixture.store.signature_len(), before.2);
+                for (_, signature) in methods {
+                    assert_eq!(
+                        fixture
+                            .store
+                            .signature(signature)
+                            .unwrap()
+                            .resolved_return_type(),
+                        None
+                    );
+                }
+                let warm = source_class_snapshot!(fixture.store, prepared.instance_type);
+                assert_eq!(
+                    prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap(),
+                    prepared
+                );
+                assert_eq!(
+                    source_class_snapshot!(fixture.store, prepared.instance_type),
+                    warm
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_body_javascript_assignments_publish_in_containment_order() {
+        let parsed = parse_javascript_source_file(concat!(
+            "class Base { static baseField = 1; } Base.baseExpando = 2; ",
+            "class Derived extends Base { static derivedField = 3; } Derived.derivedExpando = 4;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture = fixture_from_parsed_with_language_and_options(
+            parsed,
+            CanonicalModuleState::Script,
+            CanonicalSourceLanguage::JavaScript,
+            IntrinsicBootstrapOptions::default(),
+        );
+        let base = class_symbol(&fixture, "Base");
+        let derived = class_symbol(&fixture, "Derived");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        for (symbol, expected) in [
+            (base, vec!["baseField", "baseExpando"]),
+            (
+                derived,
+                vec!["derivedField", "baseField", "baseExpando", "derivedExpando"],
+            ),
+        ] {
+            let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+            let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+            let members =
+                finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+            let names = members
+                .static_properties()
+                .iter()
+                .map(|symbol| {
+                    fixture
+                        .store
+                        .symbol(*symbol)
+                        .unwrap()
+                        .name()
+                        .as_utf8()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected);
+            assert_eq!(members.declared_static_property_count, 1);
+            for source in &plan.sources {
+                if let ClassMemberOrigin::JavaScriptAssignment { assignment } = source.origin {
+                    let property = plan
+                        .properties
+                        .iter()
+                        .find(|(property, _)| property.symbol == source.symbol)
+                        .unwrap();
+                    assert_eq!(property.0.declaration, assignment);
+                    assert_eq!(
+                        fixture.store.symbol(source.symbol).unwrap().flags(),
+                        SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+                    );
+                    assert_eq!(
+                        fixture.store.symbol(source.symbol).unwrap().check_flags(),
+                        CheckFlags::NONE
+                    );
+                    assert_eq!(
+                        fixture
+                            .store
+                            .value_symbol_links(source.symbol)
+                            .unwrap()
+                            .resolved_type,
+                        Some(fixture.store.intrinsic_bootstrap().unwrap().number_type)
+                    );
+                    assert_eq!(
+                        fixture
+                            .store
+                            .type_node_links(property.0.type_node)
+                            .unwrap()
+                            .resolved_type,
+                        property_initializer_fresh_literal_type(&fixture.store, &property.0)
+                            .unwrap()
+                    );
+                }
+            }
+            let warm = source_class_snapshot!(fixture.store, prepared.instance_type);
+            assert_eq!(
+                prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap(),
+                prepared
+            );
+            assert_eq!(
+                source_class_snapshot!(fixture.store, prepared.instance_type),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn source_body_javascript_assignment_materializes_reserved_literal_pair() {
+        for cached in [false, true] {
+            let parsed = parse_javascript_source_file("class Subject {} Subject.value = 456;");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut fixture = fixture_from_parsed_with_language_and_options(
+                parsed,
+                CanonicalModuleState::Script,
+                CanonicalSourceLanguage::JavaScript,
+                IntrinsicBootstrapOptions::default(),
+            );
+            let symbol = class_symbol(&fixture, "Subject");
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+            let property = &plan.properties[0].0;
+            let number = property_initializer_number(property).unwrap();
+            let existing_pair = if cached {
+                let regular = fixture.store.regular_number_literal_type(number).unwrap();
+                Some((
+                    regular,
+                    fixture.store.fresh_type_of_literal_type(regular).unwrap(),
+                ))
+            } else {
+                None
+            };
+            let count = fixture.store.type_len();
+            fixture
+                .store
+                .prepare_regular_literal_types(&[], &[number], &[])
+                .unwrap();
+            assert_eq!(fixture.store.type_len(), count);
+            assert_eq!(
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .cached_number_literal_type(number),
+                existing_pair.map(|(regular, _)| regular)
+            );
+            assert_eq!(
+                property_initializer_fresh_literal_type(&fixture.store, property).unwrap(),
+                existing_pair.map(|(_, fresh)| fresh)
+            );
+
+            let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+            let regular = fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_number_literal_type(number)
+                .unwrap();
+            let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+            assert_ne!(regular, fresh);
+            if let Some(existing) = existing_pair {
+                assert_eq!((regular, fresh), existing);
+            }
+            let TypeData::Literal(literal) = fixture.store.type_payload(fresh).unwrap().data()
+            else {
+                panic!("the assignment RHS retains its fresh numeric literal")
+            };
+            assert!(
+                matches!(&literal.value, super::super::type_records::LiteralValue::Number(value) if *value == number)
+            );
+            assert_eq!(literal.regular_type, regular);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(property.type_node)
+                    .unwrap()
+                    .resolved_type,
+                Some(fresh)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(property.symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(fixture.store.intrinsic_bootstrap().unwrap().number_type)
+            );
+            assert_eq!(
+                fixture.store.symbol(property.symbol).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            );
+            assert_eq!(
+                fixture.store.symbol(property.symbol).unwrap().check_flags(),
+                CheckFlags::NONE
+            );
+            let members =
+                finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+            let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+            assert_eq!(
+                prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap(),
+                prepared
+            );
+            assert_eq!(
+                finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap(),
+                members
+            );
+            assert_eq!(
+                source_class_snapshot!(fixture.store, prepared.instance_type),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn source_body_javascript_assignment_rejects_malformed_literal_before_publication() {
+        let parsed = parse_javascript_source_file(
+            "class Subject { static first = 123; } Subject.value = 456;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture = fixture_from_parsed_with_language_and_options(
+            parsed,
+            CanonicalModuleState::Script,
+            CanonicalSourceLanguage::JavaScript,
+            IntrinsicBootstrapOptions::default(),
+        );
+        let symbol = class_symbol(&fixture, "Subject");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let property = &plan
+            .properties
+            .iter()
+            .find(|(property, _)| property.name == "value")
+            .unwrap()
+            .0;
+        let regular = fixture
+            .store
+            .regular_number_literal_type(property_initializer_number(property).unwrap())
+            .unwrap();
+        let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+        assert!(fixture.store.set_type_symbol(fresh, Some(symbol)));
+        let number_type = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let before = source_class_snapshot!(fixture.store, number_type);
+        assert_eq!(
+            prepare_source_class_members(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                property.type_node
+            )))
+        );
+        assert_eq!(source_class_snapshot!(fixture.store, number_type), before);
+        assert!(fixture.store.declared_type_links(symbol).is_none());
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+        assert!(
+            fixture
+                .store
+                .source_class_provenance_for_symbol(symbol)
+                .is_none()
+        );
+        for (property, _) in &plan.properties {
+            assert!(fixture.store.type_node_links(property.type_node).is_none());
+            assert!(fixture.store.value_symbol_links(property.symbol).is_none());
+        }
+    }
+
+    #[test]
+    fn source_body_expandos_keep_unsupported_values_separate_from_invalid_owners() {
+        for source in [
+            "class Subject { static first = 1; } Subject.value = [];",
+            "class Subject { static first = 1; } Subject.value = () => {};",
+            "class Subject { static first = 1; } Subject.value = 2; Subject.value = [];",
+        ] {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut fixture = fixture_from_parsed_with_language_and_options(
+                parsed,
+                CanonicalModuleState::Script,
+                CanonicalSourceLanguage::JavaScript,
+                IntrinsicBootstrapOptions::default(),
+            );
+            let symbol = class_symbol(&fixture, "Subject");
+            let member = fixture
+                .store
+                .symbol(symbol)
+                .and_then(Symbol::exports)
+                .and_then(|table| fixture.store.symbol_table(table))
+                .and_then(|table| table.get_source("value"))
+                .unwrap();
+            let unsupported_assignment = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::BinaryExpression(assignment) = &record.data else {
+                        return None;
+                    };
+                    (fixture.parsed.arena.get(assignment.right).unwrap().kind
+                        != SyntaxKind::NumericLiteral)
+                        .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+            let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let before = source_class_snapshot!(fixture.store, number);
+            assert_eq!(
+                plan_source_class_members(&fixture.store, &host, symbol),
+                Err(unsupported(ClassUnsupported::Member {
+                    node: unsupported_assignment,
+                    kind: SyntaxKind::BinaryExpression,
+                })),
+                "{source}"
+            );
+            assert_eq!(source_class_snapshot!(fixture.store, number), before);
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_class_provenance_for_symbol(symbol)
+                    .is_none()
+            );
+
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_relationships(member, None, None, None, None)
+            );
+            let poisoned = source_class_snapshot!(fixture.store, number);
+            assert!(matches!(
+                plan_source_class_members(&fixture.store, &host, symbol),
+                Err(ClassError::Invariant(_))
+            ));
+            assert_eq!(source_class_snapshot!(fixture.store, number), poisoned);
+        }
+    }
+
+    #[test]
+    fn source_body_expando_replay_requires_a_complete_valid_source_header() {
+        let parsed =
+            parse_javascript_source_file("class Subject { static first = 1; } Subject.value = 2;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture = fixture_from_parsed_with_language_and_options(
+            parsed,
+            CanonicalModuleState::Script,
+            CanonicalSourceLanguage::JavaScript,
+            IntrinsicBootstrapOptions::default(),
+        );
+        let symbol = class_symbol(&fixture, "Subject");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let before = source_class_snapshot!(fixture.store, prepared.instance_type);
+        assert!(matches!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, symbol),
+            Err(ClassError::Invariant(_))
+        ));
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            before
+        );
+
+        finish_source_class_members(&mut fixture.store, &host, &plan, &prepared).unwrap();
+        let assignment = plan
+            .sources
+            .iter()
+            .find_map(|source| match source.origin {
+                ClassMemberOrigin::JavaScriptAssignment { assignment } => Some(assignment),
+                _ => None,
+            })
+            .unwrap();
+        let warm = source_class_snapshot!(fixture.store, prepared.instance_type);
+        for _ in 0..2 {
+            assert!(matches!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, symbol),
+                Err(ClassError::Unsupported(ClassUnsupported::Member {
+                    node,
+                    kind: SyntaxKind::BinaryExpression,
+                })) if node == assignment
+            ));
+            assert_eq!(
+                source_class_snapshot!(fixture.store, prepared.instance_type),
+                warm
+            );
+        }
+
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = source_class_snapshot!(fixture.store, prepared.instance_type);
+        assert!(matches!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, symbol),
+            Err(ClassError::Invariant(_))
+        ));
+        assert_eq!(
+            source_class_snapshot!(fixture.store, prepared.instance_type),
+            poisoned
+        );
+    }
+
+    #[test]
+    fn source_body_inherited_legacy_rest_method_keeps_its_rest_projection() {
+        let mut fixture = fixture(concat!(
+            "class Base { method(...args: any[]): void {} } ",
+            "class Derived extends Base { read() {} }",
+        ));
+        let base = class_symbol(&fixture, "Base");
+        let derived = class_symbol(&fixture, "Derived");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let legacy = plan_nongeneric_class_member_query(&fixture.store, &host, base).unwrap();
+        let base_members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &legacy).unwrap();
+        let method = base_members.instance_properties()[0];
+        let method_type = fixture
+            .store
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, method_type)
+        else {
+            panic!("the legacy rest method has a valid callable projection")
+        };
+        let expected = &projection.call_signatures[0];
+        assert!(expected.parameters.is_empty());
+        assert!(expected.rest_parameter.is_some());
+        let plan = plan_source_class_members(&fixture.store, &host, derived).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        let access = prepared
+            .body_access(&fixture.store, &host, &plan.bodies()[0])
+            .unwrap();
+        for receiver in [prepared.instance_type, base_members.shells.instance_type] {
+            let callable =
+                class_body_method_callable(&fixture.store, &host, &access, receiver, method)
+                    .unwrap();
+            assert_eq!(callable.callable(), expected);
+            assert_eq!(callable.pending_return_body(), None);
+            assert_eq!(callable.class_symbol(), base);
+        }
+    }
+
+    #[test]
+    fn source_body_defaulted_constructor_call_types_keep_body_and_property_types() {
+        for (parameters, arguments, minimum) in [
+            (
+                "public value: number = 1, label: string",
+                "undefined, \"label\"",
+                2,
+            ),
+            ("public value: number = 1", "undefined", 0),
+        ] {
+            let source = format!(
+                "class Base {{ constructor({parameters}) {{ value; }} }} class Derived extends Base {{ constructor() {{ super({arguments}); }} }}"
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(91);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/classes.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+            context.check_source_file(file).unwrap();
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let host = host(&parsed.arena, bound);
+            let store = context.store();
+            let locals = store
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap();
+            let base = locals.get_source("Base").unwrap();
+            let derived = locals.get_source("Derived").unwrap();
+            let base_provenance = store.source_class_provenance_for_symbol(base).unwrap();
+            let derived_provenance = store.source_class_provenance_for_symbol(derived).unwrap();
+            assert!(base_provenance.complete);
+            assert!(derived_provenance.complete);
+            let body = &derived_provenance.prepared.plan.bodies()[0];
+            let access = derived_provenance
+                .prepared
+                .body_access(store, &host, body)
+                .unwrap();
+            let callable = class_body_super_constructor_callable(store, &host, &access).unwrap();
+            assert_eq!(callable.callable().min_argument_count, minimum);
+            assert_eq!(
+                callable.callable().signature,
+                base_provenance.prepared.construct_signature
+            );
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let TypeData::Union(union) = store
+                .type_payload(callable.callable().parameters[0])
+                .unwrap()
+                .data()
+            else {
+                panic!("the defaulted call parameter includes undefined")
+            };
+            assert_eq!(
+                union.union.types,
+                [bootstrap.undefined_type, bootstrap.number_type]
+            );
+            let parameter = &base_provenance.prepared.plan.bodies()[0].parameters[0];
+            assert_eq!(parameter.type_, bootstrap.number_type);
+            assert_eq!(
+                store
+                    .value_symbol_links(parameter.symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(bootstrap.number_type)
+            );
+            assert_eq!(
+                store
+                    .value_symbol_links(parameter.property_symbol.unwrap())
+                    .unwrap()
+                    .resolved_type,
+                Some(bootstrap.number_type)
+            );
+        }
+    }
+
+    #[test]
+    fn source_body_adoption_prepares_default_call_types_without_changing_locals() {
+        let parsed =
+            parse_source_file("class Subject { constructor(public value: number = 1) {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut fixture = fixture_from_parsed_with_options(
+            parsed,
+            CanonicalModuleState::Script,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let symbol = class_symbol(&fixture, "Subject");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let legacy = plan_nongeneric_class_member_query(&fixture.store, &host, symbol).unwrap();
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &legacy).unwrap();
+        let plan = plan_source_class_members(&fixture.store, &host, symbol).unwrap();
+        let prepared = prepare_source_class_members(&mut fixture.store, &host, &plan).unwrap();
+        assert_eq!(
+            prepared.construct_signature,
+            members.default_construct_signature
+        );
+        let parameter = &plan.bodies()[0].parameters[0];
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let undefined = fixture.store.intrinsic_bootstrap().unwrap().undefined_type;
+        let call_type = optional_constructor_parameter_type(
+            &fixture.store,
+            number,
+            true,
+            parameter.declaration,
+        )
+        .unwrap()
+        .unwrap();
+        let TypeData::Union(union) = fixture.store.type_payload(call_type).unwrap().data() else {
+            panic!("the adopted constructor retains its optional call type")
+        };
+        assert_eq!(union.union.types, [undefined, number]);
+        for symbol in [parameter.symbol, parameter.property_symbol.unwrap()] {
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(number)
+            );
+        }
     }
 
     fn class_type_parameter_nodes(fixture: &Fixture, name: &str) -> Vec<NodeRef> {
@@ -29595,8 +35166,37 @@ mod tests {
         let derived = globals.get_source("Derived").unwrap();
         assert!(context.store().declared_type_links(base).is_some());
         assert!(context.store().value_symbol_links(base).is_some());
-        assert!(context.store().declared_type_links(derived).is_none());
-        assert!(context.store().value_symbol_links(derived).is_none());
+        let provenance = context
+            .store()
+            .source_class_provenance_for_symbol(derived)
+            .unwrap();
+        assert!(provenance.complete);
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(derived)
+                .unwrap()
+                .declared_type,
+            Some(provenance.prepared.instance_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(derived)
+                .unwrap()
+                .resolved_type,
+            Some(provenance.prepared.value_type)
+        );
+        assert_eq!(
+            provenance.method_returns,
+            [Some(
+                context.store().intrinsic_bootstrap().unwrap().void_type
+            )]
+        );
+        assert_eq!(
+            validate_class_heritage_members(context.store(), provenance.prepared.instance_type),
+            ClassHeritageMembersValidation::Valid
+        );
         let warm = (
             context.store().type_len(),
             context.store().signature_len(),

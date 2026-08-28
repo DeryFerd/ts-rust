@@ -84,6 +84,26 @@ pub(super) fn validate_stored_callable_set(
     if let Some(validation) = validate_stored_recovered_property_callable_set(store, type_) {
         return validation;
     }
+    if let Some(callable) = super::classes::stored_class_instance_super_callable(store, type_) {
+        let family = CallableFamily::DeclaredCallSignatures;
+        return match callable {
+            Ok(callable) => {
+                let mut edges = callable.parameters.clone();
+                edges.extend(callable.rest_parameter);
+                edges.extend(callable.return_type);
+                StoredCallableSetValidation::Valid {
+                    family,
+                    projection: CallableSetProjection {
+                        owner: type_,
+                        call_signatures: Box::new([callable]),
+                        construct_signatures: Box::new([]),
+                    },
+                    edges,
+                }
+            }
+            Err(()) => StoredCallableSetValidation::Malformed { family },
+        };
+    }
     if let Some(validation) =
         super::instantiated_members::validate_instantiated_function_member_callable(store, type_)
     {

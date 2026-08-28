@@ -13986,13 +13986,53 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_rejects_a_later_unsupported_file_without_fallback() {
+    fn canonical_program_checks_later_class_methods_without_losing_earlier_diagnostics() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
             .unwrap();
         fs.write_file(
             "/project/later.ts",
             "class Later { method(value: string) {} }",
+        )
+        .unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "later.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(program.checker, super::ProgramChecker::Canonical);
+        let [diagnostic] = program.diagnostics() else {
+            panic!("the later class must retain the earlier assignment diagnostic");
+        };
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/first.ts"));
+        assert_eq!(diagnostic.code, Some(2322));
+        assert_eq!(
+            diagnostic.range,
+            Some(TextRange::new(TextPos::new(6), TextPos::new(11))),
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Type 'string' is not assignable to type 'number'.",
+        );
+        assert!(diagnostic.related_information.is_empty());
+    }
+
+    #[test]
+    fn canonical_program_rejects_a_later_unsupported_construction_without_fallback() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", r#"const first: number = "wrong";"#)
+            .unwrap();
+        // Reuse the unsupported construction input from canonical_class_members.rs.
+        fs.write_file(
+            "/project/later.ts",
+            "class Model { value!: string; }\nconst model = new Model(1);\n",
         )
         .unwrap();
 
@@ -14005,7 +14045,7 @@ mod tests {
                 ..CompilerOptions::default()
             },
         ) else {
-            panic!("expected unsupported syntax in the later source file");
+            panic!("expected unsupported construction in the later source file");
         };
 
         assert!(matches!(

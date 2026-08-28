@@ -20,8 +20,12 @@ use super::{
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
+    classes::{
+        ClassBodyCallable, ClassHeritageMembersValidation, optional_constructor_parameter_type,
+        validate_class_heritage_members,
+    },
     instantiate::canonical_anonymous_union,
-    signatures::{ElementFlags, Signature, SignatureFlags, TupleElementInfo},
+    signatures::{ElementFlags, Signature, SignatureFlags, SignatureKind, TupleElementInfo},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -31,7 +35,7 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DirectCallForm {
     Call,
-    #[allow(dead_code)] // Retained as an explicit typed rejection seam.
+    /// Admitted only through an authenticated class-body target.
     New,
     #[allow(dead_code)] // Source syntax integration is staged separately.
     TaggedTemplate,
@@ -260,6 +264,52 @@ pub(super) struct DirectCallResolution {
     pub(super) applicability: DirectCallApplicability,
 }
 
+/// A checked argument list that does not claim a signature return type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DirectCallArgumentResolution {
+    callee: TypeId,
+    signature: SignatureId,
+    minimum_argument_count: usize,
+    maximum_argument_count: usize,
+    has_effective_rest: bool,
+    argument_targets: Vec<DirectCallArgumentTarget>,
+    rest_argument_target: Option<DirectCallArgumentTarget>,
+    applicability: DirectCallApplicability,
+}
+
+impl DirectCallArgumentResolution {
+    pub(super) const fn signature(&self) -> SignatureId {
+        self.signature
+    }
+
+    fn with_return_type(
+        self,
+        return_type: TypeId,
+        return_kind: DirectCallReturnKind,
+    ) -> DirectCallResolution {
+        DirectCallResolution {
+            projection: DirectCallProjection {
+                callee: self.callee,
+                signature: self.signature,
+                minimum_argument_count: self.minimum_argument_count,
+                maximum_argument_count: self.maximum_argument_count,
+                has_effective_rest: self.has_effective_rest,
+                argument_targets: self.argument_targets,
+                rest_argument_target: self.rest_argument_target,
+                return_type,
+                return_kind,
+            },
+            applicability: self.applicability,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ClassBodyInvocationResolution {
+    Resolved(DirectCallResolution),
+    PendingReturn(DirectCallArgumentResolution),
+}
+
 /// Resolves the dependency-closed non-generic direct-call branch.
 ///
 /// The source caller supplies immutable options and authoritative globals.
@@ -362,6 +412,122 @@ pub(super) fn resolve_direct_call(
         return Ok(candidate);
     }
     Err(DirectCallUnsupported::OverloadFailureRecovery(request.callee).into())
+}
+
+/// Applies the ordinary fixed-signature engine to an authenticated class-body target.
+pub(super) fn resolve_class_body_invocation(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    target: &ClassBodyCallable,
+) -> Result<ClassBodyInvocationResolution, DirectCallError> {
+    if !matches!(
+        (request.form, target.kind()),
+        (DirectCallForm::Call, SignatureKind::Call)
+            | (DirectCallForm::New, SignatureKind::Construct)
+    ) {
+        return Err(DirectCallUnsupported::Form(request.form).into());
+    }
+    validate_direct_invocation_options(request)?;
+    validate_argument_types(store, request.arguments)?;
+    let callable = target.callable();
+    let invalid = || DirectCallInvariant::MalformedCallable(callable.owner);
+    let owner = store.type_payload(callable.owner).ok_or_else(invalid)?;
+    let structured = owner.data().structured().ok_or_else(invalid)?;
+    let signatures = structured.signatures.as_deref().ok_or_else(invalid)?;
+    if structured.call_signature_count > signatures.len() {
+        return Err(invalid().into());
+    }
+    let (calls, constructs) = signatures.split_at(structured.call_signature_count);
+    let (selected, other) = match target.kind() {
+        SignatureKind::Call => (calls, constructs),
+        SignatureKind::Construct => (constructs, calls),
+    };
+    let signature = validate_signature_parameters(store, callable)?;
+    if selected != [callable.signature]
+        || !other.is_empty()
+        || signature.flags().contains(SignatureFlags::CONSTRUCT)
+            != (target.kind() == SignatureKind::Construct)
+        || signature.declaration() != target.declaration()
+        || signature.resolved_return_type() != callable.return_type
+        || target.pending_return_body().is_some()
+            && (target.kind() != SignatureKind::Call || callable.return_type.is_some())
+    {
+        return Err(invalid().into());
+    }
+    if target.kind() == SignatureKind::Construct {
+        let instance = callable.return_type.ok_or_else(invalid)?;
+        if store.type_payload(instance).and_then(TypeRecord::symbol) != Some(target.class_symbol())
+            || validate_class_heritage_members(store, instance)
+                != ClassHeritageMembersValidation::Valid
+        {
+            return Err(invalid().into());
+        }
+    }
+    validate_class_call_parameter_types(store, target, signature)?;
+    if target.pending_return_body().is_some() {
+        let arguments = check_validated_class_call_arguments(
+            store,
+            global_types,
+            strict_function_types,
+            request,
+            callable,
+        )?;
+        return Ok(ClassBodyInvocationResolution::PendingReturn(arguments));
+    }
+    let mut resolution =
+        project_validated_direct_call(store, Some(global_types), request, callable)?;
+    if resolution.applicability == DirectCallApplicability::Applicable {
+        resolution.applicability =
+            check_argument_applicability(&resolution.projection, |source, target| {
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    source,
+                    target,
+                    global_types,
+                    strict_function_types,
+                )
+            })?;
+    }
+    Ok(ClassBodyInvocationResolution::Resolved(resolution))
+}
+
+fn validate_class_call_parameter_types(
+    store: &CanonicalTypeMapperStore,
+    target: &ClassBodyCallable,
+    signature: &Signature,
+) -> Result<(), DirectCallError> {
+    let callable = target.callable();
+    let invalid = || DirectCallInvariant::MalformedCallable(callable.owner);
+    for (symbol, projected) in signature.parameters().iter().zip(
+        callable
+            .parameters
+            .iter()
+            .chain(callable.rest_parameter.iter()),
+    ) {
+        let local = store
+            .value_symbol_links(*symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        if local == *projected {
+            continue;
+        }
+        if target.kind() != SignatureKind::Construct {
+            return Err(invalid().into());
+        }
+        let declaration = store
+            .symbol(*symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .ok_or_else(invalid)?;
+        // A's sealed constructor projection owns default/optional admission.
+        // Its call type may add undefined without widening the body-local type.
+        let expected = optional_constructor_parameter_type(store, local, true, declaration)
+            .map_err(|_| invalid())?;
+        if expected != Some(*projected) {
+            return Err(invalid().into());
+        }
+    }
+    Ok(())
 }
 
 /// Keeps specialized overloads first and reverses merged declaration groups.
@@ -543,6 +709,12 @@ fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), Direc
     {
         return Err(DirectCallUnsupported::Form(request.form).into());
     }
+    validate_direct_invocation_options(request)
+}
+
+fn validate_direct_invocation_options(
+    request: DirectCallRequest<'_>,
+) -> Result<(), DirectCallError> {
     if request.optional_chain {
         return Err(DirectCallUnsupported::OptionalChain.into());
     }
@@ -1039,12 +1211,18 @@ fn parameter_position_union(
     }
 }
 
-fn project_validated_direct_call(
-    store: &mut CanonicalTypeMapperStore,
+struct PreparedDirectCallParameters {
+    rest: Option<RestParameterShape>,
+    has_effective_rest: bool,
+    maximum_argument_count: usize,
+}
+
+fn prepare_direct_call_parameters(
+    store: &CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     request: DirectCallRequest<'_>,
     callable: &ValidatedSingleCallable,
-) -> Result<DirectCallResolution, DirectCallError> {
+) -> Result<PreparedDirectCallParameters, DirectCallError> {
     if callable.owner != request.callee {
         return Err(DirectCallInvariant::CallableOwnerMismatch {
             callee: request.callee,
@@ -1082,7 +1260,23 @@ fn project_validated_direct_call(
             return Err(DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate).into());
         }
     }
+    Ok(PreparedDirectCallParameters {
+        rest,
+        has_effective_rest,
+        maximum_argument_count,
+    })
+}
 
+fn project_validated_direct_call(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    request: DirectCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+) -> Result<DirectCallResolution, DirectCallError> {
+    let parameters = prepare_direct_call_parameters(store, global_types, request, callable)?;
+    let signature = store
+        .signature(callable.signature)
+        .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
     let Some(return_type) = callable.return_type else {
         return Err(DirectCallUnsupported::UnresolvedReturnType(callable.signature).into());
     };
@@ -1101,7 +1295,23 @@ fn project_validated_direct_call(
     } else {
         DirectCallReturnKind::Value
     };
+    let arguments =
+        project_direct_call_arguments(store, global_types, request, callable, parameters)?;
+    Ok(arguments.with_return_type(return_type, return_kind))
+}
 
+fn project_direct_call_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    request: DirectCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+    parameters: PreparedDirectCallParameters,
+) -> Result<DirectCallArgumentResolution, DirectCallError> {
+    let PreparedDirectCallParameters {
+        rest,
+        has_effective_rest,
+        maximum_argument_count,
+    } = parameters;
     let minimum_argument_count =
         get_min_argument_count(store, global_types, callable, MinArgumentCountFlags::NONE)?;
     if has_effective_rest {
@@ -1162,20 +1372,44 @@ fn project_validated_direct_call(
         }
         _ => DirectCallApplicability::Applicable,
     };
-    Ok(DirectCallResolution {
-        projection: DirectCallProjection {
-            callee: request.callee,
-            signature: callable.signature,
-            minimum_argument_count,
-            maximum_argument_count,
-            has_effective_rest,
-            argument_targets,
-            rest_argument_target,
-            return_type,
-            return_kind,
-        },
+    Ok(DirectCallArgumentResolution {
+        callee: request.callee,
+        signature: callable.signature,
+        minimum_argument_count,
+        maximum_argument_count,
+        has_effective_rest,
+        argument_targets,
+        rest_argument_target,
         applicability,
     })
+}
+
+fn check_validated_class_call_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    callable: &ValidatedSingleCallable,
+) -> Result<DirectCallArgumentResolution, DirectCallError> {
+    validate_argument_types(store, request.arguments)?;
+    let parameters = prepare_direct_call_parameters(store, Some(globals), request, callable)?;
+    let mut arguments =
+        project_direct_call_arguments(store, Some(globals), request, callable, parameters)?;
+    if arguments.applicability == DirectCallApplicability::Applicable {
+        arguments.applicability = check_argument_target_applicability(
+            &arguments.argument_targets,
+            arguments.rest_argument_target,
+            |source, target| {
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    source,
+                    target,
+                    globals,
+                    strict_function_types,
+                )
+            },
+        )?;
+    }
+    Ok(arguments)
 }
 
 fn non_array_rest_target(
@@ -1614,9 +1848,21 @@ fn type_contains_void(
 
 fn check_argument_applicability(
     projection: &DirectCallProjection,
+    is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
+) -> Result<DirectCallApplicability, RelationUnavailable> {
+    check_argument_target_applicability(
+        &projection.argument_targets,
+        projection.rest_argument_target,
+        is_assignable,
+    )
+}
+
+fn check_argument_target_applicability(
+    targets: &[DirectCallArgumentTarget],
+    rest_target: Option<DirectCallArgumentTarget>,
     mut is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
 ) -> Result<DirectCallApplicability, RelationUnavailable> {
-    for target in &projection.argument_targets {
+    for target in targets {
         if !is_assignable(target.argument_type, target.parameter_type)? {
             return Ok(DirectCallApplicability::ArgumentNotAssignable {
                 index: target.index,
@@ -1625,7 +1871,7 @@ fn check_argument_applicability(
             });
         }
     }
-    if let Some(target) = projection.rest_argument_target
+    if let Some(target) = rest_target
         && !is_assignable(target.argument_type, target.parameter_type)?
     {
         return Ok(DirectCallApplicability::RestArgumentsNotAssignable {
@@ -1648,9 +1894,9 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, mapper::TypeMapper,
-        types::ObjectFlags,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeHost, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, ValueSymbolLinks, mapper::TypeMapper,
+        production::GlobalMergeCompletion, types::ObjectFlags,
     };
 
     fn initialized_store() -> CanonicalTypeMapperStore {
@@ -3213,6 +3459,253 @@ mod tests {
                 parameter_type: number,
             }]
         );
+    }
+
+    #[test]
+    fn class_body_constructor_projection_keeps_locals_and_rejects_stale_types() {
+        for corrupt_projection in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "class Base { constructor(public value: number = 1, label: string) {} } ",
+                "class Derived extends Base { constructor() { super(undefined, 'label'); } }",
+            ));
+            let file = FileId::new(9_411);
+            let mut context = array_context_with_options(
+                &parsed,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let derived = context
+                .store()
+                .symbol_table(context.globals())
+                .unwrap()
+                .get_source("Derived")
+                .unwrap();
+            let plan = crate::semantic::classes::plan_source_class_members(
+                context.store(),
+                &host,
+                derived,
+            )
+            .unwrap();
+            let prepared = crate::semantic::classes::prepare_source_class_members(
+                context.store_mut_for_test(),
+                &host,
+                &plan,
+            )
+            .unwrap();
+            let token = prepared
+                .body_access(context.store(), &host, &plan.bodies()[0])
+                .unwrap();
+            let target = crate::semantic::classes::class_body_super_constructor_callable(
+                context.store(),
+                &host,
+                &token,
+            )
+            .unwrap();
+            let callable = target.callable();
+            let parameter = context
+                .store()
+                .signature(callable.signature)
+                .unwrap()
+                .parameters()[0];
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (number, string, undefined) = (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+            );
+            let projected = callable.parameters[0];
+            assert_ne!(projected, number);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .unwrap()
+                    .resolved_type,
+                Some(number)
+            );
+            let globals = context.global_types().clone();
+            let arguments = [undefined, string];
+            let request = DirectCallRequest {
+                form: DirectCallForm::New,
+                optional_chain: false,
+                type_argument_count: 0,
+                has_spread_argument: false,
+                callee: callable.owner,
+                arguments: &arguments,
+            };
+            let result = resolve_class_body_invocation(
+                context.store_mut_for_test(),
+                &globals,
+                false,
+                request,
+                &target,
+            )
+            .unwrap();
+            assert!(
+                matches!(result, ClassBodyInvocationResolution::Resolved(result)
+                if result.applicability == DirectCallApplicability::Applicable)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter)
+                    .unwrap()
+                    .resolved_type,
+                Some(number)
+            );
+
+            if corrupt_projection {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_symbol(projected, Some(target.class_symbol()))
+                );
+            } else {
+                assert!(context.store_mut_for_test().set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(string),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                resolve_class_body_invocation(
+                    context.store_mut_for_test(),
+                    &globals,
+                    false,
+                    request,
+                    &target
+                )
+                .is_err()
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn pending_class_call_arguments_check_arity_and_relations_without_a_return_type() {
+        let parsed = parse_source_file("");
+        let mut context = array_context(&parsed);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let callable = callable(store, SignatureFlags::NONE, &[number], 1, None);
+        let before = (store.type_len(), store.signature_len());
+
+        for (arguments, expected) in [
+            (
+                vec![],
+                DirectCallApplicability::TooFewArguments {
+                    expected_at_least: 1,
+                    actual: 0,
+                },
+            ),
+            (vec![number], DirectCallApplicability::Applicable),
+            (
+                vec![string],
+                DirectCallApplicability::ArgumentNotAssignable {
+                    index: 0,
+                    argument_type: string,
+                    parameter_type: number,
+                },
+            ),
+            (
+                vec![number, number],
+                DirectCallApplicability::TooManyArguments {
+                    expected_at_most: 1,
+                    actual: 2,
+                },
+            ),
+        ] {
+            let checked = check_validated_class_call_arguments(
+                store,
+                &globals,
+                strict,
+                request(callable.owner, &arguments),
+                &callable,
+            )
+            .unwrap();
+            assert_eq!(checked.signature(), callable.signature);
+            assert_eq!(checked.applicability, expected);
+            assert_eq!(
+                store
+                    .signature(callable.signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                None
+            );
+            assert_eq!((store.type_len(), store.signature_len()), before);
+        }
+    }
+
+    #[test]
+    fn pending_class_call_arguments_reject_foreign_types_before_a_body_demand() {
+        let parsed = parse_source_file("");
+        let mut context = array_context(&parsed);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let callable = callable(store, SignatureFlags::NONE, &[number], 1, None);
+        let foreign = initialized_store();
+        let foreign_type = foreign.intrinsic_bootstrap().unwrap().number_type;
+        let before = (store.type_len(), store.signature_len());
+        assert_eq!(
+            check_validated_class_call_arguments(
+                store,
+                &globals,
+                strict,
+                request(callable.owner, &[foreign_type]),
+                &callable,
+            ),
+            Err(DirectCallError::Invariant(
+                DirectCallInvariant::InvalidArgumentType {
+                    index: 0,
+                    type_: foreign_type,
+                }
+            )),
+        );
+        assert_eq!(
+            store
+                .signature(callable.signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert_eq!((store.type_len(), store.signature_len()), before);
     }
 
     #[test]

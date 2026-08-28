@@ -4962,7 +4962,7 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_direct_functions_and_static_blocks_remain_explicit_boundaries() {
+    fn unreachable_direct_functions_keep_later_static_blocks_incomplete() {
         let parsed = parse_source_file(
             r"
                 function stop() {
@@ -5012,8 +5012,16 @@ mod tests {
                 .iter()
                 .filter(|kind| **kind == UnsupportedFlowKind::ClassStaticBlock)
                 .count(),
-            1
+            0
         );
+        let static_block = nodes_of_kind(&parsed.arena, SyntaxKind::ClassStaticBlockDeclaration)[0];
+        let static_block_ref = node_ref(&parsed.arena, file, static_block);
+        assert_eq!(graph.container_is_complete(static_block_ref), Some(false));
+        assert_eq!(graph.container_start(static_block_ref), None);
+        assert!(graph.unsupported().iter().any(|unsupported| {
+            unsupported.container == static_block_ref
+                && unsupported.kind == UnsupportedFlowKind::CrossContainerFlowEffects
+        }));
     }
 
     #[test]

@@ -309,6 +309,7 @@ dependencies = [
  "ts_diagnostics",
  "ts_evaluator",
  "ts_jsnum",
+ "ts_options",
  "ts_parser",
  "ts_path",
  "ts_scanner",

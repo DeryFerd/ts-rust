@@ -4,10 +4,10 @@ use ts_binder::{
     EscapedName, InternalSymbolName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-    ResolvedSignatureState, SignatureLinks, SourceCheckError, UnsupportedSourceSyntax,
-    signatures::SignatureFlags,
+    CanonicalCheckerContext, CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions,
+    IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks, signatures::SignatureFlags,
 };
+use ts_core::{TextPos, TextRange};
 use ts_parser::{ParseResult, parse_source_file};
 
 fn checker_context(
@@ -320,32 +320,118 @@ fn explicit_constructor_keeps_strict_field_initialization_diagnostics() {
 }
 
 #[test]
-fn unsupported_constructor_parameters_and_nonempty_bodies_leave_classes_cold() {
-    for (index, source) in [
-        concat!(
-            "class Base { constructor(public value: string) {} } ",
-            "class Model extends Base { constructor(value: string) { super(value); } }",
+#[allow(clippy::too_many_lines)] // Each original input checks cold identity, diagnostics, and replay.
+fn constructor_bodies_preserve_class_identities_and_diagnostics() {
+    let cases: [(&str, &[u32]); 3] = [
+        (
+            concat!(
+                "class Base { constructor(public value: string) {} } ",
+                "class Model extends Base { constructor(value: string) { super(value); } }",
+            ),
+            &[],
         ),
-        "class Model { constructor() { const value = 1; } }",
-        "class Base {} class Model extends Base { constructor() {} }",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+        ("class Model { constructor() { const value = 1; } }", &[]),
+        (
+            "class Base {} class Model extends Base { constructor() {} }",
+            &[2377],
+        ),
+    ];
+    for (index, (source, expected_codes)) in cases.into_iter().enumerate() {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(2_106 + u32::try_from(index).unwrap());
         let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
         let owner = class_symbol(&parsed, file, &context, "Model");
 
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Class(_)
-            ))
-        ));
         assert!(context.store().declared_type_links(owner).is_none());
         assert!(context.store().value_symbol_links(owner).is_none());
+
+        context
+            .check_source_file(file)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            expected_codes,
+            "{source}",
+        );
+        for diagnostic in context.diagnostics().as_slice() {
+            assert_eq!(
+                diagnostic.node,
+                Some(class_constructor(&parsed, file, "Model"))
+            );
+            assert_eq!(
+                diagnostic.range_override,
+                Some(CanonicalCheckerDiagnosticRange::new(
+                    class_constructor(&parsed, file, "Model"),
+                    TextRange::new(TextPos::new(41), TextPos::new(52)),
+                )),
+            );
+            assert!(diagnostic.diagnostic.arguments.is_empty());
+            assert!(diagnostic.related_information.is_empty());
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Constructors for derived classes must contain a 'super' call.",
+            );
+        }
+        let instance = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .expect("the checked constructor must retain its class instance");
+        let value = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .expect("the checked constructor must retain its class value");
+        assert_ne!(instance, value);
+        assert_eq!(
+            context.store().type_payload(instance).unwrap().symbol(),
+            Some(owner)
+        );
+        assert_eq!(
+            context.store().type_payload(value).unwrap().symbol(),
+            Some(owner)
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type,
+            Some(instance),
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(value),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+            "{source}",
+        );
     }
 }
 

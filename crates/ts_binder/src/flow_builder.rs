@@ -87,6 +87,7 @@ struct FlowBuilder<'a, 'hooks> {
     has_flow_effects: bool,
     in_assignment_pattern: bool,
     effect_dependency_containers: Vec<NodeId>,
+    inline_container_dependencies: Vec<(NodeId, NodeId)>,
     built_containers: BTreeSet<NodeId>,
     visited: Vec<bool>,
 }
@@ -115,6 +116,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             has_flow_effects: false,
             in_assignment_pattern: false,
             effect_dependency_containers: Vec::new(),
+            inline_container_dependencies: Vec::new(),
             built_containers: BTreeSet::new(),
             visited: vec![false; ast.len()],
         }
@@ -129,6 +131,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
 
         self.bind_node(source_file);
         self.finish_container(source_file, true);
+        self.validate_inline_container_dependencies();
         self.graph
     }
 
@@ -168,8 +171,7 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
         let kind = node.kind;
 
         if kind == SyntaxKind::ClassStaticBlockDeclaration {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::ClassStaticBlock);
-            self.bind_children_without_flow(node_id);
+            self.bind_static_block_container(node_id);
             return;
         }
 
@@ -1549,6 +1551,61 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             }
         }
         self.restore_flow(saved);
+    }
+
+    fn bind_static_block_container(&mut self, node_id: NodeId) {
+        if !self.built_containers.insert(node_id) {
+            return;
+        }
+        let saved = self.save_flow();
+        self.inline_container_dependencies
+            .push((node_id, saved.container));
+        self.container = node_id;
+        // Static blocks run in the enclosing flow, but have their own jump targets.
+        if let Some(start) = self.current {
+            self.graph.container_starts.insert(node_id, start);
+            self.return_target = Some(self.alloc_label());
+        } else {
+            self.record_unsupported(
+                node_id,
+                node_id,
+                UnsupportedFlowKind::CrossContainerFlowEffects,
+            );
+        }
+
+        self.bind_children(node_id);
+        self.finish_container(node_id, true);
+        if let Some(return_target) = self.return_target
+            && !self.graph.incomplete_containers.contains(&node_id)
+        {
+            self.add_current_antecedent(return_target);
+            self.current = self.finish_label(return_target);
+            if let Some(return_flow) = self.current {
+                self.graph.container_returns.insert(node_id, return_flow);
+            }
+        }
+
+        let exit = self.current;
+        self.restore_flow(saved);
+        self.current = exit;
+        if self.graph.incomplete_containers.contains(&node_id) {
+            self.mark_unsupported(node_id, UnsupportedFlowKind::CrossContainerFlowEffects);
+        }
+    }
+
+    fn validate_inline_container_dependencies(&mut self) {
+        // Parents are recorded first. Their loop backedges can fail after a block is bound.
+        for (container, enclosing) in std::mem::take(&mut self.inline_container_dependencies) {
+            if self.graph.incomplete_containers.contains(&enclosing)
+                && !self.graph.incomplete_containers.contains(&container)
+            {
+                self.record_unsupported(
+                    container,
+                    container,
+                    UnsupportedFlowKind::CrossContainerFlowEffects,
+                );
+            }
+        }
     }
 
     fn bind_module_block(&mut self, node_id: NodeId) {

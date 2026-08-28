@@ -3322,6 +3322,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::TypeParameter(parameter) => {
+                if parameter.is_this_type
+                    && super::classes::source_class_this_type_owner(self, type_).is_some()
+                {
+                    return Ok(());
+                }
                 let Some(symbol) =
                     cached_ordinary_type_parameter_owner(self, type_).or_else(|| {
                         self.instantiated_interface_method_type_parameter_owner(

@@ -8,6 +8,8 @@
 //! also retain the exact block-scoped, class, and enum diagnostics. Other
 //! mutation expressions and switch-clause narrowing remain typed capability
 //! boundaries.
+//! Class initialization keeps the actual constructor exit and super-call edges.
+//! Static blocks retain their outer start and receiver-specific property keys.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -17,14 +19,26 @@ use std::{
 use ts_ast::{
     FlowFlags, FlowNode, FlowNodePayload, FlowRef, NodeArena, NodeData, NodeRef, SyntaxKind,
 };
-use ts_binder::{BoundFile, BoundFlowGraph, SemanticSymbolId, SymbolFlags};
+use ts_binder::{
+    BoundFile, BoundFlowGraph, CanonicalNameResolver, CanonicalResolutionLocation,
+    SemanticSymbolId, SymbolFlags,
+};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalCheckerDiagnostic, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, RelationUnavailable, TypeId,
+    CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
+    classes::{
+        ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassMemberOrigin, ClassMemberSource,
+        ClassPropertySide, class_body_identities, class_member_source,
+    },
     logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
+    source::CheckedClassPropertyAssignment,
+    source_properties::{
+        ClassAccessContext, SourceClassPropertyWritePlan, SourcePropertyError,
+        plan_class_property_write, validate_class_property_write_access,
+    },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -159,8 +173,10 @@ pub(super) struct SourceFlowParameterAssignment {
 #[derive(Clone, Debug)]
 pub(super) struct SourceFlowPlan {
     container: NodeRef,
+    start_container: NodeRef,
     start: FlowRef,
     start_payload: Option<NodeRef>,
+    end: Option<FlowRef>,
     points: HashMap<NodeRef, FlowRef>,
     point_order: Vec<NodeRef>,
     conditions: HashMap<NodeRef, SourceFlowCondition>,
@@ -168,6 +184,46 @@ pub(super) struct SourceFlowPlan {
     assignment_order: Vec<NodeRef>,
     parameter_assignments: HashMap<NodeRef, NodeRef>,
     calls: HashMap<NodeRef, NodeRef>,
+    class_body: Option<ClassBodyPlan>,
+    property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum ClassPropertyFlowReceiver {
+    This(NodeRef),
+    Super(NodeRef),
+    Named(SemanticSymbolId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ClassPropertyFlowReference {
+    receiver: ClassPropertyFlowReceiver,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
+struct ClassPropertyFlowAssignment {
+    expression: NodeRef,
+    reference: ClassPropertyFlowReference,
+    write: Option<ClassPropertyWriteFlow>,
+}
+
+#[derive(Clone, Debug)]
+struct ClassPropertyWriteFlow {
+    plan: SourceClassPropertyWritePlan,
+    flow: FlowRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassPropertyFlowState {
+    type_: Option<TypeId>,
+    initialized: bool,
+}
+
+struct ClassPropertyFlowQuery<'query> {
+    reference: &'query ClassPropertyFlowReference,
+    member: &'query ClassMemberSource,
+    initial: ClassPropertyFlowState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +231,7 @@ pub(super) enum SourceFlowUnsupported {
     IncompleteContainer(NodeRef),
     FlowKind { flow: FlowRef, flags: FlowFlags },
     Call(NodeRef),
+    PropertyWrite(NodeRef),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +283,8 @@ pub(super) enum SourceFlowInvariant {
     InvalidParameterAssignment(NodeRef),
     InvalidCall(NodeRef),
     InvalidDeclarationUse(NodeRef),
+    InvalidClassBody(NodeRef),
+    InvalidClassProperty(NodeRef),
     AssignmentAlreadyCompleted(NodeRef),
     MissingCurrentType(SemanticSymbolId),
     TypeofNarrowing(SourceTypeofNarrowingError),
@@ -321,6 +380,9 @@ struct SourceFlowCoverage {
 struct SourceFlowEffects {
     parameter_assignments: HashMap<NodeRef, NodeRef>,
     calls: HashMap<NodeRef, NodeRef>,
+    class_body: Option<ClassBodyPlan>,
+    start_container: Option<NodeRef>,
+    property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
 }
 
 const TRUE_CONDITION_EDGE: u8 = 1 << 0;
@@ -593,6 +655,137 @@ fn source_node_is_descendant_of(
 }
 
 impl SourceFlowPlan {
+    pub(super) fn has_reachable_end(&self) -> bool {
+        self.end.is_some()
+    }
+
+    /// Uses the binder's body flow, including an inline static block's outer start.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_class_body(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        body: &ClassBodyPlan,
+        points: impl IntoIterator<Item = NodeRef>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+    ) -> Result<Self, SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidClassBody(body.declaration);
+        if bound.node_arena_id() != arena.id()
+            || bound.node_arena_revision() != arena.revision()
+            || !body.declaration.is_for(arena.id(), bound.file_id())
+            || !bound.contains(body.declaration)
+            || !bound.contains(body.body)
+            || host
+                .source(body.declaration)
+                .is_none_or(|(source, binding)| {
+                    source.id() != arena.id() || binding.source_file() != bound.source_file()
+                })
+        {
+            return Err(invalid().into());
+        }
+        let declaration = arena.get(body.declaration.node).ok_or_else(invalid)?;
+        let expected_body = match (&declaration.data, &body.kind) {
+            (NodeData::ConstructorDeclaration(data), ClassBodyKind::Constructor)
+                if declaration.kind == SyntaxKind::Constructor =>
+            {
+                data.body
+            }
+            (NodeData::MethodDeclaration(data), ClassBodyKind::Method { .. })
+                if declaration.kind == SyntaxKind::MethodDeclaration =>
+            {
+                data.body
+            }
+            (NodeData::ClassStaticBlockDeclaration(data), ClassBodyKind::StaticBlock)
+                if declaration.kind == SyntaxKind::ClassStaticBlockDeclaration =>
+            {
+                Some(data.body)
+            }
+            _ => return Err(invalid().into()),
+        };
+        if expected_body != Some(body.body.node)
+            || declaration.parent != Some(body.class_declaration.node)
+            || arena.get(body.body.node).is_none_or(|block| {
+                block.kind != SyntaxKind::Block || block.parent != Some(body.declaration.node)
+            })
+        {
+            return Err(invalid().into());
+        }
+        let points = points.into_iter().collect::<Vec<_>>();
+        let container = bound
+            .flow_container(body.body)
+            .or_else(|| {
+                points
+                    .first()
+                    .and_then(|point| bound.flow_container(*point))
+            })
+            .unwrap_or(body.declaration);
+        let mut effects = SourceFlowEffects {
+            class_body: Some(body.clone()),
+            start_container: matches!(body.kind, ClassBodyKind::StaticBlock)
+                .then(|| class_control_flow_container(host, body.declaration))
+                .transpose()?,
+            ..SourceFlowEffects::default()
+        };
+        for call in calls {
+            let statement = validate_class_body_call(arena, bound, body, container, call)?;
+            if effects.calls.insert(call, statement).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        if matches!(
+            body.kind,
+            ClassBodyKind::Constructor | ClassBodyKind::StaticBlock
+        ) {
+            let mut pending = points
+                .iter()
+                .map(|point| {
+                    bound
+                        .flow_at(*point)
+                        .ok_or(SourceFlowInvariant::MissingFlowPoint(*point))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            pending.extend(bound.flow_graph().container_return(body.declaration));
+            let mut visited = HashSet::new();
+            while let Some(flow) = pending.pop() {
+                if !visited.insert(flow) {
+                    continue;
+                }
+                if visited.len() > FLOW_DEPTH_LIMIT {
+                    return Err(SourceFlowInvariant::DepthLimit(flow).into());
+                }
+                let node = flow_node(bound.flow_graph(), flow)?;
+                if source_flow_kind(flow, node.flags)? == SourceFlowKind::Assignment {
+                    let target = ast_payload(flow, &node)?;
+                    let assignment = if matches!(body.kind, ClassBodyKind::Constructor) {
+                        plan_constructor_property_assignment(
+                            arena, bound, store, host, body, target, flow,
+                        )?
+                    } else {
+                        plan_outer_class_property_assignment(
+                            arena, bound, store, host, body, target,
+                        )?
+                    };
+                    if let Some(assignment) = assignment {
+                        effects.property_assignments.insert(target, assignment);
+                    }
+                }
+                pending.extend(node.antecedent);
+                pending.extend(node.antecedents.iter().copied());
+            }
+        }
+        for &point in &points {
+            if is_property_assignment_target(host, point)
+                && source_node_is_descendant_of(arena, point, body.body.node)
+                && !effects.property_assignments.contains_key(&point)
+            {
+                return Err(SourceFlowUnsupported::PropertyWrite(point).into());
+            }
+        }
+        Self::preflight_with_effects(bound, container, None, points, [], assignments, effects)
+    }
+
     /// Freezes and validates every flow chain that the source executor may
     /// request. No semantic store state is read or written during preflight.
     pub(super) fn preflight(
@@ -676,10 +869,11 @@ impl SourceFlowPlan {
     ) -> Result<Self, SourceFlowError> {
         let graph = bound.flow_graph();
         validate_container(graph, container)?;
+        let start_container = effects.start_container.unwrap_or(container);
         let start = graph
-            .container_start(container)
-            .ok_or(SourceFlowInvariant::MissingStart(container))?;
-        let start_payload = preflight_start_payload(graph, container, start)?;
+            .container_start(start_container)
+            .ok_or(SourceFlowInvariant::MissingStart(start_container))?;
+        let start_payload = preflight_start_payload(graph, start_container, start)?;
         if start_payload != expected_start_payload {
             return Err(SourceFlowInvariant::InvalidStart(start).into());
         }
@@ -737,10 +931,27 @@ impl SourceFlowPlan {
                 true,
             )?;
         }
+        let end = match effects.class_body.as_ref() {
+            Some(body)
+                if matches!(
+                    body.kind,
+                    ClassBodyKind::Constructor | ClassBodyKind::StaticBlock
+                ) =>
+            {
+                Some(
+                    graph
+                        .container_return(body.declaration)
+                        .ok_or(SourceFlowInvariant::InvalidClassBody(body.declaration))?,
+                )
+            }
+            _ => graph.container_end(container),
+        };
         let plan = Self {
             container,
+            start_container,
             start,
             start_payload,
+            end,
             points: planned_points,
             point_order,
             conditions: planned_conditions,
@@ -748,6 +959,8 @@ impl SourceFlowPlan {
             assignment_order,
             parameter_assignments: effects.parameter_assignments,
             calls: effects.calls,
+            class_body: effects.class_body,
+            property_assignments: effects.property_assignments,
         };
         plan.validate_flow_paths(bound)?;
         Ok(plan)
@@ -763,8 +976,8 @@ impl SourceFlowPlan {
         let graph = bound.flow_graph();
         validate_container(graph, self.container)?;
         let actual = graph
-            .container_start(self.container)
-            .ok_or(SourceFlowInvariant::MissingStart(self.container))?;
+            .container_start(self.start_container)
+            .ok_or(SourceFlowInvariant::MissingStart(self.start_container))?;
         if actual != self.start {
             return Err(SourceFlowInvariant::StartMismatch {
                 container: self.container,
@@ -808,7 +1021,6 @@ impl SourceFlowPlan {
     }
 
     fn validate_flow_paths(&self, bound: &BoundFile) -> Result<(), SourceFlowError> {
-        let graph = bound.flow_graph();
         let mut validated = HashSet::new();
         let mut visiting = HashSet::new();
         let mut coverage = SourceFlowCoverage::default();
@@ -819,12 +1031,17 @@ impl SourceFlowPlan {
                 .ok_or(SourceFlowInvariant::MissingFlowPoint(*point))?;
             self.validate_flow(bound, flow, 0, &mut validated, &mut visiting, &mut coverage)?;
         }
-        if let Some(end) = graph.container_end(self.container) {
+        if let Some(end) = self.end {
             self.validate_flow(bound, end, 0, &mut validated, &mut visiting, &mut coverage)?;
         }
         for declaration in self.assignments.keys() {
             if !coverage.assignments.contains(declaration) {
                 return Err(SourceFlowInvariant::UnreachedAssignment(*declaration).into());
+            }
+        }
+        for (target, assignment) in &self.property_assignments {
+            if assignment.write.is_some() && !coverage.assignments.contains(target) {
+                return Err(SourceFlowInvariant::UnreachedAssignment(*target).into());
             }
         }
         for call in self.calls.keys() {
@@ -898,7 +1115,9 @@ impl SourceFlowPlan {
             SourceFlowKind::Assignment => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
-                if !self.assignments.contains_key(&declaration) {
+                if !self.assignments.contains_key(&declaration)
+                    && !self.property_assignments.contains_key(&declaration)
+                {
                     return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
                 }
                 coverage.assignments.insert(declaration);
@@ -912,7 +1131,7 @@ impl SourceFlowPlan {
                     .get(&call)
                     .copied()
                     .ok_or(SourceFlowUnsupported::Call(call))?;
-                validate_call_container(bound, self.container, call, statement, antecedent)?;
+                validate_planned_call_container(bound, self, call, statement, antecedent)?;
                 coverage.calls.insert(call);
                 self.validate_flow(bound, antecedent, depth + 1, validated, visiting, coverage)
             }
@@ -962,6 +1181,626 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     memo: HashMap<FlowRef, SourceFlowSnapshot>,
     visiting: HashSet<FlowRef>,
     loop_snapshots: HashMap<FlowRef, SourceFlowSnapshot>,
+}
+
+/// Keeps class initialization queries tied to one prepared body and binder graph.
+pub(super) struct ClassInitializationFrame<'plan, 'graph> {
+    access: ClassBodyAccessToken,
+    body: &'plan ClassBodyPlan,
+    flow: SourceFlowFrame<'plan, 'graph>,
+    completed_calls: HashSet<NodeRef>,
+    property_assignments: HashMap<NodeRef, CheckedClassPropertyAssignment>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ClassPropertyFlowRead {
+    type_: TypeId,
+    used_before_assignment: bool,
+    access: NodeRef,
+    flow: FlowRef,
+}
+
+impl ClassPropertyFlowRead {
+    pub(super) const fn type_(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) const fn used_before_assignment(&self) -> bool {
+        self.used_before_assignment
+    }
+
+    pub(super) const fn access(&self) -> NodeRef {
+        self.access
+    }
+
+    pub(super) const fn flow(&self) -> FlowRef {
+        self.flow
+    }
+}
+
+impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
+    pub(super) fn new(
+        body: &'plan ClassBodyPlan,
+        plan: &'plan SourceFlowPlan,
+        bound: &'graph BoundFile,
+        access: ClassBodyAccessToken,
+        base: SourceFlowTypes,
+    ) -> Result<Self, SourceFlowError> {
+        if plan.class_body.as_ref() != Some(body) {
+            return Err(SourceFlowInvariant::InvalidClassBody(body.declaration).into());
+        }
+        Ok(Self {
+            access,
+            body,
+            flow: plan.frame(bound, base)?,
+            completed_calls: HashSet::new(),
+            property_assignments: HashMap::new(),
+        })
+    }
+
+    pub(super) const fn access_token(&self) -> &ClassBodyAccessToken {
+        &self.access
+    }
+
+    pub(super) fn snapshot_at(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        self.flow.snapshot_at(store, globals, node)
+    }
+
+    pub(super) fn complete_assignment(
+        &mut self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        current_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        self.flow
+            .complete_assignment(declaration, symbol, current_type)
+    }
+
+    pub(super) fn complete_call(&mut self, call: NodeRef) -> Result<(), SourceFlowError> {
+        if !self.flow.plan.calls.contains_key(&call) || !self.completed_calls.insert(call) {
+            return Err(SourceFlowInvariant::InvalidCall(call).into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn preflight_property_assignment(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        plan: &SourceClassPropertyWritePlan,
+    ) -> Result<(), SourceFlowError> {
+        let target = plan.target();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(target);
+        let (identities, _) = validate_class_property_write_access(store, host, plan, &self.access)
+            .map_err(|_| invalid())?;
+        if !matches!(self.body.kind, ClassBodyKind::Constructor)
+            || identities.class_symbol != self.body.class_symbol
+            || identities.body_declaration != self.body.declaration
+            || identities.class_declaration != self.body.class_declaration
+        {
+            return Err(invalid().into());
+        }
+        let assignment = self
+            .flow
+            .plan
+            .property_assignments
+            .get(&target)
+            .ok_or(SourceFlowInvariant::UnknownAssignment(target))?;
+        let write = assignment.write.as_ref().ok_or_else(invalid)?;
+        if write.plan != *plan
+            || assignment.expression != plan.node()
+            || assignment.reference
+                != (ClassPropertyFlowReference {
+                    receiver: ClassPropertyFlowReceiver::This(self.body.class_declaration),
+                    name: plan.name().to_owned(),
+                })
+            || self.flow.bound.flow_container(target) != Some(self.flow.plan.container)
+            || self.flow.plan.container != self.body.declaration
+        {
+            return Err(invalid().into());
+        }
+        let node = flow_node(self.flow.graph, write.flow)?;
+        if source_flow_kind(write.flow, node.flags)? != SourceFlowKind::Assignment
+            || ast_payload(write.flow, &node)? != target
+        {
+            return Err(invalid().into());
+        }
+        linear_antecedent(write.flow, &node)?;
+        for point in [plan.statement(), plan.target(), plan.receiver()] {
+            let expected = self
+                .flow
+                .plan
+                .points
+                .get(&point)
+                .copied()
+                .ok_or(SourceFlowInvariant::MissingFlowPoint(point))?;
+            if self.flow.bound.flow_at(point) != Some(expected)
+                || self.flow.bound.flow_container(point) != Some(self.flow.plan.container)
+            {
+                return Err(invalid().into());
+            }
+        }
+        if self.property_assignments.contains_key(&target) {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete_property_assignment(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        assignment: &CheckedClassPropertyAssignment,
+    ) -> Result<(), SourceFlowError> {
+        let target = assignment.target();
+        let plan = target.plan();
+        self.preflight_property_assignment(store, host, plan)?;
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(plan.target());
+        if target.access_token() != &self.access
+            || store.type_payload(assignment.assigned_type()).is_none()
+            || store.type_payload(assignment.flow_type()).is_none()
+            || store
+                .type_node_links(plan.node())
+                .and_then(|links| links.resolved_type)
+                != Some(assignment.assigned_type())
+            || class_member_source(store, host, plan.member()).map_err(|_| invalid())?
+                != *target.member_source()
+        {
+            return Err(invalid().into());
+        }
+        self.property_assignments
+            .insert(plan.target(), assignment.clone());
+        Ok(())
+    }
+
+    pub(super) fn receiver_used_before_super(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        context: &ClassAccessContext,
+    ) -> Result<bool, SourceFlowError> {
+        let receiver = context.receiver();
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(receiver);
+        let identities = class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        if context.class_symbol() != self.body.class_symbol
+            || context.body_declaration() != self.body.declaration
+            || context.class_declaration() != self.body.class_declaration
+        {
+            return Err(invalid().into());
+        }
+        if !matches!(self.body.kind, ClassBodyKind::Constructor) || identities.base.is_none() {
+            return Ok(false);
+        }
+        let flow = self
+            .flow
+            .plan
+            .points
+            .get(&receiver)
+            .copied()
+            .ok_or_else(invalid)?;
+        if self.flow.bound.flow_at(receiver) != Some(flow)
+            || self.flow.bound.flow_container(receiver) != Some(self.flow.plan.container)
+        {
+            return Err(invalid().into());
+        }
+        Ok(!self.is_post_super_flow(host, flow, &mut HashSet::new(), 0)?)
+    }
+
+    fn is_post_super_flow(
+        &self,
+        host: &DeclaredTypeHost<'_>,
+        flow: FlowRef,
+        visiting: &mut HashSet<FlowRef>,
+        depth: usize,
+    ) -> Result<bool, SourceFlowError> {
+        if depth > FLOW_DEPTH_LIMIT {
+            return Err(SourceFlowInvariant::DepthLimit(flow).into());
+        }
+        if !visiting.insert(flow) {
+            return Err(SourceFlowInvariant::Cycle(flow).into());
+        }
+        let node = flow_node(self.flow.graph, flow)?;
+        let result = match source_flow_kind(flow, node.flags)? {
+            SourceFlowKind::Start => {
+                validate_start_node(self.flow.plan, flow, &node)?;
+                Ok(false)
+            }
+            SourceFlowKind::Unreachable => {
+                validate_unreachable_node(self.flow.graph, flow, &node)?;
+                Ok(true)
+            }
+            SourceFlowKind::Call => {
+                let call = ast_payload(flow, &node)?;
+                let is_super = matches!(host.node(call).map(|node| &node.data),
+                    Some(NodeData::CallExpression(data)) if host.node(NodeRef::new(call.arena, call.file, data.expression))
+                        .is_some_and(|node| node.kind == SyntaxKind::SuperKeyword));
+                if is_super {
+                    if !self.completed_calls.contains(&call) {
+                        return Err(SourceFlowInvariant::InvalidCall(call).into());
+                    }
+                    Ok(true)
+                } else {
+                    self.is_post_super_flow(
+                        host,
+                        linear_antecedent(flow, &node)?,
+                        visiting,
+                        depth + 1,
+                    )
+                }
+            }
+            SourceFlowKind::Assignment
+            | SourceFlowKind::TrueCondition
+            | SourceFlowKind::FalseCondition => {
+                self.is_post_super_flow(host, linear_antecedent(flow, &node)?, visiting, depth + 1)
+            }
+            SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel => {
+                let mut initialized = true;
+                for antecedent in label_antecedents(flow, &node)? {
+                    initialized &=
+                        self.is_post_super_flow(host, *antecedent, visiting, depth + 1)?;
+                }
+                Ok(initialized)
+            }
+        };
+        visiting.remove(&flow);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn property_read(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        context: &ClassAccessContext,
+        access: NodeRef,
+        member: &ClassMemberSource,
+        declared_type: TypeId,
+        options: CanonicalCheckerOptions,
+    ) -> Result<ClassPropertyFlowRead, SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(access);
+        class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        let source = class_member_source(store, host, member.symbol).map_err(|_| invalid())?;
+        if context.class_symbol() != self.body.class_symbol
+            || context.class_declaration() != self.body.class_declaration
+            || context.body_declaration() != self.body.declaration
+            || &source != member
+            || store.type_payload(declared_type).is_none()
+        {
+            return Err(invalid().into());
+        }
+        let flow = self
+            .flow
+            .plan
+            .points
+            .get(&access)
+            .copied()
+            .ok_or_else(invalid)?;
+        if self.flow.bound.flow_at(access) != Some(flow)
+            || self.flow.bound.flow_container(access) != Some(self.flow.plan.container)
+        {
+            return Err(invalid().into());
+        }
+        let record = host.node(access).ok_or_else(invalid)?;
+        let NodeData::PropertyAccessExpression(property) = &record.data else {
+            return Err(invalid().into());
+        };
+        let receiver = NodeRef::new(access.arena, access.file, property.expression);
+        let name_node = NodeRef::new(access.arena, access.file, property.name);
+        let name = match host.node(name_node).map(|record| &record.data) {
+            Some(NodeData::Identifier(identifier)) => &identifier.text,
+            Some(NodeData::PrivateIdentifier(identifier)) => &identifier.text,
+            _ => return Err(invalid().into()),
+        };
+        if receiver != context.receiver() {
+            return Err(invalid().into());
+        }
+        let receiver_kind = match host.node(receiver).map(|record| record.kind) {
+            Some(SyntaxKind::ThisKeyword) => {
+                ClassPropertyFlowReceiver::This(self.body.class_declaration)
+            }
+            Some(SyntaxKind::SuperKeyword) => {
+                ClassPropertyFlowReceiver::Super(self.body.class_declaration)
+            }
+            _ => return Err(invalid().into()),
+        };
+        let reference = ClassPropertyFlowReference {
+            receiver: receiver_kind,
+            name: name.clone(),
+        };
+        let assume_uninitialized = options.intrinsic.strict_null_checks
+            && match member.origin {
+                ClassMemberOrigin::Field { initializer: None } => {
+                    options.strict_property_initialization
+                        && !member.abstract_
+                        && matches!(reference.receiver, ClassPropertyFlowReceiver::This(_))
+                        && matches!(self.body.kind, ClassBodyKind::Constructor)
+                        && member.side == ClassPropertySide::Instance
+                    && member.declaring_class == self.body.class_symbol
+                    && host.node(member.declaration).is_some_and(|record| {
+                        matches!(&record.data, NodeData::PropertyDeclaration(data)
+                            if data.postfix_token.is_none_or(|token| {
+                                host.node(NodeRef::new(member.declaration.arena, member.declaration.file, token))
+                                    .is_some_and(|token| token.kind != SyntaxKind::ExclamationToken)
+                            }))
+                    })
+                }
+                ClassMemberOrigin::JavaScriptAssignment { assignment } => {
+                    class_control_flow_container(host, access)?
+                        == class_control_flow_container(host, assignment)?
+                }
+                _ => false,
+            };
+        let state = self.property_state_at(
+            store,
+            host,
+            flow,
+            &ClassPropertyFlowQuery {
+                reference: &reference,
+                member,
+                initial: ClassPropertyFlowState {
+                    type_: Some(declared_type),
+                    initialized: !assume_uninitialized,
+                },
+            },
+            &mut HashSet::new(),
+            0,
+        )?;
+        Ok(ClassPropertyFlowRead {
+            type_: state.type_.ok_or_else(invalid)?,
+            used_before_assignment: !state.initialized
+                && !class_property_type_skips_initialization_check(store, declared_type)?,
+            access,
+            flow,
+        })
+    }
+
+    pub(super) fn property_initialized_at_constructor_exit(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        member: &ClassMemberSource,
+    ) -> Result<bool, SourceFlowError> {
+        let invalid = || SourceFlowInvariant::InvalidClassProperty(member.declaration);
+        class_body_identities(store, host, &self.access).map_err(|_| invalid())?;
+        if !matches!(self.body.kind, ClassBodyKind::Constructor)
+            || member.declaring_class != self.body.class_symbol
+            || member.side != ClassPropertySide::Instance
+            || !matches!(
+                member.origin,
+                ClassMemberOrigin::Field { initializer: None }
+                    | ClassMemberOrigin::AutoAccessor { initializer: None }
+            )
+            || class_member_source(store, host, member.symbol).map_err(|_| invalid())? != *member
+        {
+            return Err(invalid().into());
+        }
+        let Some(NodeData::PropertyDeclaration(property)) =
+            host.node(member.declaration).map(|record| &record.data)
+        else {
+            return Err(invalid().into());
+        };
+        let name = NodeRef::new(
+            member.declaration.arena,
+            member.declaration.file,
+            property.name,
+        );
+        let name = match host.node(name).map(|record| &record.data) {
+            Some(NodeData::Identifier(name)) => &name.text,
+            Some(NodeData::PrivateIdentifier(name)) => &name.text,
+            _ => return Err(invalid().into()),
+        };
+        let flow = self
+            .flow
+            .graph
+            .container_return(self.body.declaration)
+            .ok_or_else(invalid)?;
+        if self.flow.plan.end != Some(flow) {
+            return Err(invalid().into());
+        }
+        let reference = ClassPropertyFlowReference {
+            receiver: ClassPropertyFlowReceiver::This(self.body.class_declaration),
+            name: name.clone(),
+        };
+        self.property_state_at(
+            store,
+            host,
+            flow,
+            &ClassPropertyFlowQuery {
+                reference: &reference,
+                member,
+                initial: ClassPropertyFlowState {
+                    type_: None,
+                    initialized: false,
+                },
+            },
+            &mut HashSet::new(),
+            0,
+        )
+        .map(|state| state.initialized)
+    }
+
+    fn property_state_at(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        flow: FlowRef,
+        query: &ClassPropertyFlowQuery<'_>,
+        visiting: &mut HashSet<FlowRef>,
+        depth: usize,
+    ) -> Result<ClassPropertyFlowState, SourceFlowError> {
+        if depth > FLOW_DEPTH_LIMIT {
+            return Err(SourceFlowInvariant::DepthLimit(flow).into());
+        }
+        if !visiting.insert(flow) {
+            return Err(SourceFlowInvariant::Cycle(flow).into());
+        }
+        let node = flow_node(self.flow.graph, flow)?;
+        let result = match source_flow_kind(flow, node.flags)? {
+            SourceFlowKind::Start => {
+                validate_start_node(self.flow.plan, flow, &node)?;
+                Ok(query.initial)
+            }
+            SourceFlowKind::Unreachable => {
+                validate_unreachable_node(self.flow.graph, flow, &node)?;
+                Ok(ClassPropertyFlowState {
+                    initialized: true,
+                    ..query.initial
+                })
+            }
+            SourceFlowKind::Assignment => {
+                let target = ast_payload(flow, &node)?;
+                if let Some(assignment) = self.flow.plan.property_assignments.get(&target)
+                    && &assignment.reference == query.reference
+                {
+                    if let Some(write) = &assignment.write {
+                        let checked = self
+                            .property_assignments
+                            .get(&target)
+                            .ok_or(SourceFlowInvariant::PendingAssignment(target))?;
+                        if write.flow != flow
+                            || checked.target().plan() != &write.plan
+                            || checked.target().access_token() != &self.access
+                            || checked.target().member_source() != query.member
+                            || query
+                                .initial
+                                .type_
+                                .is_some_and(|declared| declared != checked.target().read_type())
+                            || store
+                                .type_node_links(assignment.expression)
+                                .and_then(|links| links.resolved_type)
+                                != Some(checked.assigned_type())
+                            || store.type_payload(checked.flow_type()).is_none()
+                        {
+                            return Err(SourceFlowInvariant::InvalidClassProperty(target).into());
+                        }
+                        Ok(ClassPropertyFlowState {
+                            type_: query.initial.type_.map(|_| checked.flow_type()),
+                            initialized: true,
+                        })
+                    } else {
+                        if store
+                            .type_node_links(assignment.expression)
+                            .and_then(|links| links.resolved_type)
+                            .is_none()
+                        {
+                            return Err(SourceFlowInvariant::PendingAssignment(target).into());
+                        }
+                        Ok(ClassPropertyFlowState {
+                            initialized: true,
+                            ..query.initial
+                        })
+                    }
+                } else {
+                    self.property_state_at(
+                        store,
+                        host,
+                        linear_antecedent(flow, &node)?,
+                        query,
+                        visiting,
+                        depth + 1,
+                    )
+                }
+            }
+            SourceFlowKind::Call => {
+                let call = ast_payload(flow, &node)?;
+                if let Some(NodeData::CallExpression(data)) = host.node(call).map(|node| &node.data)
+                    && host
+                        .node(NodeRef::new(call.arena, call.file, data.expression))
+                        .is_some_and(|node| node.kind == SyntaxKind::SuperKeyword)
+                    && !self.completed_calls.contains(&call)
+                {
+                    return Err(SourceFlowInvariant::InvalidCall(call).into());
+                }
+                self.property_state_at(
+                    store,
+                    host,
+                    linear_antecedent(flow, &node)?,
+                    query,
+                    visiting,
+                    depth + 1,
+                )
+            }
+            SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel => {
+                let mut result: Option<ClassPropertyFlowState> = None;
+                for antecedent in label_antecedents(flow, &node)? {
+                    let state = self.property_state_at(
+                        store,
+                        host,
+                        *antecedent,
+                        query,
+                        visiting,
+                        depth + 1,
+                    )?;
+                    if let Some(prior) = &mut result {
+                        if prior.type_ != state.type_ {
+                            return Err(SourceFlowUnsupported::FlowKind {
+                                flow,
+                                flags: node.flags,
+                            }
+                            .into());
+                        }
+                        prior.initialized &= state.initialized;
+                    } else {
+                        result = Some(state);
+                    }
+                }
+                Ok(result.unwrap_or(ClassPropertyFlowState {
+                    initialized: true,
+                    ..query.initial
+                }))
+            }
+            SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition => {
+                Err(SourceFlowUnsupported::FlowKind {
+                    flow,
+                    flags: node.flags,
+                }
+                .into())
+            }
+        };
+        visiting.remove(&flow);
+        result
+    }
+}
+
+pub(super) fn class_property_type_skips_initialization_check(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, SourceFlowError> {
+    class_type_has_uninitialized_value(store, type_, &mut HashSet::new())
+}
+
+fn class_type_has_uninitialized_value(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<bool, SourceFlowError> {
+    let invalid =
+        SourceFlowInvariant::TypeofNarrowing(SourceTypeofNarrowingError::InvalidType(type_));
+    if !visiting.insert(type_) {
+        return Err(invalid.into());
+    }
+    let record = store.type_payload(type_).ok_or(invalid)?;
+    let result = if record
+        .flags()
+        .intersects(TypeFlags::UNDEFINED | TypeFlags::ANY | TypeFlags::UNKNOWN)
+    {
+        true
+    } else if let TypeData::Union(union) = record.data() {
+        let mut contains = false;
+        for type_ in &union.union.types {
+            contains |= class_type_has_uninitialized_value(store, *type_, visiting)?;
+        }
+        contains
+    } else {
+        false
+    };
+    visiting.remove(&type_);
+    Ok(result)
 }
 
 impl SourceFlowFrame<'_, '_> {
@@ -1069,6 +1908,9 @@ impl SourceFlowFrame<'_, '_> {
             SourceFlowKind::Assignment => {
                 let antecedent = linear_antecedent(flow, &node)?;
                 let declaration = ast_payload(flow, &node)?;
+                if self.plan.property_assignments.contains_key(&declaration) {
+                    return self.resolve_flow(store, globals, antecedent, depth + 1);
+                }
                 let assignment = *self
                     .plan
                     .assignments
@@ -1095,12 +1937,8 @@ impl SourceFlowFrame<'_, '_> {
                     .get(&call)
                     .copied()
                     .ok_or(SourceFlowUnsupported::Call(call))?;
-                validate_call_container(
-                    self.bound,
-                    self.plan.container,
-                    call,
-                    statement,
-                    antecedent,
+                validate_planned_call_container(
+                    self.bound, self.plan, call, statement, antecedent,
                 )?;
                 self.resolve_flow(store, globals, antecedent, depth + 1)
             }
@@ -2406,6 +3244,306 @@ fn validate_call_container(
     Ok(())
 }
 
+fn validate_planned_call_container(
+    bound: &BoundFile,
+    plan: &SourceFlowPlan,
+    call: NodeRef,
+    statement: NodeRef,
+    antecedent: FlowRef,
+) -> Result<(), SourceFlowError> {
+    let Some(body) = plan.class_body.as_ref() else {
+        return validate_call_container(bound, plan.container, call, statement, antecedent);
+    };
+    if !bound.contains(call)
+        || bound.container(call) != Some(body.declaration)
+        || bound.flow_container(statement) != Some(plan.container)
+        || bound.flow_at(statement) != Some(antecedent)
+    {
+        return Err(SourceFlowInvariant::InvalidCall(call).into());
+    }
+    Ok(())
+}
+
+fn validate_class_body_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    body: &ClassBodyPlan,
+    container: NodeRef,
+    expression: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(expression);
+    if !expression.is_for(arena.id(), bound.file_id())
+        || !bound.contains(expression)
+        || bound.container(expression) != Some(body.declaration)
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(expression.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(call) = &record.data else {
+        return Err(invalid().into());
+    };
+    let callee = arena.get(call.expression).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || call.question_dot_token.is_some()
+        || call.symbol.is_some()
+        || call.facts != 0
+        || callee.parent != Some(expression.node)
+        || !matches!(
+            callee.kind,
+            SyntaxKind::Identifier
+                | SyntaxKind::PropertyAccessExpression
+                | SyntaxKind::SuperKeyword
+        )
+        || callee.kind == SyntaxKind::SuperKeyword
+            && !matches!(body.kind, ClassBodyKind::Constructor)
+    {
+        return Err(invalid().into());
+    }
+    let statement = NodeRef::new(
+        expression.arena,
+        expression.file,
+        record.parent.ok_or_else(invalid)?,
+    );
+    let record = arena.get(statement.node).ok_or_else(invalid)?;
+    let NodeData::ExpressionStatement(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    if record.kind != SyntaxKind::ExpressionStatement
+        || record.flags.0 != 0
+        || data.expression != expression.node
+        || data.flow_node.is_some()
+        || !source_node_is_descendant_of(arena, statement, body.body.node)
+    {
+        return Err(invalid().into());
+    }
+    validate_node_container(bound, bound.flow_graph(), container, statement)?;
+    Ok(statement)
+}
+
+/// This owner follows checker control flow, which does not stop at a static block.
+fn class_control_flow_container(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassBody(node);
+    let mut current = node;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(invalid().into());
+        }
+        let parent = host
+            .node(current)
+            .and_then(|record| record.parent)
+            .ok_or_else(invalid)?;
+        current = NodeRef::new(node.arena, node.file, parent);
+        let record = host.node(current).ok_or_else(invalid)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::SourceFile
+                | SyntaxKind::ModuleBlock
+                | SyntaxKind::PropertyDeclaration
+                | SyntaxKind::Constructor
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+                | SyntaxKind::FunctionDeclaration
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+        ) {
+            return Ok(current);
+        }
+    }
+}
+
+fn plan_outer_class_property_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    target: NodeRef,
+) -> Result<Option<ClassPropertyFlowAssignment>, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(target);
+    let record = host.node(target).ok_or_else(invalid)?;
+    let NodeData::PropertyAccessExpression(property) = &record.data else {
+        return Ok(None);
+    };
+    if source_node_is_descendant_of(arena, target, body.body.node) {
+        return Ok(None);
+    }
+    let expression = NodeRef::new(
+        target.arena,
+        target.file,
+        record.parent.ok_or_else(invalid)?,
+    );
+    let expression_record = host.node(expression).ok_or_else(invalid)?;
+    let NodeData::BinaryExpression(binary) = &expression_record.data else {
+        return Err(invalid().into());
+    };
+    let operator = NodeRef::new(target.arena, target.file, binary.operator_token);
+    let receiver = NodeRef::new(target.arena, target.file, property.expression);
+    let receiver_record = host.node(receiver).ok_or_else(invalid)?;
+    let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+        return Err(invalid().into());
+    };
+    let name = NodeRef::new(target.arena, target.file, property.name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(member_name) = &name_record.data else {
+        return Err(invalid().into());
+    };
+    let statement = NodeRef::new(
+        target.arena,
+        target.file,
+        expression_record.parent.ok_or_else(invalid)?,
+    );
+    let statement_record = host.node(statement).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::PropertyAccessExpression
+        || record.flags.0 != 0
+        || property.question_dot_token.is_some()
+        || property.flow_node.is_some()
+        || property.facts != 0
+        || expression_record.kind != SyntaxKind::BinaryExpression
+        || expression_record.flags.0 != 0
+        || binary.left != target.node
+        || binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.facts != 0
+        || binary.modifiers.is_some()
+        || host
+            .node(operator)
+            .is_none_or(|operator| operator.kind != SyntaxKind::EqualsToken)
+        || receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.parent != Some(target.node)
+        || receiver_record.flags.0 != 0
+        || receiver_name.flow_node.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(target.node)
+        || name_record.flags.0 != 0
+        || member_name.flow_node.is_some()
+        || !matches!(&statement_record.data, NodeData::ExpressionStatement(data)
+            if data.expression == expression.node && data.flow_node.is_none())
+        || statement_record.parent != Some(bound.source_file().node)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file())
+    {
+        return Err(invalid().into());
+    }
+    let mut resolver_host = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut resolver_host)
+            .map_err(|_| invalid())?;
+    let symbol = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &receiver_name.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| invalid())?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let member = owner
+        .exports()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&member_name.text))
+        .ok_or_else(invalid)?;
+    let member_record = store.symbol(member).ok_or_else(invalid)?;
+    if !owner.flags().contains(SymbolFlags::CLASS)
+        || member_record.parent() != Some(symbol)
+        || member_record.value_declaration() != Some(expression)
+        || member_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&expression))
+    {
+        return Err(invalid().into());
+    }
+    Ok(Some(ClassPropertyFlowAssignment {
+        expression,
+        reference: ClassPropertyFlowReference {
+            receiver: ClassPropertyFlowReceiver::Named(symbol),
+            name: member_name.text.clone(),
+        },
+        write: None,
+    }))
+}
+
+fn is_property_assignment_target(host: &DeclaredTypeHost<'_>, target: NodeRef) -> bool {
+    let Some(record) = host.node(target) else {
+        return false;
+    };
+    if !matches!(record.data, NodeData::PropertyAccessExpression(_)) {
+        return false;
+    }
+    let Some(parent) = record.parent else {
+        return false;
+    };
+    let expression = NodeRef::new(target.arena, target.file, parent);
+    matches!(host.node(expression).map(|record| &record.data),
+        Some(NodeData::BinaryExpression(binary))
+            if binary.left == target.node
+                && host.node(NodeRef::new(target.arena, target.file, binary.operator_token))
+                    .is_some_and(|operator| operator.kind.is_assignment_operator()))
+}
+
+fn plan_constructor_property_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    body: &ClassBodyPlan,
+    target: NodeRef,
+    flow: FlowRef,
+) -> Result<Option<ClassPropertyFlowAssignment>, SourceFlowError> {
+    if !is_property_assignment_target(host, target) {
+        return Ok(None);
+    }
+    let invalid = || SourceFlowInvariant::InvalidClassProperty(target);
+    if !matches!(body.kind, ClassBodyKind::Constructor)
+        || !source_node_is_descendant_of(arena, target, body.body.node)
+        || bound.flow_container(target) != Some(body.declaration)
+    {
+        return Err(invalid().into());
+    }
+    let expression = NodeRef::new(
+        target.arena,
+        target.file,
+        host.node(target)
+            .and_then(|record| record.parent)
+            .ok_or_else(invalid)?,
+    );
+    let plan = plan_class_property_write(store, host, expression).map_err(|error| match error {
+        SourcePropertyError::Unsupported(_) => {
+            SourceFlowError::Unsupported(SourceFlowUnsupported::PropertyWrite(target))
+        }
+        _ => invalid().into(),
+    })?;
+    let node = flow_node(bound.flow_graph(), flow)?;
+    if plan.target() != target
+        || plan.context().class_symbol() != body.class_symbol
+        || plan.context().class_declaration() != body.class_declaration
+        || plan.context().body_declaration() != body.declaration
+        || source_flow_kind(flow, node.flags)? != SourceFlowKind::Assignment
+        || ast_payload(flow, &node)? != target
+    {
+        return Err(invalid().into());
+    }
+    linear_antecedent(flow, &node)?;
+    Ok(Some(ClassPropertyFlowAssignment {
+        expression,
+        reference: ClassPropertyFlowReference {
+            receiver: ClassPropertyFlowReceiver::This(body.class_declaration),
+            name: plan.name().to_owned(),
+        },
+        write: Some(ClassPropertyWriteFlow { plan, flow }),
+    }))
+}
+
 fn validate_node_container(
     bound: &BoundFile,
     graph: &BoundFlowGraph,
@@ -2660,6 +3798,146 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn constructor_property_writes_reject_wrong_flow_tokens_references_and_edges() {
+        use crate::semantic::{classes, production::GlobalMergeCompletion};
+
+        #[derive(Clone, Copy)]
+        enum Change {
+            Token,
+            Reference,
+            Edge,
+            Container,
+        }
+
+        let parsed = parse_source_file(concat!(
+            "class First { value?: number; constructor() { this.value = 1; this.value = 2; } } ",
+            "class Second { value?: number; constructor() { this.value = 2; } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(31_801);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let class_symbol = |context: &CanonicalCheckerContext<'_>, name| {
+            context
+                .store()
+                .symbol_table(context.globals())
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        };
+        let first_symbol = class_symbol(&context, "First");
+        let second_symbol = class_symbol(&context, "Second");
+        let first =
+            classes::plan_source_class_members(context.store(), &host, first_symbol).unwrap();
+        let second =
+            classes::plan_source_class_members(context.store(), &host, second_symbol).unwrap();
+        let assignment = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| matches!(record.data, NodeData::BinaryExpression(_)))
+            .min_by_key(|(_, record)| record.range.start)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+            .unwrap();
+        let write = plan_class_property_write(context.store(), &host, assignment).unwrap();
+        let body = &first.bodies()[0];
+        let plan = SourceFlowPlan::preflight_class_body(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            body,
+            [write.statement(), write.target(), write.receiver()],
+            [],
+            [],
+        )
+        .unwrap();
+        let other_assignment_flow = plan
+            .property_assignments
+            .values()
+            .filter_map(|assignment| assignment.write.as_ref())
+            .find(|assignment| assignment.plan.target() != write.target())
+            .unwrap()
+            .flow;
+        let first_prepared =
+            classes::prepare_source_class_members(context.store_mut_for_test(), &host, &first)
+                .unwrap();
+        let access = first_prepared
+            .body_access(context.store(), &host, body)
+            .unwrap();
+        let second_prepared =
+            classes::prepare_source_class_members(context.store_mut_for_test(), &host, &second)
+                .unwrap();
+        let second_access = second_prepared
+            .body_access(context.store(), &host, &second.bodies()[0])
+            .unwrap();
+        let frame =
+            ClassInitializationFrame::new(body, &plan, &bound, access.clone(), HashMap::new())
+                .unwrap();
+        frame
+            .preflight_property_assignment(context.store(), &host, &write)
+            .unwrap();
+        assert!(frame.property_assignments.is_empty());
+
+        for change in [
+            Change::Token,
+            Change::Reference,
+            Change::Edge,
+            Change::Container,
+        ] {
+            let mut changed = plan.clone();
+            let mut token = access.clone();
+            match change {
+                Change::Token => token = second_access.clone(),
+                Change::Reference => {
+                    changed
+                        .property_assignments
+                        .get_mut(&write.target())
+                        .unwrap()
+                        .reference
+                        .receiver = ClassPropertyFlowReceiver::Named(first_symbol);
+                }
+                Change::Edge => {
+                    changed
+                        .property_assignments
+                        .get_mut(&write.target())
+                        .unwrap()
+                        .write
+                        .as_mut()
+                        .unwrap()
+                        .flow = other_assignment_flow;
+                }
+                Change::Container => changed.container = second.bodies()[0].declaration,
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let frame =
+                ClassInitializationFrame::new(body, &changed, &bound, token, HashMap::new())
+                    .unwrap();
+            assert_eq!(
+                frame.preflight_property_assignment(context.store(), &host, &write),
+                Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+            );
+            assert!(frame.property_assignments.is_empty());
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before
+            );
+        }
+    }
+
     fn loop_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef, NodeRef, NodeRef) {
         let (function, parameter) = parsed
             .arena
@@ -2776,8 +4054,10 @@ mod tests {
         let start = FlowRef::new(arena.id(), file, FlowNodeId(3));
         let mut plan = SourceFlowPlan {
             container,
+            start_container: container,
             start,
             start_payload: None,
+            end: None,
             points: HashMap::new(),
             point_order: Vec::new(),
             conditions: HashMap::new(),
@@ -2785,6 +4065,8 @@ mod tests {
             assignment_order: Vec::new(),
             parameter_assignments: HashMap::new(),
             calls: HashMap::new(),
+            class_body: None,
+            property_assignments: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);
         assert_eq!(validate_start_node(&plan, start, &without_payload), Ok(()));

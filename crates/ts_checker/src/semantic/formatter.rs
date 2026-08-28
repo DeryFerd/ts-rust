@@ -807,6 +807,10 @@ fn display_type_worker(
     }
     if type_flags.intersects(TypeFlags::TYPE_PARAMETER) {
         require_data_kind(type_id, record, TypeDataKind::TypeParameter)?;
+        if super::classes::source_class_this_type_owner(store, type_id).is_some() {
+            state.add(4);
+            return Ok("this".to_owned());
+        }
         if let Some(host) = host
             && super::classes::class_query_is_this_type(store, host, type_id)
                 .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
@@ -1092,6 +1096,56 @@ fn display_object_type(
             validate_property_object_alias(store, host, type_id, record, alias)?;
         }
         return display_alias_name(store, host, type_id, alias, state);
+    }
+    if let Some(host) = host {
+        if let Some(symbol) =
+            super::classes::class_instance_super_display_symbol(store, host, type_id)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        {
+            return display_symbol_name(store, Some(host), type_id, symbol, state);
+        }
+        if let Some(callable) =
+            super::classes::class_instance_super_display_callable(store, host, type_id)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        {
+            if !visiting.insert(type_id) {
+                return Err(TypeDisplayUnavailable::CyclicType(type_id));
+            }
+            let result = (|| {
+                let mut result = String::new();
+                let mut parameters = callable.parameters.clone();
+                parameters.extend(callable.rest_parameter);
+                append_validated_signature_parameters(
+                    store,
+                    host,
+                    global_types,
+                    type_id,
+                    callable.signature,
+                    &parameters,
+                    flags,
+                    state,
+                    visiting,
+                    &mut result,
+                )?;
+                result.push_str(" => ");
+                state.add(4);
+                let returned = callable
+                    .return_type
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                result.push_str(&display_type_worker(
+                    store,
+                    Some(host),
+                    global_types,
+                    returned,
+                    flags,
+                    state,
+                    visiting,
+                )?);
+                Ok(result)
+            })();
+            visiting.remove(&type_id);
+            return result;
+        }
     }
     if let Some(host) = host
         && let Some(name) = display_validated_enum_value(store, host, type_id, record, state)?

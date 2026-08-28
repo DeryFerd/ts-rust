@@ -3092,7 +3092,7 @@ fn plan_callback_class_union_constructor(
         let class = ClassMemberQueryPlan::Direct(class.clone());
         if class.symbol() != class_symbol
             || class.constructor_visibility() != ClassConstructorVisibility::Public
-            || class.constructor_parameter_symbol().is_some()
+            || !class.constructor_parameter_symbols().is_empty()
             || class.constructor_minimum_argument_count() != 0
             || classes
                 .iter()
@@ -3296,7 +3296,7 @@ fn collect_class_union_constructors(
             let class = ClassMemberQueryPlan::Direct(class.clone());
             if class.symbol() != symbol
                 || class.constructor_visibility() != ClassConstructorVisibility::Public
-                || class.constructor_parameter_symbol().is_some()
+                || !class.constructor_parameter_symbols().is_empty()
                 || class.constructor_minimum_argument_count() != 0
                 || classes.iter().any(|previous| previous.symbol() == symbol)
             {
@@ -3445,7 +3445,7 @@ fn constructor_parameter(
     let parameter = match constructor_data.parameters.nodes.as_slice() {
         [] => return Ok(None),
         [parameter] => NodeRef::new(declaration.arena, declaration.file, *parameter),
-        _ => return Err(invalid()),
+        _ => return Err(unsupported(SourceNewUnsupported::Constructor(declaration))),
     };
     let parameter_record = host.node(parameter).ok_or_else(invalid)?;
     let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
@@ -3469,7 +3469,7 @@ fn constructor_parameter(
                 .is_none_or(|record| record.parent != Some(parameter.node))
             || class.constructor_minimum_argument_count() != 0
             || planned.node() != initializer
-            || class.constructor_parameter_symbol().is_none()
+            || class.constructor_parameter_symbols().len() != 1
         {
             return Err(invalid());
         }
@@ -3521,7 +3521,7 @@ fn constructor_parameter(
         || type_record.parent != Some(parameter.node)
         || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
         || raw != symbol
-        || class.constructor_parameter_symbol() != Some(symbol)
+        || class.constructor_parameter_symbols() != [symbol]
         || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
         || symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
@@ -6680,7 +6680,7 @@ fn validate_selected_default_signature(
     if signature_record.flags() != expected_flags
         || signature_record.declaration() != class.constructor_declaration()
         || signature_record.type_parameters() != type_parameters
-        || signature_record.parameters() != class.constructor_parameter_symbol().as_slice()
+        || signature_record.parameters() != class.constructor_parameter_symbols().as_slice()
         || signature_record.this_parameter().is_some()
         || signature_record.min_argument_count() != class.constructor_minimum_argument_count()
         || signature_record.resolved_min_argument_count() != -1
