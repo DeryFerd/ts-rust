@@ -678,7 +678,7 @@ struct PreparedSourceImportModuleProperty {
     type_: TypeId,
     namespace: Option<Box<PreparedSourceImportNestedNamespace>>,
     recursive_const: Option<PreparedSourceImportRecursiveConst>,
-    namespace_const: Option<PreparedSourceImportNamespaceConst>,
+    namespace_const: Option<Box<PreparedSourceImportNamespaceConst>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -752,7 +752,7 @@ enum PlannedSourceImportValueTarget {
         module: SemanticSymbolId,
         staged_alias: Option<StagedSourceImportNamespaceAlias>,
     },
-    ColdNamespaceConst(PreparedSourceImportNamespaceConst),
+    ColdNamespaceConst(Box<PreparedSourceImportNamespaceConst>),
     PublishedSpreadObject {
         declaration: NodeRef,
         object: Box<PropertyObjectPlan>,
@@ -6621,7 +6621,7 @@ fn materialize_imported_module_namespace(
             })
             .collect::<Result<Vec<_>, SourceImportError>>()?;
         let mut properties = Vec::with_capacity(existing_members.len());
-        for (member, symbol, type_) in existing_members {
+        for (index, (member, symbol, type_)) in existing_members.into_iter().enumerate() {
             let (namespace, mut recursive_const, mut namespace_const) = match member.target {
                 PlannedSourceImportValueTarget::RecursiveNamespaceConst {
                     recursive,
@@ -6677,14 +6677,19 @@ fn materialize_imported_module_namespace(
                     (namespace, None, None)
                 }
             };
+            let retained = store
+                .source_file_namespace_identity(module)
+                .and_then(|identity| identity.properties.as_ref())
+                .map(|properties| {
+                    properties
+                        .get(index)
+                        .filter(|property| property.symbol == symbol)
+                        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(module)))
+                })
+                .transpose()?;
             if namespace_const.is_none()
-                && let Some(retained) = store
-                    .source_file_namespace_identity(module)
-                    .and_then(|identity| identity.properties.as_ref())
-                    .and_then(|properties| {
-                        properties.iter().find(|property| property.symbol == symbol)
-                    })
-                    .and_then(|property| property.namespace_const.as_ref())
+                && let Some(retained) =
+                    retained.and_then(|property| property.namespace_const.as_ref())
             {
                 if namespace.is_some()
                     || recursive_const.is_some()
@@ -6701,13 +6706,8 @@ fn materialize_imported_module_namespace(
                 namespace_const = Some(retained.clone());
             }
             if recursive_const.is_none()
-                && let Some(retained) = store
-                    .source_file_namespace_identity(module)
-                    .and_then(|identity| identity.properties.as_ref())
-                    .and_then(|properties| {
-                        properties.iter().find(|property| property.symbol == symbol)
-                    })
-                    .and_then(|property| property.recursive_const.as_ref())
+                && let Some(retained) =
+                    retained.and_then(|property| property.recursive_const.as_ref())
             {
                 if namespace.is_some()
                     || namespace_const.is_some()
@@ -8758,7 +8758,7 @@ fn plan_published_namespace_const_target(
                 return Err(invalid());
             }
             return Ok(PlannedSourceImportValueTarget::ColdNamespaceConst(
-                namespace,
+                Box::new(namespace),
             ));
         }
         let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
