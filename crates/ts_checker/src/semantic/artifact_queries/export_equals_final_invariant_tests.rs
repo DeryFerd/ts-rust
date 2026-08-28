@@ -1599,3 +1599,6 @@ fn export_equals_unmerged_ambient_class_prepares_value_without_an_ordinary_read(
         });
     }
 }
+
+#[path = "standalone_global_class_review_tests.rs"]
+mod standalone_global_class_review_tests;
