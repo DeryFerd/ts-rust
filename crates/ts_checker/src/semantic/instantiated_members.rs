@@ -2347,6 +2347,26 @@ fn instantiate_generic_member_type_inner(
     if store.type_has_function_type_provenance(template) {
         return instantiate_function_member_type(store, template, mapper, array_targets, session);
     }
+    if let Some((callback, undefined)) = optional_function_member(store, template)? {
+        let mapped = instantiate_generic_member_type_worker(
+            store,
+            callback,
+            mapper,
+            array_targets,
+            session,
+            active,
+        )?;
+        if mapped == callback {
+            return Ok(template);
+        }
+        return store
+            .literal_union_type_with_alias_and_array_targets(
+                &[mapped, undefined],
+                None,
+                array_targets,
+            )
+            .map_err(|_| GenericInterfaceMemberError::UnsupportedPropertyType(template));
+    }
     let indexed = match store
         .type_payload(template)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(
@@ -2437,6 +2457,86 @@ fn method_tuple_union_members(
         .validate_canonical_union_metadata(type_, &union.union.types)
         .map_err(|_| invalid())?;
     Ok(Some(&union.union.types))
+}
+
+fn optional_function_member(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<(TypeId, TypeId)>, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::UnsupportedPropertyType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    let [first, second] = union.union.types.as_slice() else {
+        return Ok(None);
+    };
+    let undefined = store
+        .intrinsic_bootstrap()
+        .ok_or_else(invalid)?
+        .undefined_type;
+    let callback = if *first == undefined {
+        *second
+    } else if *second == undefined {
+        *first
+    } else {
+        return Ok(None);
+    };
+    let callback_source = store.type_has_function_type_provenance(callback)
+        || matches!(store.type_payload(callback).map(super::TypeRecord::data),
+        Some(TypeData::Object(object)) if object.target.is_some_and(|source| {
+            store.type_has_function_type_provenance(source)
+        }));
+    if !callback_source {
+        return Ok(None);
+    }
+    if record.alias().is_some()
+        || union.origin.is_some()
+        || store
+            .validate_canonical_union_metadata(type_, &union.union.types)
+            .is_err()
+    {
+        return Err(invalid());
+    }
+    Ok(Some((callback, undefined)))
+}
+
+fn method_parameter_contains_function(
+    store: &CanonicalTypeMapperStore,
+    parameter: TypeId,
+    callback: TypeId,
+) -> bool {
+    parameter == callback
+        || optional_function_member(store, parameter)
+            .is_ok_and(|optional| optional.is_some_and(|(source, _)| source == callback))
+}
+
+pub(super) fn instantiated_optional_function_member_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<bool> {
+    let (source, undefined) = match optional_function_member(store, template) {
+        Ok(Some(optional)) => optional,
+        Ok(None) => return None,
+        Err(_) => return Some(false),
+    };
+    Some(
+        optional_function_member(store, actual).is_ok_and(|optional| {
+            optional.is_some_and(|(mapped, sentinel)| {
+                sentinel == undefined
+                    && instantiated_function_member_type_matches(
+                        store,
+                        source,
+                        mapped,
+                        mapper,
+                        array_targets,
+                    )
+            })
+        }),
+    )
 }
 
 /// Validates fixed tuple templates through the method's original mapper.
@@ -2652,7 +2752,7 @@ fn function_member_declaring_method(
                             .iter()
                             .zip(parameter_types)
                             .any(|(&symbol, &type_)| {
-                                type_ == source
+                                method_parameter_contains_function(store, type_, source)
                                     && store
                                         .symbol(symbol)
                                         .and_then(|symbol| symbol.declarations())
@@ -2933,7 +3033,7 @@ fn instantiated_function_member_owner(
     };
     let this_type = interface.this_type?;
     let targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
-    store.types().find_map(|(method_type, record)| {
+    let published = store.types().find_map(|(method_type, record)| {
         let TypeData::Object(object) = record.data() else {
             return None;
         };
@@ -2952,13 +3052,75 @@ fn instantiated_function_member_owner(
             .iter()
             .zip(&plan.signatures)
             .any(|(&signature, original)| {
-                original.parameter_types.contains(&source)
+                original
+                    .parameter_types
+                    .iter()
+                    .any(|parameter| method_parameter_contains_function(store, *parameter, source))
                     && store
                         .signature(signature)
                         .is_some_and(|signature| signature.mapper() == Some(mapper))
             })
             .then_some(targets)
-    })
+    });
+    if published.is_some() {
+        return published;
+    }
+    if store.types().any(|(_, record)| {
+        matches!(record.data(), TypeData::Object(object)
+            if record.symbol() == Some(method)
+                && object.target == Some(method_source)
+                && object.mapper == Some(mapper))
+    }) {
+        return None;
+    }
+
+    // An optional callback union is built before its enclosing method value.
+    // At that point the source callback and exact owner mapper prove its origin.
+    let declaration = store
+        .type_payload(source)?
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))?
+        .declarations()?
+        .first()
+        .copied()?;
+    let SourceNodeParent::Parent(parameter) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(method_declaration) = store.source_node_parent(parameter)? else {
+        return None;
+    };
+    if store
+        .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
+        .is_none()
+    {
+        return None;
+    }
+    let signature = store
+        .signature_links(method_declaration)?
+        .resolved_signature
+        .signature()?;
+    if !store.signature(signature)?.type_parameters().is_empty() {
+        return None;
+    }
+    let receiver = store.map_type(mapper, this_type)?;
+    let reference = validate_direct_generic_reference(store, receiver).ok()?;
+    let parameters = interface.reference.resolved_type_arguments.as_deref()?;
+    if reference.target != owner_type || reference.type_arguments.len() != parameters.len() {
+        return None;
+    }
+    let sources = parameters
+        .iter()
+        .copied()
+        .chain([this_type])
+        .collect::<Vec<_>>();
+    let mapped = reference
+        .type_arguments
+        .iter()
+        .copied()
+        .chain([receiver])
+        .collect::<Vec<_>>();
+    (store.type_mapper_has_exact_endpoints(mapper, &sources, &mapped) == Some(true))
+        .then_some(targets)
 }
 
 /// Provides mapped function types before the declaration-only callable provider.
@@ -3874,6 +4036,16 @@ fn member_type_requires_instantiation_inner(
             )?;
         }
         return Ok(requires);
+    }
+    if let Some((callback, _)) = optional_function_member(store, type_)? {
+        return member_type_requires_instantiation_worker(
+            store,
+            callback,
+            mapper_parameters,
+            array_targets,
+            active,
+            classify_only,
+        );
     }
     if let Some(TypeData::IndexedAccess(indexed)) = store
         .type_payload(type_)

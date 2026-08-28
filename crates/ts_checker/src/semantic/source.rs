@@ -25919,11 +25919,18 @@ fn preflight_inferred_function_return_dependencies(
     cross_file_global_reads: &[PlannedCrossFileGlobalRead],
     enums: &[&SourceEnumPlan],
 ) -> Result<(), SourceCheckError> {
+    #[derive(Clone, Copy)]
+    struct FunctionDependencies<'a, 'sources> {
+        declarations: &'a [PlannedFunction],
+        host: &'a DeclaredTypeHost<'sources>,
+        store: &'a CanonicalTypeMapperStore,
+    }
+
     fn expression_is_closed(
         expression: &PlannedExpression,
         parameters: &[SourceCallableParameterPlan],
         locals: &HashSet<SemanticSymbolId>,
-        functions: &[PlannedFunction],
+        functions: FunctionDependencies<'_, '_>,
     ) -> bool {
         match &expression.kind {
             PlannedExpressionKind::Null
@@ -25946,24 +25953,102 @@ fn preflight_inferred_function_return_dependencies(
                         || locals.contains(&read.value_symbol)
                 }
                 PlannedIdentifierReadKind::Arguments => true,
-                PlannedIdentifierReadKind::DeclaredValue => locals.contains(&read.value_symbol),
+                PlannedIdentifierReadKind::DeclaredValue => {
+                    locals.contains(&read.value_symbol)
+                        || functions
+                            .store
+                            .symbol(read.value_symbol)
+                            .and_then(ts_binder::semantic::Symbol::value_declaration)
+                            .is_some_and(|declaration| {
+                                functions
+                                    .host
+                                    .bound_file(declaration)
+                                    .and_then(BoundFile::source_facts)
+                                    .is_some_and(|facts| {
+                                        facts.is_default_library() && facts.is_declaration_file()
+                                    })
+                                    && functions.host.node(declaration).is_some_and(|node| {
+                                        matches!(&node.data, NodeData::VariableDeclaration(variable)
+                                            if variable.type_.is_some() && variable.initializer.is_none())
+                                    })
+                            })
+                }
                 PlannedIdentifierReadKind::Function
                 | PlannedIdentifierReadKind::Import
                 | PlannedIdentifierReadKind::Unresolved => false,
             },
             PlannedExpressionKind::Arrow(arrow) => {
-                arrow.callable.family == SourceCallableFamily::ArrowFunction
-                    && !arrow.callable.parameters.is_empty()
-                    && arrow.callable.type_parameters.is_empty()
-                    && arrow.parameter_initializers.is_empty()
-                    && arrow.expression_statement.is_none()
-                    && matches!(arrow.body, PlannedArrowBody::Empty)
-                    && arrow.callable.parameters.iter().all(|parameter| {
+                if arrow.callable.family != SourceCallableFamily::ArrowFunction
+                    || arrow.callable.parameters.is_empty()
+                    || !arrow.callable.type_parameters.is_empty()
+                    || !arrow.parameter_initializers.is_empty()
+                    || arrow.expression_statement.is_some()
+                {
+                    return false;
+                }
+                if matches!(arrow.body, PlannedArrowBody::Empty) {
+                    return arrow.callable.parameters.iter().all(|parameter| {
                         parameter.explicit_type_node().is_some()
                             && parameter.initializer.is_none()
                             && !parameter.optional
                             && !parameter.rest
-                    })
+                    });
+                }
+                let PlannedArrowBody::Return { expression, .. } = &arrow.body else {
+                    return false;
+                };
+                let Some((arena, bound)) = functions.host.source(arrow.callable.declaration) else {
+                    return false;
+                };
+                if !super::source_calls::is_authenticated_sort_callback_syntax(
+                    arena,
+                    arrow.callable.declaration,
+                ) || arrow.callable.parameters.len() != 2
+                {
+                    return false;
+                }
+                let mut callback_locals = locals.clone();
+                for parameter in &arrow.callable.parameters {
+                    let Some(NodeData::ParameterDeclaration(parameter)) =
+                        functions
+                            .host
+                            .node(parameter.declaration)
+                            .map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    let Some(NodeData::BindingPattern(pattern)) =
+                        arena.get(parameter.name).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    if !super::source_calls::is_authenticated_sort_tuple_binding(
+                        arena,
+                        parameter.name,
+                        pattern,
+                    ) {
+                        return false;
+                    }
+                    for element in &pattern.elements.nodes {
+                        let element = NodeRef::new(arena.id(), bound.file_id(), *element);
+                        let Some(symbol) = bound
+                            .symbol(element)
+                            .and_then(|symbol| functions.store.get_merged_symbol(symbol))
+                        else {
+                            return false;
+                        };
+                        if bound.container(element) != Some(arrow.callable.declaration) {
+                            return false;
+                        }
+                        callback_locals.insert(symbol);
+                    }
+                }
+                expression_is_closed(
+                    expression,
+                    &arrow.callable.parameters,
+                    &callback_locals,
+                    functions,
+                )
             }
             PlannedExpressionKind::TypeImportValueUse(_)
             | PlannedExpressionKind::ClassReceiver(_)
@@ -26021,7 +26106,7 @@ fn preflight_inferred_function_return_dependencies(
                 let callee_is_closed = match &callee.kind {
                     PlannedExpressionKind::Identifier(read) => {
                         read.kind == PlannedIdentifierReadKind::Function
-                            && functions.iter().any(|function| {
+                            && functions.declarations.iter().any(|function| {
                                 function.callable.owner_symbol == read.value_symbol
                                     && !function.callable.return_type.is_inferred()
                             })
@@ -26062,7 +26147,7 @@ fn preflight_inferred_function_return_dependencies(
         declarations: &[PlannedVariable],
         parameters: &[SourceCallableParameterPlan],
         locals: &mut HashSet<SemanticSymbolId>,
-        functions: &[PlannedFunction],
+        functions: FunctionDependencies<'_, '_>,
     ) -> bool {
         declarations.iter().all(|local| {
             match &local.initializer {
@@ -26087,7 +26172,7 @@ fn preflight_inferred_function_return_dependencies(
         statements: &[PlannedLinearFunctionStatement],
         parameters: &[SourceCallableParameterPlan],
         locals: &mut HashSet<SemanticSymbolId>,
-        functions: &[PlannedFunction],
+        functions: FunctionDependencies<'_, '_>,
     ) -> bool {
         statements.iter().all(|statement| match statement {
             PlannedLinearFunctionStatement::Local(index) => {
@@ -26111,7 +26196,7 @@ fn preflight_inferred_function_return_dependencies(
         condition: &PlannedSourceCondition,
         parameters: &[SourceCallableParameterPlan],
         locals: &HashSet<SemanticSymbolId>,
-        functions: &[PlannedFunction],
+        functions: FunctionDependencies<'_, '_>,
     ) -> bool {
         match condition {
             PlannedSourceCondition::Logical { left, right, .. } => {
@@ -26134,6 +26219,11 @@ fn preflight_inferred_function_return_dependencies(
     }
 
     for function in functions {
+        let functions = FunctionDependencies {
+            declarations: functions,
+            host,
+            store,
+        };
         if !function.callable.return_type.is_inferred() {
             continue;
         }
@@ -28458,6 +28548,48 @@ fn source_is_global_object_factory_method(host: &DeclaredTypeHost<'_>, node: Nod
     )
 }
 
+/// Whole-value reads still require the complete annotation before source execution.
+fn cross_file_global_uses_only_object_factory_calls(
+    host: &DeclaredTypeHost<'_>,
+    identifier_reads: &[(NodeRef, SemanticSymbolId)],
+    read: &PlannedCrossFileGlobalRead,
+) -> bool {
+    if !host
+        .bound_file(read.type_node)
+        .and_then(BoundFile::source_facts)
+        .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
+    {
+        return false;
+    }
+    let mut saw_read = false;
+    for &(node, symbol) in identifier_reads {
+        if symbol != read.read.resolved_symbol {
+            continue;
+        }
+        saw_read = true;
+        let Some(property) = host
+            .node(node)
+            .and_then(|record| record.parent)
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        else {
+            return false;
+        };
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            host.node(property).map(|record| &record.data)
+        else {
+            return false;
+        };
+        if access.expression != node.node
+            || access.question_dot_token.is_some()
+            || !source_is_global_object_factory_method(host, property)
+            || !source_property_is_direct_method_call(host, property)
+        {
+            return false;
+        }
+    }
+    saw_read
+}
+
 fn emit_enum_use_before_declaration_diagnostics(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -28533,7 +28665,7 @@ fn source_property_is_direct_method_call(host: &DeclaredTypeHost<'_>, node: Node
         })
 }
 
-/// Keeps contextual sort callbacks on the existing tuple-binding call path.
+/// Identifies sort calls that use tuple-binding callbacks.
 fn source_property_is_contextual_sort_call(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
     let Some((arena, _)) = host.source(node) else {
         return false;
@@ -28554,6 +28686,43 @@ fn source_property_is_contextual_sort_call(host: &DeclaredTypeHost<'_>, node: No
             arena,
             NodeRef::new(node.arena, node.file, *argument),
         )
+}
+
+fn source_contextual_sort_needs_method_query(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let Some(array) = store.canonical_array_reference(global_types, receiver)? else {
+        return Ok(false);
+    };
+    let target = if array.readonly {
+        global_types.readonly_array_type
+    } else {
+        global_types.array_type
+    };
+    let Some(record) = store.type_payload(target) else {
+        return Ok(false);
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return Ok(false);
+    };
+    let Some(owner) = record.symbol() else {
+        return Ok(false);
+    };
+    if interface.declared_members_resolved {
+        return Ok(false);
+    }
+    if !super::object_members::authenticated_default_library_interface_owner(store, owner) {
+        return Ok(false);
+    }
+    let method = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source("sort"))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    Ok(method.is_some())
 }
 
 fn source_method_receiver_needs_source_query(
@@ -28603,6 +28772,7 @@ fn check_source_selected_method_property(
     if plan.class_access_context().is_some()
         || !source_property_is_direct_method_call(host, plan.node)
         || source_property_is_contextual_sort_call(host, plan.node)
+            && !source_contextual_sort_needs_method_query(store, global_types, receiver)?
         || source_global_wrapper_method_name(host, plan.node).is_some()
         || source_is_global_array_concat_method(host, plan.node)
         || source_global_array_callback_method_name(host, plan.node).is_some()
@@ -28621,6 +28791,8 @@ fn check_source_selected_method_property(
             | TypeFlags::ES_SYMBOL_LIKE,
     );
     if !scalar
+        && !(source_is_global_object_factory_method(host, plan.node)
+            && matches!(record.data(), TypeData::Interface(_)))
         && (!record.flags().intersects(TypeFlags::OBJECT)
             || store
                 .canonical_array_reference(global_types, receiver)?
@@ -41477,6 +41649,7 @@ impl IterationPropertyResolver for SourceIterationProperties<'_, '_, '_> {
             receiver
         };
         let mut demanded = HashSet::new();
+        let mut demanded_callback_returns = HashSet::new();
         loop {
             match super::object_members::resolve_object_property_by_key_with_source(
                 store,
@@ -41506,6 +41679,19 @@ impl IterationPropertyResolver for SourceIterationProperties<'_, '_, '_> {
                         self.diagnostics,
                         symbol,
                     )?;
+                }
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::UnsupportedStructuredType(type_),
+                )) if (store.type_has_function_type_provenance(type_)
+                    || store.type_payload(type_).is_some_and(|record| {
+                        matches!(record.data(), TypeData::Union(union)
+                        if union.union.types.iter().any(|member| {
+                            store.type_has_function_type_provenance(*member)
+                        }))
+                    }))
+                    && demanded_callback_returns.insert(type_) =>
+                {
+                    self.resolve_callable_returns(store, type_)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -54766,21 +54952,29 @@ pub(super) fn check_source_file(
             .preflight_type_from_type_node(annotation)?;
         }
     }
+    let mut lazy_cross_file_globals = HashSet::new();
     let mut preflighted_cross_file_globals = HashSet::new();
     for read in &cross_file_global_reads {
         if !preflighted_cross_file_globals.insert(read.read.value_symbol) {
             continue;
         }
+        if cross_file_global_uses_only_object_factory_calls(host, &identifier_reads, read) {
+            lazy_cross_file_globals.insert(read.read.value_symbol);
+        }
         session.reset_query();
-        CanonicalTypeQuery::new_with_global_types_and_session(
+        let query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
             session,
             &mut type_import_preflight_diagnostics,
-        )?
-        .preflight_type_from_type_node(read.type_node)?;
+        )?;
+        if lazy_cross_file_globals.contains(&read.read.value_symbol) {
+            query.preflight_type_of_declared_value(read.read.value_symbol)?;
+        } else {
+            query.preflight_type_from_type_node(read.type_node)?;
+        }
     }
     for statement in &statements {
         match statement {
@@ -55300,15 +55494,19 @@ pub(super) fn check_source_file(
         }
         session.reset_query();
         let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
-        let declared_type = CanonicalTypeQuery::new_with_global_types_and_session(
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
             global_types,
             options,
             session,
             &mut annotation_diagnostics,
-        )?
-        .get_type_from_type_node(read.type_node);
+        )?;
+        let declared_type = if lazy_cross_file_globals.contains(&read.read.value_symbol) {
+            query.get_type_of_declared_value(read.read.value_symbol)
+        } else {
+            query.get_type_from_type_node(read.type_node)
+        };
         merge_retry_diagnostics(diagnostics, annotation_diagnostics);
         let declared_type = declared_type?;
         let cached = store
@@ -63850,7 +64048,7 @@ mod tests {
         let return_type = context
             .store()
             .signature(signature)
-            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .and_then(|signature| signature.resolved_return_type())
             .unwrap();
         assert_eq!(
             context.type_to_string(return_type).unwrap(),
@@ -74055,6 +74253,7 @@ mod tests {
             "interface ReadonlyArray<T> {} ",
             "interface Object {} ",
             "interface ObjectConstructor { ",
+            "new(value?: any): Object; ",
             "keys(value: object): string[]; ",
             "values(value: {}): any[]; ",
             "entries(value: {}): [string, any][]; ",
@@ -74101,6 +74300,21 @@ mod tests {
             .and_then(|globals| globals.get_source("ObjectConstructor"))
             .and_then(|symbol| context.store().get_merged_symbol(symbol))
             .unwrap();
+        let constructor_type = context
+            .store()
+            .declared_type_links(constructor)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = context
+            .store()
+            .type_payload(constructor_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("the Object constructor must retain its declared interface")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.declared_construct_signatures.is_none());
         for (access_id, access) in source
             .arena
             .iter()
@@ -74129,6 +74343,181 @@ mod tests {
             );
         }
 
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
+    fn global_object_factory_calls_keep_full_type_checks_for_other_reads() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Object {} ",
+            "interface ObjectConstructor { ",
+            "new(value?: any): Object; ",
+            "entries(value: {}): [string, any][]; ",
+            "} declare var Object: ObjectConstructor;",
+        ));
+        let source = parsed("Object.entries({ value: 1 }); const constructor = Object;");
+        let library_file = FileId::new(9_498);
+        let source_file = FileId::new(9_499);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            source_file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            true,
+        );
+        context.check_source_file(source_file).unwrap();
+        let constructor = variable_value_type(&context, &source, source_file, "constructor");
+        let TypeData::Interface(interface) =
+            context.store().type_payload(constructor).unwrap().data()
+        else {
+            panic!("the whole-value read must retain the constructor interface")
+        };
+        assert!(interface.declared_members_resolved);
+        assert_eq!(
+            interface
+                .declared_construct_signatures
+                .as_deref()
+                .map(<[_]>::len),
+            Some(1),
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
+    fn global_object_factory_object_argument_uses_declared_fallback() {
+        for (element, expected) in [("any", "[string, any][]"), ("number", "[string, number][]")] {
+            let library = parsed(&format!(
+                "{} entries(value: {{}}): [string, {element}][]; }} declare var Object: ObjectConstructor;",
+                concat!(
+                    "interface Array<T> {} interface ReadonlyArray<T> {} ",
+                    "interface Object {} interface Function {} interface IArguments {} ",
+                    "interface String {} interface Number {} interface Boolean {} ",
+                    "interface RegExp {} interface ThisType<T> {} ",
+                    "interface ArrayLike<T> { readonly length: number; readonly [n: number]: T; } ",
+                    "interface ObjectConstructor { ",
+                    "entries<T>(value: { [s: string]: T; } | ArrayLike<T>): [string, T][];",
+                ),
+            ));
+            let source =
+                parsed("declare const input: object; const result = Object.entries(input);");
+            let library_file = FileId::new(9_500);
+            let source_file = FileId::new(9_501);
+            let mut context = context_with_cross_file_global(
+                library_file,
+                &library,
+                source_file,
+                &source,
+                CanonicalModuleState::Script,
+                CanonicalModuleState::Script,
+                true,
+            );
+            context.check_source_file(source_file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(
+                        &context,
+                        &source,
+                        source_file,
+                        "result"
+                    ))
+                    .unwrap(),
+                expected,
+            );
+            let constructor = global_symbol(&context, "ObjectConstructor");
+            let declarations = context
+                .store()
+                .symbol(constructor)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("entries"))
+                .and_then(|method| context.store().symbol(method))
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .unwrap();
+            let call = variable_initializer(&source, source_file, "result");
+            let selected = context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .and_then(|signature| context.store().signature(signature))
+                .unwrap();
+            assert_eq!(selected.declaration(), Some(declarations[1]));
+            assert!(selected.target().is_none());
+            let warm = observable_state(&context, source_file);
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(observable_state(&context, source_file), warm);
+        }
+    }
+
+    #[test]
+    fn global_object_entries_sort_checks_generic_tuple_callback_members() {
+        let library = parsed(concat!(
+            "interface Array<T> { sort(compareFn?: (a: T, b: T) => number): this; } ",
+            "interface ReadonlyArray<T> {} interface Object {} interface Function {} ",
+            "interface IArguments {} interface String {} interface Number {} ",
+            "interface Boolean {} interface RegExp {} interface ThisType<T> {} ",
+            "interface ArrayLike<T> { readonly length: number; readonly [n: number]: T; } ",
+            "interface ObjectConstructor { ",
+            "entries<T>(value: { [s: string]: T; } | ArrayLike<T>): [string, T][]; ",
+            "entries(value: {}): [string, any][]; ",
+            "} declare var Object: ObjectConstructor;",
+        ));
+        let source = parsed(concat!(
+            "function foo(x?: object) { ",
+            "return Object.entries(x || {}) ",
+            ".sort(([k1, v1], [k2, v2]) => v1.name.localeCompare(v2.name)); ",
+            "}",
+        ));
+        let library_file = FileId::new(9_502);
+        let source_file = FileId::new(9_503);
+        let mut context = context_with_cross_file_global(
+            library_file,
+            &library,
+            source_file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            true,
+        );
+        context
+            .check_source_file(source_file)
+            .unwrap_or_else(|error| {
+                let type_ = match &error {
+                    SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnsupportedStructuredType(type_),
+                    ) => context.store().type_payload(*type_),
+                    _ => None,
+                };
+                panic!("entries sort check failed: {error:?}, type: {type_:?}")
+            });
+        assert!(context.diagnostics().is_empty());
+        let function = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let returned = context
+            .store()
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .and_then(|signature| context.store().signature(signature))
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(returned).unwrap(), "[string, any][]");
         let warm = observable_state(&context, source_file);
         context.recheck_source_file(source_file).unwrap();
         assert_eq!(observable_state(&context, source_file), warm);

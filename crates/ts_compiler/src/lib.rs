@@ -13840,6 +13840,125 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // The original source, overload identity, and replay share one check.
+    fn canonical_object_subtype_reduction_checks_full_original_and_replays() {
+        let source = concat!(
+            "// @strict: true\n",
+            "// @target: esnext\n",
+            "// @noEmit: true\n\n",
+            "// https://github.com/microsoft/typescript-go/issues/1164\n\n",
+            "function foo(x?: object) {\n",
+            "    return Object.entries(x || {})\n",
+            "        .sort(([k1, v1], [k2, v2]) => v1.name.localeCompare(v2.name));\n",
+            "}\n",
+        );
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/objectSubtypeReduction.ts", source)
+            .unwrap();
+        let (program, state) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["objectSubtypeReduction.ts".to_owned()],
+            CompilerOptions {
+                strict: true,
+                strict_specified: true,
+                no_emit: true,
+                target: ScriptTarget::EsNext,
+                ..CompilerOptions::default()
+            },
+            |program, queries| {
+                let file = program
+                    .source_file("/project/objectSubtypeReduction.ts")
+                    .unwrap()
+                    .id;
+                let (arena, _) = queries.context.file(file).unwrap();
+                let declaration = arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == ts_ast::SyntaxKind::FunctionDeclaration)
+                            .then_some(ts_ast::NodeRef::new(arena.id(), file, node))
+                    })
+                    .unwrap();
+                let returned = queries
+                    .context
+                    .store()
+                    .signature_links(declaration)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .and_then(|signature| queries.context.store().signature(signature))
+                    .and_then(|signature| signature.resolved_return_type())
+                    .unwrap();
+                assert_eq!(
+                    queries.context.type_to_string(returned).unwrap(),
+                    "[string, any][]"
+                );
+                let entries = arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let ts_ast::NodeData::CallExpression(call) = &record.data else {
+                            return None;
+                        };
+                        let ts_ast::NodeData::PropertyAccessExpression(property) =
+                            &arena.get(call.expression)?.data
+                        else {
+                            return None;
+                        };
+                        let ts_ast::NodeData::Identifier(name) = &arena.get(property.name)?.data
+                        else {
+                            return None;
+                        };
+                        (name.text == "entries").then_some(ts_ast::NodeRef::new(
+                            arena.id(),
+                            file,
+                            node,
+                        ))
+                    })
+                    .unwrap();
+                let selected = queries
+                    .context
+                    .store()
+                    .signature_links(entries)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .and_then(|signature| queries.context.store().signature(signature))
+                    .unwrap();
+                assert!(selected.target().is_none());
+                assert!(selected.type_parameters().is_empty());
+                assert_eq!(selected.resolved_return_type(), Some(returned));
+                let overload = selected.declaration().unwrap();
+                let (library, bound) = queries.context.file(overload.file).unwrap();
+                assert!(bound.source_facts().unwrap().is_default_library());
+                let ts_ast::NodeData::MethodSignatureDeclaration(method) =
+                    &library.get(overload.node).unwrap().data
+                else {
+                    panic!("entries must select a real library method declaration")
+                };
+                assert!(method.type_parameters.is_none());
+                let before = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.diagnostics().len(),
+                );
+                queries.context.recheck_source_file(file).unwrap();
+                let after = (
+                    queries.context.store().type_len(),
+                    queries.context.store().symbol_len(),
+                    queries.context.store().signature_len(),
+                    queries.context.diagnostics().len(),
+                );
+                (before, after)
+            },
+        )
+        .unwrap();
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let (before, after) = state.unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Diagnostics and replay checks share the original source and checker.
     fn canonical_conditional_return_expression_matches_original_and_replays() {
         let source = concat!(

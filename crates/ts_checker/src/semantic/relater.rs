@@ -8611,6 +8611,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
         if relation == RelationKind::Assignable || relation == RelationKind::Comparable {
+            if source_flags == TypeFlags::NON_PRIMITIVE
+                && self.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                    source == bootstrap.non_primitive_type
+                        && target == bootstrap.empty_type_literal_type
+                })
+            {
+                self.validate_union_constituent(source)
+                    .map_err(|error| union_validation_unavailable(source, error))?;
+                self.validate_union_constituent(target)
+                    .map_err(|error| union_validation_unavailable(target, error))?;
+                return Ok(true);
+            }
             if source_flags.intersects(TypeFlags::ANY) {
                 return Ok(true);
             }
@@ -15616,6 +15628,22 @@ mod tests {
             ) if type_ == wrapper
         ));
         assert_eq!(fixture.store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn object_keyword_assigns_to_the_canonical_empty_type_literal() {
+        for strict_null_checks in [false, true] {
+            let mut store = initialized(strict_null_checks);
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let object = bootstrap.non_primitive_type;
+            let empty = bootstrap.empty_type_literal_type;
+            assert_eq!(store.is_type_assignable_to(object, empty), Ok(true));
+            assert_eq!(store.is_type_comparable_to(object, empty), Ok(true));
+            assert_eq!(store.is_type_identical_to(object, empty), Ok(false));
+            let warm = store.relation_state_snapshot();
+            assert_eq!(store.is_type_assignable_to(object, empty), Ok(true));
+            assert_eq!(store.relation_state_snapshot(), warm);
+        }
     }
 
     #[test]

@@ -2190,7 +2190,7 @@ fn check_authenticated_array_callback_call(
 }
 
 #[allow(clippy::too_many_arguments)] // Factory calls retain their source and diagnostic context.
-fn check_authenticated_generic_object_factory_call(
+fn check_authenticated_object_factory_call(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -2200,10 +2200,15 @@ fn check_authenticated_generic_object_factory_call(
     plan: &SourceCallPlan,
     callee_type: TypeId,
     argument_types: &[TypeId],
-    explicit_type_arguments: &[TypeId],
+    explicit_type_arguments: Option<&[TypeId]>,
 ) -> Result<Option<CheckedSourceCall>, SourceCheckError> {
-    let ([type_argument], [argument_type]) = (explicit_type_arguments, argument_types) else {
+    let [argument_type] = argument_types else {
         return Ok(None);
+    };
+    let type_argument = match explicit_type_arguments {
+        Some([type_argument]) => Some(type_argument),
+        None => None,
+        Some(_) => return Ok(None),
     };
     let PlannedExpressionKind::Property(property) = &plan.callee.unparenthesized().kind else {
         return Ok(None);
@@ -2265,6 +2270,19 @@ fn check_authenticated_generic_object_factory_call(
     if !projection.construct_signatures.is_empty() {
         return Err(SourceCheckError::Call(plan.node));
     }
+    let Some(type_argument) = type_argument else {
+        return select_object_factory_fallback_for_object(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            plan,
+            &projection.call_signatures,
+            *argument_type,
+        );
+    };
     let Some(generic) = projection.call_signatures.iter().find(|candidate| {
         store
             .signature(candidate.signature)
@@ -2445,6 +2463,162 @@ fn check_authenticated_generic_object_factory_call(
         }
     }
     publish_call_links(store, plan.node, instantiated, return_type)?;
+    Ok(Some(CheckedSourceCall { return_type }))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // The selected overload retains its source and query state.
+fn select_object_factory_fallback_for_object(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceCallPlan,
+    callables: &[ValidatedSingleCallable],
+    argument: TypeId,
+) -> Result<Option<CheckedSourceCall>, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    if argument != bootstrap.non_primitive_type
+        || host
+            .bound_file(plan.node)
+            .and_then(ts_binder::BoundFile::source_facts)
+            .is_none_or(|facts| facts.is_javascript_file())
+    {
+        return Ok(None);
+    }
+    let string = bootstrap.string_type;
+    let array_like_owner = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("ArrayLike"))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    let [generic, fallback] = callables else {
+        return Ok(None);
+    };
+    for callable in callables {
+        let signature = store
+            .signature(callable.signature)
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        if callable.parameters.len() != 1
+            || callable.min_argument_count != 1
+            || callable.rest_parameter.is_some()
+            || signature.flags() != SignatureFlags::NONE
+            || signature.this_parameter().is_some()
+            || signature.declaration().is_none_or(|declaration| {
+                !host
+                    .bound_file(declaration)
+                    .and_then(ts_binder::BoundFile::source_facts)
+                    .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
+            })
+        {
+            return Ok(None);
+        }
+    }
+    let generic_signature = store
+        .signature(generic.signature)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let [type_parameter] = generic_signature.type_parameters() else {
+        return Ok(None);
+    };
+    let type_parameter = *type_parameter;
+    let parameter_declaration = store
+        .type_payload(type_parameter)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(ts_binder::semantic::Symbol::declarations)
+        .and_then(|declarations| match declarations {
+            [declaration] => Some(*declaration),
+            _ => None,
+        });
+    if !parameter_declaration.is_some_and(|declaration| {
+        matches!(host.node(declaration).map(|node| &node.data),
+            Some(NodeData::TypeParameterDeclaration(parameter))
+                if parameter.constraint.is_none() && parameter.default_type.is_none())
+    }) || store
+        .signature(fallback.signature)
+        .is_none_or(|signature| !signature.type_parameters().is_empty())
+    {
+        return Ok(None);
+    }
+    let parameter = generic.parameters[0];
+    store.validate_union_constituent_with_global_types(global_types, parameter)?;
+    let Some(TypeData::Union(union)) = store.type_payload(parameter).map(TypeRecord::data) else {
+        return Ok(None);
+    };
+    let [first, second] = union.union.types.as_slice() else {
+        return Ok(None);
+    };
+    let mut indexed = false;
+    let mut array_like = None;
+    for constituent in [*first, *second] {
+        if let Some(TypeData::Object(object)) =
+            store.type_payload(constituent).map(TypeRecord::data)
+            && let Some([index]) = object.structured.index_infos.as_deref()
+            && object.structured.properties.is_none()
+            && store.index_info(*index).is_some_and(|index| {
+                index.key_type() == string && index.value_type() == type_parameter
+            })
+            && !indexed
+        {
+            indexed = true;
+            continue;
+        }
+        let Ok(reference) =
+            super::reference_types::validate_direct_generic_reference(store, constituent)
+        else {
+            return Ok(None);
+        };
+        let owner = store
+            .type_payload(reference.target)
+            .and_then(TypeRecord::symbol);
+        if reference.type_arguments != [type_parameter]
+            || owner != array_like_owner
+            || owner.is_none_or(|owner| {
+                !super::object_members::authenticated_default_library_interface_owner(store, owner)
+            })
+            || array_like.replace(constituent).is_some()
+        {
+            return Ok(None);
+        }
+    }
+    let Some(array_like) = array_like.filter(|_| indexed) else {
+        return Ok(None);
+    };
+    let length = super::object_members::resolve_object_property_by_key_with_source(
+        store,
+        host,
+        global_types,
+        options,
+        array_like,
+        ts_binder::EscapedNameRef::source("length"),
+        session,
+        diagnostics,
+    )?;
+    if length.is_none_or(|property| property.optional) {
+        return Ok(None);
+    }
+
+    // The object keyword supplies no property or index candidates for T.
+    // Its unknown inference cannot meet either structural parameter branch.
+    if !store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        argument,
+        fallback.parameters[0],
+        global_types,
+        options.strict_function_types,
+    )? {
+        return Ok(None);
+    }
+    let return_type = fallback
+        .return_type
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    if preflight_call_publication(store, plan.node, return_type)?
+        .is_some_and(|existing| existing != fallback.signature)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    publish_call_links(store, plan.node, fallback.signature, return_type)?;
     Ok(Some(CheckedSourceCall { return_type }))
 }
 
@@ -7481,20 +7655,18 @@ pub(super) fn check_direct_source_call(
             .as_ref()
             .map(|type_arguments| type_arguments.nodes.as_slice()),
     )?;
-    if let Some(type_arguments) = explicit_type_arguments.as_deref()
-        && let Some(checked) = check_authenticated_generic_object_factory_call(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-            plan,
-            callee_type,
-            argument_types,
-            type_arguments,
-        )?
-    {
+    if let Some(checked) = check_authenticated_object_factory_call(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        plan,
+        callee_type,
+        argument_types,
+        explicit_type_arguments.as_deref(),
+    )? {
         return Ok(checked);
     }
     let mut retried_signatures = HashSet::new();

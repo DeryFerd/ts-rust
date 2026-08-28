@@ -1627,6 +1627,17 @@ pub(super) fn instantiated_method_type_matches(
             array_targets,
         );
     }
+    if let Some(matches) =
+        super::instantiated_members::instantiated_optional_function_member_type_matches(
+            store,
+            template,
+            actual,
+            mapper,
+            array_targets,
+        )
+    {
+        return matches;
+    }
     if instantiated_member_type_matches(store, template, actual, mapper, array_targets)
         .unwrap_or(false)
     {

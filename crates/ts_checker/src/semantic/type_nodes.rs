@@ -53369,6 +53369,99 @@ mod tests {
     }
 
     #[test]
+    fn selected_object_entries_method_keeps_generic_index_union() {
+        let mut fixture = default_library_fixture(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Object {} interface Function {} interface IArguments {} ",
+            "interface String {} interface Number {} interface Boolean {} ",
+            "interface RegExp {} interface ThisType<T> {} ",
+            "interface ArrayLike<T> { readonly length: number; readonly [n: number]: T; } ",
+            "interface ObjectConstructor { ",
+            "entries<T>(o: { [s: string]: T; } | ArrayLike<T>): [string, T][]; ",
+            "entries(o: {}): [string, any][]; ",
+            "}",
+        ));
+        let globals = initialize_fixture_global_types(&mut fixture);
+        let (method, _) =
+            selected_interface_method_return(&fixture, "ObjectConstructor", "entries");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut previous = None;
+        for _ in 0..2 {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut query = CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &globals,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            query.preflight_type_of_interface_method(method).unwrap();
+            let result = query.get_type_of_interface_method(method);
+            let value = result.unwrap_or_else(|error| {
+                let constituent = match &error {
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedUnionConstituentType(type_),
+                    ) => fixture.store.type_payload(*type_),
+                    _ => None,
+                };
+                panic!("entries method query failed: {error:?}, constituent: {constituent:?}")
+            });
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(&fixture.store, value)
+            else {
+                panic!("the selected method must retain both declared overloads")
+            };
+            assert_eq!(projection.call_signatures.len(), 2);
+            assert!(projection.construct_signatures.is_empty());
+            let state = (value, function_store_state(&fixture.store));
+            if let Some(previous) = &previous {
+                assert_eq!(&state, previous);
+            }
+            previous = Some(state);
+        }
+        let value = previous.unwrap().0;
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, value)
+        else {
+            panic!("the warm method must retain its overloads")
+        };
+        let parameter = projection.call_signatures[0].parameters[0];
+        let indexed = union_types(&fixture.store, parameter)
+            .iter()
+            .copied()
+            .find(|type_| {
+                matches!(fixture.store.type_payload(*type_).map(TypeRecord::data),
+                    Some(TypeData::Object(object)) if object.structured.index_infos.is_some())
+            })
+            .unwrap();
+        let index = fixture
+            .store
+            .type_payload(indexed)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .unwrap()[0];
+        assert!(fixture.store.set_index_info_symbol(index, Some(method)));
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_constituent_with_global_types(&globals, parameter),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(indexed)),
+        );
+        assert!(fixture.store.set_index_info_symbol(index, None));
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_constituent_with_global_types(&globals, parameter),
+            Ok(()),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn selected_interface_method_query_keeps_owner_references_lazy() {
         for source in [
             "interface Box { select(value: string): Box; ignored(); (): void; }",

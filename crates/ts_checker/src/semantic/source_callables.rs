@@ -4529,7 +4529,7 @@ fn stored_direct_call_argument_arrow_is_exact(
         && store.get_merged_symbol(owner_symbol) == Some(owner_symbol)
 }
 
-fn stored_array_sort_argument_arrow_is_exact(
+pub(super) fn stored_array_sort_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
@@ -9499,7 +9499,7 @@ fn publish_prepared_contextual_source_callable(
             prepared.min_argument_count,
         )
         .ok_or_else(|| invariant(SourceCallableInvariant::Publication(prepared.declaration)))?;
-    assert!(store.set_source_callable_provenance(
+    assert!(store.set_contextual_source_callable_provenance(
         type_,
         SourceCallableProvenance {
             family: SourceCallableFamily::ArrowFunction,

@@ -1781,6 +1781,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             _ => false,
         };
+        self.set_source_callable_provenance_with_context(type_, provenance, contextual_pair)
+    }
+
+    fn set_source_callable_provenance_with_context(
+        &mut self,
+        type_: TypeId,
+        provenance: SourceCallableProvenance,
+        contextual_pair: bool,
+    ) -> bool {
         let exact_type_parameters =
             self.signatures
                 .get(provenance.signature)
@@ -9124,6 +9133,124 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Checks mapped Array.sort callbacks before storing their source identity.
+    #[allow(clippy::too_many_lines)] // The callee, source parameters, and mapped target form one proof.
+    pub(super) fn set_contextual_source_callable_provenance(
+        &mut self,
+        type_: TypeId,
+        provenance: SourceCallableProvenance,
+    ) -> bool {
+        let sort_target_is_exact = (|| {
+            let target = provenance.contextual_target?;
+            let SourceNodeParent::Parent(call) = self.source_node_parent(provenance.declaration)?
+            else {
+                return None;
+            };
+            let children = self.source_direct_children(call)?;
+            let [callee, argument] = children.as_slice() else {
+                return None;
+            };
+            if provenance.family != SourceCallableFamily::ArrowFunction
+                || provenance.return_provenance != SourceCallableReturnProvenance::Inferred
+                || provenance.contextual_variable.is_some()
+                || target == type_
+                || *argument != provenance.declaration
+                || !super::source_callables::stored_array_sort_argument_arrow_is_exact(
+                    self,
+                    provenance.declaration,
+                    provenance.owner_symbol,
+                    call,
+                )
+            {
+                return None;
+            }
+            let callee_type = self.type_node_links(*callee)?.resolved_type?;
+            let super::callables::StoredSingleCallableValidation::Valid {
+                callable: method, ..
+            } = super::callables::validate_stored_single_callable(self, callee_type)
+            else {
+                return None;
+            };
+            let [parameter] = method.parameters.as_slice() else {
+                return None;
+            };
+            let target_matches = *parameter == target
+                || matches!(self.type_payload(*parameter)?.data(), TypeData::Union(union)
+                    if union.union.types.len() == 2
+                        && union.union.types.contains(&target)
+                        && union.union.types.contains(&self.intrinsic_bootstrap()?.undefined_type)
+                        && self.validate_union_constituent(*parameter).is_ok());
+            let super::callables::StoredSingleCallableValidation::Valid {
+                callable: callback, ..
+            } = super::callables::validate_stored_single_callable(self, target)
+            else {
+                return None;
+            };
+            let target_signature = self.signature(callback.signature)?;
+            let signature = self.signature(provenance.signature)?;
+            if !target_matches
+                || callback.parameters.len() != 2
+                || callback.min_argument_count != 2
+                || callback.rest_parameter.is_some()
+                || callback.return_type.is_none()
+                || !target_signature.type_parameters().is_empty()
+                || target_signature.this_parameter().is_some()
+                || signature.declaration() != Some(provenance.declaration)
+                || signature.flags() != SignatureFlags::NONE
+                || signature.parameters().len() != 2
+                || signature.parameters()[0] == signature.parameters()[1]
+                || signature.min_argument_count() != 2
+                || signature.resolved_min_argument_count() != -1
+                || !signature.type_parameters().is_empty()
+                || signature.this_parameter().is_some()
+                || signature.resolved_type_predicate().is_some()
+                || signature.target().is_some()
+                || signature.mapper().is_some()
+                || signature.isolated_signature_type().is_some()
+                || signature.composite().is_some()
+                || signature
+                    .resolved_return_type()
+                    .is_none_or(|returned| self.type_payload(returned).is_none())
+            {
+                return None;
+            }
+            for (&parameter, &expected) in signature.parameters().iter().zip(&callback.parameters) {
+                let record = self.symbol(parameter)?;
+                let declaration = record.value_declaration()?;
+                if !super::source_callables::source_parameter_declarations_are_exact(
+                    self,
+                    provenance.declaration,
+                    declaration,
+                    parameter,
+                ) || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    || record.check_flags() != CheckFlags::NONE
+                    || record.members().is_some()
+                    || record.exports().is_some()
+                    || record.parent().is_some()
+                    || record.export_symbol().is_some()
+                    || self.get_merged_symbol(parameter) != Some(parameter)
+                    || self.value_symbol_links(parameter).is_some_and(|links| {
+                        links != &ValueSymbolLinks::default()
+                            && links
+                                != &(ValueSymbolLinks {
+                                    resolved_type: Some(expected),
+                                    ..ValueSymbolLinks::default()
+                                })
+                    })
+                {
+                    return None;
+                }
+            }
+            Some(())
+        })()
+        .is_some();
+        if sort_target_is_exact {
+            self.set_source_callable_provenance_with_context(type_, provenance, true)
+        } else {
+            self.set_source_callable_provenance(type_, provenance)
+        }
+    }
+
     /// Allocates the complete source-name record before any key or name is written.
     pub(super) fn prepare_late_bound_method_group_symbol(
         &self,

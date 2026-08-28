@@ -13871,6 +13871,10 @@ pub(super) fn validate_resolved_declared_property_type_graph(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> DeclaredPropertyTypeGraphValidation {
+    match validate_resolved_index_type_literal_type_graph(store, type_) {
+        DeclaredPropertyTypeGraphValidation::Opaque => {}
+        validation => return validation,
+    }
     match validate_global_date_interface_type_graph(store, type_) {
         DeclaredPropertyTypeGraphValidation::Opaque => {}
         validation => return validation,
@@ -13894,6 +13898,93 @@ pub(super) fn validate_resolved_declared_property_type_graph(
             DeclaredPropertyTypeGraphValidation::Malformed
         }
     }
+}
+
+/// Validates both type edges of a source type literal with one index signature.
+fn validate_resolved_index_type_literal_type_graph(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> DeclaredPropertyTypeGraphValidation {
+    use DeclaredPropertyTypeGraphValidation::{Malformed, Opaque, Traversable};
+
+    let Some(record) = store.type_payload(type_) else {
+        return Opaque;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return Opaque;
+    };
+    let Some(owner) = record.symbol() else {
+        return Opaque;
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return Malformed;
+    };
+    let Some(indexes @ [index]) = object.structured.index_infos.as_deref() else {
+        return Opaque;
+    };
+    if owner_record.flags() != SymbolFlags::TYPE_LITERAL
+        || record.alias().is_some()
+        || object.structured.properties.is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+    {
+        return Opaque;
+    }
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return Malformed;
+    }
+    let declaration = match validate_declared_property_owner(
+        store,
+        type_,
+        owner,
+        object.structured.members,
+        DeclaredPropertyObjectProof::TypeLiteral,
+    ) {
+        DeclaredPropertyOwnerValidation::Valid(declaration)
+        | DeclaredPropertyOwnerValidation::TraversableBoundary(declaration) => declaration,
+        DeclaredPropertyOwnerValidation::Malformed => return Malformed,
+    };
+    let Some(members) = object
+        .structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return Malformed;
+    };
+    let Some(symbol) = members.get(InternalSymbolName::Index.as_ref()) else {
+        return Malformed;
+    };
+    let Some(info) = store.index_info(*index) else {
+        return Malformed;
+    };
+    let Some(index_declaration) = info.declaration() else {
+        return Malformed;
+    };
+    if members.len() != 1
+        || store.source_declaration_symbol(declaration) != Some(owner)
+        || store.source_declaration_symbol(index_declaration) != Some(symbol)
+        || store.source_direct_children(declaration).as_deref() != Some(&[index_declaration])
+        || !super::structured_members::valid_index_symbol(
+            store,
+            owner,
+            &[declaration],
+            symbol,
+            indexes,
+        )
+    {
+        return Malformed;
+    }
+    Traversable(vec![info.key_type(), info.value_type()])
 }
 
 /// Validates Date's instance graph without reading its constructor or cold method types.
