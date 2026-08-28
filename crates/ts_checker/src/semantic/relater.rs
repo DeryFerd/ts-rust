@@ -6960,6 +6960,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Uses the retained checker option when exact identity includes callables.
+    pub(super) fn is_type_identical_to_with_global_types_and_strict_function_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        strict_function_types: bool,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_and_options(
+            source,
+            target,
+            RelationKind::Identity,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+            Some(strict_function_types),
+        )
+    }
+
     /// Pinned `compareTypesIdentical` for the dependency-closed relation domain.
     ///
     /// # Errors

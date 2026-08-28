@@ -41637,10 +41637,15 @@ fn check_variable_redeclaration_type(
     symbol: SemanticSymbolId,
     previous: TypeId,
     actual: TypeId,
-    no_error_truncation: bool,
+    options: CanonicalCheckerOptions,
 ) -> Result<(), SourceCheckError> {
     if previous == actual
-        || store.is_type_identical_to_with_global_types(previous, actual, global_types)?
+        || store.is_type_identical_to_with_global_types_and_strict_function_types(
+            previous,
+            actual,
+            global_types,
+            options.strict_function_types,
+        )?
     {
         return Ok(());
     }
@@ -41661,7 +41666,7 @@ fn check_variable_redeclaration_type(
             VariableInvariant::InvalidSymbolShape(symbol),
         ))?;
     let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
-    if no_error_truncation {
+    if options.no_error_truncation {
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
@@ -55943,7 +55948,7 @@ pub(super) fn check_source_file(
                         variable.symbol,
                         expected,
                         actual,
-                        options.no_error_truncation,
+                        options,
                     )?;
                 }
             }
@@ -56387,7 +56392,7 @@ pub(super) fn check_source_file(
                             variable.symbol,
                             previous,
                             declared_type,
-                            options.no_error_truncation,
+                            options,
                         )?;
 
                         let current_flow_type = current_flow_type_after_assignment(
