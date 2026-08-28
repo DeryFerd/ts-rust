@@ -2496,6 +2496,8 @@ impl CanonicalCheckerContext<'_> {
         }
         if owner.name() != EscapedNameRef::source(&identifier.text)
             || !self.store().source_symbol_declarations_match(symbol)
+                && super::classes::global_class_namespace_declaration(self.store(), symbol, owner)
+                    .is_none()
             || !self.store().source_merged_symbol_declarations_match(symbol)
             || self
                 .cached_artifact_symbol(node)?

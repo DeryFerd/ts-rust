@@ -348,6 +348,10 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
             .intersects(SymbolFlags::CLASS | SymbolFlags::ENUM)
             && (record.name() != name
                 || !self.store.source_symbol_declarations_match(symbol)
+                    && super::classes::global_class_namespace_declaration(
+                        self.store, symbol, record,
+                    )
+                    .is_none()
                 || !self.store.source_merged_symbol_declarations_match(symbol))
         {
             return Err(CanonicalNameResolutionError::InvalidHostSymbol(symbol));

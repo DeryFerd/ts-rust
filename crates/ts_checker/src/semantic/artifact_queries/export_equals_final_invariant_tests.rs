@@ -990,6 +990,145 @@ fn export_equals_final_invariant_global_class_namespace_merge_keeps_identity() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Each changed merged owner must reject cached reads and recover.
+fn export_equals_merged_class_sources_reject_changed_owners_before_cache_reads() {
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Flags(SymbolFlags),
+        ValueDeclaration,
+        DeclarationOrder,
+        MissingNamespace,
+    }
+
+    for change in [
+        Change::Flags(SymbolFlags::NONE),
+        Change::Flags(SymbolFlags::TYPE_ALIAS),
+        Change::Flags(SymbolFlags::INTERFACE),
+        Change::Flags(SymbolFlags::CLASS),
+        Change::ValueDeclaration,
+        Change::DeclarationOrder,
+        Change::MissingNamespace,
+    ] {
+        with_sources(
+            &[
+                (
+                    "declare class Value { value: number; }",
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+                (
+                    "declare namespace Value {}",
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+                (
+                    "const observed = Value; export = Value;",
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            ],
+            2,
+            |context, fixture| {
+                let owner = fixture.owner(context, "Value");
+                let (declared, value) = identities(context, owner);
+                assert_healthy(context, fixture, owner, declared, value);
+                assert!(!context.store().source_symbol_declarations_match(owner));
+                assert!(
+                    context
+                        .store()
+                        .source_merged_symbol_declarations_match(owner)
+                );
+
+                let record = context.store().symbol(owner).unwrap();
+                let flags = record.flags();
+                let check_flags = record.check_flags();
+                let declarations = record.declarations().unwrap().to_vec();
+                let value_declaration = record.value_declaration();
+                let namespace = declarations
+                    .iter()
+                    .copied()
+                    .find(|declaration| {
+                        context.store().source_node_kind(*declaration)
+                            == Some(ts_ast::SyntaxKind::ModuleDeclaration)
+                    })
+                    .unwrap();
+                let original_node_links = context
+                    .store()
+                    .type_node_links(fixture.exported)
+                    .cloned()
+                    .unwrap_or_default();
+                let number = context.global_types().number_type;
+                assert_ne!(number, declared);
+                let store = context.store_mut_for_test();
+                match change {
+                    Change::Flags(changed) => {
+                        assert!(store.set_symbol_flags(owner, changed, check_flags));
+                    }
+                    Change::ValueDeclaration => {
+                        assert!(store.set_symbol_declarations(
+                            owner,
+                            Some(declarations.clone()),
+                            Some(namespace),
+                        ));
+                    }
+                    Change::DeclarationOrder => {
+                        let mut changed = declarations.clone();
+                        changed.reverse();
+                        assert!(store.set_symbol_declarations(
+                            owner,
+                            Some(changed),
+                            value_declaration,
+                        ));
+                    }
+                    Change::MissingNamespace => {
+                        let changed = declarations
+                            .iter()
+                            .copied()
+                            .filter(|declaration| *declaration != namespace)
+                            .collect();
+                        assert!(store.set_symbol_declarations(
+                            owner,
+                            Some(changed),
+                            value_declaration,
+                        ));
+                    }
+                }
+                assert!(store.set_type_node_links(
+                    fixture.exported,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..original_node_links.clone()
+                    },
+                ));
+                let before = snapshot(context, fixture);
+                for _ in 0..2 {
+                    assert!(
+                        context
+                            .export_equals_declared_artifact_type(fixture.exported)
+                            .is_err(),
+                        "{change:?}",
+                    );
+                    assert!(
+                        context.get_type_at_location(fixture.exported).is_err(),
+                        "{change:?}",
+                    );
+                    assert_eq!(snapshot(context, fixture), before, "{change:?}");
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_symbol_flags(owner, flags, check_flags));
+                assert!(store.set_symbol_declarations(
+                    owner,
+                    Some(declarations),
+                    value_declaration,
+                ));
+                assert!(store.set_type_node_links(fixture.exported, original_node_links));
+                assert_healthy(context, fixture, owner, declared, value);
+            },
+        );
+    }
+}
+
+#[test]
 fn export_equals_final_invariant_class_flags_cannot_hide_from_value_lookup() {
     let mut failures = Vec::new();
     for (source_kind, text, declaration_file) in [
