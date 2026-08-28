@@ -1009,8 +1009,9 @@ struct PlannedArrayVariableElement {
 #[derive(Clone, Copy, Debug)]
 struct PlannedVariableRedeclaration {
     declaration: NodeRef,
+    name: NodeRef,
     symbol: SemanticSymbolId,
-    type_node: NodeRef,
+    type_node: Option<NodeRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -17628,12 +17629,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 if binding == VariableBindingKind::Var
                     && !exported
                     && variable.initializer.is_none()
-                    && let Some(type_node) = variable.type_
                     && let Some(symbol) = self.bound.symbol(declaration)
                     && self.prior_variables.contains(&symbol)
                 {
                     let name = self.reference(variable.name);
-                    let type_node = self.reference(type_node);
+                    let type_node = variable.type_.map(|node| self.reference(node));
                     let name_record = self.node(name)?;
                     let NodeData::Identifier(identifier) = &name_record.data else {
                         return Err(self.unsupported(
@@ -17658,16 +17658,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         &name_text,
                     )
                     .map_err(Self::variable_plan_error)?;
-                    if resolved != symbol || self.node(type_node)?.parent != Some(declaration.node)
-                    {
+                    if resolved != symbol {
                         return Err(SourceCheckError::Variable(
                             VariableInvariant::InvalidSymbolShape(symbol),
                         ));
                     }
-                    self.plan_type_import_annotation_root(type_node)?;
+                    if let Some(type_node) = type_node {
+                        if self.node(type_node)?.parent != Some(declaration.node) {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(symbol),
+                            ));
+                        }
+                        self.plan_type_import_annotation_root(type_node)?;
+                    }
                     return Ok(PlannedVariableStatement::Redeclaration(
                         PlannedVariableRedeclaration {
                             declaration,
+                            name,
                             symbol,
                             type_node,
                         },
@@ -17751,6 +17758,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 continue;
             };
             if self.node(initializer)?.kind != SyntaxKind::ArrowFunction {
+                continue;
+            }
+            // Shared variable symbols need the ordinary redeclaration type check.
+            // Multi-declaration statements must retain their other declarations.
+            if declarations.len() != 1
+                || binding == VariableBindingKind::Var
+                    && !exported
+                    && self.semantic.is_some_and(|(store, _)| {
+                        self.bound
+                            .symbol(declaration)
+                            .and_then(|symbol| store.symbol(symbol))
+                            .and_then(ts_binder::semantic::Symbol::declarations)
+                            .is_some_and(|declarations| declarations.len() > 1)
+                    })
+            {
                 continue;
             }
             let Some((store, host)) = self.semantic else {
@@ -18464,7 +18486,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         let redeclared = binding == VariableBindingKind::Var
             && !exported
-            && type_id.is_none()
             && initializer_id.is_some()
             && self.javascript_jsdoc.is_none()
             && self
@@ -19505,18 +19526,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
                     };
-                    if self.node(container)?.kind != SyntaxKind::FunctionDeclaration {
-                        return Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Arrow(declaration),
-                        ));
-                    }
                     let arrow_record = self.node(declaration)?;
                     let NodeData::ArrowFunction(arrow) = &arrow_record.data else {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
                     };
-                    if arrow.parameters.nodes.is_empty()
+                    if container == self.bound.source_file() {
+                        let name = self.reference(variable.name);
+                        let NodeData::Identifier(identifier) = &self.node(name)?.data else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Arrow(declaration),
+                            ));
+                        };
+                        plan_redeclared_top_level_variable(
+                            self.bound,
+                            store,
+                            parent,
+                            name,
+                            &identifier.text,
+                        )
+                        .map_err(Self::variable_plan_error)?;
+                    } else if self.node(container)?.kind != SyntaxKind::FunctionDeclaration
+                        || arrow.parameters.nodes.is_empty()
                         || !arrow.parameters.nodes.iter().all(|parameter| {
                             self.node(self.reference(*parameter)).is_ok_and(|record| {
                                 matches!(
@@ -41595,6 +41627,72 @@ fn materialize_referenced_ambient_namespace(
     Ok(type_)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_variable_redeclaration_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    name_node: NodeRef,
+    symbol: SemanticSymbolId,
+    previous: TypeId,
+    actual: TypeId,
+    no_error_truncation: bool,
+) -> Result<(), SourceCheckError> {
+    if previous == actual
+        || store.is_type_identical_to_with_global_types(previous, actual, global_types)?
+    {
+        return Ok(());
+    }
+    let Some(Node {
+        data: NodeData::Identifier(identifier),
+        ..
+    }) = host.node(name_node)
+    else {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(symbol),
+        ));
+    };
+    let name = identifier.text.clone();
+    let first_declaration = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(symbol),
+        ))?;
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        previous,
+        actual,
+        flags,
+    )?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(name_node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2403).ok_or(SourceCheckError::MissingDiagnostic(2403))?,
+                [name.clone(), display.source, display.target],
+            ),
+            related_information: vec![CanonicalCheckerRelatedInformation {
+                node: Some(first_declaration),
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(6203).ok_or(SourceCheckError::MissingDiagnostic(6203))?,
+                    [name],
+                ),
+            }],
+        },
+    );
+    Ok(())
+}
+
 fn stage_value_type(
     store: &CanonicalTypeMapperStore,
     value_types: &mut HashMap<SemanticSymbolId, TypeId>,
@@ -52335,16 +52433,18 @@ pub(super) fn check_source_file(
                 .preflight_type_from_type_node(augmentation.property.type_node)?;
             }
             PlannedStatement::VariableRedeclaration(variable) => {
-                session.reset_query();
-                CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    &mut type_import_preflight_diagnostics,
-                )?
-                .preflight_type_from_type_node(variable.type_node)?;
+                if let Some(type_node) = variable.type_node {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut type_import_preflight_diagnostics,
+                    )?
+                    .preflight_type_from_type_node(type_node)?;
+                }
             }
             PlannedStatement::UnusedIteration(iteration) => {
                 session.reset_query();
@@ -55811,31 +55911,40 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::VariableRedeclaration(variable) => {
+                if bound.symbol(variable.declaration) != Some(variable.symbol) {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidSymbolShape(variable.symbol),
+                    ));
+                }
                 let expected = top_level_declared_types
                     .get(&variable.symbol)
                     .copied()
                     .ok_or(SourceCheckError::Variable(
                         VariableInvariant::MissingStagedValueType(variable.symbol),
                     ))?;
-                let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
-                let actual = CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    &mut annotation_diagnostics,
-                )?
-                .get_type_from_type_node(variable.type_node)?;
-                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
-                if expected != actual {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Syntax {
-                            node: variable.declaration,
-                            kind: SyntaxKind::VariableDeclaration,
-                            role: SourceSyntaxRole::VariableDeclaration,
-                        },
-                    ));
+                if let Some(type_node) = variable.type_node {
+                    let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                    let actual = CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut annotation_diagnostics,
+                    )?
+                    .get_type_from_type_node(type_node)?;
+                    merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                    check_variable_redeclaration_type(
+                        store,
+                        host,
+                        global_types,
+                        diagnostics,
+                        variable.name,
+                        variable.symbol,
+                        expected,
+                        actual,
+                        options.no_error_truncation,
+                    )?;
                 }
             }
             PlannedStatement::Variables(variables) => {
@@ -56257,7 +56366,6 @@ pub(super) fn check_source_file(
                                 VariableInvariant::InvalidSymbolShape(variable.symbol),
                             ))?;
                         if variable.binding != VariableBindingKind::Var
-                            || variable.type_node.is_some()
                             || variable.jsdoc_type.is_some()
                             || first_declaration == variable.declaration
                             || bound.symbol(first_declaration) != Some(variable.symbol)
@@ -56270,58 +56378,17 @@ pub(super) fn check_source_file(
                             ));
                         }
 
-                        if previous != declared_type
-                            && !store.is_type_identical_to_with_global_types(
-                                previous,
-                                declared_type,
-                                global_types,
-                            )?
-                        {
-                            let name = match arena.get(variable.name.node) {
-                                Some(Node {
-                                    data: NodeData::Identifier(identifier),
-                                    ..
-                                }) => identifier.text.clone(),
-                                _ => {
-                                    return Err(SourceCheckError::Variable(
-                                        VariableInvariant::InvalidSymbolShape(variable.symbol),
-                                    ));
-                                }
-                            };
-                            let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
-                            if options.no_error_truncation {
-                                flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
-                            }
-                            let display =
-                                get_type_names_for_assignability_error_with_host_global_types_and_flags(
-                                    store,
-                                    host,
-                                    global_types,
-                                    previous,
-                                    declared_type,
-                                    flags,
-                                )?;
-                            merge_retry_diagnostic(
-                                diagnostics,
-                                CanonicalCheckerDiagnostic {
-                                    node: Some(variable.name),
-                                    range_override: None,
-                                    diagnostic: Diagnostic::with_arguments(
-                                        message_by_code(2403)
-                                            .ok_or(SourceCheckError::MissingDiagnostic(2403))?,
-                                        [name.clone(), display.source, display.target],
-                                    ),
-                                    related_information: vec![CanonicalCheckerRelatedInformation {
-                                        node: Some(first_declaration),
-                                        diagnostic: Diagnostic::with_arguments(
-                                            message_by_code(6203)
-                                                .ok_or(SourceCheckError::MissingDiagnostic(6203))?,
-                                            [name],
-                                        ),
-                                    }],
-                                },
-                            );
-                        }
+                        check_variable_redeclaration_type(
+                            store,
+                            host,
+                            global_types,
+                            diagnostics,
+                            variable.name,
+                            variable.symbol,
+                            previous,
+                            declared_type,
+                            options.no_error_truncation,
+                        )?;
 
                         let current_flow_type = current_flow_type_after_assignment(
                             store,
@@ -97596,34 +97663,85 @@ class Foo2 {
     }
 
     #[test]
-    fn redeclared_arrow_variables_remain_typed_unsupported_without_panicking() {
-        for (file, text) in [
+    fn redeclared_arrow_variables_keep_first_types_and_exact_diagnostics() {
+        for (index, (text, expected)) in [
             (
-                FileId::new(8_950),
-                "var shared = (): void => {}; var shared = 1;",
+                "var shared = (): void => {}; var shared = 1; const observed = shared;",
+                Some(("() => void", "number")),
             ),
             (
-                FileId::new(8_951),
-                "var shared: () => void = () => {}; var shared: () => void;",
+                "var shared = 1; var shared = () => {}; const observed = shared;",
+                Some(("number", "() => void")),
             ),
-        ] {
+            (
+                "var shared: () => void = () => {}; var shared: () => void; const observed = shared;",
+                None,
+            ),
+            (
+                "var shared: number = 1; var shared: string = 'text'; const observed = shared;",
+                Some(("number", "string")),
+            ),
+            (
+                "var shared = 1; var shared: string; const observed = shared;",
+                Some(("number", "string")),
+            ),
+            (
+                "var shared = 1; var shared; const observed = shared;",
+                None,
+            ),
+            (
+                "var untouched = 1, shared = () => {}; var shared = () => {}; const observed = shared;",
+                None,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = FileId::new(8_950 + u32::try_from(index).unwrap());
             let source = parsed(text);
             let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
             let declaration = variable_declaration(&source, file, "shared");
             let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
-            let before = observable_state(&context, file);
-            let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Variable(
-                VariableUnsupported::NonUniqueDeclaration {
-                    node: declaration,
-                    symbol,
-                    declaration_count: 2,
-                },
-            ));
 
-            assert_eq!(context.check_source_file(file), Err(expected), "{text}");
-            assert_eq!(observable_state(&context, file), before, "{text}");
-            assert!(context.diagnostics().is_empty(), "{text}");
-            assert!(!is_type_checked(&context, file), "{text}");
+            context.check_source_file(file).unwrap_or_else(|error| {
+                panic!("{text}: {error:?}");
+            });
+
+            if let Some((previous, actual)) = expected {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("{text}: {:?}", context.diagnostics());
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2403, "{text}");
+                assert_eq!(diagnostic.diagnostic.arguments, ["shared", previous, actual]);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "shared");
+                let [related] = diagnostic.related_information.as_slice() else {
+                    panic!("expected the original declaration for {text}");
+                };
+                assert_eq!(related.node, Some(declaration));
+                assert_eq!(related.diagnostic.code(), 6203);
+            } else {
+                assert!(context.diagnostics().is_empty(), "{text}: {:?}", context.diagnostics());
+            }
+            assert_eq!(
+                context.store().symbol(symbol).unwrap().declarations().unwrap().len(),
+                2,
+                "{text}",
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "observed"),
+                variable_value_type(&context, &source, file, "shared"),
+                "{text}",
+            );
+            if text.contains("untouched") {
+                assert_eq!(
+                    variable_value_type(&context, &source, file, "untouched"),
+                    context.store().intrinsic_bootstrap().unwrap().number_type,
+                );
+            }
+            assert!(is_type_checked(&context, file));
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm, "{text}");
         }
     }
 
