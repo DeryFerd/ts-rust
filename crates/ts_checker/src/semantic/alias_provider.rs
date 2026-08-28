@@ -1031,7 +1031,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 match Self::local_module_member(store, source, declaration, expression) {
                     Ok(target) => Ok(target),
                     Err(error @ CanonicalAliasTargetUnavailable::UnsupportedLocalExport(_)) => {
-                        Self::global_class_namespace_export_target(
+                        Self::global_ambient_class_export_target(
                             store,
                             source,
                             declaration,
@@ -1076,7 +1076,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
     }
 
-    fn global_class_namespace_export_target<MapperPayload>(
+    fn global_ambient_class_export_target<MapperPayload>(
         store: &CanonicalSemanticStore<MapperPayload>,
         source: ProductionAliasTargetSource<'_>,
         declaration: NodeRef,
@@ -1130,7 +1130,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let globals = store.symbol_table(store.intrinsic_bootstrap.as_ref()?.globals)?;
         let symbol = globals.get_source(&identifier.text)?;
         let owner = store.symbol(symbol)?;
-        super::classes::global_class_namespace_declaration(store, symbol, owner)?;
+        super::classes::global_ambient_class_declaration(store, symbol, owner)?;
         Some(symbol)
     }
 

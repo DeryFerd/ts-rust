@@ -7322,13 +7322,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 record.flags().contains(SymbolFlags::CLASS)
                     && record.flags().intersects(SymbolFlags::MODULE)
             })
-            .and_then(|_| {
-                self.prior_classes.get(&symbol).or_else(|| {
-                    self.ambient_class_reads
-                        .iter()
-                        .find(|class| class.symbol() == symbol)
-                        .and_then(ClassMemberQueryPlan::direct_plan)
-                })
+            .and_then(|_| self.prior_classes.get(&symbol))
+            .or_else(|| {
+                self.ambient_class_reads
+                    .iter()
+                    .find(|class| class.symbol() == symbol)
+                    .and_then(ClassMemberQueryPlan::direct_plan)
             });
         match class {
             Some(class) => plan_class_value_identifier_read(
@@ -15904,7 +15903,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         ));
                     };
                     if !flags.contains(SymbolFlags::CLASS)
-                        || !flags.intersects(SymbolFlags::MODULE)
+                        || flags != SymbolFlags::CLASS && !flags.intersects(SymbolFlags::MODULE)
                         || self
                             .plan_ambient_class_value_read(expression, &name, symbol)?
                             .is_none()
@@ -16161,7 +16160,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let export_equals_ambient_class = export_equals
             && ambient_class.is_some()
             && target.flags().contains(SymbolFlags::CLASS)
-            && target.flags().intersects(SymbolFlags::MODULE)
+            && (target.flags() == SymbolFlags::CLASS
+                || target.flags().intersects(SymbolFlags::MODULE))
             && target.check_flags() == CheckFlags::NONE
             && target.name().as_utf8() == Some(name.as_str())
             && target.parent().is_none()
@@ -20528,7 +20528,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             VariableUnsupported::NonVariableSymbol { symbol, flags, .. },
                         ),
                     ) if flags.contains(SymbolFlags::CLASS)
-                        && flags.intersects(SymbolFlags::MODULE) =>
+                        && (flags == SymbolFlags::CLASS
+                            || flags.intersects(SymbolFlags::MODULE)) =>
                     {
                         let Some(read) =
                             self.plan_ambient_class_value_read(expression, &name, symbol)?

@@ -1565,3 +1565,37 @@ fn review_merged_export_guard_rejects_foreign_same_name_global_targets() {
 
 #[path = "global_binding_capture_review_tests.rs"]
 mod global_binding_capture_review_tests;
+
+#[test]
+fn export_equals_unmerged_ambient_class_prepares_value_without_an_ordinary_read() {
+    for consumer_first in [false, true] {
+        let class = (
+            "declare class Value { value: number; }",
+            true,
+            CanonicalModuleState::Script,
+        );
+        let consumer = ("export = Value;", false, CanonicalModuleState::External);
+        let inputs = if consumer_first {
+            [consumer, class]
+        } else {
+            [class, consumer]
+        };
+        let consumer_index = usize::from(!consumer_first);
+        with_sources(&inputs, consumer_index, |context, fixture| {
+            assert!(fixture.local_table.is_none());
+            assert!(fixture.read.is_none());
+            let owner = fixture.owner(context, "Value");
+            let record = context.store().symbol(owner).unwrap();
+            assert_eq!(record.flags(), SymbolFlags::CLASS);
+            assert_eq!(record.declarations().unwrap().len(), 1);
+            let (declared, value) = identities(context, owner);
+            assert_healthy(context, fixture, owner, declared, value);
+            for _ in 0..2 {
+                context
+                    .recheck_source_file(fixture.files[consumer_index])
+                    .unwrap();
+                assert_healthy(context, fixture, owner, declared, value);
+            }
+        });
+    }
+}

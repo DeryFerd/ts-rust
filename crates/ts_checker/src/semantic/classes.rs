@@ -10514,6 +10514,43 @@ pub(super) fn is_merged_auto_accessor_interface(
         .is_some_and(|merged| merged.interface_declaration == declaration)
 }
 
+/// Proves a global ambient class, including any supported empty namespace merge.
+pub(super) fn global_ambient_class_declaration<MapperPayload>(
+    store: &CanonicalSemanticStore<MapperPayload>,
+    symbol: SemanticSymbolId,
+    owner: &Symbol,
+) -> Option<NodeRef> {
+    if owner.flags() != SymbolFlags::CLASS {
+        return global_class_namespace_declaration(store, symbol, owner);
+    }
+    let [declaration] = owner.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let SourceNodeParent::Parent(parent) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let name = store.source_child_with_kind(declaration, SyntaxKind::Identifier)?;
+    (owner.check_flags() == CheckFlags::NONE
+        && owner.parent().is_none()
+        && owner.export_symbol().is_none()
+        && owner.value_declaration() == Some(declaration)
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && store.source_symbol_declarations_match(symbol)
+        && store.source_merged_symbol_declarations_match(symbol)
+        && store.source_is_script_declaration_file(declaration)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::ClassDeclaration)
+        && store.source_node_kind(parent) == Some(SyntaxKind::SourceFile)
+        && store.source_identifier_text(name) == owner.name().as_utf8()
+        && store
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get(owner.name()))
+            == Some(symbol))
+    .then_some(declaration)
+}
+
 /// Proves a global ambient class and every empty namespace merged into it.
 pub(super) fn global_class_namespace_declaration<MapperPayload>(
     store: &CanonicalSemanticStore<MapperPayload>,
