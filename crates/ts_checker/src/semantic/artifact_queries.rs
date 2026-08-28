@@ -2490,7 +2490,14 @@ impl CanonicalCheckerContext<'_> {
                 if !record.flags().intersects(meaning)
                     && !self.get_symbol_flags(candidate)?.flags.intersects(meaning)
                 {
-                    symbol = None;
+                    // Import-equals can retain namespace exports beside its value target.
+                    let namespace = meaning == SymbolFlags::NAMESPACE
+                        && self
+                            .qualified_artifact_namespace(part.entity, part.entity, candidate)?
+                            .is_some();
+                    if !namespace {
+                        symbol = None;
+                    }
                 }
             }
             symbols.push(symbol);

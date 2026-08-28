@@ -1,8 +1,9 @@
 # Root type-name symbol composition
 
-Status: the first focused root run passed all 21 tests. The three Go cases
-passed with an empty compiled cache. The completed twelve root controls await
-full root validation and original-fixture replay. No primary promotion is planned.
+Status: the first full root run found two import-equals namespace regressions.
+The reader repair passed all 16 focused tests. Both original fixtures matched
+complete diagnostics, types, and symbols on the initial candidate. Full
+validation of the repaired candidate is pending. No primary promotion is planned.
 
 Base: `4327f7f345c90d59d6057a3f53c4d1c0e81eed9c`.
 Author source: `efad1ef7313ae516ffb123a7532c734ba6c128a9`.
@@ -37,18 +38,20 @@ No whole-file check or type-argument resolution is added to type-name queries.
 
 ## Retained controls
 
-The author worktree and all 58 assertions remain unchanged at `efad1ef7`.
+The author worktree and all 58 tests remain unchanged at `efad1ef7`.
 Its passing log contains the 42 earlier source/provider controls. This root
 base contains 15 of those 58 test names. Name presence is not a claim that the
 two branches use the same type representation or assertions.
 
 The complete 58-name map records which tests exist on the root base. Controls
 for the excluded error-alias and constraint work are not counted as root
-passes. Twelve root-specific symbol controls cover lazy known and missing names,
+passes. Thirteen root-specific symbol controls cover lazy known and missing names,
 qualified prefixes, root error-type recovery, cache rejection, empty and
 foreign names, value aliases, and const assertions. The set also retains
 real-name cache rejection, the type/namespace meaning table, malformed-input
-binding rejection, and unavailable alias lookup.
+binding rejection, and unavailable alias lookup. The import-equals control
+checks bound alias and namespace identities without source checking or type
+allocation, then repeats the same queries without new state.
 
 The original value-export-as-type unit source remains an explicit negative
 control, including the resolved-export table that points at a value symbol.
@@ -89,7 +92,55 @@ offline dependencies, 16 MiB process and Rust stacks, and the exclusive target.
 Go uses an overlay on the unchanged pin with a separate fresh compiled cache.
 TMPDIR is unchanged. No other worker or primary branch is changed.
 
-The full root test selection and complete-artifact replay of
-`braceEscapedSurrogatePairLiteralType.ts` and
-`declarationEmitKeywordPropertyNames.ts` will run on the actual root candidate.
-Original fixture sources and baselines will remain unchanged.
+## Initial root results
+
+The initial candidate is `a47b0327fcb75485e284088053985de13d06cabc`.
+Session `69544` ran all 24 selected binaries. It passed 4,449 tests and failed
+two, with none ignored or filtered. All 4,415 test names from the prior
+20-binary root gate were retained. The four added integration binaries
+contributed 24 tests, and the initial reader added twelve root controls.
+
+The unchanged failures were
+`merged_export_assignment_symbols_keep_source_and_import_names` and
+`merged_export_assignment_type_queries_keep_value_and_namespace_roles`.
+The new reader checked an import-equals alias's value target flags but missed
+the module's separate namespace exports. The repair calls the existing
+`qualified_artifact_namespace` helper only for namespace meaning. That helper
+checks the export-equals target and module relationship. It remains unchanged,
+and value aliases used as types still fail the type-meaning check.
+
+Session `79031` then passed 16 focused tests: thirteen root controls, the two
+failed integration cases, and one existing namespace-augmentation control.
+None failed or was ignored. Formatting session `29263` requested one layout
+change in the added test. That change was applied after both sessions ended.
+The full repaired gate, formatting check, and both fixture rows will run again.
+
+The first full run's warning messages match the prior root log exactly.
+No full workspace or Clippy pass is claimed.
+
+## Original fixtures
+
+Both initial replay sessions ended 0 on the clean initial candidate. Each
+selected the original case by its exact filename and executed one variant.
+The complete diagnostic, type, and symbol artifacts match. There are no
+skipped artifacts, unsupported results, mismatches, or invariants.
+
+| Original case | Diagnostics | Types | Symbols | Visited type/symbol nodes |
+| --- | --- | --- | --- | --- |
+| `braceEscapedSurrogatePairLiteralType.ts` | Exact, 0 | Exact | Exact | 17 / 20 |
+| `declarationEmitKeywordPropertyNames.ts` | Exact, 0 | Exact | Exact | 33 / 34 |
+
+Both schema-5 scorecards record clean Rust `a47b0327` and clean Go `dc37b5249`.
+Their shared oracle manifest digest is `667bc371832bee995194e09bc5b6e968`.
+The scorecards are under `target/type-name-evidence` as
+`brace-full-artifacts.json` and `keyword-full-artifacts.json`.
+Original fixture sources and baselines were not changed.
+
+Initial full root log SHA256:
+`2ef7bd6ef1e5a7067141bb915cf61aba76db1b80e04ef5406ac5b44f61a42529`.
+Brace scorecard SHA256:
+`0f7fbe8ef31e350bcd916acaf3ab94c266f28d553343010e1cc0d3be2e126b25`.
+Keyword scorecard SHA256:
+`488d9860d3868560f592ba23921b53188b434630e75ab827d3bf13f103021e1b`.
+The first-run audit is `/tmp/ts-rust-wave150-type-name-initial-audit.json`.
+These initial results will remain separate from the repaired candidate's runs.

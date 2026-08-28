@@ -151,3 +151,120 @@ fn root_type_name_symbols_do_not_recover_unavailable_alias_lookup() {
     );
     assert_eq!(state(&context).0, before);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the bound identities and cold replay checks together.
+fn root_type_name_symbols_keep_import_equals_namespace_exports_cold() {
+    let importer = parse_source_file(concat!(
+        "import api = require('./target');\n",
+        "let first: api.Shape;\n",
+        "let second: api.Names.Entry;\n",
+    ));
+    let target = parse_source_file(concat!(
+        "export type Shape = { text: string };\n",
+        "export namespace Names { export interface Entry { count: number } }\n",
+        "export = { value: 1, label: 'ok' };\n",
+    ));
+    let file = FileId::new(6_513);
+    let target_file = FileId::new(6_514);
+    let mut binder = CanonicalBinder::new();
+    for (parsed, file, path) in [
+        (&importer, file, "/project/importer.ts"),
+        (&target, target_file, "/project/target.ts"),
+    ] {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        bind(
+            &mut binder,
+            parsed,
+            file,
+            path,
+            false,
+            CanonicalModuleState::External,
+        );
+    }
+    let (alias, specifier) = importer
+        .arena
+        .iter()
+        .find_map(|(id, record)| {
+            let NodeData::ImportEqualsDeclaration(import) = &record.data else {
+                return None;
+            };
+            let NodeData::ExternalModuleReference(reference) =
+                &importer.arena.get(import.module_reference)?.data
+            else {
+                return None;
+            };
+            Some((
+                binder
+                    .file(file)
+                    .unwrap()
+                    .symbol(NodeRef::new(importer.arena.id(), file, id))
+                    .unwrap(),
+                NodeRef::new(importer.arena.id(), file, reference.expression),
+            ))
+        })
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+        binder.finish(),
+        vec![(file, &importer.arena), (target_file, &target.arena)],
+        CanonicalCheckerOptions::default(),
+        CanonicalModuleResolutionManifestInput::new([CanonicalModuleResolutionEntry::resolved(
+            specifier,
+            CanonicalResolvedModuleInput::new(
+                target_file,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+        )]),
+    )
+    .unwrap();
+    let bound = context.file(target_file).unwrap().1;
+    let module = bound.symbol(bound.source_file()).unwrap();
+    let exports = context.store().symbol(module).unwrap().exports().unwrap();
+    let exports = context.store().symbol_table(exports).unwrap();
+    let shape = exports.get_source("Shape").unwrap();
+    let names = exports.get_source("Names").unwrap();
+    let exports = context.store().symbol(names).unwrap().exports().unwrap();
+    let entry = context
+        .store()
+        .symbol_table(exports)
+        .unwrap()
+        .get_source("Entry")
+        .unwrap();
+    let (_, shape_name) = variable_annotation(&importer, file, "first");
+    let NodeData::QualifiedName(qualified) = &importer.arena.get(shape_name.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let root = NodeRef::new(shape_name.arena, file, qualified.left);
+    let (_, entry_name) = variable_annotation(&importer, file, "second");
+    let NodeData::QualifiedName(qualified) = &importer.arena.get(entry_name.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let namespace = NodeRef::new(entry_name.arena, file, qualified.left);
+    let queries = [
+        (root, alias),
+        (shape_name, shape),
+        (namespace, names),
+        (entry_name, entry),
+    ];
+    let before = state(&context).0;
+    for (node, expected) in queries {
+        assert_eq!(context.get_symbol_at_location(node), Ok(Some(expected)));
+    }
+    assert_eq!(state(&context).0, before);
+    let warm = state(&context);
+    for (node, expected) in queries {
+        assert_eq!(context.get_symbol_at_location(node), Ok(Some(expected)));
+    }
+    assert_eq!(state(&context), warm);
+    for file in [file, target_file] {
+        assert!(
+            context
+                .store()
+                .source_file_links(context.source_file(file).unwrap())
+                .is_none_or(|links| !links.type_checked)
+        );
+    }
+}
