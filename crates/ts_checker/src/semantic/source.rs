@@ -219,8 +219,8 @@ use super::{
     },
     source_flow::{
         ClassInitializationFrame, SourceEqualityCondition, SourceEqualityNarrowingError,
-        SourceFlowAssignment, SourceFlowCondition, SourceFlowError, SourceFlowFrame,
-        SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
+        SourceFlowArrayMutation, SourceFlowAssignment, SourceFlowCondition, SourceFlowError,
+        SourceFlowFrame, SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
         SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
         narrow_by_equality, narrow_by_typeof, source_block_scoped_use_before_declaration,
         source_typeof_narrowing_type_is_supported,
@@ -1439,6 +1439,57 @@ impl PlannedLinearFunctionStatement {
         )
         .then_some(expression.node)
     }
+
+    fn array_mutation(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<Option<SourceFlowArrayMutation>, SourceCheckError> {
+        let Self::Expression { expression, .. } = self else {
+            return Ok(None);
+        };
+        planned_array_mutation(store, host, expression)
+    }
+}
+
+fn planned_array_mutation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+) -> Result<Option<SourceFlowArrayMutation>, SourceCheckError> {
+    let PlannedExpressionKind::Call(call) = &expression.kind else {
+        return Ok(None);
+    };
+    let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+        return Ok(None);
+    };
+    let PlannedExpressionKind::Identifier(read) = &property.receiver.kind else {
+        return Ok(None);
+    };
+    if read.kind != PlannedIdentifierReadKind::Variable {
+        return Ok(None);
+    }
+    let Some(NodeData::PropertyAccessExpression(access)) =
+        host.node(property.node).map(|node| &node.data)
+    else {
+        return Err(SourceCheckError::Property(property.node));
+    };
+    let name = NodeRef::new(property.node.arena, property.node.file, access.name);
+    if !host.node(name).is_some_and(|node| matches!(&node.data, NodeData::Identifier(name) if matches!(name.text.as_str(), "push" | "unshift"))) {
+        return Ok(None);
+    }
+    let declaration = store
+        .symbol(read.value_symbol)
+        .and_then(|symbol| symbol.value_declaration())
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::InvalidSymbolShape(read.value_symbol),
+        ))?;
+    Ok(Some(SourceFlowArrayMutation {
+        call: expression.node,
+        receiver: property.receiver.node,
+        declaration,
+        symbol: read.value_symbol,
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -1575,10 +1626,12 @@ struct PlannedReturnBranch {
 #[derive(Clone, Debug)]
 struct PlannedJoinedFunctionStatements {
     leading: Vec<PlannedVariable>,
+    leading_statements: Vec<PlannedLinearFunctionStatement>,
     condition: PlannedSourceCondition,
     then_branch: PlannedFallthroughBranch,
     else_branch: PlannedFallthroughBranch,
     trailing: Vec<PlannedVariable>,
+    trailing_statements: Vec<PlannedLinearFunctionStatement>,
     return_statement: NodeRef,
     return_expression: PlannedExpression,
     flow: SourceFlowPlan,
@@ -1587,6 +1640,12 @@ struct PlannedJoinedFunctionStatements {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)] // Keeps ordinary truthiness expressions inline.
 enum PlannedSourceCondition {
+    Logical {
+        expression: NodeRef,
+        operator: SyntaxKind,
+        left: Box<PlannedSourceCondition>,
+        right: Box<PlannedSourceCondition>,
+    },
     Expression {
         expression: PlannedExpression,
         flow_point: NodeRef,
@@ -1628,6 +1687,7 @@ struct PlannedEqualityCondition {
 impl PlannedSourceCondition {
     fn flow_point(&self) -> NodeRef {
         match self {
+            Self::Logical { left, .. } => left.flow_point(),
             Self::Expression { flow_point, .. } => *flow_point,
             Self::Truthiness { expression, .. } => expression.unparenthesized().node,
             Self::Typeof(condition) => condition.identifier.node,
@@ -1637,6 +1697,7 @@ impl PlannedSourceCondition {
 
     fn flow_condition(&self) -> Option<SourceFlowCondition> {
         Some(match self {
+            Self::Logical { .. } => return None,
             Self::Expression { .. } => return None,
             Self::Truthiness { expression, symbol } => {
                 SourceFlowCondition::Truthiness(SourceTruthinessCondition {
@@ -1660,11 +1721,56 @@ impl PlannedSourceCondition {
             }),
         })
     }
+
+    fn flow_points(&self) -> Vec<NodeRef> {
+        if let Self::Logical { left, right, .. } = self {
+            let mut points = left.flow_points();
+            for point in right.flow_points() {
+                if !points.contains(&point) {
+                    points.push(point);
+                }
+            }
+            points
+        } else {
+            vec![self.flow_point()]
+        }
+    }
+
+    fn flow_conditions(&self) -> Vec<SourceFlowCondition> {
+        match self {
+            Self::Logical { left, right, .. } => {
+                let mut conditions = left.flow_conditions();
+                conditions.extend(right.flow_conditions());
+                conditions
+            }
+            Self::Expression { expression, .. }
+                if matches!(
+                    &expression.unparenthesized().kind,
+                    PlannedExpressionKind::Call(_)
+                ) =>
+            {
+                vec![SourceFlowCondition::Unchanged(expression.node)]
+            }
+            _ => self.flow_condition().into_iter().collect(),
+        }
+    }
+
+    fn expression_node(&self) -> NodeRef {
+        match self {
+            Self::Logical { expression, .. } => *expression,
+            Self::Expression { expression, .. } | Self::Truthiness { expression, .. } => {
+                expression.node
+            }
+            Self::Typeof(condition) => condition.expression,
+            Self::Equality(condition) => condition.expression,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct PlannedFallthroughBranch {
     locals: Vec<PlannedVariable>,
+    statements: Vec<PlannedLinearFunctionStatement>,
 }
 
 #[derive(Clone, Debug)]
@@ -8188,6 +8294,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         error: SourceFlowError,
     ) -> SourceCheckError {
         match error {
+            SourceFlowError::Array(error) => error.into(),
             SourceFlowError::Unsupported(_)
             | SourceFlowError::Narrowing {
                 error: LogicalBinaryError::Unsupported(LogicalBinaryUnsupported::Type(_)),
@@ -13764,13 +13871,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 final_if.equality_condition,
             )?
         } else {
-            self.primitive_binary_position_roots
-                .insert(final_if.condition);
-            PlannedSourceCondition::Expression {
-                expression: self.plan_expression(final_if.condition)?,
-                // Computed expressions use the binder's statement entry.
-                flow_point: final_if.statement,
-            }
+            self.finish_general_source_condition(callable, final_if.condition, final_if.statement)?
         };
 
         let then_branch = self.finish_return_branch(callable, final_if.then_branch)?;
@@ -13779,7 +13880,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let points = leading_statements
             .iter()
             .filter_map(|statement| statement.flow_point(&leading))
-            .chain(std::iter::once(condition.flow_point()))
+            .chain(condition.flow_points())
             .chain(
                 then_branch
                     .statements
@@ -13809,14 +13910,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .chain(&then_branch.statements)
             .chain(&else_branch.statements)
             .filter_map(PlannedLinearFunctionStatement::direct_call);
+        let (store, host) = self
+            .semantic
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let array_mutations = leading_statements
+            .iter()
+            .chain(&then_branch.statements)
+            .chain(&else_branch.statements)
+            .map(|statement| statement.array_mutation(store, host))
+            .collect::<Result<Vec<_>, _>>()?;
         let flow = SourceFlowPlan::preflight_with_calls(
             self.arena,
             self.bound,
             callable.declaration,
             points,
-            condition.flow_condition(),
+            condition.flow_conditions(),
             assignments,
             calls,
+            array_mutations.into_iter().flatten(),
         )
         .map_err(|error| Self::source_flow_plan_error(callable, error))?;
 
@@ -13828,6 +13939,98 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             else_branch,
             flow,
         })
+    }
+
+    fn finish_general_source_condition(
+        &mut self,
+        callable: &SourceCallablePlan,
+        expression: NodeRef,
+        entry: NodeRef,
+    ) -> Result<PlannedSourceCondition, SourceCheckError> {
+        let record = self.node(expression)?;
+        if let NodeData::BinaryExpression(binary) = &record.data {
+            let operator = self.reference(binary.operator_token);
+            let operator_record = self.node(operator)?;
+            if matches!(
+                operator_record.kind,
+                SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken
+            ) {
+                let left = self.reference(binary.left);
+                let right = self.reference(binary.right);
+                if record.flags.0 != 0
+                    || binary.symbol.is_some()
+                    || binary.type_.is_some()
+                    || binary.modifiers.is_some()
+                    || binary.facts != 0
+                    || operator_record.flags.0 != 0
+                    || !matches!(&operator_record.data, NodeData::Token(_))
+                    || operator_record.parent != Some(expression.node)
+                    || self.node(left)?.parent != Some(expression.node)
+                    || self.node(right)?.parent != Some(expression.node)
+                    || self.node(left)?.range.end > operator_record.range.start
+                    || operator_record.range.end > self.node(right)?.range.start
+                    || !self.source_spelling_matches(
+                        operator,
+                        if operator_record.kind == SyntaxKind::AmpersandAmpersandToken {
+                            "&&"
+                        } else {
+                            "||"
+                        },
+                    )
+                {
+                    return Err(SourceCheckError::LogicalOperator(expression));
+                }
+                let operator = operator_record.kind;
+                let left = self.finish_general_source_condition(callable, left, entry)?;
+                let right = self.finish_general_source_condition(callable, right, entry)?;
+                return Ok(PlannedSourceCondition::Logical {
+                    expression,
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
+        }
+        if let Some(condition) = self.plan_typeof_return_condition(callable, expression)? {
+            return Ok(PlannedSourceCondition::Typeof(Box::new(condition)));
+        }
+        self.primitive_binary_position_roots.insert(expression);
+        let expression = self.plan_expression(expression)?;
+        if let PlannedExpressionKind::Identifier(read) = &expression.unparenthesized().kind
+            && read.kind == PlannedIdentifierReadKind::Variable
+        {
+            return Ok(PlannedSourceCondition::Truthiness {
+                symbol: read.value_symbol,
+                expression,
+            });
+        }
+        let flow_point = self.condition_expression_flow_point(&expression, entry);
+        Ok(PlannedSourceCondition::Expression {
+            expression,
+            flow_point,
+        })
+    }
+
+    fn condition_expression_flow_point(
+        &self,
+        expression: &PlannedExpression,
+        entry: NodeRef,
+    ) -> NodeRef {
+        if self.bound.flow_at(expression.node).is_some() {
+            return expression.node;
+        }
+        match &expression.kind {
+            PlannedExpressionKind::Call(call) => {
+                self.condition_expression_flow_point(&call.callee, entry)
+            }
+            PlannedExpressionKind::Property(property) => {
+                self.condition_expression_flow_point(&property.receiver, entry)
+            }
+            PlannedExpressionKind::Parenthesized(inner) => {
+                self.condition_expression_flow_point(inner, entry)
+            }
+            _ => entry,
+        }
     }
 
     fn finish_source_condition(
@@ -14062,7 +14265,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         return Err(Self::unsupported_function_body(callable));
                     }
                     statements.push(PlannedLinearFunctionStatement::Local(locals.len()));
-                    locals.push(self.finish_local_declaration(local)?);
+                    locals.push(self.finish_local_declaration_with_array_flow(local, true)?);
                 }
                 SourceLinearFunctionStatementSyntax::Expression {
                     statement,
@@ -14094,8 +14297,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let SourceJoinedFunctionStatementsSyntax {
             body,
             leading: leading_syntax,
+            leading_statements: leading_statement_syntax,
             joined_if,
             trailing: trailing_syntax,
+            trailing_statements: trailing_statement_syntax,
             return_statement,
             return_expression,
         } = syntax;
@@ -14105,35 +14310,60 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
 
-        let mut leading = Vec::with_capacity(leading_syntax.len());
-        for local in leading_syntax {
-            leading.push(self.finish_local_declaration(local)?);
-        }
-
-        let condition = self.finish_source_condition(
+        let (leading, leading_statements) = self.finish_function_statement_prefix(
             callable,
-            joined_if.condition,
-            joined_if.condition_identifier,
-            joined_if.typeof_condition,
-            joined_if.equality_condition,
+            leading_syntax,
+            leading_statement_syntax,
         )?;
 
-        let then_branch = self.finish_fallthrough_branch(joined_if.then_branch)?;
-        let else_branch = self.finish_fallthrough_branch(joined_if.else_branch)?;
+        let condition = if self.node(joined_if.condition_identifier)?.kind == SyntaxKind::Identifier
+        {
+            self.finish_source_condition(
+                callable,
+                joined_if.condition,
+                joined_if.condition_identifier,
+                joined_if.typeof_condition,
+                joined_if.equality_condition,
+            )?
+        } else {
+            self.finish_general_source_condition(
+                callable,
+                joined_if.condition,
+                joined_if.statement,
+            )?
+        };
 
-        let mut trailing = Vec::with_capacity(trailing_syntax.len());
-        for local in trailing_syntax {
-            trailing.push(self.finish_local_declaration(local)?);
-        }
+        let then_branch = self.finish_fallthrough_branch(callable, joined_if.then_branch)?;
+        let else_branch = self.finish_fallthrough_branch(callable, joined_if.else_branch)?;
+
+        let (trailing, trailing_statements) = self.finish_function_statement_prefix(
+            callable,
+            trailing_syntax,
+            trailing_statement_syntax,
+        )?;
         let return_expression = self.plan_expression(return_expression)?;
 
-        let points = leading
+        let points = leading_statements
             .iter()
-            .map(|local| local.name)
-            .chain(std::iter::once(condition.flow_point()))
-            .chain(then_branch.locals.iter().map(|local| local.name))
-            .chain(else_branch.locals.iter().map(|local| local.name))
-            .chain(trailing.iter().map(|local| local.name))
+            .filter_map(|statement| statement.flow_point(&leading))
+            .chain(condition.flow_points())
+            .chain(
+                then_branch
+                    .statements
+                    .iter()
+                    .filter_map(|statement| statement.flow_point(&then_branch.locals)),
+            )
+            .chain(
+                else_branch
+                    .statements
+                    .iter()
+                    .filter_map(|statement| statement.flow_point(&else_branch.locals)),
+            )
+            .chain(
+                trailing_statements
+                    .iter()
+                    .filter_map(|statement| statement.flow_point(&trailing)),
+            )
             .chain(std::iter::once(return_statement))
             .collect::<Vec<_>>();
         let assignments = leading
@@ -14146,22 +14376,42 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 symbol: local.symbol,
             })
             .collect::<Vec<_>>();
-        let flow = SourceFlowPlan::preflight(
+        let calls = leading_statements
+            .iter()
+            .chain(&then_branch.statements)
+            .chain(&else_branch.statements)
+            .chain(&trailing_statements)
+            .filter_map(PlannedLinearFunctionStatement::direct_call);
+        let (store, host) = self
+            .semantic
+            .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        let array_mutations = leading_statements
+            .iter()
+            .chain(&then_branch.statements)
+            .chain(&else_branch.statements)
+            .chain(&trailing_statements)
+            .map(|statement| statement.array_mutation(store, host))
+            .collect::<Result<Vec<_>, _>>()?;
+        let flow = SourceFlowPlan::preflight_with_calls(
+            self.arena,
             self.bound,
             callable.declaration,
-            None,
             points,
-            condition.flow_condition(),
+            condition.flow_conditions(),
             assignments,
+            calls,
+            array_mutations.into_iter().flatten(),
         )
         .map_err(|error| Self::source_flow_plan_error(callable, error))?;
 
         Ok(PlannedJoinedFunctionStatements {
             leading,
+            leading_statements,
             condition,
             then_branch,
             else_branch,
             trailing,
+            trailing_statements,
             return_statement,
             return_expression,
             flow,
@@ -14170,16 +14420,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     fn finish_fallthrough_branch(
         &mut self,
+        callable: &SourceCallablePlan,
         syntax: SourceFallthroughBranchSyntax,
     ) -> Result<PlannedFallthroughBranch, SourceCheckError> {
         let branch_prior = self.prior_variables.clone();
         let branch_readable = self.readable_variables.clone();
         let result = (|| {
-            let mut locals = Vec::with_capacity(syntax.locals.len());
-            for local in syntax.locals {
-                locals.push(self.finish_local_declaration(local)?);
-            }
-            Ok(PlannedFallthroughBranch { locals })
+            let (locals, statements) =
+                self.finish_function_statement_prefix(callable, syntax.locals, syntax.statements)?;
+            Ok(PlannedFallthroughBranch { locals, statements })
         })();
         self.prior_variables = branch_prior;
         self.readable_variables = branch_readable;
@@ -14190,16 +14439,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         syntax: SourceLocalDeclarationSyntax,
     ) -> Result<PlannedVariable, SourceCheckError> {
+        self.finish_local_declaration_with_array_flow(syntax, false)
+    }
+
+    fn finish_local_declaration_with_array_flow(
+        &mut self,
+        syntax: SourceLocalDeclarationSyntax,
+        allow_evolving_array: bool,
+    ) -> Result<PlannedVariable, SourceCheckError> {
         if let Some(type_node) = syntax.type_node {
             self.plan_type_import_annotation_root(type_node)?;
         }
+        let mut evolving_array = false;
         let initializer = match syntax.initializer {
             Some(initializer) => {
                 let initializer = self.plan_expression(initializer)?;
-                if syntax.type_node.is_none()
+                evolving_array = syntax.type_node.is_none()
                     && self.no_implicit_any
-                    && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
-                {
+                    && !self.prior_variables.contains(&syntax.symbol)
+                    && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty());
+                if evolving_array && !allow_evolving_array {
                     return Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Variable(
                             VariableUnsupported::InferredEmptyArrayOption(syntax.declaration),
@@ -14274,7 +14533,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             name: syntax.name,
             symbol: syntax.symbol,
             binding: syntax.binding,
-            evolving_array: false,
+            evolving_array,
             type_node: syntax.type_node,
             jsdoc_type: None,
             initializer,
@@ -24592,6 +24851,7 @@ fn collect_class_expression_flow(
 
 fn class_body_flow_error(node: NodeRef, error: SourceFlowError) -> SourceCheckError {
     match error {
+        SourceFlowError::Array(error) => error.into(),
         SourceFlowError::Unsupported(_) => {
             SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node))
         }
@@ -25149,6 +25409,32 @@ fn preflight_inferred_function_return_dependencies(
         })
     }
 
+    fn condition_is_closed(
+        condition: &PlannedSourceCondition,
+        parameters: &[SourceCallableParameterPlan],
+        locals: &HashSet<SemanticSymbolId>,
+        functions: &[PlannedFunction],
+    ) -> bool {
+        match condition {
+            PlannedSourceCondition::Logical { left, right, .. } => {
+                condition_is_closed(left, parameters, locals, functions)
+                    && condition_is_closed(right, parameters, locals, functions)
+            }
+            PlannedSourceCondition::Expression { expression, .. }
+            | PlannedSourceCondition::Truthiness { expression, .. } => {
+                expression_is_closed(expression, parameters, locals, functions)
+            }
+            PlannedSourceCondition::Typeof(condition) => {
+                expression_is_closed(&condition.identifier, parameters, locals, functions)
+                    && expression_is_closed(&condition.literal, parameters, locals, functions)
+            }
+            PlannedSourceCondition::Equality(condition) => {
+                expression_is_closed(&condition.operand, parameters, locals, functions)
+                    && expression_is_closed(&condition.value, parameters, locals, functions)
+            }
+        }
+    }
+
     for function in functions {
         if !function.callable.return_type.is_inferred() {
             continue;
@@ -25484,6 +25770,12 @@ fn preflight_inferred_function_return_dependencies(
                     &mut locals,
                     functions,
                 ) && match &statements.condition {
+                    PlannedSourceCondition::Logical { .. } => condition_is_closed(
+                        &statements.condition,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    ),
                     PlannedSourceCondition::Expression { expression, .. }
                     | PlannedSourceCondition::Truthiness { expression, .. } => {
                         expression_is_closed(
@@ -25537,7 +25829,44 @@ fn preflight_inferred_function_return_dependencies(
                         )
                     })
             }
-            PlannedFunctionBody::JoinedStatements(_) => false,
+            PlannedFunctionBody::JoinedStatements(statements) => {
+                statement_prefix_is_closed(
+                    &statements.leading,
+                    &statements.leading_statements,
+                    &function.callable.parameters,
+                    &mut locals,
+                    functions,
+                ) && condition_is_closed(
+                    &statements.condition,
+                    &function.callable.parameters,
+                    &locals,
+                    functions,
+                ) && [&statements.then_branch, &statements.else_branch]
+                    .into_iter()
+                    .all(|branch| {
+                        let mut branch_locals = locals.clone();
+                        statement_prefix_is_closed(
+                            &branch.locals,
+                            &branch.statements,
+                            &function.callable.parameters,
+                            &mut branch_locals,
+                            functions,
+                        )
+                    })
+                    && statement_prefix_is_closed(
+                        &statements.trailing,
+                        &statements.trailing_statements,
+                        &function.callable.parameters,
+                        &mut locals,
+                        functions,
+                    )
+                    && expression_is_closed(
+                        &statements.return_expression,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    )
+            }
         };
         if !initializers_supported || !body_supported {
             return Err(SourceCheckError::Unsupported(
@@ -27493,6 +27822,137 @@ fn emit_enum_use_before_declaration_diagnostics(
     Ok(())
 }
 
+fn source_property_is_direct_method_call(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
+    host.node(node)
+        .and_then(|record| record.parent)
+        .and_then(|parent| host.node(NodeRef::new(node.arena, node.file, parent)))
+        .is_some_and(|record| {
+            matches!(&record.data, NodeData::CallExpression(call)
+            if call.expression == node.node && call.question_dot_token.is_none())
+        })
+}
+
+fn source_method_receiver_needs_source_query(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    receiver: &PlannedExpression,
+) -> Result<bool, SourceCheckError> {
+    match &receiver.unparenthesized().kind {
+        PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. }
+        | PlannedExpressionKind::Boolean(_) => Ok(true),
+        PlannedExpressionKind::Identifier(read) => {
+            let Some(type_) = flow_types.get(&read.value_symbol).copied() else {
+                return Ok(false);
+            };
+            let record = store
+                .type_payload(type_)
+                .ok_or(SourceCheckError::Property(receiver.node))?;
+            Ok(record.flags().intersects(
+                TypeFlags::STRING_LIKE
+                    | TypeFlags::NUMBER_LIKE
+                    | TypeFlags::BOOLEAN_LIKE
+                    | TypeFlags::BIG_INT_LIKE
+                    | TypeFlags::ES_SYMBOL_LIKE,
+            ) || record.flags().intersects(TypeFlags::OBJECT)
+                && store
+                    .canonical_array_reference(global_types, type_)?
+                    .is_some())
+        }
+        _ => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_source_selected_method_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourcePropertyPlan,
+    receiver: TypeId,
+) -> Result<Option<super::source_properties::CheckedSourceProperty>, SourceCheckError> {
+    if plan.class_access_context().is_some()
+        || !source_property_is_direct_method_call(host, plan.node)
+        || source_global_wrapper_method_name(host, plan.node).is_some()
+        || source_is_global_array_concat_method(host, plan.node)
+        || source_global_array_callback_method_name(host, plan.node).is_some()
+        || source_is_global_array_find_index_method(host, plan.node)
+    {
+        return Ok(None);
+    }
+    let record = store
+        .type_payload(receiver)
+        .ok_or(SourceCheckError::Property(plan.node))?;
+    let scalar = record.flags().intersects(
+        TypeFlags::STRING_LIKE
+            | TypeFlags::NUMBER_LIKE
+            | TypeFlags::BOOLEAN_LIKE
+            | TypeFlags::BIG_INT_LIKE
+            | TypeFlags::ES_SYMBOL_LIKE,
+    );
+    if !scalar
+        && (!record.flags().intersects(TypeFlags::OBJECT)
+            || store
+                .canonical_array_reference(global_types, receiver)?
+                .is_none())
+    {
+        return Ok(None);
+    }
+    let Some(NodeData::PropertyAccessExpression(access)) =
+        host.node(plan.node).map(|node| &node.data)
+    else {
+        return Err(SourceCheckError::Property(plan.node));
+    };
+    if access.question_dot_token.is_some() {
+        return Ok(None);
+    }
+    let name = NodeRef::new(plan.node.arena, plan.node.file, access.name);
+    let Some(NodeData::Identifier(name)) = host.node(name).map(|node| &node.data) else {
+        return Ok(None);
+    };
+    let mut properties = SourceIterationProperties {
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        node: plan.node,
+    };
+    let Some(property) =
+        properties.property(store, receiver, EscapedNameRef::source(&name.text))?
+    else {
+        return Ok(None);
+    };
+    if property.optional {
+        return Ok(None);
+    }
+    preflight_source_expression_cache(store, plan.node, property.type_)?;
+    let expected = SymbolNodeLinks {
+        resolved_symbol: Some(property.symbol),
+        ..SymbolNodeLinks::default()
+    };
+    if store
+        .symbol_node_links(plan.node)
+        .is_some_and(|links| links != &expected && links != &SymbolNodeLinks::default())
+        || !store.set_symbol_node_links(plan.node, expected)
+    {
+        return Err(SourcePlanner::property_plan_error(
+            plan.node,
+            SourcePropertyError::InvalidCache(plan.node),
+        ));
+    }
+    publish_expression_type(store, plan.node, property.type_)?;
+    Ok(Some(super::source_properties::CheckedSourceProperty {
+        type_: property.type_,
+        diagnostics: Vec::new(),
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_expression_type(
     store: &mut CanonicalTypeMapperStore,
@@ -28052,8 +28512,86 @@ fn check_expression_type_with_class_context(
             publish_expression_type(store, conditional.node, raw_type)?;
             Ok(CheckedExpressionTypes::leaf(raw_type, result_type))
         }
+        PlannedExpressionKind::Object { plan, properties }
+            if plan.spreads.is_empty()
+                && expression.object_spreads.is_empty()
+                && expression.object_computed_keys.is_empty()
+                && properties.iter().any(|property| {
+                    matches!(
+                        &property.unparenthesized().kind,
+                        PlannedExpressionKind::Call(_)
+                    )
+                })
+                && contextual_type.is_none_or(|type_| {
+                    store
+                        .type_payload(type_)
+                        .is_some_and(|record| record.flags().intersects(TypeFlags::ANY))
+                }) =>
+        {
+            super::object_members::object_literal_state(store, plan)
+                .map_err(source_object_execution_error)?;
+            if properties.len() != plan.properties.len() {
+                return Err(SourceCheckError::ObjectLiteral(
+                    SourceObjectLiteralError::InvalidCache {
+                        node: expression.node,
+                        type_: None,
+                    },
+                ));
+            }
+            let mut property_types = Vec::with_capacity(properties.len());
+            let mut checked_properties = Vec::with_capacity(properties.len());
+            for (property, property_plan) in properties.iter().zip(&plan.properties) {
+                let mut checked = check_expression_type_with_class_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    property,
+                    None,
+                    deferred,
+                    class_flow.as_deref_mut(),
+                )?;
+                checked.result = if property_plan.readonly {
+                    match store.type_payload(checked.result).map(TypeRecord::data) {
+                        Some(TypeData::Literal(literal)) => literal.regular_type,
+                        _ => checked.result,
+                    }
+                } else {
+                    inferred_variable_type(
+                        store,
+                        global_types,
+                        VariableBindingKind::Let,
+                        checked.result,
+                    )?
+                };
+                property_types.push(checked.result);
+                checked_properties.push(checked);
+            }
+            let object =
+                super::object_members::publish_object_literal(store, plan, &property_types)
+                    .map_err(source_object_execution_error)?;
+            publish_expression_type(store, expression.node, object)?;
+            Ok(CheckedExpressionTypes {
+                raw: object,
+                result: object,
+                shape: CheckedExpressionShape::Object(checked_properties),
+                primitive_binary_recovery: None,
+            })
+        }
         PlannedExpressionKind::Property(property)
             if property.class_access_context().is_some()
+                || source_property_is_direct_method_call(host, property.node)
+                    && source_method_receiver_needs_source_query(
+                        store,
+                        global_types,
+                        current_flow_types,
+                        &property.receiver,
+                    )?
                 || matches!(
                     property.receiver.unparenthesized().kind,
                     PlannedExpressionKind::Call(_) | PlannedExpressionKind::New(_)
@@ -28134,17 +28672,29 @@ fn check_expression_type_with_class_context(
                     property.node,
                 )?;
             }
-            let checked = check_direct_source_property_with_class_context_and_session(
+            let checked = match check_source_selected_method_property(
                 store,
                 host,
-                Some(global_types),
+                global_types,
                 options,
+                session,
+                diagnostics,
                 property,
                 receiver.result,
-                session,
-                class_flow.as_deref_mut().map(|context| &mut context.flow),
-            )
-            .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?;
+            )? {
+                Some(checked) => checked,
+                None => check_direct_source_property_with_class_context_and_session(
+                    store,
+                    host,
+                    Some(global_types),
+                    options,
+                    property,
+                    receiver.result,
+                    session,
+                    class_flow.as_deref_mut().map(|context| &mut context.flow),
+                )
+                .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?,
+            };
             for diagnostic in checked.diagnostics {
                 publish_or_defer_class_property_diagnostic(
                     store,
@@ -37900,16 +38450,16 @@ fn check_planned_joined_function_statements(
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
-    return_type: NodeRef,
+    return_type: Option<NodeRef>,
     statements: &PlannedJoinedFunctionStatements,
     staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
     value_order: &mut Vec<SemanticSymbolId>,
-) -> Result<(), SourceCheckError> {
+) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
     let mut frame = statements
         .flow
         .frame(bound, base_flow_types)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -37923,6 +38473,7 @@ fn check_planned_joined_function_statements(
         deferred,
         callable,
         &statements.leading,
+        &statements.leading_statements,
         staged_value_types,
         value_order,
     )?;
@@ -37940,7 +38491,7 @@ fn check_planned_joined_function_statements(
         callable,
         &statements.condition,
     )?;
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -37954,10 +38505,11 @@ fn check_planned_joined_function_statements(
         deferred,
         callable,
         &statements.then_branch.locals,
+        &statements.then_branch.statements,
         staged_value_types,
         value_order,
     )?;
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -37971,10 +38523,11 @@ fn check_planned_joined_function_statements(
         deferred,
         callable,
         &statements.else_branch.locals,
+        &statements.else_branch.statements,
         staged_value_types,
         value_order,
     )?;
-    check_planned_function_locals(
+    check_planned_function_statement_prefix(
         store,
         host,
         global_types,
@@ -37988,31 +38541,34 @@ fn check_planned_joined_function_statements(
         deferred,
         callable,
         &statements.trailing,
+        &statements.trailing_statements,
         staged_value_types,
         value_order,
     )?;
     let snapshot = frame
         .snapshot_at(store, global_types, statements.return_statement)
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-    session.reset_query();
-    check_planned_assignment(
-        store,
-        host,
-        global_types,
-        source,
-        options,
-        session,
-        diagnostics,
-        snapshot.types(),
-        preflighted_type_import_value_uses,
-        deferred,
-        return_type,
-        &[],
-        &statements.return_expression,
-        statements.return_statement,
-        None,
-    )?;
-    Ok(())
+    if let Some(return_type) = return_type {
+        session.reset_query();
+        check_planned_assignment(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            snapshot.types(),
+            preflighted_type_import_value_uses,
+            deferred,
+            return_type,
+            &[],
+            &statements.return_expression,
+            statements.return_statement,
+            None,
+        )?;
+    }
+    Ok(snapshot.types().clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -38031,6 +38587,56 @@ fn check_planned_source_condition(
     condition: &PlannedSourceCondition,
 ) -> Result<(), SourceCheckError> {
     match condition {
+        PlannedSourceCondition::Logical {
+            expression,
+            operator,
+            left,
+            right,
+        } => {
+            for operand in [left, right] {
+                check_planned_source_condition(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    frame,
+                    preflighted_type_import_value_uses,
+                    deferred,
+                    callable,
+                    operand,
+                )?;
+            }
+            let left_type = store
+                .type_node_links(left.expression_node())
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::LogicalOperator(*expression))?;
+            let right_type = store
+                .type_node_links(right.expression_node())
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::LogicalOperator(*expression))?;
+            let result = super::logical_operators::check_logical_binary(
+                store,
+                Some(global_types),
+                super::logical_operators::LogicalBinaryRequest {
+                    operator: *operator,
+                    left_type,
+                    right_type,
+                },
+            )
+            .map_err(|error| {
+                SourcePlanner::source_flow_plan_error(
+                    callable,
+                    SourceFlowError::Narrowing {
+                        condition: *expression,
+                        error,
+                    },
+                )
+            })?;
+            publish_expression_type(store, *expression, result.result_type)
+        }
         PlannedSourceCondition::Expression {
             expression,
             flow_point,
@@ -38052,6 +38658,15 @@ fn check_planned_source_condition(
                 None,
                 deferred,
             )?;
+            if let PlannedExpressionKind::Call(_) = &expression.unparenthesized().kind
+                && store
+                    .signature_links(expression.unparenthesized().node)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .and_then(|signature| store.signature(signature))
+                    .is_some_and(|signature| signature.resolved_type_predicate().is_some())
+            {
+                return Err(SourcePlanner::unsupported_function_body(callable));
+            }
             emit_truthiness_operand_diagnostics(
                 store,
                 host,
@@ -38620,9 +39235,29 @@ fn check_planned_function_statement_prefix(
                 statement,
                 expression,
             } => {
+                let mutation = planned_array_mutation(store, host, expression)?;
+                let prior = mutation
+                    .map(|mutation| {
+                        frame
+                            .raw_type_at(store, global_types, *statement, mutation.symbol)
+                            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))
+                    })
+                    .transpose()?;
+                let evolving = prior.is_some_and(|type_| {
+                    store.type_payload(type_).is_some_and(|record| {
+                        record
+                            .object_flags()
+                            .intersects(ObjectFlags::EVOLVING_ARRAY)
+                    })
+                });
                 let snapshot = frame
                     .snapshot_at(store, global_types, *statement)
                     .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                let mut types = snapshot.types().clone();
+                if evolving && let Some(mutation) = mutation {
+                    // Mutation targets use canonical any[] while their elements keep evolving.
+                    types.insert(mutation.symbol, global_types.any_array_type);
+                }
                 check_expression_type(
                     store,
                     host,
@@ -38631,12 +39266,39 @@ fn check_planned_function_statement_prefix(
                     options,
                     session,
                     diagnostics,
-                    snapshot.types(),
+                    &types,
                     preflighted_type_import_value_uses,
                     expression,
                     None,
                     deferred,
                 )?;
+                if let (Some(mutation), Some(prior)) = (mutation, prior) {
+                    let current = if evolving {
+                        let PlannedExpressionKind::Call(call) = &expression.kind else {
+                            return Err(SourcePlanner::unsupported_function_body(callable));
+                        };
+                        let mut elements = vec![store.evolving_array_element_type(prior)?];
+                        for argument in &call.arguments {
+                            let type_ = store
+                                .type_node_links(argument.node)
+                                .and_then(|links| links.resolved_type)
+                                .ok_or(SourceCheckError::Call(expression.node))?;
+                            let base = widened_fresh_literal_type(store, type_)?;
+                            elements.push(store.get_regular_type_of_object_literal(base)?);
+                        }
+                        let element = store.expression_union_type_with_global_types(
+                            global_types,
+                            &elements,
+                            UnionReduction::Literal,
+                        )?;
+                        store.create_evolving_array_type(element)?
+                    } else {
+                        prior
+                    };
+                    frame
+                        .complete_assignment(mutation.call, mutation.symbol, current)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                }
             }
             _ => return Err(SourcePlanner::unsupported_function_body(callable)),
         }
@@ -38719,8 +39381,31 @@ fn check_planned_function_locals(
                 None,
                 deferred,
             )?;
-            let declared_type =
-                inferred_variable_type(store, global_types, local.binding, initializer.result)?;
+            let declared_type = if local.evolving_array {
+                global_types.auto_array_type
+            } else {
+                inferred_variable_type(store, global_types, local.binding, initializer.result)?
+            };
+            if local.evolving_array {
+                let never = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+                    .never_type;
+                let evolving = store.create_evolving_array_type(never)?;
+                stage_value_type(
+                    store,
+                    staged_value_types,
+                    value_order,
+                    local.symbol,
+                    declared_type,
+                )?;
+                frame
+                    .complete_assignment(local.declaration, local.symbol, evolving)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                continue;
+            }
             let current_type = current_flow_type_after_assignment(
                 store,
                 host,
@@ -53994,7 +54679,29 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
-            PlannedFunctionBody::Ambient | PlannedFunctionBody::JoinedStatements(_) => {
+            PlannedFunctionBody::JoinedStatements(statements) => {
+                let flow_types = check_planned_joined_function_statements(
+                    bound,
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &type_import_capabilities,
+                    &mut deferred,
+                    &function.callable,
+                    None,
+                    statements,
+                    &mut staged_value_types,
+                    &mut value_order,
+                )?;
+                (Some(&statements.return_expression), flow_types)
+            }
+            PlannedFunctionBody::Ambient => {
                 return Err(SourceCheckError::Function(
                     SourceFunctionInvariant::Callable(function.callable.body),
                 ));
@@ -55425,7 +56132,7 @@ pub(super) fn check_source_file(
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
-                            return_type,
+                            Some(return_type),
                             statements,
                             &mut staged_value_types,
                             &mut value_order,
@@ -98305,6 +99012,96 @@ class Foo2 {
         assert_eq!(diagnostic.diagnostic.arguments, ["+", "number", "boolean"]);
         assert_eq!(resolved_node_type(&context, binary), expected);
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn joined_array_flow_keeps_branch_elements_and_existing_array_diagnostics() {
+        let library = parsed(concat!(
+            "interface Array<T> { [index: number]: T; push(...items: T[]): number; ",
+            "unshift(...items: T[]): number; } ",
+            "interface ReadonlyArray<T> { readonly [index: number]: T; }",
+        ));
+        for (index, (text, expected, codes)) in [
+            (
+                "function collect(flag: boolean) { const values = []; if (flag) { values.push(1); } else { values.unshift('text'); } return values; }",
+                "(flag: boolean) => (string | number)[]",
+                [].as_slice(),
+            ),
+            (
+                "function collect(flag: boolean) { const values: number[] = []; if (flag) { values.push('bad'); } else { values.push(1); } return values; }",
+                "(flag: boolean) => number[]",
+                [2345].as_slice(),
+            ),
+            (
+                "function collect(flag: boolean) { const values = []; if (flag) {} else {} return values; }",
+                "(flag: boolean) => any[]",
+                [7034, 7005].as_slice(),
+            ),
+        ].into_iter().enumerate() {
+            let source = parsed(text);
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(11_440 + offset);
+            let file = FileId::new(11_441 + offset);
+            let mut context = context_with_default_library_files(
+                &[(library_file, &library), (file, &source)],
+                &[library_file],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(context.diagnostics().as_slice().iter().map(|diagnostic| diagnostic.diagnostic.code()).collect::<Vec<_>>(), codes, "{text}");
+            let owner = function_symbol(&context, &source, file, "collect");
+            let callable = context.store().source_callable_type_for_owner(owner).unwrap();
+            assert_eq!(context.type_to_string(callable).unwrap(), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn object_property_calls_keep_argument_errors_and_checked_result_types() {
+        let library =
+            parsed("interface String { includes(search: string, position?: number): boolean; }");
+        let source = parsed(
+            "function check(value: string) { return { found: value.includes('a', 'bad') }; }",
+        );
+        let library_file = FileId::new(11_446);
+        let file = FileId::new(11_447);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one checked method argument diagnostic");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "'bad'");
+        let owner = function_symbol(&context, &source, file, "check");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "(value: string) => { found: boolean; }"
+        );
     }
 
     #[test]

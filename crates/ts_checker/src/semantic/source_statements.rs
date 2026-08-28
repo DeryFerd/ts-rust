@@ -2,9 +2,9 @@
 //!
 //! Returning branches retain local declarations, expression statements, and
 //! their actual return nodes. A trailing return path can supply the false path
-//! of an if without an else. Joined fallthrough branches retain the existing
-//! declaration-only form. Expression checking, narrowing, and return inference
-//! stay in the source checker.
+//! of an if without an else. Fallthrough branches retain their calls and local
+//! declarations before the final return. Expression checking, narrowing, and
+//! return inference stay in the source checker.
 
 use std::collections::HashSet;
 
@@ -559,18 +559,20 @@ pub(super) struct SourceTypeofSwitchFunctionStatementsSyntax {
     pub(super) expressions: Vec<SourceTypeofSwitchExpressionSyntax>,
 }
 
-/// One fallthrough arm containing initialized locals only.
+/// One fallthrough arm containing source-ordered locals and expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFallthroughBranchSyntax {
     pub(super) block: Option<NodeRef>,
     pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) statements: Vec<SourceLinearFunctionStatementSyntax>,
 }
 
-/// The exact joined `if` and its unwrapped direct identifier condition.
+/// The exact joined `if` and its original condition nodes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceJoinedIfSyntax {
     pub(super) statement: NodeRef,
     pub(super) condition: NodeRef,
+    /// The narrowed identifier when available, otherwise the condition root.
     pub(super) condition_identifier: NodeRef,
     pub(super) typeof_condition: Option<SourceTypeofConditionSyntax>,
     pub(super) equality_condition: Option<SourceEqualityConditionSyntax>,
@@ -590,8 +592,10 @@ struct PlannedConditionSyntax {
 pub(super) struct SourceJoinedFunctionStatementsSyntax {
     pub(super) body: NodeRef,
     pub(super) leading: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) leading_statements: Vec<SourceLinearFunctionStatementSyntax>,
     pub(super) joined_if: SourceJoinedIfSyntax,
     pub(super) trailing: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) trailing_statements: Vec<SourceLinearFunctionStatementSyntax>,
     pub(super) return_statement: NodeRef,
     pub(super) return_expression: NodeRef,
 }
@@ -599,7 +603,6 @@ pub(super) struct SourceJoinedFunctionStatementsSyntax {
 /// Valid source forms intentionally outside the first post-`if` join slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceJoinedFunctionStatementsUnsupported {
-    InferredCallable(NodeRef),
     MissingIf(NodeRef),
     AdditionalIf(NodeRef),
     MissingReturn(NodeRef),
@@ -8819,6 +8822,11 @@ impl SyntaxPlanner<'_> {
         self.validate_range(condition, statement)?;
         let condition_syntax = match self.plan_condition(condition, callable) {
             Ok(condition) => Some(condition),
+            Err(error @ SourceFunctionStatementsError::Unsupported(_))
+                if self.condition_requires_narrowing(condition)? =>
+            {
+                return Err(error);
+            }
             Err(SourceFunctionStatementsError::Unsupported(_)) => None,
             Err(error) => return Err(error),
         };
@@ -8853,6 +8861,27 @@ impl SyntaxPlanner<'_> {
             then_branch,
             else_branch,
         })
+    }
+
+    fn condition_requires_narrowing(
+        &self,
+        condition: NodeRef,
+    ) -> Result<bool, SourceFunctionStatementsError> {
+        match &self.node(condition)?.data {
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.condition_requires_narrowing(self.reference(parenthesized.expression))
+            }
+            NodeData::BinaryExpression(binary) => Ok(matches!(
+                self.node(self.reference(binary.operator_token))?.kind,
+                SyntaxKind::EqualsEqualsToken
+                    | SyntaxKind::ExclamationEqualsToken
+                    | SyntaxKind::EqualsEqualsEqualsToken
+                    | SyntaxKind::ExclamationEqualsEqualsToken
+                    | SyntaxKind::InKeyword
+                    | SyntaxKind::InstanceOfKeyword
+            )),
+            _ => Ok(false),
+        }
     }
 
     fn plan_condition(
@@ -9726,11 +9755,6 @@ impl SyntaxPlanner<'_> {
                 )
                 .into());
         }
-        if self.callable.return_type.is_inferred() {
-            return Err(SourceJoinedFunctionStatementsError::Unsupported(
-                SourceJoinedFunctionStatementsUnsupported::InferredCallable(declaration),
-            ));
-        }
 
         let declaration_record = self.node(declaration)?;
         let NodeData::FunctionDeclaration(function) = &declaration_record.data else {
@@ -9788,31 +9812,21 @@ impl SyntaxPlanner<'_> {
             ));
         };
 
-        let mut leading = Vec::new();
-        for &statement_id in &preceding[..if_index] {
-            leading.extend(self.plan_local_or_block_statement(
-                self.reference(statement_id),
-                body,
-                declaration,
-            )?);
-        }
+        let (leading, leading_statements) =
+            self.plan_return_prefix(&preceding[..if_index], body, declaration)?;
         let joined_if =
             self.plan_joined_if(self.reference(preceding[if_index]), body, declaration)?;
-        let mut trailing = Vec::new();
-        for &statement_id in &preceding[if_index + 1..] {
-            trailing.extend(self.plan_local_or_block_statement(
-                self.reference(statement_id),
-                body,
-                declaration,
-            )?);
-        }
+        let (trailing, trailing_statements) =
+            self.plan_return_prefix(&preceding[if_index + 1..], body, declaration)?;
         let return_expression = self.plan_joined_return(return_statement, body, declaration)?;
 
         let syntax = SourceJoinedFunctionStatementsSyntax {
             body,
             leading,
+            leading_statements,
             joined_if,
             trailing,
+            trailing_statements,
             return_statement,
             return_expression,
         };
@@ -9868,7 +9882,16 @@ impl SyntaxPlanner<'_> {
             SourceFunctionStatementsRole::Condition,
         )?;
         self.validate_range(condition, statement)?;
-        let condition_syntax = self.plan_condition(condition, callable)?;
+        let condition_syntax = match self.plan_condition(condition, callable) {
+            Ok(condition) => Some(condition),
+            Err(error @ SourceFunctionStatementsError::Unsupported(_))
+                if self.condition_requires_narrowing(condition)? =>
+            {
+                return Err(error.into());
+            }
+            Err(SourceFunctionStatementsError::Unsupported(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
 
         let then_block = control.then_statement;
         self.validate_range(then_block, statement)?;
@@ -9882,15 +9905,16 @@ impl SyntaxPlanner<'_> {
             SourceFallthroughBranchSyntax {
                 block: None,
                 locals: Vec::new(),
+                statements: Vec::new(),
             }
         };
 
         Ok(SourceJoinedIfSyntax {
             statement,
             condition,
-            condition_identifier: condition_syntax.identifier,
-            typeof_condition: condition_syntax.typeof_condition,
-            equality_condition: condition_syntax.equality_condition,
+            condition_identifier: condition_syntax.map_or(condition, |syntax| syntax.identifier),
+            typeof_condition: condition_syntax.and_then(|syntax| syntax.typeof_condition),
+            equality_condition: condition_syntax.and_then(|syntax| syntax.equality_condition),
             then_branch,
             else_branch,
         })
@@ -9937,14 +9961,12 @@ impl SyntaxPlanner<'_> {
             &block_data.statements.nodes,
         )?;
 
-        let mut locals = Vec::new();
-        for &statement_id in &block_data.statements.nodes {
-            let statement = self.reference(statement_id);
-            locals.extend(self.plan_local_or_block_statement(statement, block, callable)?);
-        }
+        let (locals, statements) =
+            self.plan_return_prefix(&block_data.statements.nodes, block, callable)?;
         Ok(SourceFallthroughBranchSyntax {
             block: Some(block),
             locals,
+            statements,
         })
     }
 
@@ -10030,6 +10052,21 @@ impl SyntaxPlanner<'_> {
                 }
                 .into(),
             );
+        }
+
+        // Calls and general conditions are validated by the shared source flow plan.
+        if syntax
+            .leading_statements
+            .iter()
+            .chain(&syntax.joined_if.then_branch.statements)
+            .chain(&syntax.joined_if.else_branch.statements)
+            .chain(&syntax.trailing_statements)
+            .any(|statement| !matches!(statement, SourceLinearFunctionStatementSyntax::Local(_)))
+            || syntax.joined_if.typeof_condition.is_none()
+                && syntax.joined_if.equality_condition.is_none()
+                && self.node(syntax.joined_if.condition_identifier)?.kind != SyntaxKind::Identifier
+        {
+            return Ok(());
         }
 
         for (index, local) in syntax.leading.iter().enumerate() {
