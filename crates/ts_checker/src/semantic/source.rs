@@ -31137,21 +31137,50 @@ fn check_planned_class_body(
         } else {
             if let Some(type_) = return_type
                 && !matches!(body.kind, ClassBodyKind::PropertyInitializer { .. })
-                && returns.values.is_empty()
-                && !returns.has_bare_return
                 && planned.flow.has_reachable_end()
-                && store.type_payload(type_).is_some_and(|record| {
-                    !record
-                        .flags()
-                        .intersects(TypeFlags::ANY | TypeFlags::VOID | TypeFlags::UNDEFINED)
-                })
             {
-                issue_node_diagnostic(
-                    diagnostics,
-                    body.return_annotation
-                        .ok_or(SourceCheckError::Class(body.declaration))?,
-                    2355,
-                )?;
+                let record = store
+                    .type_payload(type_)
+                    .ok_or(SourceCheckError::Class(body.declaration))?;
+                let permits_implicit_return = record
+                    .flags()
+                    .intersects(TypeFlags::ANY | TypeFlags::VOID | TypeFlags::UNDEFINED)
+                    || matches!(record.data(), TypeData::Union(union)
+                        if union.union.types.iter().any(|type_| store.type_payload(*type_)
+                            .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))));
+                let code = if permits_implicit_return {
+                    None
+                } else if record.flags().intersects(TypeFlags::NEVER) {
+                    Some(2534)
+                } else if returns.values.is_empty() && !returns.has_bare_return {
+                    Some(2355)
+                } else if options.intrinsic.strict_null_checks {
+                    let undefined = store
+                        .intrinsic_bootstrap()
+                        .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                        .undefined_type;
+                    (!source_type_is_assignable_to(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        undefined,
+                        type_,
+                    )?)
+                    .then_some(2366)
+                } else {
+                    None
+                };
+                if let Some(code) = code {
+                    issue_node_diagnostic(
+                        diagnostics,
+                        body.return_annotation
+                            .ok_or(SourceCheckError::Class(body.declaration))?,
+                        code,
+                    )?;
+                }
             }
             None
         };
@@ -102220,6 +102249,59 @@ class Foo2 {
                     ["string | undefined", "string"]
                 );
             }
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn source_class_methods_check_reachable_ends_after_branch_returns() {
+        let source = parsed(concat!(
+            "class Conditional {\n",
+            "  read(flag: boolean): string { if (flag) { return 'set'; } }\n",
+            "  complete(flag: boolean): string { if (flag) { return 'set'; } else { return 'other'; } }\n",
+            "  optional(flag: boolean): undefined { if (flag) { return undefined; } }\n",
+            "  withVoid(flag: boolean): void { if (flag) { return; } }\n",
+            "  dynamic(flag: boolean): any { if (flag) { return 'set'; } }\n",
+            "  unknown(flag: boolean): unknown { if (flag) { return 'set'; } }\n",
+            "  throwing(flag: boolean): string { if (flag) { return 'set'; } throw 'stop'; }\n",
+            "  empty(): string {}\n",
+            "  neverReturns(): never {}\n",
+            "}\n",
+        ));
+        for strict_null_checks in [false, true] {
+            let file = FileId::new(174_2717);
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap_or_else(|error| {
+                panic!("strict_null_checks={strict_null_checks}: {error:?}")
+            });
+            let actual = context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.diagnostic.code(),
+                        node_text(&source, diagnostic.node.unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = if strict_null_checks {
+                vec![(2366, "string"), (2355, "string"), (2534, "never")]
+            } else {
+                vec![(2355, "string"), (2534, "never")]
+            };
+            assert_eq!(actual, expected);
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
