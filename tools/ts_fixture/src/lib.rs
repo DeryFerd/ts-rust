@@ -25,6 +25,9 @@ mod artifacts;
 mod oracle;
 pub mod project;
 
+#[cfg(test)]
+mod artifact_classification_review;
+
 use artifacts::{
     ArtifactRenderError, GeneratedSemanticArtifacts, SemanticArtifactError, SemanticArtifactKind,
 };
@@ -2120,6 +2123,8 @@ fn execute_diagnostic_variant(
             return Ok(());
         }
     };
+    #[cfg(test)]
+    let compilation = artifact_classification_review::override_artifacts(compilation);
     let mut actual = render_error_baseline(&plan.case, &compilation.diagnostics);
     let artifact_failure = compilation
         .semantic_artifacts

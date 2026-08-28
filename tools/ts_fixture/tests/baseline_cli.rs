@@ -8,6 +8,9 @@ use std::{
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+#[path = "support/artifact_review_inputs.rs"]
+mod artifact_review_inputs;
+
 struct TestRepository(PathBuf);
 
 struct TestArtifacts(PathBuf);
@@ -1071,6 +1074,218 @@ fn canonical_option_diagnostics_precede_invalid_javascript_root_diagnostics() {
     assert_eq!(diagnostics.len(), 2);
     assert_eq!(diagnostics[0]["code"], 5052);
     assert_eq!(diagnostics[1]["code"], 6504);
+}
+
+#[test]
+fn review_artifact_cli_separates_typed_failures_from_diagnostics_only_runs() {
+    for (name, source, code) in [
+        (
+            "reviewMissingArtifact",
+            artifact_review_inputs::MISSING_TYPE,
+            "ARTIFACT.MISSING_TYPE",
+        ),
+        (
+            "reviewCallableArtifact",
+            artifact_review_inputs::CALLABLE_DISPLAY,
+            "T07.TYPE_DISPLAY",
+        ),
+    ] {
+        let repository = TestRepository::new();
+        repository.write_case(name, source, None);
+        repository.write_baseline(&format!("{name}.types"), "expected types\n");
+        repository.write_baseline(&format!("{name}.symbols"), "expected symbols\n");
+        let diagnostics_path = repository.0.join("diagnostics.json");
+        let diagnostics = run(
+            &repository.0,
+            &[
+                "--diagnostics",
+                "--canonical-checker",
+                "--scorecard-json",
+                diagnostics_path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(diagnostics.status.code(), Some(0), "{diagnostics:?}");
+        let diagnostic_scorecard: serde_json::Value =
+            serde_json::from_slice(&fs::read(&diagnostics_path).unwrap()).unwrap();
+        assert_eq!(diagnostic_scorecard["summary"]["exactMatches"], 1);
+        assert!(diagnostic_scorecard.get("semanticArtifacts").is_none());
+
+        let artifact_path = repository.0.join("artifacts.json");
+        let artifacts = run(
+            &repository.0,
+            &[
+                "--diagnostics",
+                "--canonical-checker",
+                "--semantic-artifacts",
+                "--scorecard-json",
+                artifact_path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(artifacts.status.code(), Some(1), "{artifacts:?}");
+        let scorecard: serde_json::Value =
+            serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
+        assert_eq!(scorecard["summary"]["executedVariants"], 1);
+        assert_eq!(scorecard["summary"]["exactMatches"], 0);
+        assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
+        assert_eq!(scorecard["summary"]["fatalInvariants"], 0);
+        let result = &scorecard["variants"][0];
+        assert_eq!(result["status"], "unsupported_detail");
+        assert_eq!(result["outcomeClass"], "checker_capability");
+        assert_eq!(result["frontierBlocker"]["code"], code);
+        assert_eq!(
+            result["diagnostics"],
+            diagnostic_scorecard["variants"][0]["diagnostics"]
+        );
+        assert_eq!(
+            result["frontierBlocker"]["detail"],
+            result["semanticArtifacts"]["types"]["unsupportedDetail"]
+        );
+        assert!(
+            String::from_utf8_lossy(&artifacts.stdout)
+                .contains(result["frontierBlocker"]["detail"].as_str().unwrap())
+        );
+        assert_eq!(scorecard["semanticArtifacts"]["types"]["unsupported"], 1);
+        assert_eq!(scorecard["semanticArtifacts"]["types"]["exactMatches"], 0);
+    }
+}
+
+#[test]
+fn review_artifact_cli_fatal_preserves_diagnostic_mismatches_and_related_records() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "reviewFatalArtifact",
+        artifact_review_inputs::FATAL_WITH_DIAGNOSTICS,
+        None,
+    );
+    repository.write_baseline("reviewFatalArtifact.types", "expected types\n");
+    repository.write_baseline("reviewFatalArtifact.symbols", "expected symbols\n");
+    let scorecard_path = repository.0.join("fatal.json");
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let scorecard: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["executedVariants"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["fatalInvariants"], 1);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["summary"]["headerMismatches"], 1);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
+    let result = &scorecard["variants"][0];
+    assert_eq!(result["status"], "fatal_invariant");
+    assert_eq!(result["outcomeClass"], "fatal_invariant");
+    assert_eq!(result["frontierBlocker"]["code"], "INV.SOURCE.TYPE_DISPLAY");
+    assert_eq!(
+        result["frontierBlocker"]["detail"],
+        result["semanticArtifacts"]["types"]["unsupportedDetail"]
+    );
+    assert!(result["actualHeader"].as_str().unwrap().contains("TS2451"));
+    let diagnostics = result["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic["code"], 2451);
+        assert_eq!(
+            diagnostic["relatedInformation"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(diagnostic["relatedInformation"][0]["code"], 6203);
+    }
+    assert_eq!(scorecard["semanticArtifacts"]["types"]["unsupported"], 1);
+    assert_eq!(scorecard["semanticArtifacts"]["symbols"]["mismatches"], 1);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(
+        "FATAL testdata/tests/cases/compiler/reviewFatalArtifact.ts: INV.SOURCE.TYPE_DISPLAY:"
+    ));
+    assert!(stdout.contains(result["frontierBlocker"]["detail"].as_str().unwrap()));
+}
+
+#[test]
+fn review_artifact_cli_distinguishes_disabled_checker_and_invalid_invocation() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "reviewDisabledChecker",
+        artifact_review_inputs::DISABLED_CHECKER,
+        None,
+    );
+    let scorecard_path = repository.0.join("disabled.json");
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let scorecard: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["fatalInvariants"], 0);
+    assert_eq!(scorecard["variants"][0]["status"], "unsupported_detail");
+    assert_eq!(scorecard["variants"][0]["outcomeClass"], "harness_config");
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 0);
+    }
+
+    let invalid_path = repository.0.join("invalid-invocation.json");
+    let invalid = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            invalid_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(invalid.status.code(), Some(2), "{invalid:?}");
+    assert!(!invalid_path.exists());
+}
+
+#[test]
+fn review_artifact_library_api_never_credits_unreached_requested_artifacts() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "reviewRequestedArtifacts",
+        "const value: number = 1;\n",
+        None,
+    );
+    let scorecard_path = repository.0.join("library-requested-artifacts.json");
+    let mut output = Vec::new();
+    let result = ts_fixture::run_upstream_diagnostic_baselines(
+        &repository.0,
+        &ts_fixture::RunnerOptions {
+            diagnostics: true,
+            semantic_artifacts: true,
+            canonical_checker: false,
+            scorecard_json: Some(scorecard_path.clone()),
+            ..ts_fixture::RunnerOptions::default()
+        },
+        &mut output,
+    );
+    match result {
+        Ok(summary) => {
+            let scorecard: serde_json::Value =
+                serde_json::from_slice(&fs::read(&scorecard_path).unwrap()).unwrap();
+            eprintln!("requested-artifact library result: {scorecard:#}");
+            assert!(
+                !summary.is_success(),
+                "requested artifacts received exact credit without being reached: {scorecard:#}"
+            );
+            assert_eq!(scorecard["summary"]["exactMatches"], 0);
+        }
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput),
+    }
 }
 
 #[test]
