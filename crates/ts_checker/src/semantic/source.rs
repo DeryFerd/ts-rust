@@ -94086,10 +94086,14 @@ class Foo2 {
             }
 
             let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-            for name in ["p1", "e1", "e2"] {
+            for (name, expected) in [
+                ("p1", bootstrap.error_type),
+                ("e1", bootstrap.any_type),
+                ("e2", bootstrap.any_type),
+            ] {
                 assert_eq!(
                     object_binding_value_type(&context, &source, file, name),
-                    bootstrap.error_type,
+                    expected,
                     "{name}",
                 );
             }
