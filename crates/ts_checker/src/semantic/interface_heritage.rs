@@ -2786,7 +2786,7 @@ mod tests {
             portal_plan
                 .properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["key", "children"],
         );
@@ -2990,7 +2990,7 @@ mod tests {
             properties
                 .properties
                 .iter()
-                .map(|property| property.name.as_str())
+                .map(|property| property.name.as_utf8().unwrap())
                 .collect::<Vec<_>>(),
             ["key", "children"],
         );

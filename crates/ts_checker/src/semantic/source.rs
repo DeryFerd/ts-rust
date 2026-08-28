@@ -40264,9 +40264,9 @@ fn object_binding_context_is_needed(
             let Some(name) = literal_computed_property_name(store, type_) else {
                 return Ok(false);
             };
-            names.push(name);
+            names.push(EscapedName::source(name));
         } else {
-            names.push(element.binding.property_name.clone());
+            names.push(EscapedName::source(&element.binding.property_name));
         }
     }
     Ok(plan
@@ -40449,11 +40449,11 @@ fn check_object_binding_literal_context(
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
     for (property, initializer) in plan.properties.iter().zip(properties) {
-        if !context.permits_extra
-            && store
-                .resolved_own_property(context.type_, &property.name)?
-                .is_none()
-        {
+        let name = property
+            .name
+            .as_utf8()
+            .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
+        if !context.permits_extra && store.resolved_own_property(context.type_, name)?.is_none() {
             let target = super::formatter::type_to_string_with_host_global_types_and_flags(
                 store,
                 host,
@@ -40468,7 +40468,7 @@ fn check_object_binding_literal_context(
                     range_override: None,
                     diagnostic: Diagnostic::with_arguments(
                         message_by_code(2353).ok_or(SourceCheckError::MissingDiagnostic(2353))?,
-                        [property.name.clone(), target],
+                        [name.to_owned(), target],
                     ),
                     related_information: Vec::new(),
                 },
@@ -40477,7 +40477,7 @@ fn check_object_binding_literal_context(
         if let Some((_, child)) = context
             .nested
             .iter()
-            .find(|(name, _)| name == &property.name)
+            .find(|(candidate, _)| candidate == name)
         {
             check_object_binding_literal_context(
                 store,
