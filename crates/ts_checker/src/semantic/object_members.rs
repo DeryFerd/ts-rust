@@ -25467,7 +25467,7 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn computed_method_plans_reject_duplicate_keys_before_publication() {
+    fn computed_method_plans_preserve_overloads_before_publication() {
         let mut fixture = interface_fixture(
             concat!(
                 "declare const key: unique symbol; ",
@@ -25503,13 +25503,24 @@ mod generic_publication_tests {
             fixture.store.symbol_len(),
             fixture.store.checker_link_allocated_lengths(),
         );
-        assert!(matches!(
-            plan_selected_interface_method(&fixture.store, &host, selected),
-            Err(PropertyObjectError::UnsupportedMember {
-                kind: SyntaxKind::MethodSignature,
-                ..
-            })
-        ));
+        let plan = plan_selected_interface_method(&fixture.store, &host, selected).unwrap();
+        assert_eq!(plan.properties.len(), 1);
+        assert_eq!(plan.methods.len(), 2);
+        assert_ne!(plan.methods[0].symbol, plan.methods[1].symbol);
+        for method in &plan.methods {
+            assert_eq!(
+                fixture.bound.symbol(method.declaration),
+                Some(method.symbol)
+            );
+            assert_eq!(method.computed_key.unwrap().key_symbol, key);
+            assert_eq!(method.parameters.len(), 1);
+            assert!(fixture.store.late_bound_links(method.symbol).is_none());
+            assert!(fixture.store.value_symbol_links(method.symbol).is_none());
+        }
+        assert_eq!(
+            plan_selected_interface_method(&fixture.store, &host, plan.methods[1].symbol),
+            Ok(plan)
+        );
         assert_eq!(
             (
                 fixture.store.type_len(),
@@ -25518,8 +25529,6 @@ mod generic_publication_tests {
             ),
             before
         );
-        assert!(fixture.store.late_bound_links(selected).is_none());
-        assert!(fixture.store.value_symbol_links(selected).is_none());
     }
 
     #[test]
