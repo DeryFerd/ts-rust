@@ -36071,6 +36071,7 @@ fn check_planned_lexical_iteration(
         } else {
             iteration_type
         };
+        let type_ = inferred_variable_type(store, global_types, iteration.syntax.binding, type_)?;
         if loop_flow_types.insert(binding.symbol, type_).is_some() {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
