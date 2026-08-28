@@ -159,8 +159,9 @@ use super::{
     },
     object_members::{
         DeclaredPropertyObjectValidation, GlobalArrayCallAugmentationPlan,
-        GlobalArrayPropertyAugmentationPlan, plan_global_array_call_augmentation,
-        plan_global_array_property_augmentation, validate_resolved_declared_property_object,
+        GlobalArrayPropertyAugmentationPlan, GlobalPrototypePropertyAugmentationPlan,
+        plan_global_array_call_augmentation, plan_global_array_property_augmentation,
+        plan_global_prototype_property_augmentation, validate_resolved_declared_property_object,
     },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
@@ -2110,6 +2111,7 @@ enum PlannedStatement {
     GenericInterface(super::object_members::PropertyObjectPlan),
     GlobalArrayCallAugmentation(GlobalArrayCallAugmentationPlan),
     GlobalArrayPropertyAugmentation(GlobalArrayPropertyAugmentationPlan),
+    GlobalPrototypePropertyAugmentation(GlobalPrototypePropertyAugmentationPlan),
     Namespace(Box<SourceNamespacePlan>),
     Class(ClassMemberQueryPlan),
     SourceClass(Box<PlannedSourceClass>),
@@ -3178,6 +3180,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if super::classes::is_merged_auto_accessor_interface(
                             store, host, symbol, statement,
                         ) {
+                            continue;
+                        }
+                        if let Some(augmentation) = plan_global_prototype_property_augmentation(
+                            store, host, statement, symbol,
+                        )
+                        .map_err(|error| self.interface_plan_error(statement, error))?
+                        {
+                            statements.push(PlannedStatement::GlobalPrototypePropertyAugmentation(
+                                augmentation,
+                            ));
                             continue;
                         }
                         if interface.type_parameters.is_some() {
@@ -29420,37 +29432,61 @@ fn check_expression_type_with_class_context(
                 deferred,
                 class_flow.as_deref_mut(),
             )?;
-            let checked = match check_direct_source_element(
-                store,
-                host,
-                global_types,
-                options,
-                element,
-                receiver.result,
-                index.result,
-            ) {
-                Ok(checked) => checked,
-                Err(
-                    error @ SourceElementError::Unsupported(
-                        SourceElementUnsupported::IndexSignatureSurface(_),
-                    ),
-                ) => {
-                    if let Some(checked) = recover_non_iterable_union_element(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        diagnostics,
-                        element,
-                        receiver.result,
-                        index.result,
-                    )? {
-                        return Ok(checked);
+            let mut demanded = HashSet::new();
+            let checked = loop {
+                match check_direct_source_element(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    element,
+                    receiver.result,
+                    index.result,
+                ) {
+                    Ok(checked) => break checked,
+                    Err(SourceElementError::Relation(
+                        RelationUnavailable::UnresolvedPropertyType(symbol),
+                    )) if store
+                        .get_parent_of_symbol(symbol)
+                        .and_then(|owner| store.declared_type_links(owner))
+                        .and_then(|links| links.declared_type)
+                        .is_some_and(|owner| {
+                            [global_types.object_type, global_types.function_type].contains(&owner)
+                        })
+                        && demanded.insert(symbol) =>
+                    {
+                        source_iteration_property_type(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            symbol,
+                        )?;
                     }
-                    return Err(SourcePlanner::element_plan_error(element.node, error));
-                }
-                Err(error) => {
-                    return Err(SourcePlanner::element_plan_error(element.node, error));
+                    Err(
+                        error @ SourceElementError::Unsupported(
+                            SourceElementUnsupported::IndexSignatureSurface(_),
+                        ),
+                    ) => {
+                        if let Some(checked) = recover_non_iterable_union_element(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            diagnostics,
+                            element,
+                            receiver.result,
+                            index.result,
+                        )? {
+                            return Ok(checked);
+                        }
+                        return Err(SourcePlanner::element_plan_error(element.node, error));
+                    }
+                    Err(error) => {
+                        return Err(SourcePlanner::element_plan_error(element.node, error));
+                    }
                 }
             };
             if let Some(diagnostic) = checked.diagnostic {
@@ -54657,6 +54693,20 @@ pub(super) fn check_source_file(
                 )?
                 .preflight_type_from_type_node(augmentation.property.type_node)?;
             }
+            PlannedStatement::GlobalPrototypePropertyAugmentation(augmentation) => {
+                for property in &augmentation.properties {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut type_import_preflight_diagnostics,
+                    )?
+                    .preflight_type_of_declared_value(*property)?;
+                }
+            }
             PlannedStatement::VariableRedeclaration(variable) => {
                 if let Some(type_node) = variable.type_node {
                     session.reset_query();
@@ -54921,6 +54971,37 @@ pub(super) fn check_source_file(
 
     store.prepare_regular_literal_types(&strings, &numbers, &bigints)?;
     issue_bigint_literal_target_diagnostics(arena, bound, options, diagnostics, &bigint_literals)?;
+    // Global interface properties are visible before executable statements and function bodies.
+    for statement in &statements {
+        let PlannedStatement::GlobalPrototypePropertyAugmentation(augmentation) = statement else {
+            continue;
+        };
+        if ![global_types.object_type, global_types.function_type].contains(&augmentation.target)
+            || plan_global_prototype_property_augmentation(
+                store,
+                host,
+                augmentation.declaration,
+                augmentation.symbol,
+            )
+            .map_err(|_| SourceCheckError::Property(augmentation.declaration))?
+            .as_ref()
+                != Some(augmentation)
+        {
+            return Err(SourceCheckError::Property(augmentation.declaration));
+        }
+        for property in &augmentation.properties {
+            session.reset_query();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_of_declared_value(*property)?;
+        }
+    }
     let mut deferred = Vec::new();
     // Publication owns every source value, including function-local symbols.
     // Top-level assignment/capture semantics must remain a separate map so a
@@ -56150,6 +56231,7 @@ pub(super) fn check_source_file(
                     }
                 }
             }
+            PlannedStatement::GlobalPrototypePropertyAugmentation(_) => {}
             PlannedStatement::GlobalArrayCallAugmentation(augmentation) => {
                 if augmentation.target != global_types.array_type
                     || augmentation.any_array_type != global_types.any_array_type

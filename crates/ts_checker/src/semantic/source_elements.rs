@@ -10,8 +10,8 @@
 //! unions of valid literal keys, optional properties, and optional chains.
 //! Array bindings also read authenticated own numeric interface indexes.
 //! Authenticated evolving-array element assignments reuse the same index
-//! validation. Other writes, generic indexed access types, and apparent/global
-//! property lookup stay typed boundaries.
+//! validation. Named global Object and Function properties retain their declared
+//! values. Other writes and generic indexed access types stay typed boundaries.
 
 use std::collections::HashSet;
 
@@ -36,7 +36,9 @@ use super::{
     object_members::{self, PropertyObjectState},
     signatures::ElementFlags,
     source::PlannedExpression,
-    source_callables::cached_annotation_identity,
+    source_callables::{
+        StoredSourceCallableValidation, cached_annotation_identity, validate_stored_source_callable,
+    },
     store::SourceNodeParent,
     type_nodes::CanonicalTypeQuery,
     type_records::{LiteralValue, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
@@ -1556,6 +1558,7 @@ fn check_direct_source_element_worker(
         for index in &indices {
             let resolution = resolve_element_index(
                 store,
+                host,
                 global_types,
                 array_targets,
                 plan,
@@ -1718,6 +1721,7 @@ fn optional_element_receiver(
 #[allow(clippy::too_many_arguments)]
 fn resolve_element_index(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
     array_targets: CanonicalArrayTargets,
     plan: &SourceElementPlan,
@@ -1761,7 +1765,16 @@ fn resolve_element_index(
             ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
         }
     } else {
-        resolve_object_element(store, global_types, plan, receiver_type, index, any, error)?
+        resolve_object_element(
+            store,
+            host,
+            global_types,
+            plan,
+            receiver_type,
+            index,
+            any,
+            error,
+        )?
     })
 }
 
@@ -2063,8 +2076,10 @@ fn resolve_tuple_element(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_object_element(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
     plan: &SourceElementPlan,
     receiver_type: TypeId,
@@ -2078,6 +2093,9 @@ fn resolve_object_element(
             ElementDiagnostic::InvalidIndexType,
         ));
     }
+
+    let callable =
+        global_types.is_some() && source_callable_has_no_own_properties(store, receiver_type)?;
 
     if let Some(name) = index.property_name.as_deref() {
         if let Some(property) =
@@ -2102,7 +2120,12 @@ fn resolve_object_element(
                 ),
             });
         }
-        match store.resolved_own_property(receiver_type, name) {
+        let own = if callable {
+            Ok(None)
+        } else {
+            store.resolved_own_property(receiver_type, name)
+        };
+        match own {
             Ok(Some(property)) => {
                 let type_ = optional_element_read_type(
                     store,
@@ -2116,6 +2139,25 @@ fn resolve_object_element(
             }
             Ok(None) | Err(RelationUnavailable::StructuredIndexInfos(_)) => {}
             Err(error) => return Err(error.into()),
+        }
+        if let Some(global_types) = global_types {
+            for target in callable
+                .then_some(global_types.function_type)
+                .into_iter()
+                .chain(std::iter::once(global_types.object_type))
+            {
+                if let Some(property) = global_prototype_property(store, host, target, name)? {
+                    let type_ = optional_element_read_type(
+                        store,
+                        Some(global_types),
+                        plan.node,
+                        property.symbol,
+                        property.type_,
+                        property.optional,
+                    )?;
+                    return Ok(ElementResolution::success(type_, Some(property.symbol)));
+                }
+            }
         }
     }
 
@@ -2176,6 +2218,94 @@ fn resolve_object_element(
             ElementDiagnostic::MissingBroadIndex
         },
     ))
+}
+
+fn source_callable_has_no_own_properties(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, SourceElementError> {
+    match validate_stored_source_callable(store, type_) {
+        StoredSourceCallableValidation::NotSourceCallable => Ok(false),
+        StoredSourceCallableValidation::Pending => {
+            Err(RelationUnavailable::UnresolvedFunctionType(type_).into())
+        }
+        StoredSourceCallableValidation::Malformed => {
+            Err(RelationUnavailable::MalformedFunctionType(type_).into())
+        }
+        StoredSourceCallableValidation::Valid(_) => {
+            let structured = store
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .ok_or(SourceElementError::InvalidType(type_))?;
+            Ok(structured.members.is_none()
+                && structured.properties.is_none()
+                && structured.index_infos.is_none())
+        }
+    }
+}
+
+/// Reads the canonical global member without changing the receiver's own members or call signature.
+fn global_prototype_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: TypeId,
+    name: &str,
+) -> Result<Option<super::relater::ResolvedOwnProperty>, SourceElementError> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(target);
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    if !matches!(target_record.data(), TypeData::Interface(_)) {
+        return Ok(None);
+    }
+    let owner = target_record.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let globals = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .ok_or_else(invalid)?;
+    if globals
+        .get(owner_record.name())
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        != Some(owner)
+        || cached_interface_type(store, owner)? != Some(target)
+        || !store.source_merged_symbol_declarations_match(owner)
+    {
+        return Err(invalid().into());
+    }
+    let Some(members) = owner_record.members() else {
+        return Ok(None);
+    };
+    let table = store.symbol_table(members).ok_or_else(invalid)?;
+    let Some(property) = table.get_source(name) else {
+        return Ok(None);
+    };
+    let property = store.get_merged_symbol(property).ok_or_else(invalid)?;
+    let record = store.symbol(property).ok_or_else(invalid)?;
+    if store.get_parent_of_symbol(property) != Some(owner) || record.name().as_utf8() != Some(name)
+    {
+        return Err(invalid().into());
+    }
+    let (type_, readonly) = if record.flags().contains(SymbolFlags::METHOD) {
+        let method = object_members::plan_selected_interface_method(store, host, property)
+            .map_err(|_| invalid())?;
+        let type_ = object_members::interface_method_value_state(store, &method)
+            .map_err(|_| invalid())?
+            .ok_or(RelationUnavailable::UnresolvedPropertyType(property))?;
+        (type_, false)
+    } else {
+        let value = super::declared_values::plan_declared_value(store, host, property)?;
+        (
+            value
+                .cached_type
+                .ok_or(RelationUnavailable::UnresolvedPropertyType(property))?,
+            value.readonly.ok_or_else(invalid)?,
+        )
+    };
+    Ok(Some(super::relater::ResolvedOwnProperty {
+        symbol: property,
+        type_,
+        optional: record.flags().contains(SymbolFlags::OPTIONAL),
+        readonly,
+    }))
 }
 
 fn resolve_javascript_expando_object_property(

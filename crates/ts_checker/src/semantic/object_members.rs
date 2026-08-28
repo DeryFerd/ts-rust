@@ -2311,6 +2311,14 @@ pub(super) struct GlobalArrayPropertyAugmentationPlan {
     pub property: PlannedProperty,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GlobalPrototypePropertyAugmentationPlan {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub target: TypeId,
+    pub properties: Vec<SemanticSymbolId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GlobalArrayConcatOverloadKind {
     Arrays,
@@ -5928,6 +5936,116 @@ pub(super) fn plan_global_array_call_augmentation(
         signature,
         return_type,
         any_array_type,
+    }))
+}
+
+/// Plans global prototype properties without forcing unrelated library methods.
+#[allow(clippy::too_many_lines)] // Global identity and source properties are validated together.
+pub(super) fn plan_global_prototype_property_augmentation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<Option<GlobalPrototypePropertyAugmentationPlan>, PropertyObjectError> {
+    let canonical = store
+        .get_merged_symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol: canonical,
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let globals = store.symbol_table(bootstrap.globals).ok_or_else(invalid)?;
+    let global_name = ["Object", "Function"].into_iter().find(|name| {
+        globals
+            .get_source(name)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(canonical)
+    });
+    let Some(global_name) = global_name else {
+        return Ok(None);
+    };
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if facts.is_default_library()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+    {
+        return Ok(None);
+    }
+    let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Err(invalid());
+    };
+    if interface.type_parameters.is_some() || interface.heritage_clauses.is_some() {
+        return Ok(None);
+    }
+    let owner = store.symbol(canonical).ok_or_else(invalid)?;
+    let target = store
+        .declared_type_links(canonical)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let allowed =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if record.kind != SyntaxKind::InterfaceDeclaration
+        || record.flags.0 != 0
+        || !host.symbol_matches(store, declaration, canonical)
+        || record.parent != Some(bound.source_file().node)
+        || interface.modifiers.is_some()
+        || interface.flow_node.is_some()
+        || interface.local_symbol.is_some()
+        || interface.symbol.is_some()
+        || interface.members.has_trailing_comma
+        || owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || owner.flags().without(allowed) != SymbolFlags::NONE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.parent().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || owner.name().as_utf8() != Some(global_name)
+        || !store.source_merged_symbol_declarations_match(canonical)
+        || owner
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || target_record.symbol() != Some(canonical)
+        || target_record.alias().is_some()
+        || !matches!(target_record.data(), TypeData::Interface(_))
+    {
+        return Err(invalid());
+    }
+    let mut properties = Vec::with_capacity(interface.members.nodes.len());
+    for member in &interface.members.nodes {
+        let member = NodeRef::new(declaration.arena, declaration.file, *member);
+        let member_record = preflight_node(store, host, member).map_err(|_| invalid())?;
+        if !matches!(
+            member_record.kind,
+            SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+        ) {
+            return Ok(None);
+        }
+        let property = bound
+            .symbol(member)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        let value = plan_declared_value(store, host, property).map_err(|_| invalid())?;
+        if value.readonly.is_none()
+            || member_record.parent != Some(declaration.node)
+            || store
+                .symbol(property)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                != Some(member)
+            || properties.contains(&property)
+        {
+            return Err(invalid());
+        }
+        properties.push(property);
+    }
+    Ok(Some(GlobalPrototypePropertyAugmentationPlan {
+        declaration,
+        symbol: canonical,
+        target,
+        properties,
     }))
 }
 
