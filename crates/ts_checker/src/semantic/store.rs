@@ -11,8 +11,9 @@ use std::{
 
 use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    AstScope, CanonicalSourceFileFacts, CheckFlags, EscapedName, InternalSymbolName,
-    SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags, SymbolStore, SymbolTableId,
+    AstScope, CanonicalSourceFileFacts, CheckFlags, EscapedName, EscapedNameRef,
+    InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags, SymbolStore,
+    SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol, SymbolTable},
 };
 use ts_core::TextRange;
@@ -103,6 +104,26 @@ struct SourceSymbolDeclarations {
     flags: SymbolFlags,
     declarations: Box<[NodeRef]>,
     value_declaration: Option<NodeRef>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SourceGlobalBinding {
+    pub(super) table_symbol: SemanticSymbolId,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) flags: SymbolFlags,
+}
+
+/// Global bindings retained after all initialization merges finish.
+#[derive(Debug)]
+pub(super) struct SourceGlobalBindings {
+    pub(super) table: SymbolTableId,
+    entries: HashMap<EscapedName, SourceGlobalBinding>,
+}
+
+impl SourceGlobalBindings {
+    pub(super) fn get(&self, name: EscapedNameRef<'_>) -> Option<SourceGlobalBinding> {
+        self.entries.get(name.as_bytes()).copied()
+    }
 }
 
 #[derive(Debug)]
@@ -515,6 +536,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
     source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
+    source_global_bindings: Option<SourceGlobalBindings>,
     source_declaration_owners: HashMap<NodeRef, Vec<SemanticSymbolId>>,
     type_alias_declared_type_owners: HashMap<TypeId, HashSet<SemanticSymbolId>>,
     merged_symbols: HashMap<SemanticSymbolId, SemanticSymbolId>,
@@ -668,6 +690,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
             source_symbol_declarations,
+            source_global_bindings: None,
             source_declaration_owners,
             type_alias_declared_type_owners: HashMap::new(),
             merged_symbols: HashMap::new(),
@@ -960,6 +983,44 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .filter_map(|source| self.source_symbol_declarations.get(&source))
             .map(|source| source.flags.without(SymbolFlags::TRANSIENT))
             .reduce(|left, right| left | right)
+    }
+
+    /// Saves global identities once, before source checks or artifact queries can run.
+    pub(super) fn record_source_global_bindings(&mut self, table: SymbolTableId) -> bool {
+        if self.source_global_bindings.is_some()
+            || self
+                .intrinsic_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.globals)
+                != Some(table)
+        {
+            return false;
+        }
+        let Some(entries) = self.symbol_table(table).and_then(|globals| {
+            globals
+                .iter()
+                .map(|(name, table_symbol)| {
+                    let symbol = self.get_merged_symbol(table_symbol)?;
+                    let flags = self.symbol(symbol)?.flags();
+                    Some((
+                        name.to_owned(),
+                        SourceGlobalBinding {
+                            table_symbol,
+                            symbol,
+                            flags,
+                        },
+                    ))
+                })
+                .collect::<Option<HashMap<_, _>>>()
+        }) else {
+            return false;
+        };
+        self.source_global_bindings = Some(SourceGlobalBindings { table, entries });
+        true
+    }
+
+    pub(super) fn source_global_bindings(&self) -> Option<&SourceGlobalBindings> {
+        self.source_global_bindings.as_ref()
     }
 
     /// Checks complete binder declarations and flags after canonical symbol merges.

@@ -2238,6 +2238,10 @@ fn initialize_globals(
         }
     }
 
+    if !store.record_source_global_bindings(globals) {
+        return Err(CanonicalGlobalInitializationError::InvalidGlobals(globals));
+    }
+
     Ok(GlobalInitialization {
         globals,
         global_types,

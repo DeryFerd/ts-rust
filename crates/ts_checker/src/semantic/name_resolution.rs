@@ -327,7 +327,34 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
         if !meaning.intersects(SymbolFlags::ALL) {
             return Ok(None);
         }
-        let Some(raw) = table.get(name) else {
+        let raw = table.get(name);
+        let mut original_flags = SymbolFlags::NONE;
+        if self.validate_class_enum_sources
+            && let Some(globals) = self.store.source_global_bindings()
+            && (symbols == globals.table || self.globals() == Some(symbols))
+        {
+            if self.globals() != Some(globals.table) {
+                return Err(CanonicalNameResolutionError::InvalidHostTable(symbols));
+            }
+            match (globals.get(name), raw) {
+                (Some(binding), Some(raw))
+                    if binding.table_symbol == raw
+                        && self.store.get_merged_symbol(raw) == Some(binding.symbol) =>
+                {
+                    original_flags = binding.flags;
+                }
+                (None, None) => {}
+                (Some(binding), _) => {
+                    return Err(CanonicalNameResolutionError::InvalidHostSymbol(
+                        binding.symbol,
+                    ));
+                }
+                (None, Some(raw)) => {
+                    return Err(CanonicalNameResolutionError::InvalidHostSymbol(raw));
+                }
+            }
+        }
+        let Some(raw) = raw else {
             return Ok(None);
         };
         let symbol = self
@@ -341,6 +368,7 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
         let flags = record.flags();
         if self.validate_class_enum_sources
             && (flags
+                | original_flags
                 | self
                     .store
                     .source_symbol_flags(symbol)
