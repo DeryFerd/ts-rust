@@ -6969,11 +6969,11 @@ impl Program {
                             },
                         );
                     } else if !(self.options.skip_lib_check
-                        && ts_path::is_declaration_file(&containing_file))
-                        && !source_ignores_processing_diagnostic(
+                        && ts_path::is_declaration_file(&containing_file)
+                        || source_ignores_processing_diagnostic(
                             &self.source_files[file_index],
                             directive.range,
-                        )
+                        ))
                     {
                         let mut diagnostic = type_definition_not_found(&directive.value);
                         diagnostic.file_name = Some(containing_file.clone());
@@ -13505,6 +13505,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Calls, parameters, and diagnostics share the same parsed cases.
     fn canonical_program_recovers_authenticated_strict_arguments_collisions() {
         type StrictCollisionCase = (&'static str, &'static str, &'static [(u32, u32)]);
         let cases: [StrictCollisionCase; 4] = [
@@ -16344,6 +16345,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Loading and semantic checks use the same source identities.
     fn canonical_private_helpers_keep_loading_separate_from_checking() {
         for (options, required, loaded) in [
             (private_write_helper_options(), true, true),
@@ -17443,7 +17445,7 @@ mod tests {
                     capability_code: "T06.IMPORT_HELPER_SIGNATURE",
                 }
             );
-            assert_eq!(diagnostics, [sentinel.clone()]);
+            assert_eq!(diagnostics.as_slice(), std::slice::from_ref(&sentinel));
             assert!(context.diagnostics().is_empty());
         }
     }
