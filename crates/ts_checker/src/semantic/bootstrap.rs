@@ -10241,6 +10241,54 @@ mod tests {
     }
 
     #[test]
+    fn subtype_reduction_preserves_declared_optional_properties_beside_literals() {
+        let parsed = parse_source_file(concat!(
+            "const literal = { ready: true };",
+            "declare const optional: { ready: boolean; detail?: undefined };",
+            "declare const required: { ready: boolean; detail: string };",
+            "const optionalValue = optional;",
+            "const requiredValue = required;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(153);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let literal =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "literal"));
+        let optional = checked_expression_type(
+            &context,
+            variable_initializer(&parsed, file, "optionalValue"),
+        );
+        let required = checked_expression_type(
+            &context,
+            variable_initializer(&parsed, file, "requiredValue"),
+        );
+        let store = context.store_mut_for_test();
+        let declared = store
+            .expression_union_type(&[optional, required], UnionReduction::Literal)
+            .unwrap();
+        for inputs in [[literal, optional], [optional, literal]] {
+            assert_eq!(
+                store.expression_union_type(&inputs, UnionReduction::Subtype),
+                Ok(optional),
+            );
+        }
+        for inputs in [[declared, literal], [literal, declared]] {
+            assert_eq!(
+                store.expression_union_type(&inputs, UnionReduction::Subtype),
+                Ok(declared),
+            );
+        }
+        assert_eq!(union_types(store, declared), &[optional, required]);
+        assert!(
+            record(store, literal)
+                .object_flags()
+                .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+        );
+    }
+
+    #[test]
     fn object_subtype_reduction_skips_incompatible_authenticated_unit_properties() {
         let parsed = parse_source_file(concat!(
             "interface First { kind: 'first'; value: number } ",

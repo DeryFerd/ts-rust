@@ -2769,7 +2769,7 @@ impl<'store> RelaterSession<'store> {
         let mut result = if self.relation.is_identity() {
             self.properties_identical_to(target, &source_members, &target_members)?
         } else {
-            self.properties_related_to(source, &source_members, &target_members)?
+            self.properties_related_to(source, target, &source_members, &target_members)?
         };
         if result != Ternary::False {
             result &= self.call_signatures_related_to(
@@ -2844,7 +2844,8 @@ impl<'store> RelaterSession<'store> {
             authenticated(target, target_owner)?;
         let source_members = self.class_constructor_static_members(source)?;
         let target_members = self.class_constructor_static_members(target)?;
-        let result = self.properties_related_to(source, &source_members, &target_members)?;
+        let result =
+            self.properties_related_to(source, target, &source_members, &target_members)?;
         if result == Ternary::False {
             return Ok(Some(result));
         }
@@ -3800,6 +3801,7 @@ impl<'store> RelaterSession<'store> {
     fn properties_related_to(
         &mut self,
         source: TypeId,
+        target: TypeId,
         source_members: &ResolvedObjectMembers,
         target_members: &ResolvedObjectMembers,
     ) -> Result<Ternary, RelationUnavailable> {
@@ -3827,6 +3829,34 @@ impl<'store> RelaterSession<'store> {
                     .is_none()
             {
                 return Ok(Ternary::False);
+            }
+        }
+
+        // Object-literal targets must contain every source property, even
+        // when the source is declared or the target is no longer fresh.
+        if self
+            .store
+            .type_payload(target)
+            .ok_or(RelationUnavailable::Type(target))?
+            .object_flags()
+            .intersects(ObjectFlags::OBJECT_LITERAL)
+        {
+            for source_property in &source_members.properties {
+                let name = self
+                    .property_symbol(*source_property, source_members.property_origin)?
+                    .name()
+                    .to_owned();
+                let Some(members) = target_members.members else {
+                    return Ok(Ternary::False);
+                };
+                self.observe_symbol_table(members);
+                let table = self
+                    .store
+                    .symbol_table(members)
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+                if table.get(name.as_ref()).is_none() {
+                    return Ok(Ternary::False);
+                }
             }
         }
 
@@ -15640,6 +15670,64 @@ mod tests {
         );
         assert_eq!(store.relation_cache_size(RelationKind::Subtype), 1);
         assert_eq!(store.relation_cache_size(RelationKind::StrictSubtype), 1);
+    }
+
+    #[test]
+    fn object_literal_targets_reject_extra_declared_properties() {
+        let mut store = initialized(true);
+        let (boolean, string, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.boolean_type,
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+            )
+        };
+        let ready = alloc_typed_property(&mut store, "ready", boolean, false);
+        let fresh = alloc_fresh_property_object(&mut store, vec![ready]);
+        let regular = store.get_regular_type_of_object_literal(fresh).unwrap();
+        let ready = alloc_typed_property(&mut store, "ready", boolean, false);
+        let declared = alloc_property_object(&mut store, vec![ready]);
+        for (optional, detail_type) in [(false, string), (true, undefined)] {
+            let ready = alloc_typed_property(&mut store, "ready", boolean, false);
+            let detail = alloc_typed_property(&mut store, "detail", detail_type, optional);
+            let source = alloc_property_object(&mut store, vec![ready, detail]);
+            for relation in [RelationKind::Subtype, RelationKind::StrictSubtype] {
+                for target in [fresh, regular] {
+                    assert_eq!(
+                        store.is_type_related_to(source, target, relation),
+                        Ok(false)
+                    );
+                    assert_eq!(
+                        store.is_type_related_to(declared, target, relation),
+                        Ok(true),
+                    );
+                }
+                assert_eq!(
+                    store.is_type_related_to(source, declared, relation),
+                    Ok(true)
+                );
+                assert_eq!(
+                    store.is_type_related_to(fresh, source, relation),
+                    Ok(optional),
+                );
+            }
+            assert_eq!(store.is_type_assignable_to(source, declared), Ok(true));
+        }
+        assert!(
+            store
+                .type_payload(regular)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::OBJECT_LITERAL)
+        );
+        assert!(
+            !store
+                .type_payload(regular)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::FRESH_LITERAL)
+        );
     }
 
     #[test]
