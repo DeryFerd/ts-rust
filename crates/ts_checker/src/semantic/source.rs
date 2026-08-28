@@ -97170,6 +97170,48 @@ class Foo2 {
     }
 
     #[test]
+    fn returning_and_joined_call_conditions_keep_predicate_and_assertion_boundaries() {
+        for (index, (predicate, body)) in [
+            (
+                "value is string",
+                "if (guard(value)) { return value; } return 'fallback';",
+            ),
+            (
+                "asserts value is string",
+                "if (guard(value)) { return value; } return 'fallback';",
+            ),
+            (
+                "value is string",
+                "if (guard(value)) { const text: string = value; } else {} return 'fallback';",
+            ),
+            (
+                "asserts value is string",
+                "if (guard(value)) { const text: string = value; } else {} return 'fallback';",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "declare function guard(value: unknown): {predicate}; \
+                 function rejected(value: unknown): string {{ {body} }}",
+            ));
+            let file = FileId::new(17_430 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let error = context.check_source_file(file).unwrap_err();
+            assert!(matches!(
+                error,
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::FunctionBody(_)
+                ))
+            ));
+            assert!(context.diagnostics().is_empty(), "{predicate}: {body}");
+            assert_eq!(context.check_source_file(file), Err(error));
+            assert!(context.diagnostics().is_empty(), "{predicate}: {body}");
+        }
+    }
+
+    #[test]
     fn typed_function_local_arrows_and_bare_returns_preserve_callable_identity() {
         let source = parsed(concat!(
             "function invoke(input: number): void { ",
