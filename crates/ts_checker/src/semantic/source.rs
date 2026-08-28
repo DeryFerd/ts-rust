@@ -230,7 +230,9 @@ use super::{
         SourceFunctionUnsupported, plan_function_identifier_read, plan_nested_function,
         plan_top_level_function, valid_source_javascript_duplicate_function_owner_shape,
     },
-    source_import_calls::{PlannedImportCall, check_import_call, plan_import_call},
+    source_import_calls::{
+        PlannedImportCall, check_import_call, plan_import_call, preflight_import_call,
+    },
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
@@ -20906,12 +20908,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     let Some((store, host)) = self.semantic else {
                         return Err(SourceCheckError::Import(expression));
                     };
-                    let import = plan_import_call(self.arena, store, host, expression)?
+                    let syntax = plan_import_call(self.arena, store, host, expression)?
                         .ok_or(SourceCheckError::Import(expression))?;
-                    self.strings.push(import.text.clone());
+                    let specifier = if let Some(text) = &syntax.text {
+                        self.strings.push(text.clone());
+                        None
+                    } else {
+                        Some(self.plan_expression(syntax.specifier)?)
+                    };
                     return Ok(PlannedExpression::new(
                         expression,
-                        PlannedExpressionKind::ImportCall(Box::new(import)),
+                        PlannedExpressionKind::ImportCall(Box::new(PlannedImportCall {
+                            syntax,
+                            specifier,
+                        })),
                     ));
                 }
                 if kind == SyntaxKind::CallExpression
@@ -24829,8 +24839,12 @@ fn preflight_inferred_function_return_dependencies(
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
             | PlannedExpressionKind::Boolean(_)
-            | PlannedExpressionKind::ImportCall(_)
             | PlannedExpressionKind::GlobalUndefined => true,
+            PlannedExpressionKind::ImportCall(import) => {
+                import.specifier.as_ref().is_none_or(|specifier| {
+                    expression_is_closed(specifier, parameters, locals, functions)
+                })
+            }
             PlannedExpressionKind::Identifier(read) => match read.kind {
                 PlannedIdentifierReadKind::Variable => {
                     parameters
@@ -27125,6 +27139,17 @@ fn emit_uninitialized_variable_read_diagnostics(
                 )?;
             }
         }
+        PlannedExpressionKind::ImportCall(import) => {
+            if let Some(specifier) = &import.specifier {
+                emit_uninitialized_variable_read_diagnostics(
+                    store,
+                    host,
+                    current_flow_types,
+                    diagnostics,
+                    specifier,
+                )?;
+            }
+        }
         PlannedExpressionKind::Binary(binary) => {
             for operand in [&binary.left, &binary.right] {
                 emit_uninitialized_variable_read_diagnostics(
@@ -27172,7 +27197,6 @@ fn emit_uninitialized_variable_read_diagnostics(
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
-        | PlannedExpressionKind::ImportCall(_)
         | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_) => {}
     }
@@ -28633,6 +28657,33 @@ fn check_expression_type_with_class_context(
                     UnsupportedSourceSyntax::Import(expression.node),
                 ));
             }
+            let syntax = &import.syntax;
+            preflight_import_call(store, host, syntax)?;
+            let specifier_type = if let Some(specifier) = &import.specifier {
+                if specifier.node != syntax.specifier {
+                    return Err(SourceCheckError::Import(expression.node));
+                }
+                Some(
+                    check_expression_type_with_class_context(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        current_flow_types,
+                        preflighted_type_import_value_uses,
+                        specifier,
+                        None,
+                        deferred,
+                        class_flow.as_deref_mut(),
+                    )?
+                    .result,
+                )
+            } else {
+                None
+            };
             let result = check_import_call(
                 store,
                 host,
@@ -28640,16 +28691,21 @@ fn check_expression_type_with_class_context(
                 options,
                 session,
                 diagnostics,
-                import,
+                syntax,
+                specifier_type,
             )?;
-            let code = if import.deferred_name.is_some()
+            let code = if syntax.deferred_name.is_some()
                 && options.import_call_mode != super::CanonicalImportCallMode::Deferred
             {
                 Some(18060)
-            } else if import.deferred_name.is_none()
+            } else if syntax.deferred_name.is_none()
                 && options.import_call_mode == super::CanonicalImportCallMode::Unsupported
             {
                 Some(1323)
+            } else if syntax.trailing_comma.is_some()
+                && options.import_call_mode == super::CanonicalImportCallMode::Dynamic
+            {
+                Some(1009)
             } else {
                 None
             };
@@ -28658,7 +28714,13 @@ fn check_expression_type_with_class_context(
                     diagnostics,
                     CanonicalCheckerDiagnostic {
                         node: Some(expression.node),
-                        range_override: None,
+                        range_override: if code == 1009 {
+                            syntax.trailing_comma.map(|range| {
+                                CanonicalCheckerDiagnosticRange::new(syntax.node, range)
+                            })
+                        } else {
+                            None
+                        },
                         diagnostic: Diagnostic::new(
                             message_by_code(code)
                                 .ok_or(SourceCheckError::MissingDiagnostic(code))?,

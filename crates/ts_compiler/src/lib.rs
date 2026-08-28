@@ -5258,6 +5258,12 @@ impl Program {
                     ts_checker::semantic::CanonicalImportCallMode::Deferred
                 }
                 ModuleKind::Es2015 => ts_checker::semantic::CanonicalImportCallMode::Unsupported,
+                ModuleKind::Node16
+                | ModuleKind::Node18
+                | ModuleKind::Node20
+                | ModuleKind::NodeNext => {
+                    ts_checker::semantic::CanonicalImportCallMode::DynamicWithAttributes
+                }
                 _ => ts_checker::semantic::CanonicalImportCallMode::Dynamic,
             },
             no_emit: self.options.no_emit,

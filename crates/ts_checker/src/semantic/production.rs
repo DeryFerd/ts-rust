@@ -102,6 +102,7 @@ pub enum CanonicalImportCallMode {
     Unsupported,
     #[default]
     Dynamic,
+    DynamicWithAttributes,
     Deferred,
 }
 
