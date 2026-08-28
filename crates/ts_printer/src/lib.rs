@@ -78618,14 +78618,19 @@ mod tests {
             optional.contains("class C extends (A === null || A === void 0 ? void 0 : A.B) {"),
             "{optional}",
         );
+        let recovered = "class C extends { foo: string; } {}";
+        let parsed = parse_source_file(recovered);
+        let [diagnostic] = parsed.diagnostics.as_slice() else {
+            panic!("{:?}", parsed.diagnostics)
+        };
+        assert_eq!(diagnostic.code, Some(1005));
+        assert_eq!(diagnostic.range.start.get(), 29);
+        assert_eq!(diagnostic.range.len(), 1);
+        assert_eq!(diagnostic.message, "',' expected.");
         assert!(
-            emit_with(
-                "class C extends { foo: string; } {}",
-                ScriptTarget::Es2015,
-                ModuleKind::EsNext,
-            )
-            .code
-            .contains("class C extends { foo: string } {")
+            emit_with_parse_errors(recovered, ScriptTarget::Es2015, ModuleKind::EsNext)
+                .code
+                .contains("class C extends { foo: string } {")
         );
     }
 
