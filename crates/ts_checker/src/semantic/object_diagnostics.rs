@@ -860,7 +860,13 @@ fn prototype_method_return_details(
     let [source_return, target_return] = return_types.as_slice() else {
         unreachable!("a prototype method comparison has exactly two signatures")
     };
+    // Methods that return a value can match methods that return void.
     if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        source_type,
+        target_property.type_,
+        global_types,
+        options.strict_function_types,
+    )? || store.is_type_assignable_to_with_global_types_and_strict_function_types(
         *source_return,
         *target_return,
         global_types,

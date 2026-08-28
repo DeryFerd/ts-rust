@@ -100,3 +100,39 @@ fn missing_declared_method_keeps_its_real_missing_property_diagnostic() {
         Some((start, start + 7)),
     );
 }
+
+#[test]
+fn prototype_return_details_skip_compatible_void_methods() {
+    let source = "const bad: { toString(): void; toLocaleString(): number } = {};\n";
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file("/project/input.ts", source).unwrap();
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["input.ts".to_owned()],
+        CompilerOptions {
+            target: ScriptTarget::Es2015,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    let [diagnostic] = program.diagnostics() else {
+        panic!("expected one prototype method diagnostic");
+    };
+    assert_eq!(diagnostic.code, Some(2322));
+    assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.ts"));
+    assert_eq!(
+        diagnostic
+            .range
+            .map(|range| (range.start.get(), range.end.get())),
+        Some((6, 9)),
+    );
+    assert_eq!(
+        diagnostic.message.lines().skip(1).collect::<Vec<_>>(),
+        [
+            "  The types returned by 'toLocaleString()' are incompatible between these types.",
+            "    Type 'string' is not assignable to type 'number'.",
+        ],
+    );
+}
