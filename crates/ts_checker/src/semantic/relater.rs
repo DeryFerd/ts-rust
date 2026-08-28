@@ -1133,17 +1133,11 @@ impl<'store> RelaterSession<'store> {
         Ok(true)
     }
 
-    /// Mixed Array/property-object relations that do not require instantiated
-    /// generic Array members.
-    ///
-    /// The pinned oracle is surface-sensitive: a sole empty `Array<T>` shell
-    /// makes `[[1], {}]` infer `number[][]`, while a shell with required
-    /// `length` and the default library infer `{}[]`. Array -> regularized
-    /// empty object is always true for structural relations. Assignability and
-    /// subtype comparisons prove the reverse direction false only when the raw
-    /// target has a required own property; otherwise it remains unavailable
-    /// rather than guessing that a cold shell is empty. An exact `length`
-    /// property can also be compared through its authenticated raw annotation.
+    /// Reads mixed Array/object relations without preparing generic Array members.
+    /// A negative result requires complete source names and an authenticated
+    /// required target property absent from the source and global Object.
+    /// Cold targets without that proof stay unavailable. The existing empty-object
+    /// and exact length-property comparisons remain separate.
     fn canonical_array_property_object_relation(
         &mut self,
         source: TypeId,
@@ -1186,10 +1180,31 @@ impl<'store> RelaterSession<'store> {
                 relation: self.relation,
             });
         }
+        if reverse_requires_property {
+            if !members.properties.is_empty() && !members.index_infos.is_empty() {
+                return Err(RelationUnavailable::StructuralRelation {
+                    source,
+                    target,
+                    relation: self.relation,
+                });
+            }
+            let names = self.canonical_array_source_property_names(object, &members)?;
+            if self.canonical_array_target_missing_required_property(array_target, &names)? {
+                return Ok(Some(Ternary::False));
+            }
+            return Err(if members.properties.is_empty() {
+                RelationUnavailable::UnsupportedStructuredType(array_target)
+            } else {
+                RelationUnavailable::StructuralRelation {
+                    source,
+                    target,
+                    relation: self.relation,
+                }
+            });
+        }
         if !members.properties.is_empty() {
-            if !reverse_requires_property
-                && let Some(related) =
-                    self.canonical_array_length_property_relation(array_target, &members)?
+            if let Some(related) =
+                self.canonical_array_length_property_relation(array_target, &members)?
             {
                 return Ok(Some(related));
             }
@@ -1198,11 +1213,6 @@ impl<'store> RelaterSession<'store> {
                 target,
                 relation: self.relation,
             });
-        }
-        if reverse_requires_property
-            && !self.canonical_array_target_has_required_own_property(array_target)?
-        {
-            return Err(RelationUnavailable::UnsupportedStructuredType(array_target));
         }
         Ok(Some(result))
     }
@@ -1289,9 +1299,191 @@ impl<'store> RelaterSession<'store> {
             .map(Some)
     }
 
+    fn canonical_array_source_property_names(
+        &mut self,
+        source: TypeId,
+        members: &ResolvedObjectMembers,
+    ) -> Result<HashSet<EscapedName>, RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(source);
+        let unsupported = || RelationUnavailable::UnsupportedStructuredType(source);
+        let mut names = HashSet::with_capacity(members.properties.len());
+        let mut methods = HashSet::new();
+        let source_declarations = matches!(
+            members.property_origin,
+            ObjectPropertyOrigin::Declared
+                | ObjectPropertyOrigin::InterfaceHeritage(_)
+                | ObjectPropertyOrigin::GenericReference(_)
+        );
+        for &property in &members.properties {
+            let record = self.store.symbol(property).ok_or_else(invalid)?;
+            if !names.insert(record.name().to_owned()) {
+                return Err(invalid());
+            }
+            if !source_declarations {
+                continue;
+            }
+            let owner_declarations = record
+                .parent()
+                .map(|owner| {
+                    self.store
+                        .symbol(owner)
+                        .and_then(ts_binder::semantic::Symbol::declarations)
+                        .ok_or_else(invalid)
+                })
+                .transpose()?;
+            if owner_declarations.is_some()
+                && record.declarations().is_none_or(|nodes| nodes.is_empty())
+            {
+                return Err(invalid());
+            }
+            for &declaration in record.declarations().unwrap_or_default() {
+                let Some(SourceNodeParent::Parent(parent)) =
+                    self.store.source_node_parent(declaration)
+                else {
+                    return Err(invalid());
+                };
+                if owner_declarations.is_none_or(|owners| !owners.contains(&parent)) {
+                    return Err(invalid());
+                }
+                if let Some(name) = self
+                    .store
+                    .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                    .and_then(|name| self.store.source_identifier_text(name))
+                {
+                    if record.name() != EscapedNameRef::source(name) {
+                        return Err(invalid());
+                    }
+                } else if record.flags().contains(SymbolFlags::METHOD)
+                    && self.store.source_node_kind(declaration) == Some(SyntaxKind::MethodSignature)
+                {
+                    methods.insert(declaration);
+                } else {
+                    return Err(unsupported());
+                }
+            }
+        }
+        if !source_declarations {
+            return Ok(names);
+        }
+        let mut pending = vec![source];
+        let mut seen = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let record = self.store.type_payload(current).ok_or_else(invalid)?;
+            if let TypeData::TypeReference(reference) = record.data() {
+                pending.push(reference.object.target.ok_or_else(invalid)?);
+                continue;
+            }
+            let Some(owner) = record.symbol() else {
+                if matches!(record.data(), TypeData::Interface(_)) {
+                    return Err(invalid());
+                }
+                continue;
+            };
+            let owner_record = self.store.symbol(owner).ok_or_else(invalid)?;
+            if !owner_record
+                .flags()
+                .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL)
+            {
+                continue;
+            }
+            if self.store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                current == bootstrap.empty_type_literal_type && names.is_empty()
+            }) {
+                continue;
+            }
+            let declarations = owner_record
+                .declarations()
+                .filter(|nodes| !nodes.is_empty())
+                .ok_or_else(unsupported)?;
+            let bases = match record.data() {
+                TypeData::Interface(interface) => interface.resolved_base_types.as_deref(),
+                _ => None,
+            };
+            for &declaration in declarations {
+                let kind = self
+                    .store
+                    .source_node_kind(declaration)
+                    .ok_or_else(invalid)?;
+                if kind == SyntaxKind::VariableDeclaration
+                    && owner_record.value_declaration() == Some(declaration)
+                    && owner_record
+                        .flags()
+                        .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                {
+                    continue;
+                }
+                if !matches!(
+                    kind,
+                    SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral
+                ) {
+                    return Err(invalid());
+                }
+                if kind == SyntaxKind::InterfaceDeclaration
+                    && self
+                        .store
+                        .source_child_with_kind(declaration, SyntaxKind::Identifier)
+                        .and_then(|name| self.store.source_identifier_text(name))
+                        .is_none_or(|name| owner_record.name() != EscapedNameRef::source(name))
+                {
+                    return Err(invalid());
+                }
+                for member in self
+                    .store
+                    .source_direct_children(declaration)
+                    .ok_or_else(invalid)?
+                {
+                    match self.store.source_node_kind(member).ok_or_else(invalid)? {
+                        SyntaxKind::PropertyDeclaration
+                        | SyntaxKind::PropertySignature
+                        | SyntaxKind::MethodSignature
+                        | SyntaxKind::GetAccessor
+                        | SyntaxKind::SetAccessor => {
+                            if let Some(name) = self
+                                .store
+                                .source_child_with_kind(member, SyntaxKind::Identifier)
+                                .and_then(|name| self.store.source_identifier_text(name))
+                            {
+                                if !names.contains(&EscapedName::source(name)) {
+                                    return Err(invalid());
+                                }
+                            } else if !methods.contains(&member) {
+                                return Err(unsupported());
+                            }
+                        }
+                        SyntaxKind::HeritageClause => {
+                            let bases = bases
+                                .filter(|bases| !bases.is_empty())
+                                .ok_or_else(invalid)?;
+                            pending.extend_from_slice(bases);
+                        }
+                        SyntaxKind::IndexSignature if members.index_infos.is_empty() => {
+                            return Err(invalid());
+                        }
+                        SyntaxKind::CallSignature | SyntaxKind::ConstructSignature => {
+                            return Err(invalid());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
     fn canonical_array_target_has_required_own_property(
         &mut self,
         target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        self.canonical_array_target_missing_required_property(target, &HashSet::new())
+    }
+
+    fn canonical_array_target_missing_required_property(
+        &mut self,
+        target: TypeId,
+        source_names: &HashSet<EscapedName>,
     ) -> Result<bool, RelationUnavailable> {
         let raw_target = self.store.type_payload(target).and_then(TypeRecord::symbol);
         if let Some(raw_target) = raw_target {
@@ -1399,6 +1591,42 @@ impl<'store> RelaterSession<'store> {
                     {
                         return Err(RelationUnavailable::InvalidStructuredMembers(target));
                     }
+                    let Some(SourceNodeParent::Parent(parent)) =
+                        self.store.source_node_parent(*declaration)
+                    else {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                    };
+                    if self.store.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration)
+                        || symbol
+                            .declarations()
+                            .is_none_or(|owners| !owners.contains(&parent))
+                        || self
+                            .store
+                            .source_child_with_kind(parent, SyntaxKind::Identifier)
+                            .and_then(|name| self.store.source_identifier_text(name))
+                            .is_none_or(|name| symbol.name() != EscapedNameRef::source(name))
+                        || self
+                            .store
+                            .source_child_with_kind(*declaration, SyntaxKind::Identifier)
+                            .and_then(|name| self.store.source_identifier_text(name))
+                            .is_none_or(|name| record.name() != EscapedNameRef::source(name))
+                        || self
+                            .store
+                            .source_direct_children(*declaration)
+                            .is_none_or(|children| {
+                                children.iter().any(|child| {
+                                    self.store.source_node_kind(*child)
+                                        == Some(SyntaxKind::QuestionToken)
+                                })
+                            })
+                        || record.check_flags().contains(CheckFlags::READONLY)
+                            && self
+                                .store
+                                .source_child_with_kind(*declaration, SyntaxKind::ReadonlyKeyword)
+                                .is_none()
+                    {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                    }
                 }
                 if !seen_declarations.contains(&value_declaration) {
                     return Err(RelationUnavailable::InvalidStructuredMembers(target));
@@ -1413,7 +1641,9 @@ impl<'store> RelaterSession<'store> {
                 .expect("the raw target table was shallow-validated")
                 .name()
                 .to_owned();
-            if self.global_object_property(name.as_ref())?.is_none() {
+            if !source_names.contains(&name)
+                && self.global_object_property(name.as_ref())?.is_none()
+            {
                 return Ok(true);
             }
         }
