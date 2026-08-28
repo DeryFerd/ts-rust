@@ -2,6 +2,8 @@ use ts_ast::SyntaxKind;
 use ts_core::{Diagnostic, DiagnosticCategory, JsString, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
 
+mod regexp;
+
 /// One lexical token. `range` uses UTF-8 byte offsets and `text` is the exact
 /// source spelling.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -555,6 +557,41 @@ impl<'a> Scanner<'a> {
         }
         self.byte_pos = self.last_start + 1;
         self.last_kind = SyntaxKind::LessThanToken;
+        self.current_token()
+    }
+
+    /// Rescans a checker-owned literal and checks decimal quantifier bounds.
+    /// Parser callers use `rescan_slash_token` without these grammar diagnostics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a terminated scanner token has no closing slash.
+    pub fn rescan_slash_token_with_quantifier_checks(&mut self) -> Token<'a> {
+        if !matches!(
+            self.last_kind,
+            SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken
+        ) {
+            return self.current_token();
+        }
+        self.rescan_slash_token();
+        if !self.last_flags.contains(TokenFlags::UNTERMINATED) {
+            let literal = &self.source[self.last_start..self.byte_pos];
+            let closing_slash = self.last_start
+                + literal
+                    .rfind('/')
+                    .expect("a terminated literal has a closing slash");
+            let unicode_flag = self.source[closing_slash + 1..self.byte_pos]
+                .bytes()
+                .find(|flag| matches!(flag, b'u' | b'v'));
+            for (start, end) in regexp::out_of_order_quantifier_bounds(
+                self.source,
+                self.last_start + 1,
+                closing_slash,
+                unicode_flag,
+            ) {
+                self.error_with_code(start, end, 1_506, "Numbers out of order in quantifier.");
+            }
+        }
         self.current_token()
     }
 

@@ -5299,6 +5299,11 @@ impl Program {
                 checked.source,
                 &mut diagnostics,
             )?;
+            self.add_regular_expression_quantifier_diagnostics(
+                checked.source,
+                context,
+                &mut diagnostics,
+            )?;
             self.add_external_helper_diagnostics(checked.source, context, &mut diagnostics)?;
             self.add_canonical_module_target_diagnostics(
                 checked.source,
@@ -5939,6 +5944,60 @@ impl Program {
         };
         self.canonical_program_diagnostic(Some(node), None, &diagnostic, std::iter::empty())
             .map(Some)
+    }
+
+    fn add_regular_expression_quantifier_diagnostics(
+        &self,
+        source: &SourceFile,
+        context: &CanonicalCheckerContext<'_>,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        // Pinned checkGrammarRegularExpressionLiteral skips files with parse diagnostics.
+        if !source.parse.diagnostics.is_empty() {
+            return Ok(());
+        }
+        let (_, bound) = context.file(source.id).ok_or_else(|| {
+            CanonicalProgramCheckError::MissingBoundFile {
+                file_name: source.file_name.clone(),
+                file: source.id,
+            }
+        })?;
+        let root = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+        if bound.source_file() != root {
+            return Err(CanonicalProgramCheckError::InvalidDiagnosticNode(root));
+        }
+        let message = message_by_code(1_506).expect("TS1506 must be in the generated catalog");
+        for (id, node) in source.parse.arena.iter() {
+            let literal = NodeRef::new(source.parse.arena.id(), source.id, id);
+            if node.kind != SyntaxKind::RegularExpressionLiteral || !bound.contains(literal) {
+                continue;
+            }
+            if !source
+                .source_text
+                .is_char_boundary(node.range.start.get() as usize)
+            {
+                return Err(CanonicalProgramCheckError::InvalidDiagnosticNode(literal));
+            }
+            let mut scanner = Scanner::new(&source.source_text);
+            scanner.reset_token_state(node.range.start.get() as usize);
+            scanner.scan();
+            let token = scanner.rescan_slash_token_with_quantifier_checks();
+            if token.kind != SyntaxKind::RegularExpressionLiteral || token.range != node.range {
+                return Err(CanonicalProgramCheckError::InvalidDiagnosticNode(literal));
+            }
+            for error in scanner.diagnostics() {
+                if error.code != Some(message.code()) {
+                    return Err(CanonicalProgramCheckError::InvalidDiagnosticNode(literal));
+                }
+                diagnostics.push(self.canonical_program_diagnostic(
+                    Some(literal),
+                    Some(CanonicalCheckerDiagnosticRange::new(literal, error.range)),
+                    &Diagnostic::new(message),
+                    std::iter::empty(),
+                )?);
+            }
+        }
+        Ok(())
     }
 
     fn add_missing_jsx_option_diagnostics(
@@ -13261,6 +13320,72 @@ mod tests {
                     diagnostic.message,
                     "BigInt literals are not available when targeting lower than ES2020.",
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_program_checks_quantifier_ranges_and_parse_error_gate() {
+        for (separator, parse_errors, quantifier_errors) in [(";", 0, 1), ("", 1, 0)] {
+            let fs = MemoryFileSystem::new(true);
+            let source = format!(
+                "const before = 1{separator} const pattern = /a{{8,7}}/; const wrong: string = 1;"
+            );
+            fs.write_file("/project/input.ts", &source).unwrap();
+            let (program, cold) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    target: ScriptTarget::EsNext,
+                    ..CompilerOptions::default()
+                },
+                |_, queries| {
+                    let cold = queries.cold_diagnostic_snapshot();
+                    assert_eq!(queries.replay_sources().unwrap(), cold);
+                    cold
+                },
+            )
+            .unwrap();
+            assert_eq!(cold.as_deref(), Some(program.diagnostics()));
+            assert_eq!(
+                program
+                    .source_file("/project/input.ts")
+                    .unwrap()
+                    .parse
+                    .diagnostics
+                    .len(),
+                parse_errors
+            );
+            let diagnostics = program.diagnostics();
+            assert_eq!(diagnostics.len(), 2, "{source}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|error| error.code == Some(1_005))
+                    .count(),
+                parse_errors
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|error| error.code == Some(2_322))
+                    .count(),
+                1
+            );
+            let quantifiers = diagnostics
+                .iter()
+                .filter(|error| error.code == Some(1_506))
+                .collect::<Vec<_>>();
+            assert_eq!(quantifiers.len(), quantifier_errors);
+            for error in quantifiers {
+                let range = error.range.unwrap();
+                assert_eq!(
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                    "8,7"
+                );
+                assert_eq!(error.message, "Numbers out of order in quantifier.");
             }
         }
     }
