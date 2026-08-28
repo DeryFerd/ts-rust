@@ -2809,12 +2809,49 @@ fn plan_source_callable_with_owner_shape(
     } else {
         None
     };
+    let javascript_fixed_multi_parameter_function = view.family
+        == SourceCallableFamily::FunctionDeclaration
+        && view.parameters.nodes.len() > 1
+        && type_parameters.is_empty()
+        && body_mode == SourceCallableBodyMode::Present
+        && view.return_type.is_none()
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+        && view.parameters.nodes.iter().all(|parameter| {
+            host.node(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                *parameter,
+            ))
+            .is_some_and(|record| {
+                matches!(&record.data, NodeData::ParameterDeclaration(parameter)
+                        if parameter.type_.is_none()
+                            && parameter.dot_dot_dot_token.is_none()
+                            && parameter.question_token.is_none()
+                            && parameter.initializer.is_none()
+                            && store.source_node_kind(NodeRef::new(
+                                declaration.arena,
+                                declaration.file,
+                                parameter.name,
+                            )) == Some(SyntaxKind::Identifier))
+            })
+        })
+        && {
+            let invalid = || invariant(SourceCallableInvariant::InvalidSyntax(declaration));
+            let (arena, _) = host.source(declaration).ok_or_else(invalid)?;
+            super::jsdoc::leading_jsdoc_comment(arena, declaration)
+                .map_err(|_| invalid())?
+                .is_none()
+        };
     let untyped_javascript_signature = javascript_direct_zero_parameter_arrow
         || javascript_zero_parameter_function
         || bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
-            && (view.parameters.nodes.len() == 1 || javascript_documented_multi_arrow)
+            && (view.parameters.nodes.len() == 1
+                || javascript_documented_multi_arrow
+                || javascript_fixed_multi_parameter_function)
             && type_parameters.is_empty()
             && body_mode == SourceCallableBodyMode::Present
             && (view.family == SourceCallableFamily::FunctionDeclaration
@@ -11064,14 +11101,13 @@ pub(super) fn validate_stored_source_callable(
             Some(SourceNodeParent::Parent(variable))
                 if store.source_node_kind(variable) == Some(SyntaxKind::VariableDeclaration)
         );
-    let zero_parameter_function = family == SourceCallableFamily::FunctionDeclaration
-        && store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration)
-        && signature_record.parameters().is_empty();
+    let untyped_function = family == SourceCallableFamily::FunctionDeclaration
+        && store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration);
     if untyped_javascript
         && (signature_record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
             || signature_record.parameters().len() != 1
                 && !direct_untyped_arrow
-                && !zero_parameter_function
+                && !untyped_function
             || !signature_record.type_parameters().is_empty()
             || signature_record.min_argument_count()
                 != i32::try_from(signature_record.parameters().len()).unwrap_or(-1)
