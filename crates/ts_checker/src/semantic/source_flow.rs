@@ -2271,10 +2271,10 @@ impl SourceFlowFrame<'_, '_> {
                         store,
                         Some(globals),
                         current,
-                        if assume_true != condition.negated {
-                            TruthinessAssumption::Truthy
-                        } else {
+                        if assume_true == condition.negated {
                             TruthinessAssumption::Falsy
+                        } else {
+                            TruthinessAssumption::Truthy
                         },
                     )
                     .map_err(|error| SourceFlowError::Narrowing {

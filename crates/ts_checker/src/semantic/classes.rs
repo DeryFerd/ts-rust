@@ -1841,8 +1841,8 @@ fn validate_source_class_stored_layout(
         {
             return Err(reject());
         }
-        if let Some(type_) = type_ {
-            if store.type_payload(type_).is_none()
+        if let Some(type_) = type_
+            && (store.type_payload(type_).is_none()
                 || property
                     .initializer_node
                     .and_then(|node| store.type_node_links(node))
@@ -1852,10 +1852,9 @@ fn validate_source_class_stored_layout(
                     && store
                         .type_node_links(property.type_node)
                         .and_then(|links| links.resolved_type)
-                        != Some(type_)
-            {
-                return Err(reject());
-            }
+                        != Some(type_))
+        {
+            return Err(reject());
         }
     }
     for (index, method) in plan.methods.iter().enumerate() {
@@ -3683,18 +3682,17 @@ pub(super) fn complete_source_class_body(
             body.declaration,
         )));
     }
-    if let Some((_, symbol, type_)) = property {
-        if !store.try_reserve_value_symbol_links(1)
+    if let Some((_, symbol, type_)) = property
+        && (!store.try_reserve_value_symbol_links(1)
             || !store.set_value_symbol_links(
                 symbol,
                 ValueSymbolLinks {
                     resolved_type: Some(type_),
                     ..ValueSymbolLinks::default()
                 },
-            )
-        {
-            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
-        }
+            ))
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
     }
     let provenance = store
         .source_class_provenance_mut(prepared.instance_type)

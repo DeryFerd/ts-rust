@@ -9030,7 +9030,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             };
             let declaration = store
                 .symbol(read.value_symbol)
-                .and_then(|symbol| symbol.value_declaration())
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
                 .ok_or(SourceCheckError::Class(target.node))?;
             if read.kind != PlannedIdentifierReadKind::Variable
                 || self.bound.container(declaration) != Some(body.declaration)
@@ -25187,8 +25187,8 @@ fn class_expression_nodes(
                 pending.extend(template.substitutions.iter().rev());
             }
             // An arrow has its own flow. Its lexical this still uses the class token.
-            PlannedExpressionKind::Arrow(_) => {}
-            PlannedExpressionKind::Null
+            PlannedExpressionKind::Arrow(_)
+            | PlannedExpressionKind::Null
             | PlannedExpressionKind::String(_)
             | PlannedExpressionKind::RegularExpression(_)
             | PlannedExpressionKind::Number { .. }
@@ -29303,7 +29303,7 @@ fn check_expression_type_with_class_context(
                     property.node,
                 )?;
             }
-            let checked = match check_source_selected_method_property(
+            let checked = if let Some(checked) = check_source_selected_method_property(
                 store,
                 host,
                 global_types,
@@ -29313,35 +29313,36 @@ fn check_expression_type_with_class_context(
                 property,
                 receiver.result,
             )? {
-                Some(checked) => checked,
-                None => {
-                    let mut demanded = HashSet::new();
-                    loop {
-                        match check_direct_source_property_with_class_context_and_session(
-                            store,
-                            host,
-                            Some(global_types),
-                            options,
-                            property,
-                            receiver.result,
-                            session,
-                            class_flow.as_deref_mut().map(|context| &mut context.flow),
-                        ) {
-                            Ok(checked) => break checked,
-                            Err(SourcePropertyError::PendingClassProperty(demand)) => {
-                                let context = class_flow.as_deref_mut().ok_or(
-                                    SourceCheckError::Unsupported(
+                checked
+            } else {
+                let mut demanded = HashSet::new();
+                loop {
+                    match check_direct_source_property_with_class_context_and_session(
+                        store,
+                        host,
+                        Some(global_types),
+                        options,
+                        property,
+                        receiver.result,
+                        session,
+                        class_flow.as_deref_mut().map(|context| &mut context.flow),
+                    ) {
+                        Ok(checked) => break checked,
+                        Err(SourcePropertyError::PendingClassProperty(demand)) => {
+                            let context =
+                                class_flow
+                                    .as_deref_mut()
+                                    .ok_or(SourceCheckError::Unsupported(
                                         UnsupportedSourceSyntax::Property(property.node),
-                                    ),
-                                )?;
-                                if demand.class_symbol() != context.state.class.source.symbol()
-                                    || !demanded.insert(demand.symbol())
-                                {
-                                    return Err(SourceCheckError::Unsupported(
-                                        UnsupportedSourceSyntax::Class(demand.declaration()),
-                                    ));
-                                }
-                                let index = context
+                                    ))?;
+                            if demand.class_symbol() != context.state.class.source.symbol()
+                                || !demanded.insert(demand.symbol())
+                            {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::Class(demand.declaration()),
+                                ));
+                            }
+                            let index = context
                             .state
                             .class
                             .source
@@ -29354,25 +29355,21 @@ fn check_expression_type_with_class_context(
                                         if symbol == demand.symbol())
                             })
                             .ok_or(SourceCheckError::Class(demand.declaration()))?;
-                                check_planned_class_body(
-                                    store,
-                                    host,
-                                    global_types,
-                                    source,
-                                    options,
-                                    session,
-                                    preflighted_type_import_value_uses,
-                                    deferred,
-                                    context.state,
-                                    index,
-                                )?;
-                            }
-                            Err(error) => {
-                                return Err(SourcePlanner::property_plan_error(
-                                    expression.node,
-                                    error,
-                                ));
-                            }
+                            check_planned_class_body(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                preflighted_type_import_value_uses,
+                                deferred,
+                                context.state,
+                                index,
+                            )?;
+                        }
+                        Err(error) => {
+                            return Err(SourcePlanner::property_plan_error(expression.node, error));
                         }
                     }
                 }
@@ -32582,7 +32579,7 @@ fn check_planned_arrow_argument(
                 diagnostic_node,
                 expression: body,
             } => {
-                if let Some(context) = class_flow.as_deref_mut() {
+                if let Some(context) = class_flow {
                     let mut type_diagnostics = CanonicalCheckerDiagnostics::default();
                     let target = CanonicalTypeQuery::new_with_global_types_and_session(
                         store,

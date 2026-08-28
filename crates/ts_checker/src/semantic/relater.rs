@@ -5291,7 +5291,7 @@ impl<'store> RelaterSession<'store> {
             || self
                 .store
                 .signature(callable.signature)
-                .and_then(|signature| signature.declaration())
+                .and_then(super::signatures::Signature::declaration)
                 != Some(declaration)
         {
             return Err(unsupported());
