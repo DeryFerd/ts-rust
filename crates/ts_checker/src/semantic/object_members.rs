@@ -2248,7 +2248,7 @@ pub(super) struct PlannedCallSignature {
     pub(super) type_predicate: Option<CallableTypePredicatePlan>,
     return_identity_node: NodeRef,
     return_null_literal_identity: bool,
-    flags: SignatureFlags,
+    pub(super) flags: SignatureFlags,
     pub(super) implicit_any_return: bool,
 }
 
@@ -11526,7 +11526,7 @@ fn planned_predicate_type_parameter_reference(
     .then_some(parameter.symbol)
 }
 
-fn plan_call_signature(
+pub(super) fn plan_call_signature(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: NodeRef,
@@ -11569,12 +11569,29 @@ fn plan_call_signature(
                 construct.type_,
             )
         }
+        NodeData::ConstructorTypeNode(construct)
+            if record.kind == SyntaxKind::ConstructorType && construct.modifiers.is_none() =>
+        {
+            (
+                construct.full_signature,
+                construct.next_container,
+                construct.symbol,
+                construct.type_parameters.as_ref(),
+                &construct.parameters,
+                construct.type_,
+            )
+        }
         _ => return Err(unsupported()),
     };
-    let is_construct = record.kind == SyntaxKind::ConstructSignature;
+    let constructor_type = record.kind == SyntaxKind::ConstructorType;
+    let is_construct = matches!(
+        record.kind,
+        SyntaxKind::ConstructSignature | SyntaxKind::ConstructorType
+    );
     let type_literal_call =
         !is_construct && store.source_node_kind(owner) == Some(SyntaxKind::TypeLiteral);
-    if record.parent != Some(owner.node)
+    if (constructor_type && declaration != owner)
+        || (!constructor_type && record.parent != Some(owner.node))
         || record.flags.0 != 0
         || full_signature.is_some()
         || next_container.is_some()
@@ -11610,7 +11627,16 @@ fn plan_call_signature(
         && store.source_node_kind(return_type) == Some(SyntaxKind::TypePredicate);
 
     let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
-    let raw_call_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
+    let raw_call_symbol = if constructor_type {
+        store
+            .symbol(owner_symbol)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+            .ok_or_else(unsupported)?
+    } else {
+        bound.symbol(declaration).ok_or_else(unsupported)?
+    };
     let call_symbol = store
         .get_merged_symbol(raw_call_symbol)
         .ok_or_else(unsupported)?;
@@ -11631,7 +11657,7 @@ fn plan_call_signature(
         || call_record.value_declaration().is_some()
         || call_record.members().is_some()
         || call_record.exports().is_some()
-        || call_record.parent() != Some(owner_symbol)
+        || call_record.parent() != (!constructor_type).then_some(owner_symbol)
         || call_record.export_symbol().is_some()
     {
         return Err(unsupported());
@@ -16203,7 +16229,7 @@ fn resolved_call_signature_ids(
         .collect()
 }
 
-fn validate_resolved_call_signature(
+pub(super) fn validate_resolved_call_signature(
     store: &CanonicalTypeMapperStore,
     planned: &PlannedCallSignature,
 ) -> Option<SignatureId> {
@@ -16573,7 +16599,7 @@ fn resolved_interface_method_type_parameters(
     resolved_declared_signature_type_parameters(store, method.declaration, &method.type_parameters)
 }
 
-fn resolved_declared_signature_type_parameters(
+pub(super) fn resolved_declared_signature_type_parameters(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     parameters: &[PlannedInterfaceMethodTypeParameter],

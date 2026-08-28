@@ -6558,13 +6558,32 @@ fn exact_ambient_generic_constructor_parameter(
     if store
         .symbol_node_links(annotation)
         .is_some_and(|links| links != &SymbolNodeLinks::default())
-        || store
-            .type_node_links(annotation)
-            .is_some_and(|links| links != &TypeNodeLinks::default())
     {
         return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
             annotation,
         )));
+    }
+    if let Some(links) = store.type_node_links(annotation)
+        && links != &TypeNodeLinks::default()
+    {
+        let invalid = || invariant(SourceCallableInvariant::InvalidTypeCache(annotation));
+        let cached = links.resolved_type.ok_or_else(invalid)?;
+        let signature_plan =
+            super::object_members::plan_call_signature(store, host, annotation, symbol, annotation)
+                .map_err(|_| invalid())?;
+        let signature =
+            super::object_members::validate_resolved_call_signature(store, &signature_plan)
+                .ok_or_else(invalid)?;
+        if links.outer_type_parameters.is_some()
+            || store.type_payload(cached).and_then(TypeRecord::symbol) != Some(symbol)
+            || store.declared_call_set_type_for_signature(signature) != Some(cached)
+            || !matches!(
+                super::object_members::validate_stored_declared_call_set(store, cached),
+                super::object_members::StoredDeclaredCallSetValidation::Valid(_)
+            )
+        {
+            return Err(invalid());
+        }
     }
     if store
         .symbol_node_links(array)
@@ -11817,6 +11836,9 @@ fn valid_generic_source_parameter_type_worker(
     if type_parameters.contains(&type_) {
         return true;
     }
+    if valid_generic_source_constructor_parameter(store, array_targets, type_, type_parameters) {
+        return true;
+    }
     if constrained_string_rest_tuple_parameter(store, type_, type_parameters).is_some() {
         return true;
     }
@@ -11868,6 +11890,59 @@ fn valid_generic_source_parameter_type_worker(
     };
     active.remove(&type_);
     valid
+}
+
+fn valid_generic_source_constructor_parameter(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    type_: TypeId,
+    type_parameters: &[TypeId],
+) -> bool {
+    if !matches!(
+        super::object_members::validate_stored_declared_call_set(store, type_),
+        super::object_members::StoredDeclaredCallSetValidation::Valid(_)
+    ) {
+        return false;
+    }
+    let Some(structured) = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+    else {
+        return false;
+    };
+    let Some([signature]) = structured.signatures.as_deref() else {
+        return false;
+    };
+    let Some(record) = store.signature(*signature) else {
+        return false;
+    };
+    let Some([argument]) = store.callable_signature_parameter_types(*signature) else {
+        return false;
+    };
+    let array = array_targets.and_then(|targets| {
+        store
+            .canonical_array_reference_with_targets(targets, *argument)
+            .ok()
+            .flatten()
+    });
+    structured.call_signature_count == 0
+        && record.flags() == SignatureFlags::CONSTRUCT | SignatureFlags::HAS_REST_PARAMETER
+        && record.type_parameters().is_empty()
+        && record.min_argument_count() == 0
+        && record
+            .declaration()
+            .and_then(|node| store.source_node_kind(node))
+            == Some(SyntaxKind::ConstructorType)
+        && record
+            .resolved_return_type()
+            .is_some_and(|result| type_parameters.contains(&result))
+        && array.is_some_and(|array| {
+            !array.readonly
+                && !array.array_literal
+                && store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| array.element_type == bootstrap.any_type)
+        })
 }
 
 fn valid_named_source_generic_reference(
