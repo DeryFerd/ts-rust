@@ -39279,16 +39279,20 @@ fn source_array_binding_iteration_type(
         }
         return Ok(checked.types.yield_type.unwrap_or(any));
     }
+    let tuple = store
+        .canonical_tuple_shape(receiver)
+        .map_err(|error| source_contextual_tuple_error(receiver, error))?;
     if receiver == never
-        || !source_array_binding_is_array_like(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            pattern,
-            receiver,
-        )?
+        || tuple.is_none()
+            && !source_array_binding_is_array_like(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                pattern,
+                receiver,
+            )?
     {
         issue_source_iteration_diagnostic(
             store,
@@ -40882,6 +40886,7 @@ fn check_planned_array_binding_element(
         });
     }
     if !binding.rest
+        && tuple.is_none()
         && !source_array_binding_is_array_like(
             store,
             host,
