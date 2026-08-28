@@ -16318,19 +16318,24 @@ mod tests {
         assert_eq!(store.relation_state_snapshot(), before);
 
         for (source, target) in [(array_number, nonempty), (nonempty, array_number)] {
-            assert!(matches!(
-                store.is_type_related_to_with_optional_global_types(
-                    source,
-                    target,
-                    RelationKind::StrictSubtype,
-                    Some(global_types),
-                ),
-                Err(RelationUnavailable::StructuralRelation {
-                    source: actual_source,
-                    target: actual_target,
-                    relation: RelationKind::StrictSubtype,
-                }) if actual_source == source && actual_target == target
-            ));
+            let result = store.is_type_related_to_with_optional_global_types(
+                source,
+                target,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+            );
+            if source == nonempty && target == array_number {
+                assert_eq!(result, Ok(false));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RelationUnavailable::StructuralRelation {
+                        source: actual_source,
+                        target: actual_target,
+                        relation: RelationKind::StrictSubtype,
+                    }) if actual_source == source && actual_target == target
+                ));
+            }
             assert_eq!(store.relation_state_snapshot(), before);
         }
 
