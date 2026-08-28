@@ -5295,6 +5295,10 @@ impl Program {
         for checked in checked_sources {
             self.add_missing_jsx_option_diagnostics(checked.source, &mut diagnostics);
             self.add_erasable_import_assignment_diagnostics(checked.source, &mut diagnostics);
+            self.add_checked_javascript_parameter_decorator_diagnostics(
+                checked.source,
+                &mut diagnostics,
+            )?;
             self.add_external_helper_diagnostics(checked.source, context, &mut diagnostics)?;
             self.add_canonical_module_target_diagnostics(
                 checked.source,
@@ -5351,6 +5355,62 @@ impl Program {
         );
         self.apply_comment_directives(&mut diagnostics, &checked_files);
         Ok(diagnostics)
+    }
+
+    fn add_checked_javascript_parameter_decorator_diagnostics(
+        &self,
+        source: &SourceFile,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        const JSDOC_OR_REPARSED: u32 = (1 << 22) | NodeFlags::REPARSED.0;
+        if self.options.no_check
+            || self.options.experimental_decorators
+            || !is_javascript_file_name(&source.file_name)
+        {
+            return Ok(());
+        }
+        let arena = &source.parse.arena;
+        let mut pending = vec![source.parse.source_file];
+        while let Some(node) = pending.pop() {
+            let Some(node) = arena.get(node) else {
+                continue;
+            };
+            if node.flags.0 & JSDOC_OR_REPARSED != 0 {
+                continue;
+            }
+            node.for_each_child(|child| pending.push(child));
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                continue;
+            };
+            let Some((decorator, record)) = parameter.modifiers.as_ref().and_then(|modifiers| {
+                modifiers.list.nodes.iter().find_map(|decorator| {
+                    arena
+                        .get(*decorator)
+                        .filter(|record| {
+                            record.kind == SyntaxKind::Decorator
+                                && record.flags.0 & JSDOC_OR_REPARSED == 0
+                        })
+                        .map(|record| (*decorator, record))
+                })
+            }) else {
+                continue;
+            };
+            let range = TextRange::new(
+                record.range.start,
+                TextPos::new(record.range.start.get() + 1),
+            );
+            let decorator = NodeRef::new(arena.id(), source.id, decorator);
+            let diagnostic = Diagnostic::new(
+                message_by_code(1206).expect("TS1206 must be in the diagnostic catalog"),
+            );
+            diagnostics.push(self.canonical_program_diagnostic(
+                Some(decorator),
+                Some(CanonicalCheckerDiagnosticRange::new(decorator, range)),
+                &diagnostic,
+                std::iter::empty(),
+            )?);
+        }
+        Ok(())
     }
 
     fn add_canonical_module_target_diagnostics(
@@ -6657,14 +6717,11 @@ impl Program {
             });
         }
         if is_javascript {
-            let check_js = source_check_js_directive(&source_text).unwrap_or(self.options.check_js);
             self.diagnostics.extend(javascript_syntax_diagnostics(
                 file_name,
                 &parse,
-                !self.options.experimental_decorators
-                    && (!check_js
-                        || self.checker == ProgramChecker::Canonical && !self.options.no_check),
-                check_js,
+                !source_check_js_directive(&source_text).unwrap_or(self.options.check_js)
+                    && !self.options.experimental_decorators,
             ));
         }
         let index = self.source_files.len();
@@ -10925,7 +10982,6 @@ fn javascript_syntax_diagnostics(
     file_name: &str,
     parse: &ParseResult,
     report_parameter_decorators: bool,
-    check_js: bool,
 ) -> Vec<ProgramDiagnostic> {
     const JSDOC_OR_REPARSED: u32 = (1 << 22) | NodeFlags::REPARSED.0;
     let source_node = |id| {
@@ -10992,15 +11048,7 @@ fn javascript_syntax_diagnostics(
                             .iter()
                             .find(|node| node.kind == SyntaxKind::Decorator)
                     {
-                        let range = if check_js {
-                            TextRange::new(
-                                decorator.range.start,
-                                TextPos::new(decorator.range.start.get() + 1),
-                            )
-                        } else {
-                            decorator.range
-                        };
-                        report(range, 1206, &[]);
+                        report(decorator.range, 1206, &[]);
                     }
                 }
             }
@@ -20190,6 +20238,89 @@ export function create() { return new M.Value(); }"#,
                     "{file_name}, {prefix:?}, checkJs={check_js}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn canonical_javascript_parameter_decorators_follow_the_checking_phase() {
+        let original = "function dec() {} class Foo { method(@dec @dec x, @dec y) {} }";
+        for (prefix, check_js, experimental_decorators, no_check, expected) in [
+            ("", false, false, false, Some("@dec")),
+            ("", false, true, false, None),
+            ("", true, false, false, Some("@")),
+            ("// @ts-check\n", false, false, false, Some("@")),
+            ("// @ts-nocheck\n", true, false, false, Some("@dec")),
+            ("", true, false, true, None),
+            ("", false, false, true, Some("@dec")),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            let source = format!("{prefix}{original}");
+            fs.write_file("/a.js", &source).unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/",
+                &["a.js".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    check_js,
+                    experimental_decorators,
+                    no_check,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+            let ranges = program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1206))
+                .map(|diagnostic| diagnostic.range.unwrap())
+                .collect::<Vec<_>>();
+            if let Some(expected) = expected {
+                assert_eq!(ranges.len(), 2);
+                for range in ranges {
+                    assert_eq!(
+                        &source[range.start.get() as usize..range.end.get() as usize],
+                        expected,
+                    );
+                }
+            } else {
+                assert!(
+                    ranges.is_empty(),
+                    "{prefix:?}, checkJs={check_js}, noCheck={no_check}"
+                );
+            }
+        }
+
+        let source = "function dec() {}\nclass Foo { method(@dec x) { this.missing; return x; } }";
+        for no_check in [false, true] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/a.js", source).unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/",
+                &["a.js".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    check_js: true,
+                    no_implicit_any: true,
+                    no_check,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+            let codes = program
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code.unwrap())
+                .collect::<Vec<_>>();
+            let expected = if no_check {
+                vec![]
+            } else {
+                vec![1206, 7006, 2339]
+            };
+            assert_eq!(codes, expected, "noCheck={no_check}");
         }
     }
 
