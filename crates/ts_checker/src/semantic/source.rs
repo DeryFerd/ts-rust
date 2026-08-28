@@ -39464,6 +39464,25 @@ fn source_array_binding_is_array_like(
             }
         }
     }
+    let parameter_only_array_target = store
+        .type_payload(global_types.readonly_array_type)
+        .and_then(TypeRecord::symbol)
+        .and_then(|owner| store.symbol(owner))
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .is_some_and(|members| {
+            !members.is_empty()
+                && members.iter().all(|(_, symbol)| {
+                    store.symbol(symbol)
+                        .is_some_and(|record| record.flags() == SymbolFlags::TYPE_PARAMETER)
+                })
+        });
+    if parameter_only_array_target {
+        // Prepare the actual empty declaration before the primitive relation shortcut.
+        prepare_source_propertyless_array_target(
+            store, host, global_types, options, session, diagnostics,
+        )?;
+    }
     let mut members = HashSet::new();
     let mut properties = HashSet::new();
     let mut prepared_array_target = false;
@@ -39479,7 +39498,7 @@ fn source_array_binding_is_array_like(
                     .type_payload(source)
                     .is_some_and(|record| record.flags() == TypeFlags::OBJECT)
                 && !prepared_array_target
-                && prepare_source_index_only_array_target(
+                && prepare_source_propertyless_array_target(
                     store,
                     host,
                     global_types,
@@ -39508,7 +39527,7 @@ fn source_array_binding_is_array_like(
 }
 
 #[allow(clippy::too_many_lines)] // Validate cold caches before resolving the source index annotations.
-fn prepare_source_index_only_array_target(
+fn prepare_source_propertyless_array_target(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
@@ -39531,9 +39550,7 @@ fn prepare_source_index_only_array_target(
             .members()
             .and_then(|members| store.symbol_table(members))
             .is_some_and(|members| {
-                members
-                    .get(ts_binder::InternalSymbolName::Index.as_ref())
-                    .is_some()
+                !members.is_empty()
                     && members.iter().all(|(name, symbol)| {
                         store.symbol(symbol).is_some_and(|record| {
                             record.flags() == SymbolFlags::TYPE_PARAMETER
@@ -39556,7 +39573,6 @@ fn prepare_source_index_only_array_target(
         || !plan.methods.is_empty()
         || !plan.accessors.is_empty()
         || !plan.call_signatures.is_empty()
-        || plan.indexes.is_empty()
     {
         return Ok(false);
     }
@@ -63305,28 +63321,7 @@ mod tests {
 
         context.check_source_file(file).unwrap();
 
-        let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 2);
-        for (diagnostic, (operand, expected_type)) in diagnostics
-            .iter()
-            .zip([("aNumber", "number"), ("anObject", "{ foo: string; }")])
-        {
-            assert_eq!(diagnostic.diagnostic.code(), 2495);
-            assert_eq!(diagnostic.diagnostic.arguments, [expected_type]);
-            assert_eq!(
-                diagnostic.diagnostic.render().unwrap(),
-                format!("Type '{expected_type}' is not an array type or a string type."),
-            );
-            let node = diagnostic.node.unwrap();
-            assert_eq!(node_text(&source, node), operand);
-            let range = source.arena.get(node.node).unwrap().range;
-            let expected_start = text.match_indices(operand).nth(1).unwrap().0;
-            assert_eq!(range.start.get(), u32::try_from(expected_start).unwrap());
-            assert_eq!(
-                range.end.get(),
-                u32::try_from(expected_start + operand.len()).unwrap(),
-            );
-        }
+        assert!(context.diagnostics().is_empty());
 
         let mut iteration_symbols = {
             let (_, bound) = context.file(file).unwrap();
@@ -63362,10 +63357,10 @@ mod tests {
         assert_eq!(iteration_symbols.len(), 4);
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         for ((_, symbol), expected) in iteration_symbols.iter().zip([
-            bootstrap.number_type,
+            bootstrap.any_type,
             bootstrap.string_type,
-            bootstrap.error_type,
-            bootstrap.error_type,
+            bootstrap.any_type,
+            bootstrap.any_type,
         ]) {
             assert_eq!(
                 context
@@ -63394,6 +63389,15 @@ mod tests {
                     .symbol_node_links(*read)
                     .and_then(|links| links.resolved_symbol),
                 Some(*symbol),
+            );
+            assert_eq!(
+                resolved_node_type(&context, *read),
+                context
+                    .store()
+                    .value_symbol_links(*symbol)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap(),
             );
         }
         let calls = source
@@ -63452,16 +63456,13 @@ mod tests {
 
         context.check_source_file(file).unwrap();
 
-        let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 2);
-        for diagnostic in diagnostics {
-            assert_eq!(diagnostic.diagnostic.code(), 2488);
-            assert_eq!(diagnostic.diagnostic.arguments, ["A[] | B"]);
-            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "data");
-        }
-        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert!(context.diagnostics().is_empty());
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
         for name in ["item", "ignoredItem"] {
-            assert_eq!(variable_value_type(&context, &source, file, name), error);
+            assert_eq!(variable_value_type(&context, &source, file, name), any);
+            let reads = identifier_expressions(&source, file, name);
+            assert_eq!(reads.len(), 1);
+            assert_eq!(resolved_node_type(&context, reads[0]), any);
         }
 
         let warm = observable_state(&context, file);
@@ -63527,11 +63528,19 @@ mod tests {
         context.check_source_file(file).unwrap();
 
         let [diagnostic] = context.diagnostics().as_slice() else {
-            panic!("expected one non-iterable union diagnostic")
+            panic!("expected one missing binding property diagnostic")
         };
-        assert_eq!(diagnostic.diagnostic.code(), 2488);
-        assert_eq!(diagnostic.diagnostic.arguments, ["A[] | B"]);
-        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "[item]");
+        assert_eq!(diagnostic.diagnostic.code(), 2339);
+        assert_eq!(diagnostic.diagnostic.arguments, ["0", "A[] | B"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "item");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property '0' does not exist on type 'A[] | B'.",
+        );
+        let range = source.arena.get(diagnostic.node.unwrap().node).unwrap().range;
+        assert_eq!((range.start.get(), range.end.get()), (84, 88));
+        assert!(diagnostic.range_override.is_none());
+        assert!(diagnostic.related_information.is_empty());
         assert_eq!(
             object_binding_value_type(&context, &source, file, "item"),
             context.store().intrinsic_bootstrap().unwrap().error_type,

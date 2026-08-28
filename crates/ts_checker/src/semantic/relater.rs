@@ -1140,8 +1140,8 @@ impl<'store> RelaterSession<'store> {
     /// Reads mixed Array/object relations without preparing generic Array members.
     /// A negative result requires complete source names and an authenticated
     /// required target property absent from the source and global Object.
-    /// Cold targets without that proof stay unavailable. Resolved index-only
-    /// targets use their validated instantiated indexes.
+    /// Cold targets without that proof stay unavailable. Resolved targets without
+    /// named properties use their validated instantiated indexes.
     fn canonical_array_property_object_relation(
         &mut self,
         source: TypeId,
@@ -1158,7 +1158,7 @@ impl<'store> RelaterSession<'store> {
         }
         let source_array = self.configured_array_reference_target(source)?;
         let target_array = self.configured_array_reference_target(target)?;
-        let (array, object, result, reverse_requires_property) = match (source_array, target_array)
+        let (array, object, result, object_to_array) = match (source_array, target_array)
         {
             (Some(_), None) => (source, target, Ternary::True, false),
             (None, Some(_))
@@ -1184,7 +1184,7 @@ impl<'store> RelaterSession<'store> {
                 relation: self.relation,
             });
         }
-        if reverse_requires_property {
+        if object_to_array {
             if !members.properties.is_empty() && !members.index_infos.is_empty() {
                 return Err(RelationUnavailable::StructuralRelation {
                     source,
@@ -1197,7 +1197,7 @@ impl<'store> RelaterSession<'store> {
                 return Ok(Some(Ternary::False));
             }
             if let Some(target_members) =
-                self.canonical_array_index_only_members(array, array_target)?
+                self.canonical_array_propertyless_members(array, array_target)?
             {
                 return self
                     .index_signatures_related_to(
@@ -1234,7 +1234,7 @@ impl<'store> RelaterSession<'store> {
         Ok(Some(result))
     }
 
-    fn canonical_array_index_only_members(
+    fn canonical_array_propertyless_members(
         &self,
         array: TypeId,
         target: TypeId,
@@ -1253,10 +1253,6 @@ impl<'store> RelaterSession<'store> {
             || interface.declared_call_signatures.is_some()
             || interface.declared_construct_signatures.is_some()
             || interface.resolved_base_types.is_some()
-            || interface
-                .declared_index_infos
-                .as_ref()
-                .is_none_or(Vec::is_empty)
         {
             return Ok(None);
         }
@@ -2153,6 +2149,22 @@ impl<'store> RelaterSession<'store> {
                 && let Some(array_target) = self.configured_array_reference_target(target)?
             {
                 self.canonical_array_reference_argument(target, array_target)?;
+                // A fully resolved empty Array also accepts non-null primitives.
+                if source_flags.intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+                    && matches!(
+                        self.store.type_payload(array_target).map(TypeRecord::data),
+                        Some(TypeData::Interface(interface))
+                            if interface.declared_index_infos.is_none()
+                    )
+                    && self
+                        .canonical_array_propertyless_members(target, array_target)?
+                        .is_some()
+                {
+                    self.store
+                        .validate_union_constituent(source)
+                        .map_err(|error| union_validation_unavailable(source, error))?;
+                    return Ok(Ternary::True);
+                }
                 return Ok(Ternary::False);
             }
             if self.relation != RelationKind::Identity
