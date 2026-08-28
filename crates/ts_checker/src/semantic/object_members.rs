@@ -7923,7 +7923,8 @@ fn declared_namespace_type_parent(
         .ok_or_else(invalid)?;
     let namespace_record = store.symbol(namespace).ok_or_else(invalid)?;
     let symbol_parent = store.get_parent_of_symbol(symbol);
-    let reexported_augmentation = symbol_parent != Some(namespace)
+    // An augmentation can target a namespace export or a global symbol.
+    let merged_augmentation = symbol_parent != Some(namespace)
         && bound.module_augmentations().iter().any(|augmentation| {
             augmentation.name() == NodeRef::new(module.arena, module.file, module_data.name)
         })
@@ -7935,15 +7936,25 @@ fn declared_namespace_type_parent(
             .and_then(|parent| store.get_merged_symbol(parent))
             == Some(namespace)
         && store.source_merged_symbol_declarations_match(symbol)
-        && symbol_parent
-            .and_then(|parent| store.symbol(parent))
-            .and_then(ts_binder::semantic::Symbol::exports)
-            .and_then(|exports| store.symbol_table(exports))
-            .and_then(|exports| exports.get_source(name))
-            .and_then(|export| store.get_merged_symbol(export))
-            == Some(symbol);
+        && if module_data.keyword == SyntaxKind::GlobalKeyword {
+            symbol_parent.is_none()
+                && store
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source(name))
+                    .and_then(|global| store.get_merged_symbol(global))
+                    == Some(symbol)
+        } else {
+            symbol_parent
+                .and_then(|parent| store.symbol(parent))
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(name))
+                .and_then(|export| store.get_merged_symbol(export))
+                == Some(symbol)
+        };
     if !namespace_record.flags().intersects(SymbolFlags::MODULE)
-        || symbol_parent != Some(namespace) && !reexported_augmentation
+        || symbol_parent != Some(namespace) && !merged_augmentation
         || namespace_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
@@ -19978,6 +19989,202 @@ mod selected_source_member_tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn selected_source_member_authenticates_merged_global_augmentation_targets() {
+        let library = parsed(&format!("{BASE} declare var Array: any;"));
+        let augmentation = parsed(concat!(
+            "declare global { interface Array<T> { customMethod(): T; } } ",
+            "export {};",
+        ));
+        let library_file = FileId::new(28_180);
+        let augmentation_file = FileId::new(28_181);
+        let files = [(library_file, &library), (augmentation_file, &augmentation)];
+        let mut binder = CanonicalBinder::new();
+        for (index, (file, source)) in files.iter().enumerate() {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    *file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/selected-global-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        index == 0,
+                        index == 0,
+                        if index == 0 {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, *file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, source)| (*file, &source.arena))
+                .collect(),
+            options(),
+        )
+        .unwrap();
+        context.check_source_file(augmentation_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = augmentation
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    augmentation.arena.id(),
+                    augmentation_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::InterfaceDeclaration(interface) =
+            &augmentation.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the global Array contribution")
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        let bound = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let raw = bound[1].symbol(declaration).unwrap();
+        let local = bound[1].local_symbol(declaration).unwrap();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bound)
+                .map(|((_, source), bound)| (&source.arena, bound)),
+            GlobalMergeCompletion::for_test(options().name_resolution),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let owner = store.get_merged_symbol(raw).unwrap();
+        assert_ne!(raw, owner);
+        assert_eq!(store.get_parent_of_symbol(owner), None);
+        let parent = |store: &CanonicalTypeMapperStore| {
+            declared_type_declaration_parent(
+                store,
+                &host,
+                declaration,
+                owner,
+                name,
+                interface.modifiers.as_ref(),
+            )
+        };
+        assert_eq!(parent(store), Ok(None));
+
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let receiver = store
+            .create_canonical_array_type(&globals, string, false)
+            .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let property = resolve_object_property_by_key_with_source(
+            store,
+            &host,
+            &globals,
+            options(),
+            receiver,
+            EscapedNameRef::source("customMethod"),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .unwrap();
+        let signature = store
+            .type_payload(property.type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .signatures
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            Some(string),
+        );
+        let warm = state(store);
+        let repeated = resolve_object_property_by_key_with_source(
+            store,
+            &host,
+            &globals,
+            options(),
+            receiver,
+            EscapedNameRef::source("customMethod"),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(repeated.symbol, property.symbol);
+        assert_eq!(repeated.type_, property.type_);
+        assert_eq!(state(store), warm);
+        assert!(diagnostics.is_empty());
+
+        let globals_table = store.intrinsic_bootstrap().unwrap().globals;
+        let original_global = store
+            .symbol_table(globals_table)
+            .unwrap()
+            .get_source("Array")
+            .unwrap();
+        let other = store
+            .type_payload(globals.readonly_array_type)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        assert_eq!(
+            store.insert_symbol(globals_table, EscapedName::source("Array"), other),
+            Some(Some(original_global))
+        );
+        assert_eq!(parent(store), Err(()));
+        assert_eq!(
+            store.insert_symbol(globals_table, EscapedName::source("Array"), original_global),
+            Some(Some(other))
+        );
+        assert_eq!(parent(store), Ok(None));
+
+        for (symbol, change_export) in [(local, true), (raw, false)] {
+            let record = store.symbol(symbol).unwrap();
+            let (members, exports, original_parent, export) = (
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            );
+            assert!(store.set_symbol_relationships(
+                symbol,
+                members,
+                exports,
+                if change_export {
+                    original_parent
+                } else {
+                    Some(other)
+                },
+                if change_export { Some(other) } else { export },
+            ));
+            assert_eq!(parent(store), Err(()));
+            assert!(store.set_symbol_relationships(
+                symbol,
+                members,
+                exports,
+                original_parent,
+                export
+            ));
+            assert_eq!(parent(store), Ok(None));
+        }
     }
 
     #[test]
