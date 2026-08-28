@@ -1588,6 +1588,17 @@ impl<'store, 'globals, P: IterationPropertyResolver>
         Ok(checked)
     }
 
+    /// Reads the yield type for fallback diagnostics without checking `next` input.
+    pub(super) fn yield_type_without_diagnostics(
+        &mut self,
+        input: TypeId,
+    ) -> Result<Option<TypeId>, SourceCheckError> {
+        if self.is_any(input)? {
+            return Ok(None);
+        }
+        Ok(self.iterable(input, false)?.types.yield_type)
+    }
+
     fn bootstrap(&self) -> Result<&super::IntrinsicBootstrap, SourceCheckError> {
         self.store
             .intrinsic_bootstrap()
@@ -1676,7 +1687,8 @@ impl<'store, 'globals, P: IterationPropertyResolver>
             .ok_or(RelationUnavailable::Type(input))?;
         if let TypeData::Union(union) = record.data() {
             let constituents = union.union.types.clone();
-            self.store.validate_union_constituent(input)?;
+            self.store
+                .validate_union_constituent_with_global_types(self.global_types, input)?;
             let mut types = Vec::with_capacity(constituents.len());
             for constituent in constituents {
                 let checked = self.iterable(constituent, false)?;
