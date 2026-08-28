@@ -74912,7 +74912,7 @@ mod tests {
     }
 
     #[test]
-    fn asserted_types_do_not_contextually_type_object_operands() {
+    fn asserted_types_contextually_type_object_operands() {
         let source = parsed("var value: {id: 1} = ({id: 1} as {id: 1});");
         let file = FileId::new(117);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
@@ -74931,11 +74931,20 @@ mod tests {
         context.check_source_file(file).unwrap();
 
         assert!(context.diagnostics().is_empty());
-        assert_eq!(
-            object_property_type(&context, operand, "id"),
-            context.store().intrinsic_bootstrap().unwrap().number_type,
+        let property_type = object_property_type(&context, operand, "id");
+        assert!(
+            context
+                .store()
+                .type_payload(property_type)
+                .unwrap()
+                .flags()
+                .contains(TypeFlags::NUMBER_LITERAL)
         );
+        assert_eq!(context.type_to_string(property_type).unwrap(), "1");
         assert!(is_type_checked(&context, file));
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
@@ -98936,7 +98945,7 @@ class Foo2 {
     }
 
     #[test]
-    fn untagged_any_identifiers_and_calls_remain_typed_binary_boundaries() {
+    fn canonical_any_identifiers_and_calls_use_binary_operator_rules() {
         for (file, text) in [
             (
                 FileId::new(407),
@@ -98954,25 +98963,18 @@ class Foo2 {
             let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
             let binary = variable_initializer(&source, file, "result");
             let (left, _) = primitive_binary_parts(&source, file, binary);
-            let kind = source.arena.get(left.node).unwrap().kind;
 
-            assert_eq!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Syntax {
-                        node: left,
-                        kind,
-                        role: SourceSyntaxRole::BinaryOperand,
-                    },
-                )),
-            );
+            context.check_source_file(file).unwrap();
 
-            assert!(context.store().type_node_links(binary).is_none());
+            let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+            assert_eq!(resolved_node_type(&context, left), any);
+            assert_eq!(resolved_node_type(&context, binary), any);
+            assert_eq!(variable_value_type(&context, &source, file, "result"), any);
             assert!(context.diagnostics().is_empty());
-            assert!(!is_type_checked(&context, file));
-            let rejected = observable_state(&context, file);
-            assert!(context.check_source_file(file).is_err());
-            assert_eq!(observable_state(&context, file), rejected);
+            assert!(is_type_checked(&context, file));
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
         }
     }
 
