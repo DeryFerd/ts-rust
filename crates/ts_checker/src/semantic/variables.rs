@@ -15,7 +15,8 @@ use ts_binder::{
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
-    classes::ClassMemberPlan, store::SourceNodeParent,
+    classes::ClassMemberPlan, source_callables::source_parameter_declarations_are_exact,
+    store::SourceNodeParent,
 };
 
 /// The declaration-list kind that determines a variable symbol's exact binder flags.
@@ -2018,6 +2019,14 @@ fn single_variable_declaration(
     allow_parameter: bool,
     allow_recovered_redeclarations: bool,
 ) -> Result<NodeRef, VariablePlanError> {
+    if allow_parameter
+        && flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        && let Some(parameter) = declarations.first().copied()
+        && let Some(SourceNodeParent::Parent(callable)) = store.source_node_parent(parameter)
+        && source_parameter_declarations_are_exact(store, callable, parameter, symbol)
+    {
+        return Ok(parameter);
+    }
     let mut variable = None;
     for declaration in declarations.iter().copied() {
         match store.source_node_kind(declaration) {

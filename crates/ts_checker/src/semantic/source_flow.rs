@@ -847,10 +847,17 @@ impl SourceFlowPlan {
             }
         }
 
+        let expected_start_payload = arena
+            .get(container.node)
+            .is_some_and(|record| {
+                record.kind == SyntaxKind::ArrowFunction
+                    && matches!(record.data, NodeData::ArrowFunction(_))
+            })
+            .then_some(container);
         Self::preflight_with_effects(
             bound,
             container,
-            None,
+            expected_start_payload,
             points,
             [],
             planned_assignments,

@@ -23,7 +23,9 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalTypeMapperStore,
-    source_callables::{SourceCallableFamily, SourceCallablePlan},
+    source_callables::{
+        SourceCallableFamily, SourceCallablePlan, source_parameter_declarations_are_exact,
+    },
     source_flow::{SourceTypeofComparison, SourceTypeofTag},
     variables::{VariableBindingKind, VariablePlanError, plan_top_level_variable},
 };
@@ -6312,31 +6314,28 @@ impl SyntaxPlanner<'_> {
         {
             return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
         }
-        if self.callable.family != SourceCallableFamily::FunctionDeclaration {
-            return Err(self.unsupported(
-                declaration,
-                self.node(declaration)?.kind,
-                SourceFunctionStatementsRole::Callable,
-            ));
-        }
-
         let record = self.node(declaration)?;
-        let NodeData::FunctionDeclaration(function) = &record.data else {
-            return Err(self.unsupported(
-                declaration,
-                record.kind,
-                SourceFunctionStatementsRole::Callable,
-            ));
+        let expected_return = self
+            .callable
+            .return_type
+            .type_node()
+            .map(|type_node| type_node.node);
+        let valid_callable = match &record.data {
+            NodeData::FunctionDeclaration(function) => {
+                self.callable.family == SourceCallableFamily::FunctionDeclaration
+                    && record.kind == SyntaxKind::FunctionDeclaration
+                    && function.body == Some(self.callable.body.node)
+                    && function.type_ == expected_return
+            }
+            NodeData::ArrowFunction(function) => {
+                self.callable.family == SourceCallableFamily::ArrowFunction
+                    && record.kind == SyntaxKind::ArrowFunction
+                    && function.body == self.callable.body.node
+                    && function.type_ == expected_return
+            }
+            _ => false,
         };
-        if record.kind != SyntaxKind::FunctionDeclaration
-            || function.body != Some(self.callable.body.node)
-            || function.type_
-                != self
-                    .callable
-                    .return_type
-                    .type_node()
-                    .map(|type_node| type_node.node)
-        {
+        if !valid_callable {
             return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
         }
 
@@ -8702,15 +8701,39 @@ impl SyntaxPlanner<'_> {
 
         self.validate_container(declaration, callable)?;
         self.validate_block_scope_container(declaration, expected_scope)?;
-        let symbol = plan_top_level_variable(
-            self.bound,
-            self.store,
-            declaration,
-            name,
-            &name_text,
-            binding,
-            false,
-        )?;
+        let parameter = self.callable.parameters.iter().find(|parameter| {
+            binding == VariableBindingKind::Var
+                && self.bound.symbol(declaration) == Some(parameter.symbol)
+                && source_parameter_declarations_are_exact(
+                    self.store,
+                    callable,
+                    parameter.declaration,
+                    parameter.symbol,
+                )
+        });
+        let symbol = if let Some(parameter) = parameter {
+            if self.bound.local_symbol(declaration).is_some()
+                || self
+                    .store
+                    .symbol(parameter.symbol)
+                    .is_none_or(|symbol| symbol.name().as_utf8() != Some(name_text.as_str()))
+            {
+                return Err(
+                    SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into(),
+                );
+            }
+            parameter.symbol
+        } else {
+            plan_top_level_variable(
+                self.bound,
+                self.store,
+                declaration,
+                name,
+                &name_text,
+                binding,
+                false,
+            )?
+        };
         let symbol_scope = if binding == VariableBindingKind::Var {
             callable
         } else {

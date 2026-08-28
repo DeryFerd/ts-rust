@@ -3139,6 +3139,7 @@ fn plan_source_callable_with_owner_shape(
                                     == Some(SyntaxKind::VariableDeclaration))
                     })
             })
+            && !source_parameter_declarations_are_exact(store, declaration, parameter, symbol)
         {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::OverloadDeclaration(parameter),
@@ -3148,7 +3149,7 @@ fn plan_source_callable_with_owner_shape(
             || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || symbol_record.check_flags() != CheckFlags::NONE
             || symbol_record.name().as_bytes() != parameter_name.as_bytes()
-            || symbol_record.declarations() != Some(&[parameter])
+            || !source_parameter_declarations_are_exact(store, declaration, parameter, symbol)
             || symbol_record.value_declaration() != Some(parameter)
             || symbol_record.members().is_some()
             || symbol_record.exports().is_some()
@@ -3482,6 +3483,56 @@ fn plan_source_callable_with_owner_shape(
         }
     }
     Ok(plan)
+}
+
+/// Keeps a parameter as the value declaration when direct body `var`s share its symbol.
+pub(super) fn source_parameter_declarations_are_exact(
+    store: &CanonicalTypeMapperStore,
+    callable: NodeRef,
+    parameter: NodeRef,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(record) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some((first, declarations)) = record.declarations().and_then(<[_]>::split_first) else {
+        return false;
+    };
+    if *first != parameter
+        || record.value_declaration() != Some(parameter)
+        || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+        || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(callable))
+    {
+        return false;
+    }
+    if declarations.is_empty() {
+        return true;
+    }
+    if store.source_node_kind(callable) != Some(SyntaxKind::ArrowFunction)
+        || !store.source_symbol_declarations_match(symbol)
+    {
+        return false;
+    }
+    declarations.iter().all(|declaration| {
+        if store.source_node_kind(*declaration) != Some(SyntaxKind::VariableDeclaration) {
+            return false;
+        }
+        let mut current = *declaration;
+        for kind in [
+            SyntaxKind::VariableDeclarationList,
+            SyntaxKind::VariableStatement,
+            SyntaxKind::Block,
+        ] {
+            let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(current) else {
+                return false;
+            };
+            if store.source_node_kind(parent) != Some(kind) {
+                return false;
+            }
+            current = parent;
+        }
+        store.source_node_parent(current) == Some(SourceNodeParent::Parent(callable))
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // Only exact namespace-owned void functions inherit warm targets.
@@ -11112,10 +11163,7 @@ pub(super) fn validate_stored_source_callable(
                 let Some(parameter_record) = store.symbol(*parameter) else {
                     return false;
                 };
-                let Some(parameter_declaration) = parameter_record
-                    .declarations()
-                    .and_then(|declarations| (declarations.len() == 1).then_some(declarations[0]))
-                else {
+                let Some(parameter_declaration) = parameter_record.value_declaration() else {
                     return false;
                 };
                 let links_valid = match store.value_symbol_links(*parameter) {
@@ -11159,6 +11207,12 @@ pub(super) fn validate_stored_source_callable(
                 };
                 parameter_record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
                     && parameter_record.check_flags() == CheckFlags::NONE
+                    && source_parameter_declarations_are_exact(
+                        store,
+                        declaration,
+                        parameter_declaration,
+                        *parameter,
+                    )
                     && parameter_record.value_declaration() == Some(parameter_declaration)
                     && parameter_record.members().is_none()
                     && parameter_record.exports().is_none()
@@ -19732,7 +19786,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_arrow_parameter_and_local_var_are_typed_unsupported() {
+    fn merged_rest_arrow_parameter_and_local_var_keep_one_symbol() {
         let fixture = QueryFixture::new(
             "const collision = (_i: number, ...rest: number[]): void => { var _i = 10; };",
             FileId::new(1_078),
@@ -19757,12 +19811,19 @@ mod tests {
         .unwrap();
         let before = publication_state(&fixture.store);
 
-        assert!(matches!(
-            plan_source_callable(&fixture.store, &host, arrow, owner, None),
-            Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::OverloadDeclaration(_)
-            ))
-        ));
+        let plan = plan_source_callable(&fixture.store, &host, arrow, owner, None).unwrap();
+        let parameter = plan.parameters[0];
+        let symbol = fixture.store.symbol(parameter.symbol).unwrap();
+        let [first, local] = symbol.declarations().unwrap() else {
+            panic!("expected the parameter and its body var")
+        };
+        assert_eq!(*first, parameter.declaration);
+        assert_eq!(symbol.value_declaration(), Some(parameter.declaration));
+        assert_eq!(fixture.bound.symbol(*local), Some(parameter.symbol));
+        assert_eq!(
+            fixture.store.source_node_kind(*local),
+            Some(SyntaxKind::VariableDeclaration),
+        );
         assert_eq!(publication_state(&fixture.store), before);
     }
 

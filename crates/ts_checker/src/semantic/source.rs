@@ -186,6 +186,7 @@ use super::{
         publish_inferred_source_callable_return, publish_jsdoc_contextual_source_callable,
         publish_jsdoc_parameterized_source_callable, source_array_filter_predicate_arrow_is_exact,
         source_direct_call_argument_arrow_is_exact, source_object_property_arrow_symbol,
+        source_parameter_declarations_are_exact,
         source_promise_constructor_argument_arrow_is_exact,
         source_prototype_assignment_function_is_exact, validate_stored_source_callable,
     },
@@ -1224,6 +1225,7 @@ struct PlannedArrow {
     source: SourceArrowPlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
     expression_statement: Option<PlannedArrowExpressionStatement>,
+    linear_body: Option<Box<PlannedLinearFunctionStatements>>,
     body: PlannedArrowBody,
 }
 
@@ -14112,9 +14114,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
         };
-        if !self.prior_variables.insert(syntax.symbol)
-            || !self.readable_variables.insert(syntax.symbol)
-        {
+        let shared_parameter = syntax.binding == VariableBindingKind::Var
+            && self.semantic.is_some_and(|(store, _)| {
+                let Some(parameter) = store
+                    .symbol(syntax.symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                else {
+                    return false;
+                };
+                let Some(super::store::SourceNodeParent::Parent(callable)) =
+                    store.source_node_parent(parameter)
+                else {
+                    return false;
+                };
+                store.source_declaration_belongs_to_symbol(syntax.declaration, syntax.symbol)
+                    && source_parameter_declarations_are_exact(
+                        store,
+                        callable,
+                        parameter,
+                        syntax.symbol,
+                    )
+            });
+        let valid_scope = if shared_parameter {
+            self.prior_variables.contains(&syntax.symbol)
+                && self.readable_variables.contains(&syntax.symbol)
+        } else {
+            self.prior_variables.insert(syntax.symbol)
+                && self.readable_variables.insert(syntax.symbol)
+        };
+        if !valid_scope {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(syntax.symbol),
             ));
@@ -14135,6 +14163,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         source: SourceArrowPlan,
     ) -> Result<PlannedArrow, SourceCheckError> {
+        if let SourceArrowBodyPlan::LinearBlock { block } = source.body {
+            let (parameter_initializers, body) = self.plan_function_body(&source.callable)?;
+            let PlannedFunctionBody::Linear(linear_body) = body else {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Arrow(block),
+                ));
+            };
+            return Ok(PlannedArrow {
+                source,
+                parameter_initializers,
+                expression_statement: None,
+                linear_body: Some(linear_body),
+                body: PlannedArrowBody::Empty,
+            });
+        }
         let parameter_initializers =
             self.plan_parameter_initializers_and_enter_scope(&source.callable)?;
         let awaited_statement = match self.semantic {
@@ -14170,12 +14213,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceArrowBodyPlan::ConciseExpression { expression } => {
                 self.plan_arrow_return_expression(expression, expression)
             }
+            SourceArrowBodyPlan::LinearBlock { .. } => {
+                unreachable!("statement bodies were planned above")
+            }
         };
         self.leave_callable_parameter_scope(&source.callable)?;
         Ok(PlannedArrow {
             source,
             parameter_initializers,
             expression_statement: expression_statement?,
+            linear_body: None,
             body: body?,
         })
     }
@@ -19592,6 +19639,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceArrowBodyPlan::ConciseExpression { expression } => {
                     self.plan_arrow_return_expression(expression, expression)
                 }
+                SourceArrowBodyPlan::LinearBlock { block } => Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Arrow(block),
+                )),
             };
             self.prior_variables = body_prior_variables;
             self.readable_variables = body_readable_variables;
@@ -36989,13 +37039,21 @@ fn check_planned_linear_function_statements(
                     staged_value_types,
                     value_order,
                 )?;
-                let declared =
-                    *staged_value_types
-                        .get(&local.symbol)
-                        .ok_or(SourceCheckError::Variable(
-                            VariableInvariant::MissingStagedValueType(local.symbol),
-                        ))?;
-                if nested_flow_types.insert(local.symbol, declared).is_some() {
+                let shared_parameter = callable
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.symbol == local.symbol);
+                let declared = if shared_parameter {
+                    store
+                        .value_symbol_links(local.symbol)
+                        .and_then(|links| links.resolved_type)
+                } else {
+                    staged_value_types.get(&local.symbol).copied()
+                }
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingStagedValueType(local.symbol),
+                ))?;
+                if nested_flow_types.insert(local.symbol, declared).is_some() && !shared_parameter {
                     return Err(SourceCheckError::Variable(
                         VariableInvariant::DuplicateCurrentFlowType(local.symbol),
                     ));
@@ -38128,7 +38186,7 @@ fn check_planned_function_locals(
         let snapshot = frame
             .snapshot_at(store, global_types, local.name)
             .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
-        let (declared_type, current_type) = if let Some(type_node) = local.type_node {
+        let (declared_type, mut current_type) = if let Some(type_node) = local.type_node {
             let assignment = check_planned_assignment(
                 store,
                 host,
@@ -38191,13 +38249,88 @@ fn check_planned_function_locals(
             )?;
             (declared_type, current_type)
         };
-        stage_value_type(
-            store,
-            staged_value_types,
-            value_order,
-            local.symbol,
-            declared_type,
-        )?;
+        if let Some(parameter) = callable
+            .parameters
+            .iter()
+            .find(|parameter| parameter.symbol == local.symbol)
+        {
+            let parameter_type = store
+                .value_symbol_links(parameter.symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                ))?;
+            if parameter_type != declared_type
+                && !store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                    parameter_type == bootstrap.error_type || declared_type == bootstrap.error_type
+                })
+                && !store.is_type_identical_to_with_global_types(
+                    parameter_type,
+                    declared_type,
+                    global_types,
+                )?
+            {
+                let name = store
+                    .source_identifier_text(local.name)
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::InvalidSymbolShape(local.symbol),
+                    ))?
+                    .to_owned();
+                let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                if options.no_error_truncation {
+                    flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                }
+                let display =
+                    get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                        store,
+                        host,
+                        global_types,
+                        parameter_type,
+                        declared_type,
+                        flags,
+                    )?;
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(local.name),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2403)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2403))?,
+                            [name.clone(), display.source, display.target],
+                        ),
+                        related_information: vec![CanonicalCheckerRelatedInformation {
+                            node: Some(parameter.declaration),
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(6203)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(6203))?,
+                                [name],
+                            ),
+                        }],
+                    },
+                );
+            }
+            current_type = current_flow_type_after_assignment(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                CheckedAssignment {
+                    declared_type: parameter_type,
+                    assigned_type: current_type,
+                },
+            )?;
+        } else {
+            stage_value_type(
+                store,
+                staged_value_types,
+                value_order,
+                local.symbol,
+                declared_type,
+            )?;
+        }
         frame
             .complete_assignment(local.declaration, local.symbol, current_type)
             .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
@@ -53265,6 +53398,29 @@ pub(super) fn check_source_file(
                         &callable,
                         &arrow.parameter_initializers,
                     )?;
+                    let body_flow_types = if let Some(statements) = &arrow.linear_body {
+                        check_planned_linear_function_statements(
+                            bound,
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &type_import_capabilities,
+                            &mut deferred,
+                            &callable,
+                            None,
+                            statements,
+                            &mut staged_value_types,
+                            &mut value_order,
+                        )?
+                    } else {
+                        body_flow_types
+                    };
                     if let Some(statement) = &arrow.expression_statement {
                         let checked = check_expression_type(
                             store,
@@ -53335,7 +53491,17 @@ pub(super) fn check_source_file(
                         }
                         body => {
                             let (expression, diagnostic_node) = match body {
-                                PlannedArrowBody::Empty => (None, callable.declaration),
+                                PlannedArrowBody::Empty => (
+                                    arrow
+                                        .linear_body
+                                        .as_ref()
+                                        .and_then(|body| body.return_expression.as_ref()),
+                                    arrow
+                                        .linear_body
+                                        .as_ref()
+                                        .and_then(|body| body.return_statement)
+                                        .unwrap_or(callable.declaration),
+                                ),
                                 PlannedArrowBody::Return {
                                     expression,
                                     diagnostic_node,
@@ -57133,6 +57299,28 @@ pub(super) fn check_source_file(
             &arrow.source.callable,
             &arrow.parameter_initializers,
         )?;
+        if let Some(statements) = &arrow.linear_body {
+            check_planned_linear_function_statements(
+                bound,
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                body_flow_types,
+                &preflighted_type_import_value_uses,
+                &type_import_capabilities,
+                &mut deferred,
+                &arrow.source.callable,
+                Some(return_type),
+                statements,
+                &mut staged_value_types,
+                &mut value_order,
+            )?;
+            continue;
+        }
         match &arrow.body {
             PlannedArrowBody::Empty => {}
             PlannedArrowBody::Return {
@@ -94145,6 +94333,261 @@ class Foo2 {
                 Some(context.global_types().any_array_type)
             );
 
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn collision_rest_arrow_fixture_preserves_parameter_symbols_and_warm_state() {
+        let text = concat!(
+            "// @target: es2015\n",
+            "// @strict: false\n",
+            "var f1 = (_i: number, ...restParameters) => { //_i is error\n",
+            "    var _i = 10; // no error\n",
+            "}\n",
+            "var f1NoError = (_i: number) => { // no error\n",
+            "    var _i = 10; // no error\n",
+            "}\n\n",
+            "var f2 = (...restParameters) => {\n",
+            "    var _i = 10; // No Error\n",
+            "}\n",
+            "var f2NoError = () => {\n",
+            "    var _i = 10; // no error\n",
+            "}\n",
+        );
+        let source = parsed(text);
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let library_file = FileId::new(9_941);
+        for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+            let file = FileId::new(9_942 + u32::try_from(index).unwrap());
+            let mut context = context_with_default_library_files(
+                &[(library_file, &library), (file, &source)],
+                &[library_file],
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), if no_implicit_any { 2 } else { 0 });
+            for diagnostic in diagnostics {
+                assert_eq!(diagnostic.diagnostic.code(), 7019);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "Rest parameter 'restParameters' implicitly has an 'any[]' type.",
+                );
+                assert_eq!(
+                    node_text(&source, diagnostic.node.unwrap()),
+                    "...restParameters"
+                );
+            }
+
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let any_array = context.global_types().any_array_type;
+            assert_ne!(any_array, bootstrap.empty_object_type);
+            let (_, bound) = context.file(file).unwrap();
+            for (name, has_parameter, has_rest) in [
+                ("f1", true, true),
+                ("f1NoError", true, false),
+                ("f2", false, true),
+                ("f2NoError", false, false),
+            ] {
+                let arrow = variable_initializer(&source, file, name);
+                let NodeData::ArrowFunction(data) = &source.arena.get(arrow.node).unwrap().data
+                else {
+                    panic!("expected an arrow")
+                };
+                let callable = variable_value_type(&context, &source, file, name);
+                assert!(matches!(
+                    validate_stored_source_callable(store, callable),
+                    StoredSourceCallableValidation::Valid(_)
+                ));
+                let signature = store
+                    .source_callable_provenance(callable)
+                    .and_then(|provenance| store.signature(provenance.signature))
+                    .unwrap();
+                assert_eq!(signature.resolved_return_type(), Some(bootstrap.void_type));
+                assert_eq!(signature.has_rest_parameter(), has_rest);
+                assert_eq!(signature.min_argument_count(), i32::from(has_parameter));
+
+                let NodeData::Block(block) = &source.arena.get(data.body).unwrap().data else {
+                    panic!("expected a block")
+                };
+                let NodeData::VariableStatement(statement) =
+                    &source.arena.get(block.statements.nodes[0]).unwrap().data
+                else {
+                    panic!("expected a variable statement")
+                };
+                let NodeData::VariableDeclarationList(list) =
+                    &source.arena.get(statement.declaration_list).unwrap().data
+                else {
+                    panic!("expected a variable declaration list")
+                };
+                let local = NodeRef::new(source.arena.id(), file, list.declarations.nodes[0]);
+                let local_symbol = bound.symbol(local).unwrap();
+                assert_eq!(
+                    store
+                        .value_symbol_links(local_symbol)
+                        .and_then(|links| links.resolved_type),
+                    Some(bootstrap.number_type),
+                );
+                if has_parameter {
+                    let parameter = NodeRef::new(source.arena.id(), file, data.parameters.nodes[0]);
+                    assert_eq!(bound.symbol(parameter), Some(local_symbol));
+                    assert_eq!(
+                        store.symbol(local_symbol).unwrap().value_declaration(),
+                        Some(parameter)
+                    );
+                    assert_eq!(signature.parameters()[0], local_symbol);
+                }
+                if has_rest {
+                    let rest = *signature.parameters().last().unwrap();
+                    assert_eq!(
+                        store
+                            .value_symbol_links(rest)
+                            .and_then(|links| links.resolved_type),
+                        Some(any_array),
+                    );
+                }
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn rest_arrow_variable_statements_keep_parameter_reads_and_return_types() {
+        let source = parsed(concat!(
+            "const inferred = (value: number, ...rest) => { var value = 2; return value; }; ",
+            "const annotated = (value: number): number => { var value = 3; return value; }; ",
+            "const local = (...rest) => { var answer = 4; return answer; }; ",
+            "const first = inferred(1); const second = annotated(1); const third = local();",
+        ));
+        let file = FileId::new(9_944);
+        let library_file = FileId::new(9_940);
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions {
+                no_implicit_any: false,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for name in ["first", "second", "third"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), number);
+        }
+        for read in identifier_expressions(&source, file, "value") {
+            let symbol = context
+                .store()
+                .symbol_node_links(read)
+                .unwrap()
+                .resolved_symbol
+                .unwrap();
+            let parameter = context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            assert_eq!(
+                source.arena.get(parameter.node).unwrap().kind,
+                SyntaxKind::Parameter
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(number)
+            );
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn rest_arrow_variable_statements_preserve_initializer_and_redeclaration_diagnostics() {
+        for (index, (text, expected)) in [
+            (
+                "var checked = (value: number, ...rest) => { var value = 'text'; };",
+                vec![2403],
+            ),
+            (
+                "var checked = (value: number): void => { var value: string = 1; };",
+                vec![2322, 2403],
+            ),
+            (
+                "var checked = (...rest) => { var other: number = 'text'; };",
+                vec![2322],
+            ),
+            (
+                "var checked = (value: number, ...rest) => { var value = unknownInitializer; };",
+                vec![2304],
+            ),
+            (
+                "var checked = (value: number): string => { var value = 1; return value; };",
+                vec![2322],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_945 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: false,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{text}",
+            );
+            for diagnostic in context.diagnostics().as_slice() {
+                if diagnostic.diagnostic.code() == 2403 {
+                    assert_eq!(node_text(&source, diagnostic.node.unwrap()), "value");
+                    assert_eq!(
+                        diagnostic.diagnostic.render().unwrap(),
+                        "Subsequent variable declarations must have the same type.  Variable 'value' must be of type 'number', but here has type 'string'."
+                    );
+                    let [related] = diagnostic.related_information.as_slice() else {
+                        panic!("expected the original parameter location")
+                    };
+                    assert_eq!(related.diagnostic.code(), 6203);
+                    assert_eq!(node_text(&source, related.node.unwrap()), "value: number");
+                }
+            }
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);

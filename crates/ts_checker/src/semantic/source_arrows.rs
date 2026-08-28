@@ -180,6 +180,9 @@ pub(super) enum SourceArrowBodyPlan {
     EmptyBlock {
         block: NodeRef,
     },
+    LinearBlock {
+        block: NodeRef,
+    },
     ReturnExpression {
         block: NodeRef,
         statement: NodeRef,
@@ -2024,6 +2027,37 @@ fn plan_body(
         || block.facts != 0
     {
         return Err(invariant(SourceArrowInvariant::InvalidBody(body)));
+    }
+    if !callable.is_async
+        && host
+            .bound_file(callable.declaration)
+            .and_then(ts_binder::BoundFile::source_facts)
+            .is_some_and(|facts| !facts.is_javascript_file())
+        && block.statements.nodes.first().is_some_and(|statement| {
+            store.source_node_kind(NodeRef::new(body.arena, body.file, *statement))
+                == Some(SyntaxKind::VariableStatement)
+        })
+        && block
+            .statements
+            .nodes
+            .iter()
+            .enumerate()
+            .all(|(index, statement)| {
+                let kind = store.source_node_kind(NodeRef::new(body.arena, body.file, *statement));
+                kind == Some(SyntaxKind::VariableStatement)
+                    || index + 1 == block.statements.nodes.len()
+                        && kind == Some(SyntaxKind::ReturnStatement)
+            })
+    {
+        for statement in &block.statements.nodes {
+            let statement = NodeRef::new(body.arena, body.file, *statement);
+            let record = preflight_node(store, host, statement)?;
+            if record.parent != Some(body.node) || !range_contains(body_record.range, record.range)
+            {
+                return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
+            }
+        }
+        return Ok(SourceArrowBodyPlan::LinearBlock { block: body });
     }
     match block.statements.nodes.as_slice() {
         [] => Ok(SourceArrowBodyPlan::EmptyBlock { block: body }),
@@ -4426,6 +4460,14 @@ mod tests {
             bare.plan(0),
             Err(SourceArrowError::Unsupported(
                 SourceArrowUnsupported::BareReturn(_)
+            ))
+        ));
+
+        let javascript = Fixture::javascript("const f = () => { var value = 1; };");
+        assert!(matches!(
+            javascript.plan(0),
+            Err(SourceArrowError::Unsupported(
+                SourceArrowUnsupported::ComplexBlock(_)
             ))
         ));
     }
