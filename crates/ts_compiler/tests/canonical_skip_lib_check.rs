@@ -1,5 +1,5 @@
 use ts_compiler::{Program, ProgramGraphResolutionKind};
-use ts_options::CompilerOptions;
+use ts_options::{CompilerOptions, ScriptTarget};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
 #[test]
@@ -74,9 +74,19 @@ fn canonical_skip_lib_check_matches_processing_diagnostic_fixture() {
     ] {
         fs.write_file(file, source).unwrap();
     }
-    let (program, checked) = Program::try_from_config_with_canonical_checker_and_queries(
+    // Use the baseline harness's explicit root and default target.
+    let (program, checked) = Program::try_new_with_canonical_checker_and_queries_with_config_path(
         &fs,
-        "/tsconfig.json",
+        "/.src",
+        &["/index.ts".to_owned()],
+        CompilerOptions {
+            target: ScriptTarget::Es2025,
+            strict: true,
+            strict_specified: true,
+            skip_lib_check: true,
+            ..CompilerOptions::default()
+        },
+        Some("/tsconfig.json"),
         |_, _| (),
     )
     .unwrap();
