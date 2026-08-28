@@ -29599,9 +29599,15 @@ fn class_constructor_keyword_range(
     if token.kind != SyntaxKind::ConstructorKeyword {
         return Err(invalid());
     }
-    let start = offset
+    // The diagnostic starts at the node's first token, including modifiers.
+    let declaration_start = usize::try_from(record.range.start.get()).map_err(|_| invalid())?;
+    let declaration_text = source.get(declaration_start..end).ok_or_else(invalid)?;
+    let first_token = Scanner::new(declaration_text).scan();
+    let start = record
+        .range
+        .start
         .get()
-        .checked_add(token.range.start.get())
+        .checked_add(first_token.range.start.get())
         .ok_or_else(invalid)?;
     let end = offset
         .get()
