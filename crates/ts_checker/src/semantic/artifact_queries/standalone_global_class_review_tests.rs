@@ -13,15 +13,60 @@ fn alias_snapshot(
     )
 }
 
+fn cold_typing_state(context: &CanonicalCheckerContext<'_>, fixture: &Fixture) -> [usize; 6] {
+    let store = context.store();
+    for owner in fixture.owners.iter().copied().filter(|owner| {
+        store
+            .symbol(*owner)
+            .unwrap()
+            .flags()
+            .contains(SymbolFlags::CLASS)
+    }) {
+        assert!(
+            store
+                .declared_type_links(owner)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        assert!(
+            store
+                .value_symbol_links(owner)
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        assert!(store.declared_value_provenance(owner).is_none());
+    }
+    for file in &fixture.files {
+        assert!(
+            store
+                .source_file_links(context.source_file(*file).unwrap())
+                .is_none_or(|links| !links.type_checked)
+        );
+    }
+    for node in &fixture.nodes {
+        assert!(store.type_node_links(*node).is_none());
+    }
+    [
+        store.type_len(),
+        store.symbol_len(),
+        store.signature_len(),
+        store.mapper_len(),
+        store.symbol_store().symbol_table_len(),
+        store.merged_symbol_len(),
+    ]
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // Keep the invalid lookup, local control, and restoration together.
 fn review_standalone_global_alias_keeps_the_requested_name_and_local_owner() {
     let mut failures = Vec::new();
-    for consumer in [
-        "export = Value;",
-        "class Value { local: boolean = true; } export = Value;",
+    // The local source is bound, not type-checked. It tests lazy alias lookup.
+    for (consumer, check_sources) in [
+        ("export = Value;", true),
+        (
+            "class Value { local: boolean = true; } export = Value;",
+            false,
+        ),
     ] {
-        with_sources(
+        with_source_setup(
             &[
                 (
                     "declare class Value { value: number; } declare class Other { other: string; }",
@@ -31,6 +76,7 @@ fn review_standalone_global_alias_keeps_the_requested_name_and_local_owner() {
                 (consumer, false, CanonicalModuleState::External),
             ],
             1,
+            check_sources,
             |context, fixture| {
                 let globals = context.globals();
                 let global = context
@@ -52,8 +98,10 @@ fn review_standalone_global_alias_keeps_the_requested_name_and_local_owner() {
                         .unwrap()
                         .get_source("Value")
                 });
+                assert_eq!(local.is_none(), check_sources);
                 let expected = local.unwrap_or(global);
-                let (declared, value) = identities(context, expected);
+                let types = check_sources.then(|| identities(context, expected));
+                let cold = (!check_sources).then(|| cold_typing_state(context, fixture));
                 let alias = fixture
                     .nodes
                     .iter()
@@ -82,7 +130,11 @@ fn review_standalone_global_alias_keeps_the_requested_name_and_local_owner() {
                 let healthy = context.resolve_alias(alias).unwrap();
                 assert_eq!(healthy.target, AliasTargetState::Resolved(expected));
                 assert!(healthy.events.is_empty());
-                assert_healthy(context, fixture, expected, declared, value);
+                if let Some((declared, value)) = types {
+                    assert_healthy(context, fixture, expected, declared, value);
+                } else {
+                    assert_eq!(Some(cold_typing_state(context, fixture)), cold);
+                }
                 let good_links = context.store().alias_symbol_links(alias).cloned().unwrap();
                 let before = alias_snapshot(context, fixture);
                 for _ in 0..2 {
@@ -122,7 +174,7 @@ fn review_standalone_global_alias_keeps_the_requested_name_and_local_owner() {
                         assert_eq!(context.resolve_alias(alias).unwrap(), resolved);
                         assert_eq!(alias_snapshot(context, fixture), before);
                     }
-                    assert_healthy(context, fixture, expected, declared, value);
+                    assert_eq!(Some(cold_typing_state(context, fixture)), cold);
                 } else {
                     assert!(fixture.local_table.is_none());
                     let damaged = alias_snapshot(context, fixture);
@@ -150,7 +202,11 @@ fn review_standalone_global_alias_keeps_the_requested_name_and_local_owner() {
                 let restored = alias_snapshot(context, fixture);
                 for _ in 0..2 {
                     assert_eq!(context.resolve_alias(alias).unwrap(), healthy);
-                    assert_healthy(context, fixture, expected, declared, value);
+                    if let Some((declared, value)) = types {
+                        assert_healthy(context, fixture, expected, declared, value);
+                    } else {
+                        assert_eq!(Some(cold_typing_state(context, fixture)), cold);
+                    }
                     assert_eq!(alias_snapshot(context, fixture), restored);
                 }
             },

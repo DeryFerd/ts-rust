@@ -62,6 +62,15 @@ fn with_sources(
     queried_file: usize,
     check: impl FnOnce(&mut CanonicalCheckerContext<'_>, &Fixture),
 ) {
+    with_source_setup(inputs, queried_file, true, check);
+}
+
+fn with_source_setup(
+    inputs: &[(&str, bool, CanonicalModuleState)],
+    queried_file: usize,
+    check_sources: bool,
+    check: impl FnOnce(&mut CanonicalCheckerContext<'_>, &Fixture),
+) {
     let parsed = inputs
         .iter()
         .map(|(text, _, _)| {
@@ -110,11 +119,13 @@ fn with_sources(
         CanonicalCheckerOptions::default(),
     )
     .unwrap();
-    for ((text, declaration_file, _), file) in inputs.iter().zip(&files) {
-        if !declaration_file {
-            context
-                .check_source_file(*file)
-                .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+    if check_sources {
+        for ((text, declaration_file, _), file) in inputs.iter().zip(&files) {
+            if !declaration_file {
+                context
+                    .check_source_file(*file)
+                    .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            }
         }
     }
     assert!(
