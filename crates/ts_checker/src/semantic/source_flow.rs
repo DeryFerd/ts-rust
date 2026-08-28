@@ -1417,8 +1417,18 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         let mut captured = HashSet::new();
         for (&target, &declaration) in &self.flow.plan.assignment_declarations {
             let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
-            let assignment = self.flow.plan.assignments.get(&target).ok_or_else(invalid)?;
-            let declaration_start = host.node(declaration).ok_or_else(invalid)?.range.start.get();
+            let assignment = self
+                .flow
+                .plan
+                .assignments
+                .get(&target)
+                .ok_or_else(invalid)?;
+            let declaration_start = host
+                .node(declaration)
+                .ok_or_else(invalid)?
+                .range
+                .start
+                .get();
             let mut position = host.node(target).ok_or_else(invalid)?.range.start.get();
             let mut current = target;
             let mut visited = HashSet::new();

@@ -9273,6 +9273,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn property_plan_error(node: NodeRef, error: SourcePropertyError) -> SourceCheckError {
         match error {
             SourcePropertyError::Flow(error) => class_body_flow_error(node, error),
+            SourcePropertyError::PendingClassProperty(_) => {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node))
+            }
             SourcePropertyError::Unsupported(reason) => {
                 let node = match reason {
                     SourcePropertyUnsupported::Access(node)
@@ -29311,17 +29314,68 @@ fn check_expression_type_with_class_context(
                 receiver.result,
             )? {
                 Some(checked) => checked,
-                None => check_direct_source_property_with_class_context_and_session(
-                    store,
-                    host,
-                    Some(global_types),
-                    options,
-                    property,
-                    receiver.result,
-                    session,
-                    class_flow.as_deref_mut().map(|context| &mut context.flow),
-                )
-                .map_err(|error| SourcePlanner::property_plan_error(expression.node, error))?,
+                None => {
+                    let mut demanded = HashSet::new();
+                    loop {
+                        match check_direct_source_property_with_class_context_and_session(
+                            store,
+                            host,
+                            Some(global_types),
+                            options,
+                            property,
+                            receiver.result,
+                            session,
+                            class_flow.as_deref_mut().map(|context| &mut context.flow),
+                        ) {
+                            Ok(checked) => break checked,
+                            Err(SourcePropertyError::PendingClassProperty(demand)) => {
+                                let context = class_flow.as_deref_mut().ok_or(
+                                    SourceCheckError::Unsupported(
+                                        UnsupportedSourceSyntax::Property(property.node),
+                                    ),
+                                )?;
+                                if demand.class_symbol() != context.state.class.source.symbol()
+                                    || !demanded.insert(demand.symbol())
+                                {
+                                    return Err(SourceCheckError::Unsupported(
+                                        UnsupportedSourceSyntax::Class(demand.declaration()),
+                                    ));
+                                }
+                                let index = context
+                            .state
+                            .class
+                            .source
+                            .bodies()
+                            .iter()
+                            .position(|body| {
+                                body.declaration == demand.declaration()
+                                    && body.body == demand.body()
+                                    && matches!(body.kind, ClassBodyKind::PropertyInitializer { symbol, .. }
+                                        if symbol == demand.symbol())
+                            })
+                            .ok_or(SourceCheckError::Class(demand.declaration()))?;
+                                check_planned_class_body(
+                                    store,
+                                    host,
+                                    global_types,
+                                    source,
+                                    options,
+                                    session,
+                                    preflighted_type_import_value_uses,
+                                    deferred,
+                                    context.state,
+                                    index,
+                                )?;
+                            }
+                            Err(error) => {
+                                return Err(SourcePlanner::property_plan_error(
+                                    expression.node,
+                                    error,
+                                ));
+                            }
+                        }
+                    }
+                }
             };
             for diagnostic in checked.diagnostics {
                 publish_or_defer_class_property_diagnostic(
@@ -31029,6 +31083,12 @@ fn check_planned_class_body(
                 };
                 let name =
                     NodeRef::new(body.declaration.arena, body.declaration.file, property.name);
+                publish_expression_type(
+                    store,
+                    body.return_annotation
+                        .ok_or(SourceCheckError::Class(body.declaration))?,
+                    target,
+                )?;
                 check_assignment_to_type_with_class_context(
                     store,
                     host,
@@ -102306,6 +102366,80 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn source_class_arrows_resolve_forward_field_types_without_initialization_reads() {
+        for (text, errors) in [
+            (
+                "class Forward { value = 1; read = () => this.copy; copy = this.value; }",
+                0,
+            ),
+            (
+                "class Annotated { value = 1; read = () => this.copy; copy: number = this.value; }",
+                0,
+            ),
+            (
+                "class Immediate { value = 1; read = this.copy; copy = this.value; }",
+                1,
+            ),
+            (
+                concat!(
+                    "class Nested { value = 1; read = () => this.copy; ",
+                    "copy = this.later; later = this.value; }",
+                ),
+                1,
+            ),
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(174_2718);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            assert_eq!(context.diagnostics().len(), errors, "{text}");
+            for diagnostic in context.diagnostics().as_slice() {
+                assert_eq!(diagnostic.diagnostic.code(), 2729);
+                assert_eq!(diagnostic.related_information.len(), 1);
+                assert_eq!(diagnostic.related_information[0].diagnostic.code(), 2728);
+            }
+            for (node, record) in source.arena.iter() {
+                if record.kind == SyntaxKind::ArrowFunction {
+                    let arrow = NodeRef::new(source.arena.id(), file, node);
+                    let type_ = resolved_node_type(&context, arrow);
+                    let signature = context
+                        .store()
+                        .source_callable_provenance(type_)
+                        .unwrap()
+                        .signature;
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature(signature)
+                            .unwrap()
+                            .resolved_return_type(),
+                        Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+                    );
+                }
+            }
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn source_class_field_type_demand_stops_at_active_initializer_cycles() {
+        let source = parsed("class Cycle { read = () => this.copy; copy = this.read; }");
+        let file = FileId::new(174_2719);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(_)
+            ))
+        ));
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]

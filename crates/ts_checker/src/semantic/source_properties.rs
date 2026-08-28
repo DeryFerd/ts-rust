@@ -45,7 +45,7 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     classes::{
         self, ClassConstructorVisibility, ClassHeritageMembersValidation, ClassMemberOrigin,
-        ClassMemberSource, ClassPropertySide,
+        ClassMemberSource, ClassPropertySide, ClassPropertyTypeDemand,
     },
     declared::preflight_node,
     enums,
@@ -95,6 +95,7 @@ pub(super) enum SourcePropertyUnsupported {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourcePropertyError {
     Unsupported(SourcePropertyUnsupported),
+    PendingClassProperty(ClassPropertyTypeDemand),
     InvalidCache(NodeRef),
     Union {
         node: NodeRef,
@@ -131,6 +132,13 @@ impl std::fmt::Display for SourcePropertyError {
             Self::Unsupported(error) => {
                 write!(formatter, "source property is unsupported: {error:?}")
             }
+            Self::PendingClassProperty(demand) => {
+                write!(
+                    formatter,
+                    "class property type is pending at {:?}",
+                    demand.declaration()
+                )
+            }
             Self::InvalidCache(node) => {
                 write!(formatter, "source property cache is invalid at {node:?}")
             }
@@ -157,6 +165,7 @@ impl std::error::Error for SourcePropertyError {
             Self::Relation(error) => Some(error),
             Self::Display(error) => Some(error),
             Self::Unsupported(_)
+            | Self::PendingClassProperty(_)
             | Self::InvalidCache(_)
             | Self::Union { .. }
             | Self::Capacity(_)
@@ -2060,6 +2069,14 @@ fn class_context_member_for_symbol(
         .ok_or_else(invalid)?;
     let source = classes::class_member_source(store, host, symbol).map_err(|_| invalid())?;
     let property = store.symbol(symbol).ok_or_else(invalid)?;
+    if store
+        .value_symbol_links(symbol)
+        .is_none_or(|links| links.resolved_type.is_none())
+        && let Some(demand) = classes::pending_source_class_property_type(store, host, &source)
+            .map_err(|_| invalid())?
+    {
+        return Err(SourcePropertyError::PendingClassProperty(demand));
+    }
     let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
     let type_ = links
         .resolved_type
@@ -2698,6 +2715,14 @@ fn check_prepared_class_instance_property(
         return Ok(None);
     }
     let record = store.symbol(symbol).ok_or_else(invalid)?;
+    if store
+        .value_symbol_links(symbol)
+        .is_none_or(|links| links.resolved_type.is_none())
+        && let Some(demand) = classes::pending_source_class_property_type(store, host, &member)
+            .map_err(|_| invalid())?
+    {
+        return Err(SourcePropertyError::PendingClassProperty(demand));
+    }
     let links = store.value_symbol_links(symbol).ok_or_else(invalid)?;
     let mut type_ = links
         .resolved_type

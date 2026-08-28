@@ -453,6 +453,33 @@ pub(super) struct ClassBodyIdentities {
     pub(super) base: Option<ClassBaseIdentities>,
 }
 
+/// A field type can be requested only from its retained initializer body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ClassPropertyTypeDemand {
+    class_symbol: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    body: NodeRef,
+}
+
+impl ClassPropertyTypeDemand {
+    pub(super) const fn class_symbol(self) -> SemanticSymbolId {
+        self.class_symbol
+    }
+
+    pub(super) const fn symbol(self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) const fn declaration(self) -> NodeRef {
+        self.declaration
+    }
+
+    pub(super) const fn body(self) -> NodeRef {
+        self.body
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassBodyCallable {
     kind: SignatureKind,
@@ -3515,6 +3542,55 @@ pub(super) fn prepare_class_instance_super_member_type(
     }
     assert!(store.publish_class_instance_super_member(cached));
     Ok(type_)
+}
+
+pub(super) fn pending_source_class_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: &ClassMemberSource,
+) -> Result<Option<ClassPropertyTypeDemand>, ClassError> {
+    let Some(provenance) = store.source_class_provenance_for_symbol(member.declaring_class) else {
+        return Ok(None);
+    };
+    validate_source_class_header(store, host, provenance)?;
+    let plan = &provenance.prepared.plan;
+    let Some(index) = plan
+        .initialized_properties
+        .iter()
+        .position(|property| property.symbol == member.symbol)
+    else {
+        return Ok(None);
+    };
+    if provenance.property_types[index].is_some() {
+        return Ok(None);
+    }
+    let property = &plan.initialized_properties[index];
+    let body = plan
+        .bodies
+        .iter()
+        .find(|body| {
+            body.declaration == property.declaration
+                && Some(body.body) == property.initializer_node
+                && matches!(body.kind, ClassBodyKind::PropertyInitializer { symbol, .. }
+                    if symbol == member.symbol)
+        })
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(property.declaration)))?;
+    if plan
+        .sources
+        .iter()
+        .find(|source| source.symbol == member.symbol)
+        != Some(member)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            member.declaration,
+        )));
+    }
+    Ok(Some(ClassPropertyTypeDemand {
+        class_symbol: plan.symbol(),
+        symbol: member.symbol,
+        declaration: body.declaration,
+        body: body.body,
+    }))
 }
 
 pub(super) fn complete_source_class_body(
