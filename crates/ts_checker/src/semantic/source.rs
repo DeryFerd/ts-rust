@@ -39792,8 +39792,15 @@ fn source_for_of_fallback_type(
     let element = if missing_index {
         None
     } else {
-        numeric_index_type(store, host, global_types, options, diagnostics, index_receiver)
-            .map_err(|error| SourcePlanner::element_plan_error(node, error))?
+        numeric_index_type(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            index_receiver,
+        )
+        .map_err(|error| SourcePlanner::element_plan_error(node, error))?
     };
     if has_string && let Some(element) = element {
         return store
