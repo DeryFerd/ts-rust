@@ -2193,6 +2193,7 @@ impl<'a> Parser<'a> {
         self.yield_context = asterisk_token.is_some();
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
+        let mut javascript_semicolon_end = None;
         let body = if self.current.kind == SyntaxKind::OpenBraceToken {
             Some(self.parse_block())
         } else if self.current.kind == SyntaxKind::CommaToken {
@@ -2216,13 +2217,19 @@ impl<'a> Parser<'a> {
                 &[],
             ))
         } else {
-            self.parse_semicolon(self.current.range.start);
+            let retain_semicolon =
+                self.javascript_file && self.current.kind == SyntaxKind::SemicolonToken;
+            let end = self.parse_semicolon(self.current.range.start);
+            if retain_semicolon {
+                javascript_semicolon_end = Some(end);
+            }
             None
         };
         let end = body
             .or(return_type)
             .and_then(|id| self.arena.get(id))
             .map_or(parameters.range.end, |node| node.range.end);
+        let end = javascript_semicolon_end.unwrap_or(end);
         let mut children = Vec::new();
         children.extend(asterisk_token);
         children.extend(name);
@@ -3426,6 +3433,7 @@ impl<'a> Parser<'a> {
             self.yield_context = asterisk_token.is_some();
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
+            let mut javascript_semicolon_end = None;
             let body = if !signature_only && self.current.kind == SyntaxKind::OpenBraceToken {
                 Some(self.parse_class_member_block())
             } else if !signature_only
@@ -3462,12 +3470,18 @@ impl<'a> Parser<'a> {
                 }
                 Some(body)
             } else {
-                self.parse_semicolon(parameters.range.end);
+                let retain_semicolon =
+                    self.javascript_file && self.current.kind == SyntaxKind::SemicolonToken;
+                let end = self.parse_semicolon(parameters.range.end);
+                if retain_semicolon {
+                    javascript_semicolon_end = Some(end);
+                }
                 None
             };
             let end = body
                 .or(return_type)
                 .map_or(parameters.range.end, |id| self.node_end(id));
+            let end = javascript_semicolon_end.unwrap_or(end);
             let mut children = modifier_nodes.clone();
             children.extend(asterisk_token);
             children.push(name);
