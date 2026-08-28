@@ -60969,7 +60969,7 @@ mod tests {
         context.check_source_file(file).unwrap();
 
         assert!(context.diagnostics().is_empty());
-        let global_diagnostics = &context.global_types().diagnostics;
+        let global_diagnostics = context.global_types().diagnostics();
         assert!(
             global_diagnostics
                 .iter()
