@@ -31,6 +31,9 @@ mod artifact_classification_review;
 #[cfg(test)]
 mod array_cast_fixture;
 
+#[cfg(test)]
+mod destructuring_contextual_fixture;
+
 use artifacts::{
     ArtifactRenderError, GeneratedSemanticArtifacts, SemanticArtifactError, SemanticArtifactKind,
 };

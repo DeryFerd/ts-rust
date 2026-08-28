@@ -40150,6 +40150,230 @@ fn recover_non_iterable_union_element(
     Ok(Some(CheckedExpressionTypes::leaf(error, error)))
 }
 
+struct ObjectBindingContext {
+    type_: TypeId,
+    permits_extra: bool,
+    nested: Vec<(String, Self)>,
+}
+
+fn implied_object_binding_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    pattern: NodeRef,
+) -> Result<ObjectBindingContext, SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidBindingPattern(pattern));
+    let record = host.node(pattern).ok_or_else(invalid)?;
+    let NodeData::BindingPattern(pattern_data) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::ObjectBindingPattern {
+        return Err(invalid());
+    }
+    let (any, string, empty) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.any_type,
+                bootstrap.string_type,
+                bootstrap.empty_type_literal_type,
+            )
+        })
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let mut properties = Vec::<(String, TypeId, bool)>::new();
+    let mut nested = Vec::new();
+    let mut rest = false;
+    let mut permits_extra = false;
+    for element in &pattern_data.elements.nodes {
+        let element = NodeRef::new(pattern.arena, pattern.file, *element);
+        let NodeData::BindingElement(binding) = &host.node(element).ok_or_else(invalid)?.data
+        else {
+            return Err(invalid());
+        };
+        if binding.dot_dot_dot_token.is_some() {
+            rest = true;
+            permits_extra = true;
+            continue;
+        }
+        let name = binding.name.ok_or_else(invalid)?;
+        let property = NodeRef::new(
+            pattern.arena,
+            pattern.file,
+            binding.property_name.unwrap_or(name),
+        );
+        let property_name = match &host.node(property).ok_or_else(invalid)?.data {
+            NodeData::Identifier(name) => name.text.clone(),
+            NodeData::StringLiteral(name) => name.text.clone(),
+            NodeData::NumericLiteral(name) => name.text.clone(),
+            NodeData::ComputedPropertyName(computed) => {
+                let key = NodeRef::new(pattern.arena, pattern.file, computed.expression);
+                let type_ = store
+                    .type_node_links(key)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or_else(invalid)?;
+                let Some(name) = literal_computed_property_name(store, type_) else {
+                    permits_extra = true;
+                    continue;
+                };
+                name
+            }
+            _ => return Err(invalid()),
+        };
+        let name = NodeRef::new(pattern.arena, pattern.file, name);
+        let (type_, child) = if let Some(initializer) = binding.initializer {
+            let initializer = NodeRef::new(pattern.arena, pattern.file, initializer);
+            let type_ = store
+                .type_node_links(initializer)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(invalid)?;
+            (
+                widened_fresh_literal_union_type(store, global_types, type_)?,
+                None,
+            )
+        } else if host
+            .node(name)
+            .is_some_and(|node| node.kind == SyntaxKind::ObjectBindingPattern)
+        {
+            let child = implied_object_binding_context(store, host, global_types, name)?;
+            (child.type_, Some(child))
+        } else {
+            (any, None)
+        };
+        let property = (property_name.clone(), type_, binding.initializer.is_some());
+        if let Some(existing) = properties.iter_mut().find(|entry| entry.0 == property_name) {
+            *existing = property;
+        } else {
+            properties.push(property);
+        }
+        nested.retain(|(name, _)| name != &property_name);
+        if let Some(child) = child {
+            nested.push((property_name, child));
+        }
+    }
+    if properties.is_empty() && !rest {
+        return Ok(ObjectBindingContext {
+            type_: empty,
+            permits_extra,
+            nested,
+        });
+    }
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_checker_symbol_allocations(properties.len(), 1)
+        || !store.try_reserve_value_symbol_links(properties.len())
+        || !store.try_reserve_index_infos(usize::from(rest))
+    {
+        return Err(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::Capacity,
+        ));
+    }
+    let members = store.alloc_symbol_table();
+    let mut symbols = Vec::with_capacity(properties.len());
+    for (name, type_, optional) in properties {
+        let flags = SymbolFlags::PROPERTY
+            | if optional {
+                SymbolFlags::OPTIONAL
+            } else {
+                SymbolFlags::NONE
+            };
+        let name = EscapedName::source(name);
+        let symbol = store.alloc_transient_symbol(flags, name.clone(), CheckFlags::NONE);
+        if !store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ) || store.insert_symbol(members, name, symbol) != Some(None)
+        {
+            return Err(invalid());
+        }
+        symbols.push(symbol);
+    }
+    let indexes = if rest {
+        Some(vec![
+            store
+                .alloc_index_info(string, any, false, None, Vec::new())
+                .ok_or_else(invalid)?,
+        ])
+    } else {
+        None
+    };
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+        .ok_or_else(invalid)?;
+    if !store.set_structured_type_members(type_, Some(members), Some(symbols), None, None, indexes)
+    {
+        return Err(invalid());
+    }
+    Ok(ObjectBindingContext {
+        type_,
+        permits_extra,
+        nested,
+    })
+}
+
+fn check_object_binding_literal_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    context: &ObjectBindingContext,
+    expression: &PlannedExpression,
+) -> Result<(), SourceCheckError> {
+    let PlannedExpressionKind::Object { plan, properties } = &expression.unparenthesized().kind
+    else {
+        return Ok(());
+    };
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    for (property, initializer) in plan.properties.iter().zip(properties) {
+        if !context.permits_extra
+            && store
+                .resolved_own_property(context.type_, &property.name)?
+                .is_none()
+        {
+            let target = super::formatter::type_to_string_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                context.type_,
+                flags,
+            )?;
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(property.name_node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2353).ok_or(SourceCheckError::MissingDiagnostic(2353))?,
+                        [property.name.clone(), target],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        if let Some((_, child)) = context
+            .nested
+            .iter()
+            .find(|(name, _)| name == &property.name)
+        {
+            check_object_binding_literal_context(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+                child,
+                initializer,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps property diagnostics in the source execution context.
 fn object_binding_property_type(
     store: &mut CanonicalTypeMapperStore,
@@ -56069,6 +56293,29 @@ pub(super) fn check_source_file(
                             VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
                         ));
                     }
+                }
+                if variable.type_node.is_none()
+                    && !variable.elements.is_empty()
+                    && matches!(
+                        variable.initializer.unparenthesized().kind,
+                        PlannedExpressionKind::Object { .. }
+                    )
+                {
+                    let context = implied_object_binding_context(
+                        store,
+                        host,
+                        global_types,
+                        variable.pattern,
+                    )?;
+                    check_object_binding_literal_context(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                        &context,
+                        &variable.initializer,
+                    )?;
                 }
                 if let Some(circular) = variable.circular {
                     let name_record =
