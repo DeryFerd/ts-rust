@@ -16906,7 +16906,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 minimum_type_arguments: local_type_parameter_count,
             });
         }
-        let merged_interface = if declarations.len() != 1 {
+        let merged_interface = if declarations.len() == 1 {
+            false
+        } else {
             let owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
             if !owner.flags().contains(SymbolFlags::INTERFACE)
                 || owner.flags().contains(SymbolFlags::CLASS)
@@ -16920,8 +16922,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 return Err(unsupported());
             }
             true
-        } else {
-            false
         };
         let declaration = declarations[0];
         let declaration_node = preflight_node(self.store, self.host, declaration)?;
@@ -30938,16 +30938,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .type_mapper_has_exact_endpoints(mapper, &sources, &mapped_arguments)
                         == Some(true)
                 })
-            {
-                if !matches!(
+                && (!matches!(
                     validate_stored_callable_set(self.store, candidate),
                     StoredCallableSetValidation::Valid { .. }
-                ) || cached.replace(candidate).is_some()
-                {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
-                    ));
-                }
+                ) || cached.replace(candidate).is_some())
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
+                ));
             }
         }
         if let Some(cached) = cached {

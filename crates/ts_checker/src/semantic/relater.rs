@@ -7077,33 +7077,30 @@ impl<'store> RelaterSession<'store> {
                     exact_callable: false,
                 });
             }
-            let projection = match self.validated_finite_record_mapped_projection(type_id) {
-                Ok(projection) => projection,
-                Err(_) => {
-                    let members = self
-                        .resolved_mapped_relation_members(type_id)?
-                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-                    self.observe_symbol_table(members.members());
-                    for property in members.properties() {
-                        self.property_symbol(*property, ObjectPropertyOrigin::Mapped(type_id))?;
-                    }
-                    let indexes = self
-                        .store
-                        .type_payload(type_id)
-                        .and_then(|record| record.data().structured())
-                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?
-                        .index_infos
-                        .clone()
-                        .unwrap_or_default();
-                    return Ok(ResolvedObjectMembers {
-                        members: Some(members.members()),
-                        properties: members.properties().to_vec(),
-                        index_infos: indexes,
-                        property_origin: ObjectPropertyOrigin::Mapped(type_id),
-                        call_signature: None,
-                        exact_callable: false,
-                    });
+            let Ok(projection) = self.validated_finite_record_mapped_projection(type_id) else {
+                let members = self
+                    .resolved_mapped_relation_members(type_id)?
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                self.observe_symbol_table(members.members());
+                for property in members.properties() {
+                    self.property_symbol(*property, ObjectPropertyOrigin::Mapped(type_id))?;
                 }
+                let indexes = self
+                    .store
+                    .type_payload(type_id)
+                    .and_then(|record| record.data().structured())
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?
+                    .index_infos
+                    .clone()
+                    .unwrap_or_default();
+                return Ok(ResolvedObjectMembers {
+                    members: Some(members.members()),
+                    properties: members.properties().to_vec(),
+                    index_infos: indexes,
+                    property_origin: ObjectPropertyOrigin::Mapped(type_id),
+                    call_signature: None,
+                    exact_callable: false,
+                });
             };
             self.observe_symbol_table(projection.members);
             for property in &projection.properties {
