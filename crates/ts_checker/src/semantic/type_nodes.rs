@@ -1067,17 +1067,42 @@ impl TypeQueryPlan {
                                     .ok_or_else(&invalid)?;
                                 arguments.push(substituted);
                             }
-                            let result = super::instantiate::cached_instantiation_with_vector(
-                                store,
-                                declared,
-                                alias_parameters,
-                                &arguments,
-                                callable.array_targets,
-                                identity.map(|(owner, _, arguments)| (owner, arguments)),
-                            )
-                            .map_err(|_| invalid())?;
-                            if result != Some(value) {
-                                return Err(invalid());
+                            if matches!(
+                                store.type_payload(declared).map(TypeRecord::data),
+                                Some(TypeData::Mapped(_))
+                            ) {
+                                validate_supported_mapped_alias_instantiation(
+                                    store,
+                                    reference.symbol,
+                                    declared,
+                                    alias_parameters,
+                                    &arguments,
+                                    value,
+                                    self.mapped_utility_aliases.get(&reference.symbol).copied(),
+                                )
+                                .map_err(|_| invalid())?;
+                                let (owner, arguments) = identity.map_or(
+                                    (reference.symbol, arguments.as_slice()),
+                                    |(owner, _, arguments)| (owner, arguments),
+                                );
+                                if !valid_record_mapped_alias_identity(
+                                    store, owner, arguments, value,
+                                ) {
+                                    return Err(invalid());
+                                }
+                            } else {
+                                let result = super::instantiate::cached_instantiation_with_vector(
+                                    store,
+                                    declared,
+                                    alias_parameters,
+                                    &arguments,
+                                    callable.array_targets,
+                                    identity.map(|(owner, _, arguments)| (owner, arguments)),
+                                )
+                                .map_err(|_| invalid())?;
+                                if result != Some(value) {
+                                    return Err(invalid());
+                                }
                             }
                         }
                         Some(value)
@@ -77150,6 +77175,491 @@ mod tests {
                 .unwrap()
                 .is_exact(query.store)
         );
+    }
+
+    const SYMBOLIC_MAPPED_RETURN_LIBRARY: &str = concat!(
+        "interface Array<T> {} interface ReadonlyArray<T> {} ",
+        "type Pick<T, K extends keyof T> = { [P in K]: T[P] }; ",
+        "type Partial<T> = { [P in keyof T]?: T[P] };",
+    );
+
+    const SYMBOLIC_MAPPED_RETURN_SOURCES: [(&str, &str); 2] = [
+        (
+            "Pick",
+            concat!(
+                "// @target: es2015\n",
+                "declare function pick<O, T extends keyof O>(keys: T[], obj?: O): Pick<O, T>;\n",
+                "const _    = pick(['b'], { a: 'a', b: 'b' }); // T: \"b\"\n",
+                "const {  } = pick(['b'], { a: 'a', b: 'b' }); // T: \"b\" | \"a\" ??? (before fix)\n",
+            ),
+        ),
+        (
+            "Partial",
+            "declare function partial<Model>(value: Model): Partial<Model>;\n",
+        ),
+    ];
+
+    fn symbolic_mapped_return_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+    ) -> (CanonicalCheckerContext<'arena>, FileId, FileId) {
+        let library_file = FileId::new(201_410);
+        let source_file = FileId::new(201_411);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path, library) in [
+            (library, library_file, "\"/mapped-return-lib.d.ts\"", true),
+            (source, source_file, "\"/mapped-return-source.ts\"", false),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        library,
+                        library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        (context, library_file, source_file)
+    }
+
+    #[test]
+    fn source_callable_mapped_returns_replay_symbolic_pick_and_partial() {
+        let library = parse_source_file(SYMBOLIC_MAPPED_RETURN_LIBRARY);
+        for (utility_name, text) in SYMBOLIC_MAPPED_RETURN_SOURCES {
+            let source = parse_source_file(text);
+            let (mut context, library_file, file) =
+                symbolic_mapped_return_context(&library, &source);
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let source_file = context.source_file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = source_bound.symbol(declaration).unwrap();
+            let utility = context
+                .store()
+                .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source(utility_name)
+                .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let (type_, signature, returned, mapped) = {
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                query
+                    .preflight_type_of_source_callable(declaration, owner)
+                    .unwrap();
+                let type_ = query
+                    .get_type_of_source_callable(declaration, owner)
+                    .unwrap();
+                let signature = query
+                    .store
+                    .source_callable_provenance(type_)
+                    .unwrap()
+                    .signature;
+                let evidence = query.store.source_callable_type_query(signature).unwrap();
+                let annotation = evidence.callable.return_type.type_node().unwrap();
+                assert!(evidence.is_exact(query.store));
+                assert_eq!(evidence.annotation_type(annotation), None);
+                assert_eq!(
+                    evidence.callable.array_targets,
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                );
+                assert_eq!(
+                    query
+                        .store
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    None
+                );
+                assert!(query.store.type_node_links(annotation).is_none());
+                let parameters = query
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .type_parameters()
+                    .to_vec();
+
+                let returned = query.get_return_type_of_signature(signature).unwrap();
+                let evidence = query.store.source_callable_type_query(signature).unwrap();
+                assert!(evidence.is_exact(query.store));
+                assert_eq!(evidence.annotation_type(annotation), Some(returned));
+                let record = query.store.type_payload(returned).unwrap();
+                let TypeData::Mapped(mapped) = record.data() else {
+                    panic!("the queried return must keep its symbolic mapped type");
+                };
+                let identity = query.store.type_alias(record.alias().unwrap()).unwrap();
+                assert_eq!(identity.symbol(), Some(utility));
+                assert_eq!(identity.type_arguments(), Some(parameters.as_slice()));
+                let target = query
+                    .store
+                    .type_alias_links(utility)
+                    .unwrap()
+                    .declared_type
+                    .unwrap();
+                assert_eq!(mapped.object.target, Some(target));
+                assert!(mapped.object.mapper.is_some());
+                assert_eq!(mapped.modifiers_type, Some(parameters[0]));
+                assert_eq!(mapped.object.structured, StructuredTypeData::default());
+                assert!(
+                    !record
+                        .object_flags()
+                        .contains(ObjectFlags::MEMBERS_RESOLVED)
+                );
+                let TypeData::Mapped(template) = query.store.type_payload(target).unwrap().data()
+                else {
+                    panic!("the mapped return must keep its original alias target");
+                };
+                assert_eq!(mapped.declaration, template.declaration);
+                assert_eq!(template.object.structured, StructuredTypeData::default());
+                assert_ne!(mapped.type_parameter, template.type_parameter);
+                let TypeData::IndexedAccess(indexed) = query
+                    .store
+                    .type_payload(mapped.template_type.unwrap())
+                    .unwrap()
+                    .data()
+                else {
+                    panic!("the mapped return must retain a deferred indexed template");
+                };
+                assert_eq!(indexed.access_flags, AccessFlags::NONE);
+                let utility_plan = evidence.plan.mapped_utility_aliases[&utility];
+                match utility_plan.kind {
+                    MappedUtilityKind::Pick => {
+                        assert_eq!(parameters.len(), 2);
+                        assert_eq!(indexed.object_type, parameters[0]);
+                        assert_eq!(Some(indexed.index_type), mapped.type_parameter);
+                        assert_eq!(mapped.constraint_type, Some(parameters[1]));
+                        let keys = evidence
+                            .annotation_type(
+                                evidence.callable.parameters[0]
+                                    .explicit_type_node()
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            query
+                                .store
+                                .canonical_array_reference_with_targets(
+                                    CanonicalArrayTargets::from_global_types(&globals),
+                                    keys,
+                                )
+                                .unwrap()
+                                .unwrap()
+                                .element_type,
+                            parameters[1]
+                        );
+                    }
+                    MappedUtilityKind::Homomorphic => {
+                        assert_eq!(parameters.len(), 1);
+                        assert_eq!(mapped.template_type, template.template_type);
+                        assert_eq!(Some(indexed.index_type), template.type_parameter);
+                        assert_eq!(
+                            indexed.object_type,
+                            query
+                                .store
+                                .type_alias_links(utility)
+                                .unwrap()
+                                .type_parameters
+                                .as_deref()
+                                .unwrap()[0],
+                        );
+                        let TypeData::Index(index) = query
+                            .store
+                            .type_payload(mapped.constraint_type.unwrap())
+                            .unwrap()
+                            .data()
+                        else {
+                            panic!("Partial must keep the source parameter's keyof type");
+                        };
+                        assert_eq!(index.target, parameters[0]);
+                        assert_eq!(
+                            index.index_flags,
+                            super::super::signatures::IndexFlags::NONE
+                        );
+                    }
+                }
+                assert_eq!(
+                    validate_supported_mapped_alias_instantiation(
+                        query.store,
+                        utility,
+                        target,
+                        query
+                            .store
+                            .type_alias_links(utility)
+                            .unwrap()
+                            .type_parameters
+                            .as_deref()
+                            .unwrap(),
+                        &parameters,
+                        returned,
+                        Some(utility_plan),
+                    ),
+                    Ok(())
+                );
+                (type_, signature, returned, mapped.clone())
+            };
+            let before = (
+                function_store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().relation_state_snapshot(),
+            );
+            let mut warm_session = InstantiationSession::new(InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            });
+            {
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut warm_session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        query.get_type_of_source_callable(declaration, owner),
+                        Ok(type_)
+                    );
+                    assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                    assert!(matches!(query.store.type_payload(returned).unwrap().data(),
+                        TypeData::Mapped(actual) if actual == &mapped));
+                    assert_eq!(
+                        (
+                            function_store_state(query.store),
+                            query.store.symbol_len(),
+                            query.store.relation_state_snapshot(),
+                        ),
+                        before
+                    );
+                }
+            }
+            assert_eq!(
+                (warm_session.query_count(), warm_session.total_count()),
+                (0, 0)
+            );
+            // Querying the original signature does not check either original call.
+            for (node, record) in source.arena.iter() {
+                if record.kind == SyntaxKind::CallExpression {
+                    let node = NodeRef::new(source.arena.id(), file, node);
+                    assert!(context.store().type_node_links(node).is_none());
+                    assert!(context.store().signature_links(node).is_none());
+                }
+            }
+            assert!(
+                context
+                    .store()
+                    .source_file_links(source_file)
+                    .is_none_or(|links| !links.type_checked)
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_callable_mapped_return_replay_rejects_and_restores_cache_damage() {
+        let library = parse_source_file(SYMBOLIC_MAPPED_RETURN_LIBRARY);
+        for (_, text) in SYMBOLIC_MAPPED_RETURN_SOURCES {
+            let source = parse_source_file(text);
+            let (mut context, library_file, file) =
+                symbolic_mapped_return_context(&library, &source);
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = source_bound.symbol(declaration).unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let type_ = query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = query
+                .store
+                .source_callable_provenance(type_)
+                .unwrap()
+                .signature;
+            let returned = query.get_return_type_of_signature(signature).unwrap();
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            let annotation = evidence.callable.return_type.type_node().unwrap();
+            assert!(evidence.is_exact(query.store));
+            let identity = query.store.type_payload(returned).unwrap().alias().unwrap();
+            let arguments = query
+                .store
+                .type_alias(identity)
+                .unwrap()
+                .type_arguments()
+                .unwrap()
+                .to_vec();
+            let TypeData::Mapped(mapped) = query.store.type_payload(returned).unwrap().data()
+            else {
+                panic!("the source query must produce a mapped return");
+            };
+            let original = mapped.clone();
+            let counts = query
+                .instantiation_session
+                .as_deref()
+                .map(|session| (session.query_count(), session.total_count()));
+            for damage in 0..3 {
+                match damage {
+                    0 => assert!(query.store.set_object_target_and_mapper(
+                        returned,
+                        original.object.target,
+                        None,
+                    )),
+                    1 => assert!(query.store.set_type_alias(returned, None)),
+                    2 => {
+                        let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+                        assert!(query.store.set_type_alias_arguments(
+                            identity,
+                            Some(vec![number; arguments.len()]),
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+                let snapshot = |store: &CanonicalTypeMapperStore| {
+                    let record = store.type_payload(returned).unwrap();
+                    let TypeData::Mapped(mapped) = record.data() else {
+                        panic!("cache damage must not change the mapped type family");
+                    };
+                    (
+                        function_store_state(store),
+                        store.symbol_len(),
+                        store.relation_state_snapshot(),
+                        mapped.clone(),
+                        record.alias(),
+                        store
+                            .type_alias(identity)
+                            .unwrap()
+                            .type_arguments()
+                            .map(<[TypeId]>::to_vec),
+                        store.type_node_links(annotation).cloned(),
+                        store.signature(signature).unwrap().resolved_return_type(),
+                    )
+                };
+                let before = snapshot(query.store);
+                for _ in 0..2 {
+                    let evidence = query.store.source_callable_type_query(signature).unwrap();
+                    assert!(!evidence.is_exact(query.store));
+                    assert_eq!(
+                        evidence.plan.cached_source_callable_type(
+                            query.store,
+                            evidence.callable(),
+                            evidence.type_parameters(),
+                            annotation,
+                        ),
+                        Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeReference(annotation)
+                        ))
+                    );
+                    assert_eq!(snapshot(query.store), before);
+                }
+                assert!(query.store.set_object_target_and_mapper(
+                    returned,
+                    original.object.target,
+                    original.object.mapper,
+                ));
+                assert!(query.store.set_type_alias(returned, Some(identity)));
+                assert!(
+                    query
+                        .store
+                        .set_type_alias_arguments(identity, Some(arguments.clone()))
+                );
+                assert!(
+                    query
+                        .store
+                        .source_callable_type_query(signature)
+                        .unwrap()
+                        .is_exact(query.store)
+                );
+                let restored = snapshot(query.store);
+                assert_eq!(
+                    query.get_type_of_source_callable(declaration, owner),
+                    Ok(type_)
+                );
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(snapshot(query.store), restored);
+                assert_eq!(
+                    query
+                        .instantiation_session
+                        .as_deref()
+                        .map(|session| (session.query_count(), session.total_count())),
+                    counts
+                );
+            }
+            assert!(query.diagnostics.is_empty());
+        }
     }
 
     #[test]
