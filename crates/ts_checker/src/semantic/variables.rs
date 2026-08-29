@@ -2196,7 +2196,7 @@ fn validate_target_parent(
     target: SemanticSymbolId,
     exported: bool,
 ) -> Result<(), VariablePlanError> {
-    let expected = if exported {
+    let (expected, source_owner) = if exported {
         let source = bound.source_file();
         let raw = bound
             .symbol(source)
@@ -2204,7 +2204,7 @@ fn validate_target_parent(
         let merged = store
             .get_merged_symbol(raw)
             .ok_or(VariableInvariant::InvalidMergedSymbol(raw))?;
-        if merged != raw {
+        if merged != raw && !merged_source_module_parent_is_exact(bound, store, merged, target) {
             return Err(VariablePlanError::Unsupported(
                 VariableUnsupported::MergedSymbol {
                     node: source,
@@ -2213,23 +2213,58 @@ fn validate_target_parent(
                 },
             ));
         }
-        Some(merged)
+        (Some(merged), Some(raw))
     } else {
-        None
+        (None, None)
     };
-    let actual = store
+    let parent = store
         .symbol(target)
         .ok_or(VariableInvariant::InvalidSymbol(target))?
         .parent();
-    if actual != expected {
+    let actual = parent
+        .map(|parent| {
+            store
+                .get_merged_symbol(parent)
+                .ok_or(VariableInvariant::InvalidMergedSymbol(parent))
+        })
+        .transpose()?;
+    if actual != expected || parent != expected && parent != source_owner {
         return Err(VariableInvariant::InvalidTargetParent {
             symbol: target,
             expected,
-            actual,
+            actual: parent,
         }
         .into());
     }
     Ok(())
+}
+
+fn merged_source_module_parent_is_exact(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    module: SemanticSymbolId,
+    variable: SemanticSymbolId,
+) -> bool {
+    let source = bound.source_file();
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(record) = store.symbol(module) else {
+        return false;
+    };
+    let Some(variable_record) = store.symbol(variable) else {
+        return false;
+    };
+    facts.is_external_module()
+        && !facts.is_javascript_file()
+        && !facts.is_common_js_module()
+        && super::source_imports::source_file_namespace_symbol_is_exact(store, module, source)
+        && record.name() == facts.source_file_symbol_name()
+        && record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(variable_record.name()))
+            == Some(variable)
 }
 
 fn validate_value_links(

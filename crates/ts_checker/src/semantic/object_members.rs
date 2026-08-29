@@ -7953,21 +7953,18 @@ pub(super) fn declared_type_declaration_parent(
     if facts.is_javascript_file() || !facts.is_external_module() || facts.is_common_js_module() {
         return Err(());
     }
-    let source_symbol = bound.symbol(source).ok_or_else(invalid)?;
+    let source_symbol = bound
+        .symbol(source)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
     let source_symbol_record = store.symbol(source_symbol).ok_or_else(invalid)?;
     let exported_symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
     let local = bound.local_symbol(declaration).ok_or_else(invalid)?;
     let local_record = store.symbol(local).ok_or_else(invalid)?;
-    if store.get_merged_symbol(source_symbol) != Some(source_symbol)
-        || source_symbol_record.flags() != SymbolFlags::VALUE_MODULE
-        || source_symbol_record.check_flags() != CheckFlags::NONE
-        || source_symbol_record.name() != facts.source_file_symbol_name()
-        || source_symbol_record.declarations() != Some(&[source])
-        || source_symbol_record.value_declaration() != Some(source)
-        || source_symbol_record.members().is_some()
+    if super::source_imports::source_file_namespace_declaration(store, host, source_symbol)
+        .map_err(|_| ())?
+        != source
         || source_symbol_record.exports().is_none()
-        || source_symbol_record.parent().is_some()
-        || source_symbol_record.export_symbol().is_some()
         || exported_symbol_record.name().as_utf8() != Some(identifier.text.as_str())
         || local == symbol
         || store.get_merged_symbol(local) != Some(local)

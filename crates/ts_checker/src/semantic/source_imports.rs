@@ -207,6 +207,8 @@ pub(super) struct ResolvedSourceImportBinding {
 struct SourceFileNamespacePlan {
     module: SemanticSymbolId,
     declaration: NodeRef,
+    // Keep the complete declaration proof after the source host has checked each augmentation.
+    declarations: Vec<NodeRef>,
     exports: Option<super::SymbolTableId>,
     entries: Vec<(EscapedName, SemanticSymbolId)>,
     wrapper: Option<super::alias_provider::SourceFileNamespaceWrapper>,
@@ -259,6 +261,39 @@ fn plan_source_file_namespace(
         plan.wrapper = Some(wrapper.clone());
         return Ok(plan);
     }
+    let declaration = source_file_namespace_declaration(store, host, module)?;
+    let record = store.symbol(module).ok_or_else(invalid)?;
+    let declarations = record.declarations().ok_or_else(invalid)?;
+    let entries = match record.exports() {
+        Some(table) => store
+            .symbol_table(table)
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|(name, symbol)| (name.to_owned(), symbol))
+            .collect(),
+        None => Vec::new(),
+    };
+    let plan = SourceFileNamespacePlan {
+        module,
+        declaration,
+        declarations: declarations.to_vec(),
+        exports: record.exports(),
+        entries,
+        wrapper: None,
+    };
+    if !retained_namespace_plan_is_exact(store, &plan) {
+        return Err(invalid());
+    }
+    Ok(plan)
+}
+
+/// Checks a source module and each augmentation before its exports are queried.
+pub(super) fn source_file_namespace_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    module: SemanticSymbolId,
+) -> Result<NodeRef, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(module));
     let record = store.symbol(module).ok_or_else(invalid)?;
     let Some(declarations) = record.declarations() else {
         return Err(invalid());
@@ -279,19 +314,8 @@ fn plan_source_file_namespace(
         || !facts.is_external_module()
         || facts.is_javascript_file()
         || facts.is_common_js_module()
-        || !super::source_namespaces::has_pure_module_flags(record.flags())
-        || !record.flags().contains(SymbolFlags::VALUE_MODULE)
-        || record.check_flags() != CheckFlags::NONE
         || record.name() != facts.source_file_symbol_name()
-        || record.value_declaration() != Some(declaration)
-        || record.parent().is_some()
-        || record.members().is_some()
-        || record.export_symbol().is_some()
-        || store.get_merged_symbol(module) != Some(module)
-        || !(record.flags() == SymbolFlags::VALUE_MODULE
-            && store.source_symbol_declarations_match(module)
-            || record.flags().contains(SymbolFlags::TRANSIENT)
-                && store.source_merged_symbol_declarations_match(module))
+        || !source_file_namespace_symbol_is_exact(store, module, declaration)
     {
         return Err(invalid());
     }
@@ -320,22 +344,7 @@ fn plan_source_file_namespace(
             return Err(invalid());
         }
     }
-    let entries = match record.exports() {
-        Some(table) => store
-            .symbol_table(table)
-            .ok_or_else(invalid)?
-            .iter()
-            .map(|(name, symbol)| (name.to_owned(), symbol))
-            .collect(),
-        None => Vec::new(),
-    };
-    Ok(SourceFileNamespacePlan {
-        module,
-        declaration,
-        exports: record.exports(),
-        entries,
-        wrapper: None,
-    })
+    Ok(declaration)
 }
 
 fn source_file_namespace_identity<'store>(
@@ -685,6 +694,7 @@ struct PreparedSourceImportModuleProperty {
 struct PreparedSourceImportNamespaceConst {
     declaration: NodeRef,
     initializer: NodeRef,
+    source_owner: SemanticSymbolId,
     binding: SourceImportBindingPlan,
     namespace: SourceFileNamespacePlan,
     namespace_name: EscapedName,
@@ -695,6 +705,7 @@ struct PreparedSourceImportNamespaceConst {
 struct PreparedSourceImportRecursiveConst {
     declaration: NodeRef,
     initializer: NodeRef,
+    source_owner: SemanticSymbolId,
     binding: SourceImportBindingPlan,
 }
 
@@ -5720,19 +5731,39 @@ fn plan_direct_imported_module_namespace_members(
     if store.export_type_links(module).is_some() {
         return plan_synthetic_import_namespace(store, host, global_types, alias, module);
     }
-    let Some([declaration]) = record.declarations() else {
+    let Some(declarations) = record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
         return Err(unsupported(SourceImportUnsupported::TargetSymbol {
             alias,
             target: module,
             flags: record.flags(),
         }));
     };
-    let declaration = *declaration;
+    let declaration = declarations[0];
     let (arena, bound) = host
         .source(declaration)
         .ok_or_else(|| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
     let declaration_record = checked_node(arena, bound, store, declaration)?;
-    if bound.symbol(declaration) != Some(module) {
+    if declarations.len() != 1 {
+        if declaration_record.kind != SyntaxKind::SourceFile
+            || !record.flags().contains(SymbolFlags::TRANSIENT)
+            || !super::source_namespaces::has_pure_module_flags(record.flags())
+        {
+            return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+                alias,
+                target: module,
+                flags: record.flags(),
+            }));
+        }
+        plan_source_file_namespace(store, host, module)?;
+    }
+    if bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        != Some(module)
+    {
         return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
             module,
         )));
@@ -6537,17 +6568,17 @@ fn materialize_imported_module_namespace(
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
     let shared_owner = owner.filter(|owner| {
-        store
-            .symbol(*owner)
-            .is_some_and(|symbol| symbol.flags() == SymbolFlags::VALUE_MODULE)
-            && host
-                .bound_file(declaration)
-                .and_then(BoundFile::source_facts)
-                .is_some_and(|facts| {
-                    facts.is_external_module()
-                        && !facts.is_javascript_file()
-                        && !facts.is_common_js_module()
-                })
+        store.symbol(*owner).is_some_and(|symbol| {
+            super::source_namespaces::has_pure_module_flags(symbol.flags())
+                && symbol.flags().contains(SymbolFlags::VALUE_MODULE)
+        }) && host
+            .bound_file(declaration)
+            .and_then(BoundFile::source_facts)
+            .is_some_and(|facts| {
+                facts.is_external_module()
+                    && !facts.is_javascript_file()
+                    && !facts.is_common_js_module()
+            })
     });
     // Keep member-link checks in the existing import and expression planning order.
     let retained_identity = shared_owner
@@ -8730,6 +8761,7 @@ fn plan_published_namespace_const_target(
         .value_symbol_links(target)
         .and_then(|links| links.resolved_type)
     else {
+        let source_owner = bound.symbol(bound.source_file()).ok_or_else(invalid)?;
         if namespace_module != Some(module) {
             let Some(owner) = namespace_module else {
                 return Err(unsupported_target());
@@ -8749,6 +8781,7 @@ fn plan_published_namespace_const_target(
             let namespace = PreparedSourceImportNamespaceConst {
                 declaration,
                 initializer,
+                source_owner,
                 binding: producer,
                 namespace: plan_source_file_namespace(store, host, module)?,
                 namespace_name: store.symbol(module).ok_or_else(invalid)?.name().to_owned(),
@@ -8776,6 +8809,7 @@ fn plan_published_namespace_const_target(
         let recursive = PreparedSourceImportRecursiveConst {
             declaration,
             initializer,
+            source_owner,
             binding: producer_binding,
         };
         if !recursive_namespace_const_is_exact(
@@ -8866,6 +8900,7 @@ fn retained_namespace_plan_is_exact(
     if let Some(wrapper) = &plan.wrapper {
         return plan.module == wrapper.namespace
             && plan.declaration == wrapper.source.declaration
+            && plan.declarations == [wrapper.source.declaration]
             && plan.exports == wrapper.exports
             && plan.entries == wrapper.source.entries
             && store.source_file_namespace_wrapper_for_module(plan.module) == Some(wrapper)
@@ -8886,18 +8921,70 @@ fn retained_namespace_plan_is_exact(
         }
         None => Vec::new(),
     };
-    module.flags() == SymbolFlags::VALUE_MODULE
+    source_file_namespace_symbol_is_exact(store, plan.module, plan.declaration)
+        && module.declarations() == Some(plan.declarations.as_slice())
+        && module.exports() == plan.exports
+        && entries == plan.entries
+}
+
+/// Checks immutable source ownership after a module's canonical symbol merge.
+pub(super) fn source_file_namespace_symbol_is_exact(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(module) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = module.declarations() else {
+        return false;
+    };
+    super::source_namespaces::has_pure_module_flags(module.flags())
+        && module.flags().contains(SymbolFlags::VALUE_MODULE)
         && module.check_flags() == CheckFlags::NONE
-        && module.declarations() == Some(&[plan.declaration])
-        && module.value_declaration() == Some(plan.declaration)
+        && declarations.first() == Some(&declaration)
+        && module.value_declaration() == Some(declaration)
         && module.parent().is_none()
         && module.members().is_none()
         && module.export_symbol().is_none()
-        && module.exports() == plan.exports
-        && entries == plan.entries
-        && store.source_node_kind(plan.declaration) == Some(SyntaxKind::SourceFile)
-        && store.source_symbol_declarations_match(plan.module)
-        && store.get_merged_symbol(plan.module) == Some(plan.module)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)
+        && store.source_node_parent(declaration) == Some(SourceNodeParent::Root)
+        && (module.flags() == SymbolFlags::VALUE_MODULE
+            && store.source_symbol_declarations_match(symbol)
+            || module.flags().contains(SymbolFlags::TRANSIENT)
+                && store.source_merged_symbol_declarations_match(symbol))
+        && declarations.iter().skip(1).all(|declaration| {
+            store.source_node_kind(*declaration) == Some(SyntaxKind::ModuleDeclaration)
+                && store.source_declaration_belongs_to_symbol(*declaration, symbol)
+                && store
+                    .source_child_with_kind(*declaration, SyntaxKind::StringLiteral)
+                    .is_some()
+        })
+        && store.get_merged_symbol(symbol) == Some(symbol)
+}
+
+fn namespace_const_source_parent_is_exact(
+    store: &CanonicalTypeMapperStore,
+    target: SemanticSymbolId,
+    source: NodeRef,
+    source_owner: SemanticSymbolId,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(original) = store.symbol(source_owner) else {
+        return false;
+    };
+    let Some(target) = store.symbol(target) else {
+        return false;
+    };
+    original.flags() == SymbolFlags::VALUE_MODULE
+        && original.check_flags() == CheckFlags::NONE
+        && original.declarations() == Some(&[source])
+        && original.value_declaration() == Some(source)
+        && original.parent().is_none()
+        && original.members().is_none()
+        && original.export_symbol().is_none()
+        && store.get_merged_symbol(source_owner) == Some(owner)
+        && (target.parent() == Some(source_owner) || target.parent() == Some(owner))
 }
 
 fn cold_namespace_const_is_exact(
@@ -8975,7 +9062,13 @@ fn cold_namespace_const_is_exact(
         && target_record.check_flags() == CheckFlags::NONE
         && target_record.declarations() == Some(&[namespace.declaration])
         && target_record.value_declaration() == Some(namespace.declaration)
-        && target_record.parent() == Some(owner)
+        && namespace_const_source_parent_is_exact(
+            store,
+            target,
+            source,
+            namespace.source_owner,
+            owner,
+        )
         && store.get_merged_symbol(target) == Some(target)
         && store.source_node_kind(namespace.declaration) == Some(SyntaxKind::VariableDeclaration)
         && store.source_node_kind(namespace.initializer) == Some(SyntaxKind::Identifier)
@@ -9011,10 +9104,7 @@ fn cold_namespace_const_is_exact(
                 && staged.target == module
                 && preflight_staged_namespace_alias(store, staged).is_ok()
         }))
-        && owner_record.flags() == SymbolFlags::VALUE_MODULE
-        && owner_record.check_flags() == CheckFlags::NONE
-        && owner_record.declarations() == Some(&[source])
-        && owner_record.value_declaration() == Some(source)
+        && source_file_namespace_symbol_is_exact(store, owner, source)
         && owner_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
@@ -9128,7 +9218,13 @@ fn recursive_namespace_const_is_exact(
         && target_record.check_flags() == CheckFlags::NONE
         && target_record.declarations() == Some(&[declaration])
         && target_record.value_declaration() == Some(declaration)
-        && target_record.parent() == Some(module)
+        && namespace_const_source_parent_is_exact(
+            store,
+            target,
+            source,
+            recursive.source_owner,
+            module,
+        )
         && store.get_merged_symbol(target) == Some(target)
         && store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
         && store.source_node_kind(initializer) == Some(SyntaxKind::Identifier)
@@ -9172,10 +9268,7 @@ fn recursive_namespace_const_is_exact(
                     && staged.target == module
                     && preflight_staged_namespace_alias(store, staged).is_ok()
             }))
-        && module_record.flags() == SymbolFlags::VALUE_MODULE
-        && module_record.check_flags() == CheckFlags::NONE
-        && module_record.declarations() == Some(&[source])
-        && module_record.value_declaration() == Some(source)
+        && source_file_namespace_symbol_is_exact(store, module, source)
         && module_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
@@ -9217,7 +9310,10 @@ fn published_namespace_const_is_exact(
     let Some(module_record) = store.symbol(module) else {
         return false;
     };
-    let Some([module_declaration]) = module_record.declarations() else {
+    let Some(module_declaration) = module_record
+        .declarations()
+        .and_then(|declarations| declarations.first())
+    else {
         return false;
     };
     let module_declaration = *module_declaration;
@@ -9264,9 +9360,17 @@ fn published_namespace_const_is_exact(
                     && links.type_only_declaration.is_none()
             })
         && store.value_symbol_links(namespace_alias) == Some(&expected_links)
-        && module_record.flags() == SymbolFlags::VALUE_MODULE
+        && super::source_namespaces::has_pure_module_flags(module_record.flags())
+        && module_record.flags().contains(SymbolFlags::VALUE_MODULE)
         && module_record.check_flags() == CheckFlags::NONE
         && store.source_node_kind(module_declaration) == Some(SyntaxKind::SourceFile)
+        && store
+            .source_file_namespace_identity(module)
+            .is_none_or(|identity| {
+                identity.plan.declaration == module_declaration
+                    && identity.type_ == type_
+                    && retained_namespace_plan_is_exact(store, &identity.plan)
+            })
         && store.get_merged_symbol(module) == Some(module)
         && store.value_symbol_links(module) == Some(&expected_links)
         && valid_prepared_imported_namespace(
@@ -10117,7 +10221,14 @@ fn valid_prepared_imported_namespace(
     };
     target.flags().intersects(SymbolFlags::MODULE)
         && target.flags().intersects(SymbolFlags::VALUE)
-        && (synthetic.is_some() || target.declarations() == Some(&[declaration]))
+        && (synthetic.is_some()
+            || if let Some(identity) = store.source_file_namespace_identity(module) {
+                identity.plan.declaration == declaration
+                    && identity.type_ == type_
+                    && retained_namespace_plan_is_exact(store, &identity.plan)
+            } else {
+                target.declarations() == Some(&[declaration])
+            })
         && exports.is_some()
         && record.symbol() == owner
         && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
@@ -13626,6 +13737,673 @@ mod tests {
             warm,
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    const MERGED_DEPENDENCY_NAMESPACE_SOURCES: [&str; 4] = [
+        include_str!("../../tests/fixtures/namespace_merged_dependency/consumer.ts"),
+        include_str!("../../tests/fixtures/namespace_merged_dependency/provider.ts"),
+        include_str!("../../tests/fixtures/namespace_merged_dependency/dependency.ts"),
+        include_str!("../../tests/fixtures/namespace_merged_dependency/augmentation.ts"),
+    ];
+
+    fn merged_dependency_namespace_context<'arena>(
+        files: &[(FileId, &'arena ParseResult); 4],
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        let mut entries = Vec::new();
+        for &(file, parsed) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    facts(file, CanonicalModuleState::External),
+                )
+                .unwrap();
+            for (_, node) in parsed.arena.iter() {
+                let specifier = match &node.data {
+                    NodeData::ImportDeclaration(import) => import.module_specifier,
+                    NodeData::ModuleDeclaration(module) => module.name,
+                    _ => continue,
+                };
+                let NodeData::StringLiteral(name) = &parsed.arena.get(specifier).unwrap().data
+                else {
+                    panic!("the fixture uses string module names");
+                };
+                let target = match name.text.as_str() {
+                    "./provider" => files[1].0,
+                    "./dependency" => files[2].0,
+                    name => panic!("unexpected module {name}"),
+                };
+                entries.push(CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(parsed.arena.id(), file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ));
+            }
+        }
+        for &(file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new(entries),
+        )
+        .unwrap();
+        let (arena, augmentation) = context.file(files[3].0).unwrap();
+        let name = augmentation.module_augmentations()[0].name();
+        let CanonicalModuleResolutionLookup::Resolved(resolved) = context.module_resolution(name)
+        else {
+            panic!("the augmentation has its exact module target");
+        };
+        let module = resolved.target_symbol();
+        let declaration = NodeRef::new(
+            arena.id(),
+            files[3].0,
+            arena.get(name.node).unwrap().parent.unwrap(),
+        );
+        let augmentation = augmentation.symbol(declaration).unwrap();
+        let merged = context
+            .store_mut_for_test()
+            .merge_symbol(module, augmentation, false)
+            .unwrap();
+        assert_ne!(merged, module);
+        assert!(
+            context
+                .store()
+                .source_merged_symbol_declarations_match(merged)
+        );
+        context
+    }
+
+    #[test]
+    fn merged_dependency_namespace_imports_complete_real_members_importer_first() {
+        let sources = MERGED_DEPENDENCY_NAMESPACE_SOURCES.map(parsed);
+        let files = std::array::from_fn::<_, 4, _>(|index| {
+            (
+                FileId::new(19_400 + u32::try_from(index).unwrap()),
+                &sources[index],
+            )
+        });
+        let mut context = merged_dependency_namespace_context(&files);
+        context.check_source_file(files[0].0).unwrap();
+        let (_, dependency) = context.file(files[2].0).unwrap();
+        let original = dependency.symbol(dependency.source_file()).unwrap();
+        let module = context.store().get_merged_symbol(original).unwrap();
+        let identity = context
+            .store()
+            .source_file_namespace_identity(module)
+            .unwrap();
+        let type_ = identity.type_;
+        assert!(identity.properties.is_none());
+        assert_eq!(identity.plan.entries.len(), 2);
+        assert_eq!(identity.plan.declarations.len(), 2);
+        assert!(identity.plan.declarations.iter().all(|declaration| {
+            context
+                .store()
+                .source_declaration_belongs_to_symbol(*declaration, module)
+        }));
+        assert!(
+            context
+                .store()
+                .source_file_namespace_identity(original)
+                .is_none()
+        );
+        assert!(context.store().value_symbol_links(module).is_none());
+        let cold_plan = identity.plan.clone();
+        assert_eq!(
+            context.store().type_payload(type_).unwrap().symbol(),
+            Some(module)
+        );
+        assert_eq!(
+            context.store().type_payload(type_).unwrap().object_flags(),
+            ObjectFlags::ANONYMOUS
+        );
+
+        context.check_source_file(files[1].0).unwrap();
+        context.check_source_file(files[2].0).unwrap();
+        context.check_source_file(files[3].0).unwrap();
+        assert_eq!(
+            context_exported_type(&context, files[1].0, "forwarded"),
+            type_
+        );
+        let identity = context
+            .store()
+            .source_file_namespace_identity(module)
+            .unwrap();
+        assert_eq!(identity.plan, cold_plan);
+        assert_eq!(identity.type_, type_);
+        let [value] = identity.properties.as_deref().unwrap() else {
+            panic!("the merged module retains its real value export");
+        };
+        assert_eq!(value.name.as_utf8(), Some("value"));
+        assert_eq!(
+            value.type_,
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        assert!(context.diagnostics().is_empty());
+        let completed = identity.clone();
+        let warm = (
+            store_state(context.store()),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+        for &(file, _) in &files {
+            context.recheck_source_file(file).unwrap();
+        }
+        assert_eq!(
+            (
+                store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            warm
+        );
+        assert_eq!(
+            context.store().source_file_namespace_identity(module),
+            Some(&completed),
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn merged_dependency_namespace_publication_rejects_changed_declarations() {
+        for forgery in 0..5 {
+            let mut fixture = fixture(
+                &MERGED_DEPENDENCY_NAMESPACE_SOURCES,
+                &[
+                    Route {
+                        source: 0,
+                        specifier: 0,
+                        target: Some(1),
+                    },
+                    Route {
+                        source: 1,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                    Route {
+                        source: 3,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                ],
+            );
+            let dependency = fixture.bound.get(&fixture.files[2].file).unwrap();
+            let original = dependency.symbol(dependency.source_file()).unwrap();
+            let augmentation = fixture.bound.get(&fixture.files[3].file).unwrap();
+            let name = augmentation.module_augmentations()[0].name();
+            let declaration = NodeRef::new(
+                name.arena,
+                name.file,
+                fixture.files[3]
+                    .parsed
+                    .arena
+                    .get(name.node)
+                    .unwrap()
+                    .parent
+                    .unwrap(),
+            );
+            let augmentation = augmentation.symbol(declaration).unwrap();
+            let module = fixture
+                .store
+                .merge_symbol(original, augmentation, false)
+                .unwrap();
+            let import = fixture.plan_import(0, 0);
+            let binding = &import.bindings[0];
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                binding,
+                identifier_initializer(&fixture, 0, "provider"),
+                "provider",
+                binding.alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+            resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
+            let mut prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+            preflight_prepared_source_import_publications(
+                &fixture.store,
+                std::slice::from_ref(&prepared),
+            )
+            .unwrap();
+            let PreparedSourceImportTarget::ModuleNamespace { properties } = &mut prepared.target
+            else {
+                panic!("the provider has its merged dependency namespace");
+            };
+            let namespace = properties[0].namespace_const.as_mut().unwrap();
+            assert_eq!(namespace.namespace.module, module);
+            let declarations = namespace.namespace.declarations.clone();
+            match forgery {
+                0 => {
+                    namespace.namespace.declarations.pop();
+                }
+                1 => namespace.namespace.declarations.reverse(),
+                2 => assert!(fixture.store.set_symbol_declarations(
+                    module,
+                    Some(vec![declarations[0]]),
+                    Some(declarations[0]),
+                )),
+                3 => assert!(fixture.store.set_symbol_declarations(
+                    module,
+                    Some(declarations),
+                    Some(declaration),
+                )),
+                4 => assert!(fixture.store.set_symbol_flags(
+                    module,
+                    SymbolFlags::VALUE_MODULE,
+                    CheckFlags::NONE,
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                store_state(&fixture.store),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+            );
+            assert_eq!(
+                preflight_prepared_source_import_publications(&fixture.store, &[prepared]),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::PreparedStateChanged(binding.alias_symbol),
+                )),
+                "merged namespace forgery {forgery} was accepted",
+            );
+            assert_eq!(
+                (
+                    store_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.symbol_store().symbol_table_len(),
+                ),
+                before,
+            );
+            for symbol in [module, resolved[0].target_symbol, binding.alias_symbol] {
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn merged_dependency_namespace_publication_rejects_augmentation_parents() {
+        for self_import in [false, true] {
+            for forge_source_owner in [false, true] {
+                let provider = if self_import {
+                    "import * as provider from './provider'; export const forwarded = provider;"
+                } else {
+                    MERGED_DEPENDENCY_NAMESPACE_SOURCES[1]
+                };
+                let mut fixture = fixture(
+                    &[
+                        MERGED_DEPENDENCY_NAMESPACE_SOURCES[0],
+                        provider,
+                        MERGED_DEPENDENCY_NAMESPACE_SOURCES[2],
+                        "import './provider'; declare module './provider' { interface Added {} }",
+                    ],
+                    &[
+                        Route {
+                            source: 0,
+                            specifier: 0,
+                            target: Some(1),
+                        },
+                        Route {
+                            source: 1,
+                            specifier: 0,
+                            target: Some(if self_import { 1 } else { 2 }),
+                        },
+                        Route {
+                            source: 3,
+                            specifier: 0,
+                            target: Some(1),
+                        },
+                    ],
+                );
+                let provider = fixture.bound.get(&fixture.files[1].file).unwrap();
+                let original = provider.symbol(provider.source_file()).unwrap();
+                let augmentation = fixture.bound.get(&fixture.files[3].file).unwrap();
+                let name = augmentation.module_augmentations()[0].name();
+                let declaration = NodeRef::new(
+                    name.arena,
+                    name.file,
+                    fixture.files[3]
+                        .parsed
+                        .arena
+                        .get(name.node)
+                        .unwrap()
+                        .parent
+                        .unwrap(),
+                );
+                let augmentation = augmentation.symbol(declaration).unwrap();
+                let module = fixture
+                    .store
+                    .merge_symbol(original, augmentation, false)
+                    .unwrap();
+                assert_eq!(fixture.store.get_merged_symbol(augmentation), Some(module));
+                let import = fixture.plan_import(0, 0);
+                let binding = &import.bindings[0];
+                let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+                let read = plan_source_import_identifier_read(
+                    &fixture.files[0].parsed.arena,
+                    bound,
+                    &fixture.store,
+                    binding,
+                    identifier_initializer(&fixture, 0, "provider"),
+                    "provider",
+                    binding.alias_symbol,
+                )
+                .unwrap();
+                let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+                resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
+                let mut prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+                preflight_prepared_source_import_publications(
+                    &fixture.store,
+                    std::slice::from_ref(&prepared),
+                )
+                .unwrap();
+                let PreparedSourceImportTarget::ModuleNamespace { properties } =
+                    &mut prepared.target
+                else {
+                    panic!("the provider retains the prepared namespace export");
+                };
+                let [property] = properties.as_mut_slice() else {
+                    panic!("the provider has one value export");
+                };
+                let target = property.value_symbol;
+                let source_owner = if self_import {
+                    &mut property.recursive_const.as_mut().unwrap().source_owner
+                } else {
+                    &mut property.namespace_const.as_mut().unwrap().source_owner
+                };
+                assert_eq!(*source_owner, original);
+                if forge_source_owner {
+                    *source_owner = augmentation;
+                }
+                let record = fixture.store.symbol(target).unwrap();
+                let relationships = (record.members(), record.exports(), record.export_symbol());
+                assert!(fixture.store.set_symbol_relationships(
+                    target,
+                    relationships.0,
+                    relationships.1,
+                    Some(augmentation),
+                    relationships.2,
+                ));
+                assert_eq!(fixture.store.get_parent_of_symbol(target), Some(module));
+                let before = (
+                    store_state(&fixture.store),
+                    fixture.store.symbol_len(),
+                    fixture.store.symbol_store().symbol_table_len(),
+                );
+                assert_eq!(
+                    preflight_prepared_source_import_publications(&fixture.store, &[prepared]),
+                    Err(SourceImportError::Invariant(
+                        SourceImportInvariant::PreparedStateChanged(binding.alias_symbol),
+                    )),
+                    "self_import={self_import}, forge_source_owner={forge_source_owner}",
+                );
+                assert_eq!(
+                    (
+                        store_state(&fixture.store),
+                        fixture.store.symbol_len(),
+                        fixture.store.symbol_store().symbol_table_len(),
+                    ),
+                    before,
+                );
+                for symbol in [module, target, binding.alias_symbol] {
+                    assert!(fixture.store.value_symbol_links(symbol).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_dependency_namespace_owners_forward_foreign_and_recursive_values() {
+        for self_import in [false, true] {
+            let provider = if self_import {
+                "import * as provider from './provider'; export const forwarded = provider;"
+            } else {
+                MERGED_DEPENDENCY_NAMESPACE_SOURCES[1]
+            };
+            let sources = [
+                parsed(MERGED_DEPENDENCY_NAMESPACE_SOURCES[0]),
+                parsed(provider),
+                parsed(MERGED_DEPENDENCY_NAMESPACE_SOURCES[2]),
+                parsed(
+                    "import './provider'; declare module './provider' { interface Added { label: string } }",
+                ),
+            ];
+            let files = std::array::from_fn::<_, 4, _>(|index| {
+                (
+                    FileId::new(19_440 + u32::try_from(index).unwrap()),
+                    &sources[index],
+                )
+            });
+            let mut context = merged_dependency_namespace_context(&files);
+            for &(file, _) in &files {
+                context.check_source_file(file).unwrap_or_else(|error| {
+                    panic!("self_import={self_import}, {file:?}: {error:?}");
+                });
+            }
+            let (_, provider) = context.file(files[1].0).unwrap();
+            let module = context
+                .store()
+                .get_merged_symbol(provider.symbol(provider.source_file()).unwrap())
+                .unwrap();
+            let expected = if self_import {
+                module
+            } else {
+                let (_, dependency) = context.file(files[2].0).unwrap();
+                dependency.symbol(dependency.source_file()).unwrap()
+            };
+            let expected_type = context
+                .store()
+                .source_file_namespace_identity(expected)
+                .unwrap()
+                .type_;
+            let identity = context
+                .store()
+                .source_file_namespace_identity(module)
+                .unwrap()
+                .clone();
+            let [forwarded] = identity.properties.as_deref().unwrap() else {
+                panic!("the augmented provider has one value export");
+            };
+            assert_eq!(forwarded.name.as_utf8(), Some("forwarded"));
+            assert_eq!(forwarded.type_, expected_type);
+            assert_eq!(
+                context_exported_type(&context, files[1].0, "forwarded"),
+                expected_type
+            );
+            assert_eq!(identity.plan.declarations.len(), 2);
+            let warm = (
+                store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            );
+            for &(file, _) in &files {
+                context.recheck_source_file(file).unwrap();
+            }
+            assert_eq!(
+                (
+                    store_state(context.store()),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                ),
+                warm,
+            );
+            assert_eq!(
+                context.store().source_file_namespace_identity(module),
+                Some(&identity)
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn merged_dependency_namespace_variable_rejects_unrelated_parent() {
+        let sources = MERGED_DEPENDENCY_NAMESPACE_SOURCES.map(parsed);
+        let files = std::array::from_fn::<_, 4, _>(|index| {
+            (
+                FileId::new(19_420 + u32::try_from(index).unwrap()),
+                &sources[index],
+            )
+        });
+        let mut context = merged_dependency_namespace_context(&files);
+        let (arena, bound) = context.file(files[2].0).unwrap();
+        let (declaration, name) = arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(arena.id(), files[2].0, node),
+                    NodeRef::new(arena.id(), files[2].0, variable.name),
+                ))
+            })
+            .unwrap();
+        let target = bound.symbol(declaration).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+        let module = context
+            .store()
+            .get_merged_symbol(bound.symbol(bound.source_file()).unwrap())
+            .unwrap();
+        let before = (store_state(context.store()), context.store().symbol_len());
+        assert_eq!(
+            plan_top_level_variable(
+                bound,
+                context.store(),
+                declaration,
+                name,
+                "value",
+                VariableBindingKind::Const,
+                true,
+            ),
+            Ok(target),
+        );
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            before
+        );
+        let (_, other) = context.file(files[1].0).unwrap();
+        let other = other.symbol(other.source_file()).unwrap();
+        let record = context.store().symbol(target).unwrap();
+        let relationships = (record.members(), record.exports(), record.export_symbol());
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            target,
+            relationships.0,
+            relationships.1,
+            Some(other),
+            relationships.2,
+        ));
+        let before = (store_state(context.store()), context.store().symbol_len());
+        let (_, bound) = context.file(files[2].0).unwrap();
+        assert_eq!(
+            plan_top_level_variable(
+                bound,
+                context.store(),
+                declaration,
+                name,
+                "value",
+                VariableBindingKind::Const,
+                true,
+            ),
+            Err(VariablePlanError::Invariant(
+                super::super::VariableInvariant::InvalidTargetParent {
+                    symbol: target,
+                    expected: Some(module),
+                    actual: Some(other),
+                }
+            )),
+        );
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            before
+        );
+        assert_eq!(
+            context.store().symbol(local).unwrap().export_symbol(),
+            Some(target)
+        );
+        assert!(context.store().value_symbol_links(target).is_none());
+    }
+
+    #[test]
+    fn merged_dependency_namespace_interface_rejects_unrelated_parent() {
+        let sources = MERGED_DEPENDENCY_NAMESPACE_SOURCES.map(parsed);
+        let files = std::array::from_fn::<_, 4, _>(|index| {
+            (
+                FileId::new(19_460 + u32::try_from(index).unwrap()),
+                &sources[index],
+            )
+        });
+        let mut context = merged_dependency_namespace_context(&files);
+        let declaration = sources[2]
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    sources[2].arena.id(),
+                    files[2].0,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(files[2].0).unwrap();
+        let symbol = context
+            .store()
+            .get_merged_symbol(bound.symbol(declaration).unwrap())
+            .unwrap();
+        let plan = |context: &CanonicalCheckerContext<'_>| {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files.iter().map(|(file, _)| context.file(*file).unwrap()),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            object_members::plan_interface(context.store(), &host, symbol)
+        };
+        let before = (store_state(context.store()), context.store().symbol_len());
+        let planned = plan(&context).unwrap();
+        assert_eq!(planned.symbol, symbol);
+        assert_eq!(planned.declarations.len(), 2);
+        assert_eq!(planned.properties.len(), 2);
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            before
+        );
+
+        let (_, other) = context.file(files[1].0).unwrap();
+        let other = other.symbol(other.source_file()).unwrap();
+        let record = context.store().symbol(symbol).unwrap();
+        let relationships = (record.members(), record.exports(), record.export_symbol());
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            symbol,
+            relationships.0,
+            relationships.1,
+            Some(other),
+            relationships.2,
+        ));
+        let before = (store_state(context.store()), context.store().symbol_len());
+        assert_eq!(
+            plan(&context),
+            Err(object_members::PropertyObjectError::InvalidInterface {
+                declaration,
+                symbol
+            }),
+        );
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            before
+        );
     }
 
     #[test]
