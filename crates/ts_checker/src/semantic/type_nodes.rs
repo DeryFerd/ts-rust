@@ -12661,7 +12661,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(invalid());
         }
         let record = self.store.type_payload(argument).ok_or_else(invalid)?;
-        if matches!(record.data(), TypeData::TypeParameter(_)) {
+        let deferred = match record.data() {
+            TypeData::TypeParameter(_) => true,
+            TypeData::Conditional(_) => {
+                conditional_alias_projection(self.store, argument).map_err(|_| invalid())?;
+                true
+            }
+            _ => false,
+        };
+        if deferred {
             let projection = self
                 .store
                 .validate_deferred_intersection_type(actual)
@@ -45741,6 +45749,578 @@ mod tests {
             );
         }
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    fn non_nullable_conditional_fixture(strict_null_checks: bool) -> Fixture {
+        fixture_with_source_facts(
+            concat!(
+                "type NonNullable<T> = T & {}; ",
+                "type Select<Source> = Source extends string ? number : boolean; ",
+                "type Result<Value> = NonNullable<Select<Value>>;",
+            ),
+            CanonicalModuleState::Script,
+            IntrinsicBootstrapOptions {
+                strict_null_checks,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            true,
+            |_| {},
+        )
+    }
+
+    fn non_nullable_conditional_counts(
+        store: &CanonicalTypeMapperStore,
+    ) -> (UnionState, [usize; 6], (usize, usize)) {
+        (
+            union_state(store),
+            [
+                store.conditional_root_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.properties_type_cache_len(),
+            ],
+            store.conditional_production_lengths(),
+        )
+    }
+
+    fn assert_non_nullable_conditional_intersection(
+        store: &CanonicalTypeMapperStore,
+        result: TypeId,
+        non_nullable: SemanticSymbolId,
+        argument: TypeId,
+    ) {
+        assert!(conditional_alias_projection(store, argument).is_ok());
+        let empty = store.intrinsic_bootstrap().unwrap().empty_type_literal_type;
+        let projection = store.validate_deferred_intersection_type(result).unwrap();
+        assert_eq!(projection.types, [argument, empty]);
+        assert_eq!(projection.alias_symbol, Some(non_nullable));
+        assert_eq!(projection.alias_arguments, [argument]);
+        let record = store.type_payload(result).unwrap();
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        let TypeData::Intersection(data) = record.data() else {
+            panic!("NonNullable must retain its conditional and empty object")
+        };
+        assert_eq!(data.intersection.structured, StructuredTypeData::default());
+        assert!(data.intersection.property_cache.is_none());
+        assert!(
+            data.intersection
+                .property_cache_without_function_property_augment
+                .is_none()
+        );
+        assert!(data.intersection.resolved_properties.is_none());
+        assert!(data.resolved_apparent_type.is_none());
+        assert!(data.unique_literal_filled_instantiation.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both null modes and their warm query controls together.
+    fn non_nullable_conditional_source_queries_preserve_identity_in_both_null_modes() {
+        for strict_null_checks in [false, true] {
+            let mut fixture = non_nullable_conditional_fixture(strict_null_checks);
+            let non_nullable =
+                named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "NonNullable");
+            let select = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Select");
+            let result_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+            let request = alias_parts(&fixture, "Result").2;
+            let argument_node = type_reference_argument_node(&fixture, request, 0);
+            assert!(fixture.store.type_alias_links(result_alias).is_none());
+            assert!(fixture.store.type_node_links(request).is_none());
+            assert!(fixture.store.type_node_links(argument_node).is_none());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            let result = query_declared(
+                &mut fixture,
+                result_alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let argument = fixture
+                .store
+                .type_node_links(argument_node)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let parameter = fixture
+                .store
+                .type_alias_links(result_alias)
+                .and_then(|links| links.type_parameters.as_deref())
+                .unwrap()[0];
+            assert_eq!(
+                conditional_alias_projection(&fixture.store, argument),
+                Ok(Some(ConditionalAliasIdentity {
+                    symbol: select,
+                    type_arguments: &[parameter],
+                })),
+            );
+            let TypeData::Conditional(conditional) =
+                fixture.store.type_payload(argument).unwrap().data()
+            else {
+                panic!("Select<Value> must stay conditional")
+            };
+            assert_eq!(conditional.check_type, parameter);
+            assert_eq!(
+                fixture
+                    .store
+                    .conditional_root(conditional.root)
+                    .unwrap()
+                    .node(),
+                alias_parts(&fixture, "Select").2,
+            );
+            assert!(conditional.mapper.is_some());
+            assert!(conditional.resolved_true_type.is_none());
+            assert!(conditional.resolved_false_type.is_none());
+            assert_non_nullable_conditional_intersection(
+                &fixture.store,
+                result,
+                non_nullable,
+                argument,
+            );
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                let TypeData::Conditional(conditional) =
+                    store.type_payload(argument).unwrap().data()
+                else {
+                    unreachable!()
+                };
+                (
+                    non_nullable_conditional_counts(store),
+                    store.intersection_types.clone(),
+                    store.intersection_keys_by_type.clone(),
+                    conditional.clone(),
+                )
+            };
+            let warm = snapshot(&fixture.store);
+
+            for _ in 0..2 {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        result_alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(result),
+                    "strict_null_checks={strict_null_checks}",
+                );
+                assert_eq!(
+                    query_node(&mut fixture, request, &mut diagnostics),
+                    Ok(result)
+                );
+                assert_eq!(snapshot(&fixture.store), warm);
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged proof is restored before the same source query.
+    fn non_nullable_conditional_warm_queries_reject_and_restore_damaged_proofs() {
+        for strict_null_checks in [false, true] {
+            for corruption in [
+                "mapper",
+                "root",
+                "alias arguments",
+                "forward key",
+                "reverse key",
+            ] {
+                let mut fixture = non_nullable_conditional_fixture(strict_null_checks);
+                let non_nullable =
+                    named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "NonNullable");
+                let select = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Select");
+                let result_alias =
+                    named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+                let request = alias_parts(&fixture, "Result").2;
+                let argument_node = type_reference_argument_node(&fixture, request, 0);
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = query_declared(
+                    &mut fixture,
+                    result_alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+                let argument = fixture
+                    .store
+                    .type_node_links(argument_node)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let TypeData::Conditional(conditional) =
+                    fixture.store.type_payload(argument).unwrap().data()
+                else {
+                    panic!("Select<Value> must stay conditional")
+                };
+                let conditional = conditional.clone();
+                let root_alias = fixture
+                    .store
+                    .conditional_root(conditional.root)
+                    .unwrap()
+                    .alias();
+                let identity = fixture.store.type_payload(result).unwrap().alias().unwrap();
+                let key = fixture.store.intersection_keys_by_type[&result].clone();
+                assert_non_nullable_conditional_intersection(
+                    &fixture.store,
+                    result,
+                    non_nullable,
+                    argument,
+                );
+                let snapshot = |store: &CanonicalTypeMapperStore| {
+                    let TypeData::Conditional(argument_data) =
+                        store.type_payload(argument).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let TypeData::Intersection(result_data) =
+                        store.type_payload(result).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let root = store.conditional_root(conditional.root).unwrap();
+                    let alias = store.type_alias(identity).unwrap();
+                    (
+                        non_nullable_conditional_counts(store),
+                        store.intersection_types.clone(),
+                        store.intersection_keys_by_type.clone(),
+                        [non_nullable, select, result_alias]
+                            .map(|symbol| store.type_alias_links(symbol).cloned()),
+                        [request, argument_node].map(|node| store.type_node_links(node).cloned()),
+                        (root.alias(), root.instantiations().clone()),
+                        (argument_data.clone(), result_data.clone()),
+                        (
+                            alias.symbol(),
+                            alias.type_arguments().map(<[TypeId]>::to_vec),
+                        ),
+                    )
+                };
+                let warm = snapshot(&fixture.store);
+
+                match corruption {
+                    "mapper" => {
+                        assert!(conditional.mapper.is_some());
+                        assert!(fixture.store.set_conditional_resolution(
+                            argument,
+                            conditional.resolved_true_type,
+                            conditional.resolved_false_type,
+                            conditional.resolved_inferred_true_type,
+                            conditional.resolved_default_constraint,
+                            conditional.resolved_constraint_of_distributive,
+                            None,
+                            conditional.combined_mapper,
+                        ));
+                    }
+                    "root" => {
+                        assert!(root_alias.is_some());
+                        assert!(
+                            fixture
+                                .store
+                                .set_conditional_root_alias(conditional.root, None)
+                        );
+                    }
+                    "alias arguments" => {
+                        let empty = fixture
+                            .store
+                            .intrinsic_bootstrap()
+                            .unwrap()
+                            .empty_type_literal_type;
+                        assert!(
+                            fixture
+                                .store
+                                .set_type_alias_arguments(identity, Some(vec![empty]))
+                        );
+                    }
+                    "forward key" => {
+                        assert_eq!(fixture.store.intersection_types.remove(&key), Some(result));
+                    }
+                    "reverse key" => {
+                        assert_eq!(
+                            fixture.store.intersection_keys_by_type.remove(&result),
+                            Some(key.clone())
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let damaged = snapshot(&fixture.store);
+                for _ in 0..2 {
+                    assert!(
+                        query_declared(
+                            &mut fixture,
+                            result_alias,
+                            CanonicalTypeQueryOptions::default(),
+                            &mut diagnostics,
+                        )
+                        .is_err(),
+                        "{corruption}, strict_null_checks={strict_null_checks}",
+                    );
+                    assert_eq!(snapshot(&fixture.store), damaged);
+                }
+
+                match corruption {
+                    "mapper" => assert!(fixture.store.set_conditional_resolution(
+                        argument,
+                        conditional.resolved_true_type,
+                        conditional.resolved_false_type,
+                        conditional.resolved_inferred_true_type,
+                        conditional.resolved_default_constraint,
+                        conditional.resolved_constraint_of_distributive,
+                        conditional.mapper,
+                        conditional.combined_mapper,
+                    )),
+                    "root" => assert!(
+                        fixture
+                            .store
+                            .set_conditional_root_alias(conditional.root, root_alias)
+                    ),
+                    "alias arguments" => assert!(
+                        fixture
+                            .store
+                            .set_type_alias_arguments(identity, Some(vec![argument]))
+                    ),
+                    "forward key" => assert!(
+                        fixture
+                            .store
+                            .intersection_types
+                            .insert(key, result)
+                            .is_none()
+                    ),
+                    "reverse key" => assert!(
+                        fixture
+                            .store
+                            .intersection_keys_by_type
+                            .insert(result, key)
+                            .is_none()
+                    ),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        result_alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(result),
+                );
+                assert_non_nullable_conditional_intersection(
+                    &fixture.store,
+                    result,
+                    non_nullable,
+                    argument,
+                );
+                assert_eq!(snapshot(&fixture.store), warm);
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real return annotation and both source files together.
+    fn non_nullable_conditional_one_of_type_return_request_keeps_validator_identity() {
+        let library = parse_source_file(concat!(
+            "type NonNullable<T> = T & {}; ",
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Error { name: string; message: string; stack?: string; }",
+        ));
+        let declarations = parse_source_file(concat!(
+            "declare module 'prop-types' { ",
+            "export const nominalTypeHack: unique symbol; ",
+            "export interface Validator<T> { ",
+            "(props: object, propName: string, componentName: string, ",
+            "location: string, propFullName: string): Error | null; ",
+            "[nominalTypeHack]?: T; ",
+            "} ",
+            "export interface Requireable<T> extends Validator<T | undefined | null> { ",
+            "isRequired: Validator<NonNullable<T>>; ",
+            "} ",
+            "export type InferType<V> = V extends Validator<infer T> ? T : any; ",
+            "export function oneOfType<T extends Validator<any>>(types: T[]): ",
+            "Requireable<NonNullable<InferType<T>>>; ",
+            "}",
+        ));
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(library, declarations, true);
+        let library_bound = files.get(&library_file).unwrap();
+        let declaration_bound = files.get(&declaration_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, library_bound),
+                (&declarations.arena, declaration_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let source_node = |arena: &NodeArena, file, kind, name: &str| {
+            arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind && declaration_name(arena, record) == Some(name))
+                        .then_some(NodeRef::new(arena.id(), file, node))
+                })
+                .unwrap()
+        };
+        let non_nullable = library_bound
+            .symbol(source_node(
+                &library.arena,
+                library_file,
+                SyntaxKind::TypeAliasDeclaration,
+                "NonNullable",
+            ))
+            .unwrap();
+        let infer_declaration = source_node(
+            &declarations.arena,
+            declaration_file,
+            SyntaxKind::TypeAliasDeclaration,
+            "InferType",
+        );
+        let infer_type = declaration_bound.symbol(infer_declaration).unwrap();
+        let validator = declaration_bound
+            .symbol(source_node(
+                &declarations.arena,
+                declaration_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Validator",
+            ))
+            .unwrap();
+        let function_node = source_node(
+            &declarations.arena,
+            declaration_file,
+            SyntaxKind::FunctionDeclaration,
+            "oneOfType",
+        );
+        let NodeData::FunctionDeclaration(function) =
+            &declarations.arena.get(function_node.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let parameter_symbol = declaration_bound
+            .symbol(NodeRef::new(
+                function_node.arena,
+                function_node.file,
+                function.type_parameters.as_ref().unwrap().nodes[0],
+            ))
+            .unwrap();
+        let return_node = NodeRef::new(
+            function_node.arena,
+            function_node.file,
+            function.type_.unwrap(),
+        );
+        let argument_node = |reference: NodeRef| {
+            let NodeData::TypeReferenceNode(reference_data) =
+                &declarations.arena.get(reference.node).unwrap().data
+            else {
+                panic!("oneOfType must keep its nested return type references")
+            };
+            let [argument] = reference_data
+                .type_arguments
+                .as_ref()
+                .unwrap()
+                .nodes
+                .as_slice()
+            else {
+                panic!("each return type reference must have one argument")
+            };
+            NodeRef::new(reference.arena, reference.file, *argument)
+        };
+        let request = argument_node(return_node);
+        let infer_request = argument_node(request);
+        assert!(store.type_node_links(request).is_none());
+        assert!(store.type_node_links(infer_request).is_none());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let result = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(request)
+        .unwrap();
+        let argument = store
+            .type_node_links(infer_request)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let parameter = store
+            .declared_type_links(parameter_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Conditional(conditional) = store.type_payload(argument).unwrap().data()
+        else {
+            panic!("InferType<T> must stay conditional for oneOfType's parameter")
+        };
+        assert_eq!(conditional.check_type, parameter);
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&store, parameter),
+            Some(parameter_symbol)
+        );
+        assert!(conditional.resolved_true_type.is_none());
+        assert!(conditional.resolved_false_type.is_none());
+        let extends = validate_direct_generic_reference(&store, conditional.extends_type).unwrap();
+        assert_eq!(
+            store.type_payload(extends.target).unwrap().symbol(),
+            Some(validator)
+        );
+        let NodeData::TypeAliasDeclaration(infer_alias) =
+            &declarations.arena.get(infer_declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            store.conditional_root(conditional.root).unwrap().node(),
+            NodeRef::new(
+                infer_declaration.arena,
+                infer_declaration.file,
+                infer_alias.type_
+            ),
+        );
+        assert_eq!(
+            conditional_alias_projection(&store, argument),
+            Ok(Some(ConditionalAliasIdentity {
+                symbol: infer_type,
+                type_arguments: &[parameter],
+            })),
+        );
+        assert_non_nullable_conditional_intersection(&store, result, non_nullable, argument);
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            let TypeData::Conditional(conditional) = store.type_payload(argument).unwrap().data()
+            else {
+                unreachable!()
+            };
+            (
+                non_nullable_conditional_counts(store),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+                store.type_alias_links(non_nullable).cloned(),
+                store.type_alias_links(infer_type).cloned(),
+                conditional.clone(),
+            )
+        };
+        let warm = snapshot(&store);
+        for _ in 0..2 {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(request),
+                Ok(result),
+            );
+            assert_eq!(snapshot(&store), warm);
+            assert_non_nullable_conditional_intersection(&store, result, non_nullable, argument);
+        }
         assert!(diagnostics.is_empty());
     }
 

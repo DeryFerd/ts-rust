@@ -16,6 +16,7 @@ use super::{
     TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    conditional_types::conditional_alias_projection,
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     indexed_access_types::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
@@ -2529,6 +2530,9 @@ fn append_cached_intersection_constituent(
         TypeData::Mapped(_) => store
             .validate_deferred_mapped_type(type_)
             .map_err(|_| invalid())?,
+        TypeData::Conditional(_) => {
+            conditional_alias_projection(store, type_).map_err(|_| invalid())?;
+        }
         TypeData::TypeReference(_) | TypeData::Interface(_)
             if record.object_flags().contains(ObjectFlags::REFERENCE) =>
         {
@@ -3748,6 +3752,11 @@ fn reduce_default_library_non_nullable_intersection(
         .type_payload(*argument)
         .ok_or(InstantiationError::InvalidType(*argument))?;
     if matches!(record.data(), TypeData::TypeParameter(_)) {
+        return Ok(None);
+    }
+    if matches!(record.data(), TypeData::Conditional(_)) {
+        conditional_alias_projection(store, *argument)
+            .map_err(|_| InstantiationError::InvalidType(*argument))?;
         return Ok(None);
     }
     if record.flags().intersects(TypeFlags::NULLABLE) {
@@ -5473,6 +5482,104 @@ mod tests {
         );
     }
 
+    const NON_NULLABLE_CONDITIONAL_SOURCE: &str = concat!(
+        "type Select<Value> = Value extends string ? number : boolean;\n",
+        "type Forward<Other> = Select<Other>;\n",
+    );
+
+    struct NonNullableConditionalFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        source: TypeId,
+        parameter: TypeId,
+        argument: TypeId,
+        argument_parameter: TypeId,
+        alias: SemanticSymbolId,
+    }
+
+    fn non_nullable_conditional_fixture<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        strict_null_checks: bool,
+    ) -> NonNullableConditionalFixture<'arena> {
+        let library_file = FileId::new(8_554);
+        let source_file = FileId::new(8_555);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path, default_library) in [
+            (library, library_file, "\"/lib.non-nullable.d.ts\"", true),
+            (source, source_file, "\"/conditional-argument.ts\"", false),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let [alias, forward] =
+            [(library_file, "NonNullable"), (source_file, "Forward")].map(|(file, name)| {
+                let bound = context.file(file).unwrap().1;
+                let locals = bound.locals(bound.source_file()).unwrap();
+                context
+                    .store()
+                    .symbol_table(locals)
+                    .unwrap()
+                    .get_source(name)
+                    .unwrap()
+            });
+        let source = context.get_declared_type_of_symbol(alias).unwrap();
+        let argument = context.get_declared_type_of_symbol(forward).unwrap();
+        let [parameter, argument_parameter] = [alias, forward].map(|symbol| {
+            let parameters = context
+                .store()
+                .type_alias_links(symbol)
+                .unwrap()
+                .type_parameters
+                .as_deref()
+                .unwrap();
+            assert_eq!(parameters.len(), 1);
+            parameters[0]
+        });
+        assert!(conditional_alias_projection(context.store(), argument).is_ok());
+        let TypeData::Conditional(data) = context.store().type_payload(argument).unwrap().data()
+        else {
+            panic!("the source query must retain its generic conditional")
+        };
+        assert_eq!(data.check_type, argument_parameter);
+        assert!(data.mapper.is_some());
+        NonNullableConditionalFixture {
+            context,
+            source,
+            parameter,
+            argument,
+            argument_parameter,
+            alias,
+        }
+    }
+
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
         store
@@ -5795,6 +5902,473 @@ mod tests {
             Ok(source),
         );
         assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn non_nullable_conditional_instantiation_preserves_cold_and_warm_identity() {
+        let library = parse_source_file("type NonNullable<T> = T & {};");
+        let source = parse_source_file(NON_NULLABLE_CONDITIONAL_SOURCE);
+        for strict_null_checks in [false, true] {
+            let mut fixture =
+                non_nullable_conditional_fixture(&library, &source, strict_null_checks);
+            let sources = [fixture.parameter];
+            let targets = [fixture.argument];
+            let store = fixture.context.store_mut_for_test();
+            let empty = store.intrinsic_bootstrap().unwrap().empty_type_literal_type;
+            let conditional = store.type_payload(fixture.argument).unwrap().data().clone();
+            let conditional_alias = store.type_payload(fixture.argument).unwrap().alias();
+            let production_lengths = store.conditional_production_lengths();
+            let before = deferred_intersection_store_state(store);
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    fixture.source,
+                    &sources,
+                    &targets,
+                    None,
+                    None,
+                ),
+                Ok(None),
+            );
+            assert_eq!(deferred_intersection_store_state(store), before);
+
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let result = instantiate_type_with_vector_and_session(
+                store,
+                fixture.source,
+                &sources,
+                &targets,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            assert_ne!(result, fixture.argument);
+            assert_eq!(session.query_count(), 2);
+            assert_eq!(session.total_count(), 2);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+            let projection = store.validate_deferred_intersection_type(result).unwrap();
+            assert_eq!(projection.types, [fixture.argument, empty]);
+            assert_eq!(projection.alias_symbol, Some(fixture.alias));
+            assert_eq!(projection.alias_arguments, targets);
+            assert_eq!(store.type_len(), before.0[0] + 1);
+            assert_eq!(store.type_alias_len(), before.0[1] + 1);
+            assert_eq!(store.mapper_len(), before.0[2]);
+            let TypeData::Intersection(data) = store.type_payload(result).unwrap().data() else {
+                panic!("NonNullable must retain the conditional and empty object")
+            };
+            assert_eq!(data.intersection.structured, StructuredTypeData::default());
+            assert!(data.intersection.property_cache.is_none());
+            assert!(data.intersection.resolved_properties.is_none());
+
+            let warm = deferred_intersection_store_state(store);
+            let forward = store.intersection_types.clone();
+            let reverse = store.intersection_keys_by_type.clone();
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    fixture.source,
+                    &sources,
+                    &targets,
+                    None,
+                    None,
+                ),
+                Ok(Some(result)),
+            );
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    fixture.source,
+                    &sources,
+                    &targets,
+                    None,
+                    &mut session,
+                ),
+                Ok(result),
+            );
+            assert_eq!(session.query_count(), 4);
+            assert_eq!(session.total_count(), 4);
+            assert_eq!(deferred_intersection_store_state(store), warm);
+            assert_eq!(store.intersection_types, forward);
+            assert_eq!(store.intersection_keys_by_type, reverse);
+            assert_eq!(store.conditional_production_lengths(), production_lengths);
+            assert_eq!(
+                store.type_payload(fixture.argument).unwrap().data(),
+                &conditional
+            );
+            assert_eq!(
+                store.type_payload(fixture.argument).unwrap().alias(),
+                conditional_alias
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged proof must reject the same retained result.
+    fn non_nullable_conditional_cached_replay_rejects_damaged_proofs_and_keys() {
+        let library = parse_source_file("type NonNullable<T> = T & {};");
+        let source = parse_source_file(NON_NULLABLE_CONDITIONAL_SOURCE);
+        let mut fixture = non_nullable_conditional_fixture(&library, &source, true);
+        let sources = [fixture.parameter];
+        let targets = [fixture.argument];
+        let store = fixture.context.store_mut_for_test();
+        let result =
+            instantiate_type_with_vector(store, fixture.source, &sources, &targets).unwrap();
+        let key = store
+            .intersection_keys_by_type
+            .get(&result)
+            .unwrap()
+            .clone();
+        let identity = store.type_payload(result).unwrap().alias().unwrap();
+        let TypeData::Conditional(conditional) =
+            store.type_payload(fixture.argument).unwrap().data()
+        else {
+            panic!("the source query must retain a conditional")
+        };
+        let conditional = conditional.clone();
+        let original_root_alias = store.conditional_root(conditional.root).unwrap().alias();
+        assert!(original_root_alias.is_some());
+        let assert_rejected = |store: &CanonicalTypeMapperStore| {
+            let before = deferred_intersection_store_state(store);
+            let production_lengths = store.conditional_production_lengths();
+            let forward = store.intersection_types.clone();
+            let reverse = store.intersection_keys_by_type.clone();
+            assert!(
+                cached_instantiation_with_vector(
+                    store,
+                    fixture.source,
+                    &sources,
+                    &targets,
+                    None,
+                    None,
+                )
+                .is_err()
+            );
+            assert!(store.validate_deferred_intersection_type(result).is_err());
+            assert_eq!(deferred_intersection_store_state(store), before);
+            assert_eq!(store.conditional_production_lengths(), production_lengths);
+            assert_eq!(store.intersection_types, forward);
+            assert_eq!(store.intersection_keys_by_type, reverse);
+        };
+
+        assert!(store.set_conditional_resolution(
+            fixture.argument,
+            conditional.resolved_true_type,
+            conditional.resolved_false_type,
+            conditional.resolved_inferred_true_type,
+            conditional.resolved_default_constraint,
+            conditional.resolved_constraint_of_distributive,
+            None,
+            conditional.combined_mapper,
+        ));
+        assert_rejected(store);
+        assert!(store.set_conditional_resolution(
+            fixture.argument,
+            conditional.resolved_true_type,
+            conditional.resolved_false_type,
+            conditional.resolved_inferred_true_type,
+            conditional.resolved_default_constraint,
+            conditional.resolved_constraint_of_distributive,
+            conditional.mapper,
+            conditional.combined_mapper,
+        ));
+
+        assert!(store.set_conditional_root_alias(conditional.root, None));
+        assert_rejected(store);
+        assert!(store.set_conditional_root_alias(conditional.root, original_root_alias));
+        assert!(store.set_type_alias_arguments(identity, Some(vec![fixture.parameter])));
+        assert_rejected(store);
+        assert!(store.set_type_alias_arguments(identity, Some(targets.to_vec())));
+
+        assert_eq!(store.intersection_types.remove(&key), Some(result));
+        assert_rejected(store);
+        assert!(
+            store
+                .intersection_types
+                .insert(key.clone(), result)
+                .is_none()
+        );
+        assert_eq!(
+            store.intersection_keys_by_type.remove(&result),
+            Some(key.clone())
+        );
+        assert_rejected(store);
+        assert!(
+            store
+                .intersection_keys_by_type
+                .insert(result, key)
+                .is_none()
+        );
+
+        let restored = deferred_intersection_store_state(store);
+        assert_eq!(
+            cached_instantiation_with_vector(store, fixture.source, &sources, &targets, None, None,),
+            Ok(Some(result)),
+        );
+        assert_eq!(
+            instantiate_type_with_vector(store, fixture.source, &sources, &targets),
+            Ok(result),
+        );
+        assert_eq!(deferred_intersection_store_state(store), restored);
+        assert_eq!(
+            store.type_payload(fixture.argument).unwrap().data(),
+            &TypeData::Conditional(conditional)
+        );
+    }
+
+    #[test]
+    fn non_nullable_conditional_rejects_unproved_and_foreign_arguments() {
+        let library = parse_source_file("type NonNullable<T> = T & {};");
+        let source = parse_source_file(NON_NULLABLE_CONDITIONAL_SOURCE);
+        let mut fixture = non_nullable_conditional_fixture(&library, &source, true);
+        let foreign = non_nullable_conditional_fixture(&library, &source, true);
+        let sources = [fixture.parameter];
+        let store = fixture.context.store_mut_for_test();
+        let empty = store.intrinsic_bootstrap().unwrap().empty_type_literal_type;
+        let record = store.type_payload(fixture.argument).unwrap();
+        let alias = record.alias();
+        let TypeData::Conditional(data) = record.data() else {
+            panic!("the source query must retain a conditional")
+        };
+        let data = data.clone();
+        let unproved = store
+            .alloc_conditional_type(
+                data.root,
+                data.check_type,
+                data.extends_type,
+                data.mapper,
+                data.combined_mapper,
+            )
+            .unwrap();
+        assert!(store.set_type_alias(unproved, alias));
+        assert!(store.conditional_type_production(unproved).is_none());
+        for (argument, expected_count) in [(unproved, 2), (foreign.argument, 0)] {
+            let before = deferred_intersection_store_state(store);
+            let production_lengths = store.conditional_production_lengths();
+            let forward = store.intersection_types.clone();
+            let reverse = store.intersection_keys_by_type.clone();
+            assert_eq!(
+                store.canonical_deferred_intersection_type(&[argument, empty], None),
+                Err(IntersectionTypeError::MalformedConstituent(argument)),
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    fixture.source,
+                    &sources,
+                    &[argument],
+                    None,
+                    None,
+                ),
+                Err(InstantiationError::InvalidType(argument)),
+            );
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    fixture.source,
+                    &sources,
+                    &[argument],
+                    None,
+                    &mut session,
+                ),
+                Err(InstantiationError::InvalidType(argument)),
+            );
+            assert_eq!(session.query_count(), expected_count);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+            assert_eq!(deferred_intersection_store_state(store), before);
+            assert_eq!(store.conditional_production_lengths(), production_lengths);
+            assert_eq!(store.intersection_types, forward);
+            assert_eq!(store.intersection_keys_by_type, reverse);
+        }
+    }
+
+    #[test]
+    fn non_nullable_conditional_keeps_remapping_and_members_unsupported() {
+        let library = parse_source_file("type NonNullable<T> = T & {};");
+        let source = parse_source_file(NON_NULLABLE_CONDITIONAL_SOURCE);
+        let mut fixture = non_nullable_conditional_fixture(&library, &source, true);
+        let store = fixture.context.store_mut_for_test();
+        let result = instantiate_type_with_vector(
+            store,
+            fixture.source,
+            &[fixture.parameter],
+            &[fixture.argument],
+        )
+        .unwrap();
+        let projection = store.validate_deferred_intersection_type(result).unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let before = deferred_intersection_store_state(store);
+        let forward = store.intersection_types.clone();
+        let reverse = store.intersection_keys_by_type.clone();
+        assert_eq!(
+            cached_instantiation_with_vector(
+                store,
+                result,
+                &[fixture.argument_parameter],
+                &[string],
+                None,
+                None,
+            ),
+            Err(InstantiationError::UnsupportedType(fixture.argument)),
+        );
+        assert_eq!(
+            instantiate_type_with_vector(store, result, &[fixture.argument_parameter], &[string]),
+            Err(InstantiationError::UnsupportedType(fixture.argument)),
+        );
+        assert_eq!(
+            store.canonical_intersection_type(&projection.types, Some(fixture.alias)),
+            Err(IntersectionTypeError::UnsupportedConstituent(
+                fixture.argument
+            )),
+        );
+        assert_eq!(deferred_intersection_store_state(store), before);
+        assert_eq!(store.intersection_types, forward);
+        assert_eq!(store.intersection_keys_by_type, reverse);
+        assert_eq!(
+            store.validate_deferred_intersection_type(result),
+            Ok(projection)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Real calls cover cold failure, recovery, and a spent warm budget.
+    fn non_nullable_conditional_instantiation_uses_caller_budget_and_recovery() {
+        let library = parse_source_file("type NonNullable<T> = T & {};");
+        let source = parse_source_file(NON_NULLABLE_CONDITIONAL_SOURCE);
+        let mut fixture = non_nullable_conditional_fixture(&library, &source, true);
+        let sources = [fixture.parameter];
+        let targets = [fixture.argument];
+        let store = fixture.context.store_mut_for_test();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let limits = InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        };
+        let before = deferred_intersection_store_state(store);
+        let mut fail_fast = InstantiationSession::new(limits);
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                fixture.source,
+                &sources,
+                &targets,
+                None,
+                &mut fail_fast,
+            ),
+            Err(InstantiationError::CountLimit { count: 1, limit: 1 }),
+        );
+        assert_eq!(fail_fast.query_count(), 1);
+        assert_eq!(fail_fast.total_count(), 1);
+        assert_eq!(fail_fast.depth, 0);
+        assert_eq!(fail_fast.limit_event_count(), 1);
+        assert!(fail_fast.active_mappers.is_empty());
+        assert_eq!(deferred_intersection_store_state(store), before);
+
+        let mut recovering =
+            InstantiationSession::new_recovering(store, limits, error_type).unwrap();
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                fixture.source,
+                &sources,
+                &targets,
+                None,
+                &mut recovering,
+            ),
+            Ok(error_type),
+        );
+        assert_eq!(recovering.query_count(), 1);
+        assert_eq!(recovering.total_count(), 1);
+        assert_eq!(recovering.limit_event_count(), 2);
+        assert_eq!(recovering.depth, 0);
+        assert!(recovering.active_mappers.is_empty());
+        assert_eq!(deferred_intersection_store_state(store), before);
+
+        let mut success = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 3,
+        });
+        let result = instantiate_type_with_vector_and_session(
+            store,
+            fixture.source,
+            &sources,
+            &targets,
+            None,
+            &mut success,
+        )
+        .unwrap();
+        assert_eq!(success.query_count(), 2);
+        assert_eq!(success.total_count(), 2);
+        assert_eq!(success.limit_event_count(), 0);
+        let warm = deferred_intersection_store_state(store);
+        let forward = store.intersection_types.clone();
+        let reverse = store.intersection_keys_by_type.clone();
+        for recover in [false, true] {
+            let mut session = if recover {
+                InstantiationSession::new_recovering(store, limits, error_type).unwrap()
+            } else {
+                InstantiationSession::new(limits)
+            };
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    fixture.parameter,
+                    &sources,
+                    &targets,
+                    None,
+                    &mut session,
+                ),
+                Ok(fixture.argument),
+            );
+            assert_eq!(session.query_count(), 1);
+            let actual = instantiate_type_with_vector_and_session(
+                store,
+                fixture.source,
+                &sources,
+                &targets,
+                None,
+                &mut session,
+            );
+            if recover {
+                assert_eq!(actual, Ok(error_type));
+            } else {
+                assert_eq!(
+                    actual,
+                    Err(InstantiationError::CountLimit { count: 1, limit: 1 })
+                );
+            }
+            assert_eq!(session.query_count(), 1);
+            assert_eq!(session.total_count(), 1);
+            assert_eq!(session.limit_event_count(), 1);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+        }
+        let mut zero_budget = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 0,
+        });
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                store,
+                fixture.source,
+                &sources,
+                &targets,
+                None,
+                &mut zero_budget,
+            ),
+            Err(InstantiationError::CountLimit { count: 0, limit: 0 }),
+        );
+        assert_eq!(zero_budget.query_count(), 0);
+        assert_eq!(zero_budget.total_count(), 0);
+        assert_eq!(
+            cached_instantiation_with_vector(store, fixture.source, &sources, &targets, None, None,),
+            Ok(Some(result)),
+        );
+        assert_eq!(deferred_intersection_store_state(store), warm);
+        assert_eq!(store.intersection_types, forward);
+        assert_eq!(store.intersection_keys_by_type, reverse);
     }
 
     #[test]
