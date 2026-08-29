@@ -307,7 +307,7 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
             .symbol(property.symbol)
             .ok_or_else(|| invalid(plan, type_))?;
         if planned_declared_property_key(store, property) != Some(record.name())
-            || record.parent() != Some(plan.symbol)
+            || store.get_parent_of_symbol(property.symbol) != Some(plan.symbol)
             || !inherited_index_infos.is_empty()
                 && (record.flags().contains(SymbolFlags::OPTIONAL) != property.optional
                     || record.flags().contains(SymbolFlags::METHOD)
@@ -6226,6 +6226,115 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold and warm owner corruption with restored replay.
+    fn direct_interface_own_properties_reject_unrelated_canonical_parents() {
+        for warm in [false, true] {
+            let mut prepared = prepare();
+            let own = prepared.derived_plan.properties[0].symbol;
+            let annotation = prepared.derived_plan.properties[0].type_node;
+            let other = interface_symbol(&prepared.fixture, "Other");
+            let parent = prepared.fixture.store.symbol(own).unwrap().parent();
+            assert_eq!(parent, Some(prepared.derived_plan.symbol));
+            if warm {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        &prepared.derived_plan,
+                        prepared.derived_type,
+                        &[prepared.number_type],
+                        &[prepared.base_type],
+                    ),
+                    Ok(prepared.derived_type),
+                );
+                assert!(validate_planned_interface_heritage_members(
+                    &prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                ));
+            }
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    derived_state(store, prepared.derived_type, own),
+                    store.type_node_links(annotation).cloned(),
+                    store.direct_interface_heritage_provenance(prepared.derived_type),
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            assert!(prepared.fixture.store.set_symbol_relationships(
+                own,
+                None,
+                None,
+                Some(other),
+                None,
+            ));
+            assert_eq!(
+                prepared.fixture.store.get_parent_of_symbol(own),
+                Some(other)
+            );
+            let poisoned = state(&prepared.fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        &prepared.derived_plan,
+                        prepared.derived_type,
+                        &[prepared.number_type],
+                        &[prepared.base_type],
+                    ),
+                    Err(PropertyObjectError::InvalidCachedInterface {
+                        symbol: prepared.derived_plan.symbol,
+                        type_: prepared.derived_type,
+                    }),
+                );
+                if warm {
+                    assert!(!validate_planned_interface_heritage_members(
+                        &prepared.fixture.store,
+                        &prepared.derived_plan,
+                        prepared.derived_type,
+                    ));
+                }
+                assert_eq!(state(&prepared.fixture.store), poisoned);
+            }
+            assert!(
+                prepared
+                    .fixture
+                    .store
+                    .set_symbol_relationships(own, None, None, parent, None,)
+            );
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &[prepared.base_type],
+                ),
+                Ok(prepared.derived_type),
+            );
+            assert!(validate_planned_interface_heritage_members(
+                &prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+            ));
+            let restored = state(&prepared.fixture.store);
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &[prepared.base_type],
+                ),
+                Ok(prepared.derived_type),
+            );
+            assert_eq!(state(&prepared.fixture.store), restored);
+        }
     }
 
     #[test]

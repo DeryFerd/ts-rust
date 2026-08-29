@@ -5,7 +5,7 @@
 //! namespace, an authenticated published scalar-wrapper or `Math.random`
 //! method, an exact global array reference with a published member, or belong
 //! to the validated own-property object domain in `relater`. Ordinary reads can
-//! query one source member before a generic interface's member table is ready.
+//! query one source member before an interface's member table is ready.
 //! Enum values reuse
 //! their published
 //! member identities. Class
@@ -67,7 +67,7 @@ use super::{
     source_imports::{source_file_namespace_wrapper_member, validated_source_file_namespace_owner},
     spelling::get_spelling_suggestion,
     store::SourceNodeParent,
-    type_records::{TypeData, TypeRecord},
+    type_records::{StructuredTypeData, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -1720,7 +1720,7 @@ pub(super) fn check_direct_source_property_with_session(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // Uses the caller's source query for unresolved members.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Uses the caller's source query for unresolved members.
 pub(super) fn check_direct_source_property_with_source(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1757,6 +1757,7 @@ pub(super) fn check_direct_source_property_with_source(
                     {
                         interface.reference.object.target
                     }
+                    TypeData::Interface(_) => Some(receiver),
                     _ => None,
                 });
             let cold_interface = target
@@ -1767,6 +1768,32 @@ pub(super) fn check_direct_source_property_with_source(
                             && !record.object_flags().contains(ObjectFlags::CLASS))
                 });
             if !cold_interface {
+                return resolve_direct_source_own_property(
+                    store,
+                    Some(global_types),
+                    receiver,
+                    name,
+                    session,
+                )
+                .map_err(SourcePropertyQueryError::Property);
+            }
+            if let Some(owner) = cold_inherited_interface_owner(store, host, receiver, name)
+                .map_err(SourcePropertyQueryError::Source)?
+            {
+                let resolved =
+                    super::type_nodes::CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )
+                    .and_then(|mut query| query.get_declared_interface_for_source_check(owner))
+                    .map_err(|error| SourcePropertyQueryError::Source(error.into()))?;
+                if resolved != receiver {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(receiver).into());
+                }
                 return resolve_direct_source_own_property(
                     store,
                     Some(global_types),
@@ -1789,6 +1816,95 @@ pub(super) fn check_direct_source_property_with_source(
             .map_err(SourcePropertyQueryError::Source)
         },
     )
+}
+
+/// Full member resolution is needed only after an exact own-name miss with heritage.
+fn cold_inherited_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    receiver: TypeId,
+    name: &str,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let record = store.type_payload(receiver).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Ok(None);
+    };
+    if interface.declared_members_resolved
+        || record
+            .object_flags()
+            .intersects(ObjectFlags::CLASS | ObjectFlags::MEMBERS_RESOLVED)
+        || record.object_flags().contains(ObjectFlags::REFERENCE)
+            && super::reference_types::validate_nongeneric_interface_argument_origin(
+                store, receiver,
+            )
+            .is_err()
+        || interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.is_empty())
+    {
+        return Ok(None);
+    }
+    let owner = record.symbol().ok_or_else(invalid)?;
+    let symbol = store.symbol(owner).ok_or_else(invalid)?;
+    let members = symbol
+        .members()
+        .map(|members| store.symbol_table(members).ok_or_else(invalid))
+        .transpose()?;
+    if !symbol.declarations().is_some_and(|declarations| {
+        declarations.iter().any(|declaration| {
+            store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+                && store
+                    .source_child_with_kind(*declaration, SyntaxKind::HeritageClause)
+                    .is_some()
+        })
+    }) {
+        return Ok(None);
+    }
+    if super::declared::cached_interface_type(store, owner)? != Some(receiver)
+        || interface.declared_members.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || interface.base_types_resolved
+        || interface.resolved_base_types.is_some()
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.reference.object.structured != StructuredTypeData::default()
+    {
+        return Err(invalid().into());
+    }
+    if members.is_some_and(|members| members.get_source(name).is_some()) {
+        return Ok(None);
+    }
+    let planned = super::object_members::plan_interface(store, host, owner).map_err(|error| {
+        use super::object_members::PropertyObjectError;
+        match error {
+            PropertyObjectError::UnsupportedMember { node, kind } => {
+                SourceCheckError::DeclaredType(super::DeclaredTypeError::TypeNodeUnavailable(
+                    super::type_nodes::TypeNodeUnavailable::UnsupportedSyntax { node, kind },
+                ))
+            }
+            PropertyObjectError::Capacity(_) => {
+                SourceCheckError::DeclaredType(super::DeclaredTypeError::TypeNodeUnavailable(
+                    super::type_nodes::TypeNodeUnavailable::LiteralTypeCapacity,
+                ))
+            }
+            _ => invalid().into(),
+        }
+    })?;
+    if planned.heritage.is_none() {
+        return Err(invalid().into());
+    }
+    for property in &planned.properties {
+        let key = super::object_members::planned_declared_property_key(store, property)
+            .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+        if key == EscapedNameRef::source(name) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(owner))
 }
 
 fn resolve_direct_source_own_property(
@@ -5495,8 +5611,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, IntrinsicBootstrapOptions,
-        ResolvedSignatureState, SignatureLinks,
+        AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, DeclaredTypeError,
+        DeclaredTypeUnavailable, IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks,
         signatures::{ElementFlags, SignatureFlags},
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         tuple_types::CanonicalTupleTypeRequest,
@@ -5590,6 +5706,587 @@ mod tests {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    fn source_property_context<'arena>(
+        files: &[(FileId, &'arena ParseResult)],
+        declaration_count: usize,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for (index, &(file, source)) in files.iter().enumerate() {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!(
+                            "\"/project/cold-merged-property-{index}.ts\""
+                        )),
+                        CanonicalSourceLanguage::TypeScript,
+                        index < declaration_count,
+                        index == 0,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for &(file, source) in files {
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, source)| (*file, &source.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold, warm, and poisoned reads in one source fixture.
+    fn cold_merged_interface_property_reads_leave_siblings_unresolved() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Packet { value: number; }",
+        ));
+        let added = parsed("interface Packet { unused: Missing; }");
+        let consumer =
+            parsed("declare const packet: Packet; const selected: number = packet.value;");
+        let consumer_file = FileId::new(28_612);
+        let files = [
+            (FileId::new(28_610), &library),
+            (FileId::new(28_611), &added),
+            (consumer_file, &consumer),
+        ];
+        let mut context = source_property_context(&files, 2);
+        let (owner, selected, sibling, sibling_annotation) = {
+            let store = context.store();
+            let owner = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source("Packet")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            assert_eq!(
+                store.symbol(owner).unwrap().declarations().unwrap().len(),
+                2
+            );
+            let members = store
+                .symbol_table(store.symbol(owner).unwrap().members().unwrap())
+                .unwrap();
+            let selected = members.get_source("value").unwrap();
+            let sibling = members.get_source("unused").unwrap();
+            let sibling_annotation = store
+                .source_direct_type_annotation(
+                    store.symbol(sibling).unwrap().value_declaration().unwrap(),
+                )
+                .unwrap();
+            assert!(store.value_symbol_links(selected).is_none());
+            assert!(store.value_symbol_links(sibling).is_none());
+            assert!(store.type_node_links(sibling_annotation).is_none());
+            (owner, selected, sibling, sibling_annotation)
+        };
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let record = context.store().type_payload(receiver).unwrap();
+        assert!(
+            !record
+                .object_flags()
+                .intersects(ObjectFlags::REFERENCE | ObjectFlags::CLASS)
+        );
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("Packet must retain its direct interface type")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.declared_members.is_none());
+        let access = property_access(&consumer, consumer_file);
+        context.check_source_file(consumer_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(access)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .unwrap()
+                .resolved_symbol,
+            Some(selected)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(selected)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert!(context.store().value_symbol_links(sibling).is_none());
+        assert!(
+            context
+                .store()
+                .type_node_links(sibling_annotation)
+                .is_none()
+        );
+        let TypeData::Interface(interface) = context.store().type_payload(receiver).unwrap().data()
+        else {
+            unreachable!()
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.declared_members.is_none());
+        assert_eq!(
+            interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            let record = store.type_payload(receiver).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                unreachable!()
+            };
+            (
+                (
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                files
+                    .iter()
+                    .flat_map(|(file, source)| {
+                        source.arena.iter().map(move |(node, _)| {
+                            let node = NodeRef::new(source.arena.id(), *file, node);
+                            (
+                                node,
+                                store.type_node_links(node).cloned(),
+                                store.symbol_node_links(node).cloned(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                [selected, sibling].map(|symbol| {
+                    (
+                        store.value_symbol_links(symbol).cloned(),
+                        store.declared_value_provenance(symbol),
+                    )
+                }),
+                (record.flags(), record.object_flags(), interface.clone()),
+            )
+        };
+        let warm = state(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(consumer_file).unwrap();
+            assert_eq!(
+                context.get_declared_type_of_symbol(owner).unwrap(),
+                receiver
+            );
+            assert_eq!(state(&context), warm);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let mut poisoned = context
+            .store()
+            .value_symbol_links(selected)
+            .unwrap()
+            .clone();
+        poisoned.resolved_type = Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(selected, poisoned)
+        );
+        let before = state(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.recheck_source_file(consumer_file),
+                Err(SourceCheckError::DeclaredType(
+                    DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(
+                        selected
+                    ))
+                ))
+            );
+            assert_eq!(state(&context), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check lazy own lookup before full inherited-member resolution.
+    fn cold_merged_interface_inherited_reads_preserve_selected_own_properties() {
+        use crate::semantic::{
+            declared_values::{SelectedDeclaredProperty, selected_declared_property},
+            source::UnsupportedSourceSyntax,
+            variables::VariableUnsupported,
+        };
+
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Packet extends Base { value: number; unread: string; }",
+        ));
+        let added = parsed(concat!(
+            "interface Base { inherited: boolean; } ",
+            "interface Packet { added: string; }",
+        ));
+        let own_source =
+            parsed("declare const packet: Packet; const value: number = packet.value;");
+        let inherited_source = parsed("const inherited: boolean = packet.inherited;");
+        let own_file = FileId::new(28_622);
+        let inherited_file = FileId::new(28_623);
+        let files = [
+            (FileId::new(28_620), &library),
+            (FileId::new(28_621), &added),
+            (own_file, &own_source),
+            (inherited_file, &inherited_source),
+        ];
+        let mut context = source_property_context(&files, 2);
+        let (owner, selected, unread, added_member, inherited, unread_annotation) = {
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let [owner, base] = ["Packet", "Base"].map(|name| {
+                store
+                    .get_merged_symbol(globals.get_source(name).unwrap())
+                    .unwrap()
+            });
+            let members = store
+                .symbol_table(store.symbol(owner).unwrap().members().unwrap())
+                .unwrap();
+            assert_eq!(
+                store.symbol(owner).unwrap().declarations().unwrap().len(),
+                2
+            );
+            assert!(members.get_source("inherited").is_none());
+            let [selected, unread, added_member] =
+                ["value", "unread", "added"].map(|name| members.get_source(name).unwrap());
+            let inherited = store
+                .symbol_table(store.symbol(base).unwrap().members().unwrap())
+                .unwrap()
+                .get_source("inherited")
+                .unwrap();
+            let unread_annotation = store
+                .source_direct_type_annotation(
+                    store.symbol(unread).unwrap().value_declaration().unwrap(),
+                )
+                .unwrap();
+            for symbol in [selected, unread, added_member, inherited] {
+                assert!(store.value_symbol_links(symbol).is_none());
+            }
+            (
+                owner,
+                selected,
+                unread,
+                added_member,
+                inherited,
+                unread_annotation,
+            )
+        };
+        let receiver = context.get_declared_type_of_symbol(owner).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        context.check_source_file(own_file).unwrap();
+        let selected_links = context
+            .store()
+            .value_symbol_links(selected)
+            .unwrap()
+            .clone();
+        let selected_provenance = context.store().declared_value_provenance(selected).unwrap();
+        let Some(SelectedDeclaredProperty::Resolved(property)) =
+            selected_declared_property(context.store(), receiver, EscapedNameRef::source("value"))
+                .unwrap()
+        else {
+            panic!("the cold interface must retain its selected own property")
+        };
+        assert_eq!(property.symbol, selected);
+        assert_eq!(property.type_, number);
+        assert!(matches!(
+            selected_declared_property(
+                context.store(),
+                receiver,
+                EscapedNameRef::source("inherited")
+            ),
+            Ok(None)
+        ));
+        assert!(context.store().value_symbol_links(unread).is_none());
+        assert!(context.store().type_node_links(unread_annotation).is_none());
+        assert!(context.store().value_symbol_links(inherited).is_none());
+        assert!(context.diagnostics().is_empty());
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            let record = store.type_payload(receiver).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("Packet must retain its interface identity")
+            };
+            (
+                files
+                    .iter()
+                    .map(|(file, source)| class_property_cache_state(context, source, *file))
+                    .collect::<Vec<_>>(),
+                (
+                    store.type_alias_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                ),
+                [selected, unread, added_member, inherited].map(|symbol| {
+                    (
+                        store.value_symbol_links(symbol).cloned(),
+                        store.declared_value_provenance(symbol),
+                    )
+                }),
+                (record.flags(), record.object_flags(), interface.clone()),
+                files
+                    .iter()
+                    .map(|(file, _)| {
+                        store
+                            .source_file_links(context.source_file(*file).unwrap())
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let own_warm = state(&context);
+        let mut poisoned = selected_links.clone();
+        poisoned.resolved_type = Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(selected, poisoned)
+        );
+        let before = state(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                selected_declared_property(
+                    context.store(),
+                    receiver,
+                    EscapedNameRef::source("value")
+                )
+                .map(|_| ()),
+                Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+            );
+            assert_eq!(state(&context), before);
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(selected, selected_links.clone())
+        );
+        context.recheck_source_file(own_file).unwrap();
+        assert_eq!(state(&context), own_warm);
+
+        let own_access = property_access(&own_source, own_file);
+        let syntax =
+            plan_direct_source_property_syntax(&own_source.arena, context.store(), own_access)
+                .unwrap();
+        let packet = context
+            .store()
+            .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source("packet")
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, packet))
+                .unwrap();
+        let bound = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bound)
+                .map(|((_, source), bound)| (&source.arena, bound)),
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            crate::semantic::instantiate::InstantiationLimits::default(),
+            context.store().intrinsic_bootstrap().unwrap().error_type,
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(receiver, true, None, None)
+        );
+        let before = state(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                selected_declared_property(
+                    context.store(),
+                    receiver,
+                    EscapedNameRef::source("value")
+                )
+                .map(|_| ()),
+                Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+            );
+            assert!(matches!(
+                check_direct_source_property_with_source(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &plan,
+                    receiver,
+                    &mut session,
+                    &mut diagnostics,
+                ),
+                Err(SourcePropertyQueryError::Source(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::InvalidStructuredMembers(type_)
+                ))) if type_ == receiver
+            ));
+            assert_eq!(state(&context), before);
+            assert!(diagnostics.is_empty());
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(receiver, false, None, None)
+        );
+        context.recheck_source_file(own_file).unwrap();
+        assert_eq!(state(&context), own_warm);
+
+        let access = property_access(&inherited_source, inherited_file);
+        let inherited_syntax =
+            plan_direct_source_property_syntax(&inherited_source.arena, context.store(), access)
+                .unwrap();
+        let packet_declaration = context
+            .store()
+            .symbol(packet)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let bound_packet = context
+            .file(own_file)
+            .unwrap()
+            .1
+            .symbol(packet_declaration)
+            .unwrap();
+        assert_eq!(
+            context.store().get_merged_symbol(bound_packet),
+            Some(packet)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(packet)
+                .and_then(|links| links.resolved_type),
+            Some(receiver)
+        );
+        let before = state(&context);
+        assert_eq!(
+            context.check_source_file(inherited_file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Variable(VariableUnsupported::CrossFileDeclaration {
+                    node: inherited_syntax.receiver(),
+                    declaration: packet_declaration,
+                })
+            ))
+        );
+        assert_eq!(state(&context), before);
+        assert!(context.diagnostics().is_empty());
+
+        let inherited_plan = finish_direct_source_property_plan(
+            &inherited_syntax,
+            identifier_receiver(&inherited_syntax, packet),
+        )
+        .unwrap();
+        let read_inherited =
+            |context: &mut CanonicalCheckerContext<'_>,
+             session: &mut InstantiationSession,
+             diagnostics: &mut CanonicalCheckerDiagnostics| {
+                let checked = check_direct_source_property_with_source(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &inherited_plan,
+                    receiver,
+                    session,
+                    diagnostics,
+                )
+                .unwrap();
+                assert_eq!(checked.type_, boolean);
+                assert!(checked.diagnostics.is_empty());
+            };
+        read_inherited(&mut context, &mut session, &mut diagnostics);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(access)
+                .unwrap()
+                .resolved_type,
+            Some(boolean)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .unwrap()
+                .resolved_symbol,
+            Some(inherited)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(selected),
+            Some(&selected_links)
+        );
+        assert_eq!(
+            context.store().declared_value_provenance(selected),
+            Some(selected_provenance)
+        );
+        let TypeData::Interface(interface) = context.store().type_payload(receiver).unwrap().data()
+        else {
+            unreachable!()
+        };
+        assert!(interface.declared_members_resolved);
+        assert!(interface.base_types_resolved);
+        let members = context
+            .store()
+            .symbol_table(interface.reference.object.structured.members.unwrap())
+            .unwrap();
+        assert_eq!(members.get_source("value"), Some(selected));
+        assert_eq!(members.get_source("unread"), Some(unread));
+        assert_eq!(members.get_source("inherited"), Some(inherited));
+        let warm = state(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(own_file).unwrap();
+            read_inherited(&mut context, &mut session, &mut diagnostics);
+            assert_eq!(
+                context.get_declared_type_of_symbol(owner).unwrap(),
+                receiver
+            );
+            assert_eq!(state(&context), warm);
+            assert!(diagnostics.is_empty());
+            assert!(context.diagnostics().is_empty());
         }
     }
 

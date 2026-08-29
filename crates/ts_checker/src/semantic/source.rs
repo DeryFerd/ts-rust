@@ -2121,6 +2121,10 @@ struct DeferredAssertion {
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
+    MergedGlobalInterface {
+        declaration: NodeRef,
+        plan: super::object_members::MergedGlobalInterfacePlan,
+    },
     InterfaceGrammar(PlannedInterfaceGrammar),
     InvalidBigIntIndexSignature(NodeRef),
     InterfaceConflict(PlannedInterfaceConflict),
@@ -3260,6 +3264,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 ));
                             }
                             statements.push(PlannedStatement::GenericInterface(plan));
+                            continue;
+                        }
+                        if let Some(plan) =
+                            super::object_members::plan_merged_global_interface(
+                                store, host, symbol, self.array_targets,
+                            )
+                                .map_err(|error| match error {
+                                    super::object_members::PropertyObjectError::InvalidCachedInterface {
+                                        symbol,
+                                        type_,
+                                    } => SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
+                                        super::DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                                            symbol,
+                                            declared_type: type_,
+                                        },
+                                    )),
+                                    error => self.interface_plan_error(statement, error),
+                                })?
+                            && !plan.has_shared_member_checks
+                        {
+                            statements.push(PlannedStatement::MergedGlobalInterface {
+                                declaration: statement,
+                                plan,
+                            });
                             continue;
                         }
                         if let Err(error) =
@@ -56983,7 +57011,29 @@ pub(super) fn check_source_file(
     for statement in statements {
         session.reset_query();
         match statement {
+            PlannedStatement::MergedGlobalInterface { declaration, plan } => {
+                let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
+                let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut statement_diagnostics,
+                )
+                .map_err(SourceCheckError::from)
+                .and_then(|mut query| {
+                    query.check_merged_global_interface_declaration(
+                        declaration,
+                        &plan,
+                        options.no_error_truncation,
+                    )
+                });
+                merge_retry_diagnostics(diagnostics, statement_diagnostics);
+                result?;
+            }
             PlannedStatement::TypeAlias(symbol) | PlannedStatement::Interface(symbol) => {
+                let check_interface_members = matches!(statement, PlannedStatement::Interface(_));
                 let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
                 let result = CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
@@ -57000,7 +57050,13 @@ pub(super) fn check_source_file(
                         Ok(query)
                     }
                 })
-                .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
+                .and_then(|mut query| {
+                    if check_interface_members {
+                        query.get_declared_interface_for_source_check(symbol)
+                    } else {
+                        query.get_declared_type_of_symbol(symbol)
+                    }
+                });
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;
             }

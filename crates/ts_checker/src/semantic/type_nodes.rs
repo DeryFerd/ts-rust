@@ -199,6 +199,130 @@ pub(super) fn preflight_type_annotation(
     Ok(proof)
 }
 
+/// Rechecks an existing value annotation without resolving its members or writing caches.
+#[allow(clippy::too_many_lines)] // Each written reference retains its existing result provider.
+pub(super) fn validate_cached_merged_global_value_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    node: NodeRef,
+) -> Result<(), DeclaredTypeError> {
+    let strict_builtin_iterator_return = store
+        .claimed_strict_builtin_iterator_return()
+        .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery))?;
+    let aliases = HashMap::new();
+    let mut planner = TypeQueryPlanner::new(
+        store,
+        host,
+        array_targets.map(CanonicalArrayTargets::array_type),
+        array_targets,
+        strict_builtin_iterator_return,
+        &aliases,
+    );
+    planner.lazy_interface_values = true;
+    planner.replay_cached_annotations = true;
+    planner.plan_type_node(node)?;
+    for (&reference_node, reference) in &planner.plan.references {
+        if !planner.node_is_within(reference_node, node)? {
+            continue;
+        }
+        let Some(cached) = store
+            .type_node_links(reference_node)
+            .and_then(|links| links.resolved_type)
+        else {
+            continue;
+        };
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(reference_node));
+        if store
+            .symbol_node_links(reference_node)
+            .and_then(|links| links.resolved_symbol)
+            != Some(reference.symbol)
+        {
+            return Err(invalid());
+        }
+        let flags = store.symbol(reference.symbol).ok_or_else(invalid)?.flags();
+        if reference.arity != PlannedTypeReferenceArity::Valid {
+            if store
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| cached != bootstrap.error_type)
+            {
+                return Err(invalid());
+            }
+            continue;
+        }
+        if reference.global_array_target.is_some() {
+            // The array planner checked the target and element identity.
+            continue;
+        }
+        if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+            planner.validate_cached_class_or_interface_reference(
+                reference.symbol,
+                reference_node,
+                reference.symbol,
+                cached,
+            )?;
+        } else if planner
+            .plan
+            .default_library_awaited_aliases
+            .contains_key(&reference.symbol)
+        {
+            let [argument] = reference.type_arguments.as_slice() else {
+                return Err(invalid());
+            };
+            let argument = planner.cached_type_node_identity(reference.symbol, *argument)?;
+            if planner.canonical_awaited_type(reference_node, argument)? != cached {
+                return Err(invalid());
+            }
+        } else if flags.contains(SymbolFlags::TYPE_ALIAS)
+            && store
+                .type_alias_links(reference.symbol)
+                .is_some_and(|links| links.type_parameters.is_some())
+        {
+            if reference.alias_owner.is_some() {
+                return Err(invalid());
+            }
+            let intrinsic = store
+                .intrinsic_bootstrap()
+                .ok_or_else(invalid)?
+                .intrinsic_marker_type;
+            if symbol_is_string_mapping_intrinsic(store, reference.symbol)
+                && store
+                    .type_alias_links(reference.symbol)
+                    .is_some_and(|links| links.declared_type == Some(intrinsic))
+            {
+                let [argument] = reference.type_arguments.as_slice() else {
+                    return Err(invalid());
+                };
+                let argument = planner.cached_type_node_identity(reference.symbol, *argument)?;
+                if !planner.cached_string_mapping_result(
+                    reference.symbol,
+                    argument,
+                    cached,
+                    &mut HashSet::new(),
+                ) {
+                    return Err(invalid());
+                }
+            } else {
+                let arguments = reference
+                    .type_arguments
+                    .iter()
+                    .map(|&argument| planner.cached_type_node_identity(reference.symbol, argument))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !object_members::cached_alias_reference_annotation_matches(
+                    store,
+                    reference.symbol,
+                    &arguments,
+                    cached,
+                ) {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Keeps the checked source identities while the ordinary query publishes its types.
 /// Parentheses, keywords, and null do not require their own node cache entries.
 pub(super) struct ConstructorAnnotationProof {
@@ -2513,6 +2637,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     function_indirection_depth: usize,
     intersection_planning_depth: usize,
     lazy_interface_values: bool,
+    check_merged_global_interface_members: bool,
     source_callable_alias_planning: bool,
 }
 
@@ -2545,6 +2670,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             function_indirection_depth: 0,
             intersection_planning_depth: 0,
             lazy_interface_values: false,
+            check_merged_global_interface_members: false,
             source_callable_alias_planning: false,
         }
     }
@@ -7054,6 +7180,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::SymbolNotOwned(symbol),
             ))?;
+        if !self.check_merged_global_interface_members
+            && object_members::plan_merged_global_interface(
+                self.store,
+                self.host,
+                symbol,
+                self.array_targets,
+            )
+            .map_err(property_object_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
         if self.authenticated_react_svg_factory_alias_heritage(symbol) {
             return Ok(());
         }
@@ -23300,6 +23438,252 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         })
     }
 
+    /// Checks one contribution after proving the merged interface has no shared member work.
+    #[allow(clippy::too_many_lines)] // Preflight all local work before publishing the shared identity.
+    pub(super) fn check_merged_global_interface_declaration(
+        &mut self,
+        declaration: NodeRef,
+        expected: &object_members::MergedGlobalInterfacePlan,
+        no_error_truncation: bool,
+    ) -> Result<TypeId, super::source::SourceCheckError> {
+        let invalid = || {
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidInterfaceDeclaration(
+                declaration,
+            ))
+        };
+        let plan = object_members::plan_merged_global_interface(
+            self.store,
+            self.host,
+            expected.symbol,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(property_object_error)?
+        .filter(|plan| plan == expected)
+        .ok_or_else(invalid)?;
+        if plan.has_shared_member_checks || !plan.declarations.contains(&declaration) {
+            return Err(invalid().into());
+        }
+        let local_members = plan
+            .members
+            .iter()
+            .copied()
+            .filter(|(member, _)| {
+                member.is_for(declaration.arena, declaration.file)
+                    && self
+                        .host
+                        .node(*member)
+                        .is_some_and(|record| record.parent == Some(declaration.node))
+            })
+            .collect::<Vec<_>>();
+        let mut properties = HashMap::new();
+        for &(member, symbol) in &local_members {
+            match self.store.source_node_kind(member) {
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature) => {
+                    let group = object_members::plan_merged_global_interface_property(
+                        self.store, self.host, &plan, symbol,
+                    )
+                    .map_err(property_object_error)?;
+                    let mut planner = TypeQueryPlanner::new(
+                        self.store,
+                        self.host,
+                        self.array_type,
+                        self.global_types
+                            .as_ref()
+                            .map(CanonicalArrayTargets::from_global_types),
+                        self.options.strict_builtin_iterator_return,
+                        &self.type_reference_alias_targets,
+                    );
+                    planner.lazy_interface_values = true;
+                    for property in group.iter().filter(|property| {
+                        property.declaration == member
+                            || group
+                                .first()
+                                .is_some_and(|first| property.declaration == first.declaration)
+                    }) {
+                        planner.plan_type_node(property.type_node)?;
+                    }
+                    properties.insert(symbol, group);
+                }
+                Some(SyntaxKind::MethodSignature) => {
+                    self.plan_type_of_interface_method(symbol)?;
+                }
+                kind => {
+                    return Err(
+                        type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                            node: member,
+                            kind: kind.unwrap_or(SyntaxKind::Unknown),
+                        })
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // The complete declaration proof excluded generic, inherited, index,
+        // and callable-member work. A cold identity is not a checked member table.
+        let type_ = self.get_declared_type_of_symbol(plan.symbol)?;
+        let mut format_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if no_error_truncation {
+            format_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        for (member, symbol) in local_members {
+            if let Some(group) = properties.get(&symbol) {
+                let property = group
+                    .iter()
+                    .find(|property| property.declaration == member)
+                    .ok_or_else(invalid)?;
+                self.check_merged_global_interface_property(property, group, format_flags)?;
+            } else {
+                self.get_type_of_interface_method(symbol)?;
+            }
+        }
+        Ok(type_)
+    }
+
+    fn merged_global_interface_property_type(
+        &mut self,
+        property: &object_members::PlannedProperty,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let type_ = self.get_type_from_type_node_worker(property.type_node, true)?;
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery))?;
+        if !property.optional
+            || !bootstrap.options.strict_null_checks
+            || type_ == bootstrap.error_type
+        {
+            return Ok(type_);
+        }
+        let sentinel = bootstrap.undefined_or_missing_type;
+        match self.global_types.as_ref() {
+            Some(globals) => self.store.expression_union_type_with_global_types(
+                globals,
+                &[type_, sentinel],
+                UnionReduction::Literal,
+            ),
+            None => super::instantiate::canonical_anonymous_union(self.store, &[type_, sentinel]),
+        }
+        .map_err(Self::literal_cache_error)
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep duplicate type and modifier diagnostics in Go order.
+    fn check_merged_global_interface_property(
+        &mut self,
+        property: &object_members::PlannedProperty,
+        declarations: &[object_members::PlannedProperty],
+        format_flags: CanonicalTypeFormatFlags,
+    ) -> Result<(), super::source::SourceCheckError> {
+        let first = declarations.first().ok_or(DeclaredTypeError::Unavailable(
+            DeclaredTypeUnavailable::MissingDeclarations(property.symbol),
+        ))?;
+        let type_ = self.merged_global_interface_property_type(property)?;
+        if property.declaration != first.declaration {
+            let first_type = self.merged_global_interface_property_type(first)?;
+            let error = self
+                .store
+                .intrinsic_bootstrap()
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
+                })?
+                .error_type;
+            if first_type != error && type_ != error && first_type != type_ {
+                let session = self.instantiation_session.as_deref_mut().ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery)
+                })?;
+                let limit_mark = session.limit_event_mark();
+                let identical = self.store.is_type_related_to_with_session(
+                    first_type,
+                    type_,
+                    super::relation::RelationKind::Identity,
+                    self.global_types.as_ref(),
+                    self.options.strict_function_types,
+                    session,
+                );
+                let recovered = session.limit_event_occurred_since(limit_mark);
+                if recovered {
+                    self.diagnostics.add(
+                        Some(property.type_node),
+                        Diagnostic::new(
+                            message_by_code(2589).expect("TS2589 is in the diagnostic catalog"),
+                        ),
+                    );
+                }
+                if !identical? && !recovered {
+                    let render = |type_| {
+                        if let Some(globals) = self.global_types.as_ref() {
+                            super::formatter::type_to_string_with_host_global_types_and_flags(
+                                self.store,
+                                self.host,
+                                globals,
+                                type_,
+                                format_flags,
+                            )
+                        } else {
+                            super::formatter::type_to_string_with_host_and_flags(
+                                self.store,
+                                self.host,
+                                type_,
+                                format_flags,
+                            )
+                        }
+                    };
+                    let first_text = render(first_type)?;
+                    let next_text = render(type_)?;
+                    let name = property
+                        .name
+                        .as_utf8()
+                        .ok_or(DeclaredTypeError::Unavailable(
+                            DeclaredTypeUnavailable::InvalidInterfaceDeclaration(
+                                property.declaration,
+                            ),
+                        ))?;
+                    self.diagnostics
+                        .add(
+                            Some(property.name_node),
+                            Diagnostic::with_arguments(
+                                message_by_code(2717).expect("TS2717 is in the diagnostic catalog"),
+                                [name.to_owned(), first_text, next_text],
+                            ),
+                        )
+                        .related_information
+                        .push(CanonicalCheckerRelatedInformation {
+                            node: Some(first.declaration),
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(6203).expect("TS6203 is in the diagnostic catalog"),
+                                [name],
+                            ),
+                        });
+                }
+            }
+        }
+        let modifiers_differ = if property.declaration == first.declaration {
+            declarations.iter().any(|other| {
+                other.optional != property.optional || other.readonly != property.readonly
+            })
+        } else {
+            first.optional != property.optional || first.readonly != property.readonly
+        };
+        if modifiers_differ {
+            let name = property
+                .name
+                .as_utf8()
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::InvalidInterfaceDeclaration(property.declaration),
+                ))?;
+            self.diagnostics.add(
+                Some(property.name_node),
+                Diagnostic::with_arguments(
+                    message_by_code(2687).expect("TS2687 is in the diagnostic catalog"),
+                    [name],
+                ),
+            );
+        }
+        Ok(())
+    }
+
     /// Resolves the declared type identity of one symbol.
     ///
     /// # Errors
@@ -23309,6 +23693,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     pub(super) fn get_declared_type_of_symbol(
         &mut self,
         symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.get_declared_type_of_symbol_worker(symbol, false)
+    }
+
+    /// Source declarations still require their full shared member checks.
+    pub(super) fn get_declared_interface_for_source_check(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.get_declared_type_of_symbol_worker(symbol, true)
+    }
+
+    fn get_declared_type_of_symbol_worker(
+        &mut self,
+        symbol: SemanticSymbolId,
+        check_merged_global_interface_members: bool,
     ) -> Result<TypeId, DeclaredTypeError> {
         self.reject_type_reference_alias_capabilities()?;
         if let Some(target) = self.jsdoc_import_type_target {
@@ -23342,6 +23742,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &self.type_reference_alias_targets,
         )
         .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
+        planner.check_merged_global_interface_members = check_merged_global_interface_members;
         if !flags
             .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::TYPE_PARAMETER)
             && flags.contains(SymbolFlags::TYPE_ALIAS)
@@ -32190,6 +32591,624 @@ mod tests {
         )
         .unwrap();
         (context, library_file, source_file)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check valid warm demand and each damaged owner cache together.
+    fn merged_global_interface_warm_queries_reject_corrupt_owner_and_member_state() {
+        for corruption in 0..6 {
+            let library = parse_source_file(concat!(
+                "interface Packet { original: string; read(): string; } ",
+                "declare var Packet: { prototype: Packet; new(): Packet }; ",
+                "interface Other {}",
+            ));
+            let source = parse_source_file("interface Packet { added: number; }");
+            let (mut context, library_file, source_file) =
+                default_library_interface_context(&library, &source, true);
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            let packet = context
+                .store()
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Packet")
+                .unwrap();
+            let packet = context.store().get_merged_symbol(packet).unwrap();
+            let type_ = context.get_declared_type_of_symbol(packet).unwrap();
+            context.check_source_file(source_file).unwrap();
+            let property_name = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::PropertyDeclaration(property)
+                        if identifier_text(&library.arena, property.name) == Some("original") =>
+                    {
+                        Some(NodeRef::new(
+                            library.arena.id(),
+                            library_file,
+                            property.name,
+                        ))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(context.get_type_at_location(property_name), Ok(string));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_interface_base_resolution(type_, true, None, None,)
+            );
+            let warm = store_state(context.store());
+            assert_eq!(context.get_declared_type_of_symbol(packet), Ok(type_));
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(store_state(context.store()), warm);
+
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                0 => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_structured_type_members(type_, None, None, None, None, None,)
+                    );
+                }
+                1 => {
+                    assert!(context.store_mut_for_test().set_interface_base_resolution(
+                        type_,
+                        true,
+                        None,
+                        Some(vec![number]),
+                    ));
+                }
+                2 => {
+                    let other = context
+                        .store()
+                        .symbol_table(globals)
+                        .unwrap()
+                        .get_source("Other")
+                        .unwrap();
+                    let members = context.store().symbol(packet).unwrap().members();
+                    assert!(context.store_mut_for_test().set_symbol_relationships(
+                        packet,
+                        members,
+                        None,
+                        Some(other),
+                        None,
+                    ));
+                }
+                3..=5 => {
+                    let annotation = library
+                        .arena
+                        .iter()
+                        .find_map(|(_, record)| match &record.data {
+                            NodeData::VariableDeclaration(variable) => Some(NodeRef::new(
+                                library.arena.id(),
+                                library_file,
+                                variable.type_.unwrap(),
+                            )),
+                            _ => None,
+                        })
+                        .unwrap();
+                    if corruption != 4 {
+                        assert!(context.store_mut_for_test().set_value_symbol_links(
+                            packet,
+                            ValueSymbolLinks {
+                                resolved_type: Some(number),
+                                ..ValueSymbolLinks::default()
+                            },
+                        ));
+                    }
+                    if corruption != 3 {
+                        assert!(context.store_mut_for_test().set_type_node_links(
+                            annotation,
+                            TypeNodeLinks {
+                                resolved_type: Some(number),
+                                outer_type_parameters: None,
+                            },
+                        ));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let poisoned = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_declared_type_of_symbol(packet),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                            symbol: packet,
+                            declared_type: type_,
+                        },
+                    )),
+                    "corruption {corruption}",
+                );
+                assert_eq!(store_state(context.store()), poisoned);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep supported annotation publication and coupled cache damage together.
+    fn merged_global_interface_named_value_caches_require_the_annotation_result() {
+        for (target, annotation, target_name) in [
+            (
+                "interface PacketConstructor { prototype: Packet }",
+                "PacketConstructor",
+                "PacketConstructor",
+            ),
+            (
+                "interface PacketConstructor<Value> { prototype: Value }",
+                "PacketConstructor<number>",
+                "PacketConstructor",
+            ),
+            (
+                "declare class PacketConstructor { prototype: Packet }",
+                "PacketConstructor",
+                "PacketConstructor",
+            ),
+            (
+                concat!(
+                    "interface PacketConstructor<Value> { prototype: Value } ",
+                    "type ConstructorAlias<Value = number> = PacketConstructor<Value>;",
+                ),
+                "ConstructorAlias",
+                "ConstructorAlias",
+            ),
+            (
+                concat!(
+                    "interface PacketConstructor<Value> { prototype: Value } ",
+                    "type ConstructorAlias<Value = number> = PacketConstructor<Value>;",
+                ),
+                "ConstructorAlias<string>",
+                "ConstructorAlias",
+            ),
+            (
+                "type Uppercase<Value extends string> = intrinsic;",
+                "Uppercase<\"entry\">",
+                "Uppercase",
+            ),
+            (
+                concat!(
+                    "type Uppercase<Value extends string> = intrinsic; ",
+                    "interface PacketConstructor<Value> { prototype: Value } ",
+                    "type ConstructorAlias<Value = number> = PacketConstructor<Value>;",
+                ),
+                "ConstructorAlias<Uppercase<\"entry\">>",
+                "ConstructorAlias",
+            ),
+        ] {
+            let library = parse_source_file(&format!(
+                "interface Packet {{ original: string }} {target} declare var Packet: {annotation};"
+            ));
+            let source = parse_source_file("interface Packet { added: number }");
+            let (mut context, library_file, _) =
+                default_library_interface_context(&library, &source, true);
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            let packet = context
+                .store()
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Packet")
+                .unwrap();
+            let packet = context.store().get_merged_symbol(packet).unwrap();
+            let type_ = context.get_declared_type_of_symbol(packet).unwrap();
+            let constructor = context
+                .store()
+                .symbol_table(globals)
+                .unwrap()
+                .get_source(target_name)
+                .unwrap();
+            let constructor = context.store().get_merged_symbol(constructor).unwrap();
+            let annotation = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::VariableDeclaration(variable) => Some(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        variable.type_.unwrap(),
+                    )),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(context.store().declared_value_provenance(packet).is_none());
+            assert!(context.store().type_node_links(annotation).is_none());
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let annotation_type = context.get_type_from_type_node(annotation).unwrap();
+            assert_ne!(annotation_type, number);
+            let warm = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(context.get_declared_type_of_symbol(packet), Ok(type_));
+                assert_eq!(
+                    context.get_type_from_type_node(annotation),
+                    Ok(annotation_type)
+                );
+                assert!(context.store().declared_value_provenance(packet).is_none());
+                assert_eq!(store_state(context.store()), warm);
+                assert!(context.diagnostics().is_empty());
+            }
+            let symbol_links = context
+                .store()
+                .symbol_node_links(annotation)
+                .cloned()
+                .unwrap();
+            let mut missing_symbol = symbol_links.clone();
+            missing_symbol.resolved_symbol = None;
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(annotation, missing_symbol)
+            );
+            let missing_symbol_state = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_declared_type_of_symbol(packet),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                            symbol: packet,
+                            declared_type: type_,
+                        },
+                    )),
+                );
+                assert_eq!(store_state(context.store()), missing_symbol_state);
+                assert!(context.diagnostics().is_empty());
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(annotation, symbol_links)
+            );
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    outer_type_parameters: None,
+                },
+            ));
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                annotation,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(constructor),
+                },
+            ));
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                packet,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let poisoned = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_declared_type_of_symbol(packet),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                            symbol: packet,
+                            declared_type: type_,
+                        },
+                    )),
+                );
+                assert_eq!(store_state(context.store()), poisoned);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retain each arity diagnostic, cached error, and damaged-result check.
+    fn merged_global_interface_arity_errors_keep_their_cached_error_identity() {
+        for (target, annotation, code, arguments) in [
+            (
+                "type ConstructorAlias<Value> = Value;",
+                "ConstructorAlias",
+                2314,
+                vec!["ConstructorAlias", "1"],
+            ),
+            (
+                "type Uppercase<Value extends string> = intrinsic;",
+                "Uppercase",
+                2314,
+                vec!["Uppercase", "1"],
+            ),
+            ("type Plain = string;", "Plain<number>", 2315, vec!["Plain"]),
+        ] {
+            let library = parse_source_file(&format!(
+                "interface Packet {{ original: string }} {target} declare var Packet: {annotation};"
+            ));
+            let source = parse_source_file("interface Packet {}");
+            let (mut context, library_file, _) =
+                default_library_interface_context(&library, &source, true);
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            let packet = context
+                .store()
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Packet")
+                .unwrap();
+            let packet = context.store().get_merged_symbol(packet).unwrap();
+            let type_ = context.get_declared_type_of_symbol(packet).unwrap();
+            let annotation = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::VariableDeclaration(variable) => Some(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        variable.type_.unwrap(),
+                    )),
+                    _ => None,
+                })
+                .unwrap();
+            let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+            assert_eq!(context.get_type_from_type_node(annotation), Ok(error));
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("one arity diagnostic must remain attached to the annotation");
+            };
+            assert_eq!(diagnostic.node, Some(annotation));
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(diagnostic.diagnostic.arguments, arguments);
+            assert_eq!(diagnostic.range_override, None);
+            assert!(diagnostic.related_information.is_empty());
+            let diagnostics = context.diagnostics().clone();
+            let warm = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(context.get_declared_type_of_symbol(packet), Ok(type_));
+                assert_eq!(context.get_type_from_type_node(annotation), Ok(error));
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(store_state(context.store()), warm);
+            }
+            let symbol_links = context
+                .store()
+                .symbol_node_links(annotation)
+                .cloned()
+                .unwrap();
+            let mut missing_symbol = symbol_links.clone();
+            missing_symbol.resolved_symbol = None;
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(annotation, missing_symbol)
+            );
+            let missing_symbol_state = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_declared_type_of_symbol(packet),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                            symbol: packet,
+                            declared_type: type_,
+                        },
+                    )),
+                );
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(store_state(context.store()), missing_symbol_state);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(annotation, symbol_links)
+            );
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(context.store_mut_for_test().set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    outer_type_parameters: None,
+                },
+            ));
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                packet,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let poisoned = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_declared_type_of_symbol(packet),
+                    Err(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                            symbol: packet,
+                            declared_type: type_,
+                        },
+                    )),
+                );
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(store_state(context.store()), poisoned);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep valid publication, cache damage, and replay together.
+    fn merged_global_interface_duplicates_keep_primary_value_cache_proof() {
+        for optional in ["", "?"] {
+            for complete in [false, true] {
+                for corruption in 0..3 {
+                    let text = format!("interface Packet {{ original{optional}: string }}");
+                    let library = parse_source_file("interface Packet {}");
+                    let source = parse_source_file(&format!("{text} {text}"));
+                    let (mut context, _, source_file) =
+                        default_library_interface_context(&library, &source, true);
+                    let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+                    let packet = context
+                        .store()
+                        .symbol_table(globals)
+                        .unwrap()
+                        .get_source("Packet")
+                        .unwrap();
+                    let packet = context.store().get_merged_symbol(packet).unwrap();
+                    let type_ = context.get_declared_type_of_symbol(packet).unwrap();
+                    context.check_source_file(source_file).unwrap();
+                    let plan = object_members::plan_interface(
+                        context.store(),
+                        &context.declared_type_host().unwrap(),
+                        packet,
+                    )
+                    .unwrap();
+                    let property = plan.properties[0].symbol;
+                    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    if complete {
+                        let state =
+                            object_members::interface_state(context.store(), &plan, type_).unwrap();
+                        assert_eq!(
+                            object_members::publish_property_members(
+                                context.store_mut_for_test(),
+                                &plan,
+                                state,
+                                &[string],
+                            ),
+                            Ok(type_),
+                        );
+                        assert_eq!(
+                            context
+                                .store()
+                                .value_symbol_links(property)
+                                .unwrap()
+                                .resolved_type,
+                            Some(string),
+                        );
+                    }
+                    let warm = store_state(context.store());
+                    for _ in 0..2 {
+                        context.recheck_source_file(source_file).unwrap();
+                        assert_eq!(context.get_declared_type_of_symbol(packet), Ok(type_));
+                        assert_eq!(store_state(context.store()), warm);
+                        assert!(context.diagnostics().is_empty());
+                    }
+
+                    let original = context
+                        .store()
+                        .value_symbol_links(property)
+                        .cloned()
+                        .unwrap_or_default();
+                    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        property,
+                        ValueSymbolLinks {
+                            resolved_type: Some(if corruption == 0 { number } else { string }),
+                            write_type: (corruption == 1).then_some(number),
+                            target: (corruption == 2).then_some(property),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    let poisoned = store_state(context.store());
+                    for _ in 0..2 {
+                        assert_eq!(
+                            context.recheck_source_file(source_file),
+                            Err(super::super::source::SourceCheckError::DeclaredType(
+                                DeclaredTypeError::Unavailable(
+                                    DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                                        symbol: packet,
+                                        declared_type: type_,
+                                    },
+                                ),
+                            )),
+                            "optional={optional:?}, complete={complete}, corruption={corruption}",
+                        );
+                        assert_eq!(store_state(context.store()), poisoned);
+                        assert!(context.diagnostics().is_empty());
+                    }
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(property, original)
+                    );
+                    context.recheck_source_file(source_file).unwrap();
+                    assert!(context.diagnostics().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_global_interface_source_checks_do_not_skip_a_hidden_index_annotation() {
+        let library = parse_source_file("interface Packet { original: string }");
+        let source = parse_source_file("interface Packet { [key: string]: Missing }");
+        let (mut context, _, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let annotation = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let before = store_state(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(source_file),
+                Err(super::super::source::SourceCheckError::DeclaredType(
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::MissingTypeReference(annotation),
+                    ),
+                )),
+            );
+            assert_eq!(store_state(context.store()), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn merged_global_interface_source_checks_keep_hidden_shared_work_unavailable() {
+        for library_text in [
+            concat!(
+                "interface Base {} ",
+                "interface Packet extends Base { read(): string; } ",
+                "declare var Packet: number;",
+            ),
+            concat!(
+                "interface Packet { [key: string]: unknown; read(): string; } ",
+                "declare var Packet: number;",
+            ),
+            concat!(
+                "interface Packet { (): void; read(): string; } ",
+                "declare var Packet: number;",
+            ),
+            concat!(
+                "interface Packet<Value> { original: Value; } ",
+                "declare var Packet: number;",
+            ),
+        ] {
+            let library = parse_source_file(library_text);
+            let source = parse_source_file("interface Packet {}");
+            let (mut context, _, source_file) =
+                default_library_interface_context(&library, &source, true);
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let before = store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.check_source_file(source_file),
+                    Err(super::super::source::SourceCheckError::Unsupported(
+                        super::super::source::UnsupportedSourceSyntax::Syntax {
+                            node: declaration,
+                            kind: SyntaxKind::InterfaceDeclaration,
+                            role: super::super::source::SourceSyntaxRole::InterfaceDeclaration,
+                        },
+                    )),
+                    "{library_text}",
+                );
+                assert_eq!(store_state(context.store()), before);
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     fn namespace_typeof_alias_context<'arena>(

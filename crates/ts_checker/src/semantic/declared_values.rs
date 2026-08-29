@@ -547,14 +547,14 @@ pub(super) fn selected_declared_property(
         return Err(invalid());
     }
     let declarations = owner_record.declarations().ok_or_else(invalid)?;
-    for declaration in declarations {
-        if store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+    let has_heritage = declarations.iter().any(|declaration| {
+        store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
             && store
                 .source_child_with_kind(*declaration, SyntaxKind::HeritageClause)
                 .is_some()
-        {
-            return Ok(None);
-        }
+    });
+    if has_heritage && interface.base_types_resolved {
+        return Err(invalid());
     }
     if store
         .source_computed_member_count(owner)
@@ -566,11 +566,11 @@ pub(super) fn selected_declared_property(
         return Ok(None);
     }
     let Some(members) = owner_record.members() else {
-        return Ok(Some(SelectedDeclaredProperty::Missing));
+        return Ok((!has_heritage).then_some(SelectedDeclaredProperty::Missing));
     };
     let members = store.symbol_table(members).ok_or_else(invalid)?;
     let Some(symbol) = members.get(name) else {
-        return Ok(Some(SelectedDeclaredProperty::Missing));
+        return Ok((!has_heritage).then_some(SelectedDeclaredProperty::Missing));
     };
     let symbol = store.get_merged_symbol(symbol).ok_or_else(invalid)?;
     let property = store.symbol(symbol).ok_or_else(invalid)?;
@@ -729,7 +729,8 @@ fn cold_member_names_are_exact(
                     };
                     EscapedNameRef::source(name)
                 }
-                Some(SyntaxKind::TypeParameter | SyntaxKind::HeritageClause) => return Ok(false),
+                Some(SyntaxKind::TypeParameter) => return Ok(false),
+                // Heritage clauses do not declare own member names.
                 Some(_) => continue,
                 None => return Err(invalid()),
             };

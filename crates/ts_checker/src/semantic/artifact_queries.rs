@@ -1293,6 +1293,7 @@ impl CanonicalCheckerContext<'_> {
         Ok(Some(type_))
     }
 
+    #[allow(clippy::too_many_lines)] // Keep declaration ownership and each cache-origin check together.
     fn type_declaration_artifact_symbol(
         &self,
         node: NodeRef,
@@ -1301,7 +1302,9 @@ impl CanonicalCheckerContext<'_> {
             let (arena, bound, record) = self.validated_artifact_node(node)?;
             let declaration = if matches!(
                 record.data,
-                NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_)
+                NodeData::ClassDeclaration(_)
+                    | NodeData::InterfaceDeclaration(_)
+                    | NodeData::EnumDeclaration(_)
             ) {
                 node
             } else if let Some(parent) = record.parent {
@@ -1310,7 +1313,9 @@ impl CanonicalCheckerContext<'_> {
                 };
                 if !matches!(
                     parent_record.data,
-                    NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_)
+                    NodeData::ClassDeclaration(_)
+                        | NodeData::InterfaceDeclaration(_)
+                        | NodeData::EnumDeclaration(_)
                 ) || declaration_name(&parent_record.data) != Some(node.node)
                 {
                     return Ok(None);
@@ -1335,6 +1340,17 @@ impl CanonicalCheckerContext<'_> {
                 ),
             )
         };
+        if matches!(
+            self.validated_artifact_node(declaration)?.2.data,
+            NodeData::InterfaceDeclaration(_)
+        ) && self.store().symbol(symbol).is_none_or(|owner| {
+            !owner.flags().contains(SymbolFlags::INTERFACE)
+                || owner
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&declaration))
+        }) {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
         let cached = self.cached_artifact_type(node)?;
         if is_enum {
             if self.store().get_merged_symbol(symbol) != Some(symbol) {
@@ -1370,13 +1386,25 @@ impl CanonicalCheckerContext<'_> {
                     .into(),
                 );
             }
-        } else if let Some(cached) = cached
-            && super::declared::cached_class_type(self.store(), symbol)? != Some(cached)
-        {
-            return Err(CanonicalArtifactQueryError::InvalidType {
-                node,
-                type_: cached,
-            });
+        } else if let Some(cached) = cached {
+            let declared = if matches!(
+                self.validated_artifact_node(declaration)?.2.data,
+                NodeData::ClassDeclaration(_)
+            ) || self
+                .store()
+                .symbol(symbol)
+                .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
+            {
+                super::declared::cached_class_type(self.store(), symbol)?
+            } else {
+                super::declared::cached_interface_type(self.store(), symbol)?
+            };
+            if declared != Some(cached) {
+                return Err(CanonicalArtifactQueryError::InvalidType {
+                    node,
+                    type_: cached,
+                });
+            }
         }
         Ok(Some(symbol))
     }
@@ -6008,6 +6036,470 @@ mod tests {
             }),
         );
         assert_eq!(context.get_type_at_location(declaration), Ok(instance));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source value publication and both declaration cache states together.
+    fn interface_declaration_queries_keep_instance_and_value_types_separate() {
+        let library =
+            parse_source_file("interface Packet { original: string; } declare var Packet: number;");
+        let augmentation = parse_source_file("interface Packet {}");
+        let consumer = parse_source_file("const observed: number = Packet;");
+        let library_file = FileId::new(147_201);
+        let augmentation_file = FileId::new(147_202);
+        let consumer_file = FileId::new(147_203);
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path, declaration, default_library) in [
+            (library_file, &library, "\"/lib/packet.d.ts\"", true, true),
+            (
+                augmentation_file,
+                &augmentation,
+                "\"/project/packet.d.ts\"",
+                true,
+                false,
+            ),
+            (
+                consumer_file,
+                &consumer,
+                "\"/project/consumer.ts\"",
+                false,
+                false,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (augmentation_file, &augmentation.arena),
+                (consumer_file, &consumer.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let mut locations = Vec::new();
+        for (file, parsed) in [(library_file, &library), (augmentation_file, &augmentation)] {
+            for (node, record) in parsed.arena.iter() {
+                if let NodeData::InterfaceDeclaration(interface) = &record.data {
+                    locations.extend([
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, interface.name),
+                    ]);
+                }
+            }
+        }
+        assert_eq!(locations.len(), 4);
+        let raw_owner = context
+            .file(library_file)
+            .unwrap()
+            .1
+            .symbol(locations[0])
+            .unwrap();
+        let owner = context.store().get_merged_symbol(raw_owner).unwrap();
+        let (value_name, annotation) = library
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(library.arena.id(), library_file, variable.name),
+                    NodeRef::new(library.arena.id(), library_file, variable.type_.unwrap()),
+                ))
+            })
+            .unwrap();
+        let value_read = consumer
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    consumer.arena.id(),
+                    consumer_file,
+                    variable.initializer.unwrap(),
+                ))
+            })
+            .unwrap();
+        let source = context.source_file(consumer_file).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let instance = context.get_declared_type_of_symbol(owner).unwrap();
+        assert_ne!(instance, number);
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.store().type_node_links(annotation).is_none());
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            let TypeData::Interface(data) = store.type_payload(instance).unwrap().data() else {
+                panic!("the declaration must keep its interface type");
+            };
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths().to_vec(),
+                data.clone(),
+                store.declared_type_links(owner).cloned(),
+                store.value_symbol_links(owner).cloned(),
+                locations
+                    .iter()
+                    .copied()
+                    .chain([value_name, annotation, value_read])
+                    .map(|node| {
+                        (
+                            node,
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                store.source_file_links(source).cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        for publish_value in [false, true] {
+            if publish_value {
+                context.check_source_file(consumer_file).unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(owner)
+                        .and_then(|links| links.resolved_type),
+                    Some(number),
+                );
+                for node in [value_name, value_read] {
+                    assert_eq!(context.get_type_at_location(node), Ok(number));
+                }
+            }
+            let warm = state(&context);
+            for _ in 0..2 {
+                for &node in &locations {
+                    assert_eq!(context.get_type_at_location(node), Ok(instance));
+                    assert_eq!(context.get_symbol_at_location(node), Ok(Some(owner)));
+                }
+                assert_eq!(state(&context), warm);
+            }
+            if !publish_value {
+                assert!(context.store().value_symbol_links(owner).is_none());
+                assert!(context.store().type_node_links(annotation).is_none());
+            }
+            for &node in &locations {
+                let original = context
+                    .store()
+                    .type_node_links(node)
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                let damaged = state(&context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.get_type_at_location(node),
+                        Err(CanonicalArtifactQueryError::InvalidType {
+                            node,
+                            type_: number,
+                        }),
+                    );
+                    assert_eq!(state(&context), damaged);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(node, original)
+                );
+                assert_eq!(context.get_type_at_location(node), Ok(instance));
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn interface_declaration_queries_keep_merged_class_cache_proof() {
+        for source in [
+            "declare class Packet {} interface Packet {}",
+            "interface Packet {} declare class Packet {}",
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(147_204);
+            let mut context = declaration_context(&parsed, file);
+            let locations = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let name = match &record.data {
+                        NodeData::ClassDeclaration(class) => class.name.unwrap(),
+                        NodeData::InterfaceDeclaration(interface) => interface.name,
+                        _ => return None,
+                    };
+                    Some([
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, name),
+                    ])
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(locations.len(), 4);
+            let raw_owner = context.file(file).unwrap().1.symbol(locations[0]).unwrap();
+            let owner = context.store().get_merged_symbol(raw_owner).unwrap();
+            let instance = context.get_declared_type_of_symbol(owner).unwrap();
+            assert!(
+                context
+                    .store()
+                    .type_payload(instance)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::CLASS)
+            );
+            for &node in &locations {
+                assert_eq!(context.get_type_at_location(node), Ok(instance));
+                assert_eq!(context.get_symbol_at_location(node), Ok(Some(owner)));
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(instance),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [store.type_len(), store.symbol_len(), store.signature_len()],
+                    store.checker_link_allocated_lengths().to_vec(),
+                    store.declared_type_links(owner).cloned(),
+                    store.value_symbol_links(owner).cloned(),
+                    locations
+                        .iter()
+                        .map(|node| store.type_node_links(*node).cloned())
+                        .collect::<Vec<_>>(),
+                    context.diagnostics().clone(),
+                )
+            };
+            let warm = state(&context);
+            for _ in 0..2 {
+                for &node in &locations {
+                    assert_eq!(context.get_type_at_location(node), Ok(instance));
+                }
+                assert_eq!(state(&context), warm);
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn interface_declaration_queries_reject_redirected_symbol_owners() {
+        let parsed = parse_source_file("interface Packet {} interface Other {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(147_205);
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                Some([
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, interface.name),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let [packet, other] = declarations.as_slice() else {
+            panic!("expected two interface declarations");
+        };
+        for warm in [false, true] {
+            let mut context = declaration_context(&parsed, file);
+            let bound = context.file(file).unwrap().1;
+            let packet_symbol = bound.symbol(packet[0]).unwrap();
+            let other_symbol = bound.symbol(other[0]).unwrap();
+            if warm {
+                for node in packet.iter().chain(other) {
+                    context.get_type_at_location(*node).unwrap();
+                }
+            }
+            context
+                .store_mut_for_test()
+                .record_merged_symbol(other_symbol, packet_symbol)
+                .unwrap();
+            assert_eq!(
+                context.store().get_merged_symbol(packet_symbol),
+                Some(other_symbol),
+            );
+            let state = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [store.type_len(), store.symbol_len(), store.signature_len()],
+                    store.checker_link_allocated_lengths().to_vec(),
+                    [packet_symbol, other_symbol]
+                        .map(|symbol| store.declared_type_links(symbol).cloned()),
+                    packet
+                        .iter()
+                        .chain(other)
+                        .map(|node| {
+                            (
+                                store.type_node_links(*node).cloned(),
+                                store.symbol_node_links(*node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    context.diagnostics().clone(),
+                )
+            };
+            let damaged = state(&context);
+            for _ in 0..2 {
+                for &node in packet {
+                    assert_eq!(
+                        context.get_type_at_location(node),
+                        Err(CanonicalArtifactQueryError::InvalidSymbol {
+                            node,
+                            symbol: other_symbol,
+                        }),
+                    );
+                    assert_eq!(state(&context), damaged);
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve the class-origin error for both cached declaration locations.
+    fn class_declaration_queries_reject_cached_interface_redirects() {
+        let parsed = parse_source_file("declare class Model {} interface Other {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(147_206);
+        let mut context = declaration_context(&parsed, file);
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, class.name.unwrap()),
+                ))
+            })
+            .unwrap();
+        let other =
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::InterfaceDeclaration(_))
+                        .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let other_owner = context.file(file).unwrap().1.symbol(other).unwrap();
+        let instance = context.get_type_at_location(declaration).unwrap();
+        let other_type = context.get_type_at_location(other).unwrap();
+        assert_ne!(instance, other_type);
+        assert!(
+            context
+                .store()
+                .symbol(other_owner)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE)
+        );
+        assert!(
+            !context
+                .store()
+                .symbol(other_owner)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::CLASS)
+        );
+        context
+            .store_mut_for_test()
+            .record_merged_symbol(other_owner, owner)
+            .unwrap();
+        assert_eq!(context.store().get_merged_symbol(owner), Some(other_owner));
+        for node in [declaration, name] {
+            assert!(context.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(other_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+        }
+        let source = context.source_file(file).unwrap();
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                ],
+                store.checker_link_allocated_lengths().to_vec(),
+                [owner, other_owner].map(|symbol| {
+                    (
+                        store.declared_type_links(symbol).cloned(),
+                        store.value_symbol_links(symbol).cloned(),
+                    )
+                }),
+                [declaration, name, other].map(|node| {
+                    (
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                    )
+                }),
+                store.source_file_links(source).cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let damaged = state(&context);
+        for _ in 0..2 {
+            for node in [declaration, name] {
+                assert_eq!(
+                    context.get_type_at_location(node),
+                    Err(CanonicalArtifactQueryError::DeclaredType(
+                        crate::semantic::DeclaredTypeError::Unavailable(
+                            crate::semantic::DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                                symbol: other_owner,
+                                declared_type: other_type,
+                            },
+                        ),
+                    )),
+                );
+                assert_eq!(state(&context), damaged);
+            }
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
