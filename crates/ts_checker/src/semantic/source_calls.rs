@@ -8017,7 +8017,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, IntrinsicBootstrapOptions, SourceFileLinks,
+        CanonicalCheckerContext, DeclaredTypeError, IntrinsicBootstrapOptions, SourceFileLinks,
         bootstrap::UnionReduction,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
