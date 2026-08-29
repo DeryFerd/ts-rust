@@ -9333,6 +9333,43 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// Publishes one source-checked partial construct's immutable parameter list.
+    /// The interface's complete callable set is not published by this operation.
+    pub(super) fn set_partial_declared_construct_parameter_types(
+        &mut self,
+        plan: &super::object_members::PropertyObjectPlan,
+        declaration: NodeRef,
+        signature: SignatureId,
+        parameter_types: Vec<TypeId>,
+    ) -> bool {
+        if self
+            .callable_signature_parameter_types
+            .contains_key(&signature)
+            || !super::object_members::validate_partial_declared_construct_parameter_types(
+                self,
+                plan,
+                declaration,
+                signature,
+                &parameter_types,
+            )
+            || !self.try_reserve_callable_signature_parameter_types(1)
+        {
+            return false;
+        }
+        let relation_dirty = self.relation_signature_is_observable(signature);
+        let previous = self
+            .callable_signature_parameter_types
+            .insert(signature, parameter_types);
+        assert!(
+            previous.is_none(),
+            "the partial construct parameter list was absent"
+        );
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
+        true
+    }
+
     /// Checks mapped Array.sort callbacks before storing their source identity.
     #[allow(clippy::too_many_lines)] // The callee, source parameters, and mapped target form one proof.
     pub(super) fn set_contextual_source_callable_provenance(

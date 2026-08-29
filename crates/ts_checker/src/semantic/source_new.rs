@@ -4,7 +4,8 @@
 //! constructor branch of pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
-//! exported ambient class, an earlier ambient variable, an authenticated class
+//! exported ambient class, an earlier ambient variable, a named constructor
+//! interface reached through an annotated ambient value, an authenticated class
 //! constructor union, or a global `Object`, `Boolean`, `Array`, `Date`, or
 //! `Promise` constructor. Imported ambient classes retain primitive constructor
 //! arguments and canonical generic instantiations. Global arrays retain their
@@ -40,6 +41,7 @@ use super::{
     },
     declared::{execute_type_parameter, preflight_class_or_interface_reference},
     functions::plan_function_type,
+    instantiate::InstantiationSession,
     jsdoc::leading_jsdoc_comment,
     object_members::{
         PropertyObjectPlan, PropertyObjectState, object_literal_state, plan_interface,
@@ -183,7 +185,7 @@ enum SourceNewTarget {
     GlobalObject(SourceGlobalObjectConstructorPlan),
     GlobalArray(SourceGlobalArrayConstructorPlan),
     GlobalDate(SourceGlobalDateConstructorPlan),
-    GlobalError(global_error::ErrorConstructorPlan),
+    DeclaredInterface(global_error::DeclaredConstructorPlan),
     GlobalPromise(SourceGlobalPromiseConstructorPlan),
 }
 
@@ -986,23 +988,6 @@ pub(super) fn plan_direct_default_new(
         }
         let global = plan_global_date_constructor(store, host, constructor, symbol)?;
         (SourceNewTarget::GlobalDate(global), None)
-    } else if identifier.text == "Error"
-        && symbol_record
-            .value_declaration()
-            .is_some_and(|declaration| store.source_is_default_library_declaration(declaration))
-        && store
-            .intrinsic_bootstrap()
-            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-            .and_then(|globals| globals.get_source("Error"))
-            .and_then(|symbol| store.get_merged_symbol(symbol))
-            == Some(symbol)
-    {
-        let global = global_error::plan(store, host, constructor, symbol)?;
-        let parameter = argument
-            .as_ref()
-            .map(|_| global_error::message_parameter(store, host, &global))
-            .transpose()?;
-        (SourceNewTarget::GlobalError(global), parameter)
     } else if global_promise {
         let Some(executor) = executor else {
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
@@ -1069,6 +1054,10 @@ pub(super) fn plan_direct_default_new(
             return Err(unsupported(SourceNewUnsupported::Arguments(node)));
         }
         (SourceNewTarget::Class(Box::new(class)), parameter)
+    } else if global_error::is_named_interface_value(store, host, symbol) {
+        let declared = global_error::plan(store, host, constructor, symbol, argument.as_ref())?;
+        let parameter = declared.parameter;
+        (SourceNewTarget::DeclaredInterface(declared), parameter)
     } else if matches!(
         symbol_record.flags(),
         SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
@@ -3854,14 +3843,15 @@ pub(super) fn preflight_direct_default_new(
                 )));
             }
         }
-        SourceNewTarget::GlobalError(expected) => {
-            let actual = global_error::plan(store, host, plan.constructor, plan.resolved_symbol)?;
-            let parameter = plan
-                .argument
-                .as_ref()
-                .map(|_| global_error::message_parameter(store, host, &actual))
-                .transpose()?;
-            if actual != *expected || plan.parameter != parameter {
+        SourceNewTarget::DeclaredInterface(expected) => {
+            let actual = global_error::plan(
+                store,
+                host,
+                plan.constructor,
+                plan.resolved_symbol,
+                plan.argument.as_ref(),
+            )?;
+            if actual != *expected || plan.parameter != actual.parameter {
                 return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 )));
@@ -3892,14 +3882,17 @@ pub(super) fn preflight_direct_default_new(
     preflight_default_new_cache(store, host, plan)
 }
 
-/// Revalidates every retained construction before reserving any sparse link
-/// capacity, then installs only empty default slots. No construction may
-/// execute until its complete preparation batch succeeds.
+/// Revalidates every construction, prepares required constructor signatures,
+/// then reserves the use-site links. Expressions execute only after this
+/// complete preparation batch succeeds.
+#[allow(clippy::too_many_arguments)] // Preparation shares the source query's session and diagnostics.
 pub(super) fn prepare_direct_default_news(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     plans: &[SourceDefaultNewPlan],
 ) -> Result<(), SourceNewError> {
     let Some(capacity_node) = plans.first().map(|plan| plan.node) else {
@@ -3927,8 +3920,17 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
-            SourceNewTarget::GlobalError(global) => {
-                global_error::prepare(store, host, global_types, options, plan, global)?;
+            SourceNewTarget::DeclaredInterface(declared) => {
+                global_error::prepare(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    plan,
+                    declared,
+                )?;
             }
             SourceNewTarget::GlobalObject(global)
                 if resolved_global_object_constructor(store, plan, global)?.is_none() =>
@@ -5078,12 +5080,13 @@ pub(super) fn check_direct_default_new(
                 ))
             })?
         }
-        SourceNewTarget::GlobalError(global) => global_error::resolve(store, plan, global)?
-            .ok_or_else(|| {
+        SourceNewTarget::DeclaredInterface(declared) => {
+            global_error::resolve(store, host, plan, declared)?.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 ))
-            })?,
+            })?
+        }
         SourceNewTarget::GlobalPromise(global) => {
             resolved_global_promise_constructor(store, plan, global)?.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
@@ -6470,8 +6473,8 @@ fn preflight_default_new_cache(
                 )));
             }
         }
-        SourceNewTarget::GlobalError(global) => {
-            let resolved = global_error::resolve(store, plan, global)?;
+        SourceNewTarget::DeclaredInterface(declared) => {
+            let resolved = global_error::resolve(store, host, plan, declared)?;
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
@@ -10358,6 +10361,77 @@ mod tests {
                 "{source}",
             );
         }
+    }
+
+    #[test]
+    fn named_constructor_values_select_distinct_returns_without_a_prototype() {
+        let parsed = parse_source_file(concat!(
+            "interface Factory { new(value: string): string; new(value: number): number; label: string; } ",
+            "declare const Build: Factory; ",
+            "const text = new Build(\"ready\"); const count = new Build(1);",
+        ));
+        let file = FileId::new(1_983);
+        let mut context = context(&parsed, file);
+        let (text, text_value) = variable_new(&parsed, file, "text");
+        let (count, count_value) = variable_new(&parsed, file, "count");
+        context.check_source_file(file).unwrap();
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let text_signature = store
+            .signature_links(text)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let count_signature = store
+            .signature_links(count)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        assert_ne!(text_signature, count_signature);
+        assert_eq!(
+            store.type_node_links(text).unwrap().resolved_type,
+            Some(bootstrap.string_type)
+        );
+        assert_eq!(
+            store.type_node_links(count).unwrap().resolved_type,
+            Some(bootstrap.number_type)
+        );
+        assert_eq!(
+            store.type_node_links(text_value),
+            store.type_node_links(count_value)
+        );
+        assert_eq!(
+            store
+                .signature(text_signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(bootstrap.string_type)
+        );
+        assert_eq!(
+            store
+                .signature(count_signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(bootstrap.number_type)
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            warm
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

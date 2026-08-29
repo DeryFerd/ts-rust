@@ -55881,8 +55881,16 @@ pub(super) fn check_source_file(
         .filter(|construction| construction.requires_early_preparation())
         .cloned()
         .collect::<Vec<_>>();
-    prepare_direct_default_news(store, host, global_types, options, &early_default_news)
-        .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
+    prepare_direct_default_news(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        &early_default_news,
+    )
+    .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
 
     let materialized_overloads = materialize_source_overloads(
         store,
@@ -56569,8 +56577,16 @@ pub(super) fn check_source_file(
         inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
-    prepare_direct_default_news(store, host, global_types, options, &default_news)
-        .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
+    prepare_direct_default_news(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        &default_news,
+    )
+    .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
     for statement in statements {
         session.reset_query();
         match statement {

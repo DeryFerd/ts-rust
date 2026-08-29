@@ -1,539 +1,384 @@
+//! New-expression adapter for the shared declared constructor-value provider.
+
+use super::super::{
+    constructor_values::{
+        DeclaredConstructorValueError, DeclaredConstructorValuePlan,
+        plan_declared_constructor_value, prepare_declared_construct_signature,
+        resolve_declared_construct_signature,
+    },
+    instantiate::InstantiationSession,
+    object_members::PropertyObjectError,
+};
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
-    CanonicalTypeMapperStore, CanonicalTypeQuery, CheckFlags, CheckedSourceDefaultNew,
-    DeclaredTypeHost, InternalSymbolName, NodeData, NodeRef, ObjectFlags, ResolvedSignatureState,
-    SemanticSymbolId, SignatureFlags, SignatureLinks, SourceDefaultNewPlan, SourceNewError,
-    SourceNewInvariant, SourceNewParameter, SourceNewUnsupported, SymbolFlags, SymbolNodeLinks,
-    SyntaxKind, TypeFlags, TypeNodeLinks, ValueSymbolLinks, exact_class_value_type,
-    exact_signature_cache, exact_symbol_cache, exact_type_cache, invariant,
-    optional_constructor_parameter_type, preflight_class_or_interface_reference, unsupported,
+    CanonicalTypeMapperStore, CheckedSourceDefaultNew, DeclaredTypeHost, NodeData, NodeRef,
+    SemanticSymbolId, SourceDefaultNewPlan, SourceNewArgument, SourceNewArgumentValue,
+    SourceNewError, SourceNewInvariant, SourceNewParameter, SourceNewUnsupported, SymbolFlags,
+    SyntaxKind, argument_matches_parameter, invariant, unsupported,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ErrorConstructorPlan {
-    annotation: NodeRef,
-    owner: SemanticSymbolId,
+pub(super) struct DeclaredConstructorPlan {
+    value: DeclaredConstructorValuePlan,
     declaration: NodeRef,
-    return_annotation: NodeRef,
-    parameters: Vec<(NodeRef, SemanticSymbolId, NodeRef)>,
+    pub(super) parameter: Option<SourceNewParameter>,
 }
 
-fn invalid(node: NodeRef) -> SourceNewError {
-    invariant(SourceNewInvariant::InvalidConstructorCache(node))
+fn provider_error(
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    error: DeclaredConstructorValueError,
+) -> SourceNewError {
+    match error {
+        DeclaredConstructorValueError::DeclaredType(error) => error.into(),
+        DeclaredConstructorValueError::Capacity(node)
+        | DeclaredConstructorValueError::Members(PropertyObjectError::Capacity(node)) => {
+            invariant(SourceNewInvariant::Capacity(node))
+        }
+        DeclaredConstructorValueError::Unsupported { .. }
+        | DeclaredConstructorValueError::Members(PropertyObjectError::UnsupportedMember {
+            ..
+        }) => unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        }),
+        DeclaredConstructorValueError::InvalidValue(_)
+        | DeclaredConstructorValueError::InvalidSignature(_)
+        | DeclaredConstructorValueError::Members(_) => {
+            invariant(SourceNewInvariant::InvalidConstructorCache(constructor))
+        }
+    }
 }
 
-fn reference_names(
+/// Keeps existing type-literal, alias, union, and class routes outside this adapter.
+pub(super) fn is_named_interface_value(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    node: NodeRef,
     symbol: SemanticSymbolId,
 ) -> bool {
-    let Some(record) = host.node(node) else {
+    let Some(value) = store.symbol(symbol) else {
         return false;
     };
-    let NodeData::TypeReferenceNode(reference) = &record.data else {
+    if !value
+        .flags()
+        .intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE)
+    {
+        return false;
+    }
+    let Some(declaration) = value.value_declaration() else {
         return false;
     };
-    let name = NodeRef::new(node.arena, node.file, reference.type_name);
-    record.kind == SyntaxKind::TypeReference
-        && record.flags.0 == 0
-        && reference.type_arguments.is_none()
-        && host
-            .name_resolver_host(store)
-            .ok()
-            .and_then(|mut resolver| {
-                resolver
-                    .resolve_entity_name(name, SymbolFlags::TYPE)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|raw| store.get_merged_symbol(raw))
-            == Some(symbol)
+    let Some(NodeData::VariableDeclaration(variable)) =
+        host.node(declaration).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(annotation) = variable
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return false;
+    };
+    let Some(NodeData::TypeReferenceNode(reference)) = host.node(annotation).map(|node| &node.data)
+    else {
+        return false;
+    };
+    host.name_resolver_host(store)
+        .ok()
+        .and_then(|mut resolver| {
+            resolver
+                .resolve_entity_name(
+                    NodeRef::new(annotation.arena, annotation.file, reference.type_name),
+                    SymbolFlags::TYPE,
+                )
+                .ok()
+                .flatten()
+        })
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|owner| owner.flags().contains(SymbolFlags::INTERFACE))
 }
 
-// Select a real Error overload with optional parameters.
+/// Applies the admitted primitive-argument overload selection to real source signatures.
 pub(super) fn plan(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     constructor: NodeRef,
     symbol: SemanticSymbolId,
-) -> Result<ErrorConstructorPlan, SourceNewError> {
-    let reject = || {
-        unsupported(SourceNewUnsupported::ConstructorClass {
-            node: constructor,
-            symbol,
-        })
-    };
-    let globals = store
-        .intrinsic_bootstrap()
-        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-        .ok_or_else(reject)?;
-    let error = store.symbol(symbol).ok_or_else(reject)?;
-    let declaration = error.value_declaration().ok_or_else(reject)?;
-    let owner = globals
-        .get_source("ErrorConstructor")
-        .and_then(|raw| store.get_merged_symbol(raw))
-        .ok_or_else(reject)?;
-    let owner_record = store.symbol(owner).ok_or_else(reject)?;
-    let declarations = owner_record.declarations().ok_or_else(reject)?;
-    if globals.get_source("Error").and_then(|raw| store.get_merged_symbol(raw)) != Some(symbol)
-        || !super::super::object_members::authenticated_default_library_interface_owner(
-            store, symbol,
-        )
-        || error.flags().without(SymbolFlags::TRANSIENT)
-            != SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
-        || error.declarations().is_none_or(|declarations| {
-            declarations.iter().any(|declaration| {
-                !matches!(
-                    store.source_node_kind(*declaration),
-                    Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::VariableDeclaration)
-                )
-            }) || declarations.iter().copied().find(|declaration| {
-                store.source_node_kind(*declaration) == Some(SyntaxKind::VariableDeclaration)
-            }) != Some(declaration)
-        })
-        || !store.source_is_default_library_declaration(declaration)
-        || error.parent().is_some()
-        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
-        || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.parent().is_some()
-        || owner_record.value_declaration().is_some()
-        || owner_record.exports().is_some()
-        || owner_record.export_symbol().is_some()
-        || !store.source_merged_symbol_declarations_match(owner)
-        || declarations.is_empty()
-        || declarations.iter().any(|node| {
-            !store.source_is_default_library_declaration(*node)
-                || !matches!(host.node(*node).map(|node| &node.data), Some(NodeData::InterfaceDeclaration(interface)) if interface.type_parameters.is_none() && interface.heritage_clauses.is_none())
-        })
-    {
-        return Err(reject());
-    }
-    let NodeData::VariableDeclaration(variable) = &host.node(declaration).ok_or_else(reject)?.data
-    else {
-        return Err(reject());
-    };
-    let annotation = variable
-        .type_
-        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
-        .ok_or_else(reject)?;
-    if variable.initializer.is_some() || !reference_names(store, host, annotation, owner) {
-        return Err(reject());
-    }
-    for provider in [symbol, owner] {
-        let flags = store.symbol(provider).ok_or_else(reject)?.flags();
-        if preflight_class_or_interface_reference(store, host, provider, flags)? != 0 {
-            return Err(reject());
-        }
-    }
-    let signature_symbol = owner_record
-        .members()
-        .and_then(|members| store.symbol_table(members))
-        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
-        .and_then(|raw| store.get_merged_symbol(raw))
-        .ok_or_else(reject)?;
-    let signature = store.symbol(signature_symbol).ok_or_else(reject)?;
-    if signature.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::SIGNATURE
-        || signature.check_flags() != CheckFlags::NONE
-        || signature.value_declaration().is_some()
-        || signature.members().is_some()
-        || signature.exports().is_some()
-        || signature.export_symbol().is_some()
-        || store.get_parent_of_symbol(signature_symbol) != Some(owner)
-        || !store.source_merged_symbol_declarations_match(signature_symbol)
-    {
-        return Err(reject());
-    }
-    let mut groups: Vec<(NodeRef, Vec<ErrorConstructorPlan>)> = Vec::new();
-    for &node in signature.declarations().ok_or_else(reject)? {
-        let record = host.node(node).ok_or_else(reject)?;
-        let NodeData::ConstructSignatureDeclaration(data) = &record.data else {
-            return Err(reject());
-        };
-        let parent = record
-            .parent
-            .map(|parent| NodeRef::new(node.arena, node.file, parent))
-            .ok_or_else(reject)?;
-        let return_annotation = data
-            .type_
-            .map(|node_id| NodeRef::new(node.arena, node.file, node_id))
-            .ok_or_else(reject)?;
-        if record.kind != SyntaxKind::ConstructSignature
-            || record.flags.0 != 0
-            || !declarations.contains(&parent)
-            || data.type_parameters.is_some()
-            || data.full_signature.is_some()
-            || data.next_container.is_some()
-            || data.symbol.is_some()
-            || data.parameters.has_trailing_comma
-            || data.parameters.nodes.len() > 2
-            || !reference_names(store, host, return_annotation, symbol)
-            || host
-                .node(return_annotation)
-                .is_none_or(|record| record.parent != Some(node.node))
-            || !host.symbol_matches(store, node, signature_symbol)
-        {
-            return Err(reject());
-        }
-        let bound = host.bound_file(node).ok_or_else(reject)?;
-        let locals = bound
-            .locals(node)
-            .and_then(|locals| store.symbol_table(locals))
-            .ok_or_else(reject)?;
-        let mut parameters = Vec::new();
-        for &parameter_id in &data.parameters.nodes {
-            let parameter = NodeRef::new(node.arena, node.file, parameter_id);
-            let record = host.node(parameter).ok_or_else(reject)?;
-            let NodeData::ParameterDeclaration(data) = &record.data else {
-                return Err(reject());
-            };
-            let symbol = bound.symbol(parameter).ok_or_else(reject)?;
-            let parameter_symbol = store.symbol(symbol).ok_or_else(reject)?;
-            let annotation = data
-                .type_
-                .map(|id| NodeRef::new(node.arena, node.file, id))
-                .ok_or_else(reject)?;
-            let question = data
-                .question_token
-                .map(|id| NodeRef::new(node.arena, node.file, id))
-                .ok_or_else(reject)?;
-            let name = NodeRef::new(node.arena, node.file, data.name);
-            let Some(NodeData::Identifier(name)) = host.node(name).map(|node| &node.data) else {
-                return Err(reject());
-            };
-            if record.kind != SyntaxKind::Parameter
-                || record.flags.0 != 0
-                || record.parent != Some(node.node)
-                || data.initializer.is_some()
-                || data.dot_dot_dot_token.is_some()
-                || data.modifiers.is_some()
-                || data.symbol.is_some()
-                || data.facts != 0
-                || name.text == "this"
-                || host.node(question).is_none_or(|token| {
-                    token.kind != SyntaxKind::QuestionToken || token.parent != Some(parameter.node)
-                })
-                || host
-                    .node(annotation)
-                    .is_none_or(|node| node.parent != Some(parameter.node))
-                || parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
-                || parameter_symbol.check_flags() != CheckFlags::NONE
-                || parameter_symbol.name().as_utf8() != Some(name.text.as_str())
-                || parameter_symbol.declarations() != Some(&[parameter])
-                || parameter_symbol.value_declaration() != Some(parameter)
-                || parameter_symbol.parent().is_some()
-                || parameter_symbol.members().is_some()
-                || parameter_symbol.exports().is_some()
-                || parameter_symbol.export_symbol().is_some()
-                || locals.get_source(&name.text) != Some(symbol)
-                || store.get_merged_symbol(symbol) != Some(symbol)
-            {
-                return Err(reject());
+    argument: Option<&SourceNewArgument>,
+) -> Result<DeclaredConstructorPlan, SourceNewError> {
+    let value = plan_declared_constructor_value(store, host, symbol)
+        .map_err(|error| provider_error(constructor, symbol, error))?;
+    let invalid = || invariant(SourceNewInvariant::InvalidConstructorCache(constructor));
+    let mut candidates = Vec::with_capacity(value.construct_declarations().len());
+    let mut last_parent = None;
+    let mut last_symbol = None;
+    let mut index = 0;
+    let mut cutoff_index = 0;
+    let mut specialized_count = 0;
+    for declaration in value.construct_declarations() {
+        let parent = host
+            .node(declaration)
+            .and_then(|node| node.parent)
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(invalid)?;
+        let symbol = store
+            .source_declaration_symbol(declaration)
+            .ok_or_else(invalid)?;
+        if last_symbol.is_none() || last_symbol == Some(symbol) {
+            if last_parent == Some(parent) {
+                index += 1;
+            } else {
+                last_parent = Some(parent);
+                index = cutoff_index;
             }
-            parameters.push((parameter, symbol, annotation));
-        }
-        if locals.len() != parameters.len() {
-            return Err(reject());
-        }
-        let candidate = ErrorConstructorPlan {
-            annotation,
-            owner,
-            declaration: node,
-            return_annotation,
-            parameters,
-        };
-        if let Some((last, candidates)) = groups.last_mut()
-            && *last == parent
-        {
-            candidates.push(candidate);
         } else {
-            groups.push((parent, vec![candidate]));
+            index = candidates.len();
+            cutoff_index = candidates.len();
+            last_parent = Some(parent);
         }
+        last_symbol = Some(symbol);
+        let Some(NodeData::ConstructSignatureDeclaration(signature)) =
+            host.node(declaration).map(|node| &node.data)
+        else {
+            return Err(invalid());
+        };
+        let specialized = signature.parameters.nodes.iter().any(|&node| {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, node);
+            store
+                .source_direct_type_annotation(parameter)
+                .is_some_and(|annotation| {
+                    store.source_node_kind(annotation) == Some(SyntaxKind::LiteralType)
+                })
+        });
+        let insertion_index = if specialized {
+            let insertion_index = specialized_count;
+            specialized_count += 1;
+            cutoff_index += 1;
+            insertion_index
+        } else {
+            index
+        };
+        candidates.insert(insertion_index, declaration);
     }
-    groups
-        .into_iter()
-        .rev()
-        .flat_map(|(_, candidates)| candidates)
-        .next()
-        .ok_or_else(reject)
+    for declaration in candidates {
+        let Some(NodeData::ConstructSignatureDeclaration(signature)) =
+            host.node(declaration).map(|node| &node.data)
+        else {
+            return Err(invalid());
+        };
+        let minimum = signature.parameters.nodes.iter().position(|&node| {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, node);
+            matches!(host.node(parameter).map(|node| &node.data), Some(NodeData::ParameterDeclaration(parameter)) if parameter.question_token.is_some())
+        }).unwrap_or(signature.parameters.nodes.len());
+        let supplied = usize::from(argument.is_some());
+        if supplied < minimum || supplied > signature.parameters.nodes.len() {
+            continue;
+        }
+        let parameter = if let Some(argument) = argument {
+            let declaration = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                signature.parameters.nodes[0],
+            );
+            let parameter_symbol = host
+                .bound_file(declaration)
+                .and_then(|bound| bound.symbol(declaration))
+                .ok_or_else(invalid)?;
+            let annotation = store
+                .source_direct_type_annotation(declaration)
+                .ok_or_else(invalid)?;
+            let Some(parameter) =
+                argument_parameter(store, host, argument, parameter_symbol, annotation)?
+            else {
+                continue;
+            };
+            Some(parameter)
+        } else {
+            None
+        };
+        return Ok(DeclaredConstructorPlan {
+            value,
+            declaration,
+            parameter,
+        });
+    }
+    Err(unsupported(SourceNewUnsupported::Arguments(constructor)))
 }
 
-pub(super) fn message_parameter(
+fn argument_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    global: &ErrorConstructorPlan,
-) -> Result<SourceNewParameter, SourceNewError> {
-    let reject = || unsupported(SourceNewUnsupported::Arguments(global.declaration));
-    let &(_, symbol, annotation) = global.parameters.first().ok_or_else(reject)?;
-    let record = host.node(annotation).ok_or_else(reject)?;
-    if record.kind != SyntaxKind::StringKeyword || record.flags.0 != 0 {
-        return Err(reject());
-    }
-    let type_ = store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.string_type)
-        .ok_or_else(reject)?;
-    Ok(SourceNewParameter { symbol, type_ })
+    argument: &SourceNewArgument,
+    symbol: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Result<Option<SourceNewParameter>, SourceNewError> {
+    let invalid = || invariant(SourceNewInvariant::InvalidConstructorCache(annotation));
+    let record = host.node(annotation).ok_or_else(invalid)?;
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let type_ = match record.kind {
+        SyntaxKind::StringKeyword => bootstrap.string_type,
+        SyntaxKind::NumberKeyword => bootstrap.number_type,
+        SyntaxKind::BooleanKeyword => bootstrap.boolean_type,
+        SyntaxKind::AnyKeyword => bootstrap.any_type,
+        SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+        SyntaxKind::LiteralType => {
+            let NodeData::LiteralTypeNode(literal) = &record.data else {
+                return Err(invalid());
+            };
+            let literal = host
+                .node(NodeRef::new(
+                    annotation.arena,
+                    annotation.file,
+                    literal.literal,
+                ))
+                .ok_or_else(invalid)?;
+            match (&argument.value, &literal.data) {
+                (SourceNewArgumentValue::String(value), NodeData::StringLiteral(literal))
+                    if value == &literal.text =>
+                {
+                    bootstrap.string_type
+                }
+                (SourceNewArgumentValue::Number(value), NodeData::NumericLiteral(literal))
+                    if *value == ts_jsnum::from_string(&literal.text) =>
+                {
+                    bootstrap.number_type
+                }
+                (SourceNewArgumentValue::Boolean(value), NodeData::KeywordExpression(_))
+                    if literal.kind
+                        == if *value {
+                            SyntaxKind::TrueKeyword
+                        } else {
+                            SyntaxKind::FalseKeyword
+                        } =>
+                {
+                    bootstrap.boolean_type
+                }
+                _ => return Ok(None),
+            }
+        }
+        _ => return Err(unsupported(SourceNewUnsupported::Arguments(argument.node))),
+    };
+    let parameter = SourceNewParameter { symbol, type_ };
+    Ok(argument_matches_parameter(store, argument, parameter).then_some(parameter))
 }
 
 pub(super) fn resolve(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
-    global: &ErrorConstructorPlan,
+    declared: &DeclaredConstructorPlan,
 ) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
-    let invalid = || invalid(plan.constructor);
-    let value = store
-        .declared_type_links(global.owner)
-        .and_then(|links| links.declared_type);
-    let instance = store
-        .declared_type_links(plan.resolved_symbol)
-        .and_then(|links| links.declared_type);
-    let annotation = exact_type_cache(store, global.annotation).map_err(|()| invalid())?;
-    let return_type = exact_type_cache(store, global.return_annotation).map_err(|()| invalid())?;
-    let value_links = exact_class_value_type(store, plan.resolved_symbol)?;
-    let annotation_symbol = exact_symbol_cache(store, global.annotation).map_err(|()| invalid())?;
-    let return_symbol =
-        exact_symbol_cache(store, global.return_annotation).map_err(|()| invalid())?;
-    if annotation.is_some_and(|type_| Some(type_) != value)
-        || return_type.is_some_and(|type_| Some(type_) != instance)
-        || value_links.is_some_and(|type_| Some(type_) != value)
-        || annotation_symbol.is_some_and(|symbol| symbol != global.owner)
-        || return_symbol.is_some_and(|symbol| symbol != plan.resolved_symbol)
-    {
-        return Err(invalid());
-    }
-    let Some(signature) =
-        exact_signature_cache(store, global.declaration).map_err(|()| invalid())?
-    else {
-        return Ok(None);
-    };
-    let (Some(value_type), Some(instance_type)) = (value, instance) else {
-        return Err(invalid());
-    };
-    for (type_, symbol) in [
-        (value_type, global.owner),
-        (instance_type, plan.resolved_symbol),
-    ] {
-        let record = store.type_payload(type_).ok_or_else(invalid)?;
-        if record.flags() != TypeFlags::OBJECT
-            || !record.object_flags().contains(ObjectFlags::INTERFACE)
-            || record.symbol() != Some(symbol)
-            || record.alias().is_some()
-        {
-            return Err(invalid());
-        }
-    }
-    let record = store.signature(signature).ok_or_else(invalid)?;
-    let parameters = global
-        .parameters
-        .iter()
-        .map(|(_, symbol, _)| *symbol)
-        .collect::<Vec<_>>();
-    let parameter_types = parameters
-        .iter()
-        .map(|symbol| {
-            store
-                .value_symbol_links(*symbol)
-                .and_then(|links| links.resolved_type)
-                .ok_or_else(invalid)
+    resolve_declared_construct_signature(store, host, &declared.value, declared.declaration)
+        .map_err(|error| provider_error(plan.constructor, plan.resolved_symbol, error))?
+        .map(|signature| {
+            if signature.value().value_symbol() != plan.resolved_symbol
+                || signature.declaration() != declared.declaration
+            {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+            Ok(CheckedSourceDefaultNew {
+                value_type: signature.value().constructor_type(),
+                instance_type: signature.return_type(),
+                signature: signature.signature(),
+            })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    if annotation != value
-        || return_type != instance
-        || value_links != value
-        || annotation_symbol != Some(global.owner)
-        || return_symbol != Some(plan.resolved_symbol)
-        || record.flags() != SignatureFlags::CONSTRUCT
-        || record.declaration() != Some(global.declaration)
-        || record.parameters() != parameters
-        || !record.type_parameters().is_empty()
-        || record.this_parameter().is_some()
-        || record.min_argument_count() != 0
-        || record.resolved_min_argument_count() != -1
-        || record.resolved_return_type() != instance
-        || record.resolved_type_predicate().is_some()
-        || record.target().is_some()
-        || record.mapper().is_some()
-        || record.composite().is_some()
-        || record.isolated_signature_type().is_some()
-        || store
-            .callable_signature_parameter_types(signature)
-            .is_some_and(|cached| cached != parameter_types)
-        || store.function_signature_return_annotation(signature)
-            != Some((global.return_annotation, false))
-    {
-        return Err(invalid());
-    }
-    for ((declaration, symbol, annotation), &type_) in
-        global.parameters.iter().zip(&parameter_types)
-    {
-        let base = exact_type_cache(store, *annotation)
-            .map_err(|()| invalid())?
-            .ok_or_else(invalid)?;
-        if optional_constructor_parameter_type(store, base, true, *declaration)? != Some(type_)
-            || store.value_symbol_links(*symbol)
-                != Some(&ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                })
-        {
-            return Err(invalid());
-        }
-    }
-    Ok(Some(CheckedSourceDefaultNew {
-        value_type,
-        instance_type,
-        signature,
-    }))
+        .transpose()
 }
 
-// The selected signature is published while the constructor interface stays lazy.
+#[allow(clippy::too_many_arguments)] // The expression adapter borrows its caller's query context.
 pub(super) fn prepare(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     globals: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceDefaultNewPlan,
-    global: &ErrorConstructorPlan,
+    declared: &DeclaredConstructorPlan,
 ) -> Result<(), SourceNewError> {
-    if resolve(store, plan, global)?.is_some() {
-        return Ok(());
-    }
-    let invalid = || invalid(plan.constructor);
-    let instance_type = store.get_declared_type_of_symbol(host, plan.resolved_symbol)?;
-    let value_type = store.get_declared_type_of_symbol(host, global.owner)?;
-    if !store.try_reserve_type_node_links(global.parameters.len()) {
-        return Err(invariant(SourceNewInvariant::Capacity(plan.constructor)));
-    }
-    let mut parameter_types = Vec::new();
-    for &(declaration, symbol, annotation) in &global.parameters {
-        let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let base = CanonicalTypeQuery::new_with_global_types(
-            store,
-            host,
-            globals,
-            options,
-            &mut diagnostics,
-        )?
-        .get_type_from_type_node(annotation)?;
-        if !diagnostics.is_empty() {
-            return Err(invalid());
-        }
-        if exact_type_cache(store, annotation)
-            .map_err(|()| invalid())?
-            .is_some_and(|cached| cached != base)
-            || !store.set_type_node_links(
-                annotation,
-                TypeNodeLinks {
-                    resolved_type: Some(base),
-                    ..TypeNodeLinks::default()
-                },
-            )
-        {
-            return Err(invalid());
-        }
-        let type_ = if let Some(type_) =
-            optional_constructor_parameter_type(store, base, true, declaration)?
-        {
-            type_
-        } else {
-            let undefined = store
-                .intrinsic_bootstrap()
-                .ok_or_else(invalid)?
-                .undefined_type;
-            super::super::instantiate::canonical_anonymous_union(store, &[base, undefined])
-                .map_err(|_| invalid())?
-        };
-        let expected = ValueSymbolLinks {
-            resolved_type: Some(type_),
-            ..ValueSymbolLinks::default()
-        };
-        if store
-            .value_symbol_links(symbol)
-            .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
-        {
-            return Err(invalid());
-        }
-        parameter_types.push(type_);
-    }
-    if !store.try_reserve_signatures(1)
-        || !store.try_reserve_signature_links(1)
-        || !store.try_reserve_type_node_links(2)
-        || !store.try_reserve_symbol_node_links(2)
-        || !store.try_reserve_value_symbol_links(global.parameters.len() + 1)
-        || !store.try_reserve_function_signature_return_annotations(1)
-    {
-        return Err(invariant(SourceNewInvariant::Capacity(plan.constructor)));
-    }
-    let signature = store
-        .alloc_signature(
-            SignatureFlags::CONSTRUCT,
-            Some(global.declaration),
-            Vec::new(),
-            None,
-            global
-                .parameters
-                .iter()
-                .map(|(_, symbol, _)| *symbol)
-                .collect(),
-            Some(instance_type),
-            None,
-            0,
-        )
-        .ok_or_else(invalid)?;
-    for ((_, symbol, _), &type_) in global.parameters.iter().zip(&parameter_types) {
-        if !store.set_value_symbol_links(
-            *symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(type_),
-                ..ValueSymbolLinks::default()
-            },
-        ) {
-            return Err(invalid());
+    prepare_declared_construct_signature(
+        store,
+        host,
+        globals,
+        options,
+        session,
+        diagnostics,
+        &declared.value,
+        declared.declaration,
+    )
+    .map(|_| ())
+    .map_err(|error| provider_error(plan.constructor, plan.resolved_symbol, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::parse_source_file;
+
+    use super::*;
+    use crate::semantic::CanonicalCheckerContext;
+
+    #[test]
+    fn merged_specialized_constructors_keep_provider_order_before_general_candidates() {
+        for (index, (source, expected_declarations)) in [
+            (
+                "interface Factory { new(value: \"x\"): \"first\"; } interface Factory { new(value: \"x\"): \"second\"; } declare const Build: Factory; const result = new Build(\"x\");",
+                vec![0],
+            ),
+            (
+                concat!(
+                    "interface Factory { new(value: \"x\"): \"first-special\"; new(value: string): \"first-general\"; } ",
+                    "interface Factory { new(value: \"x\"): \"second-special\"; new(value: string): \"second-general\"; } ",
+                    "declare const Build: Factory; const special = new Build(\"x\"); const general = new Build(\"other\");",
+                ),
+                vec![0, 3],
+            ),
+            (
+                concat!(
+                    "interface Factory { new(value: string): \"first-general\"; new(value: \"x\"): \"first-special\"; } ",
+                    "interface Factory { new(value: string): \"second-general\"; new(value: \"x\"): \"second-special\"; } ",
+                    "declare const Build: Factory; const special = new Build(\"x\"); const general = new Build(\"other\");",
+                ),
+                vec![1, 2],
+            ),
+        ].into_iter().enumerate() {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(9_780 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder.bind_source_file_with_facts(
+                &parsed.arena, parsed.source_file, file,
+                CanonicalSourceFileFacts::new(EscapedName::source("\"/merged-constructors.ts\""), CanonicalSourceLanguage::TypeScript, false, CanonicalModuleState::Script),
+            ).unwrap();
+            binder.bind_typescript_declaration_slice(&parsed.arena, file).unwrap();
+            let mut context = CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], CanonicalCheckerOptions::default()).unwrap();
+            let declarations = parsed.arena.iter().filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConstructSignature).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            }).collect::<Vec<_>>();
+            let expressions = parsed.arena.iter().filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            }).collect::<Vec<_>>();
+            assert_eq!(expressions.len(), expected_declarations.len());
+            context.check_source_file(file).unwrap();
+            for (expression, expected) in expressions.iter().zip(expected_declarations) {
+                let signature = context.store().signature_links(*expression).unwrap().resolved_signature.signature().unwrap();
+                assert_eq!(context.store().signature(signature).unwrap().declaration(), Some(declarations[expected]), "{source}");
+                let annotation = context.store().source_direct_type_annotation(declarations[expected]).unwrap();
+                let expected_return = context.get_type_from_type_node(annotation).unwrap();
+                assert_eq!(context.store().type_node_links(*expression).unwrap().resolved_type, Some(expected_return));
+            }
+            assert!(context.diagnostics().is_empty());
+            let warm = (context.store().type_len(), context.store().signature_len(), context.store().checker_link_allocated_lengths());
+            context.recheck_source_file(file).unwrap();
+            assert_eq!((context.store().type_len(), context.store().signature_len(), context.store().checker_link_allocated_lengths()), warm);
+            assert!(context.diagnostics().is_empty());
         }
     }
-    for (node, type_, symbol) in [
-        (global.annotation, value_type, global.owner),
-        (
-            global.return_annotation,
-            instance_type,
-            plan.resolved_symbol,
-        ),
-    ] {
-        if !store.set_type_node_links(
-            node,
-            TypeNodeLinks {
-                resolved_type: Some(type_),
-                ..TypeNodeLinks::default()
-            },
-        ) || !store.set_symbol_node_links(
-            node,
-            SymbolNodeLinks {
-                resolved_symbol: Some(symbol),
-            },
-        ) {
-            return Err(invalid());
-        }
-    }
-    if !store.set_value_symbol_links(
-        plan.resolved_symbol,
-        ValueSymbolLinks {
-            resolved_type: Some(value_type),
-            ..ValueSymbolLinks::default()
-        },
-    ) || !store.set_signature_links(
-        global.declaration,
-        SignatureLinks {
-            resolved_signature: ResolvedSignatureState::Resolved(signature),
-            ..SignatureLinks::default()
-        },
-    ) || !store.set_function_signature_return_annotation(
-        signature,
-        global.return_annotation,
-        false,
-    ) || resolve(store, plan, global)?.is_none()
-    {
-        return Err(invalid());
-    }
-    Ok(())
 }
