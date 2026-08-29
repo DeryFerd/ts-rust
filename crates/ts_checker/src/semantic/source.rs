@@ -2175,7 +2175,8 @@ enum PlannedStatement {
     MissingNamedExport(PlannedMissingNamedExport),
     NamedReexport,
     DefaultAlias(Box<PlannedDefaultAliasExport>),
-    DefaultObject(Box<PlannedDefaultObjectExport>),
+    DefaultObject(Box<PlannedDefaultExpressionExport>),
+    DefaultAssertion(Box<PlannedDefaultExpressionExport>),
     DefaultArrow(Box<PlannedDefaultArrowExport>),
     AmbientExportAssignment(NodeRef),
     AmbientNamespaceExport,
@@ -2245,7 +2246,7 @@ struct PlannedDefaultAliasExport {
 }
 
 #[derive(Clone, Debug)]
-struct PlannedDefaultObjectExport {
+struct PlannedDefaultExpressionExport {
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
     expression: PlannedExpression,
@@ -3819,7 +3820,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         continue;
                     }
                     if expression_node.kind == SyntaxKind::ObjectLiteralExpression {
-                        let owner_symbol = self.plan_default_object_export(
+                        let owner_symbol = self.plan_default_value_export(
                             statement,
                             expression,
                             export.is_export_equals,
@@ -3833,7 +3834,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             ));
                         }
                         statements.push(PlannedStatement::DefaultObject(Box::new(
-                            PlannedDefaultObjectExport {
+                            PlannedDefaultExpressionExport {
+                                declaration: statement,
+                                owner_symbol,
+                                expression,
+                            },
+                        )));
+                        continue;
+                    }
+                    if !export.is_export_equals
+                        && matches!(
+                            expression_node.kind,
+                            SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression
+                        )
+                    {
+                        let owner_symbol =
+                            self.plan_default_value_export(statement, expression, false)?;
+                        let expression = self.plan_assertion(expression)?;
+                        statements.push(PlannedStatement::DefaultAssertion(Box::new(
+                            PlannedDefaultExpressionExport {
                                 declaration: statement,
                                 owner_symbol,
                                 expression,
@@ -17560,7 +17579,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         })
     }
 
-    fn plan_default_object_export(
+    fn plan_default_value_export(
         &self,
         declaration: NodeRef,
         expression: NodeRef,
@@ -17569,7 +17588,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some((store, _)) = self.semantic else {
             return Err(self.unsupported(
                 expression,
-                SyntaxKind::ObjectLiteralExpression,
+                self.node(expression)?.kind,
                 SourceSyntaxRole::Statement,
             ));
         };
@@ -24288,6 +24307,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let const_assertion = self.node(expression)?.kind != SyntaxKind::SatisfiesExpression
             && self.is_const_assertion_type(type_node)?;
+        if !const_assertion {
+            self.plan_type_import_annotation_root(type_node)?;
+        }
         let operand = self.plan_expression(operand)?;
         let supported_const_operand = matches!(
             &operand.unparenthesized().kind,
@@ -31516,6 +31538,14 @@ fn check_expression_type_with_capture_context(
                     session,
                     &mut satisfaction_diagnostics,
                 )?
+                .with_type_reference_alias_targets(
+                    type_import_execution
+                        .annotation_capabilities
+                        .get(type_node)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                )?
                 .get_type_from_type_node(*type_node);
                 merge_retry_diagnostics(diagnostics, satisfaction_diagnostics);
                 let target = target?;
@@ -31627,6 +31657,14 @@ fn check_expression_type_with_capture_context(
                     session,
                     &mut assertion_diagnostics,
                 )?
+                .with_type_reference_alias_targets(
+                    type_import_execution
+                        .annotation_capabilities
+                        .get(type_node)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                )?
                 .get_type_from_type_node(*type_node);
                 merge_retry_diagnostics(diagnostics, assertion_diagnostics);
                 Some(target?)
@@ -31724,6 +31762,14 @@ fn check_expression_type_with_capture_context(
                     options,
                     session,
                     &mut assertion_diagnostics,
+                )?
+                .with_type_reference_alias_targets(
+                    type_import_execution
+                        .annotation_capabilities
+                        .get(type_node)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
                 )?
                 .get_type_from_type_node(*type_node);
                 merge_retry_diagnostics(diagnostics, assertion_diagnostics);
@@ -59670,8 +59716,9 @@ pub(super) fn check_source_file(
             PlannedStatement::AmbientExportAssignment(expression) => {
                 issue_node_diagnostic(diagnostics, expression, 2714)?;
             }
-            PlannedStatement::DefaultObject(export) => {
-                let object = check_expression_type(
+            PlannedStatement::DefaultObject(export)
+            | PlannedStatement::DefaultAssertion(export) => {
+                let checked = check_expression_type(
                     store,
                     host,
                     global_types,
@@ -59688,7 +59735,7 @@ pub(super) fn check_source_file(
                 if store
                     .type_node_links(export.expression.node)
                     .and_then(|links| links.resolved_type)
-                    != Some(object.result)
+                    != Some(checked.result)
                 {
                     return Err(SourceCheckError::Import(export.declaration));
                 }
@@ -59697,7 +59744,7 @@ pub(super) fn check_source_file(
                     &mut staged_value_types,
                     &mut value_order,
                     export.owner_symbol,
-                    object.result,
+                    checked.result,
                 )?;
             }
             PlannedStatement::DefaultArrow(export) => {
@@ -71768,16 +71815,15 @@ mod tests {
     }
 
     #[test]
-    fn local_alias_and_assertion_type_imports_fail_before_source_publication() {
+    fn local_alias_and_call_type_imports_fail_before_source_publication() {
         let target = parsed("export type User = number;");
         for (index, body) in [
-            "type Wrapped = Local;",
-            "const asserted = null as Local;",
-            "function identity<T>(value: T): T { return value; } const called = identity<Local>(1);",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+            (0, "type Wrapped = Local;"),
+            (
+                2,
+                "function identity<T>(value: T): T { return value; } const called = identity<Local>(1);",
+            ),
+        ] {
             let importer = parsed(&format!(
                 "import type {{ User as Local }} from './target'; const earlier: number = 1; {body}"
             ));
@@ -71808,6 +71854,319 @@ mod tests {
                 assert!(context.diagnostics().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn imported_assertion_keeps_its_original_source_and_rejects_poisoned_type_roots() {
+        let target = parsed("export type User = number;");
+        let importer = parsed(concat!(
+            "import type { User as Local } from './target'; const earlier: number = 1; ",
+            "const asserted = null as Local;",
+        ));
+        let importer_file = FileId::new(921);
+        let target_file = FileId::new(931);
+        for poison in [false, true] {
+            let files = [(importer_file, &importer), (target_file, &target)];
+            let mut context = external_context_with_import_routes(
+                &files,
+                &[SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                }],
+            );
+            let assertion = variable_initializer(&importer, importer_file, "asserted");
+            let NodeData::AsExpression(data) = &importer.arena.get(assertion.node).unwrap().data
+            else {
+                panic!("expected the original imported assertion")
+            };
+            let root = NodeRef::new(importer.arena.id(), importer_file, data.type_);
+            let operand = NodeRef::new(importer.arena.id(), importer_file, data.expression);
+            let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+            let earlier = variable_symbol(&context, &importer, importer_file, "earlier");
+            let asserted = variable_symbol(&context, &importer, importer_file, "asserted");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let null = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .null_widening_type;
+            if poison {
+                let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    root,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                let cold_counts = observable_state(&context, importer_file).0;
+                let expected = SourceCheckError::Import(root);
+                assert_eq!(context.check_source_file(importer_file), Err(expected));
+                assert_eq!(observable_state(&context, importer_file).0, cold_counts);
+                assert!(context.store().value_symbol_links(earlier).is_none());
+                assert!(context.store().value_symbol_links(asserted).is_none());
+                assert!(context.store().value_symbol_links(alias).is_none());
+                assert!(context.store().type_node_links(operand).is_none());
+                assert!(context.store().type_node_links(assertion).is_none());
+                assert!(context.store().assertion_links(assertion).is_none());
+                assert!(!is_type_checked(&context, importer_file));
+                assert!(context.diagnostics().is_empty());
+                let failed = observable_state(&context, importer_file);
+                for _ in 0..2 {
+                    assert_eq!(context.check_source_file(importer_file), Err(expected));
+                    assert_eq!(observable_state(&context, importer_file), failed);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(root, TypeNodeLinks::default())
+                );
+            }
+
+            context.check_source_file(importer_file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(resolved_node_type(&context, root), number);
+            assert_eq!(resolved_node_type(&context, operand), null);
+            assert_eq!(resolved_node_type(&context, assertion), number);
+            assert_eq!(
+                context.store().assertion_links(assertion),
+                Some(&AssertionLinks {
+                    expr_type: Some(null)
+                }),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(asserted)
+                    .unwrap()
+                    .resolved_type,
+                Some(number),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(earlier)
+                    .unwrap()
+                    .resolved_type,
+                Some(number),
+            );
+            assert!(context.store().value_symbol_links(alias).is_none());
+            let source = context.source_file(importer_file).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .source_file_links(source)
+                    .unwrap()
+                    .deferred_nodes
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [assertion],
+            );
+            let warm = observable_state(&context, importer_file);
+            context.recheck_source_file(importer_file).unwrap();
+            assert_eq!(observable_state(&context, importer_file), warm);
+            assert_eq!(resolved_node_type(&context, assertion), number);
+            assert!(context.store().value_symbol_links(alias).is_none());
+        }
+    }
+
+    #[test]
+    fn default_assertion_import_capability_rejects_other_roots_before_publication() {
+        let importer = parsed(concat!(
+            "import type { User as Local } from './target'; ",
+            "const earlier: number = 1; export default null as Local;",
+        ));
+        let target = parsed("export type User = number;");
+        let importer_file = FileId::new(1_092);
+        let target_file = FileId::new(1_093);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let importer_bound: BoundFile = context.file(importer_file).unwrap().1.clone();
+        let target_bound: BoundFile = context.file(target_file).unwrap().1.clone();
+        let options = context.options();
+        let globals: CanonicalGlobalTypes = context.global_types().clone();
+        let sources = || {
+            [
+                (&importer.arena, &importer_bound),
+                (&target.arena, &target_bound),
+            ]
+        };
+        let manifest = super::super::module_resolution::validate_module_resolution_manifest(
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(
+                        importer.arena.id(),
+                        importer_file,
+                        source_module_specifiers(&importer)[0],
+                    ),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                ),
+            ]),
+            context.store().symbol_store(),
+            sources()
+                .into_iter()
+                .map(|(arena, bound)| (bound.file_id(), arena, bound)),
+        )
+        .unwrap();
+        assert_eq!(&manifest, context.module_resolutions());
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let source = context.source_file(importer_file).unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &importer.arena,
+            &importer_bound,
+            source,
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let [reference] = plan.type_import_references.as_slice() else {
+            panic!("expected only the written assertion root")
+        };
+        let root = reference.root;
+        assert_eq!(reference.node, root);
+        let export = plan
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                PlannedStatement::DefaultAssertion(export) => Some(export),
+                _ => None,
+            })
+            .unwrap();
+        let assertion = export.expression.node;
+        let owner = export.owner_symbol;
+        assert_eq!(importer_bound.symbol(export.declaration), Some(owner));
+        assert_eq!(
+            context.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::PROPERTY
+        );
+        let earlier = variable_symbol(&context, &importer, importer_file, "earlier");
+        let other_root = variable_type_node(&importer, importer_file, "earlier");
+        let binding = &plan.type_imports[0].bindings[0];
+        let mut alias_host =
+            ProductionAliasTargetHost::new(context.store(), sources(), &manifest).unwrap();
+        let resolved = resolve_source_type_import_binding(
+            context.store_mut_for_test(),
+            &mut alias_host,
+            &host,
+            binding,
+        )
+        .unwrap();
+        let capability =
+            plan_source_type_import_reference(context.store(), &host, &resolved, root, root)
+                .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = observable_state(&context, importer_file);
+        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .with_type_reference_alias_targets([capability])
+        .unwrap()
+        .preflight_type_from_type_node(other_root);
+        assert_eq!(
+            result,
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(root),
+            )),
+        );
+        assert_eq!(observable_state(&context, importer_file), before);
+        assert!(diagnostics.is_empty());
+        assert!(context.store().type_node_links(root).is_none());
+        assert!(context.store().type_node_links(assertion).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.store().value_symbol_links(earlier).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(binding.alias_symbol)
+                .is_none()
+        );
+
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            root,
+            SymbolNodeLinks {
+                resolved_symbol: Some(earlier)
+            },
+        ));
+        let poisoned = observable_state(&context, importer_file);
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(importer_file),
+                Err(SourceCheckError::Import(root)),
+            );
+            assert_eq!(observable_state(&context, importer_file), poisoned);
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().value_symbol_links(earlier).is_none());
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(binding.alias_symbol)
+                    .is_none()
+            );
+            assert!(context.store().assertion_links(assertion).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(root, SymbolNodeLinks::default())
+        );
+        context.check_source_file(importer_file).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(resolved_node_type(&context, root), number);
+        assert_eq!(resolved_node_type(&context, assertion), number);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(binding.alias_symbol)
+                .is_none()
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
     }
 
     #[test]
