@@ -2233,6 +2233,7 @@ pub(super) fn prepare_source_class_members(
             strict_builtin_iterator_return: store
                 .claimed_strict_builtin_iterator_return()
                 .unwrap_or_default(),
+            strict_function_types: store.claimed_strict_function_types(),
             no_implicit_any: true,
         };
         let mut diagnostics = CanonicalCheckerDiagnostics::default();

@@ -16684,7 +16684,7 @@ mod tests {
             .unwrap()
             .resolved_type
             .unwrap();
-        let provenance = *store.source_callable_provenance(callable).unwrap();
+        let provenance = store.source_callable_provenance(callable).unwrap();
         assert_eq!(provenance.declaration, declaration);
         assert_eq!(provenance.owner_symbol, symbol);
         assert_eq!(provenance.owner_parent, Some(namespace.symbol));

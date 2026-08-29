@@ -30085,14 +30085,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 && let Some(TypeData::Union(union)) =
                     self.store.type_payload(type_).map(TypeRecord::data)
             {
-                let types = union
+                let constituents = union
                     .union
                     .types
                     .iter()
                     .copied()
                     .filter(|type_| *type_ != bootstrap.missing_type)
                     .collect::<Vec<_>>();
-                return self.construct_alias_union(&types, None);
+                return self.construct_alias_union(&constituents, None);
             }
             return Ok(type_);
         }

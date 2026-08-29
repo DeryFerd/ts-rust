@@ -4510,8 +4510,8 @@ impl<'store> RelaterSession<'store> {
                     LiteralTypeCacheError::Capacity => {
                         RelationUnavailable::UnionValidationCapacity(owner)
                     }
-                    LiteralTypeCacheError::UnsupportedUnionConstituent(type_) => {
-                        RelationUnavailable::UnsupportedUnionConstituent(type_)
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(constituent) => {
+                        RelationUnavailable::UnsupportedUnionConstituent(constituent)
                     }
                     _ => RelationUnavailable::MalformedUnion(owner),
                 });
