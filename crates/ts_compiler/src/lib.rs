@@ -60,7 +60,7 @@ use ts_module::{
 };
 use ts_options::{
     CompilerOptions, ModuleDetectionKind, ModuleKind, ModuleResolutionKind, PrinterSettings,
-    ScriptTarget, parse_project_options,
+    ScriptTarget, is_module_resolution_diagnostic, parse_project_options,
 };
 use ts_parser::{
     ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
@@ -2598,6 +2598,25 @@ impl Program {
         program
     }
 
+    /// Creates a direct-file CLI Program and retains its deferred resolution diagnostics.
+    #[must_use]
+    pub fn new_with_command_line_options(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+    ) -> Self {
+        let mut program =
+            Self::new_with_options(file_system, current_directory, root_names, options);
+        for diagnostic in program.options.module_resolution_diagnostics() {
+            program
+                .diagnostics
+                .push(module_resolution_option_diagnostic(&diagnostic, None));
+        }
+        program.diagnostics.sort_by(compare_program_diagnostics);
+        program
+    }
+
     /// Creates a Program and checks it through the experimental canonical
     /// diagnostics-only semantic core.
     ///
@@ -3188,20 +3207,6 @@ impl Program {
                 ));
             }
         }
-        config_diagnostics.extend(options_result.diagnostics.iter().map(|diagnostic| {
-            ProgramDiagnostic {
-                file_name: Some(config.path.clone()),
-                range: config_source.as_deref().and_then(|source| {
-                    compiler_option_diagnostic_range(&config.path, source, diagnostic)
-                }),
-                code: Some(diagnostic.code()),
-                category: diagnostic.category(),
-                message: diagnostic
-                    .render()
-                    .unwrap_or_else(|error| error.to_string()),
-                related_information: Vec::new(),
-            }
-        }));
         if let Some(value) = overrides.no_check {
             options_result.options.no_check = value;
         }
@@ -3218,7 +3223,30 @@ impl Program {
             options_result
                 .options
                 .apply_overrides(command_line_options, specified_options);
+            options_result.refresh_module_resolution_diagnostics();
         }
+        config_diagnostics.extend(options_result.diagnostics.iter().map(|diagnostic| {
+            if is_module_resolution_diagnostic(diagnostic) {
+                return module_resolution_option_diagnostic(
+                    diagnostic,
+                    config_source
+                        .as_deref()
+                        .map(|source| (config.path.as_str(), source)),
+                );
+            }
+            ProgramDiagnostic {
+                file_name: Some(config.path.clone()),
+                range: config_source.as_deref().and_then(|source| {
+                    compiler_option_diagnostic_range(&config.path, source, diagnostic)
+                }),
+                code: Some(diagnostic.code()),
+                category: diagnostic.category(),
+                message: diagnostic
+                    .render()
+                    .unwrap_or_else(|error| error.to_string()),
+                related_information: Vec::new(),
+            }
+        }));
         let mut discovery = DiscoveryOptions::new(config_directory);
         let has_files = config.files.is_some();
         discovery.files = config.files.unwrap_or_default();
@@ -3388,6 +3416,20 @@ impl Program {
         self.file_index
             .get(&canonical)
             .and_then(|index| self.source_files.get(*index))
+    }
+
+    /// Returns retained text for a Program source or the exact loaded config path.
+    #[must_use]
+    pub fn diagnostic_source_text(&self, file_name: &str) -> Option<&str> {
+        if let Some(source) = self.source_file(file_name) {
+            return Some(&source.source_text);
+        }
+        let config = self.graph_config.as_ref()?;
+        if config.resolved.path == file_name {
+            config.source_text.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Looks up a source file by its stable program identity.
@@ -11706,7 +11748,27 @@ fn compiler_option_key_range(
     primary: &str,
     fallback: Option<&str>,
 ) -> Option<TextRange> {
-    compiler_option_range(file_name, source, primary, fallback, false)
+    compiler_option_range(file_name, source, primary, fallback, false, false)
+}
+
+fn module_resolution_option_diagnostic(
+    diagnostic: &Diagnostic,
+    config_source: Option<(&str, &str)>,
+) -> ProgramDiagnostic {
+    let location = config_source.and_then(|(file_name, source)| {
+        compiler_option_diagnostic_range(file_name, source, diagnostic)
+            .map(|range| (file_name, range))
+    });
+    ProgramDiagnostic {
+        file_name: location.map(|(file_name, _)| file_name.to_owned()),
+        range: location.map(|(_, range)| range),
+        code: Some(diagnostic.code()),
+        category: diagnostic.category(),
+        message: diagnostic
+            .render()
+            .unwrap_or_else(|error| error.to_string()),
+        related_information: Vec::new(),
+    }
 }
 
 fn compiler_option_diagnostic_range(
@@ -11718,6 +11780,7 @@ fn compiler_option_diagnostic_range(
         5059 => ("reactNamespace", None, true),
         5067 => ("jsxFactory", None, true),
         5095 | 5109 => ("moduleResolution", None, true),
+        5108 => (diagnostic.arguments.first()?.as_str(), None, true),
         5110 => ("module", None, true),
         5096 => ("allowImportingTsExtensions", None, true),
         18_035 => ("jsxFragmentFactory", None, true),
@@ -11728,7 +11791,14 @@ fn compiler_option_diagnostic_range(
         ),
         _ => return None,
     };
-    compiler_option_range(file_name, source, primary, fallback, value)
+    compiler_option_range(
+        file_name,
+        source,
+        primary,
+        fallback,
+        value,
+        is_module_resolution_diagnostic(diagnostic),
+    )
 }
 
 fn compiler_option_range(
@@ -11737,13 +11807,19 @@ fn compiler_option_range(
     primary: &str,
     fallback: Option<&str>,
     on_value: bool,
+    allow_null_options: bool,
 ) -> Option<TextRange> {
     let parsed = ts_config::parse_jsonc(file_name, source).value?;
     let root = parsed.as_object()?;
-    let options = root.get("compilerOptions")?.as_object()?;
-    let selected = std::iter::once(primary)
-        .chain(fallback)
-        .find_map(|option| options.keys().find(|key| key.eq_ignore_ascii_case(option)));
+    let selected = match root.get("compilerOptions")? {
+        ts_config::JsonValue::Null if allow_null_options => None,
+        value => {
+            let options = value.as_object()?;
+            std::iter::once(primary)
+                .chain(fallback)
+                .find_map(|option| options.keys().find(|key| key.eq_ignore_ascii_case(option)))
+        }
+    };
 
     let mut scanner = Scanner::new(source);
     let mut object_depth = 0usize;

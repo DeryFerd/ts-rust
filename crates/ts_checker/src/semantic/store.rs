@@ -1009,6 +1009,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    /// Reads retained binder facts for a TypeScript script source.
+    #[must_use]
+    pub(super) fn source_is_typescript_script(&self, node: NodeRef) -> bool {
+        self.contains_node_ref(node)
+            && self.source_file_facts.get(&node.file).is_some_and(|facts| {
+                !facts.is_javascript_file() && !facts.is_external_or_common_js_module()
+            })
+    }
+
     /// Checks immutable binder ownership, including canonical merged-symbol redirects.
     #[must_use]
     pub(super) fn source_declaration_belongs_to_symbol(
@@ -9897,7 +9906,8 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Every declared-type link is authoritative by the time heritage members
     /// resolve. The first base may be a canonical reference to its declared
     /// interface. A second base must be a distinct, resolved, nongeneric
-    /// property-only interface.
+    /// property-only interface, or the same nongeneric base written in a
+    /// second source declaration of the owner.
     pub(super) fn publish_direct_interface_heritage_provenance(
         &mut self,
         type_: TypeId,
@@ -9930,6 +9940,18 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         let second_base_is_exact = provenance
             .second_base
             .is_none_or(|(base_symbol, base_type)| {
+                if base_symbol == provenance.base_symbol && base_type == provenance.base_type {
+                    return base_type != type_
+                        && self
+                            .declared_type_links(base_symbol)
+                            .is_some_and(|links| links.declared_type == Some(base_type))
+                        && super::structured_members::repeated_nongeneric_interface_base_nodes(
+                            self,
+                            provenance.owner_symbol,
+                            base_symbol,
+                        )
+                        .is_some();
+                }
                 base_symbol != provenance.owner_symbol
                     && base_symbol != provenance.base_symbol
                     && base_type != type_

@@ -7120,10 +7120,13 @@ mod tests {
         assert_property_alias_call_is_unpublished(context.store(), inferred);
         assert!(context.diagnostics().is_empty());
         let warm = vector_cache_graph_counts(context.store());
+        let source = context.source_file(file).unwrap();
+        assert!(context.store().source_file_links(source).is_none());
         assert_eq!(
-            context.recheck_source_file(file),
+            context.check_source_file(file),
             Err(SourceCheckError::Call(inferred)),
         );
+        assert!(context.store().source_file_links(source).is_none());
         assert_eq!(
             property_alias_call_state(context.store(), copied),
             (cached, input)

@@ -5997,10 +5997,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Check lazy own lookup before full inherited-member resolution.
     fn cold_merged_interface_inherited_reads_preserve_selected_own_properties() {
-        use crate::semantic::{
-            declared_values::{SelectedDeclaredProperty, selected_declared_property},
-            source::UnsupportedSourceSyntax,
-            variables::VariableUnsupported,
+        use crate::semantic::declared_values::{
+            SelectedDeclaredProperty, selected_declared_property,
         };
 
         let library = parsed(concat!(
@@ -6264,17 +6262,26 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(receiver)
         );
-        let before = state(&context);
+        context.check_source_file(inherited_file).unwrap();
         assert_eq!(
-            context.check_source_file(inherited_file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Variable(VariableUnsupported::CrossFileDeclaration {
-                    node: inherited_syntax.receiver(),
-                    declaration: packet_declaration,
-                })
-            ))
+            context.store().type_node_links(access),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(boolean),
+                outer_type_parameters: None,
+            })
         );
-        assert_eq!(state(&context), before);
+        assert_eq!(
+            context.store().symbol_node_links(access),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(inherited),
+            })
+        );
+        assert!(
+            context
+                .store()
+                .source_file_links(context.source_file(inherited_file).unwrap())
+                .is_some_and(|links| links.type_checked)
+        );
         assert!(context.diagnostics().is_empty());
 
         let inherited_plan = finish_direct_source_property_plan(
@@ -6341,6 +6348,7 @@ mod tests {
         let warm = state(&context);
         for _ in 0..2 {
             context.recheck_source_file(own_file).unwrap();
+            context.recheck_source_file(inherited_file).unwrap();
             read_inherited(&mut context, &mut session, &mut diagnostics);
             assert_eq!(
                 context.get_declared_type_of_symbol(owner).unwrap(),

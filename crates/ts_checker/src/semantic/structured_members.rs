@@ -26,7 +26,8 @@ use super::{
         DeclaredPropertyTypeGraphValidation, DirectInterfaceDeclaredState,
         PlannedComputedMemberKey, PropertyObjectError, PropertyObjectKind, PropertyObjectPlan,
         PropertyObjectState, ResolvedCallSignatureTypes, StoredDeclaredCallSetValidation,
-        authenticated_default_library_interface_owner, planned_declared_property_key,
+        authenticated_default_library_interface_owner,
+        authenticated_nongeneric_global_interface_owner, planned_declared_property_key,
         prepare_direct_interface_declared_properties, publish_declared_members,
         publish_prepared_direct_interface_declared_properties, resolved_computed_member_key,
         valid_declared_property_check_flags, validate_stored_declared_call_set,
@@ -110,6 +111,137 @@ fn planned_base_matches(
                     .is_ok()
             })
     })
+}
+
+/// Retains two written nongeneric base edges from distinct global interface declarations.
+pub(super) fn repeated_nongeneric_interface_base_nodes(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    base: SemanticSymbolId,
+) -> Option<[NodeRef; 2]> {
+    if owner == base
+        || !authenticated_nongeneric_global_interface_owner(store, owner)
+        || !authenticated_nongeneric_global_interface_owner(store, base)
+    {
+        return None;
+    }
+    let base_name = store.symbol(base)?.name().as_utf8()?;
+    let mut nodes = [None, None];
+    let mut count = 0;
+    for &declaration in store.symbol(owner)?.declarations()? {
+        if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+            continue;
+        }
+        let clauses = store
+            .source_direct_children(declaration)?
+            .into_iter()
+            .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::HeritageClause))
+            .collect::<Vec<_>>();
+        if clauses.is_empty() {
+            continue;
+        }
+        let [clause] = clauses.as_slice() else {
+            return None;
+        };
+        let children = store.source_direct_children(*clause)?;
+        let [node] = children.as_slice() else {
+            return None;
+        };
+        let expressions = store.source_direct_children(*node)?;
+        let [expression] = expressions.as_slice() else {
+            return None;
+        };
+        if count == nodes.len()
+            || store.source_node_kind(*node) != Some(SyntaxKind::ExpressionWithTypeArguments)
+            || store.source_node_kind(*expression) != Some(SyntaxKind::Identifier)
+            || store.source_identifier_text(*expression) != Some(base_name)
+            || store.source_node_parent(*clause) != Some(SourceNodeParent::Parent(declaration))
+            || store.source_node_parent(*node) != Some(SourceNodeParent::Parent(*clause))
+            || store.source_node_parent(*expression) != Some(SourceNodeParent::Parent(*node))
+        {
+            return None;
+        }
+        nodes[count] = Some(*node);
+        count += 1;
+    }
+    Some([nodes[0]?, nodes[1]?])
+}
+
+fn planned_repeated_interface_bases_are_exact(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> bool {
+    let Some(heritage) = &plan.heritage else {
+        return false;
+    };
+    let [first, second] = heritage.bases.as_slice() else {
+        return false;
+    };
+    first.symbol == second.symbol
+        && [first, second].iter().all(|base| {
+            base.type_arguments.is_empty()
+                && base.defaults.is_empty()
+                && store.source_direct_children(base.node).as_deref() == Some(&[base.expression])
+        })
+        && repeated_nongeneric_interface_base_nodes(store, plan.symbol, first.symbol)
+            == Some([first.node, second.node])
+        && store.source_node_parent(first.node) == Some(SourceNodeParent::Parent(heritage.clause))
+        && store.symbol(plan.symbol).is_some_and(|owner| {
+            owner.declarations().is_some_and(|declarations| {
+                declarations
+                    .iter()
+                    .copied()
+                    .filter(|declaration| {
+                        store.source_node_kind(*declaration)
+                            == Some(SyntaxKind::InterfaceDeclaration)
+                    })
+                    .eq(plan.declarations.iter().copied())
+            })
+        })
+}
+
+/// Matches the retained store publication policy for a distinct second base.
+fn distinct_second_interface_base_is_supported(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    type_: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return false;
+    };
+    let structured = &interface.reference.object.structured;
+    store.get_merged_symbol(symbol) == Some(symbol)
+        && store
+            .declared_type_links(symbol)
+            .is_some_and(|links| links.declared_type == Some(type_))
+        && record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        && record.symbol() == Some(symbol)
+        && record.alias().is_none()
+        && store.symbol(symbol).is_some_and(|symbol| {
+            symbol.flags() == SymbolFlags::INTERFACE
+                && symbol.members() == interface.declared_members
+        })
+        && interface.all_type_parameters.is_none()
+        && interface.outer_type_parameter_count == 0
+        && interface.this_type.is_none()
+        && interface.reference.object.target.is_none()
+        && interface.reference.object.mapper.is_none()
+        && interface.reference.object.instantiations == TypeCacheState::Unallocated
+        && interface.reference.node.is_none()
+        && interface.reference.resolved_type_arguments.is_none()
+        && interface.base_types_resolved
+        && interface.declared_members_resolved
+        && interface.resolved_base_constructor_type.is_none()
+        && interface.declared_call_signatures.is_none()
+        && interface.declared_construct_signatures.is_none()
+        && interface.declared_index_infos.is_none()
+        && structured.signatures.is_none()
+        && structured.call_signature_count == 0
+        && structured.index_infos.is_none()
 }
 
 fn matching_inherited_property_contract(
@@ -216,8 +348,25 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
         .get(1)
         .zip(base_types.get(1))
         .map(|(base, type_)| (base.symbol, *type_));
-    if second_base
-        .is_some_and(|(symbol, type_)| symbol == planned_base.symbol || type_ == base_type)
+    if second_base.is_some_and(|(symbol, type_)| {
+        (symbol == planned_base.symbol || type_ == base_type)
+            && (symbol != planned_base.symbol
+                || type_ != base_type
+                || !planned_repeated_interface_bases_are_exact(store, plan))
+    }) {
+        return Err(invalid(plan, type_));
+    }
+    let owner = store
+        .symbol(plan.symbol)
+        .ok_or_else(|| invalid(plan, type_))?;
+    let value_owner = authenticated_default_library_interface_owner(store, plan.symbol)
+        || authenticated_nongeneric_global_interface_owner(store, plan.symbol);
+    if (owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || owner.value_declaration().is_some())
+        && !value_owner
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
     {
         return Err(invalid(plan, type_));
     }
@@ -232,7 +381,12 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
     base_surfaces
         .try_reserve_exact(base_types.len())
         .map_err(|_| capacity(plan))?;
-    for (planned, base) in heritage.bases.iter().zip(base_types.iter().copied()) {
+    for (index, (planned, base)) in heritage
+        .bases
+        .iter()
+        .zip(base_types.iter().copied())
+        .enumerate()
+    {
         let base_record = store
             .type_payload(base)
             .ok_or_else(|| invalid(plan, type_))?;
@@ -264,6 +418,17 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
             return Err(invalid(plan, type_));
         }
         if second_base.is_some() && !surface.index_infos.is_empty() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: planned.node,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+            });
+        }
+        if index == 1
+            && planned.symbol != planned_base.symbol
+            && (planned.symbol == plan.symbol
+                || base == type_
+                || !distinct_second_interface_base_is_supported(store, planned.symbol, base))
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: planned.node,
                 kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -745,7 +910,12 @@ pub(super) fn validate_planned_interface_heritage_members_with_array_targets(
         base_type,
         second_base,
     };
-    if record.symbol() != Some(plan.symbol)
+    if second_base.is_some_and(|(symbol, second_type)| {
+        (symbol == planned_base.symbol || second_type == base_type)
+            && (symbol != planned_base.symbol
+                || second_type != base_type
+                || !planned_repeated_interface_bases_are_exact(store, plan))
+    }) || record.symbol() != Some(plan.symbol)
         || interface.declared_members != plan.members
         || store.direct_interface_heritage_provenance(type_) != Some(expected_provenance)
         || heritage
@@ -1059,7 +1229,11 @@ fn validate_property_interface_worker(
     let library_owner = record
         .symbol()
         .is_some_and(|owner| authenticated_default_library_interface_owner(store, owner));
-    let reference_identity = (requires_direct_base || library_owner)
+    let global_owner = record
+        .symbol()
+        .is_some_and(|owner| authenticated_nongeneric_global_interface_owner(store, owner));
+    let value_owner = library_owner || global_owner;
+    let reference_identity = (requires_direct_base || value_owner)
         && validate_nongeneric_interface_argument_origin(store, type_).is_ok();
     if record.object_flags().contains(ObjectFlags::REFERENCE) && !reference_identity {
         let result = validate_generic_base_property_interface(store, type_, array_targets);
@@ -1105,16 +1279,16 @@ fn validate_property_interface_worker(
         || object_flags != identity_flags | ObjectFlags::MEMBERS_RESOLVED
         || record.alias().is_some()
         || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
-            && !library_owner
+            && !value_owner
         || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.value_declaration().is_some() && !library_owner
+        || owner_record.value_declaration().is_some() && !value_owner
         || !valid_declared_member_table(store, owner, interface.declared_members)
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
         || owner_declarations.iter().any(|declaration| {
             store.source_node_kind(*declaration) != Some(SyntaxKind::InterfaceDeclaration)
-                && !(library_owner
+                && !(value_owner
                     && owner_record.value_declaration() == Some(*declaration)
                     && store.source_node_kind(*declaration)
                         == Some(SyntaxKind::VariableDeclaration))
@@ -1168,11 +1342,17 @@ fn validate_property_interface_worker(
         (true, Some([first, second]), Some((second_symbol, second_type)))
             if *first != type_
                 && *second != type_
-                && *first != *second
                 && *first == heritage_provenance.base_type
                 && *second == second_type
                 && second_symbol != owner
-                && second_symbol != heritage_provenance.base_symbol =>
+                && if *first == *second || second_symbol == heritage_provenance.base_symbol {
+                    *first == *second
+                        && second_symbol == heritage_provenance.base_symbol
+                        && repeated_nongeneric_interface_base_nodes(store, owner, second_symbol)
+                            .is_some()
+                } else {
+                    true
+                } =>
         {
             interface.resolved_base_types.as_deref()?
         }
@@ -2390,6 +2570,7 @@ fn valid_interface_method_signatures(
     if owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         && !merged_namespace_interface
         && !authenticated_default_library_interface_owner(store, owner)
+        && !authenticated_nongeneric_global_interface_owner(store, owner)
         || declarations.is_empty()
         || declarations.len() != signatures.len()
         || record.flags() != TypeFlags::OBJECT
@@ -2749,11 +2930,11 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolData,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        DeclaredTypeHost,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeHost,
         bootstrap::IntrinsicBootstrapOptions,
         declared::get_declared_class_interface_or_type_parameter,
         interface_heritage::plan_direct_interface_heritage,
@@ -2865,6 +3046,27 @@ mod tests {
             files,
             store,
         }
+    }
+
+    fn fixture_with_recorded_source(source: &str, file: u32) -> Fixture {
+        let mut fixture = fixture_with_source(source, file);
+        let source = fixture
+            .store
+            .register_source_file(
+                &fixture.parsed.arena,
+                fixture.parsed.source_file,
+                fixture.file,
+            )
+            .unwrap();
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        assert!(
+            fixture
+                .store
+                .register_source_file_facts(source, bound.source_facts().unwrap())
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert!(fixture.store.record_source_global_bindings(globals));
+        fixture
     }
 
     fn host<'a>(arena: &'a NodeArena, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
@@ -6225,6 +6427,1000 @@ mod tests {
                 prepared.fixture.store.checker_link_allocated_lengths(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check real merged-owner metadata before and after publication.
+    fn source_merged_heritage_rejects_changed_owner_proofs_and_replays() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let parsed = parse_source_file(concat!(
+            "interface Base { first: number } ",
+            "interface Derived extends Base { own: number } ",
+            "interface Derived extends Base {} ",
+            "declare var Derived: number; ",
+            "interface Leaf extends Base, Derived {}",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(parsed.diagnostics.is_empty());
+        let library_file = FileId::new(14_712);
+        let file = FileId::new(14_713);
+        for warm in [false, true] {
+            let mut binder = CanonicalBinder::new();
+            for (file, source, default_library) in
+                [(library_file, &library, true), (file, &parsed, false)]
+            {
+                binder
+                    .bind_source_file_with_facts(
+                        &source.arena,
+                        source.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(if default_library {
+                                "\"/lib/array.d.ts\""
+                            } else {
+                                "\"/project/merged.ts\""
+                            }),
+                            CanonicalSourceLanguage::TypeScript,
+                            default_library,
+                            default_library,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&source.arena, file)
+                    .unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(library_file, &library.arena), (file, &parsed.arena)],
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            let [base, owner, leaf] = ["Base", "Derived", "Leaf"].map(|name| {
+                let store = context.store();
+                store
+                    .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                    .unwrap()
+                    .get_source(name)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap()
+            });
+            assert!(authenticated_nongeneric_global_interface_owner(
+                context.store(),
+                owner,
+            ));
+            assert!(!authenticated_default_library_interface_owner(
+                context.store(),
+                owner,
+            ));
+            let bound_library = context.file(library_file).unwrap().1.clone();
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&library.arena, &bound_library), (&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let base_plan = object_members::plan_interface(context.store(), &host, base).unwrap();
+            let plan = object_members::plan_interface(context.store(), &host, owner).unwrap();
+            let flags = context.store().symbol(owner).unwrap().flags();
+            let declarations = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let value_declaration = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let value_annotation = context
+                .store()
+                .source_direct_type_annotation(value_declaration)
+                .unwrap();
+            let base_flags = context.store().symbol(base).unwrap().flags();
+            let base_type = get_declared_class_interface_or_type_parameter(
+                context.store_mut_for_test(),
+                &host,
+                base,
+                base_flags,
+            )
+            .unwrap()
+            .unwrap();
+            let type_ = get_declared_class_interface_or_type_parameter(
+                context.store_mut_for_test(),
+                &host,
+                owner,
+                flags,
+            )
+            .unwrap()
+            .unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let state =
+                object_members::interface_state(context.store(), &base_plan, base_type).unwrap();
+            object_members::publish_declared_members(
+                context.store_mut_for_test(),
+                &base_plan,
+                state,
+                &[number],
+                &[],
+                &[],
+            )
+            .unwrap();
+            let own = plan.properties[0].symbol;
+            let bases = [base_type, base_type];
+            if warm {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        context.store_mut_for_test(),
+                        &plan,
+                        type_,
+                        &[number],
+                        &bases,
+                    ),
+                    Ok(type_),
+                );
+            }
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                let symbol = store.symbol(owner).unwrap();
+                (
+                    derived_state(store, type_, own),
+                    store.direct_interface_heritage_provenance(type_),
+                    (
+                        symbol.flags(),
+                        symbol.check_flags(),
+                        symbol.declarations().unwrap().to_vec(),
+                        symbol.value_declaration(),
+                    ),
+                    store.value_symbol_links(owner).cloned(),
+                    store.type_node_links(value_annotation).cloned(),
+                    (
+                        store.symbol(base).unwrap().flags(),
+                        store.symbol(base).unwrap().check_flags(),
+                    ),
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    context.diagnostics().clone(),
+                )
+            };
+            let original = snapshot(&context);
+            for damage in ["owner-flags", "value-declaration", "base-flags"] {
+                match damage {
+                    "value-declaration" => {
+                        assert!(context.store_mut_for_test().set_symbol_declarations(
+                            owner,
+                            Some(declarations.clone()),
+                            Some(plan.node),
+                        ));
+                    }
+                    "base-flags" => {
+                        let changed = if base_flags.contains(SymbolFlags::TRANSIENT) {
+                            base_flags.without(SymbolFlags::TRANSIENT)
+                        } else {
+                            base_flags | SymbolFlags::TRANSIENT
+                        };
+                        assert!(context.store_mut_for_test().set_symbol_flags(
+                            base,
+                            changed,
+                            CheckFlags::NONE,
+                        ));
+                    }
+                    _ => {
+                        assert!(context.store_mut_for_test().set_symbol_flags(
+                            owner,
+                            flags | SymbolFlags::CLASS,
+                            CheckFlags::NONE,
+                        ));
+                    }
+                }
+                let damaged = snapshot(&context);
+                for _ in 0..2 {
+                    let damaged_owner = if damage == "base-flags" { base } else { owner };
+                    assert!(!authenticated_nongeneric_global_interface_owner(
+                        context.store(),
+                        damaged_owner,
+                    ));
+                    assert_eq!(
+                        repeated_nongeneric_interface_base_nodes(context.store(), owner, base),
+                        None,
+                    );
+                    assert_eq!(
+                        resolve_direct_interface_members(
+                            context.store_mut_for_test(),
+                            &plan,
+                            type_,
+                            &[number],
+                            &bases,
+                        ),
+                        Err(PropertyObjectError::InvalidCachedInterface {
+                            symbol: owner,
+                            type_,
+                        }),
+                    );
+                    if warm {
+                        assert!(!validate_planned_interface_heritage_members(
+                            context.store(),
+                            &plan,
+                            type_,
+                        ));
+                        assert_eq!(
+                            validate_interface_heritage_members(context.store(), type_),
+                            InterfaceHeritageMembersValidation::Malformed,
+                        );
+                    }
+                    assert_eq!(snapshot(&context), damaged);
+                }
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    base,
+                    base_flags,
+                    CheckFlags::NONE,
+                ));
+                assert!(context.store_mut_for_test().set_symbol_flags(
+                    owner,
+                    flags,
+                    CheckFlags::NONE,
+                ));
+                assert!(context.store_mut_for_test().set_symbol_declarations(
+                    owner,
+                    Some(declarations.clone()),
+                    Some(value_declaration),
+                ));
+                assert_eq!(snapshot(&context), original);
+                assert!(authenticated_nongeneric_global_interface_owner(
+                    context.store(),
+                    owner,
+                ));
+            }
+            assert_eq!(
+                resolve_direct_interface_members(
+                    context.store_mut_for_test(),
+                    &plan,
+                    type_,
+                    &[number],
+                    &bases,
+                ),
+                Ok(type_),
+            );
+            let published = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        context.store_mut_for_test(),
+                        &plan,
+                        type_,
+                        &[number],
+                        &bases,
+                    ),
+                    Ok(type_),
+                );
+                assert!(validate_planned_interface_heritage_members(
+                    context.store(),
+                    &plan,
+                    type_,
+                ));
+                assert_eq!(
+                    validate_interface_heritage_members(context.store(), type_),
+                    InterfaceHeritageMembersValidation::Valid,
+                );
+                assert_eq!(snapshot(&context), published);
+            }
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().type_node_links(value_annotation).is_none());
+            assert!(context.diagnostics().is_empty());
+
+            // The direct publisher also checks the retained second-base boundary.
+            let leaf_record = context.store().symbol(leaf).unwrap();
+            let [leaf_node] = leaf_record.declarations().unwrap() else {
+                panic!("the leaf has one source interface declaration");
+            };
+            let leaf_node = *leaf_node;
+            let leaf_flags = leaf_record.flags();
+            assert!(leaf_record.members().is_none());
+            let NodeData::InterfaceDeclaration(leaf_source) =
+                &parsed.arena.get(leaf_node.node).unwrap().data
+            else {
+                panic!("the leaf retains its parsed interface declaration");
+            };
+            assert!(leaf_source.members.nodes.is_empty());
+            let leaf_heritage = plan_direct_interface_heritage(
+                context.store(),
+                &host,
+                leaf_node,
+                leaf,
+                leaf_source.heritage_clauses.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(leaf_heritage.bases.len(), 2);
+            assert_eq!(leaf_heritage.bases[0].symbol, base);
+            assert_eq!(leaf_heritage.bases[1].symbol, owner);
+            let second_node = leaf_heritage.bases[1].node;
+            assert_eq!(
+                object_members::plan_interface(context.store(), &host, leaf),
+                Err(PropertyObjectError::UnsupportedMember {
+                    node: second_node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                }),
+            );
+            let leaf_plan = PropertyObjectPlan {
+                kind: PropertyObjectKind::Interface,
+                node: leaf_node,
+                const_context: false,
+                declarations: vec![leaf_node],
+                symbol: leaf,
+                members: None,
+                properties: Vec::new(),
+                methods: Vec::new(),
+                accessors: Vec::new(),
+                spreads: Vec::new(),
+                indexes: Vec::new(),
+                call_signatures: Vec::new(),
+                alias_symbol: None,
+                heritage: Some(leaf_heritage),
+            };
+            let leaf_type = get_declared_class_interface_or_type_parameter(
+                context.store_mut_for_test(),
+                &host,
+                leaf,
+                leaf_flags,
+            )
+            .unwrap()
+            .unwrap();
+            let leaf_state = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                let record = store.type_payload(leaf_type).unwrap();
+                let TypeData::Interface(interface) = record.data() else {
+                    panic!("the leaf retains its interface identity");
+                };
+                (
+                    record.object_flags(),
+                    interface.clone(),
+                    store.declared_type_links(leaf).cloned(),
+                    store.type_node_links(leaf_node).cloned(),
+                    store.direct_interface_heritage_provenance(leaf_type),
+                    snapshot(context),
+                )
+            };
+            let unpublished = leaf_state(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        context.store_mut_for_test(),
+                        &leaf_plan,
+                        leaf_type,
+                        &[],
+                        &[base_type, type_],
+                    ),
+                    Err(PropertyObjectError::UnsupportedMember {
+                        node: second_node,
+                        kind: SyntaxKind::ExpressionWithTypeArguments,
+                    }),
+                );
+                assert_eq!(leaf_state(&context), unpublished);
+            }
+            assert!(
+                context
+                    .store()
+                    .direct_interface_heritage_provenance(leaf_type)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Restore real file facts after both publication paths reject them.
+    fn repeated_interface_bases_require_retained_script_facts_before_publication() {
+        let mut fixture = fixture_with_source(
+            &format!("{SOURCE}interface Derived extends Base {{}}\n"),
+            14_714,
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert!(fixture.store.record_source_global_bindings(globals));
+        let mut prepared = prepare_fixture(fixture);
+        let plan = &prepared.derived_plan;
+        let own = plan.properties[0].symbol;
+        let annotation = plan.properties[0].type_node;
+        let base = interface_symbol(&prepared.fixture, "Base");
+        let heritage = plan.heritage.as_ref().unwrap();
+        assert_eq!(heritage.bases.len(), 2);
+        let expected_nodes = [heritage.bases[0].node, heritage.bases[1].node];
+        let expected_bases = [prepared.base_type, prepared.base_type];
+        let provenance = DirectInterfaceHeritageProvenance {
+            owner_symbol: plan.symbol,
+            base_symbol: base,
+            base_type: prepared.base_type,
+            second_base: Some((base, prepared.base_type)),
+        };
+        assert!(prepared.fixture.store.source_global_bindings().is_some());
+        assert!(
+            !prepared
+                .fixture
+                .store
+                .source_is_typescript_script(plan.node)
+        );
+        assert!(
+            prepared
+                .fixture
+                .store
+                .try_reserve_direct_interface_heritage_provenance(1)
+        );
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                derived_state(store, prepared.derived_type, own),
+                store.type_node_links(annotation).cloned(),
+                store.declared_type_links(plan.symbol).cloned(),
+                store.direct_interface_heritage_provenance(prepared.derived_type),
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let before = state(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                repeated_nongeneric_interface_base_nodes(
+                    &prepared.fixture.store,
+                    plan.symbol,
+                    base
+                ),
+                None,
+            );
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &expected_bases,
+                ),
+                Err(PropertyObjectError::InvalidCachedInterface {
+                    symbol: plan.symbol,
+                    type_: prepared.derived_type,
+                }),
+            );
+            assert!(
+                !prepared
+                    .fixture
+                    .store
+                    .publish_direct_interface_heritage_provenance(
+                        prepared.derived_type,
+                        provenance
+                    )
+            );
+            assert_eq!(state(&prepared.fixture.store), before);
+        }
+        let source = prepared
+            .fixture
+            .store
+            .register_source_file(
+                &prepared.fixture.parsed.arena,
+                prepared.fixture.parsed.source_file,
+                prepared.fixture.file,
+            )
+            .unwrap();
+        let bound = prepared.fixture.files.get(&prepared.fixture.file).unwrap();
+        let facts = bound.source_facts().unwrap();
+        assert!(!facts.is_javascript_file());
+        assert!(!facts.is_external_or_common_js_module());
+        assert!(
+            prepared
+                .fixture
+                .store
+                .register_source_file_facts(source, facts)
+        );
+        assert_eq!(state(&prepared.fixture.store), before);
+        assert!(
+            prepared
+                .fixture
+                .store
+                .source_is_typescript_script(plan.node)
+        );
+        assert_eq!(
+            repeated_nongeneric_interface_base_nodes(&prepared.fixture.store, plan.symbol, base),
+            Some(expected_nodes),
+        );
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &expected_bases,
+            ),
+            Ok(prepared.derived_type),
+        );
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .direct_interface_heritage_provenance(prepared.derived_type),
+            Some(provenance),
+        );
+        let warm = state(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &expected_bases,
+                ),
+                Ok(prepared.derived_type),
+            );
+            assert!(validate_planned_interface_heritage_members(
+                &prepared.fixture.store,
+                plan,
+                prepared.derived_type,
+            ));
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid,
+            );
+            assert!(
+                !prepared
+                    .fixture
+                    .store
+                    .publish_direct_interface_heritage_provenance(
+                        prepared.derived_type,
+                        provenance
+                    )
+            );
+            assert_eq!(state(&prepared.fixture.store), warm);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep actual parser, binder, and file-fact identities together.
+    fn repeated_interface_base_proof_rejects_javascript_and_module_facts() {
+        const DECLARATIONS: &str = concat!(
+            "interface Base {}\n",
+            "interface Derived extends Base {}\n",
+            "interface Derived extends Base {}\n",
+        );
+        for javascript in [true, false] {
+            let parsed = if javascript {
+                parse_javascript_source_file(DECLARATIONS)
+            } else {
+                parse_source_file(&format!("{DECLARATIONS}export {{}};\n"))
+            };
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(if javascript { 14_715 } else { 14_716 });
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(if javascript {
+                            "\"/repeated-base.js\""
+                        } else {
+                            "\"/repeated-base.ts\""
+                        }),
+                        if javascript {
+                            CanonicalSourceLanguage::JavaScript
+                        } else {
+                            CanonicalSourceLanguage::TypeScript
+                        },
+                        false,
+                        if javascript {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+            if javascript {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            } else {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let (symbols, files) = binder.finish().try_into_parts().unwrap();
+            let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+            let source = store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+            let bound = files.get(&file).unwrap();
+            let facts = bound.source_facts().unwrap();
+            assert_eq!(facts.is_javascript_file(), javascript);
+            assert_eq!(facts.is_external_or_common_js_module(), !javascript);
+            assert!(store.register_source_file_facts(source, facts));
+            store
+                .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+                .unwrap();
+            let locals = bound.locals(bound.source_file()).unwrap();
+            let raw_symbols = ["Base", "Derived"].map(|name| {
+                store
+                    .symbol_table(locals)
+                    .unwrap()
+                    .get_source(name)
+                    .unwrap()
+            });
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            // Exercise the private proof after real merges, not Program module admission.
+            for symbol in raw_symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+            let [base, owner] = raw_symbols.map(|symbol| store.get_merged_symbol(symbol).unwrap());
+            let declarations = store
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            assert_eq!(declarations.len(), 2);
+            for symbol in [base, owner] {
+                let record = store.symbol(symbol).unwrap();
+                assert_eq!(
+                    record.flags().without(SymbolFlags::TRANSIENT),
+                    SymbolFlags::INTERFACE,
+                );
+                assert!(record.parent().is_none());
+                assert!(record.value_declaration().is_none());
+                assert!(store.source_merged_symbol_declarations_match(symbol));
+                assert!(store.declared_type_links(symbol).is_none());
+            }
+            let state = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.source_global_bindings().is_some(),
+                    [base, owner].map(|symbol| {
+                        (
+                            store.declared_type_links(symbol).cloned(),
+                            store.value_symbol_links(symbol).cloned(),
+                        )
+                    }),
+                    declarations
+                        .iter()
+                        .map(|node| store.type_node_links(*node).cloned())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            for recorded_globals in [false, true] {
+                if recorded_globals {
+                    assert!(store.record_source_global_bindings(globals));
+                }
+                assert_eq!(store.source_global_bindings().is_some(), recorded_globals);
+                let before = state(&store);
+                for _ in 0..2 {
+                    assert!(!store.source_is_typescript_script(declarations[0]));
+                    assert!(!authenticated_nongeneric_global_interface_owner(
+                        &store, base
+                    ));
+                    assert!(!authenticated_nongeneric_global_interface_owner(
+                        &store, owner
+                    ));
+                    assert_eq!(
+                        repeated_nongeneric_interface_base_nodes(&store, owner, base),
+                        None,
+                    );
+                    assert_eq!(state(&store), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep repeated source edges, cache corruption, and replay together.
+    fn repeated_nongeneric_bases_keep_ordered_edges_and_original_members() {
+        let mut prepared = prepare_fixture(fixture_with_recorded_source(
+            &format!("{SOURCE}interface Derived extends Base {{}}\ninterface Derived {{}}\n"),
+            14_710,
+        ));
+        let plan = &prepared.derived_plan;
+        let own = plan.properties[0].symbol;
+        let base = prepared
+            .fixture
+            .store
+            .type_payload(prepared.base_type)
+            .unwrap();
+        let TypeData::Interface(base_data) = base.data() else {
+            panic!("the base must retain its interface identity");
+        };
+        let base_properties = base_data
+            .reference
+            .object
+            .structured
+            .properties
+            .clone()
+            .unwrap();
+        let base_symbol = base.symbol().unwrap();
+        let heritage = plan.heritage.as_ref().unwrap();
+        assert_eq!(heritage.bases.len(), 2);
+        assert_eq!(
+            repeated_nongeneric_interface_base_nodes(
+                &prepared.fixture.store,
+                plan.symbol,
+                base_symbol,
+            ),
+            Some([heritage.bases[0].node, heritage.bases[1].node]),
+        );
+        assert_ne!(heritage.bases[0].node, heritage.bases[1].node);
+        let expected_bases = [prepared.base_type, prepared.base_type];
+        let types_before = prepared.fixture.store.type_len();
+        let symbols_before = prepared.fixture.store.symbol_len();
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &expected_bases,
+            ),
+            Ok(prepared.derived_type),
+        );
+        let TypeData::Interface(data) = prepared
+            .fixture
+            .store
+            .type_payload(prepared.derived_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("the derived type must retain its interface identity");
+        };
+        assert_eq!(
+            data.resolved_base_types.as_deref(),
+            Some(expected_bases.as_slice()),
+        );
+        let expected_properties = [own, base_properties[0], base_properties[1]];
+        assert_eq!(
+            data.reference.object.structured.properties.as_deref(),
+            Some(expected_properties.as_slice()),
+        );
+        assert_eq!(prepared.fixture.store.type_len(), types_before);
+        assert_eq!(prepared.fixture.store.symbol_len(), symbols_before);
+        let expected_provenance = DirectInterfaceHeritageProvenance {
+            owner_symbol: plan.symbol,
+            base_symbol,
+            base_type: prepared.base_type,
+            second_base: Some((base_symbol, prepared.base_type)),
+        };
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                derived_state(store, prepared.derived_type, own),
+                store.direct_interface_heritage_provenance(prepared.derived_type),
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+                store
+                    .symbol(plan.symbol)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec(),
+            )
+        };
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .direct_interface_heritage_provenance(prepared.derived_type),
+            Some(expected_provenance),
+        );
+        let warm = state(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &expected_bases,
+                ),
+                Ok(prepared.derived_type),
+            );
+            assert!(validate_planned_interface_heritage_members(
+                &prepared.fixture.store,
+                plan,
+                prepared.derived_type,
+            ));
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid,
+            );
+            assert_eq!(state(&prepared.fixture.store), warm);
+        }
+        for wrong in [
+            vec![prepared.base_type],
+            vec![prepared.other_type, prepared.base_type],
+            vec![prepared.base_type, prepared.other_type],
+        ] {
+            assert!(prepared.fixture.store.set_interface_base_resolution(
+                prepared.derived_type,
+                true,
+                None,
+                Some(wrong),
+            ));
+            let poisoned = state(&prepared.fixture.store);
+            for _ in 0..2 {
+                assert!(!validate_planned_interface_heritage_members(
+                    &prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                ));
+                assert_eq!(
+                    validate_interface_heritage_members(
+                        &prepared.fixture.store,
+                        prepared.derived_type,
+                    ),
+                    InterfaceHeritageMembersValidation::Malformed,
+                );
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        plan,
+                        prepared.derived_type,
+                        &[prepared.number_type],
+                        &expected_bases,
+                    ),
+                    Err(PropertyObjectError::InvalidCachedInterface {
+                        symbol: plan.symbol,
+                        type_: prepared.derived_type,
+                    }),
+                );
+                assert_eq!(state(&prepared.fixture.store), poisoned);
+            }
+            assert!(prepared.fixture.store.set_interface_base_resolution(
+                prepared.derived_type,
+                true,
+                None,
+                Some(expected_bases.to_vec()),
+            ));
+            assert_eq!(state(&prepared.fixture.store), warm);
+        }
+        assert!(
+            !prepared
+                .fixture
+                .store
+                .publish_direct_interface_heritage_provenance(
+                    prepared.derived_type,
+                    expected_provenance,
+                )
+        );
+        assert_eq!(state(&prepared.fixture.store), warm);
+        let declarations = prepared
+            .fixture
+            .store
+            .symbol(plan.symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        assert_eq!(declarations.len(), 3);
+        assert!(prepared.fixture.store.set_symbol_declarations(
+            plan.symbol,
+            Some(declarations[..2].to_vec()),
+            None,
+        ));
+        let damaged = state(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                repeated_nongeneric_interface_base_nodes(
+                    &prepared.fixture.store,
+                    plan.symbol,
+                    base_symbol,
+                ),
+                None,
+            );
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Malformed,
+            );
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &expected_bases,
+                ),
+                Err(PropertyObjectError::InvalidCachedInterface {
+                    symbol: plan.symbol,
+                    type_: prepared.derived_type,
+                }),
+            );
+            assert_eq!(state(&prepared.fixture.store), damaged);
+        }
+        assert!(prepared.fixture.store.set_symbol_declarations(
+            plan.symbol,
+            Some(declarations),
+            None,
+        ));
+        assert_eq!(state(&prepared.fixture.store), warm);
+        assert!(validate_planned_interface_heritage_members(
+            &prepared.fixture.store,
+            plan,
+            prepared.derived_type,
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep independent source-plan damage cases beside restored publication.
+    fn repeated_base_publication_rejects_invented_or_reordered_plan_edges() {
+        let mut prepared = prepare_fixture(fixture_with_recorded_source(
+            &format!("{SOURCE}interface Derived extends Base {{}}\n"),
+            14_711,
+        ));
+        let own = prepared.derived_plan.properties[0].symbol;
+        let before = derived_state(&prepared.fixture.store, prepared.derived_type, own);
+        for damage in 0..4 {
+            let mut plan = prepared.derived_plan.clone();
+            let heritage = plan.heritage.as_mut().unwrap();
+            match damage {
+                0 => heritage.bases[1] = heritage.bases[0].clone(),
+                1 => heritage.bases.swap(0, 1),
+                2 => {
+                    heritage.bases[1].symbol = prepared
+                        .fixture
+                        .store
+                        .type_payload(prepared.other_type)
+                        .unwrap()
+                        .symbol()
+                        .unwrap();
+                }
+                _ => {
+                    assert!(plan.declarations.pop().is_some());
+                }
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        &plan,
+                        prepared.derived_type,
+                        &[prepared.number_type],
+                        &[prepared.base_type, prepared.base_type],
+                    ),
+                    Err(PropertyObjectError::InvalidCachedInterface {
+                        symbol: plan.symbol,
+                        type_: prepared.derived_type,
+                    }),
+                );
+                assert_eq!(
+                    derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                    before,
+                );
+                assert!(
+                    prepared
+                        .fixture
+                        .store
+                        .direct_interface_heritage_provenance(prepared.derived_type)
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type, prepared.base_type],
+            ),
+            Ok(prepared.derived_type),
         );
     }
 

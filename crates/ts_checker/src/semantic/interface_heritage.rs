@@ -331,7 +331,9 @@ fn plan_direct_interface_heritage_inner(
             });
             continue;
         }
-        if symbol_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE {
+        let interface_value_base =
+            symbol_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE;
+        if interface_value_base {
             if authenticate_default_library_interface_base(store, host, symbol, base_declarations)?
             {
                 bases.push(DirectInterfaceBasePlan {
@@ -344,15 +346,42 @@ fn plan_direct_interface_heritage_inner(
                 });
                 continue;
             }
-            return Err(DirectInterfaceHeritageError::Unsupported {
-                node: expression,
-                kind: expression_record.kind,
-            });
+            if !super::object_members::authenticated_nongeneric_global_interface_owner(
+                store, symbol,
+            ) {
+                return Err(DirectInterfaceHeritageError::Unsupported {
+                    node: expression,
+                    kind: expression_record.kind,
+                });
+            }
+            if super::declared::preflight_class_or_interface_reference(
+                store,
+                host,
+                symbol,
+                symbol_record.flags(),
+            )
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+                != 0
+            {
+                return Err(DirectInterfaceHeritageError::Invalid);
+            }
         }
         let mut seen_declarations = HashSet::with_capacity(base_declarations.len());
         for &base_declaration in base_declarations {
             let base_declaration_record = preflight_node(store, host, base_declaration)
                 .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+            if interface_value_base && symbol_record.value_declaration() == Some(base_declaration) {
+                if base_declaration_record.kind != SyntaxKind::VariableDeclaration
+                    || !matches!(
+                        &base_declaration_record.data,
+                        NodeData::VariableDeclaration(_)
+                    )
+                    || !host.symbol_matches(store, base_declaration, symbol)
+                {
+                    return Err(DirectInterfaceHeritageError::Invalid);
+                }
+                continue;
+            }
             let NodeData::InterfaceDeclaration(base_interface) = &base_declaration_record.data
             else {
                 return Err(DirectInterfaceHeritageError::Unsupported {
@@ -467,14 +496,16 @@ fn plan_interface_type_arguments(
         && owner_symbol
             .declarations()
             .is_some_and(|declarations| declarations.contains(&declaration))
-        && authenticate_default_library_interface_base(
+        && (authenticate_default_library_interface_base(
             store,
             host,
             owner,
             owner_symbol
                 .declarations()
                 .ok_or(DirectInterfaceHeritageError::Invalid)?,
-        )?;
+        )? || super::object_members::authenticated_nongeneric_global_interface_owner(
+            store, owner,
+        ));
     if owner_record.kind != SyntaxKind::InterfaceDeclaration
         || owner_record.flags.0 != 0
         || !host.symbol_matches(store, declaration, owner)
@@ -3287,6 +3318,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the ordinary source case beside the provenance checks.
     fn default_library_dom_interface_bases_reject_forged_provenance() {
         let library = parse_source_file(concat!(
             "interface HTMLElement { value: string }\n",
@@ -3295,6 +3327,19 @@ mod tests {
         let source = parse_source_file("interface HTMLWebViewElement extends HTMLElement {}\n");
         assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let source_edges = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some((node, base.expression, record.parent?))
+            })
+            .collect::<Vec<_>>();
+        let [(edge, expression, clause)] = source_edges.as_slice() else {
+            panic!("the source must retain its one written heritage edge");
+        };
 
         for corruption in 0..4 {
             let (mut context, library_file, source_file) =
@@ -3353,13 +3398,42 @@ mod tests {
                 context.store().symbol_store().symbol_table_len(),
                 context.store().checker_link_allocated_lengths(),
             );
-            assert!(
-                matches!(
-                    heritage_plan(&source, source_file, &context, "HTMLWebViewElement"),
-                    Err(DirectInterfaceHeritageError::Unsupported { .. })
-                ),
-                "corruption {corruption} accepted a forged DOM base"
-            );
+            let result = heritage_plan(&source, source_file, &context, "HTMLWebViewElement");
+            if corruption == 0 {
+                let plan = result.unwrap();
+                assert_eq!(plan.bases.len(), 1);
+                let inherited = &plan.bases[0];
+                assert_eq!(inherited.kind, DirectInterfaceBaseKind::Interface);
+                assert_eq!(inherited.symbol, base);
+                assert!(inherited.type_arguments.is_empty());
+                assert!(inherited.defaults.is_empty());
+                assert_eq!(
+                    plan.clause,
+                    NodeRef::new(source.arena.id(), source_file, *clause),
+                );
+                assert_eq!(
+                    inherited.node,
+                    NodeRef::new(source.arena.id(), source_file, *edge),
+                );
+                assert_eq!(
+                    inherited.expression,
+                    NodeRef::new(source.arena.id(), source_file, *expression),
+                );
+                assert_eq!(
+                    context.store().source_identifier_text(inherited.expression),
+                    Some("HTMLElement"),
+                );
+                assert!(context.store().declared_type_links(base).is_none());
+                assert!(context.store().value_symbol_links(base).is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DirectInterfaceHeritageError::Unsupported { .. })
+                    ),
+                    "corruption {corruption} accepted a forged DOM base"
+                );
+            }
             assert_eq!(
                 (
                     context.store().type_len(),
@@ -4044,26 +4118,49 @@ mod tests {
             "declare var HTMLAnchorElement: unknown;",
         ));
         let source = parse_source_file("");
+        let source_edges = library
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some((node, base.expression, record.parent?))
+            })
+            .collect::<Vec<_>>();
+        let [(edge, expression, clause)] = source_edges.as_slice() else {
+            panic!("the owner must retain its one written heritage edge");
+        };
         for default_library in [false, true] {
             let (context, file, _) =
                 default_library_heritage_context(&library, &source, default_library);
             let owner = interface_symbol(&library, file, &context, "HTMLAnchorElement");
+            let base = interface_symbol(&library, file, &context, "ElementBase");
             let before = (
                 context.store().type_len(),
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
             );
-            let result = heritage_plan(&library, file, &context, "HTMLAnchorElement");
-            if default_library {
-                let plan = result.unwrap();
-                assert_eq!(plan.bases.len(), 1);
-                assert!(plan.bases[0].type_arguments.is_empty());
-            } else {
-                assert!(matches!(
-                    result,
-                    Err(DirectInterfaceHeritageError::Unsupported { .. })
-                ));
-            }
+            let plan = heritage_plan(&library, file, &context, "HTMLAnchorElement").unwrap();
+            assert_eq!(plan.bases.len(), 1);
+            assert!(plan.bases[0].type_arguments.is_empty());
+            let inherited = &plan.bases[0];
+            assert_eq!(inherited.kind, DirectInterfaceBaseKind::Interface);
+            assert_eq!(inherited.symbol, base);
+            assert!(inherited.defaults.is_empty());
+            assert_eq!(plan.clause, NodeRef::new(library.arena.id(), file, *clause),);
+            assert_eq!(
+                inherited.node,
+                NodeRef::new(library.arena.id(), file, *edge),
+            );
+            assert_eq!(
+                inherited.expression,
+                NodeRef::new(library.arena.id(), file, *expression),
+            );
+            assert_eq!(
+                context.store().source_identifier_text(inherited.expression),
+                Some("ElementBase"),
+            );
             assert!(context.store().declared_type_links(owner).is_none());
             assert!(context.store().value_symbol_links(owner).is_none());
             assert_eq!(

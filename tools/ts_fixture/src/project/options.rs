@@ -90,6 +90,7 @@ pub(super) fn normalized_options(options: &CompilerOptions) -> Value {
         module,
         module_specified,
         module_resolution,
+        module_resolution_configured,
         target,
         jsx,
         jsx_factory,
@@ -248,16 +249,11 @@ pub(super) fn normalized_options(options: &CompilerOptions) -> Value {
     );
     result.insert(
         "module_resolution".to_owned(),
-        Value::String(
-            match module_resolution {
-                ModuleResolutionKind::Classic => "classic",
-                ModuleResolutionKind::Node10 => "node10",
-                ModuleResolutionKind::Node16 => "node16",
-                ModuleResolutionKind::NodeNext => "nodenext",
-                ModuleResolutionKind::Bundler => "bundler",
-            }
-            .to_owned(),
-        ),
+        Value::String(module_resolution_name(*module_resolution).to_owned()),
+    );
+    result.insert(
+        "module_resolution_configured".to_owned(),
+        serde_json::json!(module_resolution_configured.map(module_resolution_name)),
     );
     result.insert(
         "target".to_owned(),
@@ -319,6 +315,16 @@ pub(super) fn normalized_options(options: &CompilerOptions) -> Value {
     Value::Object(result)
 }
 
+const fn module_resolution_name(resolution: ModuleResolutionKind) -> &'static str {
+    match resolution {
+        ModuleResolutionKind::Classic => "classic",
+        ModuleResolutionKind::Node10 => "node10",
+        ModuleResolutionKind::Node16 => "node16",
+        ModuleResolutionKind::NodeNext => "nodenext",
+        ModuleResolutionKind::Bundler => "bundler",
+    }
+}
+
 pub(super) const fn module_name(module: ModuleKind) -> &'static str {
     match module {
         ModuleKind::None => "none",
@@ -353,8 +359,9 @@ mod tests {
         assert_eq!(report["module"], json!("none"));
         assert_eq!(report["module_specified"], json!(false));
         assert_eq!(report["effective_module"], json!("es2022"));
-        assert_eq!(report["module_resolution"], json!("node10"));
-        assert_eq!(report["resolve_json_module"], json!(false));
+        assert_eq!(report["module_resolution"], json!("bundler"));
+        assert_eq!(report["module_resolution_configured"], json!(null));
+        assert_eq!(report["resolve_json_module"], json!(true));
         assert_eq!(report["resolve_json_module_specified"], json!(false));
         assert_eq!(options.module, ModuleKind::None);
         assert!(!options.module_specified);
@@ -406,6 +413,37 @@ mod tests {
             assert_eq!(report["effective_module"], json!(effective));
             assert_eq!(options.module, module);
             assert!(options.module_specified);
+        }
+    }
+
+    #[test]
+    fn report_keeps_configured_resolution_separate_from_effective_defaults() {
+        for configured in [None, Some("bundler"), Some("classic"), Some("node10")] {
+            let resolution = configured.map_or_else(String::new, |name| {
+                format!(",\"moduleResolution\":\"{name}\"")
+            });
+            let config = ts_config::parse_config_text(
+                "/project/tsconfig.json",
+                &format!("{{\"compilerOptions\":{{\"target\":\"es2015\"{resolution}}}}}"),
+            )
+            .value
+            .unwrap();
+            let parsed = ts_options::parse_project_options(&config);
+            let removed = matches!(configured, Some("classic" | "node10"));
+            assert_eq!(parsed.diagnostics.len(), usize::from(removed));
+            if removed {
+                assert_eq!(parsed.diagnostics[0].code(), 5108);
+            }
+            let report = normalized_options(&parsed.options);
+            assert_eq!(report["module"], "none");
+            assert_eq!(report["module_specified"], false);
+            assert_eq!(report["module_resolution"], "bundler");
+            assert_eq!(
+                report["module_resolution_configured"],
+                serde_json::json!(configured)
+            );
+            assert_eq!(report["resolve_json_module"], true);
+            assert_eq!(report["resolve_json_module_specified"], false);
         }
     }
 }

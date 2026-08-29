@@ -166,7 +166,7 @@ use super::{
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
-        compound_assignment_binary_operator,
+        check_primitive_binary_with_session, compound_assignment_binary_operator,
     },
     reference_types::validate_direct_generic_reference,
     relater::ResolvedOwnProperty,
@@ -30703,8 +30703,17 @@ fn check_expression_type_with_class_context(
                             )
                         })
                     });
-                    let resolution = check_primitive_binary(
+                    let mut display_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                    if options.no_error_truncation {
+                        display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                    }
+                    let resolution = check_primitive_binary_with_session(
                         store,
+                        host,
+                        global_types,
+                        options.strict_function_types,
+                        display_flags,
+                        session,
                         PrimitiveBinaryRequest {
                             expression: node,
                             left: left_node,
@@ -41481,8 +41490,17 @@ fn check_planned_equality_condition(
     let [left, right] = checked.as_slice() else {
         unreachable!("an authenticated equality condition has exactly two operands")
     };
-    match check_primitive_binary(
+    let mut display_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    match check_primitive_binary_with_session(
         store,
+        host,
+        global_types,
+        options.strict_function_types,
+        display_flags,
+        session,
         PrimitiveBinaryRequest {
             expression: condition.expression,
             left: expressions[0].node,
@@ -85126,12 +85144,12 @@ mod tests {
         };
         check(&context);
         let warm = observable_state(&context, file);
-        let cached = caches(&context);
+        let expected = caches(&context);
         for _ in 0..2 {
             context.recheck_source_file(file).unwrap();
             check(&context);
             assert_eq!(observable_state(&context, file), warm);
-            assert_eq!(caches(&context), cached);
+            assert_eq!(caches(&context), expected);
         }
     }
 
@@ -95132,6 +95150,599 @@ class Foo2 {
                 .is_none()
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    fn object_equality_test_request(
+        source: &ParseResult,
+        file: FileId,
+        left_type: TypeId,
+        right_type: TypeId,
+    ) -> PrimitiveBinaryRequest {
+        let expression = variable_initializer(source, file, "comparison");
+        let NodeData::BinaryExpression(binary) = &source.arena.get(expression.node).unwrap().data
+        else {
+            panic!("the source must retain its comparison");
+        };
+        PrimitiveBinaryRequest {
+            expression,
+            left: NodeRef::new(expression.arena, file, binary.left),
+            operator: source.arena.get(binary.operator_token).unwrap().kind,
+            right: NodeRef::new(expression.arena, file, binary.right),
+            left_type,
+            right_type,
+            left_recovery: None,
+            right_recovery: None,
+            bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
+        }
+    }
+
+    #[test]
+    fn object_equality_kernel_authenticates_operands_before_early_results() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Item = { value: string }; declare const input: Item; ",
+            "declare const array: string[]; declare const mixed: string | number;",
+        ));
+        let source = parsed("const comparison = input === input;");
+        let foreign_source = parsed("declare const value: number;");
+        let library_file = FileId::new(200_610);
+        let file = FileId::new(200_611);
+        let options = CanonicalCheckerOptions {
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let foreign = context(&[(FileId::new(200_612), &foreign_source)], options);
+        let foreign_number = foreign.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut ctx = context(&[(library_file, &library), (file, &source)], options);
+        ctx.check_source_file(library_file).unwrap();
+        let [item, array, mixed] = ["input", "array", "mixed"].map(|name| {
+            ctx.get_type_from_type_node(variable_type_node(&library, library_file, name))
+                .unwrap()
+        });
+        let library_bound = ctx.file(library_file).unwrap().1.clone();
+        let source_bound = ctx.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = ctx.global_types().clone();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let store = ctx.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (null, undefined, any) = (
+            bootstrap.null_type,
+            bootstrap.undefined_type,
+            bootstrap.any_type,
+        );
+        let owner = store.type_payload(item).unwrap().symbol().unwrap();
+        assert!(store.set_type_symbol(item, None));
+        let malformed = store
+            .validate_union_constituent_with_global_types(&globals, item)
+            .unwrap_err();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.relation_state_snapshot(),
+        );
+        for (left, right) in [
+            (item, item),
+            (item, null),
+            (null, item),
+            (item, undefined),
+            (undefined, item),
+            (item, any),
+            (any, item),
+        ] {
+            let request = object_equality_test_request(&source, file, left, right);
+            assert_eq!(
+                check_primitive_binary_with_session(
+                    store,
+                    &host,
+                    &globals,
+                    options.strict_function_types,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                    &mut session,
+                    request,
+                ),
+                Err(PrimitiveBinaryError::Literal(malformed)),
+            );
+            assert!(store.type_node_links(request.expression).is_none());
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.set_type_symbol(item, Some(owner)));
+        for (left, right) in [
+            (foreign_number, foreign_number),
+            (foreign_number, null),
+            (undefined, foreign_number),
+            (any, foreign_number),
+        ] {
+            let request = object_equality_test_request(&source, file, left, right);
+            assert_eq!(
+                check_primitive_binary_with_session(
+                    store,
+                    &host,
+                    &globals,
+                    options.strict_function_types,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                    &mut session,
+                    request,
+                ),
+                Err(PrimitiveBinaryError::Invariant(
+                    super::super::primitive_operators::PrimitiveBinaryInvariant::InvalidType(
+                        foreign_number,
+                    ),
+                )),
+            );
+            assert!(store.type_node_links(request.expression).is_none());
+        }
+        let request = object_equality_test_request(&source, file, mixed, item);
+        assert_eq!(
+            check_primitive_binary_with_session(
+                store,
+                &host,
+                &globals,
+                options.strict_function_types,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                &mut session,
+                request,
+            ),
+            Err(PrimitiveBinaryError::Unsupported(
+                PrimitiveBinaryUnsupported::Operand {
+                    node: request.left,
+                    type_: mixed,
+                },
+            )),
+        );
+        let mut invalid_globals = globals.clone();
+        invalid_globals.array_type = foreign_number;
+        let invalid_array = store
+            .validate_union_constituent_with_global_types(&invalid_globals, array)
+            .unwrap_err();
+        assert_eq!(
+            check_primitive_binary_with_session(
+                store,
+                &host,
+                &invalid_globals,
+                options.strict_function_types,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                &mut session,
+                object_equality_test_request(&source, file, array, null),
+            ),
+            Err(PrimitiveBinaryError::Literal(invalid_array)),
+        );
+        let restored = check_primitive_binary_with_session(
+            store,
+            &host,
+            &globals,
+            options.strict_function_types,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            &mut session,
+            object_equality_test_request(&source, file, item, item),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.result_type,
+            store.intrinsic_bootstrap().unwrap().boolean_type
+        );
+        assert!(restored.diagnostics.is_empty());
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+        assert!(store.type_node_links(request.expression).is_none());
+    }
+
+    #[test]
+    fn object_equality_kernel_rejects_warm_generic_proxy_corruption() {
+        let library = parsed("interface Cell<T> { value: T }");
+        let source = parsed(concat!(
+            "declare const input: Cell<string>; const value = input.value; ",
+            "const comparison = input === input;",
+        ));
+        let library_file = FileId::new(200_617);
+        let file = FileId::new(200_618);
+        let options = CanonicalCheckerOptions {
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut ctx = context(&[(library_file, &library), (file, &source)], options);
+        ctx.check_source_file(library_file).unwrap();
+        ctx.check_source_file(file).unwrap();
+        assert!(ctx.diagnostics().is_empty());
+        let input = ctx
+            .get_type_from_type_node(variable_type_node(&source, file, "input"))
+            .unwrap();
+        let value = variable_initializer(&source, file, "value");
+        let proxy = ctx
+            .store()
+            .symbol_node_links(value)
+            .unwrap()
+            .resolved_symbol
+            .unwrap();
+        let library_bound = ctx.file(library_file).unwrap().1.clone();
+        let source_bound = ctx.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = ctx.global_types().clone();
+        let store = ctx.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number, null, undefined, any, boolean) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.null_type,
+            bootstrap.undefined_type,
+            bootstrap.any_type,
+            bootstrap.boolean_type,
+        );
+        let original = store.value_symbol_links(proxy).unwrap().clone();
+        assert_eq!(original.resolved_type, Some(string));
+        let poisoned = ValueSymbolLinks {
+            resolved_type: Some(number),
+            ..original.clone()
+        };
+        assert!(store.set_value_symbol_links(proxy, poisoned.clone()));
+        assert_eq!(
+            super::super::instantiated_members::validate_generic_interface_members(
+                store,
+                input,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+            ),
+            Err(super::super::instantiated_members::GenericInterfaceMemberError::InvalidCachedProperty(proxy)),
+        );
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.relation_state_snapshot(),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        for (left, right) in [
+            (input, input),
+            (input, null),
+            (null, input),
+            (input, undefined),
+            (undefined, input),
+            (input, any),
+            (any, input),
+        ] {
+            let request = object_equality_test_request(&source, file, left, right);
+            assert_eq!(
+                check_primitive_binary_with_session(
+                    store,
+                    &host,
+                    &globals,
+                    options.strict_function_types,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                    &mut session,
+                    request,
+                ),
+                Err(PrimitiveBinaryError::Relation(
+                    RelationUnavailable::InvalidStructuredMembers(input)
+                )),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(request.expression)
+                    .unwrap()
+                    .resolved_type,
+                Some(boolean)
+            );
+        }
+        assert_eq!(store.value_symbol_links(proxy), Some(&poisoned));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+        assert!(store.set_value_symbol_links(proxy, original));
+        let restored = check_primitive_binary_with_session(
+            store,
+            &host,
+            &globals,
+            options.strict_function_types,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            &mut session,
+            object_equality_test_request(&source, file, input, input),
+        )
+        .unwrap();
+        assert_eq!(restored.result_type, boolean);
+        assert!(restored.diagnostics.is_empty());
+        let warm = observable_state(&ctx, file);
+        ctx.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&ctx, file), warm);
+    }
+
+    #[test]
+    fn object_equality_kernel_keeps_relation_options_and_nullable_order() {
+        let library = parsed(concat!(
+            "interface Empty {} interface Item { value: string } ",
+            "declare const empty: Empty; declare const item: Item;",
+        ));
+        let source = parsed("const comparison = empty === item;");
+        let library_file = FileId::new(200_613);
+        let file = FileId::new(200_614);
+        let options = CanonicalCheckerOptions {
+            strict_function_types: true,
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut ctx = context(&[(library_file, &library), (file, &source)], options);
+        ctx.check_source_file(library_file).unwrap();
+        let empty = ctx
+            .get_type_from_type_node(variable_type_node(&library, library_file, "empty"))
+            .unwrap();
+        let item = ctx
+            .get_type_from_type_node(variable_type_node(&library, library_file, "item"))
+            .unwrap();
+        let library_bound = ctx.file(library_file).unwrap().1.clone();
+        let source_bound = ctx.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = ctx.global_types().clone();
+        let store = ctx.store_mut_for_test();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        for (source, target, expected) in [(empty, item, false), (item, empty, true)] {
+            assert_eq!(
+                store.is_type_related_to_with_session(
+                    source,
+                    target,
+                    super::super::RelationKind::Comparable,
+                    Some(&globals),
+                    Some(true),
+                    &mut session,
+                ),
+                Ok(expected),
+            );
+        }
+        let result = check_primitive_binary_with_session(
+            store,
+            &host,
+            &globals,
+            true,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            &mut session,
+            object_equality_test_request(&source, file, empty, item),
+        )
+        .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (boolean, null, undefined) = (
+            bootstrap.boolean_type,
+            bootstrap.null_type,
+            bootstrap.undefined_type,
+        );
+        assert_eq!(result.result_type, boolean);
+        assert!(result.diagnostics.is_empty());
+        let mismatch = PrimitiveBinaryError::Relation(
+            RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                established: true,
+                requested: false,
+            },
+        );
+        let before = store.relation_state_snapshot();
+        for (left, right) in [(item, item), (null, item), (undefined, item)] {
+            assert_eq!(
+                check_primitive_binary_with_session(
+                    store,
+                    &host,
+                    &globals,
+                    false,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                    &mut session,
+                    object_equality_test_request(&source, file, left, right),
+                ),
+                Err(mismatch.clone()),
+            );
+        }
+        for nullable in [null, undefined] {
+            let result = check_primitive_binary_with_session(
+                store,
+                &host,
+                &globals,
+                false,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                &mut session,
+                object_equality_test_request(&source, file, item, nullable),
+            )
+            .unwrap();
+            assert_eq!(result.result_type, boolean);
+            assert!(result.diagnostics.is_empty());
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+    }
+
+    #[test]
+    fn object_equality_kernel_uses_spent_caller_budget_and_short_circuits() {
+        let library = parsed("interface Cell<T> { value: T }");
+        let source = parsed(concat!(
+            "declare const left: Cell<string>; declare const right: Cell<number>; ",
+            "const comparison = left !== right;",
+        ));
+        let library_file = FileId::new(200_615);
+        let file = FileId::new(200_616);
+        let options = CanonicalCheckerOptions {
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut ctx = context(&[(library_file, &library), (file, &source)], options);
+        ctx.check_source_file(library_file).unwrap();
+        let left = ctx
+            .get_type_from_type_node(variable_type_node(&source, file, "left"))
+            .unwrap();
+        let right = ctx
+            .get_type_from_type_node(variable_type_node(&source, file, "right"))
+            .unwrap();
+        for reference in [left, right] {
+            assert!(
+                ctx.store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .properties
+                    .is_none()
+            );
+        }
+        let library_bound = ctx.file(library_file).unwrap().1.clone();
+        let source_bound = ctx.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = ctx.global_types().clone();
+        let store = ctx.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, boolean, error) = (
+            bootstrap.number_type,
+            bootstrap.boolean_type,
+            bootstrap.error_type,
+        );
+        let owner = store
+            .symbol_table(library_bound.locals(library_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("Cell")
+            .unwrap();
+        let declared = store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(interface) = store.type_payload(declared).unwrap().data() else {
+            panic!("Cell must retain its declared interface target");
+        };
+        let parameter = interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::instantiate::instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut session,
+            ),
+            Ok(number),
+        );
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        let before = session.limit_event_mark();
+        let request = object_equality_test_request(&source, file, left, right);
+        let result = check_primitive_binary_with_session(
+            store,
+            &host,
+            &globals,
+            options.strict_function_types,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            &mut session,
+            request,
+        )
+        .unwrap();
+        assert_eq!(result.result_type, boolean);
+        assert_eq!(result.recovery, None);
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(session.limit_event_occurred_since(before));
+        let [diagnostic] = result.diagnostics.as_slice() else {
+            panic!(
+                "the comparison must own one limit diagnostic: {:?}",
+                result.diagnostics
+            );
+        };
+        assert_eq!(diagnostic.node, Some(request.expression));
+        assert_eq!(diagnostic.range_override, None);
+        assert_eq!(diagnostic.diagnostic.code(), 2589);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type instantiation is excessively deep and possibly infinite."
+        );
+        assert!(diagnostic.related_information.is_empty());
+        for (reference, expected, recovered) in [(left, None, false), (right, Some(error), true)] {
+            let [property] = store
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("Cell must retain its one property");
+            };
+            assert_eq!(
+                store.value_symbol_links(*property).unwrap().resolved_type,
+                expected
+            );
+            assert_eq!(
+                store.instantiated_property_recovery(*property).is_some(),
+                recovered
+            );
+        }
+        assert!(store.type_node_links(request.expression).is_none());
+        let after = session.limit_event_mark();
+        assert_eq!(
+            super::super::instantiate::instantiate_type_with_vector_and_session(
+                store,
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut session,
+            ),
+            Ok(error),
+        );
+        assert!(session.limit_event_occurred_since(after));
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
     }
 
     #[test]

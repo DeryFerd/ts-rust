@@ -414,7 +414,7 @@ fn compiler_program(
         compiler_options.no_check = true;
         compiler_options.no_emit = true;
     }
-    Program::new_with_options(
+    Program::new_with_command_line_options(
         &file_system,
         current_directory,
         &options.files,
@@ -1030,8 +1030,7 @@ fn writer_diagnostic<'source>(
     let source_text = diagnostic
         .file_name
         .as_deref()
-        .and_then(|file_name| program.source_file(file_name))
-        .map(|source_file| source_file.source_text.as_str());
+        .and_then(|file_name| program.diagnostic_source_text(file_name));
     let category = match diagnostic.category.name() {
         "warning" => DiagnosticCategory::Warning,
         "suggestion" => DiagnosticCategory::Suggestion,

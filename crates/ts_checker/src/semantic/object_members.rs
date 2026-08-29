@@ -5652,6 +5652,13 @@ pub(super) fn plan_interface(
     }
     let mut additional_members = Vec::with_capacity(interface_declarations.len() - 1);
     let mut heritage = None;
+    let preserve_repeated_bases = symbol_record.parent().is_none()
+        && store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get(symbol_record.name()))
+            .and_then(|global| store.get_merged_symbol(global))
+            == Some(symbol);
     for (index, &candidate) in interface_declarations.iter().enumerate() {
         let invalid = || PropertyObjectError::InvalidInterface {
             declaration: candidate,
@@ -5701,7 +5708,14 @@ pub(super) fn plan_interface(
                     PropertyObjectError::UnsupportedMember { node, kind }
                 }
             })?;
-            merge_interface_heritage(store, host, &mut heritage, planned, 2)?;
+            merge_interface_heritage(
+                store,
+                host,
+                &mut heritage,
+                planned,
+                2,
+                preserve_repeated_bases,
+            )?;
         }
         if index != 0 {
             additional_members.push((candidate, &interface.members));
@@ -5757,6 +5771,7 @@ pub(super) fn plan_interface(
                 &value_declarations,
                 &plan,
             )
+            && !authenticated_nongeneric_global_interface_owner(store, symbol)
             || symbol_record.name().as_utf8() == Some("IntrinsicElements")
                 && store
                     .get_parent_of_symbol(symbol)
@@ -5808,6 +5823,19 @@ pub(super) fn plan_interface(
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
+            });
+        }
+        if let [first, second] = heritage.bases.as_slice()
+            && first.symbol != second.symbol
+            && store
+                .symbol(second.symbol)
+                .ok_or(PropertyObjectError::InvalidInterfaceSymbol(second.symbol))?
+                .flags()
+                != SymbolFlags::INTERFACE
+        {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: second.node,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
             });
         }
         let mut base_plans = Vec::<PropertyObjectPlan>::with_capacity(heritage.bases.len());
@@ -5941,7 +5969,9 @@ pub(super) fn plan_interface(
                 kind: call.syntax_kind(),
             });
         }
-        if !value_declarations.is_empty() {
+        if !value_declarations.is_empty()
+            && !authenticated_nongeneric_global_interface_owner(store, symbol)
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
@@ -6458,7 +6488,7 @@ fn authenticated_default_library_method_interface(
         })
 }
 
-pub(super) fn authenticated_default_library_interface_owner(
+fn authenticated_source_global_interface_owner(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,
 ) -> bool {
@@ -6491,10 +6521,19 @@ pub(super) fn authenticated_default_library_interface_owner(
             == Some(original.table_symbol)
         && owner.parent().is_none()
         && store.source_merged_symbol_declarations_match(symbol)
-        && owner.declarations().is_some_and(|declarations| {
-            declarations
-                .iter()
-                .all(|declaration| store.source_is_default_library_declaration(*declaration))
+}
+
+pub(super) fn authenticated_default_library_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> bool {
+    authenticated_source_global_interface_owner(store, symbol)
+        && store.symbol(symbol).is_some_and(|owner| {
+            owner.declarations().is_some_and(|declarations| {
+                declarations
+                    .iter()
+                    .all(|declaration| store.source_is_default_library_declaration(*declaration))
+            })
         })
 }
 
@@ -6524,6 +6563,92 @@ pub(super) fn has_authenticated_builtin_symbol_member(
                 })
             })
         })
+}
+
+/// Proves a global interface's type declarations without reading its value annotation.
+pub(super) fn authenticated_nongeneric_global_interface_owner(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> bool {
+    if !authenticated_source_global_interface_owner(store, symbol) {
+        return false;
+    }
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    let mut previous = None;
+    let mut has_interface = false;
+    let mut value = None;
+    for &declaration in declarations {
+        let Some(position) = store
+            .source_file_rank(declaration.file)
+            .zip(store.source_node_start(declaration))
+        else {
+            return false;
+        };
+        if previous.is_some_and(|previous| previous >= position)
+            || !store.source_is_typescript_script(declaration)
+        {
+            return false;
+        }
+        previous = Some(position);
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration) else {
+            return false;
+        };
+        match store.source_node_kind(declaration) {
+            Some(SyntaxKind::InterfaceDeclaration) => {
+                let Some(children) = store.source_direct_children(declaration) else {
+                    return false;
+                };
+                let mut names = children
+                    .iter()
+                    .copied()
+                    .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Identifier));
+                let Some(name) = names.next() else {
+                    return false;
+                };
+                if store.source_node_kind(parent) != Some(SyntaxKind::SourceFile)
+                    || store.source_node_parent(parent) != Some(SourceNodeParent::Root)
+                    || store.source_identifier_text(name) != owner.name().as_utf8()
+                    || names.next().is_some()
+                    || children.iter().any(|child| {
+                        store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter)
+                    })
+                {
+                    return false;
+                }
+                has_interface = true;
+            }
+            Some(SyntaxKind::VariableDeclaration) => {
+                let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(parent)
+                else {
+                    return false;
+                };
+                let Some(SourceNodeParent::Parent(root)) = store.source_node_parent(statement)
+                else {
+                    return false;
+                };
+                if value.replace(declaration).is_some()
+                    || store.source_node_kind(parent) != Some(SyntaxKind::VariableDeclarationList)
+                    || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+                    || store.source_node_kind(root) != Some(SyntaxKind::SourceFile)
+                    || store.source_node_parent(root) != Some(SourceNodeParent::Root)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    has_interface
+        && value == owner.value_declaration()
+        && value.is_some()
+            == owner
+                .flags()
+                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
 }
 
 fn authenticated_default_library_builtin_symbol_tag(
@@ -6889,13 +7014,14 @@ fn authenticated_default_library_builtin_symbol_method(
             .is_some_and(|members| members.iter().all(|(_, member)| member != symbol))
 }
 
-/// Combines reopened interface clauses without duplicating authenticated bases.
+/// Keeps nongeneric source base contributions in declaration order.
 fn merge_interface_heritage(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     heritage: &mut Option<DirectInterfaceHeritagePlan>,
     planned: DirectInterfaceHeritagePlan,
     maximum_bases: usize,
+    preserve_repeated_bases: bool,
 ) -> Result<(), PropertyObjectError> {
     let Some(existing) = heritage.as_mut() else {
         *heritage = Some(planned);
@@ -6903,10 +7029,14 @@ fn merge_interface_heritage(
     };
 
     for base in planned.bases {
-        if let Some(previous) = existing
-            .bases
-            .iter()
-            .find(|previous| previous.symbol == base.symbol)
+        if (!preserve_repeated_bases
+            || base.kind != DirectInterfaceBaseKind::Interface
+            || !base.type_arguments.is_empty()
+            || !base.defaults.is_empty())
+            && let Some(previous) = existing
+                .bases
+                .iter()
+                .find(|previous| previous.symbol == base.symbol)
         {
             if previous.kind != base.kind
                 || previous.type_arguments.len() != base.type_arguments.len()
@@ -8849,7 +8979,7 @@ pub(super) fn plan_generic_interface_identity(
                     kind: SyntaxKind::HeritageClause,
                 });
             }
-            merge_interface_heritage(store, host, &mut heritage, planned, 2)?;
+            merge_interface_heritage(store, host, &mut heritage, planned, 2, false)?;
         }
     }
     Ok(GenericInterfaceIdentityPlan {
@@ -8970,7 +9100,7 @@ pub(super) fn plan_generic_interface(
                     kind: SyntaxKind::HeritageClause,
                 });
             }
-            merge_interface_heritage(store, host, &mut heritage, planned, 2)?;
+            merge_interface_heritage(store, host, &mut heritage, planned, 2, false)?;
         }
 
         let mut current_parameters = Vec::with_capacity(parameters.nodes.len());
@@ -32002,7 +32132,7 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn date_unions_reject_nonlibrary_owners_and_late_file_reclassification() {
+    fn date_unions_accept_ordinary_owners_without_library_reclassification() {
         let library = parse_source_file(DATE_UNION_LIBRARY);
         let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
         let mut fixture = date_union_fixture(&library, &augmentation, false);
@@ -32022,27 +32152,55 @@ mod generic_publication_tests {
             .value_declaration()
             .unwrap();
         assert!(!store.source_is_default_library_declaration(declaration));
+        assert!(!authenticated_default_library_interface_owner(
+            store,
+            fixture.date,
+        ));
+        assert!(authenticated_nongeneric_global_interface_owner(
+            store,
+            fixture.date,
+        ));
         let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let mut constituents = [fixture.type_, undefined];
+        constituents.sort_unstable();
+        assert!(
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_union_type(&constituents)
+                .is_none()
+        );
+        let union = assert_date_union_identity_without_member_writes(&mut fixture);
+        let store = fixture.context.store_mut_for_test();
         let before = (
             store.type_len(),
             store.signature_len(),
             store.symbol_len(),
+            store.mapper_len(),
+            store.index_info_len(),
             store.checker_link_allocated_lengths(),
         );
-        assert!(matches!(
-            store.expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal),
-            Err(crate::semantic::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
-                if type_ == fixture.type_,
-        ));
-        assert_eq!(
-            (
-                store.type_len(),
-                store.signature_len(),
-                store.symbol_len(),
-                store.checker_link_allocated_lengths()
-            ),
-            before
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                assert_date_union_identity_without_member_writes(&mut fixture),
+                union,
+            );
+            let store = fixture.context.store_mut_for_test();
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            for symbol in [fixture.date, fixture.marker, fixture.sibling] {
+                assert!(store.value_symbol_links(symbol).is_none());
+            }
+        }
     }
 
     #[test]
@@ -33086,13 +33244,44 @@ mod generic_publication_tests {
             .unwrap();
         let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
         fixture.store.merge_global_symbol(globals, base).unwrap();
+        let source = fixture
+            .store
+            .register_source_file(
+                &fixture.parsed.arena,
+                fixture.parsed.source_file,
+                fixture.file,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .register_source_file_facts(source, fixture.bound.source_facts().unwrap(),)
+        );
+        assert!(fixture.store.record_source_global_bindings(globals));
         let host = host(&fixture.parsed, &fixture.bound);
         let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
         let heritage = plan.heritage.as_ref().unwrap();
 
         assert_eq!(plan.declarations.len(), 2);
-        assert_eq!(heritage.bases.len(), 1);
+        assert_eq!(heritage.bases.len(), 2);
         assert_eq!(heritage.bases[0].symbol, base);
+        assert_eq!(heritage.bases[1].symbol, base);
+        assert_ne!(heritage.bases[0].node, heritage.bases[1].node);
+        for (base, declaration) in heritage.bases.iter().zip(&plan.declarations) {
+            let Some(SourceNodeParent::Parent(clause)) =
+                fixture.store.source_node_parent(base.node)
+            else {
+                panic!("each base must keep its source heritage clause")
+            };
+            assert_eq!(
+                fixture.store.source_node_kind(clause),
+                Some(SyntaxKind::HeritageClause),
+            );
+            assert_eq!(
+                fixture.store.source_node_parent(clause),
+                Some(SourceNodeParent::Parent(*declaration)),
+            );
+        }
         assert_eq!(
             plan.properties
                 .iter()
@@ -33115,6 +33304,16 @@ mod generic_publication_tests {
         else {
             panic!("the reopened declaration must retain its interface identity")
         };
+        let base_type = fixture
+            .store
+            .declared_type_links(base)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            interface.resolved_base_types.as_deref(),
+            Some([base_type, base_type].as_slice()),
+        );
         let properties = interface
             .reference
             .object

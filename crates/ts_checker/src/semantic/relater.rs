@@ -66,6 +66,10 @@ use super::{
     },
     mapper::TypeMapper,
     object_aliases::property_object_alias_projection,
+    object_members::{
+        DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
+        validate_resolved_declared_property_object,
+    },
     reference_types::validate_direct_generic_reference,
     relation::{
         ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
@@ -383,23 +387,41 @@ fn validate_property_object_alias_relation_endpoint(
     Ok(())
 }
 
-/// Rejects strict nullish sources only after proving the generic target's cache.
-/// A valid cold target needs no member publication or property value demand.
-fn authenticated_nullish_generic_nonmatch(
+/// Rejects strict nullish sources after proving a supported object target.
+/// Generic members may stay cold. Declared property objects must be resolved.
+fn authenticated_nullish_object_nonmatch(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     source: TypeId,
     target: TypeId,
     bootstrap: RelationBootstrapFacts,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, RelationUnavailable> {
-    if !bootstrap.strict_null_checks
-        || !store.type_flags(source)?.intersects(TypeFlags::NULLABLE)
-        || !matches!(
-            store.type_payload(target).map(TypeRecord::data),
-            Some(TypeData::TypeReference(_))
-        )
-    {
+    if !bootstrap.strict_null_checks || !store.type_flags(source)?.intersects(TypeFlags::NULLABLE) {
         return Ok(false);
+    }
+    if !matches!(
+        store.type_payload(target).map(TypeRecord::data),
+        Some(TypeData::TypeReference(_))
+    ) {
+        match validate_resolved_declared_property_object(store, target) {
+            DeclaredPropertyObjectValidation::NotDeclared => return Ok(false),
+            DeclaredPropertyObjectValidation::Malformed => {
+                return Err(RelationUnavailable::InvalidStructuredMembers(target));
+            }
+            DeclaredPropertyObjectValidation::Valid(
+                DeclaredPropertyObjectProof::Interface | DeclaredPropertyObjectProof::TypeLiteral,
+            ) => {}
+        }
+        for endpoint in [source, target] {
+            let validation = match array_targets {
+                Some(targets) => {
+                    store.validate_union_constituent_with_array_targets(targets, endpoint)
+                }
+                None => store.validate_union_constituent(endpoint),
+            };
+            validation.map_err(|error| union_validation_unavailable(endpoint, error))?;
+        }
+        return Ok(true);
     }
     store
         .validate_union_constituent(source)
@@ -2235,7 +2257,7 @@ impl<'store> RelaterSession<'store> {
             return Ok(Ternary::True);
         }
 
-        if authenticated_nullish_generic_nonmatch(
+        if authenticated_nullish_object_nonmatch(
             self.store,
             source,
             target,
@@ -7080,6 +7102,16 @@ impl<'store> RelaterSession<'store> {
             && owner_flags != SymbolFlags::TYPE_LITERAL
             && owner_flags & SymbolFlags::TYPE != SymbolFlags::INTERFACE
             || owner_members != Some(members)
+                && (owner_flags & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+                    || !matches!(
+                        self.store.type_payload(type_id).map(TypeRecord::data),
+                        Some(TypeData::Interface(_))
+                    )
+                    || !super::structured_members::valid_declared_member_table(
+                        self.store,
+                        owner,
+                        Some(members),
+                    ))
             || !owner_declarations.iter().any(|owner_declaration| {
                 declaration_parent == Some(SourceNodeParent::Parent(*owner_declaration))
             })
@@ -7090,7 +7122,7 @@ impl<'store> RelaterSession<'store> {
                 .declarations()
                 .is_none_or(|declarations| !declarations.contains(&declaration))
             || index_record.value_declaration().is_some()
-            || index_record.parent() != Some(owner)
+            || self.store.get_parent_of_symbol(index_symbol) != Some(owner)
             || index_record.members().is_some()
             || index_record.exports().is_some()
             || index_record.export_symbol().is_some()
@@ -8997,7 +9029,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        if authenticated_nullish_generic_nonmatch(
+        if authenticated_nullish_object_nonmatch(
             self,
             source,
             target,
@@ -10747,8 +10779,8 @@ mod tests {
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
-        CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeHost,
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, MembersAndExportsLinks,
+        CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalTypeMapperStore,
+        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, MembersAndExportsLinks,
         MembersOrExportsResolutionKind, RelationComparisonResult, RelationKind, SignatureId,
         SignatureLinks, TypeAliasLinks, TypeId, TypeNodeLinks, ValueSymbolLinks,
         array_types::CanonicalArrayTargets,
@@ -14381,6 +14413,454 @@ mod tests {
             .declared_type
             .unwrap();
         (context, target)
+    }
+
+    fn nullish_declared_relation_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        strict_null_checks: bool,
+    ) -> (CanonicalCheckerContext<'arena>, TypeId, SemanticSymbolId) {
+        let file = FileId::new(96_452);
+        let mut context = source_relation_context(
+            library,
+            source,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types: false,
+                },
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store();
+        let owner = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source("Target")
+            .unwrap();
+        let target = store
+            .type_alias_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let [property] = store
+            .type_payload(target)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the declared target must retain its one source property");
+        };
+        let property = *property;
+        assert!(matches!(
+            super::validate_resolved_declared_property_object(store, target),
+            super::DeclaredPropertyObjectValidation::Valid(
+                super::DeclaredPropertyObjectProof::Interface
+                    | super::DeclaredPropertyObjectProof::TypeLiteral,
+            ),
+        ));
+        (context, target, property)
+    }
+
+    fn assert_nullish_relation_entries(
+        store: &mut TestStore,
+        endpoints: (TypeId, TypeId),
+        kind: RelationKind,
+        globals: Option<&CanonicalGlobalTypes>,
+        session: &mut super::InstantiationSession,
+        expected: Result<bool, RelationUnavailable>,
+    ) {
+        let (source, target) = endpoints;
+        assert_eq!(
+            store.is_type_related_to_with_session(
+                source,
+                target,
+                kind,
+                globals,
+                Some(true),
+                session,
+            ),
+            expected,
+        );
+        let bootstrap = store.relation_bootstrap_facts().unwrap();
+        let mut relation = super::RelaterSession::new_with_global_types_options_and_session(
+            store,
+            kind,
+            bootstrap,
+            globals.map(RelationGlobalTypes::from_global_types),
+            Some(true),
+            Some(session),
+        );
+        assert_eq!(
+            relation.is_related_to_ex(
+                source,
+                target,
+                super::RecursionFlags::BOTH,
+                super::IntersectionState::NONE,
+            ),
+            expected.map(|related| if related {
+                Ternary::True
+            } else {
+                Ternary::False
+            }),
+        );
+    }
+
+    #[test]
+    fn nullish_declared_targets_use_both_relation_entries_without_instantiation() {
+        let library = parse_source_file("");
+        for text in [
+            "interface Value { value: number } type Target = Value;",
+            "type Target = { value: number };",
+        ] {
+            let source = parse_source_file(text);
+            for strict in [false, true] {
+                let (mut context, target, property) =
+                    nullish_declared_relation_context(&library, &source, strict);
+                let globals = context.global_types().clone();
+                let store = context.store_mut_for_test();
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let (null, undefined, number, error) = (
+                    bootstrap.null_type,
+                    bootstrap.undefined_type,
+                    bootstrap.number_type,
+                    bootstrap.error_type,
+                );
+                assert_eq!(
+                    store.value_symbol_links(property).unwrap().resolved_type,
+                    Some(number),
+                );
+                assert_eq!(store.claim_strict_function_types(true), Ok(()));
+                let snapshot = |store: &TestStore| {
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.index_info_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                        store.type_payload(target).map(|record| {
+                            let data = match record.data() {
+                                TypeData::Interface(data) => (Some(data.clone()), None),
+                                TypeData::Object(data) => (None, Some(data.clone())),
+                                _ => panic!("the target must keep its declared object data"),
+                            };
+                            (
+                                record.id(),
+                                record.flags(),
+                                record.object_flags(),
+                                record.symbol(),
+                                record.alias(),
+                                data,
+                            )
+                        }),
+                        store.value_symbol_links(property).cloned(),
+                    )
+                };
+                let before = snapshot(store);
+                let mut session = super::InstantiationSession::new_recovering(
+                    store,
+                    super::InstantiationLimits {
+                        max_depth: 0,
+                        max_count: 0,
+                    },
+                    error,
+                )
+                .unwrap();
+                let mark = session.limit_event_mark();
+                for source in [null, undefined] {
+                    for kind in [RelationKind::Assignable, RelationKind::Comparable] {
+                        for _ in 0..2 {
+                            assert_nullish_relation_entries(
+                                store,
+                                (source, target),
+                                kind,
+                                Some(&globals),
+                                &mut session,
+                                Ok(!strict),
+                            );
+                            assert_eq!(snapshot(store), before);
+                        }
+                    }
+                }
+                assert_eq!((session.query_count(), session.total_count()), (0, 0));
+                assert!(!session.limit_event_occurred_since(mark));
+                assert_eq!(session.recovery_error_type(), Some(error));
+            }
+        }
+    }
+
+    #[test]
+    fn nullish_declared_targets_preserve_malformed_and_unowned_errors() {
+        let library = parse_source_file("");
+        for text in [
+            "interface Value { value: number } type Target = Value;",
+            "type Target = { value: number };",
+        ] {
+            let source = parse_source_file(text);
+            let (mut context, target, property) =
+                nullish_declared_relation_context(&library, &source, true);
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (null, undefined, error) = (
+                bootstrap.null_type,
+                bootstrap.undefined_type,
+                bootstrap.error_type,
+            );
+            let target_owner = store.type_payload(target).unwrap().symbol().unwrap();
+            let original = store.value_symbol_links(property).unwrap().clone();
+            let unowned = alloc_property_object(store, Vec::new());
+            assert_eq!(
+                super::validate_resolved_declared_property_object(store, unowned),
+                super::DeclaredPropertyObjectValidation::NotDeclared,
+            );
+            assert_eq!(store.claim_strict_function_types(true), Ok(()));
+            let mut session = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            let mark = session.limit_event_mark();
+            let snapshot = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                    store.value_symbol_links(property).cloned(),
+                )
+            };
+            for source in [null, undefined] {
+                for kind in [RelationKind::Assignable, RelationKind::Comparable] {
+                    let unsupported = RelationUnavailable::StructuralRelation {
+                        source,
+                        target: unowned,
+                        relation: kind,
+                    };
+                    let before = snapshot(store);
+                    assert_nullish_relation_entries(
+                        store,
+                        (source, unowned),
+                        kind,
+                        Some(&globals),
+                        &mut session,
+                        Err(unsupported),
+                    );
+                    assert_eq!(snapshot(store), before);
+
+                    assert!(store.set_type_symbol(source, Some(target_owner)));
+                    let before = snapshot(store);
+                    assert_nullish_relation_entries(
+                        store,
+                        (source, unowned),
+                        kind,
+                        Some(&globals),
+                        &mut session,
+                        Err(unsupported),
+                    );
+                    assert_nullish_relation_entries(
+                        store,
+                        (source, target),
+                        kind,
+                        Some(&globals),
+                        &mut session,
+                        Err(RelationUnavailable::UnsupportedUnionConstituent(source)),
+                    );
+                    assert_eq!(snapshot(store), before);
+                    assert!(store.set_type_symbol(source, None));
+                    assert_nullish_relation_entries(
+                        store,
+                        (source, target),
+                        kind,
+                        Some(&globals),
+                        &mut session,
+                        Ok(false),
+                    );
+
+                    assert!(store.set_value_symbol_links(
+                        property,
+                        ValueSymbolLinks {
+                            resolved_type: None,
+                            ..original.clone()
+                        },
+                    ));
+                    assert_eq!(
+                        super::validate_resolved_declared_property_object(store, target),
+                        super::DeclaredPropertyObjectValidation::Malformed,
+                    );
+                    let before = snapshot(store);
+                    assert_eq!(
+                        store.is_type_related_to_with_session(
+                            source,
+                            target,
+                            kind,
+                            Some(&globals),
+                            Some(false),
+                            &mut session,
+                        ),
+                        Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                            established: true,
+                            requested: false,
+                        }),
+                    );
+                    assert_nullish_relation_entries(
+                        store,
+                        (source, target),
+                        kind,
+                        Some(&globals),
+                        &mut session,
+                        Err(RelationUnavailable::InvalidStructuredMembers(target)),
+                    );
+                    assert_eq!(snapshot(store), before);
+                    assert!(store.set_value_symbol_links(property, original.clone()));
+                    let before = snapshot(store);
+                    assert_nullish_relation_entries(
+                        store,
+                        (source, target),
+                        kind,
+                        Some(&globals),
+                        &mut session,
+                        Ok(false),
+                    );
+                    assert_eq!(snapshot(store), before);
+                }
+            }
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert!(!session.limit_event_occurred_since(mark));
+            assert_eq!(store.value_symbol_links(property), Some(&original));
+        }
+    }
+
+    #[test]
+    fn nullish_declared_targets_keep_array_capability_errors() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        for text in [
+            "interface Value { values: number[] } type Target = Value;",
+            "type Target = { values: number[] };",
+        ] {
+            let source = parse_source_file(text);
+            let (mut context, target, property) =
+                nullish_declared_relation_context(&library, &source, true);
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (null, undefined, number, error) = (
+                bootstrap.null_type,
+                bootstrap.undefined_type,
+                bootstrap.number_type,
+                bootstrap.error_type,
+            );
+            let array = store
+                .value_symbol_links(property)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(
+                store
+                    .canonical_array_reference_with_targets(
+                        CanonicalArrayTargets::from_global_types(&globals),
+                        array,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .element_type,
+                number,
+            );
+            let missing_capability = super::union_validation_unavailable(
+                target,
+                store.validate_union_constituent(target).unwrap_err(),
+            );
+            let mut wrong_globals = globals.clone();
+            wrong_globals.array_type = number;
+            let wrong_capability = super::union_validation_unavailable(
+                target,
+                store
+                    .validate_union_constituent_with_array_targets(
+                        CanonicalArrayTargets::from_global_types(&wrong_globals),
+                        target,
+                    )
+                    .unwrap_err(),
+            );
+            assert_eq!(store.claim_strict_function_types(true), Ok(()));
+            let mut session = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            let mark = session.limit_event_mark();
+            let snapshot = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                    store.type_payload(target).map(|record| {
+                        let data = match record.data() {
+                            TypeData::Interface(data) => (Some(data.clone()), None),
+                            TypeData::Object(data) => (None, Some(data.clone())),
+                            _ => panic!("the target must keep its declared object data"),
+                        };
+                        (
+                            record.id(),
+                            record.flags(),
+                            record.object_flags(),
+                            record.symbol(),
+                            record.alias(),
+                            data,
+                        )
+                    }),
+                    store.value_symbol_links(property).cloned(),
+                )
+            };
+            let before = snapshot(store);
+            for source in [null, undefined] {
+                for kind in [RelationKind::Assignable, RelationKind::Comparable] {
+                    for _ in 0..2 {
+                        for (capability, expected) in [
+                            (None, Err(missing_capability)),
+                            (Some(&wrong_globals), Err(wrong_capability)),
+                            (Some(&globals), Ok(false)),
+                        ] {
+                            assert_nullish_relation_entries(
+                                store,
+                                (source, target),
+                                kind,
+                                capability,
+                                &mut session,
+                                expected,
+                            );
+                            assert_eq!(snapshot(store), before);
+                        }
+                    }
+                }
+            }
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert!(!session.limit_event_occurred_since(mark));
+        }
     }
 
     #[test]
@@ -19693,6 +20173,629 @@ mod tests {
             fixture.store.is_type_assignable_to(source, target),
             Ok(true)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real cross-file merge and both warm-cache corruption checks together.
+    fn cross_file_numeric_index_parents_revalidate_warm_relations() {
+        let library = parse_source_file("interface Indexed { [key: number]: number; }");
+        let source = parse_source_file(concat!(
+            "interface Indexed { length: number; } ",
+            "interface Same { length: number; [key: number]: number }",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(96_473);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store_mut_for_test();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let owner = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Indexed")
+            .unwrap();
+        assert_eq!(store.get_merged_symbol(owner), Some(owner));
+        assert_eq!(
+            store.symbol(owner).unwrap().flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+        );
+        assert_eq!(
+            store
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .iter()
+                .map(|declaration| declaration.file)
+                .collect::<Vec<_>>(),
+            [FileId::new(96_450), file],
+        );
+        let target = store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let matching_owner = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Same")
+            .unwrap();
+        let matching = store
+            .declared_type_links(matching_owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let members = store.symbol(owner).unwrap().members().unwrap();
+        let index_symbol = store
+            .symbol_table(members)
+            .unwrap()
+            .get(InternalSymbolName::Index.as_ref())
+            .unwrap();
+        let index_record = store.symbol(index_symbol).unwrap();
+        let raw_owner = index_record.parent().unwrap();
+        assert_eq!(index_record.flags(), SymbolFlags::SIGNATURE);
+        assert!(index_record.members().is_none());
+        assert!(index_record.exports().is_none());
+        assert!(index_record.export_symbol().is_none());
+        assert_ne!(raw_owner, owner);
+        assert_eq!(store.get_merged_symbol(raw_owner), Some(owner));
+        assert_eq!(store.get_parent_of_symbol(index_symbol), Some(owner));
+        let structured = store
+            .type_payload(target)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap();
+        assert_eq!(structured.members, Some(members));
+        let [index] = structured.index_infos.as_deref().unwrap() else {
+            panic!("the merged interface must retain its one numeric index");
+        };
+        let info = store.index_info(*index).unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(info.key_type(), number);
+        assert_eq!(info.value_type(), number);
+        assert_eq!(info.index_symbol(), None);
+        assert_eq!(
+            index_record.declarations(),
+            Some([info.declaration().unwrap()].as_slice()),
+        );
+        assert_eq!(info.declaration().unwrap().file, FileId::new(96_450));
+
+        let unrelated = alloc_symbol(store, SymbolFlags::INTERFACE, "Unrelated");
+        let state = |store: &TestStore| {
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        assert_eq!(
+            store.is_type_assignable_to_with_strict_function_types(matching, target, false),
+            Ok(true),
+        );
+        let root_key = store
+            .relation_key_if_available(
+                matching,
+                target,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        let warm = state(store);
+        for poison_redirect in [true, false] {
+            assert_eq!(
+                store.symbol(index_symbol).unwrap().parent(),
+                Some(raw_owner)
+            );
+            assert_eq!(store.get_parent_of_symbol(index_symbol), Some(owner));
+            assert!(
+                store
+                    .relation_cache_get(RelationKind::Assignable, root_key)
+                    .contains(RelationComparisonResult::SUCCEEDED),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    store
+                        .is_type_assignable_to_with_strict_function_types(matching, target, false,),
+                    Ok(true),
+                );
+                assert_eq!(state(store), warm);
+            }
+            if poison_redirect {
+                assert_eq!(
+                    store.record_merged_symbol(unrelated, raw_owner),
+                    Ok(Some(owner)),
+                );
+                assert_eq!(
+                    store.symbol(index_symbol).unwrap().parent(),
+                    Some(raw_owner)
+                );
+            } else {
+                assert!(store.set_symbol_relationships(
+                    index_symbol,
+                    None,
+                    None,
+                    Some(unrelated),
+                    None,
+                ));
+                assert_eq!(store.get_merged_symbol(raw_owner), Some(owner));
+            }
+            assert_eq!(store.get_parent_of_symbol(index_symbol), Some(unrelated));
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, root_key),
+                RelationComparisonResult::NONE,
+            );
+            let damaged = state(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store
+                        .is_type_assignable_to_with_strict_function_types(matching, target, false,),
+                    Err(RelationUnavailable::InvalidStructuredMembers(target)),
+                );
+                assert_eq!(state(store), damaged);
+            }
+            if poison_redirect {
+                assert_eq!(
+                    store.record_merged_symbol(owner, raw_owner),
+                    Ok(Some(unrelated)),
+                );
+            } else {
+                assert!(store.set_symbol_relationships(
+                    index_symbol,
+                    None,
+                    None,
+                    Some(raw_owner),
+                    None,
+                ));
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    store
+                        .is_type_assignable_to_with_strict_function_types(matching, target, false,),
+                    Ok(true),
+                );
+                assert_eq!(
+                    store.symbol(index_symbol).unwrap().parent(),
+                    Some(raw_owner)
+                );
+                assert_eq!(store.get_parent_of_symbol(index_symbol), Some(owner));
+                assert_eq!(state(store), warm);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the source-built expanded table and its cache corruption checks together.
+    fn computed_numeric_index_members_revalidate_warm_relations() {
+        use crate::semantic::SymbolNodeLinks;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            MissingResolvedTable,
+            RawResolvedTable,
+            RawMember,
+            ComputedSource,
+        }
+        for poison in [
+            Poison::MissingResolvedTable,
+            Poison::RawResolvedTable,
+            Poison::RawMember,
+            Poison::ComputedSource,
+        ] {
+            let library = parse_source_file("interface Indexed { [position: number]: number; }");
+            let source = parse_source_file(concat!(
+                "declare const key: unique symbol; ",
+                "interface Indexed { length: number; [key](): number; } ",
+                "interface Same { [position: number]: number; length: number; [key](): number; } ",
+                "interface Other { length: number; }",
+            ));
+            assert!(library.diagnostics.is_empty());
+            assert!(source.diagnostics.is_empty());
+            let file = FileId::new(96_474);
+            let mut context = source_relation_context(
+                &library,
+                &source,
+                file,
+                CanonicalCheckerOptions::default(),
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let store = context.store_mut_for_test();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            let owner = store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Indexed")
+                .unwrap();
+            assert_eq!(store.get_merged_symbol(owner), Some(owner));
+            assert_eq!(
+                store.symbol(owner).unwrap().flags(),
+                SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            );
+            assert_eq!(
+                store
+                    .symbol(owner)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .iter()
+                    .map(|declaration| declaration.file)
+                    .collect::<Vec<_>>(),
+                [FileId::new(96_450), file],
+            );
+            let target = store
+                .declared_type_links(owner)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let matching_owner = store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Same")
+                .unwrap();
+            let matching = store
+                .declared_type_links(matching_owner)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let raw = store.symbol(owner).unwrap().members().unwrap();
+            let tables = store.members_and_exports_links(owner).unwrap().clone();
+            let expanded = tables
+                .table(MembersOrExportsResolutionKind::ResolvedMembers)
+                .unwrap();
+            let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+                panic!("the source must publish the merged interface");
+            };
+            assert_ne!(raw, expanded);
+            assert_eq!(interface.declared_members, Some(expanded));
+            assert_eq!(
+                interface.reference.object.structured.members,
+                Some(expanded)
+            );
+            assert_eq!(store.source_computed_member_count(owner), Some(1));
+            assert!(
+                super::super::structured_members::valid_declared_member_table(
+                    store,
+                    owner,
+                    Some(expanded),
+                )
+            );
+            let [index] = interface
+                .reference
+                .object
+                .structured
+                .index_infos
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("the interface must retain its one numeric index");
+            };
+            let info = store.index_info(*index).unwrap();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!((info.key_type(), info.value_type()), (number, number));
+            assert_eq!(info.declaration().unwrap().file, FileId::new(96_450));
+            let raw_table = store.symbol_table(raw).unwrap();
+            let length = raw_table.get_source("length").unwrap();
+            let index_symbol = raw_table.get(InternalSymbolName::Index.as_ref()).unwrap();
+            assert_ne!(store.symbol(index_symbol).unwrap().parent(), Some(owner));
+            assert_eq!(store.get_parent_of_symbol(index_symbol), Some(owner));
+            let expanded_table = store.symbol_table(expanded).unwrap();
+            assert_eq!(expanded_table.len(), raw_table.len() + 1);
+            assert_eq!(expanded_table.get_source("length"), Some(length));
+            assert_eq!(
+                expanded_table.get(InternalSymbolName::Index.as_ref()),
+                Some(index_symbol),
+            );
+            let method = expanded_table
+                .iter()
+                .find_map(|(name, symbol)| name.is_late_bound().then_some(symbol))
+                .unwrap();
+            let declaration = store.symbol(method).unwrap().declarations().unwrap()[0];
+            assert_eq!(declaration.file, file);
+            let declaration_links = store.symbol_node_links(declaration).unwrap().clone();
+            assert_eq!(declaration_links.resolved_symbol, Some(method));
+            let other = store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Other")
+                .unwrap();
+            let other_length = store
+                .symbol(other)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("length"))
+                .unwrap();
+            let state = |store: &TestStore| {
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                        store.index_info_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            assert_eq!(
+                store.is_type_assignable_to_with_strict_function_types(matching, target, false),
+                Ok(true),
+            );
+            let root_key = store
+                .relation_key_if_available(
+                    matching,
+                    target,
+                    super::IntersectionState::NONE,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .key();
+            assert!(
+                store
+                    .relation_cache_get(RelationKind::Assignable, root_key)
+                    .contains(RelationComparisonResult::SUCCEEDED),
+            );
+            let warm = state(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store
+                        .is_type_assignable_to_with_strict_function_types(matching, target, false,),
+                    Ok(true),
+                );
+                assert_eq!(state(store), warm);
+            }
+            match poison {
+                Poison::MissingResolvedTable | Poison::RawResolvedTable => {
+                    let mut poisoned = tables.clone();
+                    poisoned.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
+                        matches!(poison, Poison::RawResolvedTable).then_some(raw);
+                    assert!(store.set_members_and_exports_links(owner, poisoned));
+                }
+                Poison::RawMember => {
+                    let size = store.symbol_table(expanded).unwrap().len();
+                    assert_eq!(
+                        store.insert_symbol(expanded, EscapedName::source("length"), other_length),
+                        Some(Some(length)),
+                    );
+                    assert_eq!(store.symbol_table(expanded).unwrap().len(), size);
+                }
+                Poison::ComputedSource => {
+                    assert!(store.set_symbol_node_links(declaration, SymbolNodeLinks::default()));
+                }
+            }
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, root_key),
+                RelationComparisonResult::NONE,
+                "{poison:?}",
+            );
+            let damaged = state(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store
+                        .is_type_assignable_to_with_strict_function_types(matching, target, false,),
+                    Err(RelationUnavailable::InvalidStructuredMembers(target)),
+                    "{poison:?}",
+                );
+                assert_eq!(state(store), damaged, "{poison:?}");
+            }
+            match poison {
+                Poison::MissingResolvedTable | Poison::RawResolvedTable => {
+                    assert!(store.set_members_and_exports_links(owner, tables.clone()));
+                }
+                Poison::RawMember => assert_eq!(
+                    store.insert_symbol(expanded, EscapedName::source("length"), length),
+                    Some(Some(other_length)),
+                ),
+                Poison::ComputedSource => {
+                    assert!(store.set_symbol_node_links(declaration, declaration_links.clone()));
+                }
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    store
+                        .is_type_assignable_to_with_strict_function_types(matching, target, false,),
+                    Ok(true),
+                );
+                assert_eq!(store.members_and_exports_links(owner), Some(&tables));
+                assert_eq!(
+                    store.symbol_node_links(declaration),
+                    Some(&declaration_links)
+                );
+                assert_eq!(state(store), warm);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Prove that equal table contents cannot invent computed source members.
+    fn ordinary_numeric_index_members_reject_forged_expanded_tables() {
+        let library = parse_source_file("interface Indexed { [position: number]: number; }");
+        let source = parse_source_file(concat!(
+            "interface Indexed { length: number; } ",
+            "interface Same { [position: number]: number; length: number; }",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(96_475);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store_mut_for_test();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let owner = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Indexed")
+            .unwrap();
+        let target = store
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let matching_owner = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Same")
+            .unwrap();
+        let matching = store
+            .declared_type_links(matching_owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("the source must publish the merged interface");
+        };
+        let interface = interface.clone();
+        let structured = &interface.reference.object.structured;
+        let raw = store.symbol(owner).unwrap().members().unwrap();
+        assert_eq!(interface.declared_members, Some(raw));
+        assert_eq!(structured.members, Some(raw));
+        assert_eq!(structured.index_infos.as_deref().unwrap().len(), 1);
+        assert_eq!(store.source_computed_member_count(owner), Some(0));
+        let copied = store.clone_symbol_table(raw).unwrap();
+        assert_ne!(raw, copied);
+        assert_eq!(
+            store.symbol_table(raw).unwrap().len(),
+            store.symbol_table(copied).unwrap().len(),
+        );
+        for (name, symbol) in store.symbol_table(raw).unwrap().iter() {
+            assert_eq!(store.symbol_table(copied).unwrap().get(name), Some(symbol));
+        }
+        let tables = store
+            .members_and_exports_links(owner)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            tables.table(MembersOrExportsResolutionKind::ResolvedMembers),
+            None
+        );
+        // Allocate the empty link record before measuring either relation result.
+        assert!(store.set_members_and_exports_links(owner, tables.clone()));
+        let state = |store: &TestStore| {
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        assert_eq!(
+            store.is_type_assignable_to_with_strict_function_types(matching, target, false),
+            Ok(true),
+        );
+        let root_key = store
+            .relation_key_if_available(
+                matching,
+                target,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, root_key)
+                .contains(RelationComparisonResult::SUCCEEDED),
+        );
+        let warm = state(store);
+        for _ in 0..2 {
+            assert_eq!(
+                store.is_type_assignable_to_with_strict_function_types(matching, target, false),
+                Ok(true),
+            );
+            assert_eq!(state(store), warm);
+        }
+        let mut expanded_tables = tables.clone();
+        expanded_tables.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
+            Some(copied);
+        assert!(store.set_members_and_exports_links(owner, expanded_tables));
+        assert!(store.set_interface_declared_members(
+            target,
+            true,
+            Some(copied),
+            interface.declared_call_signatures.clone(),
+            interface.declared_construct_signatures.clone(),
+            interface.declared_index_infos.clone(),
+        ));
+        assert!(store.set_structured_type_members(
+            target,
+            Some(copied),
+            structured.properties.clone(),
+            interface.declared_call_signatures.clone(),
+            interface.declared_construct_signatures.clone(),
+            structured.index_infos.clone(),
+        ));
+        assert!(
+            !super::super::structured_members::valid_declared_member_table(
+                store,
+                owner,
+                Some(copied),
+            )
+        );
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE,
+        );
+        let damaged = state(store);
+        for _ in 0..2 {
+            assert_eq!(
+                store.is_type_assignable_to_with_strict_function_types(matching, target, false),
+                Err(RelationUnavailable::InvalidStructuredMembers(target)),
+            );
+            assert_eq!(state(store), damaged);
+        }
+        assert!(store.set_members_and_exports_links(owner, tables.clone()));
+        assert!(store.set_interface_declared_members(
+            target,
+            true,
+            interface.declared_members,
+            interface.declared_call_signatures.clone(),
+            interface.declared_construct_signatures.clone(),
+            interface.declared_index_infos.clone(),
+        ));
+        assert!(store.set_structured_type_members(
+            target,
+            structured.members,
+            structured.properties.clone(),
+            interface.declared_call_signatures.clone(),
+            interface.declared_construct_signatures.clone(),
+            structured.index_infos.clone(),
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                store.is_type_assignable_to_with_strict_function_types(matching, target, false),
+                Ok(true),
+            );
+            assert_eq!(
+                store.type_payload(target).unwrap().data(),
+                &TypeData::Interface(interface.clone())
+            );
+            assert_eq!(store.members_and_exports_links(owner), Some(&tables));
+            assert_eq!(state(store), warm);
+        }
     }
 
     #[test]

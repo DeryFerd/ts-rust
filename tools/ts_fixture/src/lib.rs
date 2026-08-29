@@ -9211,11 +9211,33 @@ mod tests {
         )
         .unwrap();
         let compilation = compile_case(&case).unwrap();
-        assert!(
-            compilation.diagnostics.is_empty(),
-            "{:?}",
-            compilation.diagnostics
+        let [diagnostic] = compilation.diagnostics.as_slice() else {
+            panic!(
+                "expected the Bundler option error: {:?}",
+                compilation.diagnostics
+            );
+        };
+        assert_eq!(diagnostic.file_name, None);
+        assert_eq!(diagnostic.source_text, None);
+        assert_eq!(diagnostic.range, None);
+        assert_eq!(diagnostic.code, Some(5095));
+        assert_eq!(
+            diagnostic.category,
+            Some(super::CompilationDiagnosticCategory::Error)
         );
+        assert_eq!(
+            diagnostic.message,
+            "Option 'bundler' can only be used when 'module' is set to 'preserve', 'commonjs', or 'es2015' or later."
+        );
+        assert_eq!(diagnostic.related_information, None);
+        assert_eq!(
+            diagnostic.ordering.origin,
+            super::CompilationDiagnosticOrigin::CompilerOption
+        );
+        let structured = diagnostic.ordering.diagnostic.as_ref().unwrap();
+        assert_eq!(structured.code(), 5095);
+        assert_eq!(structured.arguments, ["bundler"]);
+        assert!(structured.details.is_empty());
         assert_eq!(compilation.outputs.len(), 1);
         assert_eq!(
             compilation.outputs["/.src/out.js"],

@@ -2676,14 +2676,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                     return Ok(());
                 }
-                let recognized_library_interface = matches!(record.data(), TypeData::Interface(_))
-                    && !record.object_flags().contains(ObjectFlags::REFERENCE)
+                let new_global_interface = matches!(record.data(), TypeData::Interface(_))
                     && record.symbol().is_some_and(|symbol| {
-                        object_members::authenticated_default_library_interface_owner(self, symbol)
-                            && self.source_has_only_interface_property_members(symbol)
+                        !object_members::authenticated_default_library_interface_owner(self, symbol)
+                            && object_members::authenticated_nongeneric_global_interface_owner(
+                                self, symbol,
+                            )
                     });
+                let recognized_library_interface = new_global_interface
+                    || (matches!(record.data(), TypeData::Interface(_))
+                        && !record.object_flags().contains(ObjectFlags::REFERENCE)
+                        && record.symbol().is_some_and(|symbol| {
+                            object_members::authenticated_default_library_interface_owner(
+                                self, symbol,
+                            ) && self.source_has_only_interface_property_members(symbol)
+                        }));
                 if let TypeData::Interface(interface) = record.data()
-                    && !record.object_flags().contains(ObjectFlags::REFERENCE)
+                    && (!record.object_flags().contains(ObjectFlags::REFERENCE)
+                        || new_global_interface)
                     && let Some(edges) = self.lazy_default_library_interface_union_edges(
                         type_,
                         record,
@@ -2831,7 +2841,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     object_members::DeclaredPropertyTypeGraphValidation::Opaque
                         if recognized_library_interface =>
                     {
-                        // A failed library proof must not hide its member type edges.
+                        // A failed member proof must not hide its type edges.
                         Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
                     }
                     object_members::DeclaredPropertyTypeGraphValidation::Opaque => Ok(()),
@@ -3033,7 +3043,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result
     }
 
-    /// Library annotations keep their declared identity as member queries populate caches.
+    /// Global interface annotations keep their identity as member queries populate caches.
     fn lazy_default_library_interface_union_edges(
         &self,
         type_: TypeId,
@@ -3042,7 +3052,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         array_targets: Option<CanonicalArrayTargets>,
     ) -> Option<Vec<TypeId>> {
         let symbol = record.symbol()?;
-        if !object_members::authenticated_default_library_interface_owner(self, symbol)
+        let library_owner =
+            object_members::authenticated_default_library_interface_owner(self, symbol);
+        if !(library_owner
+            || object_members::authenticated_nongeneric_global_interface_owner(self, symbol))
             || self.direct_interface_heritage_provenance(type_).is_some()
             || interface.resolved_base_constructor_type.is_some()
             || interface.resolved_base_types.is_some()
@@ -3064,7 +3077,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && !interface.base_types_resolved
             && validate_nongeneric_interface_argument_origin(self, type_).is_ok();
         if reference {
-            return Some(Vec::new());
+            return if library_owner {
+                Some(Vec::new())
+            } else {
+                self.lazy_default_library_interface_member_edges(symbol, array_targets, None)
+            };
         }
         let resolved = flags == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
             && interface.base_types_resolved
@@ -8231,6 +8248,241 @@ mod tests {
                 );
                 assert_eq!(snapshot(store), warm);
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep lazy identity, later member demand, and rejected replay together.
+    fn merged_interface_nullable_identity_checks_lazy_member_edges() {
+        let source = parse_source_file("interface Channel { extra: number }");
+        let reader = parse_source_file(
+            "declare const channel: Channel; const selected: string = channel.value;",
+        );
+        let library_file = FileId::new(9_967);
+        let source_file = FileId::new(9_968);
+        let reader_file = FileId::new(9_969);
+        for (declaration_file, uses_this) in [(false, false), (true, false), (true, true)] {
+            let chain = if uses_this { "chain(): this;" } else { "" };
+            let library = parse_source_file(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+                 interface Channel {{ value: string; notify(callback: (value: unknown) => void): void; {chain} }} \
+                 declare var Channel: {{ new(options: {{ channel: Channel }}): Channel }};",
+            ));
+            let mut binder = CanonicalBinder::new();
+            for (parsed, file, library_source) in [
+                (&library, library_file, true),
+                (&source, source_file, false),
+                (&reader, reader_file, false),
+            ] {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!(
+                                "\"/merged-nullable-{}.ts\"",
+                                file.index()
+                            )),
+                            CanonicalSourceLanguage::TypeScript,
+                            library_source || file == source_file && declaration_file,
+                            library_source,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![
+                    (library_file, &library.arena),
+                    (source_file, &source.arena),
+                    (reader_file, &reader.arena),
+                ],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+            let globals = context.global_types().clone();
+            let owner = context
+                .store()
+                .symbol_table(context.globals())
+                .and_then(|globals| globals.get_source("Channel"))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let channel = context.get_declared_type_of_symbol(owner).unwrap();
+            let store = context.store();
+            assert!(object_members::authenticated_nongeneric_global_interface_owner(store, owner));
+            assert!(!object_members::authenticated_default_library_interface_owner(store, owner));
+            let array_owner = store
+                .type_payload(globals.array_type)
+                .unwrap()
+                .symbol()
+                .unwrap();
+            assert!(
+                object_members::authenticated_default_library_interface_owner(store, array_owner,)
+            );
+            assert!(
+                !object_members::authenticated_nongeneric_global_interface_owner(
+                    store,
+                    array_owner,
+                )
+            );
+            let member_table = store.symbol(owner).unwrap().members().unwrap();
+            let members = store.symbol_table(member_table).unwrap();
+            let value = members.get_source("value").unwrap();
+            let notify = members.get_source("notify").unwrap();
+            let value_annotation = store
+                .source_direct_type_annotation(
+                    store.symbol(owner).unwrap().value_declaration().unwrap(),
+                )
+                .unwrap();
+            let value_name = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::PropertyDeclaration(property) = &record.data else {
+                        return None;
+                    };
+                    matches!(
+                        library.arena.get(property.name).map(|name| &name.data),
+                        Some(NodeData::Identifier(identifier)) if identifier.text == "value"
+                    )
+                    .then_some(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        property.name,
+                    ))
+                })
+                .unwrap();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let constituents = [channel, bootstrap.null_type];
+            let string = bootstrap.string_type;
+            let number = bootstrap.number_type;
+            let union = context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &constituents,
+                    UnionReduction::Literal,
+                )
+                .unwrap();
+            let store = context.store();
+            assert!(store.value_symbol_links(value).is_none());
+            assert!(store.value_symbol_links(notify).is_none());
+            assert!(store.value_symbol_links(owner).is_none());
+            assert!(store.type_node_links(value_annotation).is_none());
+            assert!(
+                !store
+                    .type_payload(channel)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert_eq!(
+                store
+                    .type_payload(channel)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::REFERENCE),
+                uses_this,
+            );
+
+            assert_eq!(context.get_type_at_location(value_name), Ok(string));
+            context.check_source_file(source_file).unwrap();
+            context.check_source_file(reader_file).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(value)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+            let snapshot = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let warm = snapshot(context.store());
+            for _ in 0..2 {
+                assert_eq!(context.get_declared_type_of_symbol(owner), Ok(channel));
+                assert_eq!(context.get_type_at_location(value_name), Ok(string));
+                context.recheck_source_file(source_file).unwrap();
+                context.recheck_source_file(reader_file).unwrap();
+                let store = context.store_mut_for_test();
+                assert_eq!(
+                    store.expression_union_type_with_global_types(
+                        &globals,
+                        &constituents,
+                        UnionReduction::Literal,
+                    ),
+                    Ok(union),
+                );
+                assert_eq!(
+                    store.validate_cached_array_capability_with_array_targets(
+                        CanonicalArrayTargets::from_global_types(&globals),
+                        channel,
+                    ),
+                    Ok(()),
+                );
+                assert!(store.value_symbol_links(notify).is_none());
+                assert!(store.value_symbol_links(owner).is_none());
+                assert!(store.type_node_links(value_annotation).is_none());
+                assert_eq!(snapshot(store), warm);
+            }
+            let store = context.store_mut_for_test();
+            let original = store.value_symbol_links(value).cloned().unwrap();
+            assert!(store.set_value_symbol_links(
+                value,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..original.clone()
+                },
+            ));
+            for _ in 0..2 {
+                assert_eq!(
+                    store.expression_union_type_with_global_types(
+                        &globals,
+                        &constituents,
+                        UnionReduction::Literal,
+                    ),
+                    Err(LiteralTypeCacheError::UnsupportedUnionConstituent(channel)),
+                );
+                assert_eq!(
+                    store.validate_cached_array_capability_with_array_targets(
+                        CanonicalArrayTargets::from_global_types(&globals),
+                        channel,
+                    ),
+                    Err(LiteralTypeCacheError::UnsupportedUnionConstituent(channel)),
+                );
+                assert_eq!(snapshot(store), warm);
+            }
+            assert!(store.set_value_symbol_links(value, original));
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &constituents,
+                    UnionReduction::Literal,
+                ),
+                Ok(union),
+            );
+            assert_eq!(snapshot(store), warm);
+            assert!(context.diagnostics().is_empty());
         }
     }
 

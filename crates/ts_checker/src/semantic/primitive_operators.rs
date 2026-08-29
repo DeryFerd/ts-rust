@@ -2,23 +2,31 @@
 //!
 //! The admitted domain is deliberately atomic: the canonical `any`, `string`,
 //! `number`, `bigint`, and `boolean` types plus their validated literal pairs
-//! and authenticated homogeneous enum types. Every broader type family remains
-//! a typed boundary. The kernel mirrors the pinned checker's operator-specific
-//! diagnostics and recovery types without publishing expression links; source
-//! integration owns publication after the complete result and diagnostic batch
-//! have been staged.
+//! and authenticated homogeneous enum types. The scalar entry keeps broader
+//! type families as typed boundaries. The kernel mirrors the pinned checker's
+//! operator-specific diagnostics and recovery types. Source integration publishes
+//! expression links after the complete result and diagnostic batch are staged.
+//! The caller-aware entry also compares authenticated object operands for
+//! equality. Other operators retain the scalar boundary.
 
 use ts_ast::{NodeRef, SyntaxKind};
+use ts_binder::SymbolFlags;
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalCheckerDiagnostic, CanonicalTypeMapperStore, RelationUnavailable,
-    TypeDisplayUnavailable, TypeId,
+    CanonicalCheckerDiagnostic, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
+    RelationKind, RelationUnavailable, TypeDisplayUnavailable, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     enums,
-    formatter::type_to_string,
+    formatter::{
+        CanonicalTypeFormatFlags,
+        get_type_names_for_assignability_error_with_host_global_types_and_flags, type_to_string,
+    },
+    instantiate::InstantiationSession,
+    instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     type_records::{LiteralValue, TypeData},
-    types::TypeFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// Target capability needed only by `bigint ** bigint`.
@@ -343,6 +351,202 @@ pub(super) fn check_primitive_binary(
         recovery: result.recovery,
         diagnostics,
     })
+}
+
+/// Keeps equality member work in the source query's session and option context.
+pub(super) fn check_primitive_binary_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    display_flags: CanonicalTypeFormatFlags,
+    session: &mut InstantiationSession,
+    request: PrimitiveBinaryRequest,
+) -> Result<PrimitiveBinaryResolution, PrimitiveBinaryError> {
+    if !matches!(
+        PrimitiveBinaryOperator::from_syntax(request.operator)?,
+        PrimitiveBinaryOperator::Equality(_)
+    ) {
+        return check_primitive_binary(store, request);
+    }
+
+    let left_base = equality_binary_operand(
+        store,
+        global_types,
+        request.left,
+        request.left_type,
+        request.left_recovery,
+    )?;
+    let right_base = equality_binary_operand(
+        store,
+        global_types,
+        request.right,
+        request.right_type,
+        request.right_recovery,
+    )?;
+    let boolean = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.boolean_type)
+        .ok_or(PrimitiveBinaryInvariant::MissingBootstrap)?;
+    store.validate_union_constituent(boolean)?;
+
+    let limit_mark = session.limit_event_mark();
+    let comparable = equality_types_are_comparable_with_session(
+        store,
+        global_types,
+        strict_function_types,
+        session,
+        request.left_type,
+        request.right_type,
+    )?;
+    let display_types = if comparable {
+        None
+    } else {
+        let bases_are_comparable = equality_types_are_comparable_with_session(
+            store,
+            global_types,
+            strict_function_types,
+            session,
+            left_base,
+            right_base,
+        )?;
+        Some(if bases_are_comparable {
+            (request.left_type, request.right_type)
+        } else {
+            (left_base, right_base)
+        })
+    };
+
+    let mut diagnostics = Vec::new();
+    if session.limit_event_occurred_since(limit_mark) {
+        diagnostics.push(fixed_diagnostic(request.expression, 2589)?);
+    }
+    if let Some((left, right)) = display_types {
+        let names = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            left,
+            right,
+            display_flags,
+        )?;
+        let mut diagnostic = fixed_diagnostic(request.expression, 2367)?;
+        diagnostic.diagnostic.arguments = vec![names.source, names.target];
+        diagnostics.push(diagnostic);
+    }
+    Ok(PrimitiveBinaryResolution {
+        result_type: boolean,
+        recovery: None,
+        diagnostics,
+    })
+}
+
+/// Returns the literal base only after the whole operand is authenticated.
+fn equality_binary_operand(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    node: NodeRef,
+    type_: TypeId,
+    recovery: Option<PrimitiveBinaryRecovery>,
+) -> Result<TypeId, PrimitiveBinaryError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(type_))?;
+    let base = match primitive_binary_operand(store, node, type_, recovery) {
+        Ok(PrimitiveBinaryOperand::Scalar(scalar)) => scalar.base,
+        Ok(PrimitiveBinaryOperand::Recovery(_) | PrimitiveBinaryOperand::Nullish(_)) => type_,
+        Err(PrimitiveBinaryError::Unsupported(PrimitiveBinaryUnsupported::Operand {
+            type_: unsupported,
+            ..
+        })) if unsupported == type_ && record.flags().intersects(TypeFlags::OBJECT) => type_,
+        Err(error) => return Err(error),
+    };
+    store.validate_union_constituent_with_global_types(global_types, type_)?;
+    if let TypeData::TypeReference(reference) = record.data()
+        && let Some(target) = reference.object.target
+        && target != global_types.array_type
+        && target != global_types.readonly_array_type
+        && store.type_payload(target).is_some_and(|target| {
+            matches!(target.data(), TypeData::Interface(_))
+                && target.object_flags().contains(ObjectFlags::INTERFACE)
+                && !target.object_flags().intersects(ObjectFlags::CLASS)
+                && target
+                    .symbol()
+                    .and_then(|owner| store.symbol(owner))
+                    .is_some_and(|owner| owner.flags() == SymbolFlags::INTERFACE)
+        })
+    {
+        // A cold member set stays cold. Published proxies must retain their
+        // mapper and property values before identity or nullish short-circuits.
+        validate_generic_interface_members(
+            store,
+            type_,
+            Some(CanonicalArrayTargets::from_global_types(global_types)),
+        )
+        .map_err(|error| match error {
+            GenericInterfaceMemberError::UnsupportedTarget(_) => {
+                RelationUnavailable::UnsupportedStructuredType(type_)
+            }
+            GenericInterfaceMemberError::UnsupportedMember(symbol) => {
+                RelationUnavailable::UnsupportedProperty(symbol)
+            }
+            GenericInterfaceMemberError::UnsupportedPropertyType(type_) => {
+                RelationUnavailable::UnsupportedStructuredType(type_)
+            }
+            GenericInterfaceMemberError::Capacity(_) => {
+                RelationUnavailable::UnionValidationCapacity(type_)
+            }
+            GenericInterfaceMemberError::Reference(_)
+            | GenericInterfaceMemberError::InvalidTarget(_)
+            | GenericInterfaceMemberError::InvalidMember(_)
+            | GenericInterfaceMemberError::InvalidCachedMembers(_)
+            | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+                RelationUnavailable::InvalidStructuredMembers(type_)
+            }
+        })?;
+    }
+    Ok(base)
+}
+
+fn equality_types_are_comparable_with_session(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    session: &mut InstantiationSession,
+    left: TypeId,
+    right: TypeId,
+) -> Result<bool, PrimitiveBinaryError> {
+    let left_flags = store
+        .type_payload(left)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(left))?
+        .flags();
+    let right_flags = store
+        .type_payload(right)
+        .ok_or(PrimitiveBinaryInvariant::InvalidType(right))?
+        .flags();
+    if right_flags.intersects(TypeFlags::NULLABLE)
+        || store.is_type_related_to_with_session(
+            left,
+            right,
+            RelationKind::Comparable,
+            Some(global_types),
+            Some(strict_function_types),
+            session,
+        )?
+        || left_flags.intersects(TypeFlags::NULLABLE)
+    {
+        return Ok(true);
+    }
+    store
+        .is_type_related_to_with_session(
+            right,
+            left,
+            RelationKind::Comparable,
+            Some(global_types),
+            Some(strict_function_types),
+            session,
+        )
+        .map_err(Into::into)
 }
 
 fn primitive_binary_operand(

@@ -16428,6 +16428,34 @@ mod tests {
             let root_links = fixture.store.type_alias_links(root_symbol).unwrap().clone();
             let root_declared = root_links.declared_type.as_ref().unwrap();
             let root_parameters = root_links.type_parameters.as_deref().unwrap();
+            let root_body_links = fixture.store.type_node_links(root_body).cloned();
+            let root_body_symbol_links = fixture.store.symbol_node_links(root_body).cloned();
+            let NodeData::TypeAliasDeclaration(root_alias) = &fixture
+                .parsed
+                .arena
+                .get(root_declaration.node)
+                .unwrap()
+                .data
+            else {
+                panic!("the root must retain its actual alias declaration");
+            };
+            let root_parameter_owners = root_alias
+                .type_parameters
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|node| {
+                    let declaration =
+                        NodeRef::new(root_declaration.arena, root_declaration.file, *node);
+                    let symbol = fixture
+                        .store
+                        .get_merged_symbol(fixture.bound.symbol(declaration).unwrap())
+                        .unwrap();
+                    (declaration, symbol)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(root_parameter_owners.len(), root_parameters.len());
             let NodeData::TypeReferenceNode(reference) =
                 &fixture.parsed.arena.get(annotation.node).unwrap().data
             else {
@@ -16619,7 +16647,7 @@ mod tests {
                             assert!(fixture.store.set_type_alias_arguments(
                                 identity_id,
                                 Some(root_parameters.to_vec())
-                            ))
+                            ));
                         }
                         2 => {
                             let mut links = owner_links.clone();
@@ -16686,9 +16714,55 @@ mod tests {
             ));
             for _ in 0..2 {
                 assert_eq!(
-                    property_object_alias_projection(&fixture.store, projection.target),
-                    Ok(Some(original.clone()))
+                    property_object_alias_template_matches(
+                        &fixture.store,
+                        original.alias_symbol,
+                        original.declaration,
+                        original.target,
+                        &original.parameters,
+                    ),
+                    Ok(true)
                 );
+                assert_eq!(
+                    fixture.store.type_alias_links(root_symbol),
+                    Some(&root_links)
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_declaration_belongs_to_symbol(root_declaration, root_symbol)
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .source_direct_type_annotation(root_declaration),
+                    Some(root_body)
+                );
+                assert_eq!(
+                    fixture.store.type_node_links(root_body).cloned(),
+                    root_body_links
+                );
+                assert_eq!(
+                    fixture.store.symbol_node_links(root_body).cloned(),
+                    root_body_symbol_links
+                );
+                for (parameter, (declaration, symbol)) in
+                    root_parameters.iter().zip(&root_parameter_owners)
+                {
+                    assert_eq!(
+                        cached_ordinary_type_parameter_owner(&fixture.store, *parameter),
+                        Some(*symbol)
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .source_declaration_belongs_to_symbol(*declaration, *symbol)
+                    );
+                    assert_eq!(
+                        fixture.store.source_node_parent(*declaration),
+                        Some(SourceNodeParent::Parent(root_declaration))
+                    );
+                }
                 assert!(
                     !fixture
                         .store

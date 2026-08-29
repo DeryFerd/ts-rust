@@ -9152,6 +9152,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 })
                 .map(|method| method.return_type)
                 .collect::<HashSet<_>>();
+            let separate_global_value =
+                object_members::authenticated_nongeneric_global_interface_owner(self.store, symbol)
+                    && self.store.symbol(symbol).is_some_and(|owner| {
+                        owner
+                            .flags()
+                            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                    });
             for annotation in planned
                 .property_type_nodes()
                 .chain(
@@ -9162,7 +9169,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .chain(planned.call_type_nodes())
             {
                 let previous = self.lazy_interface_values;
-                self.lazy_interface_values |= library_method_returns.contains(&annotation);
+                self.lazy_interface_values |=
+                    separate_global_value || library_method_returns.contains(&annotation);
                 let result = self.plan_type_node_in_context(annotation, None, false);
                 self.lazy_interface_values = previous;
                 result?;
@@ -34677,6 +34685,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 type_,
                 mapped_parameters,
                 type_arguments,
+                None,
             );
         }
         if self.alias_type_contains_forwarded_interface_reference(type_, mapped_parameters) {
@@ -36595,8 +36604,9 @@ mod tests {
     }
 
     #[test]
-    fn merged_global_interface_source_checks_keep_hidden_shared_work_unavailable() {
-        for library_text in [
+    #[allow(clippy::too_many_lines)] // Keep shared member publication and unsupported rows in one source matrix.
+    fn merged_global_interface_source_checks_preserve_shared_work() {
+        for (case, library_text) in [
             concat!(
                 "interface Base {} ",
                 "interface Packet extends Base { read(): string; } ",
@@ -36614,10 +36624,13 @@ mod tests {
                 "interface Packet<Value> { original: Value; } ",
                 "declare var Packet: number;",
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let library = parse_source_file(library_text);
             let source = parse_source_file("interface Packet {}");
-            let (mut context, _, source_file) =
+            let (mut context, library_file, source_file) =
                 default_library_interface_context(&library, &source, true);
             let declaration = source
                 .arena
@@ -36631,6 +36644,193 @@ mod tests {
                 })
                 .unwrap();
             let before = store_state(context.store());
+            if case < 2 {
+                let packet = context
+                    .file(source_file)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap();
+                let packet = context.store().get_merged_symbol(packet).unwrap();
+                let plan = object_members::plan_interface(
+                    context.store(),
+                    &context.declared_type_host().unwrap(),
+                    packet,
+                )
+                .unwrap();
+                assert_eq!(plan.declarations.len(), 2);
+                assert_eq!(plan.declarations[1], declaration);
+                let [method] = plan.methods.as_slice() else {
+                    panic!("the shared declaration must retain its one read method")
+                };
+                assert_eq!(method.declaration.file, library_file);
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol(method.symbol)
+                        .unwrap()
+                        .name()
+                        .as_utf8(),
+                    Some("read"),
+                );
+                let value = context
+                    .store()
+                    .symbol(packet)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap();
+                let annotation = context
+                    .store()
+                    .source_direct_type_annotation(value)
+                    .unwrap();
+                assert!(context.store().value_symbol_links(packet).is_none());
+                assert!(context.store().type_node_links(annotation).is_none());
+                assert_eq!(store_state(context.store()), before);
+
+                context.check_source_file(source_file).unwrap();
+                let type_ = context
+                    .store()
+                    .declared_type_links(packet)
+                    .unwrap()
+                    .declared_type
+                    .unwrap();
+                let record = context.store().type_payload(type_).unwrap();
+                let TypeData::Interface(interface) = record.data() else {
+                    panic!("the shared type must retain its canonical interface identity")
+                };
+                assert_eq!(record.symbol(), Some(packet));
+                assert!(interface.declared_members_resolved);
+                assert!(interface.base_types_resolved);
+                assert_eq!(
+                    interface.reference.object.structured.properties.as_deref(),
+                    Some(&[method.symbol][..]),
+                );
+                let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                let method_type = context
+                    .store()
+                    .value_symbol_links(method.symbol)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let method_members = context
+                    .store()
+                    .type_payload(method_type)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                assert_eq!(method_members.call_signature_count, 1);
+                let [signature] = method_members.signatures.as_deref().unwrap() else {
+                    panic!("read must retain exactly one call signature")
+                };
+                let signature = *signature;
+                let signature_record = context.store().signature(signature).unwrap();
+                assert_eq!(signature_record.declaration(), Some(method.declaration));
+                assert!(signature_record.parameters().is_empty());
+                assert_eq!(signature_record.min_argument_count(), 0);
+                assert_eq!(signature_record.resolved_return_type(), Some(string));
+                if case == 0 {
+                    let [base] = plan.heritage.as_ref().unwrap().bases.as_slice() else {
+                        panic!("Packet must retain its one written Base edge")
+                    };
+                    assert_eq!(base.kind, DirectInterfaceBaseKind::Interface);
+                    assert!(base.type_arguments.is_empty());
+                    assert!(base.defaults.is_empty());
+                    assert_eq!(
+                        context
+                            .store()
+                            .symbol(base.symbol)
+                            .unwrap()
+                            .name()
+                            .as_utf8(),
+                        Some("Base")
+                    );
+                    let base_type = context
+                        .store()
+                        .declared_type_links(base.symbol)
+                        .unwrap()
+                        .declared_type
+                        .unwrap();
+                    assert_eq!(
+                        interface.resolved_base_types.as_deref(),
+                        Some(&[base_type][..])
+                    );
+                    assert!(plan.indexes.is_empty());
+                    assert!(
+                        interface
+                            .reference
+                            .object
+                            .structured
+                            .index_infos
+                            .as_deref()
+                            .unwrap_or_default()
+                            .is_empty()
+                    );
+                } else {
+                    assert!(plan.heritage.is_none());
+                    assert!(interface.resolved_base_types.is_none());
+                    let [index] = interface
+                        .reference
+                        .object
+                        .structured
+                        .index_infos
+                        .as_deref()
+                        .unwrap()
+                    else {
+                        panic!("Packet must publish its one shared string index")
+                    };
+                    assert_eq!(
+                        interface.declared_index_infos.as_deref(),
+                        Some(&[*index][..])
+                    );
+                    let [planned_index] = plan.indexes.as_slice() else {
+                        panic!("the index must come from the original shared declaration")
+                    };
+                    let index = context.store().index_info(*index).unwrap();
+                    assert_eq!(index.declaration(), Some(planned_index.declaration));
+                    assert_eq!(index.key_type(), string);
+                    assert_eq!(
+                        index.value_type(),
+                        context.store().intrinsic_bootstrap().unwrap().unknown_type
+                    );
+                }
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    let TypeData::Interface(interface) =
+                        context.store().type_payload(type_).unwrap().data()
+                    else {
+                        panic!("warm checks must retain the interface payload")
+                    };
+                    let signature = context.store().signature(signature).unwrap();
+                    (
+                        store_state(context.store()),
+                        context.store().signature_len(),
+                        context.store().index_info_len(),
+                        context.store().symbol_len(),
+                        context.store().symbol_store().symbol_table_len(),
+                        InterfaceTypeData::clone(interface),
+                        (
+                            context.store().value_symbol_links(packet).cloned(),
+                            context.store().value_symbol_links(method.symbol).cloned(),
+                            context.store().type_node_links(annotation).cloned(),
+                        ),
+                        (
+                            signature.declaration(),
+                            signature.parameters().to_vec(),
+                            signature.resolved_return_type(),
+                        ),
+                    )
+                };
+                let warm = snapshot(&context);
+                for _ in 0..2 {
+                    context.recheck_source_file(source_file).unwrap();
+                    assert_eq!(context.get_declared_type_of_symbol(packet), Ok(type_));
+                    assert!(context.store().value_symbol_links(packet).is_none());
+                    assert!(context.store().type_node_links(annotation).is_none());
+                    assert_eq!(snapshot(&context), warm);
+                    assert!(context.diagnostics().is_empty());
+                }
+                continue;
+            }
             for _ in 0..2 {
                 assert_eq!(
                     context.check_source_file(source_file),
@@ -52987,7 +53187,8 @@ mod tests {
     }
 
     #[test]
-    fn lazy_default_library_interface_bases_reject_unsupported_source_shapes() {
+    #[allow(clippy::too_many_lines)] // Keep the ordinary-source positive beside unchanged library-only boundaries.
+    fn lazy_default_library_interface_bases_keep_source_and_library_boundaries() {
         let library = parse_source_file(concat!(
             "interface HTMLElement { method(value: string): void; } ",
             "declare var HTMLElement: unknown; ",
@@ -53018,6 +53219,178 @@ mod tests {
                 context.store().signature_len(),
                 context.store().index_info_len(),
             );
+
+            if !is_default_library {
+                let plan = object_members::plan_interface(
+                    context.store(),
+                    &context.declared_type_host().unwrap(),
+                    derived,
+                )
+                .unwrap();
+                let [base] = plan.heritage.as_ref().unwrap().bases.as_slice() else {
+                    panic!("the ordinary source must retain one HTMLElement base")
+                };
+                assert_eq!(base.kind, DirectInterfaceBaseKind::Interface);
+                assert!(base.type_arguments.is_empty());
+                assert!(base.defaults.is_empty());
+                let expected_base = context
+                    .store()
+                    .symbol_table(globals)
+                    .unwrap()
+                    .get_source("HTMLElement")
+                    .unwrap();
+                let expected_base = context.store().get_merged_symbol(expected_base).unwrap();
+                assert_eq!(base.symbol, expected_base);
+                assert!(
+                    !object_members::authenticated_default_library_interface_owner(
+                        context.store(),
+                        base.symbol
+                    )
+                );
+                assert!(
+                    object_members::authenticated_nongeneric_global_interface_owner(
+                        context.store(),
+                        base.symbol
+                    )
+                );
+                let base_plan = object_members::plan_interface(
+                    context.store(),
+                    &context.declared_type_host().unwrap(),
+                    base.symbol,
+                )
+                .unwrap();
+                let [method] = base_plan.methods.as_slice() else {
+                    panic!("the base must retain its one source method")
+                };
+                let [parameter] = method.parameters.as_slice() else {
+                    panic!("method must retain its one string parameter")
+                };
+                let value = context
+                    .store()
+                    .symbol(base.symbol)
+                    .unwrap()
+                    .value_declaration()
+                    .unwrap();
+                let annotation = context
+                    .store()
+                    .source_direct_type_annotation(value)
+                    .unwrap();
+                assert!(context.store().value_symbol_links(base.symbol).is_none());
+                assert!(context.store().type_node_links(annotation).is_none());
+                assert_eq!(
+                    (
+                        store_state(context.store()),
+                        context.store().signature_len(),
+                        context.store().index_info_len(),
+                    ),
+                    before,
+                );
+
+                let derived_type = context.get_declared_type_of_symbol(derived).unwrap();
+                let base_type = context
+                    .store()
+                    .declared_type_links(base.symbol)
+                    .unwrap()
+                    .declared_type
+                    .unwrap();
+                let record = context.store().type_payload(derived_type).unwrap();
+                let TypeData::Interface(interface) = record.data() else {
+                    panic!("the derived type must retain its canonical interface identity")
+                };
+                assert_eq!(record.symbol(), Some(derived));
+                assert!(interface.declared_members_resolved);
+                assert!(interface.base_types_resolved);
+                assert_eq!(
+                    interface.resolved_base_types.as_deref(),
+                    Some(&[base_type][..])
+                );
+                assert_eq!(
+                    interface.reference.object.structured.properties.as_deref(),
+                    Some(&[method.symbol][..]),
+                );
+                let members = context
+                    .store()
+                    .symbol_table(interface.reference.object.structured.members.unwrap())
+                    .unwrap();
+                assert_eq!(members.get_source("method"), Some(method.symbol));
+                let method_type = context
+                    .store()
+                    .value_symbol_links(method.symbol)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let method_members = context
+                    .store()
+                    .type_payload(method_type)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                assert_eq!(method_members.call_signature_count, 1);
+                let [signature] = method_members.signatures.as_deref().unwrap() else {
+                    panic!("the inherited method must keep its one original signature")
+                };
+                let signature = context.store().signature(*signature).unwrap();
+                assert_eq!(signature.declaration(), Some(method.declaration));
+                assert_eq!(signature.parameters(), &[parameter.symbol]);
+                assert_eq!(signature.min_argument_count(), 1);
+                assert_eq!(
+                    signature.resolved_return_type(),
+                    Some(context.store().intrinsic_bootstrap().unwrap().void_type)
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(parameter.symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(context.store().intrinsic_bootstrap().unwrap().string_type),
+                );
+                let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                    let payload = |type_| {
+                        let TypeData::Interface(interface) =
+                            context.store().type_payload(type_).unwrap().data()
+                        else {
+                            panic!("warm queries must retain both interface payloads")
+                        };
+                        InterfaceTypeData::clone(interface)
+                    };
+                    (
+                        store_state(context.store()),
+                        context.store().signature_len(),
+                        context.store().index_info_len(),
+                        context.store().symbol_len(),
+                        context.store().symbol_store().symbol_table_len(),
+                        payload(derived_type),
+                        payload(base_type),
+                        (
+                            context.store().value_symbol_links(base.symbol).cloned(),
+                            context.store().type_node_links(annotation).cloned(),
+                            context.store().value_symbol_links(method.symbol).cloned(),
+                            context
+                                .store()
+                                .value_symbol_links(parameter.symbol)
+                                .cloned(),
+                        ),
+                    )
+                };
+                let warm = snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.get_declared_type_of_symbol(derived),
+                        Ok(derived_type)
+                    );
+                    assert_eq!(
+                        context.get_declared_type_of_symbol(base.symbol),
+                        Ok(base_type)
+                    );
+                    assert!(context.store().value_symbol_links(base.symbol).is_none());
+                    assert!(context.store().type_node_links(annotation).is_none());
+                    assert_eq!(snapshot(&context), warm);
+                    assert!(context.diagnostics().is_empty());
+                }
+                continue;
+            }
 
             assert!(
                 context.get_declared_type_of_symbol(derived).is_err(),

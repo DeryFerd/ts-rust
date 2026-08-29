@@ -707,16 +707,270 @@ fn command_line_options_override_project_options() {
             "false",
         ],
     );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"tsconfig.json(1,22): error TS5108: Option 'moduleResolution=node10' has been removed. Please remove it from your configuration.\n"
     );
+    assert!(output.stderr.is_empty(), "{output:?}");
     let javascript = fs::read_to_string(directory.0.join("override/main.js")).unwrap();
     assert!(javascript.contains("const answer"));
     assert!(directory.0.join("override/main.js.map").is_file());
     assert!(directory.0.join("override/main.d.ts").is_file());
     assert!(!directory.0.join("original/main.js").exists());
+}
+
+#[test]
+fn direct_file_removed_resolution_reports_global_error_and_emits() {
+    let directory = TestDirectory::new("direct-removed-resolution");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--target",
+            "es2015",
+            "--moduleResolution",
+            "node10",
+            "--outDir",
+            "dist",
+            "--declaration",
+            "--sourceMap",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"error TS5108: Option 'moduleResolution=node10' has been removed. Please remove it from your configuration.\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let javascript = fs::read_to_string(directory.0.join("dist/main.js")).unwrap();
+    assert!(
+        javascript.contains("export const answer = 42;"),
+        "{javascript}"
+    );
+    assert!(directory.0.join("dist/main.js.map").is_file());
+    assert!(directory.0.join("dist/main.d.ts").is_file());
+    assert!(!directory.0.join("main.js").exists());
+}
+
+#[test]
+fn direct_file_removed_resolution_no_emit_on_error_skips_outputs() {
+    let directory = TestDirectory::new("direct-removed-resolution-no-emit");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--target",
+            "es2015",
+            "--moduleResolution",
+            "node10",
+            "--outDir",
+            "dist",
+            "--declaration",
+            "--sourceMap",
+            "--noEmitOnError",
+            "true",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"error TS5108: Option 'moduleResolution=node10' has been removed. Please remove it from your configuration.\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    for relative in ["dist/main.js", "dist/main.js.map", "dist/main.d.ts"] {
+        assert!(!directory.0.join(relative).exists(), "{relative}");
+    }
+    assert!(!directory.0.join("main.js").exists());
+}
+
+#[test]
+fn project_removed_resolution_no_emit_on_error_skips_outputs() {
+    let directory = TestDirectory::new("project-removed-resolution-no-emit");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"target":"es2015","outDir":"dist","noEmitOnError":true,"declaration":true,"sourceMap":true}}"#,
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "--project",
+            "tsconfig.json",
+            "--moduleResolution",
+            "node10",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"tsconfig.json(1,22): error TS5108: Option 'moduleResolution=node10' has been removed. Please remove it from your configuration.\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    for relative in ["dist/main.js", "dist/main.js.map", "dist/main.d.ts"] {
+        assert!(!directory.0.join(relative).exists(), "{relative}");
+    }
+    assert!(!directory.0.join("main.js").exists());
+}
+
+#[test]
+fn command_line_bundler_override_clears_removed_project_resolution() {
+    let directory = TestDirectory::new("project-resolution-override");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"target":"es2015","moduleResolution":"node10","outDir":"dist"}}"#,
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "--project",
+            "tsconfig.json",
+            "--moduleResolution",
+            "bundler",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let javascript = fs::read_to_string(directory.0.join("dist/main.js")).unwrap();
+    assert!(
+        javascript.contains("export const answer = 42;"),
+        "{javascript}"
+    );
+}
+
+#[test]
+fn command_line_resolution_uses_inherited_node_module() {
+    let directory = TestDirectory::new("inherited-node-resolution");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    fs::write(
+        directory.0.join("base.json"),
+        r#"{"compilerOptions":{"module":"node20","target":"es2015","outDir":"dist"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"extends":"./base.json","files":["main.ts"]}"#,
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "--project",
+            "tsconfig.json",
+            "--moduleResolution",
+            "node16",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let javascript = fs::read_to_string(directory.0.join("dist/main.js")).unwrap();
+    assert!(javascript.contains("answer = 42;"), "{javascript}");
+}
+
+#[test]
+fn removed_command_line_resolution_without_config_anchor_is_global() {
+    let directory = TestDirectory::new("project-resolution-without-anchor");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    fs::write(
+        directory.0.join("base.json"),
+        r#"{"compilerOptions":{"target":"es2015","outDir":"dist"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"extends":"./base.json","files":["main.ts"]}"#,
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "--project",
+            "tsconfig.json",
+            "--moduleResolution",
+            "node10",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"error TS5108: Option 'moduleResolution=node10' has been removed. Please remove it from your configuration.\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let javascript = fs::read_to_string(directory.0.join("dist/main.js")).unwrap();
+    assert!(
+        javascript.contains("export const answer = 42;"),
+        "{javascript}"
+    );
+}
+
+#[test]
+fn unrelated_command_line_option_errors_remain_immediate() {
+    for (option_arguments, expected_stdout) in [
+        (
+            &["--wat"][..],
+            "error TS5023: Unknown compiler option '--wat'.\n",
+        ),
+        (
+            &["--jsx", "invalid"][..],
+            concat!(
+                "error TS6046: Argument for 'jsx' option must be: ",
+                "'preserve', 'react', 'react-native', 'react-jsx', 'react-jsxdev'.\n"
+            ),
+        ),
+        (
+            &["--checkJs", "true", "--allowJs", "false"][..],
+            "error TS5052: Option 'checkJs' cannot be specified without specifying option 'allowJs'.\n",
+        ),
+    ] {
+        let directory = TestDirectory::new("immediate-option-error");
+        fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+        let mut arguments = vec![
+            "main.ts",
+            "--ignoreConfig",
+            "--target",
+            "es2015",
+            "--moduleResolution",
+            "node10",
+            "--outDir",
+            "dist",
+            "--pretty",
+            "false",
+        ];
+        arguments.extend_from_slice(option_arguments);
+        let output = run(env!("CARGO_BIN_EXE_tsgo"), &directory.0, &arguments);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {output:?}");
+        assert_eq!(output.stdout, expected_stdout.as_bytes(), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+        assert!(!directory.0.join("dist/main.js").exists());
+        assert!(!directory.0.join("main.js").exists());
+    }
 }
 
 #[test]

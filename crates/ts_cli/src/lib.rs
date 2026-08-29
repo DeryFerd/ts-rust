@@ -6,7 +6,10 @@ use std::{
 };
 
 use ts_config::JsonValue;
-use ts_options::{CompilerOptions as NormalizedCompilerOptions, parse_compiler_options_map};
+use ts_options::{
+    CompilerOptions as NormalizedCompilerOptions, is_module_resolution_diagnostic,
+    parse_compiler_options_map,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -241,7 +244,11 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
         index += 1;
     }
     let parsed = parse_compiler_options_map(&compiler_options);
-    if let Some(diagnostic) = parsed.diagnostics.first() {
+    if let Some(diagnostic) = parsed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| !is_module_resolution_diagnostic(diagnostic))
+    {
         return Err(CommandLineError {
             code: u16::try_from(diagnostic.code()).unwrap_or(u16::MAX),
             message: diagnostic
@@ -1099,7 +1106,7 @@ mod tests {
         );
         assert_eq!(
             options.compiler_options.module_resolution,
-            ts_options::ModuleResolutionKind::Node10
+            ts_options::ModuleResolutionKind::Bundler
         );
         assert_eq!(
             options.compiler_options.target,
@@ -1118,9 +1125,13 @@ mod tests {
 
     #[test]
     fn target_default_preserves_explicit_legacy_command_line_options() {
-        for (resolution, expected) in [
-            ("classic", ts_options::ModuleResolutionKind::Classic),
-            ("node10", ts_options::ModuleResolutionKind::Node10),
+        for (resolution, expected, diagnostic_name) in [
+            (
+                "classic",
+                ts_options::ModuleResolutionKind::Classic,
+                "Classic",
+            ),
+            ("node10", ts_options::ModuleResolutionKind::Node10, "node10"),
         ] {
             let Command::Compile(options) = parse(&[
                 "--target",
@@ -1145,7 +1156,21 @@ mod tests {
                 ts_options::ModuleKind::CommonJs
             );
             assert!(options.compiler_options.module_specified);
-            assert_eq!(options.compiler_options.module_resolution, expected);
+            assert_eq!(
+                options.compiler_options.module_resolution_configured,
+                Some(expected),
+            );
+            assert_eq!(
+                options.compiler_options.module_resolution,
+                ts_options::ModuleResolutionKind::Bundler,
+            );
+            let diagnostics = options.compiler_options.module_resolution_diagnostics();
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code(), 5108);
+            assert_eq!(
+                diagnostics[0].arguments,
+                ["moduleResolution", diagnostic_name].map(str::to_owned),
+            );
             assert!(!options.compiler_options.resolve_json_module);
             assert!(options.compiler_options.resolve_json_module_specified);
             assert_eq!(
@@ -1248,6 +1273,52 @@ mod tests {
             options.compiler_options.out_file.as_deref(),
             Some("bundle.js")
         );
+    }
+
+    #[test]
+    fn defers_resolution_validation_without_losing_configured_options() {
+        for (arguments, configured, effective, codes) in [
+            (
+                vec!["--moduleResolution", "node10", "main.ts"],
+                ts_options::ModuleResolutionKind::Node10,
+                ts_options::ModuleResolutionKind::Bundler,
+                vec![5108],
+            ),
+            (
+                vec!["--moduleResolution", "node16", "main.ts"],
+                ts_options::ModuleResolutionKind::Node16,
+                ts_options::ModuleResolutionKind::Node16,
+                vec![5110],
+            ),
+            (
+                vec![
+                    "--module",
+                    "nodenext",
+                    "--moduleResolution",
+                    "bundler",
+                    "main.ts",
+                ],
+                ts_options::ModuleResolutionKind::Bundler,
+                ts_options::ModuleResolutionKind::Bundler,
+                vec![5095, 5109],
+            ),
+        ] {
+            let Command::Compile(options) = parse(&arguments).unwrap() else {
+                panic!("expected compile command");
+            };
+            assert_eq!(options.files, ["main.ts"]);
+            assert!(options.specified_options.contains("moduleresolution"));
+            assert_eq!(
+                options.compiler_options.module_resolution_configured,
+                Some(configured)
+            );
+            assert_eq!(options.compiler_options.module_resolution, effective);
+            let diagnostics = options.compiler_options.module_resolution_diagnostics();
+            assert_eq!(diagnostics.len(), codes.len());
+            for (diagnostic, code) in diagnostics.iter().zip(codes) {
+                assert_eq!(diagnostic.code(), code);
+            }
+        }
     }
 
     #[test]

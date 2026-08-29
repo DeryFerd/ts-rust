@@ -54,10 +54,10 @@ impl ModuleKind {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ModuleResolutionKind {
     Classic,
-    #[default]
     Node10,
     Node16,
     NodeNext,
+    #[default]
     Bundler,
 }
 
@@ -224,7 +224,11 @@ pub struct CompilerOptions {
     pub module: ModuleKind,
     /// Whether `module` was explicitly supplied rather than selected as the default.
     pub module_specified: bool,
+    /// Effective resolution mode after applying defaults and removed-mode fallbacks.
     pub module_resolution: ModuleResolutionKind,
+    /// Configured `moduleResolution`, before defaults or removed-mode fallbacks.
+    /// Set this for an explicit mode that must survive `apply_overrides`.
+    pub module_resolution_configured: Option<ModuleResolutionKind>,
     pub target: ScriptTarget,
     pub jsx: JsxEmit,
     pub jsx_factory: Option<String>,
@@ -345,7 +349,8 @@ impl Default for CompilerOptions {
             lib: None,
             module: ModuleKind::default(),
             module_specified: false,
-            module_resolution: ModuleResolutionKind::Node10,
+            module_resolution: ModuleResolutionKind::Bundler,
+            module_resolution_configured: None,
             target: ScriptTarget::default(),
             jsx: JsxEmit::None,
             jsx_factory: None,
@@ -356,7 +361,7 @@ impl Default for CompilerOptions {
             max_node_module_js_depth: None,
             custom_conditions: None,
             module_suffixes: None,
-            resolve_json_module: false,
+            resolve_json_module: true,
             resolve_json_module_specified: false,
             resolve_package_json_exports: true,
             resolve_package_json_imports: true,
@@ -413,9 +418,33 @@ impl ParseOptionsResult {
     pub const fn is_ok(&self) -> bool {
         self.diagnostics.is_empty()
     }
+
+    /// Rechecks resolution diagnostics after applying command-line overrides.
+    pub fn refresh_module_resolution_diagnostics(&mut self) {
+        self.diagnostics
+            .retain(|diagnostic| !is_module_resolution_diagnostic(diagnostic));
+        let mut resolution_diagnostics = self.options.module_resolution_diagnostics();
+        if resolution_diagnostics
+            .first()
+            .is_some_and(|diagnostic| diagnostic.code() == 5108)
+        {
+            self.diagnostics.insert(0, resolution_diagnostics.remove(0));
+        }
+        self.diagnostics.extend(resolution_diagnostics);
+    }
 }
 
 impl CompilerOptions {
+    /// Validates the resolution family after all option overrides are applied.
+    #[must_use]
+    pub fn module_resolution_diagnostics(&self) -> Vec<Diagnostic> {
+        module_resolution_diagnostics(
+            self.module.effective_for_target(self.target),
+            self.module_resolution_configured,
+            self.custom_conditions.is_some(),
+        )
+    }
+
     /// Applies `strict` to strict-family options that were not explicitly set.
     pub fn normalize_strict_flags(&mut self) {
         if !self.no_implicit_any_specified {
@@ -668,25 +697,17 @@ impl CompilerOptions {
                 "module" => {
                     self.module = overrides.module;
                     self.module_specified = true;
-                    if !names.contains("moduleresolution") {
-                        self.module_resolution = overrides.module_resolution;
-                    }
-                    if !names.contains("moduledetection") && !self.module_detection_specified {
-                        self.module_detection = overrides.module_detection;
-                    }
-                    if !names.contains("resolvejsonmodule") && !self.resolve_json_module_specified {
-                        self.resolve_json_module = overrides.resolve_json_module;
-                    }
                 }
                 "moduledetection" => {
                     self.module_detection = overrides.module_detection;
                     self.module_detection_specified = true;
                 }
                 "moduleresolution" => {
-                    self.module_resolution = overrides.module_resolution;
-                    if !names.contains("resolvejsonmodule") && !self.resolve_json_module_specified {
-                        self.resolve_json_module = overrides.resolve_json_module;
-                    }
+                    self.module_resolution_configured = Some(
+                        overrides
+                            .module_resolution_configured
+                            .unwrap_or(overrides.module_resolution),
+                    );
                 }
                 "modulesuffixes" => self.module_suffixes.clone_from(&overrides.module_suffixes),
                 "newline" => self.new_line = overrides.new_line,
@@ -839,6 +860,20 @@ impl CompilerOptions {
                     self.verbatim_module_syntax = overrides.verbatim_module_syntax;
                 }
                 _ => {}
+            }
+        }
+        if names.contains("module")
+            || names.contains("moduleresolution")
+            || names.contains("target")
+        {
+            self.module_resolution =
+                effective_module_resolution(self.module, self.module_resolution_configured);
+            if !self.module_detection_specified {
+                self.module_detection = default_module_detection(self.module);
+            }
+            if !self.resolve_json_module_specified {
+                self.resolve_json_module =
+                    default_resolve_json_module(self.module, self.module_resolution);
             }
         }
     }
@@ -1406,9 +1441,7 @@ impl PartialOptions {
         } else {
             ModuleKind::default()
         });
-        let module_resolution = self
-            .module_resolution
-            .unwrap_or_else(|| default_module_resolution(module));
+        let module_resolution = effective_module_resolution(module, self.module_resolution);
         let es_module_interop = self.es_module_interop.unwrap_or(true);
         CompilerOptions {
             always_strict: self.always_strict.unwrap_or(true),
@@ -1449,19 +1482,9 @@ impl PartialOptions {
             isolated_declarations: self.isolated_declarations.unwrap_or(false),
             import_helpers: self.import_helpers.unwrap_or(false),
             lib_replacement: self.lib_replacement.unwrap_or(false),
-            module_detection: self.module_detection.unwrap_or({
-                if matches!(
-                    module,
-                    ModuleKind::Node16
-                        | ModuleKind::Node18
-                        | ModuleKind::Node20
-                        | ModuleKind::NodeNext
-                ) {
-                    ModuleDetectionKind::Force
-                } else {
-                    ModuleDetectionKind::Auto
-                }
-            }),
+            module_detection: self
+                .module_detection
+                .unwrap_or_else(|| default_module_detection(module)),
             module_detection_specified,
             new_line: self.new_line.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
@@ -1516,6 +1539,7 @@ impl PartialOptions {
             module,
             module_specified,
             module_resolution,
+            module_resolution_configured: self.module_resolution,
             target: self.target.unwrap_or_default(),
             jsx: self.jsx.unwrap_or_default(),
             jsx_factory: self.jsx_factory,
@@ -1526,10 +1550,9 @@ impl PartialOptions {
             max_node_module_js_depth: self.max_node_module_js_depth,
             custom_conditions: self.custom_conditions,
             module_suffixes: self.module_suffixes,
-            resolve_json_module: self.resolve_json_module.unwrap_or(
-                module_resolution == ModuleResolutionKind::Bundler
-                    || matches!(module, ModuleKind::Node20 | ModuleKind::NodeNext),
-            ),
+            resolve_json_module: self
+                .resolve_json_module
+                .unwrap_or_else(|| default_resolve_json_module(module, module_resolution)),
             resolve_json_module_specified,
             resolve_package_json_exports: self.resolve_package_json_exports.unwrap_or(true),
             resolve_package_json_imports: self.resolve_package_json_imports.unwrap_or(true),
@@ -1557,22 +1580,59 @@ impl PartialOptions {
 
 const fn default_module_resolution(module: ModuleKind) -> ModuleResolutionKind {
     match module {
-        ModuleKind::Amd => ModuleResolutionKind::Classic,
         ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 => {
             ModuleResolutionKind::Node16
         }
         ModuleKind::NodeNext => ModuleResolutionKind::NodeNext,
-        ModuleKind::Es2015
-        | ModuleKind::Es2020
-        | ModuleKind::Es2022
-        | ModuleKind::EsNext
-        | ModuleKind::Preserve => ModuleResolutionKind::Bundler,
-        _ => ModuleResolutionKind::Node10,
+        _ => ModuleResolutionKind::Bundler,
+    }
+}
+
+const fn effective_module_resolution(
+    module: ModuleKind,
+    configured: Option<ModuleResolutionKind>,
+) -> ModuleResolutionKind {
+    // GetModuleResolutionKind in pinned Go uses the default for removed modes.
+    match configured {
+        Some(ModuleResolutionKind::Classic | ModuleResolutionKind::Node10) | None => {
+            default_module_resolution(module)
+        }
+        Some(resolution) => resolution,
+    }
+}
+
+const fn default_resolve_json_module(module: ModuleKind, resolution: ModuleResolutionKind) -> bool {
+    matches!(module, ModuleKind::Node20 | ModuleKind::NodeNext)
+        || matches!(resolution, ModuleResolutionKind::Bundler)
+}
+
+const fn default_module_detection(module: ModuleKind) -> ModuleDetectionKind {
+    if matches!(
+        module,
+        ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext
+    ) {
+        ModuleDetectionKind::Force
+    } else {
+        ModuleDetectionKind::Auto
     }
 }
 
 #[allow(clippy::too_many_lines)] // Preserve upstream compiler-option diagnostic order.
 fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
+    let mut resolution_diagnostics = module_resolution_diagnostics(
+        options
+            .module
+            .unwrap_or_default()
+            .effective_for_target(options.target.unwrap_or_default()),
+        options.module_resolution,
+        options.custom_conditions.is_some(),
+    );
+    if resolution_diagnostics
+        .first()
+        .is_some_and(|diagnostic| diagnostic.code() == 5108)
+    {
+        diagnostics.push(resolution_diagnostics.remove(0));
+    }
     validate_strict_options(options, diagnostics);
     validate_isolated_declaration_options(options, diagnostics);
 
@@ -1630,18 +1690,6 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     {
         diagnostics.push(diagnostic(5096, []));
     }
-    if options.custom_conditions.is_some()
-        && !matches!(
-            options.module_resolution.unwrap_or_else(|| {
-                default_module_resolution(options.module.unwrap_or_default())
-            }),
-            ModuleResolutionKind::Node16
-                | ModuleResolutionKind::NodeNext
-                | ModuleResolutionKind::Bundler
-        )
-    {
-        diagnostics.push(diagnostic(5098, ["customConditions"]));
-    }
     if options.out_file.is_some()
         && options.module.is_some_and(|module| {
             !matches!(
@@ -1653,30 +1701,89 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
         diagnostics.push(diagnostic(6082, ["outFile"]));
     }
 
-    if options.module_resolution == Some(ModuleResolutionKind::Bundler)
-        && options.module.is_some_and(|module| {
-            !matches!(
-                module,
-                ModuleKind::CommonJs
-                    | ModuleKind::Es2015
-                    | ModuleKind::Es2020
-                    | ModuleKind::Es2022
-                    | ModuleKind::EsNext
-                    | ModuleKind::Preserve
-            )
-        })
+    diagnostics.extend(resolution_diagnostics);
+}
+
+fn module_resolution_diagnostics(
+    module: ModuleKind,
+    configured: Option<ModuleResolutionKind>,
+    custom_conditions: bool,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(diagnostic) = removed_module_resolution_diagnostic(configured) {
+        diagnostics.push(diagnostic);
+    }
+    validate_module_resolution_options(module, configured, custom_conditions, &mut diagnostics);
+    diagnostics
+}
+
+fn removed_module_resolution_diagnostic(
+    configured: Option<ModuleResolutionKind>,
+) -> Option<Diagnostic> {
+    let name = match configured {
+        Some(ModuleResolutionKind::Classic) => "Classic",
+        Some(ModuleResolutionKind::Node10) => "node10",
+        _ => return None,
+    };
+    Some(diagnostic(5108, ["moduleResolution", name]))
+}
+
+/// Identifies only the option diagnostics deferred until resolution settings are final.
+#[must_use]
+pub fn is_module_resolution_diagnostic(diagnostic: &Diagnostic) -> bool {
+    match (diagnostic.code(), diagnostic.arguments.as_slice()) {
+        (5095, [mode]) => mode == "bundler",
+        (5098, [option]) => option == "customConditions",
+        (5108, [option, mode]) => {
+            option == "moduleResolution" && matches!(mode.as_str(), "Classic" | "node10")
+        }
+        (5109, [resolution, module]) => {
+            matches!(resolution.as_str(), "Node16" | "NodeNext")
+                && matches!(module.as_str(), "Node16" | "Node18" | "Node20" | "NodeNext")
+        }
+        (5110, [module, resolution]) => {
+            module == resolution && matches!(resolution.as_str(), "Node16" | "NodeNext")
+        }
+        _ => false,
+    }
+}
+
+fn validate_module_resolution_options(
+    module: ModuleKind,
+    configured: Option<ModuleResolutionKind>,
+    custom_conditions: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let resolution = effective_module_resolution(module, configured);
+    if custom_conditions
+        && !matches!(
+            resolution,
+            ModuleResolutionKind::Node16
+                | ModuleResolutionKind::NodeNext
+                | ModuleResolutionKind::Bundler
+        )
+    {
+        diagnostics.push(diagnostic(5098, ["customConditions"]));
+    }
+    if resolution == ModuleResolutionKind::Bundler
+        && !matches!(
+            module,
+            ModuleKind::CommonJs
+                | ModuleKind::Es2015
+                | ModuleKind::Es2020
+                | ModuleKind::Es2022
+                | ModuleKind::EsNext
+                | ModuleKind::Preserve
+        )
     {
         diagnostics.push(diagnostic(5095, ["bundler"]));
     }
 
-    let Some(resolution) = options.module_resolution else {
-        return;
-    };
-    let node_module = match options.module {
-        Some(module @ (ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20)) => {
+    let node_module = match module {
+        module @ (ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20) => {
             Some((module, ModuleResolutionKind::Node16))
         }
-        Some(module @ ModuleKind::NodeNext) => Some((module, ModuleResolutionKind::NodeNext)),
+        module @ ModuleKind::NodeNext => Some((module, ModuleResolutionKind::NodeNext)),
         _ => None,
     };
     let is_node_resolution = matches!(
@@ -2171,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn default_target_uses_es2025_without_resolver_changes() {
+    fn default_target_uses_es2025_with_bundler_resolution() {
         assert_eq!(ScriptTarget::default(), ScriptTarget::Es2025);
         let parsed = parse_compiler_options(&object([]));
         assert!(parsed.is_ok(), "{:?}", parsed.diagnostics);
@@ -2184,14 +2291,15 @@ mod tests {
                 options.module.effective_for_target(options.target),
                 ModuleKind::Es2022
             );
-            assert_eq!(options.module_resolution, ModuleResolutionKind::Node10);
+            assert_eq!(options.module_resolution, ModuleResolutionKind::Bundler);
+            assert_eq!(options.module_resolution_configured, None);
             assert_eq!(
                 options.module_resolution_options().mode,
-                ResolutionMode::Node10
+                ResolutionMode::Bundler
             );
-            assert!(!options.resolve_json_module);
+            assert!(options.resolve_json_module);
             assert!(!options.resolve_json_module_specified);
-            assert!(!options.module_resolution_options().resolve_json);
+            assert!(options.module_resolution_options().resolve_json);
             assert!(options.lib.is_none());
             assert!(!options.no_check);
         }
@@ -2392,29 +2500,37 @@ mod tests {
     }
 
     #[test]
-    fn target_defaults_preserve_explicit_legacy_resolution_and_json_false() {
-        for (name, configured, mode) in [
-            (
-                "classic",
-                ModuleResolutionKind::Classic,
-                ResolutionMode::Classic,
-            ),
-            (
-                "node10",
-                ModuleResolutionKind::Node10,
-                ResolutionMode::Node10,
-            ),
+    fn target_defaults_report_removed_resolution_and_preserve_json_false() {
+        for (name, configured) in [
+            ("classic", ModuleResolutionKind::Classic),
+            ("node10", ModuleResolutionKind::Node10),
         ] {
             let parsed = parse_compiler_options(&object([
                 ("moduleResolution", JsonValue::String(name.to_owned())),
                 ("resolveJsonModule", JsonValue::Bool(false)),
             ]));
-            assert!(parsed.is_ok(), "{name}: {:?}", parsed.diagnostics);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{name}: {:?}",
+                parsed.diagnostics
+            );
+            assert_eq!(parsed.diagnostics[0].code(), 5108);
             assert_eq!(parsed.options.target, ScriptTarget::Es2025);
             assert_eq!(parsed.options.module, ModuleKind::None);
             assert!(!parsed.options.module_specified);
-            assert_eq!(parsed.options.module_resolution, configured);
-            assert_eq!(parsed.options.module_resolution_options().mode, mode);
+            assert_eq!(
+                parsed.options.module_resolution,
+                ModuleResolutionKind::Bundler
+            );
+            assert_eq!(
+                parsed.options.module_resolution_configured,
+                Some(configured)
+            );
+            assert_eq!(
+                parsed.options.module_resolution_options().mode,
+                ResolutionMode::Bundler
+            );
             assert!(!parsed.options.resolve_json_module);
             assert!(parsed.options.resolve_json_module_specified);
             assert!(!parsed.options.module_resolution_options().resolve_json);
@@ -2422,12 +2538,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_untransformed_modules_with_node10_resolution() {
+    fn defaults_keep_omitted_modules_with_bundler_resolution() {
         let direct = CompilerOptions::default();
         assert_eq!(ModuleKind::default(), ModuleKind::None);
         assert_eq!(direct.module, ModuleKind::None);
         assert!(!direct.module_specified);
-        assert_eq!(direct.module_resolution, ModuleResolutionKind::Node10);
+        assert_eq!(direct.module_resolution, ModuleResolutionKind::Bundler);
+        assert_eq!(direct.module_resolution_configured, None);
+        assert!(direct.resolve_json_module);
+        assert!(!direct.resolve_json_module_specified);
 
         let parsed = parse_compiler_options(&object([]));
         assert!(parsed.is_ok(), "{:?}", parsed.diagnostics);
@@ -2435,7 +2554,12 @@ mod tests {
         assert!(!parsed.options.module_specified);
         assert_eq!(
             parsed.options.module_resolution,
-            ModuleResolutionKind::Node10
+            ModuleResolutionKind::Bundler
+        );
+        assert_eq!(parsed.options.module_resolution_configured, None);
+        assert_eq!(
+            parsed.options.module_resolution_options(),
+            direct.module_resolution_options()
         );
 
         let mut overridden = CompilerOptions::default();
@@ -2444,6 +2568,159 @@ mod tests {
             &BTreeSet::from(["module".to_owned()]),
         );
         assert!(overridden.module_specified);
+    }
+
+    #[test]
+    fn target_only_project_options_use_effective_resolution_defaults() {
+        let config = parse_config_text(
+            "/project/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "target": "es2015",
+                    "lib": ["es2015"],
+                    "types": [],
+                    "strict": true,
+                    "skipLibCheck": true,
+                    "noEmit": true
+                },
+                "files": ["case.ts"]
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        let options = result.options;
+        assert_eq!(options.target, ScriptTarget::Es2015);
+        assert_eq!(options.module, ModuleKind::None);
+        assert!(!options.module_specified);
+        assert_eq!(
+            options.module.effective_for_target(options.target),
+            ModuleKind::Es2015
+        );
+        assert_eq!(options.module_resolution_configured, None);
+        assert_eq!(options.module_resolution, ModuleResolutionKind::Bundler);
+        assert!(options.resolve_json_module);
+        assert!(!options.resolve_json_module_specified);
+        let resolver = options.module_resolution_options();
+        assert_eq!(resolver.mode, ResolutionMode::Bundler);
+        assert!(resolver.resolve_json);
+    }
+
+    #[test]
+    fn resolution_defaults_follow_configured_module_modes() {
+        for (module, resolution, json) in [
+            (None, ModuleResolutionKind::Bundler, true),
+            (Some("commonjs"), ModuleResolutionKind::Bundler, true),
+            (Some("es2015"), ModuleResolutionKind::Bundler, true),
+            (Some("preserve"), ModuleResolutionKind::Bundler, true),
+            (Some("node16"), ModuleResolutionKind::Node16, false),
+            (Some("node18"), ModuleResolutionKind::Node16, false),
+            (Some("node20"), ModuleResolutionKind::Node16, true),
+            (Some("nodenext"), ModuleResolutionKind::NodeNext, true),
+        ] {
+            let mut input = vec![("target", JsonValue::String("es2015".into()))];
+            if let Some(module) = module {
+                input.push(("module", JsonValue::String(module.into())));
+            }
+            let result = parse_compiler_options(&object(input));
+            assert!(result.is_ok(), "{module:?}: {:?}", result.diagnostics);
+            assert_eq!(result.options.module_resolution, resolution, "{module:?}");
+            assert_eq!(result.options.module_resolution_configured, None);
+            assert_eq!(result.options.resolve_json_module, json, "{module:?}");
+            assert!(!result.options.resolve_json_module_specified);
+            assert_eq!(
+                result.options.module_resolution_options().resolve_json,
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_node_resolution_keeps_the_configured_json_rules() {
+        for (module, default_json) in [
+            ("node16", false),
+            ("node18", false),
+            ("node20", true),
+            ("nodenext", true),
+        ] {
+            for (name, resolution) in [
+                ("node16", ModuleResolutionKind::Node16),
+                ("nodenext", ModuleResolutionKind::NodeNext),
+            ] {
+                for json in [None, Some(false), Some(true)] {
+                    let mut input = vec![
+                        ("module", JsonValue::String(module.into())),
+                        ("moduleResolution", JsonValue::String(name.into())),
+                    ];
+                    if let Some(json) = json {
+                        input.push(("resolveJsonModule", JsonValue::Bool(json)));
+                    }
+                    let result = parse_compiler_options(&object(input));
+                    assert!(result.is_ok(), "{:?}", result.diagnostics);
+                    assert_eq!(result.options.module_resolution, resolution);
+                    assert_eq!(
+                        result.options.module_resolution_configured,
+                        Some(resolution)
+                    );
+                    assert_eq!(
+                        result.options.resolve_json_module,
+                        json.unwrap_or(default_json),
+                        "{module}/{name}/{json:?}"
+                    );
+                    assert_eq!(result.options.resolve_json_module_specified, json.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn removed_resolution_modes_keep_their_source_and_use_effective_fallbacks() {
+        for (name, configured, label) in [
+            ("classic", ModuleResolutionKind::Classic, "Classic"),
+            ("node", ModuleResolutionKind::Node10, "node10"),
+            ("node10", ModuleResolutionKind::Node10, "node10"),
+        ] {
+            for (module, effective, json) in [
+                (None, ModuleResolutionKind::Bundler, true),
+                (Some("node16"), ModuleResolutionKind::Node16, false),
+                (Some("node20"), ModuleResolutionKind::Node16, true),
+                (Some("nodenext"), ModuleResolutionKind::NodeNext, true),
+            ] {
+                let mut input = vec![
+                    ("target", JsonValue::String("es2015".into())),
+                    ("moduleResolution", JsonValue::String(name.into())),
+                    (
+                        "customConditions",
+                        JsonValue::Array(vec![JsonValue::String("development".into())]),
+                    ),
+                ];
+                if let Some(module) = module {
+                    input.push(("module", JsonValue::String(module.into())));
+                }
+                let result = parse_compiler_options(&object(input));
+                let [diagnostic] = result.diagnostics.as_slice() else {
+                    panic!("{module:?}/{name}: {:?}", result.diagnostics);
+                };
+                assert_eq!(diagnostic.code(), 5108);
+                assert_eq!(
+                    diagnostic.render().unwrap(),
+                    format!(
+                        "Option 'moduleResolution={label}' has been removed. Please remove it from your configuration."
+                    )
+                );
+                assert_eq!(
+                    result.options.module_resolution_configured,
+                    Some(configured)
+                );
+                assert_eq!(result.options.module_resolution, effective);
+                assert_eq!(result.options.resolve_json_module, json);
+                assert_eq!(
+                    result.options.module_resolution_options().custom_conditions,
+                    ["development"]
+                );
+            }
+        }
     }
 
     #[test]
@@ -2602,6 +2879,187 @@ mod tests {
         explicit.apply_overrides(&node, &BTreeSet::from(["module".to_owned()]));
         assert_eq!(explicit.module_detection, ModuleDetectionKind::Legacy);
         assert!(!explicit.resolve_json_module);
+    }
+
+    #[test]
+    fn module_overrides_derive_from_the_merged_options_only() {
+        let mut base =
+            parse_compiler_options(&object([("module", JsonValue::String("node20".into()))]))
+                .options;
+        let overrides = parse_compiler_options(&object([
+            ("module", JsonValue::String("node18".into())),
+            ("moduleResolution", JsonValue::String("nodenext".into())),
+            ("moduleDetection", JsonValue::String("legacy".into())),
+            ("resolveJsonModule", JsonValue::Bool(true)),
+        ]))
+        .options;
+        base.apply_overrides(&overrides, &BTreeSet::from(["module".to_owned()]));
+        assert_eq!(base.module, ModuleKind::Node18);
+        assert!(base.module_specified);
+        assert_eq!(base.module_resolution, ModuleResolutionKind::Node16);
+        assert_eq!(base.module_resolution_configured, None);
+        assert_eq!(base.module_detection, ModuleDetectionKind::Force);
+        assert!(!base.module_detection_specified);
+        assert!(!base.resolve_json_module);
+        assert!(!base.resolve_json_module_specified);
+    }
+
+    #[test]
+    fn module_overrides_preserve_explicit_base_resolution_and_json() {
+        let mut base = parse_compiler_options(&object([
+            ("module", JsonValue::String("node18".into())),
+            ("moduleResolution", JsonValue::String("nodenext".into())),
+            ("moduleDetection", JsonValue::String("legacy".into())),
+            ("resolveJsonModule", JsonValue::Bool(false)),
+        ]))
+        .options;
+        let overrides =
+            parse_compiler_options(&object([("module", JsonValue::String("node20".into()))]))
+                .options;
+        base.apply_overrides(&overrides, &BTreeSet::from(["module".to_owned()]));
+        assert_eq!(base.module, ModuleKind::Node20);
+        assert_eq!(base.module_resolution, ModuleResolutionKind::NodeNext);
+        assert_eq!(
+            base.module_resolution_configured,
+            Some(ModuleResolutionKind::NodeNext)
+        );
+        assert_eq!(base.module_detection, ModuleDetectionKind::Legacy);
+        assert!(base.module_detection_specified);
+        assert!(!base.resolve_json_module);
+        assert!(base.resolve_json_module_specified);
+    }
+
+    #[test]
+    fn resolution_overrides_keep_node_json_defaults_from_the_base_module() {
+        for module in ["node20", "nodenext"] {
+            let mut base =
+                parse_compiler_options(&object([("module", JsonValue::String(module.into()))]))
+                    .options;
+            let overrides = parse_compiler_options(&object([(
+                "moduleResolution",
+                JsonValue::String("node16".into()),
+            )]))
+            .options;
+            assert!(!overrides.resolve_json_module);
+            base.apply_overrides(&overrides, &BTreeSet::from(["moduleresolution".to_owned()]));
+            assert_eq!(base.module_resolution, ModuleResolutionKind::Node16);
+            assert_eq!(
+                base.module_resolution_configured,
+                Some(ModuleResolutionKind::Node16)
+            );
+            assert!(base.resolve_json_module);
+            assert!(!base.resolve_json_module_specified);
+            assert!(base.module_resolution_options().resolve_json);
+        }
+    }
+
+    #[test]
+    fn removed_resolution_provenance_survives_module_overrides() {
+        let mut base = parse_compiler_options(&object([
+            ("module", JsonValue::String("node20".into())),
+            ("moduleResolution", JsonValue::String("node10".into())),
+        ]))
+        .options;
+        assert_eq!(base.module_resolution, ModuleResolutionKind::Node16);
+        let overrides =
+            parse_compiler_options(&object([("module", JsonValue::String("es2015".into()))]))
+                .options;
+        base.apply_overrides(&overrides, &BTreeSet::from(["module".to_owned()]));
+        assert_eq!(base.module_resolution, ModuleResolutionKind::Bundler);
+        assert_eq!(
+            base.module_resolution_configured,
+            Some(ModuleResolutionKind::Node10)
+        );
+        assert!(base.resolve_json_module);
+    }
+
+    #[test]
+    fn target_overrides_keep_module_omission_and_explicit_json_false() {
+        let mut base = parse_compiler_options(&object([
+            ("target", JsonValue::String("es2015".into())),
+            ("resolveJsonModule", JsonValue::Bool(false)),
+        ]))
+        .options;
+        let overrides =
+            parse_compiler_options(&object([("target", JsonValue::String("esnext".into()))]))
+                .options;
+        base.apply_overrides(&overrides, &BTreeSet::from(["target".to_owned()]));
+        assert_eq!(base.target, ScriptTarget::EsNext);
+        assert_eq!(base.module, ModuleKind::None);
+        assert!(!base.module_specified);
+        assert_eq!(base.module_resolution_configured, None);
+        assert_eq!(base.module_resolution, ModuleResolutionKind::Bundler);
+        assert!(!base.resolve_json_module);
+        assert!(base.resolve_json_module_specified);
+    }
+
+    #[test]
+    fn resolution_diagnostics_refresh_after_cli_replaces_a_removed_mode() {
+        let mut result = parse_compiler_options(&object([
+            ("moduleResolution", JsonValue::String("node10".into())),
+            ("unknownOption", JsonValue::Bool(true)),
+        ]));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == 5108)
+        );
+        let overrides = parse_compiler_options(&object([(
+            "moduleResolution",
+            JsonValue::String("bundler".into()),
+        )]))
+        .options;
+        result
+            .options
+            .apply_overrides(&overrides, &BTreeSet::from(["moduleresolution".to_owned()]));
+        result.refresh_module_resolution_diagnostics();
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code(), 5023);
+        assert_eq!(result.diagnostics[0].arguments, ["unknownOption"]);
+        assert_eq!(
+            result.options.module_resolution,
+            ModuleResolutionKind::Bundler
+        );
+        assert_eq!(
+            result.options.module_resolution_configured,
+            Some(ModuleResolutionKind::Bundler)
+        );
+    }
+
+    #[test]
+    fn resolution_diagnostic_refresh_matches_the_actual_option_identity() {
+        let unrelated = [
+            super::diagnostic(5108, ["module", "AMD"]),
+            super::diagnostic(5108, ["target", "ES5"]),
+            super::diagnostic(5098, ["resolvePackageJsonImports"]),
+        ];
+        let mut result = parse_compiler_options(&object([
+            ("module", JsonValue::String("nodenext".into())),
+            ("moduleResolution", JsonValue::String("bundler".into())),
+        ]));
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5095, 5109]
+        );
+        result.diagnostics.extend(unrelated.clone());
+        let overrides =
+            parse_compiler_options(&object([("module", JsonValue::String("commonjs".into()))]))
+                .options;
+        result
+            .options
+            .apply_overrides(&overrides, &BTreeSet::from(["module".to_owned()]));
+        result.refresh_module_resolution_diagnostics();
+        assert_eq!(result.diagnostics, unrelated);
+        assert_eq!(result.options.module, ModuleKind::CommonJs);
+        assert_eq!(
+            result.options.module_resolution,
+            ModuleResolutionKind::Bundler
+        );
     }
 
     #[test]
@@ -3023,8 +3481,19 @@ mod tests {
             "customConditions",
             JsonValue::Array(vec![JsonValue::String("development".into())]),
         )]));
-        assert_eq!(conditions.diagnostics.len(), 1);
-        assert_eq!(conditions.diagnostics[0].code(), 5098);
+        assert!(conditions.is_ok(), "{:?}", conditions.diagnostics);
+        assert_eq!(
+            conditions.options.module_resolution,
+            ModuleResolutionKind::Bundler
+        );
+        assert_eq!(conditions.options.module_resolution_configured, None);
+        assert_eq!(
+            conditions.options.custom_conditions,
+            Some(vec!["development".to_owned()])
+        );
+        let resolution = conditions.options.module_resolution_options();
+        assert_eq!(resolution.mode, ResolutionMode::Bundler);
+        assert_eq!(resolution.custom_conditions, ["development"]);
 
         let plugins = parse_compiler_options(&object([(
             "plugins",
@@ -3974,7 +4443,7 @@ mod tests {
                 .iter()
                 .map(ts_diagnostics::Diagnostic::code)
                 .collect::<Vec<_>>(),
-            [5069, 5109]
+            [5108, 5069]
         );
     }
 
@@ -4350,7 +4819,8 @@ mod tests {
         .value
         .unwrap();
         let result = parse_project_options(&config);
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].code(), 5095);
         assert_eq!(
             result.options.out_file.as_deref(),
             Some("/repo/dist/bundle.js")
