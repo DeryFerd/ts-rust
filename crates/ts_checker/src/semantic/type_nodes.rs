@@ -9152,6 +9152,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 })
                 .map(|method| method.return_type)
                 .collect::<HashSet<_>>();
+            // Library methods publish optional parameter unions after these queries.
+            let library_method_parameters = planned
+                .methods
+                .iter()
+                .filter(|method| {
+                    self.store
+                        .source_is_default_library_declaration(method.declaration)
+                })
+                .flat_map(|method| {
+                    method
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.type_node)
+                })
+                .collect::<HashSet<_>>();
             let separate_global_value =
                 object_members::authenticated_nongeneric_global_interface_owner(self.store, symbol)
                     && self.store.symbol(symbol).is_some_and(|owner| {
@@ -9169,8 +9184,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .chain(planned.call_type_nodes())
             {
                 let previous = self.lazy_interface_values;
-                self.lazy_interface_values |=
-                    separate_global_value || library_method_returns.contains(&annotation);
+                self.lazy_interface_values |= separate_global_value
+                    && !library_method_parameters.contains(&annotation)
+                    || library_method_returns.contains(&annotation);
                 let result = self.plan_type_node_in_context(annotation, None, false);
                 self.lazy_interface_values = previous;
                 result?;
@@ -36038,6 +36054,348 @@ mod tests {
         )
         .unwrap();
         (context, library_file, source_file)
+    }
+
+    fn native_method_parameter_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        strict_null_checks: bool,
+    ) -> (CanonicalCheckerContext<'arena>, FileId, FileId) {
+        let library_file = FileId::new(8_482);
+        let source_file = FileId::new(8_483);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, is_library, name) in [
+            (
+                library,
+                library_file,
+                true,
+                "\"/native-method-library.d.ts\"",
+            ),
+            (source, source_file, false, "\"/native-method-input.ts\""),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types: strict_null_checks,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        (context, library_file, source_file)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the native parameter dependency through class defaults and replay.
+    fn native_method_parameters_prepare_date_optional_dependencies() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "declare namespace Intl { interface DateTimeFormatOptions { ",
+            "hour12?: boolean | undefined; timeZone?: string | undefined; } } ",
+            "interface Date { toISOString(): string; ",
+            "toLocaleString(locales?: string | string[], ",
+            "options?: Intl.DateTimeFormatOptions): string; } ",
+            "interface DateConstructor { new(): Date; readonly prototype: Date; } ",
+            "declare var Date: DateConstructor;",
+        ));
+        let source = parse_source_file(concat!(
+            "class WithDefault { constructor(readonly timestamp = new Date()) {} } ",
+            "class WithoutDefault { constructor(readonly timestamp?: Date) {} }",
+        ));
+        for strict_null_checks in [false, true] {
+            let (mut context, library_file, source_file) =
+                native_method_parameter_context(&library, &source, strict_null_checks);
+            let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+            let global = |name| {
+                context
+                    .store()
+                    .symbol_table(globals)
+                    .and_then(|globals| globals.get_source(name))
+                    .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                    .unwrap()
+            };
+            let date = global("Date");
+            let constructor = global("DateConstructor");
+            let intl = global("Intl");
+            let options = context
+                .store()
+                .symbol(intl)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("DateTimeFormatOptions"))
+                .unwrap();
+            assert_eq!(context.store().get_parent_of_symbol(options), Some(intl));
+            assert!(
+                object_members::authenticated_nongeneric_global_interface_owner(
+                    context.store(),
+                    date,
+                )
+            );
+            let options_annotation = library
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::ParameterDeclaration(parameter)
+                        if identifier_text(&library.arena, parameter.name) == Some("options") =>
+                    {
+                        Some(NodeRef::new(
+                            library.arena.id(),
+                            library_file,
+                            parameter.type_.unwrap(),
+                        ))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .type_node_links(options_annotation)
+                    .is_none()
+            );
+            context.check_source_file(source_file).unwrap();
+
+            let declared = |symbol| {
+                context
+                    .store()
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    .unwrap()
+            };
+            let date_type = declared(date);
+            let constructor_type = declared(constructor);
+            let options_type = declared(options);
+            assert_ne!(date_type, constructor_type);
+            assert_eq!(
+                context.store().type_payload(date_type).unwrap().symbol(),
+                Some(date)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(date)
+                    .unwrap()
+                    .resolved_type,
+                Some(constructor_type),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(options_annotation)
+                    .unwrap()
+                    .resolved_type,
+                Some(options_type),
+            );
+            let TypeData::Interface(options_data) =
+                context.store().type_payload(options_type).unwrap().data()
+            else {
+                panic!("the native parameter must retain its interface type")
+            };
+            assert!(options_data.declared_members_resolved);
+            let method = context
+                .store()
+                .symbol(date)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("toLocaleString"))
+                .unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(method)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let signature = context
+                .store()
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                .unwrap()[0];
+            let parameters = context
+                .store()
+                .callable_signature_parameter_types(signature)
+                .unwrap();
+            assert_eq!(parameters.len(), 2);
+            if strict_null_checks {
+                assert_ne!(parameters[1], options_type);
+                assert_eq!(
+                    context
+                        .store()
+                        .validate_optional_parameter_type_metadata(options_type, parameters[1]),
+                    Ok(()),
+                );
+            } else {
+                assert_eq!(parameters[1], options_type);
+            }
+            let warm = function_store_state(context.store());
+            for _ in 0..2 {
+                context.recheck_source_file(source_file).unwrap();
+                assert_eq!(context.get_declared_type_of_symbol(date), Ok(date_type));
+                assert_eq!(function_store_state(context.store()), warm);
+                assert_eq!(
+                    context
+                        .store()
+                        .type_node_links(options_annotation)
+                        .unwrap()
+                        .resolved_type,
+                    Some(options_type),
+                );
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_method_parameters_keep_library_return_members_cold() {
+        let library = parse_source_file(concat!(
+            "declare namespace Native { interface Options { enabled: boolean; } } ",
+            "interface Result { value: string; } ",
+            "interface Factory { create(options?: Native.Options): Result; } ",
+            "declare var Factory: unknown;",
+        ));
+        let source = parse_source_file("declare let factory: Factory;");
+        let (mut context, library_file, _) =
+            native_method_parameter_context(&library, &source, true);
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let factory = context
+            .store()
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Factory")
+            .unwrap();
+        let factory = context.store().get_merged_symbol(factory).unwrap();
+        let result = context
+            .store()
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Result")
+            .unwrap();
+        let value_annotation = library
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::PropertyDeclaration(property)
+                    if identifier_text(&library.arena, property.name) == Some("value") =>
+                {
+                    Some(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        property.type_.unwrap(),
+                    ))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let factory_type = context.get_declared_type_of_symbol(factory).unwrap();
+        let result_type = context
+            .store()
+            .declared_type_links(result)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(result_data) =
+            context.store().type_payload(result_type).unwrap().data()
+        else {
+            panic!("the library return must retain its interface type")
+        };
+        assert!(!result_data.declared_members_resolved);
+        assert_eq!(result_data.declared_members, None);
+        assert!(
+            !context
+                .store()
+                .type_payload(result_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(context.store().type_node_links(value_annotation).is_none());
+        assert!(context.store().value_symbol_links(factory).is_none());
+        let warm = function_store_state(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_declared_type_of_symbol(factory),
+                Ok(factory_type)
+            );
+            assert_eq!(function_store_state(context.store()), warm);
+            assert!(context.store().type_node_links(value_annotation).is_none());
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn native_method_parameters_keep_mixed_source_parameter_plans_lazy() {
+        let library = parse_source_file(concat!(
+            "declare namespace Native { interface Options { native: string; } } ",
+            "interface Result { value: string; } ",
+            "interface Service { native(options: Native.Options): Result; } ",
+            "declare var Service: unknown;",
+        ));
+        let source = parse_source_file(concat!(
+            "interface SourceOptions { source: string; } ",
+            "interface Service { source(options: SourceOptions): Result; }",
+        ));
+        let (context, library_file, source_file) =
+            native_method_parameter_context(&library, &source, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let owner = context
+            .store()
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Service")
+            .unwrap();
+        let owner = context.store().get_merged_symbol(owner).unwrap();
+        let methods = object_members::plan_interface(context.store(), &host, owner).unwrap();
+        assert_eq!(methods.methods.len(), 2);
+        let aliases = HashMap::new();
+        let before = function_store_state(context.store());
+        let mut planner =
+            TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases);
+        planner.check_merged_global_interface_members = true;
+        planner.plan_property_interface(owner).unwrap();
+        let plan = planner.finish();
+        for method in &methods.methods {
+            let parameter = &plan.references[&method.parameters[0].type_node];
+            let native = context
+                .store()
+                .source_is_default_library_declaration(method.declaration);
+            assert_eq!(plan.interfaces.contains_key(&parameter.symbol), native);
+            let result = &plan.references[&method.return_type];
+            assert!(!plan.interfaces.contains_key(&result.symbol));
+        }
+        assert_eq!(function_store_state(context.store()), before);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
