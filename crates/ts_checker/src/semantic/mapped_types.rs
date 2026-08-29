@@ -18,6 +18,7 @@ use xxhash_rust::xxh3::Xxh3;
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IndexInfoId, TypeId,
     TypeMapperId, TypeResolutionTarget, TypeSystemPropertyName,
+    array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
@@ -36,12 +37,16 @@ use super::{
     instantiated_members::{RecoveredPropertyTypeIdentity, property_recovery_type_identity},
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
-        resolve_nongeneric_keyof_type,
+        plan_nongeneric_keyof_type_with_array_targets, resolve_nongeneric_keyof_type,
+        validate_generic_keyof_index_type, validate_source_object_literal_for_keyof,
     },
     links::{MappedSymbolLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperApplication,
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     signatures::{IndexFlags, IndexInfo},
-    store::SourceNodeParent,
+    store::{SourceMappedTypeOperands, SourceNodeParent},
     template_types::{MAX_TEMPLATE_UNION_SIZE, StringMappingKind},
     type_nodes::type_alias_instantiation_cache_key,
     type_records::{
@@ -254,6 +259,481 @@ pub(super) struct FiniteRecordMappedProperty {
 pub(super) struct MappedAliasDisplayIdentity {
     pub(super) symbol: SemanticSymbolId,
     pub(super) arguments: Vec<TypeId>,
+}
+
+/// A source-owned selection alias, without demanding its mapped properties.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SupportedMappedAliasProjection {
+    pub(super) type_: TypeId,
+    pub(super) alias: SemanticSymbolId,
+    pub(super) declared_type: TypeId,
+    pub(super) type_parameters: Vec<TypeId>,
+    pub(super) arguments: Vec<TypeId>,
+    pub(super) identity_symbol: SemanticSymbolId,
+    pub(super) identity_arguments: Vec<TypeId>,
+}
+
+/// Reuses the installed alias producer for `[P in K]: S[P]` source declarations.
+/// Other mapped families keep their existing query and instantiation paths.
+pub(super) fn supported_mapped_alias_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
+    supported_mapped_alias_projection_worker(store, type_, array_targets, &mut HashSet::new())
+}
+
+fn supported_mapped_alias_projection_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
+    if !active.insert(type_) {
+        return Err(MappedTypeError::InvalidMappedType(type_));
+    }
+    let result = supported_mapped_alias_projection_inner(store, type_, array_targets, active);
+    active.remove(&type_);
+    result
+}
+
+fn supported_mapped_alias_projection_inner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<SupportedMappedAliasProjection>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Ok(None);
+    };
+    let declaration = mapped.declaration.ok_or_else(invalid)?;
+    let Some(SourceNodeParent::Parent(alias_declaration)) = store.source_node_parent(declaration)
+    else {
+        return Ok(None);
+    };
+    if store.source_node_kind(alias_declaration) != Some(SyntaxKind::TypeAliasDeclaration) {
+        return Ok(None);
+    }
+    let operands = store
+        .source_mapped_type_operands(declaration)
+        .ok_or_else(invalid)?;
+    let source_parameters = store
+        .source_direct_children(alias_declaration)
+        .ok_or_else(invalid)?
+        .into_iter()
+        .filter(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+        .collect::<Vec<_>>();
+    // Use immutable syntax to select this producer. A changed template cache
+    // must not turn an installed selection alias into an unsupported family.
+    if source_parameters.len() != 2
+        || operands.name_type.is_some()
+        || store.source_mapped_type_modifiers(declaration) != Some(MappedTypeModifiers::NONE)
+        || store.source_node_kind(operands.constraint) != Some(SyntaxKind::TypeReference)
+        || operands
+            .template
+            .and_then(|node| store.source_node_kind(node))
+            != Some(SyntaxKind::IndexedAccessType)
+    {
+        return Ok(None);
+    }
+    let Some((constraint_node, constraint_target)) =
+        selection_alias_source_constraint(store, &source_parameters, operands)
+    else {
+        return Ok(None);
+    };
+    let alias = store
+        .source_declaration_symbol(alias_declaration)
+        .ok_or_else(invalid)?;
+    if !store.source_symbol_declarations_match(alias)
+        || store.source_direct_type_annotation(alias_declaration) != Some(declaration)
+    {
+        return Err(invalid());
+    }
+    let links = store.type_alias_links(alias).ok_or_else(invalid)?;
+    let declared_type = links.declared_type.ok_or_else(invalid)?;
+    let type_parameters = links.type_parameters.as_deref().ok_or_else(invalid)?;
+    if type_parameters.len() != source_parameters.len()
+        || type_parameters
+            .iter()
+            .zip(&source_parameters)
+            .any(|(type_, declaration)| {
+                cached_ordinary_type_parameter_owner(store, *type_).is_none_or(|owner| {
+                    store.symbol(owner).and_then(|owner| owner.declarations())
+                        != Some(&[*declaration][..])
+                })
+            })
+        || mapped.object.target.unwrap_or(type_) != declared_type
+    {
+        return Err(invalid());
+    }
+    let Some(TypeData::TypeParameter(key)) =
+        store.type_payload(type_parameters[1]).map(TypeRecord::data)
+    else {
+        return Err(invalid());
+    };
+    let constraint = key.constraint.ok_or_else(invalid)?;
+    if validate_generic_keyof_index_type(store, constraint).map_err(|_| invalid())?
+        != type_parameters[0]
+        || !store.source_direct_type_annotation_is_exact(constraint_node, constraint)
+        || !store.source_direct_type_annotation_is_exact(constraint_target, type_parameters[0])
+    {
+        return Err(invalid());
+    }
+    let arguments = if mapped.object.target.is_some() {
+        let Some(TypeData::Mapped(original)) =
+            store.type_payload(declared_type).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+        let Some(TypeMapperApplication::Composite { second, .. }) =
+            store.mapper_application(mapper, original.type_parameter.ok_or_else(invalid)?)
+        else {
+            return Err(invalid());
+        };
+        type_parameters
+            .iter()
+            .map(|parameter| store.map_type(second, *parameter).ok_or_else(invalid))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        type_parameters.to_vec()
+    };
+    validate_supported_mapped_alias_source_worker(store, arguments[0], array_targets, active)?;
+    store
+        .validate_pick_mapped_alias_instantiation(
+            alias,
+            declared_type,
+            type_parameters,
+            &arguments,
+            type_,
+        )
+        .map_err(|error| selection_alias_cache_error(type_, error))?;
+    let identity = store
+        .mapped_alias_display_identity(type_, alias)
+        .map_err(|error| selection_alias_cache_error(type_, error))?;
+    // A forwarding alias needs its own concrete alias-cache proof. The
+    // installed declaration-only wrapper proof must not authorize that result.
+    if identity.symbol != alias {
+        return Ok(None);
+    }
+    if identity.arguments != arguments {
+        return Err(invalid());
+    }
+    Ok(Some(SupportedMappedAliasProjection {
+        type_,
+        alias,
+        declared_type,
+        type_parameters: type_parameters.to_vec(),
+        arguments,
+        identity_symbol: identity.symbol,
+        identity_arguments: identity.arguments,
+    }))
+}
+
+fn selection_alias_source_constraint(
+    store: &CanonicalTypeMapperStore,
+    parameters: &[NodeRef],
+    operands: SourceMappedTypeOperands,
+) -> Option<(NodeRef, NodeRef)> {
+    let [source_parameter, key_parameter] = parameters else {
+        return None;
+    };
+    let source_name = source_type_parameter_name(store, *source_parameter)?;
+    let key_name = source_type_parameter_name(store, *key_parameter)?;
+    let mapped_name = source_type_parameter_name(store, operands.type_parameter)?;
+    if source_name == key_name || source_name == mapped_name {
+        return None;
+    }
+    let constraint = store.source_direct_type_annotation(*key_parameter)?;
+    let constraint_target = store.source_direct_type_annotation(constraint)?;
+    let template = operands.template?;
+    let template_children = store.source_direct_children(template)?;
+    let [object, index] = template_children.as_slice() else {
+        return None;
+    };
+    (store.source_type_operator(constraint) == Some(SyntaxKind::KeyOfKeyword)
+        && source_type_parameter_reference(store, constraint_target, source_name)
+        && source_type_parameter_reference(store, operands.constraint, key_name)
+        && source_type_parameter_reference(store, *object, source_name)
+        && source_type_parameter_reference(store, *index, mapped_name))
+    .then_some((constraint, constraint_target))
+}
+
+fn source_type_parameter_name(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Option<&str> {
+    let children = store.source_direct_children(declaration)?;
+    let mut names = children
+        .into_iter()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::Identifier));
+    let name = names.next()?;
+    if names.next().is_some() {
+        return None;
+    }
+    store.source_identifier_text(name)
+}
+
+fn source_type_parameter_reference(
+    store: &CanonicalTypeMapperStore,
+    reference: NodeRef,
+    expected_name: &str,
+) -> bool {
+    let Some(children) = store.source_direct_children(reference) else {
+        return false;
+    };
+    let [name] = children.as_slice() else {
+        return false;
+    };
+    store.source_node_kind(reference) == Some(SyntaxKind::TypeReference)
+        && store.source_node_kind(*name) == Some(SyntaxKind::Identifier)
+        && store.source_identifier_text(*name) == Some(expected_name)
+}
+
+fn selection_alias_cache_error(type_: TypeId, error: MappedTypeError) -> MappedTypeError {
+    match error {
+        MappedTypeError::UnsupportedConstraint(_)
+        | MappedTypeError::UnsupportedNameType(_)
+        | MappedTypeError::UnsupportedTemplate(_) => MappedTypeError::InvalidMappedType(type_),
+        _ => error,
+    }
+}
+
+fn validate_supported_mapped_alias_source(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), MappedTypeError> {
+    validate_supported_mapped_alias_source_worker(store, source, array_targets, &mut HashSet::new())
+}
+
+fn validate_supported_mapped_alias_source_worker(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    active: &mut HashSet<TypeId>,
+) -> Result<(), MappedTypeError> {
+    let record = store
+        .type_payload(source)
+        .ok_or(MappedTypeError::InvalidSource(source))?;
+    match record.data() {
+        TypeData::TypeParameter(_) => {
+            return cached_ordinary_type_parameter_owner(store, source)
+                .map(|_| ())
+                .ok_or(MappedTypeError::InvalidSource(source));
+        }
+        TypeData::Intrinsic(_)
+            if record
+                .flags()
+                .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN) =>
+        {
+            return store
+                .validate_union_constituent(source)
+                .map_err(|_| MappedTypeError::InvalidSource(source));
+        }
+        TypeData::Mapped(_) => {
+            supported_mapped_alias_projection_worker(store, source, array_targets, active)?
+                .ok_or(MappedTypeError::UnsupportedSource(source))?;
+            return validate_mapped_utility_source(store, source);
+        }
+        _ => {}
+    }
+    if validate_source_object_literal_for_keyof(store, source, array_targets)
+        .map_err(|_| MappedTypeError::InvalidSource(source))?
+    {
+        return Ok(());
+    }
+    if record
+        .object_flags()
+        .intersects(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+        || record
+            .symbol()
+            .and_then(|owner| store.symbol(owner))
+            .is_some_and(|owner| owner.flags().contains(SymbolFlags::OBJECT_LITERAL))
+    {
+        return Err(if matches!(record.data(), TypeData::Object(_)) {
+            MappedTypeError::UnsupportedSource(source)
+        } else {
+            MappedTypeError::InvalidSource(source)
+        });
+    }
+    match validate_resolved_declared_property_object(store, source) {
+        DeclaredPropertyObjectValidation::Valid(_) => return Ok(()),
+        DeclaredPropertyObjectValidation::Malformed => {
+            return Err(MappedTypeError::InvalidSource(source));
+        }
+        DeclaredPropertyObjectValidation::NotDeclared => {}
+    }
+    if record.data().structured().is_some_and(|structured| {
+        structured.signatures.is_some() || structured.call_signature_count != 0
+    }) {
+        return Err(MappedTypeError::UnsupportedSource(source));
+    }
+    match plan_nongeneric_keyof_type_with_array_targets(store, source, array_targets) {
+        Ok(_) => Ok(()),
+        Err(NongenericKeyofError::UnsupportedObject(_)) => {
+            Err(MappedTypeError::UnsupportedSource(source))
+        }
+        Err(_) => Err(MappedTypeError::InvalidSource(source)),
+    }
+}
+
+fn validate_supported_mapped_alias_instance_request(
+    store: &CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<CacheHashKey, MappedTypeError> {
+    if supported_mapped_alias_projection(store, projection.type_, array_targets)?.as_ref()
+        != Some(projection)
+        || arguments.len() != projection.type_parameters.len()
+    {
+        return Err(MappedTypeError::InvalidMappedType(projection.type_));
+    }
+    if identity.0 != projection.alias {
+        return Err(MappedTypeError::UnsupportedSource(projection.type_));
+    }
+    if identity.1 != arguments {
+        return Err(MappedTypeError::InvalidMappedType(projection.type_));
+    }
+    validate_supported_mapped_alias_source(store, arguments[0], array_targets)?;
+    validate_pick_mapped_alias_request(
+        store,
+        projection.alias,
+        projection.declared_type,
+        &projection.type_parameters,
+        arguments,
+    )
+    .map_err(|error| selection_alias_cache_error(projection.type_, error))?;
+    Ok(type_alias_instantiation_cache_key(arguments, None))
+}
+
+/// Reads the same canonical alias cache used by type-node queries.
+pub(super) fn cached_supported_mapped_alias_instance(
+    store: &CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let key = validate_supported_mapped_alias_instance_request(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+    )?;
+    if arguments == projection.arguments && identity.1 == projection.identity_arguments {
+        return Ok(Some(projection.type_));
+    }
+    if arguments == projection.type_parameters {
+        return Ok(Some(projection.declared_type));
+    }
+    let cached = store
+        .type_alias_links(projection.alias)
+        .and_then(|links| links.instantiations.as_ref())
+        .and_then(|entries| entries.get(&key))
+        .copied();
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    store
+        .validate_pick_mapped_alias_instantiation(
+            projection.alias,
+            projection.declared_type,
+            &projection.type_parameters,
+            arguments,
+            cached,
+        )
+        .map_err(|error| selection_alias_cache_error(cached, error))?;
+    let actual = store
+        .mapped_alias_display_identity(cached, projection.alias)
+        .map_err(|error| selection_alias_cache_error(cached, error))?;
+    if actual.symbol != identity.0 || actual.arguments != identity.1 {
+        return Err(MappedTypeError::InvalidMappedType(cached));
+    }
+    Ok(Some(cached))
+}
+
+/// Publishes only a complete source-proved alias instance. Argument substitution
+/// and limit recovery belong to the caller's existing instantiation frame.
+pub(super) fn instantiate_supported_mapped_alias_instance(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &SupportedMappedAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, MappedTypeError> {
+    if let Some(cached) = cached_supported_mapped_alias_instance(
+        store,
+        projection,
+        arguments,
+        identity,
+        array_targets,
+    )? {
+        return Ok(cached);
+    }
+    let key = type_alias_instantiation_cache_key(arguments, None);
+    let mut links = store
+        .type_alias_links(projection.alias)
+        .cloned()
+        .ok_or(MappedTypeError::InvalidSymbol(projection.alias))?;
+    links
+        .instantiations
+        .as_mut()
+        .ok_or(MappedTypeError::InvalidSymbol(projection.alias))?
+        .try_reserve(1)
+        .map_err(|_| MappedTypeError::Capacity)?;
+    let mut alias_arguments = Vec::new();
+    alias_arguments
+        .try_reserve_exact(identity.1.len())
+        .map_err(|_| MappedTypeError::Capacity)?;
+    alias_arguments.extend_from_slice(identity.1);
+    if !store.try_reserve_type_aliases(1)
+        || !store.try_reserve_types(3)
+        || !store.try_reserve_mappers(3)
+    {
+        return Err(MappedTypeError::Capacity);
+    }
+    let result = store
+        .instantiate_pick_mapped_alias(
+            projection.alias,
+            projection.declared_type,
+            &projection.type_parameters,
+            arguments,
+        )
+        .map_err(|error| selection_alias_cache_error(projection.type_, error))?;
+    let alias = store
+        .alloc_type_alias(Some(identity.0))
+        .ok_or(MappedTypeError::Capacity)?;
+    if !store.set_type_alias_arguments(alias, Some(alias_arguments))
+        || !store.set_type_alias(result, Some(alias))
+    {
+        return Err(MappedTypeError::InvalidMappedType(result));
+    }
+    store
+        .validate_pick_mapped_alias_instantiation(
+            projection.alias,
+            projection.declared_type,
+            &projection.type_parameters,
+            arguments,
+            result,
+        )
+        .map_err(|error| selection_alias_cache_error(result, error))?;
+    if links
+        .instantiations
+        .as_mut()
+        .ok_or(MappedTypeError::InvalidSymbol(projection.alias))?
+        .insert(key, result)
+        .is_some()
+        || !store.set_type_alias_links(projection.alias, links)
+    {
+        return Err(MappedTypeError::InvalidMappedType(result));
+    }
+    Ok(result)
 }
 
 /// An invalid mapped record, unsupported input, or poisoned lazy cache.
@@ -6181,7 +6661,10 @@ mod tests {
 
     use super::{
         MAX_TEMPLATE_UNION_SIZE, MappedTypeError, MappedTypeKey, MappedTypeKeys,
-        MappedTypeModifiers, plan_mapped_type_declaration, plan_mapped_type_keys,
+        MappedTypeModifiers, SupportedMappedAliasProjection,
+        cached_supported_mapped_alias_instance, instantiate_supported_mapped_alias_instance,
+        plan_mapped_type_declaration, plan_mapped_type_keys, selection_alias_source_constraint,
+        supported_mapped_alias_projection,
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
@@ -6197,6 +6680,7 @@ mod tests {
         links::TypeAliasLinks,
         object_members,
         signatures::IndexFlags,
+        type_nodes::type_alias_instantiation_cache_key,
         type_records::{LiteralValue, TypeCacheState},
         types::{AccessFlags, ObjectFlags},
     };
@@ -6302,6 +6786,390 @@ mod tests {
             bootstrap.union_cache_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    fn selection_call_fixture(
+        parsed: &ParseResult,
+    ) -> (
+        CanonicalCheckerContext<'_>,
+        SupportedMappedAliasProjection,
+        TypeId,
+    ) {
+        let mut context = checker_context(parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        assert!(context.sorted_diagnostics().is_empty());
+        let annotation = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::FunctionDeclaration(function) => function.type_,
+                _ => None,
+            })
+            .map(|node| NodeRef::new(parsed.arena.id(), FileId::new(0), node))
+            .unwrap();
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    FileId::new(0),
+                    node,
+                ))
+            })
+            .unwrap();
+        let return_type = context.get_type_from_type_node(annotation).unwrap();
+        let source = context.get_type_at_location(object).unwrap();
+        let projection = supported_mapped_alias_projection(context.store(), return_type, None)
+            .unwrap()
+            .unwrap();
+        (context, projection, source)
+    }
+
+    #[test]
+    fn selection_alias_instances_share_query_caches_and_source_properties() {
+        let parsed = parse_source_file(concat!(
+            "type SelectedFields<S, K extends keyof S> = { [P in K]: S[P] };\n",
+            "declare function select<O, K extends keyof O>(value: O): SelectedFields<O, K>;\n",
+            "const value = { a: 'a', b: 1 };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let (mut context, projection, source) = selection_call_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let key = store.regular_string_literal_type("b".to_owned()).unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let regular = store.get_regular_type_of_object_literal(source).unwrap();
+        assert_ne!(source, regular);
+        for source in [source, regular] {
+            let arguments = [source, key];
+            let identity = (projection.alias, arguments.as_slice());
+            assert_eq!(
+                cached_supported_mapped_alias_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    identity,
+                    None
+                ),
+                Ok(None),
+            );
+            let result = instantiate_supported_mapped_alias_instance(
+                store,
+                &projection,
+                &arguments,
+                identity,
+                None,
+            )
+            .unwrap();
+            let cache_key = type_alias_instantiation_cache_key(&arguments, None);
+            assert_eq!(
+                store
+                    .type_alias_links(projection.alias)
+                    .unwrap()
+                    .instantiations
+                    .as_ref()
+                    .unwrap()
+                    .get(&cache_key),
+                Some(&result),
+            );
+            let source_members = store
+                .type_payload(source)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap();
+            let source_property = store
+                .symbol_table(source_members.members.unwrap())
+                .unwrap()
+                .get_source("b")
+                .unwrap();
+            let property = store
+                .resolve_mapped_type_property(result, "b", MappedTypeModifiers::NONE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(property.type_id(), number);
+            assert_eq!(
+                store
+                    .mapped_symbol_links(property.symbol())
+                    .unwrap()
+                    .synthetic_origin,
+                Some(source_property),
+            );
+            assert_eq!(
+                store.resolve_mapped_type_property(result, "a", MappedTypeModifiers::NONE),
+                Ok(None),
+            );
+            let warm = (cache_state(store), store.type_alias_len_internal());
+            for _ in 0..2 {
+                assert_eq!(
+                    cached_supported_mapped_alias_instance(
+                        store,
+                        &projection,
+                        &arguments,
+                        identity,
+                        None
+                    ),
+                    Ok(Some(result)),
+                );
+                assert_eq!(
+                    instantiate_supported_mapped_alias_instance(
+                        store,
+                        &projection,
+                        &arguments,
+                        identity,
+                        None
+                    ),
+                    Ok(result),
+                );
+                assert_eq!(
+                    supported_mapped_alias_projection(store, projection.type_, None),
+                    Ok(Some(projection.clone())),
+                );
+                assert_eq!((cache_state(store), store.type_alias_len_internal()), warm);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_alias_instances_reject_changed_source_and_result_caches() {
+        let parsed = parse_source_file(concat!(
+            "type SelectedFields<S, K extends keyof S> = { [P in K]: S[P] };\n",
+            "declare function select<O, K extends keyof O>(value: O): SelectedFields<O, K>;\n",
+            "const value = { a: 'a', b: 1 };\n",
+        ));
+        let (mut context, projection, source) = selection_call_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let a = store.regular_string_literal_type("a".to_owned()).unwrap();
+        let b = store.regular_string_literal_type("b".to_owned()).unwrap();
+        let arguments = [source, b];
+        let identity = (projection.alias, arguments.as_slice());
+        let result = instantiate_supported_mapped_alias_instance(
+            store,
+            &projection,
+            &arguments,
+            identity,
+            None,
+        )
+        .unwrap();
+        let other_arguments = [source, a];
+        let other = instantiate_supported_mapped_alias_instance(
+            store,
+            &projection,
+            &other_arguments,
+            (projection.alias, &other_arguments),
+            None,
+        )
+        .unwrap();
+        let key = type_alias_instantiation_cache_key(&arguments, None);
+        let original_links = store.type_alias_links(projection.alias).unwrap().clone();
+        let mut poisoned = original_links.clone();
+        assert_eq!(
+            poisoned.instantiations.as_mut().unwrap().insert(key, other),
+            Some(result)
+        );
+        assert!(store.set_type_alias_links(projection.alias, poisoned));
+        let before = (cache_state(store), store.type_alias_len_internal());
+        for _ in 0..2 {
+            assert_eq!(
+                cached_supported_mapped_alias_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    identity,
+                    None
+                ),
+                Err(MappedTypeError::InvalidMappedType(other)),
+            );
+            assert_eq!(
+                instantiate_supported_mapped_alias_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    identity,
+                    None
+                ),
+                Err(MappedTypeError::InvalidMappedType(other)),
+            );
+            assert_eq!(
+                (cache_state(store), store.type_alias_len_internal()),
+                before
+            );
+        }
+        assert!(store.set_type_alias_links(projection.alias, original_links));
+
+        let key_parameter = projection.type_parameters[1];
+        let key_owner = super::cached_ordinary_type_parameter_owner(store, key_parameter).unwrap();
+        let key_declaration = store.symbol(key_owner).unwrap().declarations().unwrap()[0];
+        let constraint = store
+            .source_direct_type_annotation(key_declaration)
+            .unwrap();
+        let constraint_links = store.type_node_links(constraint).unwrap().clone();
+        let TypeData::TypeParameter(call_key) =
+            store.type_payload(projection.arguments[1]).unwrap().data()
+        else {
+            panic!("the source call must retain its own key parameter")
+        };
+        let wrong_index = call_key.constraint.unwrap();
+        let mut poisoned = constraint_links.clone();
+        poisoned.resolved_type = Some(wrong_index);
+        assert!(store.set_type_node_links(constraint, poisoned));
+        let before = (cache_state(store), store.type_alias_len_internal());
+        for _ in 0..2 {
+            assert_eq!(
+                supported_mapped_alias_projection(store, projection.type_, None),
+                Err(MappedTypeError::InvalidMappedType(projection.type_)),
+            );
+            assert_eq!(
+                cached_supported_mapped_alias_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    identity,
+                    None
+                ),
+                Err(MappedTypeError::InvalidMappedType(projection.type_)),
+            );
+            assert_eq!(
+                (cache_state(store), store.type_alias_len_internal()),
+                before
+            );
+        }
+        assert!(store.set_type_node_links(constraint, constraint_links));
+        assert_eq!(
+            instantiate_supported_mapped_alias_instance(
+                store,
+                &projection,
+                &arguments,
+                identity,
+                None
+            ),
+            Ok(result),
+        );
+    }
+
+    #[test]
+    fn selection_alias_source_roles_exclude_other_indexed_templates() {
+        for (template, selected) in [("S[P]", true), ("S[K]", false), ("K[P]", false)] {
+            let parsed = parse_source_file(&format!(
+                "type SelectedFields<S, K extends keyof S> = {{ [P in K]: {template} }};",
+            ));
+            let context = checker_context(&parsed);
+            let (declaration, mapped) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), FileId::new(0), node),
+                        NodeRef::new(parsed.arena.id(), FileId::new(0), alias.type_),
+                    ))
+                })
+                .unwrap();
+            let store = context.store();
+            let parameters = store
+                .source_direct_children(declaration)
+                .unwrap()
+                .into_iter()
+                .filter(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+                .collect::<Vec<_>>();
+            let operands = store.source_mapped_type_operands(mapped).unwrap();
+            let before = cache_state(store);
+            assert_eq!(
+                selection_alias_source_constraint(store, &parameters, operands).is_some(),
+                selected,
+            );
+            assert_eq!(cache_state(store), before);
+        }
+    }
+
+    #[test]
+    fn selection_alias_nested_sources_recheck_the_original_literal_clone() {
+        let parsed = parse_source_file(concat!(
+            "type SelectedFields<S, K extends keyof S> = { [P in K]: S[P] };\n",
+            "declare function select<O, K extends keyof O>(value: O): SelectedFields<O, K>;\n",
+            "const value = { a: 'a', b: 1 };\n",
+        ));
+        let (mut context, projection, source) = selection_call_fixture(&parsed);
+        let store = context.store_mut_for_test();
+        let b = store.regular_string_literal_type("b".to_owned()).unwrap();
+        let inner_arguments = [source, b];
+        let inner = instantiate_supported_mapped_alias_instance(
+            store,
+            &projection,
+            &inner_arguments,
+            (projection.alias, &inner_arguments),
+            None,
+        )
+        .unwrap();
+        let arguments = [inner, b];
+        let identity = (projection.alias, arguments.as_slice());
+        let outer = instantiate_supported_mapped_alias_instance(
+            store,
+            &projection,
+            &arguments,
+            identity,
+            None,
+        )
+        .unwrap();
+        let members = store
+            .type_payload(source)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap();
+        let table = store.symbol_table(members.members.unwrap()).unwrap();
+        let a_property = table.get_source("a").unwrap();
+        let b_property = table.get_source("b").unwrap();
+        let original = store.value_symbol_links(b_property).unwrap().clone();
+        let mut poisoned = original.clone();
+        poisoned.target = store.value_symbol_links(a_property).unwrap().target;
+        assert!(store.set_value_symbol_links(b_property, poisoned.clone()));
+        let before = (cache_state(store), store.type_alias_len_internal());
+        for _ in 0..2 {
+            assert_eq!(
+                cached_supported_mapped_alias_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    identity,
+                    None
+                ),
+                Err(MappedTypeError::InvalidSource(source)),
+            );
+            assert_eq!(
+                instantiate_supported_mapped_alias_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    identity,
+                    None
+                ),
+                Err(MappedTypeError::InvalidSource(source)),
+            );
+            assert_eq!(store.value_symbol_links(b_property), Some(&poisoned));
+            assert_eq!(
+                (cache_state(store), store.type_alias_len_internal()),
+                before
+            );
+        }
+        assert!(store.set_value_symbol_links(b_property, original));
+        let restored = (cache_state(store), store.type_alias_len_internal());
+        assert_eq!(
+            instantiate_supported_mapped_alias_instance(
+                store,
+                &projection,
+                &arguments,
+                identity,
+                None
+            ),
+            Ok(outer),
+        );
+        assert_eq!(
+            (cache_state(store), store.type_alias_len_internal()),
+            restored
+        );
     }
 
     fn record_mapped_fixture(

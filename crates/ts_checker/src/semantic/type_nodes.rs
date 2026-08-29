@@ -33302,6 +33302,41 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     symbol,
                 ))
             };
+            if utility.is_some_and(|utility| utility.kind == MappedUtilityKind::Pick)
+                && alias_identity.is_none()
+                && provided_argument_count == type_arguments.len()
+            {
+                let array_targets = self
+                    .global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types);
+                let projection = super::mapped_types::supported_mapped_alias_projection(
+                    self.store,
+                    declared_type,
+                    array_targets,
+                )
+                .map_err(|_| invalid_cache())?;
+                if let Some(projection) = projection {
+                    match super::mapped_types::instantiate_supported_mapped_alias_instance(
+                        self.store,
+                        &projection,
+                        &type_arguments,
+                        (symbol, &type_arguments),
+                        array_targets,
+                    ) {
+                        Ok(instantiated) => return Ok(instantiated),
+                        // Keep the existing source-query domain for inputs
+                        // outside the new general-instantiation source proof.
+                        Err(MappedTypeError::UnsupportedSource(_)) => {}
+                        Err(MappedTypeError::Capacity) => {
+                            return Err(type_node_unavailable(
+                                TypeNodeUnavailable::LiteralTypeCapacity,
+                            ));
+                        }
+                        Err(_) => return Err(invalid_cache()),
+                    }
+                }
+            }
             let (identity_symbol, identity_arguments) = alias_identity
                 .as_ref()
                 .map_or((symbol, type_arguments.as_slice()), |(owner, arguments)| {

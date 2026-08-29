@@ -20,6 +20,10 @@ use super::{
     RelationUnavailable, SymbolTableId, TypeId, VariableInvariant,
     callables::{StoredSingleCallableValidation, validate_stored_single_callable},
     declared::cached_ordinary_type_parameter_owner,
+    generic_calls::{
+        GenericCallVectorError, SourceGenericConstraint, source_generic_type_parameter_constraint,
+    },
+    keyof_types::validate_generic_keyof_index_type,
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
@@ -1431,6 +1435,47 @@ fn identifier_treatment(
     }
 }
 
+/// Reuses the source query's direct `keyof` constraint and exact base cache.
+/// This does not resolve a constraint or start an instantiation query.
+pub(super) fn source_keyof_contextual_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+) -> Result<Option<SourceGenericConstraint>, SourceCheckError> {
+    let record = store
+        .type_payload(type_parameter)
+        .ok_or(RelationUnavailable::Type(type_parameter))?;
+    if !matches!(record.data(), TypeData::TypeParameter(_)) {
+        return Ok(None);
+    }
+    let Some(proof) = source_generic_type_parameter_constraint(store, type_parameter).map_err(
+        |error| match error {
+            GenericCallVectorError::Unsupported(_) => {
+                RelationUnavailable::UnsupportedStructuredType(type_parameter).into()
+            }
+            GenericCallVectorError::Relation(error) => SourceCheckError::from(error),
+            _ => RelationUnavailable::MalformedStructuredType(type_parameter).into(),
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(constraint) = proof.constraint else {
+        return Ok(None);
+    };
+    if !matches!(
+        store.type_payload(constraint).map(TypeRecord::data),
+        Some(TypeData::Index(_))
+    ) {
+        return Ok(None);
+    }
+    validate_generic_keyof_index_type(store, constraint)
+        .map_err(|_| RelationUnavailable::MalformedStructuredType(constraint))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MalformedStructuredType(type_parameter))?;
+    Ok((proof.base_constraint == bootstrap.string_number_symbol_type).then_some(proof))
+}
+
 fn is_literal_of_contextual_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -1449,6 +1494,11 @@ fn is_literal_of_contextual_type(
             .type_payload(contextual_type)
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         let flags = record.flags();
+        if flags == TypeFlags::TYPE_PARAMETER
+            && source_keyof_contextual_type_parameter(store, contextual_type)?.is_some()
+        {
+            return Ok(matches!(kind, LiteralKind::String | LiteralKind::Number));
+        }
         if flags.intersects(TypeFlags::UNION | TypeFlags::INTERSECTION) {
             let types = if flags.intersects(TypeFlags::UNION) {
                 validate_contextual_union(store, global_types, contextual_type)?;
@@ -3311,6 +3361,256 @@ mod tests {
             Ok(LiteralTreatment::Fresh),
             "root cached expressions retain freshness"
         );
+    }
+
+    fn checked_source_keyof_parameter(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (CanonicalCheckerContext<'_>, TypeId) {
+        let mut context = mapped_record_context(parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_declaration(declaration)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let [_, parameter] = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the source declaration must retain both type parameters")
+        };
+        let parameter = *parameter;
+        (context, parameter)
+    }
+
+    #[test]
+    fn source_keyof_context_preserves_string_and_number_literals_without_writes() {
+        let parsed =
+            parse_source_file("declare function select<O, K extends keyof O>(value: K): K;");
+        assert!(parsed.diagnostics.is_empty());
+        let (mut context, parameter) = checked_source_keyof_parameter(&parsed, FileId::new(1_094));
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let proof = source_keyof_contextual_type_parameter(store, parameter)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.base_constraint,
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_number_symbol_type,
+        );
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        for _ in 0..2 {
+            for global_types in [None, Some(&globals)] {
+                for (kind, expected) in [
+                    (LiteralKind::String, LiteralTreatment::Regular),
+                    (LiteralKind::Number, LiteralTreatment::Regular),
+                    (LiteralKind::BigInt, LiteralTreatment::WidenedPrimitive),
+                    (LiteralKind::Boolean, LiteralTreatment::WidenedPrimitive),
+                ] {
+                    assert_eq!(
+                        literal_treatment(
+                            store,
+                            global_types,
+                            kind,
+                            Some(parameter),
+                            ExpressionLocation::Mutable,
+                        ),
+                        Ok(expected),
+                    );
+                }
+                let index = proof.constraint.unwrap();
+                assert_eq!(
+                    literal_treatment(
+                        store,
+                        global_types,
+                        LiteralKind::String,
+                        Some(index),
+                        ExpressionLocation::Mutable,
+                    ),
+                    Err(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnsupportedStructuredType(index),
+                    )),
+                    "a raw Index record is not a source-owned parameter context",
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.cached_signature_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One query proves direct, base, and Index cache rejection.
+    fn source_keyof_context_rejects_changed_constraints_without_writes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            Constraint,
+            BaseConstraint,
+            IndexBaseConstraint,
+        }
+
+        let parsed =
+            parse_source_file("declare function select<O, K extends keyof O>(value: K): K;");
+        assert!(parsed.diagnostics.is_empty());
+        let (mut context, parameter) = checked_source_keyof_parameter(&parsed, FileId::new(1_095));
+        let store = context.store_mut_for_test();
+        let proof = source_keyof_contextual_type_parameter(store, parameter)
+            .unwrap()
+            .unwrap();
+        let index = proof.constraint.unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let TypeData::TypeParameter(original) = store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the source query must retain the parameter record")
+        };
+        let original = original.clone();
+        let original_index_base = store
+            .type_payload(index)
+            .unwrap()
+            .data()
+            .constrained()
+            .unwrap()
+            .resolved_base_constraint;
+
+        for poison in [
+            Poison::Constraint,
+            Poison::BaseConstraint,
+            Poison::IndexBaseConstraint,
+        ] {
+            match poison {
+                Poison::Constraint => assert!(store.set_type_parameter_resolution(
+                    parameter,
+                    Some(number),
+                    original.target,
+                    original.mapper,
+                    original.resolved_default_type,
+                )),
+                Poison::BaseConstraint => {
+                    assert!(store.set_resolved_base_constraint(parameter, Some(number)));
+                }
+                Poison::IndexBaseConstraint => {
+                    assert!(store.set_resolved_base_constraint(index, Some(number)));
+                }
+            }
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        source_keyof_contextual_type_parameter(store, parameter),
+                        Err(SourceCheckError::RelationUnavailable(
+                            RelationUnavailable::MalformedStructuredType(_)
+                        )),
+                    ),
+                    "{poison:?}",
+                );
+                assert!(
+                    matches!(
+                        literal_treatment(
+                            store,
+                            None,
+                            LiteralKind::String,
+                            Some(parameter),
+                            ExpressionLocation::Mutable,
+                        ),
+                        Err(SourceCheckError::RelationUnavailable(
+                            RelationUnavailable::MalformedStructuredType(_)
+                        )),
+                    ),
+                    "{poison:?}",
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.cached_signature_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    ),
+                    before,
+                    "{poison:?}",
+                );
+            }
+            assert!(store.set_type_parameter_resolution(
+                parameter,
+                original.constraint,
+                original.target,
+                original.mapper,
+                original.resolved_default_type,
+            ));
+            assert!(store.set_resolved_base_constraint(
+                parameter,
+                original.constrained.resolved_base_constraint,
+            ));
+            assert!(store.set_resolved_base_constraint(index, original_index_base));
+            assert_eq!(
+                source_keyof_contextual_type_parameter(store, parameter),
+                Ok(Some(proof)),
+            );
+            assert_eq!(
+                literal_treatment(
+                    store,
+                    None,
+                    LiteralKind::String,
+                    Some(parameter),
+                    ExpressionLocation::Mutable,
+                ),
+                Ok(LiteralTreatment::Regular),
+            );
+        }
     }
 
     #[test]

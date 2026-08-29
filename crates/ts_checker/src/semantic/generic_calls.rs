@@ -41,9 +41,14 @@ use super::{
     },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
-        instantiate_type_with_session, instantiate_type_with_vector_and_session,
+        cached_instantiation_with_vector, instantiate_type_with_session,
+        instantiate_type_with_vector_and_session,
     },
-    keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
+    keyof_types::{
+        NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
+        validate_generic_keyof_index_type,
+    },
+    mapped_types::{MappedTypeError, supported_mapped_alias_projection},
     object_aliases::property_object_alias_nonempty_projection,
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
     signatures::{ElementFlags, IndexFlags, SignatureFlags},
@@ -51,7 +56,10 @@ use super::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
         valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
     },
-    store::{CachedSignatureLookup, SourceCallableFamily, SourceCallableReturnProvenance},
+    store::{
+        CachedSignatureLookup, SourceCallableFamily, SourceCallableReturnProvenance,
+        SourceNodeParent,
+    },
     tuple_types::CanonicalTupleTypeRequest,
     type_nodes::SourceCallableTypeQueryEvidence,
     type_records::TypeData,
@@ -162,6 +170,16 @@ pub(super) enum GenericCallVectorInvariant {
     InvalidInterfaceVariance {
         signature: SignatureId,
         type_: TypeId,
+    },
+    InvalidMappedAlias {
+        signature: SignatureId,
+        type_: TypeId,
+        error: MappedTypeError,
+    },
+    InvalidIndexType {
+        signature: SignatureId,
+        type_: TypeId,
+        error: NongenericKeyofError,
     },
 }
 
@@ -344,6 +362,16 @@ struct GenericCallTypeParameter {
     constraint: Option<TypeId>,
     default_type: Option<TypeId>,
     base_constraint: TypeId,
+}
+
+/// Source-owned constraints already resolved by the callable's type query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceGenericConstraint {
+    pub(super) callee: TypeId,
+    pub(super) signature: SignatureId,
+    pub(super) type_parameter: TypeId,
+    pub(super) constraint: Option<TypeId>,
+    pub(super) base_constraint: TypeId,
 }
 
 #[derive(Clone, Debug)]
@@ -1772,6 +1800,96 @@ fn optional_generic_parameter_template(
     Ok((generic || valid_fixed_generic_source_parameter_type(store, template)).then_some(template))
 }
 
+/// Reads a parameter's existing query proof without demanding a return type.
+pub(super) fn source_generic_type_parameter_constraint(
+    store: &CanonicalTypeMapperStore,
+    type_parameter: TypeId,
+) -> Result<Option<SourceGenericConstraint>, GenericCallVectorError> {
+    let invalid = || GenericCallVectorInvariant::InvalidTypeParameter(type_parameter);
+    let record = store.type_payload(type_parameter).ok_or_else(invalid)?;
+    if !matches!(record.data(), TypeData::TypeParameter(_)) {
+        return Ok(None);
+    }
+    let Some(symbol) = record.symbol() else {
+        return Ok(None);
+    };
+    let owner = store.symbol(symbol).ok_or_else(invalid)?;
+    let Some([declaration]) = owner.declarations() else {
+        return Ok(None);
+    };
+    let Some(SourceNodeParent::Parent(callable_declaration)) =
+        store.source_node_parent(*declaration)
+    else {
+        return Ok(None);
+    };
+    let Some(callee) = store.source_callable_type_for_declaration(callable_declaration) else {
+        return Ok(None);
+    };
+    if store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+        || cached_ordinary_type_parameter_owner(store, type_parameter) != Some(symbol)
+    {
+        return Err(invalid().into());
+    }
+    let provenance = store
+        .source_callable_provenance(callee)
+        .ok_or_else(invalid)?;
+    if !matches!(
+        validate_stored_source_callable(store, callee),
+        StoredSourceCallableValidation::Valid(_)
+    ) {
+        return Err(GenericCallVectorInvariant::MalformedCallable(callee).into());
+    }
+    let signature = store.signature(provenance.signature).ok_or(
+        GenericCallVectorInvariant::InvalidSignature(provenance.signature),
+    )?;
+    let Some(evidence) = validate_generic_call_type_query(
+        store,
+        callee,
+        provenance.signature,
+        signature.type_parameters(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let no_constraint = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.no_constraint_type)
+        .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let mut parameters = Vec::with_capacity(signature.type_parameters().len());
+    let mut selected = None;
+    for parameter in signature.type_parameters().iter().copied() {
+        if parameters
+            .iter()
+            .any(|earlier: &GenericCallTypeParameter| earlier.type_ == parameter)
+        {
+            return Err(GenericCallVectorInvariant::DuplicateTypeParameter(parameter).into());
+        }
+        let (constraint, default_type, base_constraint) = validate_generic_call_type_parameter(
+            store,
+            parameter,
+            &parameters,
+            no_constraint,
+            Some(evidence),
+        )?;
+        if parameter == type_parameter {
+            selected = Some(SourceGenericConstraint {
+                callee,
+                signature: provenance.signature,
+                type_parameter,
+                constraint,
+                base_constraint,
+            });
+        }
+        parameters.push(GenericCallTypeParameter {
+            type_: parameter,
+            constraint,
+            default_type,
+            base_constraint,
+        });
+    }
+    selected.map(Some).ok_or_else(|| invalid().into())
+}
+
 /// Authenticates queried source-callable metadata without extending call mapping.
 fn validate_generic_call_type_query<'store>(
     store: &'store CanonicalTypeMapperStore,
@@ -2153,6 +2271,59 @@ fn validate_generic_mapper_type(
     match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(()),
         TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(()),
+        TypeData::Index(_) => {
+            let target = validate_generic_keyof_index_type(store, type_)
+                .map_err(|error| generic_mapper_index_error(signature, type_, error))?;
+            validate_generic_mapper_type(
+                store,
+                target,
+                type_parameters,
+                array_targets,
+                signature,
+                active_types,
+            )
+        }
+        TypeData::Mapped(_) => {
+            let Some(projection) =
+                supported_mapped_alias_projection(store, type_, array_targets)
+                    .map_err(|error| generic_mapper_mapped_alias_error(signature, type_, error))?
+            else {
+                return Err(
+                    GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
+                );
+            };
+            if active_types.contains(&type_) {
+                return Err(GenericCallVectorInvariant::InvalidMappedAlias {
+                    signature,
+                    type_,
+                    error: MappedTypeError::InvalidMappedType(type_),
+                }
+                .into());
+            }
+            let identity_arguments = if projection.identity_arguments == projection.arguments {
+                &[]
+            } else {
+                projection.identity_arguments.as_slice()
+            };
+            active_types.push(type_);
+            let result = projection
+                .arguments
+                .iter()
+                .chain(identity_arguments)
+                .copied()
+                .try_for_each(|argument| {
+                    validate_generic_mapper_type(
+                        store,
+                        argument,
+                        type_parameters,
+                        array_targets,
+                        signature,
+                        active_types,
+                    )
+                });
+            active_types.pop();
+            result
+        }
         TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
             for constituent in &union.union.types {
                 validate_generic_mapper_type(
@@ -2226,6 +2397,65 @@ fn validate_generic_mapper_type(
             Ok(())
         }
         _ => Err(GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()),
+    }
+}
+
+fn generic_mapper_mapped_alias_error(
+    signature: SignatureId,
+    type_: TypeId,
+    error: MappedTypeError,
+) -> GenericCallVectorError {
+    match error {
+        MappedTypeError::BootstrapUninitialized => {
+            GenericCallVectorInvariant::MissingBootstrap.into()
+        }
+        MappedTypeError::UnsupportedSource(_)
+        | MappedTypeError::UnsupportedConstraint(_)
+        | MappedTypeError::UnsupportedNameType(_)
+        | MappedTypeError::UnsupportedTemplate(_)
+        | MappedTypeError::RecursiveMembers(_)
+        | MappedTypeError::CrossProductTooLarge { .. } => {
+            GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()
+        }
+        MappedTypeError::InstantiationDepthLimit { depth, limit } => {
+            InstantiationError::DepthLimit { depth, limit }.into()
+        }
+        MappedTypeError::InstantiationCountLimit { count, limit } => {
+            InstantiationError::CountLimit { count, limit }.into()
+        }
+        MappedTypeError::Capacity => GenericCallVectorInvariant::Capacity(signature).into(),
+        _ => GenericCallVectorInvariant::InvalidMappedAlias {
+            signature,
+            type_,
+            error,
+        }
+        .into(),
+    }
+}
+
+fn generic_mapper_index_error(
+    signature: SignatureId,
+    type_: TypeId,
+    error: NongenericKeyofError,
+) -> GenericCallVectorError {
+    match error {
+        NongenericKeyofError::UnsupportedObject(_)
+        | NongenericKeyofError::UnsupportedPropertyName { .. }
+        | NongenericKeyofError::PropertiesCacheRequired { .. } => {
+            GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()
+        }
+        NongenericKeyofError::LiteralCache(
+            super::bootstrap::LiteralTypeCacheError::BootstrapUninitialized,
+        ) => GenericCallVectorInvariant::MissingBootstrap.into(),
+        NongenericKeyofError::LiteralCache(super::bootstrap::LiteralTypeCacheError::Capacity) => {
+            GenericCallVectorInvariant::Capacity(signature).into()
+        }
+        _ => GenericCallVectorInvariant::InvalidIndexType {
+            signature,
+            type_,
+            error,
+        }
+        .into(),
     }
 }
 
@@ -2795,6 +3025,9 @@ fn type_maybe_primitive(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool
     let Some(record) = store.type_payload(type_) else {
         return false;
     };
+    if matches!(record.data(), TypeData::Index(_)) {
+        return validate_generic_keyof_index_type(store, type_).is_ok();
+    }
     record.flags().intersects(TypeFlags::PRIMITIVE)
         || matches!(record.data(), TypeData::Union(union)
             if union.union.types.iter().copied().any(|type_| type_maybe_primitive(store, type_)))
@@ -3659,6 +3892,12 @@ fn generic_call_type_instantiation_matches(
     if store
         .intrinsic_bootstrap()
         .is_some_and(|bootstrap| actual == bootstrap.error_type)
+        && !matches!(
+            store
+                .type_payload(template)
+                .map(super::type_records::TypeRecord::data),
+            Some(TypeData::Index(_) | TypeData::Mapped(_))
+        )
     {
         return true;
     }
@@ -3768,6 +4007,18 @@ fn generic_call_type_instantiation_matches(
     match template_record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
             template == actual
+        }
+        TypeData::Index(_) | TypeData::Mapped(_) => {
+            !active_templates.contains(&template)
+                && cached_instantiation_with_vector(
+                    store,
+                    template,
+                    sources,
+                    targets,
+                    array_targets,
+                    None,
+                )
+                .is_ok_and(|cached| cached == Some(actual))
         }
         TypeData::Union(union) if template_record.alias().is_none() && union.origin.is_none() => {
             generic_call_union_instantiation_matches(
@@ -4343,6 +4594,13 @@ fn demand_generic_call_vector_return(
     {
         return Ok(resolved);
     }
+    let requires_exact_return_cache = matches!(
+        store
+            .type_payload(shape.return_type)
+            .map(super::type_records::TypeRecord::data),
+        Some(TypeData::Index(_) | TypeData::Mapped(_))
+    );
+    let limit_mark = session.limit_event_mark();
     let resolved = instantiate_type_with_session(
         store,
         shape.return_type,
@@ -4350,6 +4608,9 @@ fn demand_generic_call_vector_return(
         shape.array_targets,
         session,
     )?;
+    if requires_exact_return_cache && session.limit_event_occurred_since(limit_mark) {
+        return Ok(resolved);
+    }
     assert!(
         store.set_signature_resolved_return_type(signature, Some(resolved)),
         "the warm-validated instantiated signature accepts its return type"
@@ -6287,6 +6548,37 @@ mod tests {
         match validate_stored_single_callable(store, owner) {
             StoredSingleCallableValidation::Valid { callable, .. } => callable,
             other => panic!("expected a source generic callable: {other:?}"),
+        }
+    }
+
+    fn source_generic_callable_named(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> ValidatedSingleCallable {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(function.name?)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing function {name}"));
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callee = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        match validate_stored_single_callable(context.store(), callee) {
+            StoredSingleCallableValidation::Valid { callable, .. } => callable,
+            other => panic!("expected a source generic callable {name}: {other:?}"),
         }
     }
 
@@ -9799,6 +10091,442 @@ mod tests {
             string,
         );
         assert_ne!(number, string);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn source_generic_constraint_replays_exact_query_ownership() {
+        let parsed = parse_source_file(concat!(
+            "declare function first<O, K extends keyof O>(key: K): K; ",
+            "declare function second<M, P extends keyof M>(key: P): P;",
+        ));
+        let file = FileId::new(96_420);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let first = source_generic_callable_named(&context, &parsed, file, "first");
+        let second = source_generic_callable_named(&context, &parsed, file, "second");
+        let parameters = context
+            .store()
+            .signature(first.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let other_parameters = context
+            .store()
+            .signature(second.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let store = context.store_mut_for_test();
+        let parameter = parameters[1];
+        let proof = source_generic_type_parameter_constraint(store, parameter)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.callee, first.owner);
+        assert_eq!(proof.signature, first.signature);
+        assert_eq!(proof.type_parameter, parameter);
+        assert_eq!(
+            validate_generic_keyof_index_type(store, proof.constraint.unwrap()),
+            Ok(parameters[0]),
+        );
+        assert_eq!(
+            proof.base_constraint,
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_number_symbol_type,
+        );
+        assert!(type_maybe_primitive(store, proof.constraint.unwrap()));
+        let before = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                source_generic_type_parameter_constraint(store, parameter),
+                Ok(Some(proof)),
+            );
+            assert_eq!(vector_cache_graph_counts(store), before);
+            assert_eq!(
+                store
+                    .signature(first.signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                first.return_type,
+            );
+        }
+
+        let symbol = cached_ordinary_type_parameter_owner(store, parameter).unwrap();
+        let original_links = store.declared_type_links(symbol).unwrap().clone();
+        let mut wrong_links = original_links.clone();
+        wrong_links.declared_type = Some(other_parameters[1]);
+        assert!(store.set_declared_type_links(symbol, wrong_links.clone()));
+        let poisoned = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                source_generic_type_parameter_constraint(store, parameter),
+                Err(GenericCallVectorError::Invariant(
+                    GenericCallVectorInvariant::InvalidTypeParameter(parameter),
+                )),
+            );
+            assert_eq!(store.declared_type_links(symbol), Some(&wrong_links));
+            assert_eq!(vector_cache_graph_counts(store), poisoned);
+        }
+        assert!(store.set_declared_type_links(symbol, original_links));
+        assert_eq!(
+            source_generic_type_parameter_constraint(store, parameter),
+            Ok(Some(proof)),
+        );
+
+        let wrong_rows = store
+            .source_callable_type_parameters(second.signature)
+            .unwrap()
+            .to_vec()
+            .into_boxed_slice();
+        let original_rows = store
+            .replace_source_callable_type_parameters_for_test(
+                first.signature,
+                Some(wrong_rows.clone()),
+            )
+            .unwrap();
+        let poisoned = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                source_generic_type_parameter_constraint(store, parameter),
+                Err(GenericCallVectorError::Invariant(
+                    GenericCallVectorInvariant::MalformedCallable(first.owner),
+                )),
+            );
+            assert_eq!(
+                store.source_callable_type_parameters(first.signature),
+                Some(wrong_rows.as_ref()),
+            );
+            assert_eq!(vector_cache_graph_counts(store), poisoned);
+        }
+        assert_eq!(
+            store.replace_source_callable_type_parameters_for_test(
+                first.signature,
+                Some(original_rows),
+            ),
+            Some(wrong_rows),
+        );
+        assert_eq!(
+            source_generic_type_parameter_constraint(store, parameter),
+            Ok(Some(proof)),
+        );
+        assert_eq!(vector_cache_graph_counts(store), before);
+
+        let (_, unowned) = identity_callable(store);
+        let unowned_counts = vector_cache_graph_counts(store);
+        assert_eq!(
+            source_generic_type_parameter_constraint(store, unowned),
+            Ok(None),
+        );
+        assert_eq!(vector_cache_graph_counts(store), unowned_counts);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mapped_alias_generic_calls_keep_exact_returns_and_the_caller_session() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Selection<S, K extends keyof S> = { [P in K]: S[P] }; ",
+            "declare function select<O, T extends keyof O>(keys: T[], obj?: O): Selection<O, T>; ",
+            "declare const keys: 'b'[]; const input = { a: 'a', b: 'b' };",
+        ));
+        let file = FileId::new(96_421);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let callable = source_generic_callable_named(&context, &parsed, file, "select");
+        let symbolic_return = context
+            .get_return_type_of_signature(callable.signature)
+            .unwrap();
+        let callable = source_generic_callable_named(&context, &parsed, file, "select");
+        assert_eq!(callable.return_type, Some(symbolic_return));
+        let keys = context
+            .get_type_from_type_node(
+                property_alias_variable_nodes(&parsed, file, "keys")
+                    .0
+                    .unwrap(),
+            )
+            .unwrap();
+        let input_node = property_alias_variable_nodes(&parsed, file, "input")
+            .1
+            .unwrap();
+        let input = context
+            .store()
+            .type_node_links(input_node)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let globals = context.global_types().clone();
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let strict_function_types = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let sources = store
+            .signature(callable.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let index = source_generic_type_parameter_constraint(store, sources[1])
+            .unwrap()
+            .unwrap()
+            .constraint
+            .unwrap();
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                index,
+                &sources,
+                array_targets,
+                callable.signature,
+                &mut Vec::new(),
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                symbolic_return,
+                &sources,
+                array_targets,
+                callable.signature,
+                &mut Vec::new(),
+            ),
+            Ok(()),
+        );
+        let arguments = [keys, input];
+        let request = vector_request(callable.owner, None, &arguments);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let resolved = resolve_generic_call_vector_with_session(
+            store,
+            &globals,
+            strict_function_types,
+            request,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        let selected = resolved.projection.instantiation.signature;
+        let mapper = resolved.projection.instantiation.mapper;
+        let type_arguments = resolved.projection.instantiation.type_arguments.clone();
+        let b = store
+            .canonical_array_reference_with_targets(array_targets.unwrap(), keys)
+            .unwrap()
+            .unwrap()
+            .element_type;
+        assert_eq!(type_arguments[1], b);
+        assert_eq!(
+            store.signature(selected).unwrap().resolved_return_type(),
+            None,
+        );
+        let key_union = instantiate_type_with_vector_and_session(
+            store,
+            index,
+            &sources,
+            &type_arguments,
+            array_targets,
+            &mut session,
+        )
+        .unwrap();
+        assert!(generic_call_type_instantiation_matches(
+            store,
+            array_targets,
+            index,
+            key_union,
+            &sources,
+            &type_arguments,
+            &mut Vec::new(),
+        ));
+
+        let mut constraint_session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_session(
+                store,
+                sources[0],
+                mapper,
+                array_targets,
+                &mut constraint_session,
+            ),
+            Ok(type_arguments[0]),
+        );
+        let before_constraint = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_generic_call_vector_with_session(
+                    store,
+                    &globals,
+                    strict_function_types,
+                    vector_request(callable.owner, Some(&type_arguments), &arguments),
+                    None,
+                    &mut constraint_session,
+                ),
+                Err(GenericCallVectorError::Instantiation(
+                    InstantiationError::CountLimit { count: 1, limit: 1 },
+                )),
+            );
+            assert_eq!(constraint_session.query_count(), 1);
+            assert_eq!(constraint_session.total_count(), 1);
+            assert_eq!(vector_cache_graph_counts(store), before_constraint);
+        }
+
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let mut exhausted = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            },
+            error_type,
+        )
+        .unwrap();
+        assert_eq!(
+            instantiate_type_with_session(store, sources[0], mapper, array_targets, &mut exhausted,),
+            Ok(type_arguments[0]),
+        );
+        assert_eq!(exhausted.query_count(), 1);
+        let cold_return_counts = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            let mark = exhausted.limit_event_mark();
+            assert_eq!(
+                demand_generic_call_vector_return_with_session(store, &resolved, &mut exhausted),
+                Ok(error_type),
+            );
+            assert!(exhausted.limit_event_occurred_since(mark));
+            assert_eq!(exhausted.query_count(), 1);
+            assert_eq!(exhausted.total_count(), 1);
+            assert_eq!(
+                store.signature(selected).unwrap().resolved_return_type(),
+                None,
+            );
+            assert_eq!(
+                store
+                    .signature(callable.signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(symbolic_return),
+            );
+            assert_eq!(vector_cache_graph_counts(store), cold_return_counts);
+        }
+        assert!(!generic_call_type_instantiation_matches(
+            store,
+            array_targets,
+            symbolic_return,
+            error_type,
+            &sources,
+            &type_arguments,
+            &mut Vec::new(),
+        ));
+        assert!(!generic_call_type_instantiation_matches(
+            store,
+            array_targets,
+            index,
+            error_type,
+            &sources,
+            &type_arguments,
+            &mut Vec::new(),
+        ));
+
+        assert!(store.set_signature_resolved_return_type(selected, Some(error_type)));
+        for _ in 0..2 {
+            assert_eq!(
+                demand_generic_call_vector_return_with_session(store, &resolved, &mut session),
+                Err(GenericCallVectorError::Invariant(
+                    GenericCallVectorInvariant::InvalidCachedInstantiation {
+                        target: callable.signature,
+                        signature: selected,
+                    },
+                )),
+            );
+            assert_eq!(
+                store.signature(selected).unwrap().resolved_return_type(),
+                Some(error_type),
+            );
+            assert_eq!(vector_cache_graph_counts(store), cold_return_counts);
+        }
+        assert!(store.set_signature_resolved_return_type(selected, None));
+
+        let return_type =
+            demand_generic_call_vector_return_with_session(store, &resolved, &mut session).unwrap();
+        let projection = supported_mapped_alias_projection(store, return_type, array_targets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.arguments, type_arguments);
+        assert_eq!(projection.identity_arguments, type_arguments);
+        assert_eq!(
+            store.signature(selected).unwrap().resolved_return_type(),
+            Some(return_type),
+        );
+        assert!(generic_call_type_instantiation_matches(
+            store,
+            array_targets,
+            symbolic_return,
+            return_type,
+            &sources,
+            &type_arguments,
+            &mut Vec::new(),
+        ));
+        let a = store.regular_string_literal_type("a".into()).unwrap();
+        let wrong_return = instantiate_type_with_vector_and_session(
+            store,
+            symbolic_return,
+            &sources,
+            &[type_arguments[0], a],
+            array_targets,
+            &mut session,
+        )
+        .unwrap();
+        assert_ne!(wrong_return, return_type);
+        assert!(store.set_signature_resolved_return_type(selected, Some(wrong_return)));
+        let poisoned = vector_cache_graph_counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                demand_generic_call_signature_return_with_session(
+                    store,
+                    array_targets,
+                    selected,
+                    &mut session,
+                ),
+                Err(GenericCallVectorError::Invariant(
+                    GenericCallVectorInvariant::InvalidCachedInstantiation {
+                        target: callable.signature,
+                        signature: selected,
+                    },
+                )),
+            );
+            assert_eq!(vector_cache_graph_counts(store), poisoned);
+        }
+        assert!(store.set_signature_resolved_return_type(selected, Some(return_type)));
+        let warm = vector_cache_graph_counts(store);
+        let event_mark = session.limit_event_mark();
+        for _ in 0..2 {
+            assert_eq!(
+                demand_generic_call_signature_return_with_session(
+                    store,
+                    array_targets,
+                    selected,
+                    &mut session,
+                ),
+                Ok(return_type),
+            );
+            assert_eq!(vector_cache_graph_counts(store), warm);
+            assert_eq!(session.limit_event_mark(), event_mark);
+            assert_eq!(
+                store
+                    .signature(callable.signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(symbolic_return),
+            );
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
