@@ -2257,11 +2257,46 @@ fn plan_body(
         }
         return Ok(SourceArrowBodyPlan::ForOfBlock { block: body });
     }
+    let linear_statement = |statement| {
+        let statement = NodeRef::new(body.arena, body.file, statement);
+        let Some(record) = host.node(statement) else {
+            return false;
+        };
+        if record.kind == SyntaxKind::VariableStatement {
+            return true;
+        }
+        let NodeData::ExpressionStatement(statement) = &record.data else {
+            return false;
+        };
+        if record.kind != SyntaxKind::ExpressionStatement {
+            return false;
+        }
+        let expression = NodeRef::new(body.arena, body.file, statement.expression);
+        let Some(record) = host.node(expression) else {
+            return false;
+        };
+        match &record.data {
+            NodeData::CallExpression(_) => record.kind == SyntaxKind::CallExpression,
+            NodeData::BinaryExpression(binary) => {
+                record.kind == SyntaxKind::BinaryExpression
+                    && store.source_node_kind(NodeRef::new(body.arena, body.file, binary.left))
+                        == Some(SyntaxKind::Identifier)
+                    && store.source_node_kind(NodeRef::new(
+                        body.arena,
+                        body.file,
+                        binary.operator_token,
+                    )) == Some(SyntaxKind::EqualsToken)
+            }
+            _ => false,
+        }
+    };
     if synchronous_typescript
-        && block.statements.nodes.first().is_some_and(|statement| {
-            store.source_node_kind(NodeRef::new(body.arena, body.file, *statement))
-                == Some(SyntaxKind::VariableStatement)
-        })
+        && block
+            .statements
+            .nodes
+            .first()
+            .copied()
+            .is_some_and(linear_statement)
         && block
             .statements
             .nodes
@@ -2269,7 +2304,7 @@ fn plan_body(
             .enumerate()
             .all(|(index, statement)| {
                 let kind = store.source_node_kind(NodeRef::new(body.arena, body.file, *statement));
-                kind == Some(SyntaxKind::VariableStatement)
+                linear_statement(*statement)
                     || index + 1 == block.statements.nodes.len()
                         && kind == Some(SyntaxKind::ReturnStatement)
             })

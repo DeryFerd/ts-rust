@@ -223,12 +223,14 @@ use super::{
         execute_top_level_enum, plan_local_const_enum, plan_local_enum, plan_top_level_enum,
     },
     source_flow::{
-        ClassInitializationFrame, SourceEqualityCondition, SourceEqualityNarrowingError,
-        SourceFlowArrayMutation, SourceFlowAssignment, SourceFlowCondition, SourceFlowError,
-        SourceFlowFrame, SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
-        SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
-        captured_variables_with_later_writes, narrow_by_equality, narrow_by_typeof,
-        source_block_scoped_use_before_declaration, source_typeof_narrowing_type_is_supported,
+        ClassInitializationFrame, SourceCapturedLocal, SourceEqualityCondition,
+        SourceEqualityNarrowingError, SourceFlowArrayMutation, SourceFlowAssignment,
+        SourceFlowCapturedArrayMutation, SourceFlowCapturedAssignment, SourceFlowCondition,
+        SourceFlowError, SourceFlowFrame, SourceFlowInvariant, SourceFlowParameterAssignment,
+        SourceFlowPlan, SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition,
+        SourceTypeofTag, captured_variables_with_later_writes, narrow_by_equality,
+        narrow_by_typeof, plan_source_captured_local, source_block_scoped_use_before_declaration,
+        source_typeof_narrowing_type_is_supported, validate_source_captured_local,
     },
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
@@ -1454,6 +1456,8 @@ struct PlannedLinearFunctionStatements {
     return_expression: Option<PlannedExpression>,
     unreachable_ranges: Vec<CanonicalCheckerDiagnosticRange>,
     flow: SourceFlowPlan,
+    capture_assignments: Vec<SourceFlowAssignment>,
+    captured_array_mutations: Vec<SourceFlowCapturedArrayMutation>,
 }
 
 #[derive(Clone, Debug)]
@@ -1496,6 +1500,7 @@ enum PlannedLinearFunctionStatement {
     Function(Box<PlannedFunction>),
     Enum(SourceEnumPlan),
     ParameterAssignment(Box<PlannedLinearParameterAssignment>),
+    CapturedAssignment(Box<PlannedCapturedLocalAssignment>),
     Expression {
         statement: NodeRef,
         expression: Box<PlannedExpression>,
@@ -1512,6 +1517,7 @@ impl PlannedLinearFunctionStatement {
             Self::Local(index) => locals.get(*index).map(|local| local.name),
             Self::Expression { statement, .. } | Self::Throw { statement, .. } => Some(*statement),
             Self::ParameterAssignment(assignment) => Some(assignment.statement),
+            Self::CapturedAssignment(assignment) => Some(assignment.flow.statement),
             Self::Function(_) | Self::Enum(_) => None,
         }
     }
@@ -1585,6 +1591,12 @@ struct PlannedLinearParameterAssignment {
     statement: NodeRef,
     expression: NodeRef,
     flow: SourceFlowParameterAssignment,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedCapturedLocalAssignment {
+    flow: SourceFlowCapturedAssignment,
     right: PlannedExpression,
 }
 
@@ -13517,6 +13529,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                 } => {
                     if let Some(assignment) =
+                        self.plan_linear_captured_local_assignment(callable, statement, expression)?
+                    {
+                        statements.push(PlannedLinearFunctionStatement::CapturedAssignment(
+                            Box::new(assignment),
+                        ));
+                        continue;
+                    }
+                    if let Some(assignment) =
                         self.plan_linear_parameter_assignment(callable, statement, expression)?
                     {
                         statements.push(PlannedLinearFunctionStatement::ParameterAssignment(
@@ -13609,6 +13629,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                     Some(assignment.statement)
                 }
+                PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                    Some(assignment.flow.statement)
+                }
                 PlannedLinearFunctionStatement::Expression { statement, .. }
                 | PlannedLinearFunctionStatement::Throw { statement, .. } => Some(*statement),
             })
@@ -13646,10 +13669,67 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             _ => None,
         });
-        let Some((store, _)) = self.semantic else {
+        let Some((store, host)) = self.semantic else {
             return Err(Self::unsupported_function_body(callable));
         };
-        let flow = if logical_statements.is_empty() {
+        let capture_assignments = collect_callable_capture_assignments(
+            store,
+            host,
+            callable.declaration,
+            &self.identifier_reads,
+        )?;
+        let mut captured_array_mutations = Vec::new();
+        if callable.family == SourceCallableFamily::ArrowFunction
+            && self.node(callable.declaration)?.kind == SyntaxKind::ArrowFunction
+        {
+            for statement in &statements {
+                if statement.flow_point(&locals).is_some_and(|point| {
+                    self.bound.flow_graph().is_unreachable(point) == Some(true)
+                }) {
+                    continue;
+                }
+                let Some(mutation) = statement.array_mutation(store, host)? else {
+                    continue;
+                };
+                let local = plan_source_captured_local(
+                    store,
+                    host,
+                    callable.declaration,
+                    mutation.receiver,
+                    mutation.symbol,
+                )
+                .map_err(|error| Self::source_flow_plan_error(callable, error))?
+                .ok_or_else(|| Self::unsupported_function_body(callable))?;
+                captured_array_mutations.push(SourceFlowCapturedArrayMutation { mutation, local });
+            }
+        }
+        let has_captured_assignment = statements.iter().any(|statement| {
+            matches!(
+                statement,
+                PlannedLinearFunctionStatement::CapturedAssignment(_)
+            )
+        });
+        let flow = if has_captured_assignment || !captured_array_mutations.is_empty() {
+            SourceFlowPlan::preflight_linear_with_captured_effects(
+                self.arena,
+                self.bound,
+                store,
+                host,
+                callable.declaration,
+                points,
+                assignments,
+                parameter_assignments,
+                calls,
+                logical_statements,
+                statements.iter().filter_map(|statement| match statement {
+                    PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                        Some(assignment.flow)
+                    }
+                    _ => None,
+                }),
+                captured_array_mutations.iter().copied(),
+            )
+        } else if logical_statements.is_empty() {
             SourceFlowPlan::preflight_linear(
                 self.arena,
                 self.bound,
@@ -13682,6 +13762,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return_expression,
             unreachable_ranges,
             flow,
+            capture_assignments,
+            captured_array_mutations,
         })
     }
 
@@ -13895,6 +13977,81 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             operand,
             symbol,
         })
+    }
+
+    fn plan_linear_captured_local_assignment(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedCapturedLocalAssignment>, SourceCheckError> {
+        if callable.family != SourceCallableFamily::ArrowFunction
+            || self.node(callable.declaration)?.kind != SyntaxKind::ArrowFunction
+        {
+            return Ok(None);
+        }
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Ok(None);
+        };
+        let operator = self.reference(binary.operator_token);
+        if self.node(operator)?.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        let target = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        let target_record = self.node(target)?;
+        let NodeData::Identifier(identifier) = &target_record.data else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if record.kind != SyntaxKind::BinaryExpression
+            || record.flags.0 != 0
+            || target_record.kind != SyntaxKind::Identifier
+            || target_record.flags.0 != 0
+            || target_record.parent != Some(expression.node)
+            || identifier.flow_node.is_some()
+            || self.node(right)?.parent != Some(expression.node)
+        {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let name = identifier.text.clone();
+        let Some((store, host)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let read = plan_identifier_read(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_variables,
+            &self.readable_variables,
+            target,
+            &name,
+        )
+        .map_err(Self::variable_plan_error)?;
+        if read.kind != PlannedIdentifierReadKind::Variable {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let local = plan_source_captured_local(
+            store,
+            host,
+            callable.declaration,
+            target,
+            read.value_symbol,
+        )
+        .map_err(|error| Self::source_flow_plan_error(callable, error))?
+        .ok_or_else(|| Self::unsupported_function_body(callable))?;
+        self.identifier_reads.push((target, read.resolved_symbol));
+        self.primitive_binary_position_roots.insert(right);
+        let right = self.plan_expression(right)?;
+        Ok(Some(PlannedCapturedLocalAssignment {
+            flow: SourceFlowCapturedAssignment {
+                statement,
+                expression,
+                local,
+            },
+            right,
+        }))
     }
 
     fn plan_linear_parameter_assignment(
@@ -33784,7 +33941,10 @@ fn check_planned_arrow_argument(
                 .map(|statements| &statements.flow),
             assignments: match &arrow.body {
                 PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
-                _ => &[],
+                _ => arrow
+                    .linear_body
+                    .as_ref()
+                    .map_or(&[], |statements| statements.capture_assignments.as_slice()),
             },
             value_exports: &[],
         });
@@ -33861,7 +34021,10 @@ fn check_planned_arrow_argument(
                 .map(|statements| &statements.flow),
             assignments: match &arrow.body {
                 PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
-                _ => &[],
+                _ => arrow
+                    .linear_body
+                    .as_ref()
+                    .map_or(&[], |statements| statements.capture_assignments.as_slice()),
             },
             value_exports: &[],
         });
@@ -41352,6 +41515,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
             }
             PlannedLinearFunctionStatement::Local(_)
             | PlannedLinearFunctionStatement::ParameterAssignment(_)
+            | PlannedLinearFunctionStatement::CapturedAssignment(_)
             | PlannedLinearFunctionStatement::Expression { .. }
             | PlannedLinearFunctionStatement::Throw { .. } => {}
         }
@@ -41359,7 +41523,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
 
     let mut frame = statements
         .flow
-        .frame(bound, base_flow_types.clone())
+        .frame_with_captured_locals(store, host, bound, base_flow_types.clone())
         .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
     let mut nested_flow_types = base_flow_types.clone();
     let mut unreachable_ranges = statements.unreachable_ranges.iter().peekable();
@@ -41392,7 +41556,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
             mutable_symbols: None,
             outer: outer_capture.as_ref(),
             flow: Some(&statements.flow),
-            assignments: &[],
+            assignments: &statements.capture_assignments,
             value_exports: &[],
         });
         match statement {
@@ -41453,7 +41617,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
                             function.callable.owner_symbol,
                         ),
                     ))?;
-                let flow_types = check_callable_parameter_initializers(
+                let flow_types = check_callable_parameter_initializers_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -41467,7 +41631,10 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     &function.callable,
                     &function.parameter_initializers,
                     &function.object_parameter_bindings,
+                    arrow_capture,
                 )?;
+                let mut nested_capture_entries =
+                    source_arrow_parameter_entry_types(store, &function.callable)?;
                 let (expression, return_flow_types) = match &function.body {
                     PlannedFunctionBody::Empty => (None, flow_types),
                     PlannedFunctionBody::Return { expression, .. } => {
@@ -41491,25 +41658,28 @@ fn check_planned_linear_function_statements_with_capture_entries(
                         (None, flow_types)
                     }
                     PlannedFunctionBody::Linear(nested) => {
-                        let flow_types = check_planned_linear_function_statements(
-                            bound,
-                            store,
-                            host,
-                            global_types,
-                            source,
-                            options,
-                            session,
-                            diagnostics,
-                            flow_types,
-                            type_import_execution,
-                            type_import_capabilities,
-                            deferred,
-                            &function.callable,
-                            None,
-                            nested,
-                            staged_value_types,
-                            value_order,
-                        )?;
+                        let flow_types =
+                            check_planned_linear_function_statements_with_capture_entries(
+                                bound,
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                flow_types,
+                                type_import_execution,
+                                type_import_capabilities,
+                                deferred,
+                                &function.callable,
+                                None,
+                                nested,
+                                staged_value_types,
+                                value_order,
+                                &mut nested_capture_entries,
+                                arrow_capture,
+                            )?;
                         (nested.return_expression.as_ref(), flow_types)
                     }
                     PlannedFunctionBody::ForIn(iteration)
@@ -41554,7 +41724,18 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     }
                     _ => return Err(SourcePlanner::unsupported_function_body(&function.callable)),
                 };
-                publish_checked_source_callable_return(
+                let return_capture = match &function.body {
+                    PlannedFunctionBody::Linear(nested) => Some(SourceArrowCaptureContext {
+                        declared_types: &nested_capture_entries,
+                        mutable_symbols: None,
+                        outer: arrow_capture.as_ref(),
+                        flow: Some(&nested.flow),
+                        assignments: &nested.capture_assignments,
+                        value_exports: &[],
+                    }),
+                    _ => arrow_capture,
+                };
+                publish_checked_source_callable_return_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -41568,6 +41749,8 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     &function.callable,
                     materialized.signature,
                     expression,
+                    None,
+                    return_capture,
                 )?;
             }
             PlannedLinearFunctionStatement::Enum(enumeration) => {
@@ -41587,6 +41770,49 @@ fn check_planned_linear_function_statements_with_capture_entries(
                 }
                 issue_unreachable_source_enum_diagnostic(bound, options, diagnostics, enumeration)?;
                 issue_source_enum_diagnostics(diagnostics, enumeration)?;
+            }
+            PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                let local = assignment.flow.local;
+                let snapshot = frame
+                    .snapshot_at(store, global_types, assignment.flow.statement)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                let declared_type = arrow_capture
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::MissingStagedValueType(local.symbol()),
+                    ))?
+                    .declared_type(store, host, local)?;
+                let checked = check_assignment_to_type_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    type_import_execution,
+                    deferred,
+                    declared_type,
+                    None,
+                    &assignment.right,
+                    local.target(),
+                    Some(assignment.flow.expression),
+                    None,
+                    arrow_capture,
+                )?;
+                let current_type = current_flow_type_after_assignment(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    checked,
+                )?;
+                frame
+                    .complete_assignment(local.target(), local.symbol(), current_type)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                nested_flow_types.insert(local.symbol(), current_type);
             }
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                 let snapshot = frame
@@ -41643,6 +41869,34 @@ fn check_planned_linear_function_statements_with_capture_entries(
                 statement,
                 expression,
             } => {
+                let mutation = statements
+                    .captured_array_mutations
+                    .iter()
+                    .find(|mutation| mutation.mutation.call == expression.node);
+                let prior = mutation
+                    .map(|mutation| {
+                        arrow_capture
+                            .ok_or(SourceCheckError::Variable(
+                                VariableInvariant::MissingStagedValueType(mutation.local.symbol()),
+                            ))?
+                            .declared_type(store, host, mutation.local)?;
+                        let prior = frame
+                            .raw_type_at(store, global_types, *statement, mutation.local.symbol())
+                            .map_err(|error| {
+                                SourcePlanner::source_flow_plan_error(callable, error)
+                            })?;
+                        let prior_record = store
+                            .type_payload(prior)
+                            .ok_or(RelationUnavailable::Type(prior))?;
+                        if prior_record
+                            .object_flags()
+                            .intersects(ObjectFlags::EVOLVING_ARRAY)
+                        {
+                            return Err(SourcePlanner::unsupported_function_body(callable));
+                        }
+                        Ok(prior)
+                    })
+                    .transpose()?;
                 let snapshot = frame
                     .snapshot_at(store, global_types, *statement)
                     .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
@@ -41662,6 +41916,11 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     None,
                     arrow_capture,
                 )?;
+                if let (Some(mutation), Some(prior)) = (mutation, prior) {
+                    frame
+                        .complete_assignment(mutation.mutation.call, mutation.local.symbol(), prior)
+                        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                }
             }
         }
     }
@@ -41687,7 +41946,7 @@ fn check_planned_linear_function_statements_with_capture_entries(
         mutable_symbols: None,
         outer: outer_capture.as_ref(),
         flow: Some(&statements.flow),
-        assignments: &[],
+        assignments: &statements.capture_assignments,
         value_exports: &[],
     });
     if let (Some(return_type), Some(expression)) =
@@ -47590,6 +47849,38 @@ struct SourceArrowCaptureContext<'a> {
 }
 
 impl SourceArrowCaptureContext<'_> {
+    fn declared_type(
+        self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        local: SourceCapturedLocal,
+    ) -> Result<TypeId, SourceCheckError> {
+        let invalid =
+            || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(local.symbol()));
+        validate_source_captured_local(store, host, &local).map_err(|_| invalid())?;
+        let mut context = Some(self);
+        let mut declared = None;
+        while let Some(current) = context {
+            if let Some(&type_) = current.declared_types.get(&local.symbol()) {
+                if current
+                    .mutable_symbols
+                    .is_some_and(|symbols| !symbols.contains(&local.symbol()))
+                    || declared.is_some_and(|previous| previous != type_)
+                {
+                    return Err(invalid());
+                }
+                if store.type_payload(type_).is_none() {
+                    return Err(RelationUnavailable::Type(type_).into());
+                }
+                declared = Some(type_);
+            }
+            context = current.outer.copied();
+        }
+        declared.ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingStagedValueType(local.symbol()),
+        ))
+    }
+
     fn flow_types(
         self,
         store: &CanonicalTypeMapperStore,
@@ -47979,8 +48270,40 @@ fn source_arrow_parameter_entry_types(
         .collect()
 }
 
-/// Uses the complete source plans so a later write or value export cannot be
-/// missed when an earlier arrow is checked. Identifier names are already bound.
+/// Retains writes from nested bodies and parameter initializers in this callable.
+fn collect_callable_capture_assignments(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: NodeRef,
+    identifier_reads: &[(NodeRef, SemanticSymbolId)],
+) -> Result<Vec<SourceFlowAssignment>, SourceCheckError> {
+    let mut reads = Vec::new();
+    for &(node, symbol) in identifier_reads {
+        let invalid =
+            || SourceCheckError::Provenance(SourceCheckProvenanceError::MissingNode(node));
+        if !node.is_for(callable.arena, callable.file) {
+            return Err(invalid());
+        }
+        let mut current = Some(node);
+        let mut visited = HashSet::new();
+        while let Some(ancestor) = current {
+            if !visited.insert(ancestor) {
+                return Err(invalid());
+            }
+            let record = host.node(ancestor).ok_or_else(invalid)?;
+            if ancestor == callable {
+                reads.push((node, symbol));
+                break;
+            }
+            current = record
+                .parent
+                .map(|parent| NodeRef::new(node.arena, node.file, parent));
+        }
+    }
+    collect_source_capture_assignments(store, host, &[], &reads)
+}
+
+/// Collects source writes without applying them to the creating callable's flow.
 fn collect_source_capture_assignments(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -57930,6 +58253,7 @@ pub(super) fn check_source_file(
                         PlannedLinearFunctionStatement::Local(_)
                         | PlannedLinearFunctionStatement::Enum(_)
                         | PlannedLinearFunctionStatement::ParameterAssignment(_)
+                        | PlannedLinearFunctionStatement::CapturedAssignment(_)
                         | PlannedLinearFunctionStatement::Expression { .. }
                         | PlannedLinearFunctionStatement::Throw { .. } => None,
                         PlannedLinearFunctionStatement::Function(function) => {
@@ -60895,6 +61219,31 @@ pub(super) fn check_source_file(
                         }
                         _ => None,
                     };
+                    let mut captured_entry_types = if arrow.linear_body.is_some() {
+                        if host.node(callable.declaration).is_none_or(|record| {
+                            record.kind != SyntaxKind::ArrowFunction
+                                || !matches!(record.data, NodeData::ArrowFunction(_))
+                        }) {
+                            return Err(SourceCheckError::Arrow(callable.declaration));
+                        }
+                        source_arrow_parameter_entry_types(store, &callable)?
+                    } else {
+                        HashMap::new()
+                    };
+                    let arrow_capture =
+                        match &arrow.body {
+                            PlannedArrowBody::ForOf(_) => for_of_capture,
+                            _ => arrow.linear_body.as_ref().map(|statements| {
+                                SourceArrowCaptureContext {
+                                    declared_types: &captured_entry_types,
+                                    mutable_symbols: None,
+                                    outer: Some(&source_capture),
+                                    flow: Some(&statements.flow),
+                                    assignments: &statements.capture_assignments,
+                                    value_exports: &[],
+                                }
+                            }),
+                        };
                     let body_flow_types =
                         check_callable_parameter_initializers_with_capture_context(
                             store,
@@ -60910,10 +61259,10 @@ pub(super) fn check_source_file(
                             &callable,
                             &arrow.parameter_initializers,
                             &[],
-                            for_of_capture,
+                            arrow_capture,
                         )?;
                     let body_flow_types = if let Some(statements) = &arrow.linear_body {
-                        check_planned_linear_function_statements(
+                        check_planned_linear_function_statements_with_capture_entries(
                             bound,
                             store,
                             host,
@@ -60931,6 +61280,8 @@ pub(super) fn check_source_file(
                             statements,
                             &mut staged_value_types,
                             &mut value_order,
+                            &mut captured_entry_types,
+                            Some(source_capture),
                         )?
                     } else {
                         body_flow_types
@@ -60954,6 +61305,18 @@ pub(super) fn check_source_file(
                             for_of_capture,
                         )?;
                     }
+                    let return_capture =
+                        arrow
+                            .linear_body
+                            .as_ref()
+                            .map(|statements| SourceArrowCaptureContext {
+                                declared_types: &captured_entry_types,
+                                mutable_symbols: None,
+                                outer: Some(&source_capture),
+                                flow: Some(&statements.flow),
+                                assignments: &statements.capture_assignments,
+                                value_exports: &[],
+                            });
                     if let Some(statement) = &arrow.expression_statement {
                         let checked = check_expression_type(
                             store,
@@ -61091,7 +61454,7 @@ pub(super) fn check_source_file(
                                 )
                                 .map_err(SourcePlanner::callable_plan_error)?;
                             } else {
-                                publish_checked_source_callable_return(
+                                publish_checked_source_callable_return_with_capture_context(
                                     store,
                                     host,
                                     global_types,
@@ -61105,6 +61468,8 @@ pub(super) fn check_source_file(
                                     &callable,
                                     materialized.signature,
                                     expression,
+                                    None,
+                                    return_capture,
                                 )?;
                             }
                         }
@@ -108398,6 +108763,387 @@ class Foo2 {
             assert_eq!(context.get_type_at_location(read).unwrap(), expected_type);
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    fn captured_arrow_test_plan(
+        context: &CanonicalCheckerContext<'_>,
+        source: &ParseResult,
+        file: FileId,
+    ) -> PlannedArrow {
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let mut plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            context.global_types(),
+            context.options(),
+        )
+        .finish()
+        .unwrap();
+        assert_eq!(plan.arrows.len(), 1);
+        plan.arrows.pop().unwrap()
+    }
+
+    #[test]
+    fn captured_arrow_writes_keep_complete_sibling_and_parameter_initializer_facts() {
+        for (index, body) in [
+            "const write = () => { value = false; }; const read = (): number => value;",
+            "const read = (): number => value; const write = () => { value = false; };",
+            "const read = (): number => value; const controls = { write: () => { value = false; } };",
+            "const read = (): number => value; const write = (item: number = (() => (value = 2))()): void => {};",
+        ].into_iter().enumerate() {
+            let file = FileId::new(202_310 + u32::try_from(index).unwrap());
+            let text = format!(
+                "const factory = (): number => {{ let value: number | false = 1; const before = value; {body} const after = value; return after; }};"
+            );
+            let source = parsed(&text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let value = variable_symbol(&context, &source, file, "value");
+            assert!(context.store().value_symbol_links(value).is_none());
+            context.check_source_file(file).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            let declared = variable_value_type(&context, &source, file, "value");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert!(matches!(context.store().type_payload(declared).unwrap().data(), TypeData::Union(_)));
+            let reader = variable_initializer(&source, file, "read");
+            let NodeData::ArrowFunction(reader_data) = &source.arena.get(reader.node).unwrap().data else {
+                panic!("expected the original stored reader")
+            };
+            let read = NodeRef::new(source.arena.id(), file, reader_data.body);
+            assert_eq!(resolved_node_type(&context, read), declared, "{text}");
+            assert_eq!(context.store().symbol_node_links(read).unwrap().resolved_symbol, Some(value));
+            let before = variable_initializer(&source, file, "before");
+            let after = variable_initializer(&source, file, "after");
+            assert_eq!(resolved_node_type(&context, before), number);
+            assert_eq!(resolved_node_type(&context, after), number);
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected only the stored reader's return mismatch: {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.node, Some(read));
+            let plan = captured_arrow_test_plan(&context, &source, file);
+            let linear = plan.linear_body.as_ref().unwrap();
+            let [write] = linear.capture_assignments.as_slice() else {
+                panic!("the full callable must retain its nested write: {text}")
+            };
+            assert_eq!(write.symbol, value);
+            assert_eq!(context.store().symbol_node_links(write.declaration).unwrap().resolved_symbol, Some(value));
+            if index != 3 {
+                assert_eq!(resolved_node_type(&context, write.declaration), declared);
+            }
+            assert!(linear.captured_array_mutations.is_empty());
+            let diagnostics = context.diagnostics().clone();
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                for (node, expected) in [(read, declared), (before, number), (after, number)] {
+                    assert_eq!(context.get_type_at_location(node).unwrap(), expected);
+                }
+                assert_eq!(variable_value_type(&context, &source, file, "value"), declared);
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(observable_state(&context, file), warm);
+            }
+        }
+    }
+
+    #[test]
+    fn captured_arrow_assignment_changes_only_its_own_execution_flow() {
+        let file = FileId::new(202_314);
+        let source = parsed(concat!(
+            "const factory = (): number => { ",
+            "let value: number | false = 1; ",
+            "const write = () => { value = false; const inside = value; }; ",
+            "const outside = value; return outside; };",
+        ));
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declared = variable_value_type(&context, &source, file, "value");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let inside = variable_initializer(&source, file, "inside");
+        let outside = variable_initializer(&source, file, "outside");
+        let inside_type = resolved_node_type(&context, inside);
+        assert_eq!(
+            context.store().type_payload(inside_type).unwrap().flags(),
+            TypeFlags::BOOLEAN_LITERAL,
+        );
+        let TypeData::Literal(literal) = context.store().type_payload(inside_type).unwrap().data()
+        else {
+            panic!("the child's assigned value must be the false literal")
+        };
+        assert_eq!(literal.value, LiteralValue::Boolean(false));
+        assert_ne!(inside_type, declared);
+        assert_ne!(inside_type, number);
+        assert_eq!(resolved_node_type(&context, outside), number);
+        let writer = variable_initializer(&source, file, "write");
+        let signature = context
+            .store()
+            .signature_links(writer)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            context.get_return_type_of_signature(signature).unwrap(),
+            void
+        );
+        let warm = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.get_type_at_location(inside).unwrap(), inside_type);
+            assert_eq!(context.get_type_at_location(outside).unwrap(), number);
+            assert_eq!(
+                context.get_return_type_of_signature(signature).unwrap(),
+                void
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "value"),
+                declared
+            );
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn captured_arrow_writes_keep_inferred_factory_return_entries() {
+        let file = FileId::new(202_315);
+        let source = parsed(concat!(
+            "const factory = () => { let value: number | false = 1; ",
+            "return { write: () => { value = false; }, read: (): number => value }; };",
+        ));
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let value = variable_symbol(&context, &source, file, "value");
+        let declared = variable_value_type(&context, &source, file, "value");
+        let mut reads = identifier_expressions(&source, file, "value");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [target, read] = reads.as_slice() else {
+            panic!("expected the exact returned write and read")
+        };
+        assert_eq!(resolved_node_type(&context, *target), declared);
+        assert_eq!(resolved_node_type(&context, *read), declared);
+        for node in [target, read] {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(*node)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(value)
+            );
+        }
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected the stored reader's actual return mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.node, Some(*read));
+        let factory = variable_initializer(&source, file, "factory");
+        let signature = context
+            .store()
+            .signature_links(factory)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let returned = context.get_return_type_of_signature(signature).unwrap();
+        assert!(matches!(
+            context.store().type_payload(returned).unwrap().data(),
+            TypeData::Object(_)
+        ));
+        let plan = captured_arrow_test_plan(&context, &source, file);
+        assert_eq!(
+            plan.linear_body
+                .as_ref()
+                .unwrap()
+                .capture_assignments
+                .as_slice(),
+            [SourceFlowAssignment {
+                declaration: *target,
+                symbol: value
+            }]
+        );
+        let diagnostics = context.diagnostics().clone();
+        let warm = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                context.get_return_type_of_signature(signature).unwrap(),
+                returned
+            );
+            assert_eq!(context.get_type_at_location(*read).unwrap(), declared);
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn captured_arrow_writes_keep_nested_function_entry_context() {
+        for (index, text) in [
+            "function factory(): void { let value: number | false = 1; function nested() { const write = () => { value = false; }; } }",
+            "function factory(): void { let value: number | false = 1; const before = value; function nested() { const write = () => { value = false; }; } const after = value; }",
+        ].into_iter().enumerate() {
+            let file = FileId::new(202_317 + u32::try_from(index).unwrap());
+            let source = parsed(text);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            assert!(context.diagnostics().is_empty());
+            let declared = variable_value_type(&context, &source, file, "value");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+            let target = identifier_expressions(&source, file, "value").into_iter().find(|node| {
+                source.arena.get(node.node).unwrap().parent.and_then(|parent| source.arena.get(parent))
+                    .is_some_and(|parent| matches!(&parent.data, NodeData::BinaryExpression(binary) if binary.left == node.node))
+            }).unwrap();
+            assert_eq!(resolved_node_type(&context, target), declared);
+            let writer = variable_initializer(&source, file, "write");
+            let signature = context.store().signature_links(writer).unwrap().resolved_signature.signature().unwrap();
+            assert_eq!(context.get_return_type_of_signature(signature).unwrap(), void);
+            let eager = if index == 1 {
+                vec![variable_initializer(&source, file, "before"), variable_initializer(&source, file, "after")]
+            } else {
+                Vec::new()
+            };
+            for node in &eager {
+                assert_eq!(resolved_node_type(&context, *node), number);
+            }
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_at_location(target).unwrap(), declared);
+                assert_eq!(context.get_return_type_of_signature(signature).unwrap(), void);
+                for node in &eager {
+                    assert_eq!(context.get_type_at_location(*node).unwrap(), number);
+                }
+                assert!(context.diagnostics().is_empty());
+                assert_eq!(observable_state(&context, file), warm);
+            }
+        }
+    }
+
+    #[test]
+    fn captured_arrow_declared_entry_lookup_requires_the_real_borrowed_owner() {
+        let file = FileId::new(202_316);
+        let source = parsed(concat!(
+            "const factory = (): number => { let value: number | false = 1; ",
+            "const write = () => { value = false; }; return 0; };",
+        ));
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let value = variable_symbol(&context, &source, file, "value");
+        let writer = variable_initializer(&source, file, "write");
+        let target = identifier_expressions(&source, file, "value")[0];
+        let local = plan_source_captured_local(context.store(), &host, writer, target, value)
+            .unwrap()
+            .unwrap();
+        let cold = observable_state(&context, file);
+        assert_eq!(
+            validate_source_captured_local(context.store(), &host, &local),
+            Ok(())
+        );
+        assert_eq!(observable_state(&context, file), cold);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declared = variable_value_type(&context, &source, file, "value");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let entries = HashMap::from([(value, declared)]);
+        let empty = HashMap::new();
+        let outer = SourceArrowCaptureContext {
+            declared_types: &entries,
+            mutable_symbols: None,
+            outer: None,
+            flow: None,
+            assignments: &[],
+            value_exports: &[],
+        };
+        let inner = SourceArrowCaptureContext {
+            declared_types: &empty,
+            mutable_symbols: None,
+            outer: Some(&outer),
+            flow: None,
+            assignments: &[],
+            value_exports: &[],
+        };
+        let warm = observable_state(&context, file);
+        assert_eq!(
+            inner.declared_type(context.store(), &host, local),
+            Ok(declared)
+        );
+        assert_eq!(
+            SourceArrowCaptureContext {
+                outer: None,
+                ..inner
+            }
+            .declared_type(context.store(), &host, local),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::MissingStagedValueType(value)
+            ))
+        );
+        let conflict = HashMap::from([(value, number)]);
+        assert_eq!(
+            SourceArrowCaptureContext {
+                declared_types: &conflict,
+                ..inner
+            }
+            .declared_type(context.store(), &host, local),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(value)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), warm);
+        let owner = bound.symbol(writer).unwrap();
+        let record = context.store().symbol(owner).unwrap();
+        let relationships = (
+            record.members(),
+            record.exports(),
+            record.parent(),
+            record.export_symbol(),
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            owner,
+            relationships.0,
+            relationships.1,
+            Some(value),
+            relationships.3
+        ));
+        let poisoned = observable_state(&context, file);
+        assert_eq!(
+            inner.declared_type(context.store(), &host, local),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(value)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            owner,
+            relationships.0,
+            relationships.1,
+            relationships.2,
+            relationships.3
+        ));
+        assert_eq!(
+            inner.declared_type(context.store(), &host, local),
+            Ok(declared)
+        );
+        let restored = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            declared
+        );
+        assert_eq!(observable_state(&context, file), restored);
     }
 
     #[test]
