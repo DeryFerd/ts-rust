@@ -6797,7 +6797,7 @@ mod tests {
     ) {
         let mut context = checker_context(parsed);
         context.check_source_file(FileId::new(0)).unwrap();
-        assert!(context.sorted_diagnostics().is_empty());
+        assert!(context.diagnostics().is_empty());
         let annotation = parsed
             .arena
             .iter()

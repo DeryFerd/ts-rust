@@ -4659,7 +4659,7 @@ mod tests {
         assert_ne!(widened, regular);
         let keys = ["a", "b", "nested"]
             .map(|name| store.regular_string_literal_type(name.into()).unwrap());
-        let expected = store.literal_union_type(&keys).unwrap();
+        let expected = store.literal_union_type(&keys, None).unwrap();
         for object in [fixture.fresh, regular, widened] {
             let targets = [object, keys[1]];
             let mapper = store
@@ -4744,7 +4744,7 @@ mod tests {
             Ok(())
         );
         let expected = store
-            .literal_union_type(&[keys[0], keys[1], number])
+            .literal_union_type(&[keys[0], keys[1], number], None)
             .unwrap();
         let mapper = store
             .new_type_mapper(sources.to_vec(), targets.to_vec())
