@@ -243,7 +243,7 @@ pub(super) struct SourceIterationBindingSyntax {
     pub(super) symbol: SemanticSymbolId,
 }
 
-/// One lexical `for...in` or function-owned `for...of` iteration.
+/// One lexical `for...in` or callable-owned `for...of` iteration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceForInStatementSyntax {
     pub(super) control: SourceControlLoopSyntax,
@@ -1172,7 +1172,7 @@ pub(super) fn plan_source_function_for_in_statement_syntax(
     .plan_for_in()
 }
 
-/// Proves one function-owned `for...of` body and its lexical iteration binding.
+/// Proves one function or arrow `for...of` body and its lexical iteration binding.
 pub(super) fn plan_source_function_for_of_statement_syntax(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -6495,32 +6495,39 @@ impl SyntaxPlanner<'_> {
         {
             return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
         }
-        if self.callable.family != SourceCallableFamily::FunctionDeclaration {
-            return Err(self.unsupported(
-                declaration,
-                self.node(declaration)?.kind,
-                SourceFunctionStatementsRole::Callable,
-            ));
-        }
-
         let record = self.node(declaration)?;
-        let NodeData::FunctionDeclaration(function) = &record.data else {
-            return Err(self.unsupported(
-                declaration,
-                record.kind,
-                SourceFunctionStatementsRole::Callable,
-            ));
-        };
-        if record.kind != SyntaxKind::FunctionDeclaration
-            || function.body != Some(self.callable.body.node)
-            || function.type_
-                != self
-                    .callable
-                    .return_type
-                    .type_node()
-                    .map(|type_node| type_node.node)
-        {
-            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        match (&record.data, self.callable.family) {
+            (
+                NodeData::FunctionDeclaration(function),
+                SourceCallableFamily::FunctionDeclaration,
+            ) => {
+                if record.kind != SyntaxKind::FunctionDeclaration
+                    || function.body != Some(self.callable.body.node)
+                    || function.type_
+                        != self
+                            .callable
+                            .return_type
+                            .type_node()
+                            .map(|type_node| type_node.node)
+                {
+                    return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                        declaration,
+                    )
+                    .into());
+                }
+            }
+            (NodeData::ArrowFunction(_), SourceCallableFamily::ArrowFunction)
+                if expected_kind == SourceControlLoopKind::ForOf =>
+            {
+                self.validate_for_of_arrow_callable()?;
+            }
+            _ => {
+                return Err(self.unsupported(
+                    declaration,
+                    record.kind,
+                    SourceFunctionStatementsRole::Callable,
+                ));
+            }
         }
 
         let body = self.callable.body;
@@ -6585,6 +6592,53 @@ impl SyntaxPlanner<'_> {
             );
         }
         Ok(syntax)
+    }
+
+    fn validate_for_of_arrow_callable(&self) -> Result<(), SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        let record = self.node(declaration)?;
+        let NodeData::ArrowFunction(arrow) = &record.data else {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        };
+        let owner = self.store.symbol(self.callable.owner_symbol).ok_or(
+            SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration),
+        )?;
+        if record.kind != SyntaxKind::ArrowFunction
+            || self.reference(arrow.body) != self.callable.body
+            || arrow.type_.map(|node| self.reference(node)) != self.callable.return_type.type_node()
+            || self.bound.symbol(declaration) != Some(self.callable.owner_symbol)
+            || owner.flags() != SymbolFlags::FUNCTION
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.parent().is_some()
+            || self.callable.owner_parent.is_some()
+            || self.callable.export_local.is_some()
+            || arrow.parameters.nodes.len() != self.callable.parameters.len()
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+        for (&parameter, planned) in arrow.parameters.nodes.iter().zip(&self.callable.parameters) {
+            let parameter = self.reference(parameter);
+            let parameter_record = self.node(parameter)?;
+            if parameter != planned.declaration
+                || parameter_record.kind != SyntaxKind::Parameter
+                || parameter_record.parent != Some(declaration.node)
+                || self.bound.symbol(parameter) != Some(planned.symbol)
+                || !source_parameter_declarations_are_exact(
+                    self.store,
+                    declaration,
+                    parameter,
+                    planned.symbol,
+                )
+            {
+                return Err(
+                    SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into(),
+                );
+            }
+            self.validate_container(parameter, declaration)?;
+        }
+        Ok(())
     }
 
     fn plan_loop(
@@ -10535,6 +10589,50 @@ mod joined_tests {
             )
         }
 
+        fn variable_arrow(&self, name: &str) -> NodeRef {
+            self.parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) =
+                        &self.parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    let initializer = variable.initializer?;
+                    (identifier.text == name
+                        && self.parsed.arena.get(initializer)?.kind == SyntaxKind::ArrowFunction)
+                        .then_some(NodeRef::new(self.parsed.arena.id(), self.file, initializer))
+                })
+                .expect("expected the named variable's actual arrow initializer")
+        }
+
+        fn arrow_callable(&self, name: &str) -> SourceCallablePlan {
+            let declaration = self.variable_arrow(name);
+            let owner = self.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_source_callable(&self.store, &host, declaration, owner, None).unwrap()
+        }
+
+        fn for_of_callable_plan(
+            &self,
+            callable: &SourceCallablePlan,
+        ) -> Result<SourceForInStatementSyntax, SourceFunctionStatementsError> {
+            plan_source_function_for_of_statement_syntax(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                callable,
+            )
+        }
+
         fn conditional_enum_plan(
             &self,
         ) -> Result<SourceConditionalEnumFunctionStatementsSyntax, SourceFunctionStatementsError>
@@ -11255,6 +11353,220 @@ mod joined_tests {
                 Some(syntax.symbol),
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the source, lexical owners, and flow in one control.
+    fn arrow_for_of_keeps_lexical_parameters_and_the_logical_observer_call() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "type Observer<T> = { next: (value: T) => void; };\n",
+                "const make = <T>() => {\n",
+                "  let _observers: Observer<T>[] = [];\n",
+                "  const next = (value: T) => {\n",
+                "    for (const observer of _observers) {\n",
+                "      observer.next && observer.next(value);\n",
+                "    }\n",
+                "  };\n",
+                "};\n",
+            ),
+            FileId::new(1_540),
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let callable = fixture.arrow_callable("next");
+        let outer = fixture.variable_arrow("make");
+        assert_eq!(callable.family, SourceCallableFamily::ArrowFunction);
+        assert!(callable.type_parameters.is_empty());
+        assert!(callable.return_type.is_inferred());
+        assert_ne!(fixture.bound.symbol(outer), Some(callable.owner_symbol));
+        assert_eq!(fixture.bound.container(callable.declaration), Some(outer));
+        let [parameter] = callable.parameters.as_slice() else {
+            panic!("expected the inner arrow's value parameter")
+        };
+        assert_eq!(
+            fixture.bound.container(parameter.declaration),
+            Some(callable.declaration),
+        );
+        assert_eq!(
+            fixture.bound.symbol(parameter.declaration),
+            Some(parameter.symbol)
+        );
+        let annotation = parameter.explicit_type_node().unwrap();
+        let NodeData::TypeReferenceNode(reference) =
+            &fixture.parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("expected the unchanged T annotation")
+        };
+        let NodeData::Identifier(name) =
+            &fixture.parsed.arena.get(reference.type_name).unwrap().data
+        else {
+            panic!("expected the outer type parameter name")
+        };
+        assert_eq!(name.text, "T");
+        assert!(fixture.store.type_node_links(annotation).is_none());
+        assert!(fixture.store.value_symbol_links(parameter.symbol).is_none());
+
+        let syntax = fixture.for_of_callable_plan(&callable).unwrap();
+        assert_eq!(syntax.control.kind, SourceControlLoopKind::ForOf);
+        assert_eq!(syntax.binding, VariableBindingKind::Const);
+        assert_eq!(syntax.bindings.len(), 1);
+        assert_eq!(
+            fixture.bound.container(syntax.declaration),
+            Some(callable.declaration)
+        );
+        assert_eq!(
+            fixture
+                .bound
+                .locals(syntax.control.statement)
+                .and_then(|locals| fixture.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("observer")),
+            Some(syntax.symbol),
+        );
+        let [body] = syntax.body_statements.as_slice() else {
+            panic!("expected the original logical observer call")
+        };
+        let expression = fixture.parsed.arena.get(body.expression.node).unwrap();
+        let NodeData::BinaryExpression(binary) = &expression.data else {
+            panic!("expected observer.next && observer.next(value)")
+        };
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(binary.operator_token)
+                .unwrap()
+                .kind,
+            SyntaxKind::AmpersandAmpersandToken,
+        );
+        assert_eq!(
+            fixture.parsed.arena.get(binary.left).unwrap().kind,
+            SyntaxKind::PropertyAccessExpression
+        );
+        assert_eq!(
+            fixture.parsed.arena.get(binary.right).unwrap().kind,
+            SyntaxKind::CallExpression
+        );
+        assert_eq!(
+            fixture.bound.container(body.expression),
+            Some(callable.declaration),
+        );
+        assert_eq!(
+            fixture.bound.flow_container(body.statement),
+            Some(callable.declaration),
+        );
+        let graph = fixture.bound.flow_graph();
+        assert_eq!(
+            fixture.bound.flow_at(syntax.control.statement),
+            graph.container_start(callable.declaration),
+        );
+        let binding_flow = syntax.binding_flow.unwrap();
+        assert_eq!(fixture.bound.flow_at(body.statement), Some(binding_flow));
+        assert_eq!(
+            graph.nodes().get(binding_flow).unwrap().payload,
+            Some(FlowNodePayload::Ast(syntax.declaration)),
+        );
+        assert!(syntax.locals.is_empty());
+        assert!(syntax.trailing_statements.is_empty());
+        assert_eq!(fixture.for_of_callable_plan(&callable).unwrap(), syntax);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn arrow_for_of_rejects_other_callable_owners_and_parameter_lists() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "const first = (values: string, saved: number): void => {\n",
+                "  for (let item of values) { consume(item, saved); }\n",
+                "};\n",
+                "const second = (values: string, saved: number): void => {\n",
+                "  for (let item of values) { consume(item, saved); }\n",
+                "};\n",
+            ),
+            FileId::new(1_541),
+        );
+        let first = fixture.arrow_callable("first");
+        let second = fixture.arrow_callable("second");
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let syntax = fixture.for_of_callable_plan(&first).unwrap();
+        assert_eq!(syntax.binding, VariableBindingKind::Let);
+        let expected =
+            Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(first.declaration).into());
+        let mut wrong_owner = first.clone();
+        wrong_owner.owner_symbol = second.owner_symbol;
+        assert_eq!(fixture.for_of_callable_plan(&wrong_owner), expected);
+        let mut wrong_body = first.clone();
+        wrong_body.body = second.body;
+        assert_eq!(fixture.for_of_callable_plan(&wrong_body), expected);
+        let mut wrong_return = first.clone();
+        wrong_return.return_type = second.return_type;
+        assert_eq!(fixture.for_of_callable_plan(&wrong_return), expected);
+        let mut wrong_parameters = first.clone();
+        wrong_parameters.parameters = second.parameters.clone();
+        assert_eq!(fixture.for_of_callable_plan(&wrong_parameters), expected);
+        let mut wrong_symbol = first.clone();
+        wrong_symbol.parameters[0].symbol = second.parameters[0].symbol;
+        assert_eq!(fixture.for_of_callable_plan(&wrong_symbol), expected);
+        let mut wrong_order = first.clone();
+        wrong_order.parameters.swap(0, 1);
+        assert_eq!(fixture.for_of_callable_plan(&wrong_order), expected);
+        let mut missing_parameter = first.clone();
+        missing_parameter.parameters.truncate(1);
+        assert_eq!(fixture.for_of_callable_plan(&missing_parameter), expected);
+        let mut wrong_parent = first.clone();
+        wrong_parent.owner_parent = Some(second.owner_symbol);
+        assert_eq!(fixture.for_of_callable_plan(&wrong_parent), expected);
+        assert_eq!(fixture.for_of_callable_plan(&first).unwrap(), syntax);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn arrow_for_of_does_not_admit_arrow_for_in() {
+        let fixture = JoinedFixture::new(
+            "const iterate = (values: object) => { for (const key in values) { consume(key); } };",
+            FileId::new(1_542),
+        );
+        let callable = fixture.arrow_callable("iterate");
+        assert_eq!(
+            plan_source_function_for_in_statement_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &callable,
+            ),
+            Err(SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::Syntax {
+                    node: callable.declaration,
+                    kind: SyntaxKind::ArrowFunction,
+                    role: SourceFunctionStatementsRole::Callable,
+                },
+            )),
+        );
     }
 
     #[test]
