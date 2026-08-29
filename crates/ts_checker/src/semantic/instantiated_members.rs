@@ -4092,6 +4092,11 @@ fn instantiated_function_property_owner(
     })
 }
 
+enum FunctionPropertyRecovery<'a> {
+    Normal,
+    Recovered(InstantiatedPropertyRecoveryIdentity<'a>),
+}
+
 /// Reads a real property recovery without entering the member or callable graph again.
 fn instantiated_function_property_recovery(
     store: &CanonicalTypeMapperStore,
@@ -4099,7 +4104,7 @@ fn instantiated_function_property_recovery(
     actual: TypeId,
     mapper: TypeMapperId,
     receiver: TypeId,
-) -> Option<Option<InstantiatedPropertyRecoveryIdentity<'_>>> {
+) -> Option<FunctionPropertyRecovery<'_>> {
     let original = function_member_declaring_property_alias(store, source)?;
     let declaration = store
         .type_payload(source)?
@@ -4116,13 +4121,14 @@ fn instantiated_function_property_recovery(
         .object_flags()
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
-        return (record.data().structured()? == &StructuredTypeData::default()).then_some(None);
+        return (record.data().structured()? == &StructuredTypeData::default())
+            .then_some(FunctionPropertyRecovery::Normal);
     }
     let (members, properties) =
         property_object_alias_member_table(store, receiver, original.properties.len()).ok()?;
     let property = *properties.get(index)?;
     let Some(recovery) = store.instantiated_property_recovery(property) else {
-        return Some(None);
+        return Some(FunctionPropertyRecovery::Normal);
     };
     let source_property = original.properties.get(index)?;
     let record = store.symbol(property)?;
@@ -4162,7 +4168,9 @@ fn instantiated_function_property_recovery(
     {
         return None;
     }
-    Some(Some(recovery.checked_identity(store)?))
+    Some(FunctionPropertyRecovery::Recovered(
+        recovery.checked_identity(store)?,
+    ))
 }
 
 /// Copies a function-valued member through its authenticated owner mapper.
@@ -4618,25 +4626,30 @@ pub(super) fn validate_instantiated_function_member_callable(
     let family = CallableFamily::FunctionType;
     let validated = (|| {
         let mapper = object.mapper?;
-        let (targets, recovery, alias) = if let Some(receiver) =
-            instantiated_function_property_owner(store, source, mapper)
-        {
-            let origin = store.instantiated_property_alias_callable(type_)?;
-            if origin.source != source || origin.mapper != mapper {
-                return None;
-            }
-            (
-                origin.array_targets,
-                instantiated_function_property_recovery(store, source, type_, mapper, receiver)?,
-                Some(property_object_alias_projection(store, receiver).ok()??),
-            )
-        } else {
-            (
-                Some(instantiated_function_member_owner(store, source, mapper)?),
-                None,
-                None,
-            )
-        };
+        let (targets, recovery, alias) =
+            if let Some(receiver) = instantiated_function_property_owner(store, source, mapper) {
+                let origin = store.instantiated_property_alias_callable(type_)?;
+                if origin.source != source || origin.mapper != mapper {
+                    return None;
+                }
+                let recovery = match instantiated_function_property_recovery(
+                    store, source, type_, mapper, receiver,
+                )? {
+                    FunctionPropertyRecovery::Normal => None,
+                    FunctionPropertyRecovery::Recovered(identity) => Some(identity),
+                };
+                (
+                    origin.array_targets,
+                    recovery,
+                    Some(property_object_alias_projection(store, receiver).ok()??),
+                )
+            } else {
+                (
+                    Some(instantiated_function_member_owner(store, source, mapper)?),
+                    None,
+                    None,
+                )
+            };
         let callable = instantiated_function_member_projection(
             store, source, type_, mapper, targets, recovery,
         )?;
@@ -7699,7 +7712,7 @@ mod tests {
                     Some(fixture.mapper)
                 )),
                 "parameter_error" => {
-                    assert!(store.set_value_symbol_links(parameter, parameter_links))
+                    assert!(store.set_value_symbol_links(parameter, parameter_links));
                 }
                 "receiver_mapper" => assert!(store.set_object_target_and_mapper(
                     fixture.receiver,
@@ -7707,7 +7720,7 @@ mod tests {
                     Some(fixture.mapper)
                 )),
                 "proxy_mapper" => {
-                    assert!(store.set_value_symbol_links(fixture.property, proxy_links))
+                    assert!(store.set_value_symbol_links(fixture.property, proxy_links));
                 }
                 _ => unreachable!(),
             }
@@ -7939,6 +7952,93 @@ mod tests {
     }
 
     #[test]
+    fn property_alias_function_outer_parameter_union_is_an_atomic_source_boundary() {
+        use crate::semantic::{DeclaredTypeError, TypeNodeUnavailable};
+
+        let parsed = array_property_function_source("T | undefined", "string[]");
+        let file = FileId::new(19_924);
+        let options = array_property_function_options();
+        let mut context = checker_context(&parsed, file, options);
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "observer");
+        let original = property_object_alias_projection(context.store(), receiver)
+            .unwrap()
+            .unwrap();
+        let property = &original.properties[0];
+        let NodeData::FunctionTypeNode(function) =
+            &parsed.arena.get(property.type_node.node).unwrap().data
+        else {
+            panic!("next retains its function type annotation");
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &parsed.arena.get(function.parameters.nodes[0]).unwrap().data
+        else {
+            panic!("next retains its value parameter");
+        };
+        let NodeData::UnionTypeNode(union) =
+            &parsed.arena.get(parameter.type_.unwrap()).unwrap().data
+        else {
+            panic!("value retains its written union annotation");
+        };
+        let unsupported = NodeRef::new(parsed.arena.id(), file, union.types.nodes[0]);
+        let globals = context.global_types().clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let store = context.store_mut_for_test();
+        resolve_property_object_alias_members(store, original.target).unwrap();
+        let before = (
+            property_recovery_store_counts(store),
+            store.instantiated_property_alias_callable_len(),
+            store.value_symbol_links(property.symbol).cloned(),
+            store.type_node_links(property.type_node).cloned(),
+            store.signature_links(property.type_node).cloned(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                demand_property_object_alias_property(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    original.target,
+                    property.symbol,
+                ),
+                Err(SourceCheckError::DeclaredType(
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedUnionConstituent(unsupported)
+                    )
+                ))
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(store),
+                    store.instantiated_property_alias_callable_len(),
+                    store.value_symbol_links(property.symbol).cloned(),
+                    store.type_node_links(property.type_node).cloned(),
+                    store.signature_links(property.type_node).cloned(),
+                ),
+                before
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn property_alias_callable_rejects_foreign_mapping_capabilities_before_copying() {
         let parsed = property_function_source();
         let file = FileId::new(19_926);
@@ -8008,7 +8108,6 @@ mod tests {
         for (annotation, argument, no_capability_matches) in [
             ("T[] | undefined", "string", false),
             ("readonly T[] | undefined", "string", false),
-            ("T | undefined", "string[]", false),
             ("T", "string[]", true),
         ] {
             let parsed = array_property_function_source(annotation, argument);
