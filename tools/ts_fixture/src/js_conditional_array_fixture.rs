@@ -40,7 +40,7 @@ fn original_js_array_conditional_checks_date_and_both_branches() {
             match &artifacts.types {
                 Ok(types) => fs::write(directory.join("original.types"), types).unwrap(),
                 Err(error) => {
-                    fs::write(directory.join("types-error.txt"), format!("{error:?}")).unwrap()
+                    fs::write(directory.join("types-error.txt"), format!("{error:?}")).unwrap();
                 }
             }
         }

@@ -42,6 +42,7 @@ fn variable(program: &Program, path: &str, name: &str) -> NodeRef {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Check both import paths and their replay identities together.
 fn namespace_imports_keep_augmented_module_owners_and_replay() {
     for merge_through_star in [false, true] {
         let filesystem = MemoryFileSystem::new(true);
@@ -115,13 +116,15 @@ fn namespace_imports_keep_augmented_module_owners_and_replay() {
                 assert_eq!(queries.get_type_at_location(source), Ok(namespace));
                 let value_symbol = queries.get_symbol_at_location(value).unwrap().unwrap();
                 let observed = variable(program, "/project/namespace-read.ts", "observed");
-                let observer = program.source_file("/project/namespace-read.ts").unwrap();
+                let consumer_source = program.source_file("/project/namespace-read.ts").unwrap();
                 let NodeData::VariableDeclaration(variable) =
-                    &observer.parse.arena.get(observed.node).unwrap().data
+                    &consumer_source.parse.arena.get(observed.node).unwrap().data
                 else {
                     panic!("the observer is a variable declaration");
                 };
-                let access = observer.node_ref(variable.initializer.unwrap()).unwrap();
+                let access = consumer_source
+                    .node_ref(variable.initializer.unwrap())
+                    .unwrap();
                 assert_eq!(queries.get_type_at_location(observed), Ok(number));
                 assert_eq!(queries.get_type_at_location(access), Ok(number));
                 assert_eq!(
