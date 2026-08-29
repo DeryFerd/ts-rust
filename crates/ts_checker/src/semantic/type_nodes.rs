@@ -599,6 +599,8 @@ impl TypeQueryPlan {
                     }
                 }
             }
+        } else if let Some(constraint) = self.infer_constraints.get(&node) {
+            children.push(*constraint);
         } else if let Some(array) = self.arrays.get(&node) {
             if array.fallback.is_none() {
                 children.push(array.element_type);
@@ -1131,6 +1133,66 @@ impl TypeQueryPlan {
                     }
                     Some(declared)
                 }
+            }
+        } else if self.infer_parameters.contains_key(&node)
+            || store.source_node_kind(node) == Some(SyntaxKind::InferType)
+        {
+            // Nested infer arguments can own a declared type without a node cache.
+            needs_node_cache = false;
+            let symbol = self
+                .infer_parameters
+                .get(&node)
+                .copied()
+                .ok_or_else(&invalid)?;
+            let owner = store.symbol(symbol).ok_or_else(&invalid)?;
+            let Some([declaration]) = owner.declarations() else {
+                return Err(invalid());
+            };
+            if store.source_node_kind(node) != Some(SyntaxKind::InferType)
+                || owner.flags() != SymbolFlags::TYPE_PARAMETER
+                || store.get_merged_symbol(symbol) != Some(symbol)
+                || !store.source_symbol_declarations_match(symbol)
+                || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+                || store.source_node_parent(*declaration) != Some(SourceNodeParent::Parent(node))
+                || !store.source_declaration_belongs_to_symbol(*declaration, symbol)
+            {
+                return Err(invalid());
+            }
+            let constraint_node = self.infer_constraints.get(&node).copied();
+            let children = store
+                .source_direct_children(*declaration)
+                .ok_or_else(&invalid)?;
+            let Some((name, annotations)) = children.split_first() else {
+                return Err(invalid());
+            };
+            if store.source_node_kind(*name) != Some(SyntaxKind::Identifier)
+                || annotations != constraint_node.as_slice()
+            {
+                return Err(invalid());
+            }
+            let constraint = constraint_node
+                .map(|node| child(node, active))
+                .transpose()?;
+            if let Some(type_) = store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+            {
+                if cached_ordinary_type_parameter_owner(store, type_) != Some(symbol) {
+                    return Err(invalid());
+                }
+                let Some(TypeData::TypeParameter(parameter)) =
+                    store.type_payload(type_).map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                match (constraint, parameter.constraint) {
+                    (None, None) => Some(type_),
+                    (Some(Some(expected)), Some(actual)) if actual == expected => Some(type_),
+                    (Some(_), None) => None,
+                    _ => return Err(invalid()),
+                }
+            } else {
+                None
             }
         } else if let Some(array) = self.arrays.get(&node) {
             if let Some(fallback) = array.fallback {
@@ -56686,6 +56748,743 @@ mod tests {
             );
             assert_eq!(fixture.store.type_node_links(infer), node_links.as_ref());
             assert!(diagnostics.is_empty());
+        }
+    }
+
+    fn source_callable_infer_argument_nodes(
+        fixture: &Fixture,
+    ) -> (NodeRef, NodeRef, SemanticSymbolId) {
+        let parameter = named_node(fixture, SyntaxKind::TypeParameter, "Item");
+        let infer = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            fixture
+                .parsed
+                .arena
+                .get(parameter.node)
+                .unwrap()
+                .parent
+                .unwrap(),
+        );
+        let reference = NodeRef::new(
+            infer.arena,
+            infer.file,
+            fixture
+                .parsed
+                .arena
+                .get(infer.node)
+                .unwrap()
+                .parent
+                .unwrap(),
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(infer),
+            Some(SyntaxKind::InferType)
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(reference),
+            Some(SyntaxKind::TypeReference)
+        );
+        (infer, reference, node_symbol(fixture, parameter))
+    }
+
+    fn source_callable_infer_replay_state(
+        store: &CanonicalTypeMapperStore,
+        session: &InstantiationSession,
+    ) -> (
+        StoreState,
+        [usize; 8],
+        (usize, usize, InstantiationLimitEventMark),
+    ) {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        (
+            store_state(store),
+            [
+                store.signature_len(),
+                store.type_alias_len(),
+                store.conditional_root_len(),
+                store.canonical_tuple_target_len(),
+                store.source_callable_type_query_len(),
+                store.symbol_len(),
+                bootstrap.union_cache_len(),
+                bootstrap.union_of_union_cache_len(),
+            ],
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark(),
+            ),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check both real query orders and the retained capture without publishing infer links.
+    fn source_callable_infer_replay_keeps_cold_links_and_captures_generic_arguments() {
+        for node_first in [false, true] {
+            let mut fixture = fixture(concat!(
+                "interface Box<Value> { value: Value } ",
+                "declare function inspect<Input>(value: Input): ",
+                "Input extends Box<infer Item> ? Item : never;",
+            ));
+            let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "inspect");
+            let owner = node_symbol(&fixture, declaration);
+            let (infer, reference, infer_owner) = source_callable_infer_argument_nodes(&fixture);
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let annotation = callable.return_type.type_node().unwrap();
+            assert!(callable.requires_type_query_evidence());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_session_for_test(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let before = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            let plan = query.plan_source_callable_type_inputs(&callable).unwrap();
+            assert_eq!(plan.infer_parameters.get(&infer), Some(&infer_owner));
+            assert_eq!(query.store.declared_type_links(infer_owner), None);
+            for node in [infer, reference] {
+                assert_eq!(
+                    plan.cached_source_callable_type(query.store, &callable, &[], node),
+                    Ok(None)
+                );
+            }
+            let mut cold_results = BTreeMap::new();
+            query
+                .capture_source_callable_query_results(&callable, &plan, &[], &mut cold_results)
+                .unwrap();
+            assert_eq!(cold_results.get(&infer), None);
+            assert_eq!(cold_results.get(&reference), None);
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                before
+            );
+            let infer_links = query.store.type_node_links(infer).cloned();
+            let infer_symbol_links = query.store.symbol_node_links(infer).cloned();
+            assert!(infer_links.is_none());
+            assert!(infer_symbol_links.is_none());
+
+            let type_ = query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = function_signature(query.store, declaration);
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.is_exact(query.store));
+            assert_eq!(evidence.annotation_type(infer), None);
+            assert_eq!(evidence.annotation_type(reference), None);
+            assert_eq!(evidence.annotation_type(annotation), None);
+            let first_reference =
+                node_first.then(|| query.get_type_from_type_node(reference).unwrap());
+            assert_eq!(
+                query
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                None
+            );
+            let returned = query.get_return_type_of_signature(signature).unwrap();
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.is_exact(query.store));
+            let inferred = evidence.annotation_type(infer).unwrap();
+            let boxed = evidence.annotation_type(reference).unwrap();
+            assert!(first_reference.is_none_or(|first| first == boxed));
+            assert_eq!(evidence.annotation_type(annotation), Some(returned));
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(query.store, inferred),
+                Some(infer_owner)
+            );
+            assert_eq!(
+                validate_direct_generic_reference(query.store, boxed)
+                    .unwrap()
+                    .type_arguments,
+                [inferred]
+            );
+            let TypeData::Conditional(conditional) =
+                query.store.type_payload(returned).unwrap().data()
+            else {
+                panic!("the explicit return must retain its deferred conditional")
+            };
+            assert_eq!(conditional.extends_type, boxed);
+            assert_eq!(
+                query
+                    .store
+                    .conditional_root(conditional.root)
+                    .unwrap()
+                    .infer_type_parameters(),
+                Some(&[inferred][..])
+            );
+            let parameters = evidence.type_parameters().to_vec();
+            let results = evidence.annotation_results.clone();
+            let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    query.store,
+                    inferred,
+                    &[inferred],
+                    &[number],
+                    None,
+                    query.instantiation_session.as_deref_mut().unwrap(),
+                ),
+                Ok(number)
+            );
+            assert!(
+                query
+                    .instantiation_session
+                    .as_deref()
+                    .unwrap()
+                    .query_count()
+                    > 0
+            );
+            let warm = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            for _ in 0..2 {
+                for (node, expected) in [(infer, inferred), (reference, boxed)] {
+                    assert_eq!(
+                        plan.cached_source_callable_type(query.store, &callable, &parameters, node),
+                        Ok(Some(expected))
+                    );
+                }
+                let mut replay = results.clone();
+                query
+                    .capture_source_callable_query_results(
+                        &callable,
+                        &plan,
+                        &parameters,
+                        &mut replay,
+                    )
+                    .unwrap();
+                assert_eq!(replay, results);
+                assert_eq!(
+                    query.get_type_of_source_callable(declaration, owner),
+                    Ok(type_)
+                );
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(query.store.type_node_links(infer), infer_links.as_ref());
+                assert_eq!(
+                    query.store.symbol_node_links(infer),
+                    infer_symbol_links.as_ref()
+                );
+                assert_eq!(
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap(),
+                    ),
+                    warm
+                );
+            }
+            assert!(query.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage each independent source/cache owner, then replay the real restored signature.
+    fn source_callable_infer_replay_rejects_and_restores_owner_and_cache_damage() {
+        for damage in 0..7 {
+            let mut fixture = fixture(concat!(
+                "interface Box<Value> {} ",
+                "declare function inspect<Input>(value: Input): ",
+                "Input extends Box<infer Item> ? Item : never; ",
+                "type Other<OtherValue> = OtherValue;",
+            ));
+            let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "inspect");
+            let owner = node_symbol(&fixture, declaration);
+            let other = named_symbol(&fixture, SyntaxKind::TypeParameter, "OtherValue");
+            let (infer, reference, infer_owner) = source_callable_infer_argument_nodes(&fixture);
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_session_for_test(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let other_type = query.get_declared_type_of_symbol(other).unwrap();
+            let type_ = query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = function_signature(query.store, declaration);
+            let returned = query.get_return_type_of_signature(signature).unwrap();
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            let inferred = evidence.annotation_type(infer).unwrap();
+            let boxed = evidence.annotation_type(reference).unwrap();
+            let parameters = evidence.type_parameters().to_vec();
+            let results = evidence.annotation_results.clone();
+            let mut plan = query.plan_source_callable_type_inputs(&callable).unwrap();
+            let original_owner = query.store.symbol(infer_owner).unwrap();
+            let declarations = original_owner.declarations().unwrap().to_vec();
+            let value_declaration = original_owner.value_declaration();
+            let declared_links = query
+                .store
+                .declared_type_links(infer_owner)
+                .unwrap()
+                .clone();
+            let node_links = query
+                .store
+                .type_node_links(infer)
+                .cloned()
+                .unwrap_or_default();
+            let symbol_links = query
+                .store
+                .symbol_node_links(infer)
+                .cloned()
+                .unwrap_or_default();
+            match damage {
+                0 => {
+                    assert_eq!(
+                        plan.infer_parameters.insert(infer, other),
+                        Some(infer_owner)
+                    );
+                }
+                1 => {
+                    let foreign = query
+                        .store
+                        .symbol(other)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .to_vec();
+                    assert!(
+                        query
+                            .store
+                            .set_symbol_declarations(infer_owner, Some(foreign), None)
+                    );
+                }
+                2 => {
+                    let mut changed = declared_links.clone();
+                    changed.declared_type = Some(other_type);
+                    assert!(query.store.set_declared_type_links(infer_owner, changed));
+                }
+                3 => {
+                    assert!(query.store.set_type_node_links(
+                        infer,
+                        TypeNodeLinks {
+                            resolved_type: Some(other_type),
+                            outer_type_parameters: None,
+                        }
+                    ));
+                }
+                4 => {
+                    assert!(query.store.set_type_node_links(
+                        infer,
+                        TypeNodeLinks {
+                            resolved_type: Some(inferred),
+                            outer_type_parameters: Some(vec![other_type]),
+                        }
+                    ));
+                }
+                5 => {
+                    assert!(query.store.set_symbol_node_links(
+                        infer,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(infer_owner),
+                        }
+                    ));
+                }
+                6 => {
+                    assert_eq!(plan.infer_parameters.remove(&infer), Some(infer_owner));
+                }
+                _ => unreachable!(),
+            }
+            let damaged = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            let damaged_node_links = query.store.type_node_links(infer).cloned();
+            let damaged_symbol_links = query.store.symbol_node_links(infer).cloned();
+            let expected = type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(infer));
+            for _ in 0..2 {
+                for node in [infer, reference] {
+                    assert_eq!(
+                        plan.cached_source_callable_type(query.store, &callable, &parameters, node),
+                        Err(expected),
+                        "damage {damage}"
+                    );
+                }
+                let mut replay = results.clone();
+                assert_eq!(
+                    query.capture_source_callable_query_results(
+                        &callable,
+                        &plan,
+                        &parameters,
+                        &mut replay,
+                    ),
+                    Err(expected),
+                    "damage {damage}"
+                );
+                assert_eq!(
+                    query.store.type_node_links(infer),
+                    damaged_node_links.as_ref()
+                );
+                assert_eq!(
+                    query.store.symbol_node_links(infer),
+                    damaged_symbol_links.as_ref()
+                );
+                assert_eq!(
+                    query
+                        .store
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(returned)
+                );
+                assert_eq!(
+                    query
+                        .store
+                        .source_callable_type_query(signature)
+                        .unwrap()
+                        .annotation_results,
+                    results
+                );
+                assert_eq!(
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap(),
+                    ),
+                    damaged
+                );
+            }
+            match damage {
+                0 | 6 => {
+                    plan.infer_parameters.insert(infer, infer_owner);
+                }
+                1 => {
+                    assert!(query.store.set_symbol_declarations(
+                        infer_owner,
+                        Some(declarations),
+                        value_declaration
+                    ));
+                }
+                2 => {
+                    assert!(
+                        query
+                            .store
+                            .set_declared_type_links(infer_owner, declared_links)
+                    );
+                }
+                3 | 4 => {
+                    assert!(query.store.set_type_node_links(infer, node_links));
+                }
+                5 => {
+                    assert!(query.store.set_symbol_node_links(infer, symbol_links));
+                }
+                _ => unreachable!(),
+            }
+            let restored = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            assert_eq!(
+                plan.cached_source_callable_type(query.store, &callable, &parameters, reference),
+                Ok(Some(boxed))
+            );
+            let mut replay = results.clone();
+            query
+                .capture_source_callable_query_results(&callable, &plan, &parameters, &mut replay)
+                .unwrap();
+            assert_eq!(replay, results);
+            assert!(
+                query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(query.store)
+            );
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(type_)
+            );
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                restored
+            );
+            assert!(query.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve a cold bound, then reject each damaged bound without resolving it.
+    fn source_callable_infer_replay_keeps_explicit_constraints_cold_and_rejects_damage() {
+        for damage in 0..5 {
+            let mut fixture = fixture(concat!(
+                "interface Box<Value> {} ",
+                "declare function inspect<Input>(value: Input): ",
+                "Input extends Box<infer Item extends [string]> ? Item : never; ",
+                "type Other = [number];",
+            ));
+            let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "inspect");
+            let owner = node_symbol(&fixture, declaration);
+            let (infer, reference, infer_owner) = source_callable_infer_argument_nodes(&fixture);
+            let (_, constraint, _) = constrained_inferred_parameter_nodes(&fixture, "Item");
+            let foreign_constraint = alias_parts(&fixture, "Other").2;
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_session_for_test(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let inferred = query.get_declared_type_of_symbol(infer_owner).unwrap();
+            let mut plan = query.plan_source_callable_type_inputs(&callable).unwrap();
+            assert_eq!(plan.infer_constraints.get(&infer), Some(&constraint));
+            assert_eq!(
+                plan.source_callable_replay_dependencies(query.store, &callable, infer),
+                Ok((vec![constraint], None))
+            );
+            let cold = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            assert_eq!(query.store.type_node_links(constraint), None);
+            assert_eq!(
+                plan.cached_source_callable_type(query.store, &callable, &[], infer),
+                Ok(None)
+            );
+            let TypeData::TypeParameter(parameter) =
+                query.store.type_payload(inferred).unwrap().data()
+            else {
+                panic!("the declared query must keep the inferred parameter")
+            };
+            assert_eq!(parameter.constraint, None);
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                cold
+            );
+
+            let type_ = query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = function_signature(query.store, declaration);
+            let returned = query.get_return_type_of_signature(signature).unwrap();
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.is_exact(query.store));
+            assert_eq!(evidence.annotation_type(infer), Some(inferred));
+            let boxed = evidence.annotation_type(reference).unwrap();
+            let parameters = evidence.type_parameters().to_vec();
+            let results = evidence.annotation_results.clone();
+            let constraint_links = query.store.type_node_links(constraint).unwrap().clone();
+            let bound = constraint_links.resolved_type.unwrap();
+            let TypeData::TypeParameter(parameter) =
+                query.store.type_payload(inferred).unwrap().data()
+            else {
+                panic!("the conditional must keep the original inferred parameter")
+            };
+            let original_parameter = parameter.clone();
+            assert_eq!(parameter.constraint, Some(bound));
+            assert_eq!(
+                query
+                    .store
+                    .canonical_tuple_shape(bound)
+                    .unwrap()
+                    .unwrap()
+                    .element_types(),
+                [query.store.intrinsic_bootstrap().unwrap().string_type]
+            );
+            assert_eq!(
+                validate_direct_generic_reference(query.store, boxed)
+                    .unwrap()
+                    .type_arguments,
+                [inferred]
+            );
+            assert_eq!(query.store.type_node_links(infer), None);
+            assert_eq!(query.store.symbol_node_links(infer), None);
+            let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+            match damage {
+                0 | 4 => {
+                    assert!(query.store.set_type_parameter_resolution(
+                        inferred,
+                        (damage == 0).then_some(number),
+                        original_parameter.target,
+                        original_parameter.mapper,
+                        original_parameter.resolved_default_type,
+                    ));
+                }
+                1 => {
+                    assert_eq!(plan.infer_constraints.remove(&infer), Some(constraint));
+                }
+                2 => {
+                    assert_eq!(
+                        plan.infer_constraints.insert(infer, foreign_constraint),
+                        Some(constraint)
+                    );
+                }
+                3 => {
+                    assert!(query.store.set_type_node_links(
+                        constraint,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            outer_type_parameters: None,
+                        }
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let expected = type_node_unavailable(match damage {
+                3 => TypeNodeUnavailable::InvalidTupleType(constraint),
+                4 => TypeNodeUnavailable::InvalidTypeReference(reference),
+                _ => TypeNodeUnavailable::InvalidTypeReference(infer),
+            });
+            let damaged = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            let TypeData::TypeParameter(damaged_parameter) =
+                query.store.type_payload(inferred).unwrap().data()
+            else {
+                panic!("damage must leave the original parameter record in place")
+            };
+            let damaged_parameter = damaged_parameter.clone();
+            let damaged_links = query.store.type_node_links(constraint).cloned();
+            for _ in 0..2 {
+                assert_eq!(
+                    plan.cached_source_callable_type(query.store, &callable, &parameters, infer),
+                    if damage == 4 { Ok(None) } else { Err(expected) },
+                    "damage {damage}"
+                );
+                assert_eq!(
+                    plan.cached_source_callable_type(
+                        query.store,
+                        &callable,
+                        &parameters,
+                        reference
+                    ),
+                    Err(expected),
+                    "damage {damage}"
+                );
+                let mut replay = results.clone();
+                assert_eq!(
+                    query.capture_source_callable_query_results(
+                        &callable,
+                        &plan,
+                        &parameters,
+                        &mut replay,
+                    ),
+                    Err(expected),
+                    "damage {damage}"
+                );
+                assert!(matches!(query.store.type_payload(inferred).unwrap().data(),
+                    TypeData::TypeParameter(parameter) if parameter == &damaged_parameter));
+                assert_eq!(
+                    query.store.type_node_links(constraint),
+                    damaged_links.as_ref()
+                );
+                assert_eq!(
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap(),
+                    ),
+                    damaged
+                );
+            }
+            match damage {
+                0 | 4 => {
+                    assert!(query.store.set_type_parameter_resolution(
+                        inferred,
+                        original_parameter.constraint,
+                        original_parameter.target,
+                        original_parameter.mapper,
+                        original_parameter.resolved_default_type,
+                    ));
+                }
+                1 | 2 => {
+                    plan.infer_constraints.insert(infer, constraint);
+                }
+                3 => {
+                    assert!(
+                        query
+                            .store
+                            .set_type_node_links(constraint, constraint_links)
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let restored = source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            );
+            let mut replay = results.clone();
+            query
+                .capture_source_callable_query_results(&callable, &plan, &parameters, &mut replay)
+                .unwrap();
+            assert_eq!(replay, results);
+            assert!(
+                query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(query.store)
+            );
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(type_)
+            );
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            assert_eq!(
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                restored
+            );
+            assert!(query.diagnostics.is_empty());
         }
     }
 
