@@ -3143,21 +3143,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     array_targets,
                     &mut HashSet::new(),
                 )?;
-                let expected = if record.flags().contains(SymbolFlags::OPTIONAL)
-                    && self.intrinsic_bootstrap()?.options.strict_null_checks
-                {
-                    self.cached_annotation_union_type(
-                        &[
-                            annotation_type,
-                            self.intrinsic_bootstrap()?.undefined_or_missing_type,
-                        ],
-                        None,
-                    )
-                    .ok()??
-                } else {
-                    annotation_type
-                };
-                if value != expected {
+                // Nongeneric properties store the annotation. Reads add optionality.
+                if value != annotation_type {
                     return None;
                 }
             }
@@ -6838,6 +6825,264 @@ mod tests {
             .type_node_links(expression)
             .and_then(|links| links.resolved_type)
             .expect("the expression was checked")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check raw caches, read projections, replay, and cache rejection.
+    fn library_optional_properties_keep_raw_annotation_caches() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface LibraryShape { label?: string; items?: string[]; } ",
+            "interface LibraryShapeConstructor { new(): LibraryShape; } ",
+            "declare var LibraryShape: LibraryShapeConstructor;",
+        ));
+        let source = parse_source_file(concat!(
+            "declare const sample: LibraryShape; ",
+            "const labelRead = sample.label; const itemsRead = sample.items; ",
+            "const inferred = () => sample;",
+        ));
+        let library_file = FileId::new(9_961);
+        let file = FileId::new(9_962);
+        for (strict, exact) in [(false, false), (true, false), (true, true)] {
+            let mut binder = CanonicalBinder::new();
+            for (parsed, file, default_library) in
+                [(&library, library_file, true), (&source, file, false)]
+            {
+                assert!(parsed.diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!("\"/optional-{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            default_library,
+                            default_library,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let options = CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: strict,
+                    exact_optional_property_types: exact,
+                },
+                ..CanonicalCheckerOptions::default()
+            };
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(library_file, &library.arena), (file, &source.arena)],
+                options,
+            )
+            .unwrap();
+            let globals = context.global_types().clone();
+            let store = context.store();
+            let owner = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source("LibraryShape"))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let properties = ["label", "items"].map(|name| {
+                store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(name))
+                    .unwrap()
+            });
+            for property in properties {
+                assert!(store.value_symbol_links(property).is_none());
+            }
+            let type_ = {
+                let library_bound = context.file(library_file).unwrap().1.clone();
+                let source_bound = context.file(file).unwrap().1.clone();
+                let host = crate::semantic::DeclaredTypeHost::new_after_global_merge(
+                    [
+                        (&library.arena, &library_bound),
+                        (&source.arena, &source_bound),
+                    ],
+                    crate::semantic::production::GlobalMergeCompletion::for_test(
+                        options.name_resolution,
+                    ),
+                )
+                .unwrap();
+                context
+                    .store_mut_for_test()
+                    .get_declared_type_of_symbol(&host, owner)
+                    .unwrap()
+            };
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let constituents = [type_, number];
+            let union = context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &constituents,
+                    UnionReduction::Literal,
+                )
+                .unwrap();
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(type_));
+            let store = context.store();
+            assert!(
+                store
+                    .type_payload(type_)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            let raw_types = properties.map(|property| {
+                assert_eq!(
+                    store.symbol(property).unwrap().flags(),
+                    SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+                );
+                store
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            });
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(raw_types[0], string);
+            let array = store
+                .canonical_array_reference(&globals, raw_types[1])
+                .unwrap()
+                .unwrap();
+            assert_eq!(array.element_type, string);
+            assert_eq!(array.base_type, raw_types[1]);
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(&globals),
+                    type_,
+                ),
+                Ok(()),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability(type_),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    raw_types[1]
+                )),
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let reads = ["labelRead", "itemsRead"].map(|name| {
+                let node = variable_initializer(&source, file, name);
+                (node, checked_expression_type(&context, node))
+            });
+            let store = context.store_mut_for_test();
+            for (property, (raw, (_, read))) in
+                properties.into_iter().zip(raw_types.into_iter().zip(reads))
+            {
+                assert_eq!(
+                    store.value_symbol_links(property),
+                    Some(&ValueSymbolLinks {
+                        resolved_type: Some(raw),
+                        ..ValueSymbolLinks::default()
+                    }),
+                );
+                if strict {
+                    let mut expected = [
+                        raw,
+                        store
+                            .intrinsic_bootstrap()
+                            .unwrap()
+                            .undefined_or_missing_type,
+                    ];
+                    expected.sort_unstable();
+                    assert_ne!(raw, read);
+                    assert_eq!(
+                        store.validate_canonical_union_metadata(read, &expected),
+                        Ok(())
+                    );
+                } else {
+                    assert_eq!(read, raw);
+                }
+            }
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &constituents,
+                    UnionReduction::Literal
+                ),
+                Ok(union),
+            );
+            let snapshot = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let warm = snapshot(store);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_declared_type_of_symbol(owner), Ok(type_));
+                for (node, read) in reads {
+                    assert_eq!(context.get_type_at_location(node), Ok(read));
+                }
+                let store = context.store_mut_for_test();
+                assert_eq!(
+                    store.expression_union_type_with_global_types(
+                        &globals,
+                        &constituents,
+                        UnionReduction::Literal
+                    ),
+                    Ok(union),
+                );
+                assert_eq!(snapshot(store), warm);
+            }
+            if !strict {
+                continue;
+            }
+            let store = context.store_mut_for_test();
+            for (property, (_, read)) in properties.into_iter().zip(reads) {
+                let original = store.value_symbol_links(property).cloned().unwrap();
+                assert!(store.set_value_symbol_links(
+                    property,
+                    ValueSymbolLinks {
+                        resolved_type: Some(read),
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                let rejected = Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                for _ in 0..2 {
+                    assert_eq!(
+                        store.validate_cached_array_capability_with_array_targets(
+                            CanonicalArrayTargets::from_global_types(&globals),
+                            type_,
+                        ),
+                        rejected,
+                    );
+                    assert_eq!(
+                        store.expression_union_type_with_global_types(
+                            &globals,
+                            &constituents,
+                            UnionReduction::Literal
+                        ),
+                        Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_)),
+                    );
+                    assert_eq!(snapshot(store), warm);
+                }
+                assert!(store.set_value_symbol_links(property, original));
+                assert_eq!(
+                    store.expression_union_type_with_global_types(
+                        &globals,
+                        &constituents,
+                        UnionReduction::Literal
+                    ),
+                    Ok(union),
+                );
+                assert_eq!(snapshot(store), warm);
+            }
+        }
     }
 
     fn inherited_graph_property(store: &TestStore) -> (TypeId, TypeId, SemanticSymbolId) {
