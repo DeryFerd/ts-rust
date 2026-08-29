@@ -511,6 +511,9 @@ impl CanonicalTypeMapperStore {
                     return Err(IntersectionTypeError::MalformedConstituent(type_));
                 }
             }
+            TypeData::Mapped(_) => self
+                .validate_deferred_mapped_type(type_)
+                .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?,
             TypeData::TypeReference(_) | TypeData::Interface(_)
                 if record.object_flags().contains(ObjectFlags::REFERENCE) =>
             {

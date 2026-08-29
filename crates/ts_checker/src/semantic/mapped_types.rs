@@ -26,7 +26,7 @@ use super::{
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
-        instantiate_type_with_session,
+        instantiate_type_with_session, instantiated_member_type_matches,
     },
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -539,6 +539,7 @@ struct HomomorphicMappedAliasShape {
     parameter: TypeId,
     parameter_symbol: SemanticSymbolId,
     source_argument: TypeId,
+    template: TypeId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -680,6 +681,61 @@ pub(super) fn plan_mapped_type_keys(
 }
 
 impl CanonicalTypeMapperStore {
+    pub(super) fn validate_deferred_mapped_type(
+        &self,
+        type_: TypeId,
+    ) -> Result<(), MappedTypeError> {
+        let invalid = || MappedTypeError::InvalidMappedType(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Mapped(mapped) = record.data() else {
+            return Err(invalid());
+        };
+        let declaration = mapped.declaration.ok_or_else(invalid)?;
+        let parameter = mapped.type_parameter.ok_or_else(invalid)?;
+        let target = mapped.object.target.unwrap_or(type_);
+        let target_record = self.type_payload(target).ok_or_else(invalid)?;
+        let TypeData::Mapped(original) = target_record.data() else {
+            return Err(invalid());
+        };
+        let original_parameter = original.type_parameter.ok_or_else(invalid)?;
+        let request = MappedTypeRequest::new(
+            declaration,
+            target_record.symbol().ok_or_else(invalid)?,
+            original_parameter,
+            original.constraint_type.ok_or_else(invalid)?,
+            original.template_type.ok_or_else(invalid)?,
+            original.modifiers_type.ok_or_else(invalid)?,
+        );
+        let request = original
+            .name_type
+            .map_or(request, |name| request.with_name_type(name));
+        validate_mapped_request(self, request)?;
+        validate_request_record(self, request, target)?;
+        if record.flags() != TypeFlags::OBJECT
+            || !record.object_flags().contains(ObjectFlags::MAPPED)
+            || original.object.target.is_some()
+            || original.object.mapper.is_some()
+            || mapped.declaration != original.declaration
+            || record.symbol() != target_record.symbol()
+            || mapped_type_parameter_owner(self, type_, parameter).is_none()
+            || self.source_mapped_type_modifiers(declaration).is_none()
+            || self
+                .type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                != Some(target)
+            || [
+                mapped.constraint_type,
+                mapped.template_type,
+                mapped.modifiers_type,
+            ]
+            .into_iter()
+            .any(|type_| type_.is_none_or(|type_| self.type_payload(type_).is_none()))
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Publishes the mapped declaration and alias identity before its body runs.
     ///
     /// Recursive constraints can then refer to the same declaration-owned
@@ -1347,7 +1403,7 @@ impl CanonicalTypeMapperStore {
         Ok(())
     }
 
-    /// Instantiates an authenticated `{ [K in keyof T]: T[K] }` alias.
+    /// Instantiates a mapped alias whose template reads its source by key.
     ///
     /// The concrete source supplies both the canonical `keyof` constraint and
     /// the property modifiers. Indexed values remain unresolved until their
@@ -1404,9 +1460,14 @@ impl CanonicalTypeMapperStore {
             return Err(MappedTypeError::InvalidTypeParameter(parameter));
         }
 
-        let template = self
-            .alloc_indexed_access_type(shape.source_argument, parameter, AccessFlags::NONE)
-            .ok_or(MappedTypeError::Capacity)?;
+        let template = instantiate_type_with_session(
+            self,
+            shape.template,
+            mapper,
+            None,
+            &mut InstantiationSession::new(InstantiationLimits::default()),
+        )
+        .map_err(|error| mapped_instantiation_error(shape.template, &error))?;
         let instantiated = self
             .alloc_mapped_type(
                 ObjectFlags::INSTANTIATED_MAPPED,
@@ -1490,13 +1551,9 @@ impl CanonicalTypeMapperStore {
         else {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         };
-        let Some(TypeData::IndexedAccess(template)) = mapped
+        let template = mapped
             .template_type
-            .and_then(|template| self.type_payload(template))
-            .map(TypeRecord::data)
-        else {
-            return Err(MappedTypeError::InvalidMappedType(instantiated));
-        };
+            .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
         let allowed_flags = ObjectFlags::INSTANTIATED_MAPPED
             | ObjectFlags::MEMBERS_RESOLVED
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
@@ -1539,9 +1596,8 @@ impl CanonicalTypeMapperStore {
                 != Some(true)
             || self.type_mapper_has_exact_endpoints(second, type_parameters, type_arguments)
                 != Some(true)
-            || template.object_type != shape.source_argument
-            || template.index_type != parameter
-            || template.access_flags != AccessFlags::NONE
+            || !instantiated_member_type_matches(self, shape.template, template, type_mapper, None)
+                .map_err(|_| MappedTypeError::InvalidMappedType(instantiated))?
         {
             return Err(MappedTypeError::InvalidMappedType(instantiated));
         }
@@ -2013,16 +2069,11 @@ impl CanonicalTypeMapperStore {
         if !modifiers.valid() {
             return Err(MappedTypeError::InvalidModifiers);
         }
-        let modifiers = if self.is_authenticated_partial_mapped_type(type_) {
-            if modifiers != MappedTypeModifiers::NONE
-                && modifiers != MappedTypeModifiers::INCLUDE_OPTIONAL
-            {
-                return Err(MappedTypeError::InvalidModifiers);
-            }
-            MappedTypeModifiers::INCLUDE_OPTIONAL
-        } else {
-            modifiers
-        };
+        let declared = self.declared_mapped_modifiers(type_)?;
+        if modifiers != MappedTypeModifiers::NONE && modifiers != declared {
+            return Err(MappedTypeError::InvalidModifiers);
+        }
+        let modifiers = declared;
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
         let shape = validate_mapped_shape(self, type_)?;
         let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
@@ -2032,80 +2083,18 @@ impl CanonicalTypeMapperStore {
         publish_mapped_members(self, &shape, properties, &indexes)
     }
 
-    fn is_authenticated_partial_mapped_type(&self, type_: TypeId) -> bool {
-        let Some(record) = self.type_payload(type_) else {
-            return false;
+    fn declared_mapped_modifiers(
+        &self,
+        type_: TypeId,
+    ) -> Result<MappedTypeModifiers, MappedTypeError> {
+        let Some(TypeData::Mapped(mapped)) = self.type_payload(type_).map(TypeRecord::data) else {
+            return Err(MappedTypeError::InvalidMappedType(type_));
         };
-        let TypeData::Mapped(mapped) = record.data() else {
-            return false;
-        };
-        let Some(alias) = self
-            .intrinsic_bootstrap()
-            .and_then(|bootstrap| self.symbol_table(bootstrap.globals))
-            .and_then(|globals| globals.get_source("Partial"))
-            .and_then(|symbol| self.get_merged_symbol(symbol))
-        else {
-            return false;
-        };
-        let Some(owner) = self.symbol(alias) else {
-            return false;
-        };
-        let Some([declaration]) = owner.declarations() else {
-            return false;
-        };
-        let Some(links) = self.type_alias_links(alias) else {
-            return false;
-        };
-        let Some(declared) = links.declared_type else {
-            return false;
-        };
-        let Some([source]) = links.type_parameters.as_deref() else {
-            return false;
-        };
-        let target = mapped.object.target.unwrap_or(type_);
-        let Some(TypeData::Mapped(original)) = self.type_payload(target).map(TypeRecord::data)
-        else {
-            return false;
-        };
-        let Some(TypeData::Index(constraint)) = original
-            .constraint_type
-            .and_then(|constraint| self.type_payload(constraint))
-            .map(TypeRecord::data)
-        else {
-            return false;
-        };
-        let Some(TypeData::IndexedAccess(template)) = original
-            .template_type
-            .and_then(|template| self.type_payload(template))
-            .map(TypeRecord::data)
-        else {
-            return false;
-        };
-        owner.flags() == SymbolFlags::TYPE_ALIAS
-            && owner.check_flags() == CheckFlags::NONE
-            && owner.name().as_utf8() == Some("Partial")
-            && owner.parent().is_none()
-            && owner.value_declaration().is_none()
-            && owner.members().is_none()
-            && owner.exports().is_none()
-            && owner.export_symbol().is_none()
-            && declared == target
-            && original.modifiers_type == Some(*source)
-            && constraint.target == *source
-            && constraint.index_flags == IndexFlags::NONE
-            && template.object_type == *source
-            && Some(template.index_type) == original.type_parameter
-            && template.access_flags == AccessFlags::NONE
-            && links
-                .instantiations
-                .as_ref()
-                .and_then(|instantiations| instantiations.get(&type_list_key(&[*source])))
-                == Some(&declared)
-            && original.declaration.is_some_and(|mapped_declaration| {
-                self.source_node_kind(mapped_declaration) == Some(SyntaxKind::MappedType)
-                    && self.source_node_parent(mapped_declaration)
-                        == Some(SourceNodeParent::Parent(*declaration))
-            })
+        let declaration = mapped
+            .declaration
+            .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+        self.source_mapped_type_modifiers(declaration)
+            .ok_or(MappedTypeError::InvalidDeclaration(declaration))
     }
 
     /// Validates an existing finite `Record` projection without changing caches.
@@ -2438,12 +2427,9 @@ fn validate_homomorphic_mapped_alias_request(
     let template = mapped
         .template_type
         .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
-    let template_record = store
-        .type_payload(template)
-        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
-    let TypeData::IndexedAccess(indexed) = template_record.data() else {
+    if !mapped_template_source_is_exact(store, template, *source_parameter, parameter) {
         return Err(MappedTypeError::UnsupportedTemplate(template));
-    };
+    }
     let Some([parameter_declaration]) = store
         .symbol(parameter_symbol)
         .and_then(|owner| owner.declarations())
@@ -2479,13 +2465,6 @@ fn validate_homomorphic_mapped_alias_request(
         || constraint_record.alias().is_some()
         || index.target != *source_parameter
         || index.index_flags != IndexFlags::NONE
-        || template_record.flags() != TypeFlags::INDEXED_ACCESS
-        || template_record.object_flags() != ObjectFlags::NONE
-        || template_record.symbol().is_some()
-        || template_record.alias().is_some()
-        || indexed.object_type != *source_parameter
-        || indexed.index_type != parameter
-        || indexed.access_flags != AccessFlags::NONE
         || store.source_node_parent(*parameter_declaration)
             != Some(SourceNodeParent::Parent(declaration))
         || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::TypeParameter)
@@ -2511,7 +2490,47 @@ fn validate_homomorphic_mapped_alias_request(
         parameter,
         parameter_symbol,
         source_argument: *source_argument,
+        template,
     })
+}
+
+fn mapped_template_source_is_exact(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    source: TypeId,
+    key: TypeId,
+) -> bool {
+    let mut current = template;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        let Some(record) = store.type_payload(current) else {
+            return false;
+        };
+        match record.data() {
+            TypeData::IndexedAccess(indexed) => {
+                return record.flags() == TypeFlags::INDEXED_ACCESS
+                    && record.object_flags() == ObjectFlags::NONE
+                    && record.symbol().is_none()
+                    && record.alias().is_none()
+                    && indexed.object_type == source
+                    && indexed.index_type == key
+                    && indexed.access_flags == AccessFlags::NONE;
+            }
+            TypeData::TypeReference(_) => {
+                let Ok(reference) =
+                    super::reference_types::validate_direct_generic_reference(store, current)
+                else {
+                    return false;
+                };
+                let [argument] = reference.type_arguments.as_slice() else {
+                    return false;
+                };
+                current = *argument;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn validate_mapped_utility_source(
@@ -2522,6 +2541,13 @@ fn validate_mapped_utility_source(
         .type_payload(source)
         .ok_or(MappedTypeError::InvalidSource(source))?;
     match record.data() {
+        TypeData::Intrinsic(_)
+            if record
+                .flags()
+                .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN) =>
+        {
+            Ok(())
+        }
         TypeData::TypeParameter(_)
             if cached_ordinary_type_parameter_owner(store, source).is_some() =>
         {
@@ -2738,15 +2764,7 @@ fn validate_pick_mapped_alias_request(
     let links = store
         .type_alias_links(alias)
         .ok_or(MappedTypeError::InvalidSymbol(alias))?;
-    let global = store
-        .intrinsic_bootstrap()
-        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-        .and_then(|globals| globals.get_source("Pick"))
-        .and_then(|symbol| store.get_merged_symbol(symbol));
     if alias_record.flags() != SymbolFlags::TYPE_ALIAS
-        || alias_record.name().as_utf8() != Some("Pick")
-        || alias_record.parent().is_some()
-        || global != Some(alias)
         || store.get_merged_symbol(alias) != Some(alias)
         || store.source_node_kind(*alias_declaration) != Some(SyntaxKind::TypeAliasDeclaration)
         || links.declared_type != Some(declared_type)
@@ -3508,14 +3526,22 @@ fn mapped_type_parameter_owner(
             original_parameter,
             parameter,
         )
-        && mapped_instantiated_operand_matches(
+        && (mapped_instantiated_operand_matches(
             store,
             second,
             original.template_type?,
             mapped.template_type?,
             original_parameter,
             parameter,
+        ) || instantiated_member_type_matches(
+            store,
+            original.template_type?,
+            mapped.template_type?,
+            instantiation_mapper,
+            None,
         )
+        .ok()
+            == Some(true))
         && store.map_type(second, original.modifiers_type?) == mapped.modifiers_type)
         .then_some(owner)
 }
@@ -3589,7 +3615,10 @@ fn source_properties(
     let record = store
         .type_payload(type_)
         .ok_or(MappedTypeError::InvalidSource(type_))?;
-    if record.flags().contains(TypeFlags::UNKNOWN) {
+    if record
+        .flags()
+        .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN)
+    {
         return Ok(Vec::new());
     }
     if !record
@@ -3680,7 +3709,10 @@ fn source_indexes(
     let record = store
         .type_payload(type_)
         .ok_or(MappedTypeError::InvalidSource(type_))?;
-    if record.flags().contains(TypeFlags::UNKNOWN) {
+    if record
+        .flags()
+        .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN)
+    {
         return Ok(Vec::new());
     }
     let structured = record
@@ -3863,7 +3895,13 @@ fn mapped_index_value_type(
         }
         _ if store
             .type_payload(shape.type_)
-            .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED)) =>
+            .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED))
+            && !mapped_template_source_is_exact(
+                store,
+                shape.template_type,
+                shape.modifiers_type,
+                shape.type_parameter,
+            ) =>
         {
             Ok(shape.template_type)
         }
@@ -4197,7 +4235,7 @@ fn property_name_from_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> O
     }
 }
 
-fn escaped_property_name_from_type(
+pub(super) fn escaped_property_name_from_type(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<EscapedName> {
@@ -4597,7 +4635,7 @@ fn compute_mapped_property_type(
             property.check_flags().contains(CheckFlags::STRIP_OPTIONAL),
         )
     };
-    let (strict, exact, undefined, missing) = store
+    let (strict, exact, undefined, missing, void) = store
         .intrinsic_bootstrap()
         .map(|bootstrap| {
             (
@@ -4605,6 +4643,7 @@ fn compute_mapped_property_type(
                 bootstrap.options.exact_optional_property_types,
                 bootstrap.undefined_type,
                 bootstrap.undefined_or_missing_type,
+                bootstrap.void_type,
             )
         })
         .ok_or(MappedTypeError::BootstrapUninitialized)?;
@@ -4614,6 +4653,9 @@ fn compute_mapped_property_type(
     } else if strip_optional {
         let sentinel = if exact { missing } else { undefined };
         type_ = remove_type(store, type_, sentinel)?;
+        if !exact {
+            type_ = remove_type(store, type_, void)?;
+        }
     }
     Ok(type_)
 }
@@ -4641,10 +4683,19 @@ fn instantiate_mapped_template(
     if indexed.is_some() {
         return indexed_mapped_template(store, shape, key_type);
     }
-    if shape.template_type != shape.type_parameter
-        && store
-            .type_payload(shape.type_)
-            .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED))
+    if let Some(TypeData::Mapped(mapped)) = store.type_payload(shape.type_).map(TypeRecord::data)
+        && let Some(TypeData::Mapped(original)) = mapped
+            .object
+            .target
+            .and_then(|target| store.type_payload(target))
+            .map(TypeRecord::data)
+        && original.template_type != original.type_parameter
+        && original.template_type.is_some_and(|template| {
+            matches!(
+                store.type_payload(template).map(TypeRecord::data),
+                Some(TypeData::TypeParameter(_))
+            )
+        })
     {
         return Ok(shape.template_type);
     }

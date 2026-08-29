@@ -3,9 +3,9 @@
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
 //! Array/ReadonlyArray references under an explicit target capability, direct
-//! full-arity generic class/interface references, authenticated deferred
-//! intersections, template literals, intrinsic string mappings, and unions
-//! with canonical alias arguments and union origins. Other object and
+//! full-arity generic class/interface references, indexed accesses,
+//! authenticated deferred intersections, template literals, intrinsic string
+//! mappings, and unions with canonical alias arguments and union origins. Other object and
 //! signature instantiation needs its owning caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
@@ -15,7 +15,11 @@ use super::{
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
+    indexed_access_types::{
+        cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
+    },
     intersection_types::{DeferredIntersectionTypeProjection, IntersectionTypeError},
+    mapped_types::escaped_property_name_from_type,
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
@@ -27,10 +31,10 @@ use super::{
     store::SourceNodeParent,
     template_types::TemplateTypeError,
     type_records::{TypeData, TypeRecord},
-    types::{ObjectFlags, TypeFlags},
+    types::{AccessFlags, ObjectFlags, TypeFlags},
 };
 use ts_ast::SyntaxKind;
-use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
+use ts_binder::{CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags};
 
 /// Pinned checker limits for one instantiation query.
 ///
@@ -1138,13 +1142,22 @@ fn instantiated_member_type_matches_worker(
         {
             Ok(template == actual)
         }
-        TypeData::TypeParameter(_) => Ok(store
-            .map_type(mapper, template)
-            .ok_or(InstantiationError::InvalidMapper(mapper))?
-            == actual),
-        TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) => {
-            cached_instantiated_member_type(store, template, mapper, &mut HashSet::new())
-                .map(|expected| expected == Some(actual))
+        TypeData::TypeParameter(_) => cached_apply_mapping(
+            store,
+            template,
+            InstantiationMapping::Stored(mapper),
+            array_targets,
+        )
+        .map(|expected| expected == Some(actual)),
+        TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) | TypeData::IndexedAccess(_) => {
+            cached_instantiated_member_type(
+                store,
+                template,
+                mapper,
+                array_targets,
+                &mut HashSet::new(),
+            )
+            .map(|expected| expected == Some(actual))
         }
         TypeData::Union(_) => {
             instantiated_member_union_matches(store, template, actual, mapper, array_targets)
@@ -1210,13 +1223,14 @@ fn cached_instantiated_member_type(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
     mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
     active: &mut HashSet<TypeId>,
 ) -> Result<Option<TypeId>, InstantiationError> {
     cached_instantiated_type_worker(
         store,
         template,
         InstantiationMapping::Stored(mapper),
-        None,
+        array_targets,
         None,
         active,
     )
@@ -1267,18 +1281,89 @@ fn cached_instantiated_type_worker(
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
             Ok(Some(template))
         }
-        TypeData::TypeParameter(_) => match mapping {
-            InstantiationMapping::Stored(mapper) => store
-                .map_type(mapper, template)
-                .map(Some)
-                .ok_or(InstantiationError::InvalidMapper(mapper)),
-            InstantiationMapping::Vector { sources, targets } => Ok(Some(
-                sources
-                    .iter()
-                    .position(|source| *source == template)
-                    .map_or(template, |index| targets[index]),
-            )),
-        },
+        TypeData::TypeParameter(_) => cached_apply_mapping(store, template, mapping, array_targets),
+        TypeData::IndexedAccess(indexed) => {
+            let object = cached_instantiated_type_worker(
+                store,
+                indexed.object_type,
+                mapping,
+                array_targets,
+                None,
+                active,
+            )?;
+            let index = cached_instantiated_type_worker(
+                store,
+                indexed.index_type,
+                mapping,
+                array_targets,
+                None,
+                active,
+            )?;
+            let (Some(object), Some(index)) = (object, index) else {
+                return Ok(None);
+            };
+            match indexed_access_resolution(store, object, index, array_targets)? {
+                IndexedAccessResolution::Type(type_) => Ok(Some(type_)),
+                IndexedAccessResolution::Deferred => {
+                    cached_deferred_indexed_access_type(store, object, index, indexed.access_flags)
+                        .map_err(InstantiationError::InvalidType)
+                }
+                IndexedAccessResolution::Property(name) => {
+                    let record = store
+                        .type_payload(object)
+                        .ok_or(InstantiationError::InvalidType(object))?;
+                    if !record
+                        .object_flags()
+                        .contains(ObjectFlags::MEMBERS_RESOLVED)
+                    {
+                        return Ok(None);
+                    }
+                    match validate_resolved_declared_property_object(store, object) {
+                        DeclaredPropertyObjectValidation::Valid(_) => {}
+                        _ => {
+                            super::instantiated_members::validate_generic_interface_members(
+                                store,
+                                object,
+                                array_targets,
+                            )
+                            .map_err(|_| InstantiationError::InvalidType(object))?
+                            .ok_or(InstantiationError::UnsupportedType(object))?;
+                        }
+                    }
+                    let Some(structured) = record.data().structured() else {
+                        return Err(InstantiationError::InvalidType(object));
+                    };
+                    let property = structured
+                        .members
+                        .and_then(|members| store.symbol_table(members))
+                        .and_then(|members| members.get(name.as_ref()));
+                    let Some(property) = property else {
+                        return Ok(None);
+                    };
+                    if !structured
+                        .properties
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains(&property)
+                    {
+                        return Err(InstantiationError::InvalidType(object));
+                    }
+                    let Some(value) = store
+                        .value_symbol_links(property)
+                        .and_then(|links| links.resolved_type)
+                    else {
+                        return Ok(None);
+                    };
+                    let optional = store
+                        .symbol(property)
+                        .is_some_and(|property| property.flags().contains(SymbolFlags::OPTIONAL));
+                    let types = indexed_access_property_types(store, value, optional)?;
+                    store
+                        .cached_literal_union_type_with_alias(&types, None, array_targets)
+                        .map_err(Into::into)
+                }
+            }
+        }
         TypeData::TemplateLiteral(data) => {
             let mut types = Vec::with_capacity(data.types.len());
             for type_ in &data.types {
@@ -1499,6 +1584,11 @@ enum InstantiationWork {
     Union,
     Intersection(DeferredIntersectionTypeProjection),
     TypeReference,
+    IndexedAccess {
+        object: TypeId,
+        index: TypeId,
+        flags: AccessFlags,
+    },
     Unsupported,
 }
 
@@ -1536,6 +1626,11 @@ fn instantiate_type_worker(
                     .map_err(|error| deferred_intersection_error(type_, error))?,
             ),
             TypeData::TypeReference(_) => InstantiationWork::TypeReference,
+            TypeData::IndexedAccess(indexed) => InstantiationWork::IndexedAccess {
+                object: indexed.object_type,
+                index: indexed.index_type,
+                flags: indexed.access_flags,
+            },
             TypeData::Interface(interface)
                 if interface
                     .reference
@@ -1550,6 +1645,43 @@ fn instantiate_type_worker(
         }
     };
     match work {
+        InstantiationWork::IndexedAccess {
+            object,
+            index,
+            flags,
+        } => {
+            let object =
+                instantiate_type_with_alias(store, object, mapping, array_targets, None, session)?;
+            let index =
+                instantiate_type_with_alias(store, index, mapping, array_targets, None, session)?;
+            match indexed_access_resolution(store, object, index, array_targets)? {
+                IndexedAccessResolution::Type(type_) => Ok(type_),
+                IndexedAccessResolution::Deferred => {
+                    get_instantiated_indexed_access_type(store, object, index, flags)
+                        .ok_or(InstantiationError::InvalidType(type_))
+                }
+                IndexedAccessResolution::Property(name) => {
+                    let property = super::object_members::resolve_object_property_by_key(
+                        store,
+                        None,
+                        object,
+                        name.as_ref(),
+                        session,
+                    )
+                    .map_err(|_| InstantiationError::UnsupportedType(type_))?
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                    let values =
+                        indexed_access_property_types(store, property.type_, property.optional)?;
+                    store
+                        .literal_union_type_with_alias_and_array_targets(
+                            &values,
+                            None,
+                            array_targets,
+                        )
+                        .map_err(Into::into)
+                }
+            }
+        }
         InstantiationWork::TypeParameter => {
             apply_mapping(store, type_, mapping, array_targets, session)
         }
@@ -1583,6 +1715,71 @@ fn instantiate_type_worker(
         }
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
     }
+}
+
+enum IndexedAccessResolution {
+    Type(TypeId),
+    Deferred,
+    Property(EscapedName),
+}
+
+fn indexed_access_property_types(
+    store: &CanonicalTypeMapperStore,
+    property_type: TypeId,
+    optional: bool,
+) -> Result<Vec<TypeId>, InstantiationError> {
+    let record = store
+        .type_payload(property_type)
+        .ok_or(InstantiationError::InvalidType(property_type))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(InstantiationError::InvalidType(property_type))?;
+    if !bootstrap.options.strict_null_checks || !optional {
+        return Ok(vec![property_type]);
+    }
+    let mut types = match record.data() {
+        TypeData::Union(union) => union.union.types.clone(),
+        _ => vec![property_type],
+    };
+    types.retain(|type_| *type_ != bootstrap.missing_type);
+    types.push(bootstrap.undefined_type);
+    Ok(types)
+}
+
+fn indexed_access_resolution(
+    store: &CanonicalTypeMapperStore,
+    object: TypeId,
+    index: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<IndexedAccessResolution, InstantiationError> {
+    let object_record = store
+        .type_payload(object)
+        .ok_or(InstantiationError::InvalidType(object))?;
+    let index_record = store
+        .type_payload(index)
+        .ok_or(InstantiationError::InvalidType(index))?;
+    if object_record.flags().contains(TypeFlags::ANY) {
+        return Ok(IndexedAccessResolution::Type(object));
+    }
+    if index_record.flags().contains(TypeFlags::NEVER) {
+        return Ok(IndexedAccessResolution::Type(index));
+    }
+    if object_record
+        .flags()
+        .intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
+        || index_record.flags().intersects(TypeFlags::INSTANTIABLE)
+    {
+        return Ok(IndexedAccessResolution::Deferred);
+    }
+    if let Some(targets) = array_targets
+        && index_record.flags().intersects(TypeFlags::NUMBER_LIKE)
+        && let Some(array) = store.canonical_array_reference_with_targets(targets, object)?
+    {
+        return Ok(IndexedAccessResolution::Type(array.element_type));
+    }
+    escaped_property_name_from_type(store, index)
+        .map(IndexedAccessResolution::Property)
+        .ok_or(InstantiationError::UnsupportedType(index))
 }
 
 fn instantiate_template_literal(
@@ -1904,6 +2101,66 @@ fn deferred_intersection_error(source: TypeId, error: IntersectionTypeError) -> 
             InstantiationError::Union(LiteralTypeCacheError::Capacity)
         }
         _ => InstantiationError::UnsupportedType(source),
+    }
+}
+
+fn cached_apply_mapping(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    store
+        .type_payload(type_)
+        .ok_or(InstantiationError::InvalidType(type_))?;
+    let mapper = match mapping {
+        InstantiationMapping::Vector { sources, targets } => {
+            return Ok(Some(
+                sources
+                    .iter()
+                    .position(|source| *source == type_)
+                    .map_or(type_, |index| targets[index]),
+            ));
+        }
+        InstantiationMapping::Stored(mapper) => mapper,
+    };
+    let application = store
+        .mapper_application(mapper, type_)
+        .ok_or(InstantiationError::InvalidMapper(mapper))?;
+    match application {
+        TypeMapperApplication::Direct(replacement) => Ok(Some(replacement)),
+        TypeMapperApplication::Merged { first, second }
+        | TypeMapperApplication::Composite { first, second } => {
+            let Some(intermediate) = cached_apply_mapping(
+                store,
+                type_,
+                InstantiationMapping::Stored(first),
+                array_targets,
+            )?
+            else {
+                return Ok(None);
+            };
+            if intermediate != type_
+                && matches!(application, TypeMapperApplication::Composite { .. })
+            {
+                // The second mapper starts a separate type traversal.
+                cached_instantiated_type_worker(
+                    store,
+                    intermediate,
+                    InstantiationMapping::Stored(second),
+                    array_targets,
+                    None,
+                    &mut HashSet::new(),
+                )
+            } else {
+                cached_apply_mapping(
+                    store,
+                    intermediate,
+                    InstantiationMapping::Stored(second),
+                    array_targets,
+                )
+            }
+        }
     }
 }
 
@@ -3110,6 +3367,60 @@ mod tests {
     }
 
     #[test]
+    fn deferred_indexed_access_substitution_retains_array_targets_for_cache_checks() {
+        let mut store = initialized_store();
+        let targets = canonical_array_targets(&mut store);
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let source_parameter = store.alloc_type_parameter(None).unwrap();
+        let indexed = get_instantiated_indexed_access_type(
+            &mut store,
+            source_parameter,
+            number,
+            AccessFlags::NONE,
+        )
+        .unwrap();
+        for readonly in [false, true] {
+            let array = store
+                .create_canonical_array_type_with_targets(targets, string, readonly)
+                .unwrap();
+            let mapper = store
+                .new_simple_type_mapper(source_parameter, array)
+                .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            assert_eq!(
+                instantiate_type_with_session(
+                    &mut store,
+                    indexed,
+                    mapper,
+                    Some(targets),
+                    &mut session
+                ),
+                Ok(string)
+            );
+            let warm = deferred_intersection_store_state(&store);
+            assert_eq!(
+                instantiated_member_type_matches(&store, indexed, string, mapper, Some(targets)),
+                Ok(true)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &store,
+                    indexed,
+                    &[source_parameter],
+                    &[array],
+                    Some(targets),
+                    None,
+                ),
+                Ok(Some(string))
+            );
+            assert_eq!(deferred_intersection_store_state(&store), warm);
+        }
+    }
+
+    #[test]
     fn composite_mapper_recursively_instantiates_a_changed_intermediate() {
         let mut store = initialized_store();
         let (string, number) = {
@@ -3135,6 +3446,18 @@ mod tests {
             panic!("the recursively instantiated intermediate must remain a union");
         };
         assert_eq!(data.union.types, [string, number]);
+        assert_eq!(
+            instantiated_member_type_matches(&store, outer, intermediate, merged, None),
+            Ok(true)
+        );
+        assert_eq!(
+            instantiated_member_type_matches(&store, outer, instantiated, composite, None),
+            Ok(true)
+        );
+        assert_eq!(
+            instantiated_member_type_matches(&store, outer, intermediate, composite, None),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -3175,6 +3498,14 @@ mod tests {
             panic!("nested composites must recursively instantiate the union")
         };
         assert_eq!(data.union.types, [string, number]);
+        assert_eq!(
+            instantiated_member_type_matches(&store, untouched, number, unchanged, None),
+            Ok(true)
+        );
+        assert_eq!(
+            instantiated_member_type_matches(&store, outer, instantiated, nested, None),
+            Ok(true)
+        );
     }
 
     #[test]

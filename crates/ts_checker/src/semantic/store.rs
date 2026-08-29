@@ -48,6 +48,7 @@ use super::{
         TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
+    mapped_types::MappedTypeModifiers,
     object_members::ObjectLiteralPropertyCloneOrigin,
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
@@ -96,6 +97,7 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
+    mapped_modifiers: Option<MappedTypeModifiers>,
     exported: bool,
     signature_links_eligible: bool,
 }
@@ -7693,6 +7695,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node)?.type_operator
     }
 
+    pub(super) fn source_mapped_type_modifiers(
+        &self,
+        node: NodeRef,
+    ) -> Option<MappedTypeModifiers> {
+        self.source_node_fact(node)?.mapped_modifiers
+    }
+
     pub(super) fn source_direct_children(&self, parent: NodeRef) -> Option<Vec<NodeRef>> {
         self.source_node_fact(parent)?;
         self.source_node_facts
@@ -8037,6 +8046,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
                 type_operator: match &node.data {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
+                mapped_modifiers: match &node.data {
+                    NodeData::MappedTypeNode(mapped) => MappedTypeModifiers::from_token_kinds(
+                        mapped
+                            .readonly_token
+                            .and_then(|token| arena.get(token))
+                            .map(|token| token.kind),
+                        mapped
+                            .question_token
+                            .and_then(|token| arena.get(token))
+                            .map(|token| token.kind),
+                    ),
                     _ => None,
                 },
                 exported: match &node.data {

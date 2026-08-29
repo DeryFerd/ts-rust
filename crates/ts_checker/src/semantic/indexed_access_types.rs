@@ -213,6 +213,35 @@ pub(super) fn get_deferred_indexed_access_type(
 ) -> Option<TypeId> {
     cached_ordinary_type_parameter_owner(store, object_type)?;
     cached_ordinary_type_parameter_owner(store, index_type)?;
+    get_instantiated_indexed_access_type(store, object_type, index_type, access_flags)
+}
+
+/// Retains a deferred access after one or both operands were instantiated.
+pub(super) fn get_instantiated_indexed_access_type(
+    store: &mut CanonicalTypeMapperStore,
+    object_type: TypeId,
+    index_type: TypeId,
+    access_flags: AccessFlags,
+) -> Option<TypeId> {
+    let cached =
+        cached_deferred_indexed_access_type(store, object_type, index_type, access_flags).ok()?;
+    cached.or_else(|| {
+        store.alloc_indexed_access_type(
+            object_type,
+            index_type,
+            access_flags & AccessFlags::PERSISTENT,
+        )
+    })
+}
+
+pub(super) fn cached_deferred_indexed_access_type(
+    store: &CanonicalTypeMapperStore,
+    object_type: TypeId,
+    index_type: TypeId,
+    access_flags: AccessFlags,
+) -> Result<Option<TypeId>, TypeId> {
+    store.type_payload(object_type).ok_or(object_type)?;
+    store.type_payload(index_type).ok_or(index_type)?;
     let persistent_flags = access_flags & AccessFlags::PERSISTENT;
     let mut cached = None;
 
@@ -231,11 +260,11 @@ pub(super) fn get_deferred_indexed_access_type(
             || record.alias().is_some()
             || cached.replace(type_).is_some()
         {
-            return None;
+            return Err(type_);
         }
     }
 
-    cached.or_else(|| store.alloc_indexed_access_type(object_type, index_type, persistent_flags))
+    Ok(cached)
 }
 
 /// Preflights a nested indexed-access path without resolving its named root.

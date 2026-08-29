@@ -1061,14 +1061,14 @@ struct PropTypesKeyAliasPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DefaultLibraryMappedUtilityKind {
-    Partial,
+enum MappedUtilityKind {
+    Homomorphic,
     Pick,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DefaultLibraryMappedUtilityPlan {
-    kind: DefaultLibraryMappedUtilityKind,
+struct MappedUtilityPlan {
+    kind: MappedUtilityKind,
     mapped: NodeRef,
     source_parameter: SemanticSymbolId,
     key_parameter: Option<SemanticSymbolId>,
@@ -1238,8 +1238,7 @@ struct TypeQueryPlan {
     default_library_non_nullable_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryNonNullablePlan>,
     prop_types_infer_props_aliases: BTreeMap<SemanticSymbolId, PropTypesInferPropsPlan>,
     prop_types_key_aliases: BTreeMap<SemanticSymbolId, PropTypesKeyAliasPlan>,
-    default_library_mapped_utility_aliases:
-        BTreeMap<SemanticSymbolId, DefaultLibraryMappedUtilityPlan>,
+    mapped_utility_aliases: BTreeMap<SemanticSymbolId, MappedUtilityPlan>,
     recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     jsdoc_imports: BTreeMap<NodeRef, CanonicalJsDocImportTypeTarget>,
@@ -1359,6 +1358,7 @@ struct PlannedUnionType {
 struct PlannedIntersectionType {
     types: Vec<NodeRef>,
     alias_symbol: Option<SemanticSymbolId>,
+    deferred: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1507,11 +1507,11 @@ fn validate_supported_mapped_alias_instantiation(
     type_parameters: &[TypeId],
     type_arguments: &[TypeId],
     instantiated: TypeId,
-    utility: Option<DefaultLibraryMappedUtilityPlan>,
+    utility: Option<MappedUtilityPlan>,
 ) -> Result<(), MappedTypeError> {
     match utility {
-        Some(DefaultLibraryMappedUtilityPlan {
-            kind: DefaultLibraryMappedUtilityKind::Partial,
+        Some(MappedUtilityPlan {
+            kind: MappedUtilityKind::Homomorphic,
             modifiers,
             ..
         }) => store.validate_homomorphic_mapped_alias_instantiation(
@@ -1522,8 +1522,8 @@ fn validate_supported_mapped_alias_instantiation(
             instantiated,
             modifiers,
         ),
-        Some(DefaultLibraryMappedUtilityPlan {
-            kind: DefaultLibraryMappedUtilityKind::Pick,
+        Some(MappedUtilityPlan {
+            kind: MappedUtilityKind::Pick,
             ..
         }) => store.validate_pick_mapped_alias_instantiation(
             alias,
@@ -3536,7 +3536,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && recursive_alias.is_none()
             && self
                 .plan
-                .default_library_mapped_utility_aliases
+                .mapped_utility_aliases
                 .get(&alias)
                 .is_none_or(|utility| utility.mapped != node)
             && !self.is_homomorphic_generic_mapped_alias(alias, mapped)?
@@ -8082,20 +8082,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .copied()
                 .filter(|planned| planned.intersection == node)
         });
-        if react_alias.is_none()
-            && non_nullable_alias.is_none()
-            && infer_props_alias.is_none()
-            && alias_symbol.is_some_and(|alias| {
-                self.plan
-                    .aliases
-                    .get(&alias)
-                    .is_some_and(|plan| !plan.type_parameters.is_empty())
-            })
-        {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
-            ));
-        }
         let record = preflight_node(self.store, self.host, node)?;
         let NodeData::IntersectionTypeNode(intersection) = &record.data else {
             return Err(type_node_unavailable(
@@ -8141,6 +8127,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         })();
         self.intersection_planning_depth -= 1;
         planning?;
+        let mapped_constituents = types
+            .iter()
+            .map(|node| self.planned_mapped_intersection_constituent(*node))
+            .collect::<Option<Vec<_>>>();
+        let mapped_deferred =
+            mapped_constituents.is_some_and(|mapped| mapped.into_iter().any(|mapped| mapped));
+        let known_deferred =
+            react_alias.is_some() || non_nullable_alias.is_some() || infer_props_alias.is_some();
+        if !known_deferred
+            && !mapped_deferred
+            && alias_symbol.is_some_and(|alias| {
+                self.plan
+                    .aliases
+                    .get(&alias)
+                    .is_some_and(|alias| !alias.type_parameters.is_empty())
+            })
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+            ));
+        }
         if let Some(react_alias) = react_alias {
             if types.as_slice()
                 != [
@@ -8169,7 +8176,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
                 ));
             }
-        } else {
+        } else if !mapped_deferred {
             if let Some(literal) = types.iter().copied().find(|constituent| {
                 matches!(
                     self.plan.literals.get(constituent),
@@ -8199,13 +8206,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
             ));
         }
-        let derived_alias =
-            if react_alias.is_some() || non_nullable_alias.is_some() || infer_props_alias.is_some()
-            {
-                alias_symbol
-            } else {
-                self.direct_union_alias(node)?
-            };
+        let derived_alias = if known_deferred || mapped_deferred {
+            alias_symbol
+        } else {
+            self.direct_union_alias(node)?
+        };
         if alias_symbol.is_some() && derived_alias != alias_symbol {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidIntersectionType(node),
@@ -8214,6 +8219,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let planned = PlannedIntersectionType {
             types,
             alias_symbol: alias_symbol.or(derived_alias),
+            deferred: known_deferred || mapped_deferred,
         };
         if let Some(existing) = self.plan.intersections.insert(node, planned.clone())
             && existing != planned
@@ -8223,6 +8229,28 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         }
         Ok(())
+    }
+
+    fn planned_mapped_intersection_constituent(&self, node: NodeRef) -> Option<bool> {
+        if self.host.node(node)?.kind != SyntaxKind::TypeReference {
+            return None;
+        }
+        let reference = self.plan.references.get(&node)?;
+        if reference.arity != PlannedTypeReferenceArity::Valid || reference.import_alias.is_some() {
+            return None;
+        }
+        let owner = self.store.symbol(reference.symbol)?;
+        if owner.flags() == SymbolFlags::TYPE_PARAMETER && reference.type_arguments.is_empty() {
+            Some(false)
+        } else if self
+            .plan
+            .mapped_utility_aliases
+            .contains_key(&reference.symbol)
+        {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     fn plan_intersection_callable_returns(
@@ -9146,6 +9174,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 .or_else(|| {
                                     self.authenticated_prop_types_infer_props_alias(symbol)
                                         .map(|alias| alias.intersection)
+                                })
+                                .or_else(|| {
+                                    self.cached_mapped_intersection_source_is_exact(
+                                        intersection,
+                                        declared_type,
+                                    )
+                                    .then_some(intersection)
                                 });
                             let Some(authenticated_intersection) = authenticated_intersection
                             else {
@@ -9866,9 +9901,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                     type_parameters,
                                     &type_arguments,
                                     declared_type,
-                                    self.authenticated_default_library_mapped_utility_alias(
-                                        canonical,
-                                    ),
+                                    self.authenticated_mapped_utility_alias(canonical),
                                 )
                                 .is_err()
                                     || !valid_record_mapped_alias_identity(
@@ -9899,6 +9932,115 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
             }
         }
+    }
+
+    fn cached_mapped_intersection_source_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
+        let Ok(projection) = self.store.validate_deferred_intersection_type(result) else {
+            return false;
+        };
+        let Some(NodeData::IntersectionTypeNode(intersection)) =
+            self.host.node(node).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let mut constituents = Vec::new();
+        let mut has_mapped = false;
+        for child in &intersection.types.nodes {
+            let child = NodeRef::new(node.arena, node.file, *child);
+            let Some(record) = self.host.node(child) else {
+                return false;
+            };
+            let Some(type_) = self
+                .store
+                .type_node_links(child)
+                .and_then(|links| links.resolved_type)
+            else {
+                return false;
+            };
+            if record.parent != Some(node.node) {
+                return false;
+            }
+            match self.store.type_payload(type_).map(TypeRecord::data) {
+                Some(TypeData::TypeParameter(_)) => {
+                    let Some(symbol) = cached_ordinary_type_parameter_owner(self.store, type_)
+                    else {
+                        return false;
+                    };
+                    if self.resolve_uncached_type_reference_symbol(child).ok() != Some(symbol)
+                        || self
+                            .store
+                            .symbol_node_links(child)
+                            .and_then(|links| links.resolved_symbol)
+                            != Some(symbol)
+                    {
+                        return false;
+                    }
+                }
+                Some(TypeData::Mapped(_)) => {
+                    if self.store.validate_deferred_mapped_type(type_).is_err() {
+                        return false;
+                    }
+                    let NodeData::TypeReferenceNode(reference) = &record.data else {
+                        return false;
+                    };
+                    let Ok(symbol) = self.resolve_uncached_type_reference_symbol(child) else {
+                        return false;
+                    };
+                    if self
+                        .store
+                        .symbol_node_links(child)
+                        .and_then(|links| links.resolved_symbol)
+                        != Some(symbol)
+                    {
+                        return false;
+                    }
+                    let Some(utility) = self.authenticated_mapped_utility_alias(symbol) else {
+                        return false;
+                    };
+                    let Some(links) = self.store.type_alias_links(symbol) else {
+                        return false;
+                    };
+                    let (Some(declared), Some(parameters), Some(arguments)) = (
+                        links.declared_type,
+                        links.type_parameters.as_deref(),
+                        reference.type_arguments.as_ref(),
+                    ) else {
+                        return false;
+                    };
+                    let arguments = arguments
+                        .nodes
+                        .iter()
+                        .map(|argument| {
+                            self.store
+                                .type_node_links(NodeRef::new(child.arena, child.file, *argument))?
+                                .resolved_type
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(arguments) = arguments else {
+                        return false;
+                    };
+                    if validate_supported_mapped_alias_instantiation(
+                        self.store,
+                        symbol,
+                        declared,
+                        parameters,
+                        &arguments,
+                        type_,
+                        Some(utility),
+                    )
+                    .is_err()
+                    {
+                        return false;
+                    }
+                    has_mapped = true;
+                }
+                _ => return false,
+            }
+            if !constituents.contains(&type_) {
+                constituents.push(type_);
+            }
+        }
+        has_mapped && projection.types == constituents
     }
 
     fn validate_cached_non_nullable_instantiation(
@@ -14556,20 +14698,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     }
 
     #[allow(clippy::too_many_lines)] // The utility declaration and every bound parameter are one proof.
-    fn authenticated_default_library_mapped_utility_alias(
+    fn authenticated_mapped_utility_alias(
         &self,
         alias: SemanticSymbolId,
-    ) -> Option<DefaultLibraryMappedUtilityPlan> {
+    ) -> Option<MappedUtilityPlan> {
         let owner = self.store.symbol(alias)?;
-        let kind = match owner.name().as_utf8()? {
-            "Partial" if self.global_symbol_has_name(alias, "Partial") => {
-                DefaultLibraryMappedUtilityKind::Partial
-            }
-            "Pick" if self.global_symbol_has_name(alias, "Pick") => {
-                DefaultLibraryMappedUtilityKind::Pick
-            }
-            _ => return None,
-        };
         let [declaration] = owner.declarations()? else {
             return None;
         };
@@ -14585,26 +14718,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let NodeData::Identifier(identifier) = &name_record.data else {
             return None;
         };
-        let expected_name = match kind {
-            DefaultLibraryMappedUtilityKind::Partial => "Partial",
-            DefaultLibraryMappedUtilityKind::Pick => "Pick",
-        };
+        let expected_name = owner.name().as_utf8()?;
         if owner.flags() != SymbolFlags::TYPE_ALIAS
             || owner.check_flags() != CheckFlags::NONE
-            || owner.parent().is_some()
             || owner.value_declaration().is_some()
             || owner.members().is_some()
             || owner.exports().is_some()
             || owner.export_symbol().is_some()
             || self.store.get_merged_symbol(alias) != Some(alias)
-            || !facts.is_default_library()
-            || !facts.is_declaration_file()
             || facts.is_javascript_file()
-            || facts.is_external_module()
-            || facts.is_common_js_module()
             || record.kind != SyntaxKind::TypeAliasDeclaration
             || record.flags.0 != 0
-            || record.parent != Some(bound.source_file().node)
             || !self.host.symbol_matches(self.store, declaration, alias)
             || bound
                 .symbol(declaration)
@@ -14614,7 +14738,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || data.local_symbol.is_some()
             || data.next_container.is_some()
             || data.symbol.is_some()
-            || data.modifiers.is_some()
             || name_record.kind != SyntaxKind::Identifier
             || name_record.flags.0 != 0
             || name_record.parent != Some(declaration.node)
@@ -14625,26 +14748,24 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let metadata = self.plan.aliases.get(&alias);
-        let expected_parameters = match kind {
-            DefaultLibraryMappedUtilityKind::Partial => ["T"].as_slice(),
-            DefaultLibraryMappedUtilityKind::Pick => ["T", "K"].as_slice(),
-        };
         let parameters = data.type_parameters.as_ref()?;
+        let kind = match parameters.nodes.len() {
+            1 => MappedUtilityKind::Homomorphic,
+            2 => MappedUtilityKind::Pick,
+            _ => return None,
+        };
         let locals = bound
             .locals(declaration)
             .and_then(|locals| self.store.symbol_table(locals))?;
         if parameters.has_trailing_comma
-            || parameters.nodes.len() != expected_parameters.len()
             || metadata
-                .is_some_and(|metadata| metadata.type_parameters.len() != expected_parameters.len())
-            || locals.len() != expected_parameters.len()
+                .is_some_and(|metadata| metadata.type_parameters.len() != parameters.nodes.len())
+            || locals.len() != parameters.nodes.len()
         {
             return None;
         }
-        let mut planned_parameters = Vec::with_capacity(expected_parameters.len());
-        for (index, (parameter_id, expected)) in
-            parameters.nodes.iter().zip(expected_parameters).enumerate()
-        {
+        let mut planned_parameters = Vec::with_capacity(parameters.nodes.len());
+        for (index, parameter_id) in parameters.nodes.iter().enumerate() {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
             let parameter_record = preflight_node(self.store, self.host, parameter).ok()?;
             let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
@@ -14659,6 +14780,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .symbol(parameter)
                 .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
             let parameter_owner = self.store.symbol(symbol)?;
+            let expected = parameter_owner.name().as_utf8()?;
             if parameter_record.kind != SyntaxKind::TypeParameter
                 || parameter_record.flags.0 != 0
                 || parameter_record.parent != Some(declaration.node)
@@ -14672,7 +14794,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 })
                 || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
                 || parameter_owner.check_flags() != CheckFlags::NONE
-                || parameter_owner.name().as_utf8() != Some(*expected)
                 || parameter_owner.declarations() != Some(&[parameter])
                 || parameter_owner.parent().is_some()
                 || parameter_owner.value_declaration().is_some()
@@ -14684,7 +14805,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 || name_record.kind != SyntaxKind::Identifier
                 || name_record.flags.0 != 0
                 || name_record.parent != Some(parameter.node)
-                || identifier.text != *expected
+                || identifier.text != expected
                 || identifier.flow_node.is_some()
             {
                 return None;
@@ -14700,6 +14821,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let source_parameter = planned_parameters[0];
+        let source_name = self
+            .store
+            .symbol(source_parameter.symbol)?
+            .name()
+            .as_utf8()?;
         if source_parameter.constraint.is_some() || source_parameter.default_type.is_some() {
             return None;
         }
@@ -14719,16 +14845,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             NodeRef::new(mapped.arena, mapped.file, mapped_syntax.type_parameter);
         let mapped_plan = plan_mapped_type_declaration(self.store, self.host, mapped).ok()?;
         let mapped_parameter = mapped_plan.type_parameter_symbol();
-        if self
+        let mapped_parameter_name = self
             .store
             .symbol(mapped_parameter)
-            .and_then(|parameter| parameter.name().as_utf8())
-            != Some("P")
-            || mapped_plan.name_type().is_some()
-        {
+            .and_then(|parameter| parameter.name().as_utf8())?;
+        if mapped_plan.name_type().is_some() {
             return None;
         }
-        let template = mapped_plan.template()?;
+        let mut template = mapped_plan.template()?;
+        let mut template_parent = mapped;
+        while let NodeData::TypeReferenceNode(reference) = &self.host.node(template)?.data {
+            let arguments = reference.type_arguments.as_ref()?;
+            let [argument] = arguments.nodes.as_slice() else {
+                return None;
+            };
+            let argument = NodeRef::new(template.arena, template.file, *argument);
+            if arguments.has_trailing_comma
+                || self.host.node(argument)?.parent != Some(template.node)
+            {
+                return None;
+            }
+            template_parent = template;
+            template = argument;
+        }
         let template_record = preflight_node(self.store, self.host, template).ok()?;
         let NodeData::IndexedAccessTypeNode(indexed) = &template_record.data else {
             return None;
@@ -14737,17 +14876,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let parameter_reference = NodeRef::new(template.arena, template.file, indexed.index_type);
         if template_record.kind != SyntaxKind::IndexedAccessType
             || template_record.flags.0 != 0
-            || template_record.parent != Some(mapped.node)
+            || template_record.parent != Some(template_parent.node)
             || !self.react_detailed_html_props_parameter_reference(
                 source_reference,
                 template,
-                "T",
+                source_name,
                 source_parameter.symbol,
             )
             || !self.react_detailed_html_props_parameter_reference(
                 parameter_reference,
                 template,
-                "P",
+                mapped_parameter_name,
                 mapped_parameter,
             )
         {
@@ -14755,21 +14894,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
 
         let key_parameter = match kind {
-            DefaultLibraryMappedUtilityKind::Partial => {
+            MappedUtilityKind::Homomorphic => {
                 let constraint = mapped_plan.constraint();
                 let constraint_record = preflight_node(self.store, self.host, constraint).ok()?;
                 let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
                     return None;
                 };
                 let target = NodeRef::new(constraint.arena, constraint.file, operator.type_);
-                if mapped_plan.modifiers() != MappedTypeModifiers::INCLUDE_OPTIONAL
-                    || constraint_record.kind != SyntaxKind::TypeOperator
+                if constraint_record.kind != SyntaxKind::TypeOperator
                     || operator.operator != SyntaxKind::KeyOfKeyword
                     || mapped_plan.modifiers_source() != Some(target)
                     || !self.react_detailed_html_props_parameter_reference(
                         target,
                         constraint,
-                        "T",
+                        source_name,
                         source_parameter.symbol,
                     )
                 {
@@ -14777,8 +14915,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 None
             }
-            DefaultLibraryMappedUtilityKind::Pick => {
+            MappedUtilityKind::Pick => {
                 let key = planned_parameters[1];
+                let key_name = self.store.symbol(key.symbol)?.name().as_utf8()?;
                 let constraint = key.constraint?;
                 let constraint_record = preflight_node(self.store, self.host, constraint).ok()?;
                 let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
@@ -14793,13 +14932,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     || !self.react_detailed_html_props_parameter_reference(
                         target,
                         constraint,
-                        "T",
+                        source_name,
                         source_parameter.symbol,
                     )
                     || !self.react_detailed_html_props_parameter_reference(
                         mapped_plan.constraint(),
                         mapped_parameter_declaration,
-                        "K",
+                        key_name,
                         key.symbol,
                     )
                 {
@@ -14809,7 +14948,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         };
 
-        Some(DefaultLibraryMappedUtilityPlan {
+        Some(MappedUtilityPlan {
             kind,
             mapped,
             source_parameter: source_parameter.symbol,
@@ -18113,19 +18252,25 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 if self
                     .plan
-                    .default_library_mapped_utility_aliases
+                    .mapped_utility_aliases
                     .get(&alias)
                     .is_some_and(|utility| {
-                        utility.kind == DefaultLibraryMappedUtilityKind::Pick
+                        utility.kind == MappedUtilityKind::Pick
                             && utility.key_parameter == Some(parameter.symbol)
                             && earlier_parameters.iter().any(|earlier| {
                                 earlier.symbol == utility.source_parameter
-                                    && self.react_detailed_html_props_parameter_reference(
-                                        target,
-                                        node,
-                                        "T",
-                                        utility.source_parameter,
-                                    )
+                                    && self
+                                        .store
+                                        .symbol(utility.source_parameter)
+                                        .and_then(|owner| owner.name().as_utf8())
+                                        .is_some_and(|name| {
+                                            self.react_detailed_html_props_parameter_reference(
+                                                target,
+                                                node,
+                                                name,
+                                                utility.source_parameter,
+                                            )
+                                        })
                             })
                     })
                 {
@@ -19766,10 +19911,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if let Some(key_alias) = self.authenticated_prop_types_key_alias(symbol) {
             self.plan.prop_types_key_aliases.insert(symbol, key_alias);
         }
-        if let Some(utility) = self.authenticated_default_library_mapped_utility_alias(symbol) {
-            self.plan
-                .default_library_mapped_utility_aliases
-                .insert(symbol, utility);
+        if let Some(utility) = self.authenticated_mapped_utility_alias(symbol) {
+            self.plan.mapped_utility_aliases.insert(symbol, utility);
         }
         if let Some(cached) = cached
             && let Some(alias) = self
@@ -25455,11 +25598,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .any_type
         };
         let utility_source = plan
-            .default_library_mapped_utility_aliases
+            .mapped_utility_aliases
             .values()
-            .find(|utility| {
-                utility.kind == DefaultLibraryMappedUtilityKind::Pick && utility.mapped == node
-            })
+            .find(|utility| utility.kind == MappedUtilityKind::Pick && utility.mapped == node)
             .map(|utility| utility.source_reference);
         let modifiers_source = match mapped.modifiers_source().or(utility_source) {
             Some(source) => self.execute_type_node(source, plan, prepared)?,
@@ -26616,30 +26757,30 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .map_err(function_type_error)?;
             }
         }
-        let resolved_type = if let Some(alias) = intersection.alias_symbol
-            && (plan
-                .react_detailed_html_props_aliases
-                .get(&alias)
-                .is_some_and(|react_alias| react_alias.intersection == node)
-                || plan
-                    .default_library_non_nullable_aliases
-                    .get(&alias)
-                    .is_some_and(|non_nullable_alias| non_nullable_alias.intersection == node)
-                || plan
-                    .prop_types_infer_props_aliases
-                    .get(&alias)
-                    .is_some_and(|infer_props_alias| infer_props_alias.intersection == node))
-        {
-            let metadata = plan.aliases.get(&alias).ok_or_else(|| {
-                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(alias))
-            })?;
-            let arguments = metadata
-                .type_parameters
-                .iter()
-                .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
-                .collect::<Vec<_>>();
+        let resolved_type = if intersection.deferred {
+            let identity = intersection
+                .alias_symbol
+                .map(|alias| {
+                    let metadata = plan.aliases.get(&alias).ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(
+                            alias,
+                        ))
+                    })?;
+                    let arguments = metadata
+                        .type_parameters
+                        .iter()
+                        .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
+                        .collect::<Vec<_>>();
+                    Ok::<_, DeclaredTypeError>((alias, arguments))
+                })
+                .transpose()?;
             self.store
-                .canonical_deferred_intersection_type(&types, Some((alias, &arguments)))
+                .canonical_deferred_intersection_type(
+                    &types,
+                    identity
+                        .as_ref()
+                        .map(|(alias, arguments)| (*alias, arguments.as_slice())),
+                )
                 .map_err(|error| intersection_type_error(error, node))?
         } else {
             self.store
@@ -28237,9 +28378,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &type_parameters,
             &type_arguments,
             plan.react_detailed_html_props_aliases.get(&symbol).copied(),
-            plan.default_library_mapped_utility_aliases
-                .get(&symbol)
-                .copied(),
+            plan.mapped_utility_aliases.get(&symbol).copied(),
         )?;
         if let Some(key_alias) = plan.prop_types_key_aliases.get(&symbol).copied() {
             return self.execute_prop_types_key_alias_instantiation(
@@ -28307,10 +28446,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Mapped(_))
         ) {
-            let utility = plan
-                .default_library_mapped_utility_aliases
-                .get(&symbol)
-                .copied();
+            let utility = plan.mapped_utility_aliases.get(&symbol).copied();
             let invalid_cache = || {
                 type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
                     symbol,
@@ -28383,7 +28519,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
 
             let instantiation = match utility {
-                Some(utility) if utility.kind == DefaultLibraryMappedUtilityKind::Partial => {
+                Some(utility) if utility.kind == MappedUtilityKind::Homomorphic => {
                     self.store.instantiate_homomorphic_mapped_alias(
                         symbol,
                         declared_type,
@@ -28392,7 +28528,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         utility.modifiers,
                     )
                 }
-                Some(utility) if utility.kind == DefaultLibraryMappedUtilityKind::Pick => {
+                Some(utility) if utility.kind == MappedUtilityKind::Pick => {
                     self.store.instantiate_pick_mapped_alias(
                         symbol,
                         declared_type,
@@ -29126,7 +29262,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         type_parameters: &[TypeId],
         type_arguments: &[TypeId],
         dependent_react_alias: Option<ReactDetailedHtmlPropsPlan>,
-        mapped_utility: Option<DefaultLibraryMappedUtilityPlan>,
+        mapped_utility: Option<MappedUtilityPlan>,
     ) -> Result<(), DeclaredTypeError> {
         for (index, node) in reference.type_arguments.iter().copied().enumerate() {
             let parameter = metadata.type_parameters[index];
@@ -29148,7 +29284,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ))
             })?;
             let constraint = if mapped_utility.is_some_and(|utility| {
-                utility.kind == DefaultLibraryMappedUtilityKind::Pick
+                utility.kind == MappedUtilityKind::Pick
                     && utility.key_parameter == Some(parameter.symbol)
             }) {
                 let source = type_arguments.first().copied().ok_or_else(|| {
@@ -29200,7 +29336,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
             let assignable = if comparison_argument == constraint
                 || mapped_utility.is_some_and(|utility| {
-                    utility.kind == DefaultLibraryMappedUtilityKind::Pick
+                    utility.kind == MappedUtilityKind::Pick
                         && self.authenticated_deferred_pick_key(argument, constraint)
                 })
                 || dependent_react_alias.is_some_and(|react_alias| {
@@ -29326,13 +29462,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
     }
 
-    #[allow(clippy::too_many_lines)] // Generic arguments and their sole declared base share one proof.
+    #[allow(clippy::too_many_lines)] // Each inherited parameter must retain its written argument.
     fn authenticated_react_html_attribute_base(
         &self,
         argument: TypeId,
         constraint: TypeId,
         react_alias: ReactDetailedHtmlPropsPlan,
     ) -> bool {
+        let planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
         let Ok(derived) = validate_direct_generic_reference(self.store, argument) else {
             return false;
         };
@@ -29350,126 +29496,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return false;
         }
-        let Some(target_record) = self.store.type_payload(derived.target) else {
-            return false;
-        };
-        let TypeData::Interface(target) = target_record.data() else {
-            return false;
-        };
-        let Some(symbol) = target_record.symbol() else {
-            return false;
-        };
-        let Some(owner) = self.store.symbol(symbol) else {
-            return false;
-        };
-        let Some([declaration]) = owner.declarations() else {
-            return false;
-        };
-        let declaration = *declaration;
-        let Some(bound) = self.host.bound_file(declaration) else {
-            return false;
-        };
-        let Some(facts) = bound.source_facts() else {
-            return false;
-        };
-        let Ok(record) = preflight_node(self.store, self.host, declaration) else {
-            return false;
-        };
-        let NodeData::InterfaceDeclaration(interface) = &record.data else {
-            return false;
-        };
-        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
-        let Ok(name_record) = preflight_node(self.store, self.host, name) else {
-            return false;
-        };
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return false;
-        };
-        let Some(parameters) = interface.type_parameters.as_ref() else {
-            return false;
-        };
-        let [parameter_id] = parameters.nodes.as_slice() else {
-            return false;
-        };
-        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
-        let Ok(parameter_record) = preflight_node(self.store, self.host, parameter) else {
-            return false;
-        };
-        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
-            return false;
-        };
-        let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
-        let Ok(parameter_name_record) = preflight_node(self.store, self.host, parameter_name)
+        let Some(mut current) = self
+            .store
+            .type_payload(derived.target)
+            .and_then(TypeRecord::symbol)
         else {
-            return false;
-        };
-        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
-            return false;
-        };
-        let Some(parameter_symbol) = bound
-            .symbol(parameter)
-            .and_then(|symbol| self.store.get_merged_symbol(symbol))
-        else {
-            return false;
-        };
-        let Some(parameter_owner) = self.store.symbol(parameter_symbol) else {
-            return false;
-        };
-        let Some([declared_parameter]) = target.reference.resolved_type_arguments.as_deref() else {
-            return false;
-        };
-        let Some(clauses) = interface.heritage_clauses.as_ref() else {
-            return false;
-        };
-        let [clause_id] = clauses.nodes.as_slice() else {
-            return false;
-        };
-        let clause = NodeRef::new(declaration.arena, declaration.file, *clause_id);
-        let Ok(clause_record) = preflight_node(self.store, self.host, clause) else {
-            return false;
-        };
-        let NodeData::HeritageClause(heritage) = &clause_record.data else {
-            return false;
-        };
-        let [base_id] = heritage.types.nodes.as_slice() else {
-            return false;
-        };
-        let base_node = NodeRef::new(clause.arena, clause.file, *base_id);
-        let Ok(base_record) = preflight_node(self.store, self.host, base_node) else {
-            return false;
-        };
-        let NodeData::ExpressionWithTypeArguments(base_data) = &base_record.data else {
-            return false;
-        };
-        let base_name = NodeRef::new(base_node.arena, base_node.file, base_data.expression);
-        let Ok(base_name_record) = preflight_node(self.store, self.host, base_name) else {
-            return false;
-        };
-        let NodeData::Identifier(base_identifier) = &base_name_record.data else {
-            return false;
-        };
-        let Some(arguments) = base_data.type_arguments.as_ref() else {
-            return false;
-        };
-        let [argument_id] = arguments.nodes.as_slice() else {
-            return false;
-        };
-        let argument_node = NodeRef::new(base_node.arena, base_node.file, *argument_id);
-        let Ok(argument_record) = preflight_node(self.store, self.host, argument_node) else {
-            return false;
-        };
-        let NodeData::TypeReferenceNode(argument_data) = &argument_record.data else {
-            return false;
-        };
-        let argument_name = NodeRef::new(
-            argument_node.arena,
-            argument_node.file,
-            argument_data.type_name,
-        );
-        let Ok(argument_name_record) = preflight_node(self.store, self.host, argument_name) else {
-            return false;
-        };
-        let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
             return false;
         };
         let Some(exports) = self
@@ -29480,93 +29511,106 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         else {
             return false;
         };
-        if !facts.is_declaration_file()
-            || facts.is_default_library()
-            || record.kind != SyntaxKind::InterfaceDeclaration
-            || record.flags.0 != 0
-            || !self.host.symbol_matches(self.store, declaration, symbol)
-            || !owner.flags().contains(SymbolFlags::INTERFACE)
-            || owner
-                .flags()
-                .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
-                != SymbolFlags::NONE
-            || self.store.get_merged_symbol(symbol) != Some(symbol)
-            || self.store.get_parent_of_symbol(symbol) != Some(react_alias.namespace)
-            || name_record.kind != SyntaxKind::Identifier
-            || name_record.parent != Some(declaration.node)
-            || identifier.flow_node.is_some()
-            || owner.name().as_utf8() != Some(identifier.text.as_str())
-            || exports
-                .get_source(&identifier.text)
-                .and_then(|export| self.store.get_merged_symbol(export))
-                != Some(symbol)
-            || object_members::declared_type_declaration_parent(
-                self.store,
-                self.host,
-                declaration,
-                symbol,
-                name,
-                interface.modifiers.as_ref(),
-            ) != Ok(Some(react_alias.namespace))
-            || parameters.has_trailing_comma
-            || parameter_record.kind != SyntaxKind::TypeParameter
-            || parameter_record.parent != Some(declaration.node)
-            || parameter_data.constraint.is_some()
-            || parameter_data.default_type.is_some()
-            || parameter_data.expression.is_some()
-            || parameter_data.modifiers.is_some()
-            || parameter_name_record.kind != SyntaxKind::Identifier
-            || parameter_name_record.parent != Some(parameter.node)
-            || parameter_identifier.flow_node.is_some()
-            || !parameter_owner
-                .flags()
-                .contains(SymbolFlags::TYPE_PARAMETER)
-            || parameter_owner
-                .flags()
-                .without(SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT)
-                != SymbolFlags::NONE
-            || self.store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
-            || cached_ordinary_type_parameter_owner(self.store, *declared_parameter)
-                != Some(parameter_symbol)
-            || clauses.has_trailing_comma
-            || clause_record.kind != SyntaxKind::HeritageClause
-            || clause_record.parent != Some(declaration.node)
-            || heritage.token != SyntaxKind::ExtendsKeyword
-            || heritage.types.has_trailing_comma
-            || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
-            || base_record.parent != Some(clause.node)
-            || base_data.facts != 0
-            || arguments.has_trailing_comma
-            || base_name_record.kind != SyntaxKind::Identifier
-            || base_name_record.parent != Some(base_node.node)
-            || base_identifier.flow_node.is_some()
-            || base_identifier.text != "HTMLAttributes"
-            || argument_record.kind != SyntaxKind::TypeReference
-            || argument_record.parent != Some(base_node.node)
-            || argument_data.type_arguments.is_some()
-            || argument_name_record.kind != SyntaxKind::Identifier
-            || argument_name_record.parent != Some(argument_node.node)
-            || argument_identifier.flow_node.is_some()
-            || argument_identifier.text != parameter_identifier.text
-        {
-            return false;
+        let mut seen = HashSet::new();
+        for _ in 0..16 {
+            if current == react_alias.html_attributes {
+                return true;
+            }
+            if !seen.insert(current) {
+                return false;
+            }
+            let Some(owner) = self.store.symbol(current) else {
+                return false;
+            };
+            if self.store.get_parent_of_symbol(current) != Some(react_alias.namespace)
+                || exports
+                    .get(owner.name())
+                    .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                    != Some(current)
+                || owner.declarations().is_none_or(|declarations| {
+                    declarations.iter().any(|declaration| {
+                        self.host
+                            .bound_file(*declaration)
+                            .and_then(|bound| bound.source_facts())
+                            .is_none_or(|facts| {
+                                !facts.is_declaration_file() || facts.is_default_library()
+                            })
+                    })
+                })
+            {
+                return false;
+            }
+            let Ok(identity) =
+                object_members::plan_generic_interface_identity(self.store, self.host, current)
+            else {
+                return false;
+            };
+            let [parameter] = identity.parameters.as_slice() else {
+                return false;
+            };
+            let Some(parameter_owner) = self.store.symbol(*parameter) else {
+                return false;
+            };
+            let Some(parameter_name) = parameter_owner.name().as_utf8() else {
+                return false;
+            };
+            if parameter_owner.declarations().is_none_or(|declarations| declarations.iter().any(|declaration| {
+                !matches!(self.host.node(*declaration).map(|record| &record.data), Some(NodeData::TypeParameterDeclaration(data))
+                    if data.constraint.is_none() && data.default_type.is_none() && data.expression.is_none() && data.modifiers.is_none() && data.symbol.is_none())
+            })) {
+                return false;
+            }
+            if let Some(cached) = self
+                .store
+                .declared_type_links(current)
+                .and_then(|links| links.declared_type)
+            {
+                let Ok(reference) = validate_direct_generic_reference(self.store, cached) else {
+                    return false;
+                };
+                if reference.target != cached
+                    || reference.type_arguments.len() != 1
+                    || cached_ordinary_type_parameter_owner(self.store, reference.type_arguments[0])
+                        != Some(*parameter)
+                {
+                    return false;
+                }
+            }
+            let Some(heritage) = identity.heritage else {
+                return false;
+            };
+            let [inherited] = heritage.bases.as_slice() else {
+                return false;
+            };
+            let [argument] = inherited.type_arguments.as_slice() else {
+                return false;
+            };
+            let Some(base_name) = self
+                .store
+                .symbol(inherited.symbol)
+                .and_then(|owner| owner.name().as_utf8())
+            else {
+                return false;
+            };
+            if inherited.kind != DirectInterfaceBaseKind::Interface
+                || !inherited.defaults.is_empty()
+                || !planner.react_detailed_html_props_identifier(
+                    inherited.expression,
+                    inherited.node,
+                    base_name,
+                )
+                || !planner.react_detailed_html_props_parameter_reference(
+                    *argument,
+                    inherited.node,
+                    parameter_name,
+                    *parameter,
+                )
+            {
+                return false;
+            }
+            current = inherited.symbol;
         }
-
-        let Ok(mut callback_host) = self.host.name_resolver_host(self.store) else {
-            return false;
-        };
-        callback_host
-            .resolve_entity_name(base_name, SymbolFlags::TYPE)
-            .ok()
-            .flatten()
-            .and_then(|symbol| self.store.get_merged_symbol(symbol))
-            == Some(react_alias.html_attributes)
-            && callback_host
-                .resolve_entity_name(argument_name, SymbolFlags::TYPE)
-                .ok()
-                .flatten()
-                .and_then(|symbol| self.store.get_merged_symbol(symbol))
-                == Some(parameter_symbol)
+        false
     }
 
     fn instantiate_dependent_alias_type(
@@ -30179,6 +30223,20 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             | TypeData::Intrinsic(_)
             | TypeData::Literal(_)
             | TypeData::Interface(_) => Ok(()),
+            TypeData::Object(_)
+                if self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| type_ == bootstrap.empty_type_literal_type)
+                    && matches!(
+                        object_members::validate_resolved_declared_property_object(
+                            self.store, type_
+                        ),
+                        object_members::DeclaredPropertyObjectValidation::Valid(_)
+                    ) =>
+            {
+                Ok(())
+            }
             TypeData::Object(_) if self.is_literal_method_callable(type_) => Ok(()),
             TypeData::Union(union)
                 if !union
@@ -30728,13 +30786,19 @@ mod tests {
             "src: string; ",
             "addEventListener(type: string, listener: (this: HTMLImageElement) => void): void; ",
             "} ",
-            "declare var HTMLImageElement: unknown;",
+            "declare var HTMLImageElement: unknown; ",
+            "interface HTMLMediaElement extends HTMLElement { volume: number; } ",
+            "declare var HTMLMediaElement: unknown; ",
+            "interface HTMLAudioElement extends HTMLMediaElement {} ",
+            "declare var HTMLAudioElement: unknown;",
         ));
         let react_members = concat!(
             "interface DOMAttributes<T> {} ",
             "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
             "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
             "interface ImgHTMLAttributes<T> extends HTMLAttributes<T> { src?: string; } ",
+            "interface MediaHTMLAttributes<T> extends HTMLAttributes<T> { src?: string; } ",
+            "interface AudioHTMLAttributes<T> extends MediaHTMLAttributes<T> {} ",
             "interface Attributes { key?: string; } ",
             "interface ClassAttributes<T> extends Attributes { ref?: T; } ",
             "type DetailedHTMLProps<E extends HTMLAttributes<T>, T> = ClassAttributes<T> & E; ",
@@ -30744,6 +30808,7 @@ mod tests {
             "div: React.DetailedHTMLProps<React.HTMLAttributes<HTMLDivElement>, HTMLDivElement>; ",
             "h1: React.DetailedHTMLProps<React.HTMLAttributes<HTMLHeadingElement>, HTMLHeadingElement>; ",
             "img: React.DetailedHTMLProps<React.ImgHTMLAttributes<HTMLImageElement>, HTMLImageElement>; ",
+            "audio: React.DetailedHTMLProps<React.AudioHTMLAttributes<HTMLAudioElement>, HTMLAudioElement>; ",
             "}",
         );
         let react_source = if let Some(module_name) = ambient_module_name {
@@ -36614,6 +36679,137 @@ mod tests {
     }
 
     #[test]
+    fn mapped_alias_optionality_uses_source_modifiers_in_all_strict_modes() {
+        for (strict_null_checks, exact_optional_property_types) in
+            [(false, false), (true, false), (true, true)]
+        {
+            let mut fixture = fixture_with_source_facts(
+                concat!(
+                    "type Solid<Model> = { [Key in keyof Model]-?: Model[Key] }; ",
+                    "type Required<Model> = { [Key in keyof Model]?: Model[Key] }; ",
+                    "interface Shape { readonly optional?: number; explicit?: number | undefined; ",
+                    "fixed: string | undefined; nothing?: undefined; empty?: void; } ",
+                    "type Hard = Solid<Shape>; type Soft = Required<Shape>;",
+                ),
+                CanonicalModuleState::Script,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types,
+                },
+                false,
+                |_| {},
+            );
+            let hard = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Hard");
+            let soft = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Soft");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let hard_type = query_declared(
+                &mut fixture,
+                hard,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let soft_type = query_declared(
+                &mut fixture,
+                soft,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let (number, string, undefined, void, never) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.number_type,
+                    bootstrap.string_type,
+                    bootstrap.undefined_type,
+                    bootstrap.void_type,
+                    bootstrap.never_type,
+                )
+            };
+            for (name, expected) in [
+                ("optional", vec![number]),
+                (
+                    "explicit",
+                    if exact_optional_property_types {
+                        vec![number, undefined]
+                    } else {
+                        vec![number]
+                    },
+                ),
+                (
+                    "fixed",
+                    if strict_null_checks {
+                        vec![string, undefined]
+                    } else {
+                        vec![string]
+                    },
+                ),
+                (
+                    "nothing",
+                    vec![if strict_null_checks && !exact_optional_property_types {
+                        never
+                    } else {
+                        undefined
+                    }],
+                ),
+                (
+                    "empty",
+                    vec![if strict_null_checks && !exact_optional_property_types {
+                        never
+                    } else {
+                        void
+                    }],
+                ),
+            ] {
+                let property = fixture
+                    .store
+                    .resolve_mapped_type_property(hard_type, name, MappedTypeModifiers::NONE)
+                    .unwrap()
+                    .unwrap();
+                assert!(!property.is_optional(), "{name}");
+                assert_eq!(property.is_readonly(), name == "optional");
+                let constituents = match fixture
+                    .store
+                    .type_payload(property.type_id())
+                    .unwrap()
+                    .data()
+                {
+                    TypeData::Union(union) => union.union.types.clone(),
+                    _ => vec![property.type_id()],
+                };
+                assert!(
+                    constituents.len() == expected.len()
+                        && expected.iter().all(|type_| constituents.contains(type_)),
+                    "{name}, strict={strict_null_checks}, exact={exact_optional_property_types}: {constituents:?} != {expected:?}"
+                );
+                let optional = fixture
+                    .store
+                    .resolve_mapped_type_property(soft_type, name, MappedTypeModifiers::NONE)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    optional.is_optional(),
+                    "an alias name must not change its written modifiers"
+                );
+            }
+            let warm = store_state(&fixture.store);
+            for (alias, expected) in [(hard, hard_type), (soft, soft_type)] {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics
+                    ),
+                    Ok(expected)
+                );
+            }
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn default_library_pick_and_partial_retain_deferred_generic_sources() {
         let mut fixture = default_library_fixture(concat!(
             "type Partial<T> = { [P in keyof T]?: T[P] }; ",
@@ -36650,6 +36846,212 @@ mod tests {
             assert_eq!(union_state(&fixture.store), warm);
         }
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_mapped_intersections_keep_deferred_constituents_and_alias_identity() {
+        let mut fixture = fixture(concat!(
+            "type Solid<Model> = { [Key in keyof Model]-?: Model[Key] }; ",
+            "type Combined<Left, Right> = Left & Solid<Right>;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Combined");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let parameters = fixture
+            .store
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .clone()
+            .unwrap();
+        let projection = fixture
+            .store
+            .validate_deferred_intersection_type(result)
+            .unwrap();
+        assert_eq!(projection.alias_symbol, Some(alias));
+        assert_eq!(projection.alias_arguments, parameters);
+        let [left, right] = projection.types.as_slice() else {
+            panic!("both generic intersection constituents must remain")
+        };
+        assert_eq!(*left, parameters[0]);
+        fixture.store.validate_deferred_mapped_type(*right).unwrap();
+        let TypeData::Mapped(mapped) = fixture.store.type_payload(*right).unwrap().data() else {
+            unreachable!()
+        };
+        assert_eq!(mapped.modifiers_type, Some(parameters[1]));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            ),
+            Ok(result)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_alias_defaults_keep_canonical_empty_object_identity() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Value> { value: Value; } ",
+            "type Defaulted<Value = {}> = Box<Value>; type Chosen = Defaulted;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Chosen");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let result = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let reference = validate_direct_generic_reference(&fixture.store, result).unwrap();
+        assert_eq!(
+            reference.type_arguments,
+            [fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_type_literal_type]
+        );
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            ),
+            Ok(result)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn mapped_alias_templates_substitute_indexed_values_inside_references() {
+        for (strict, exact) in [(false, false), (true, false), (true, true)] {
+            let mut fixture = fixture_with_source_facts(
+                concat!(
+                    "interface Wrapper<Value> { value: Value; } ",
+                    "type Cells<Model> = { [Key in keyof Model]-?: Wrapper<Model[Key]> }; ",
+                    "interface Shape { optional?: number; fixed: string; } ",
+                    "type Concrete = Cells<Shape>; type Loose = Cells<any>;",
+                ),
+                CanonicalModuleState::Script,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: strict,
+                    exact_optional_property_types: exact,
+                },
+                false,
+                |_| {},
+            );
+            let concrete = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Concrete");
+            let loose = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Loose");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let concrete_type = query_declared(
+                &mut fixture,
+                concrete,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let loose_type = query_declared(
+                &mut fixture,
+                loose,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let (number, string, undefined, any) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.number_type,
+                    bootstrap.string_type,
+                    bootstrap.undefined_type,
+                    bootstrap.any_type,
+                )
+            };
+            for (name, expected) in [
+                (
+                    "optional",
+                    if strict {
+                        vec![number, undefined]
+                    } else {
+                        vec![number]
+                    },
+                ),
+                ("fixed", vec![string]),
+            ] {
+                let property = fixture
+                    .store
+                    .resolve_mapped_type_property(concrete_type, name, MappedTypeModifiers::NONE)
+                    .unwrap()
+                    .unwrap();
+                assert!(!property.is_optional());
+                let reference =
+                    validate_direct_generic_reference(&fixture.store, property.type_id()).unwrap();
+                let [argument] = reference.type_arguments.as_slice() else {
+                    panic!("one written wrapper argument")
+                };
+                let actual = match fixture.store.type_payload(*argument).unwrap().data() {
+                    TypeData::Union(union) => union.union.types.clone(),
+                    _ => vec![*argument],
+                };
+                assert!(
+                    actual.len() == expected.len()
+                        && expected.iter().all(|expected| actual.contains(expected)),
+                    "{name}: actual={actual:?}, expected={expected:?}, strict={strict}, exact={exact}"
+                );
+            }
+            fixture
+                .store
+                .resolve_mapped_type_members(loose_type, MappedTypeModifiers::NONE)
+                .unwrap();
+            let indexes = fixture
+                .store
+                .type_payload(loose_type)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .clone()
+                .unwrap();
+            assert_eq!(indexes.len(), 3);
+            for index in indexes {
+                let value = fixture.store.index_info(index).unwrap().value_type();
+                assert_eq!(
+                    validate_direct_generic_reference(&fixture.store, value)
+                        .unwrap()
+                        .type_arguments,
+                    [any]
+                );
+            }
+            let warm = store_state(&fixture.store);
+            for (alias, expected) in [(concrete, concrete_type), (loose, loose_type)] {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics
+                    ),
+                    Ok(expected)
+                );
+            }
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
@@ -36782,49 +37184,79 @@ mod tests {
     }
 
     #[test]
-    fn mapped_utilities_require_exact_default_library_declarations() {
+    fn mapped_utilities_follow_structure_instead_of_library_names() {
         let cases = [
             (
                 fixture("type Partial<T> = { [P in keyof T]?: T[P] };"),
                 "Partial",
+                true,
             ),
             (
                 default_library_fixture("type Partial<U> = { [P in keyof U]?: U[P] };"),
                 "Partial",
+                true,
             ),
             (
                 default_library_fixture("type Partial<T> = { [P in keyof T]: T[P] };"),
                 "Partial",
+                true,
             ),
             (
                 fixture("type Pick<T, K extends keyof T> = { [P in K]: T[P] };"),
                 "Pick",
+                true,
+            ),
+            (
+                fixture(concat!(
+                    "type Subset<Model, Keys extends keyof Model> = { [Key in Keys]: Model[Key] }; ",
+                    "interface Shape { fixed: string; } type Selected = Subset<Shape, 'fixed'>;",
+                )),
+                "Selected",
+                true,
             ),
             (
                 default_library_fixture("type Pick<T, K extends keyof any> = { [P in K]: T[P] };"),
                 "Pick",
+                false,
             ),
             (
                 default_library_fixture("type Pick<T, K extends keyof T> = { [P in K]?: T[P] };"),
                 "Pick",
+                false,
             ),
         ];
-        for (mut fixture, name) in cases {
+        for (mut fixture, name, supported) in cases {
             let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
             let before = union_state(&fixture.store);
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
-            assert!(
-                query_declared(
-                    &mut fixture,
-                    alias,
-                    CanonicalTypeQueryOptions::default(),
-                    &mut diagnostics,
-                )
-                .is_err(),
-                "utility: {name}",
+            let result = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
             );
-            assert_eq!(union_state(&fixture.store), before, "utility: {name}");
+            if supported {
+                let resolved = result.unwrap();
+                assert!(matches!(
+                    fixture.store.type_payload(resolved).unwrap().data(),
+                    TypeData::Mapped(_)
+                ));
+                let warm = union_state(&fixture.store);
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(resolved)
+                );
+                assert_eq!(union_state(&fixture.store), warm, "utility: {name}");
+            } else {
+                assert!(result.is_err(), "utility: {name}");
+                assert_eq!(union_state(&fixture.store), before, "utility: {name}");
+            }
             assert!(diagnostics.is_empty(), "utility: {name}");
         }
     }
@@ -45211,6 +45643,102 @@ mod tests {
             Ok(image),
         );
         assert_eq!(store_state(&store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn react_transitive_attribute_constraints_replay_and_reject_changed_base_exports() {
+        let ReactDomFixture {
+            library,
+            react,
+            source,
+            library_file,
+            react_file,
+            source_file,
+            files,
+            mut store,
+        } = react_dom_fixture_with_owner(true, Some("react"));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let annotation = react_dom_property_annotation(&react, react_file, "audio");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(annotation)
+        .unwrap();
+        let projection = store.validate_deferred_intersection_type(resolved).unwrap();
+        let aliases = HashMap::new();
+        let proof = TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+            .authenticated_react_detailed_html_props_alias(projection.alias_symbol.unwrap())
+            .unwrap();
+        let html = store
+            .declared_type_links(proof.html_attributes)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let constraint = store
+            .create_direct_generic_reference_type(html, &[projection.alias_arguments[1]])
+            .unwrap();
+        let argument = projection.alias_arguments[0];
+        let warm = store_state(&store);
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .authenticated_react_html_attribute_base(argument, constraint, proof)
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            )
+            .unwrap()
+            .get_type_from_type_node(annotation),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&store), warm);
+        let exports = store.symbol(proof.namespace).unwrap().exports().unwrap();
+        let media = store
+            .symbol_table(exports)
+            .unwrap()
+            .get_source("MediaHTMLAttributes")
+            .unwrap();
+        assert_eq!(
+            store.insert_symbol(
+                exports,
+                EscapedName::source("MediaHTMLAttributes"),
+                proof.class_attributes
+            ),
+            Some(Some(media))
+        );
+        let changed = store_state(&store);
+        let query = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(!query.authenticated_react_html_attribute_base(argument, constraint, proof));
+        assert_eq!(store_state(&store), changed);
         assert!(diagnostics.is_empty());
     }
 
