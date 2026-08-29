@@ -208,14 +208,36 @@ fn resolved_type(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> TypeId
         .expect("source checking publishes the node type")
 }
 
+fn assertion_target_type(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    assertion: AssertionParts,
+    value_symbol: SemanticSymbolId,
+) -> TypeId {
+    match parsed.arena.get(assertion.target.node).unwrap().kind {
+        SyntaxKind::NumberKeyword | SyntaxKind::StringKeyword => {
+            assert!(context.store().type_node_links(assertion.target).is_none());
+            let before = snapshot(context, &assertion.nodes(), &[value_symbol]);
+            let target = context.get_type_from_type_node(assertion.target).unwrap();
+            assert!(context.store().type_node_links(assertion.target).is_none());
+            assert_eq!(
+                snapshot(context, &assertion.nodes(), &[value_symbol]),
+                before,
+            );
+            target
+        }
+        _ => resolved_type(context, assertion.target),
+    }
+}
+
 fn assert_default_assertion(
-    context: &CanonicalCheckerContext<'_>,
+    context: &mut CanonicalCheckerContext<'_>,
     parsed: &ParseResult,
     assertion: AssertionParts,
     owner: SemanticSymbolId,
 ) -> (TypeId, TypeId) {
     assert_eq!(default_owner(context, parsed, assertion), owner);
-    let target = resolved_type(context, assertion.target);
+    let target = assertion_target_type(context, parsed, assertion, owner);
     let operand = resolved_type(context, assertion.operand);
     assert_eq!(resolved_type(context, assertion.expression), target);
     assert_eq!(
@@ -317,7 +339,7 @@ fn local_annotated_call_default_assertion_keeps_the_binder_owner() {
 
     context.check_source_file(FILE).unwrap();
 
-    let (target, operand) = assert_default_assertion(&context, &source, assertion, owner);
+    let (target, operand) = assert_default_assertion(&mut context, &source, assertion, owner);
     assert_eq!(
         target,
         context.store().intrinsic_bootstrap().unwrap().number_type
@@ -325,7 +347,7 @@ fn local_annotated_call_default_assertion_keeps_the_binder_owner() {
     assert_eq!(operand, target);
     assert!(context.diagnostics().is_empty());
     assert_replay_stable(&mut context, &assertion.nodes(), &[owner, function]);
-    assert_default_assertion(&context, &source, assertion, owner);
+    assert_default_assertion(&mut context, &source, assertion, owner);
 }
 
 #[test]
@@ -338,7 +360,7 @@ fn local_structural_default_assertion_keeps_target_and_operand_separate() {
 
     context.check_source_file(FILE).unwrap();
 
-    let (target, operand) = assert_default_assertion(&context, &source, assertion, owner);
+    let (target, operand) = assert_default_assertion(&mut context, &source, assertion, owner);
     assert_ne!(target, operand);
     assert_eq!(
         context.type_to_string(target).unwrap(),
@@ -356,7 +378,7 @@ fn local_structural_default_assertion_keeps_target_and_operand_separate() {
     );
     assert_eq!(snapshot(&context, &assertion.nodes(), &[owner]), checked);
     assert_replay_stable(&mut context, &assertion.nodes(), &[owner]);
-    assert_default_assertion(&context, &source, assertion, owner);
+    assert_default_assertion(&mut context, &source, assertion, owner);
 }
 
 // Importer and provider identities and both replay orders form one control.
@@ -392,7 +414,7 @@ fn imported_call_default_assertion_keeps_the_type_only_target_out_of_values() {
 
     context.check_source_file(FILE).unwrap();
 
-    let (target, operand) = assert_default_assertion(&context, &source, assertion, owner);
+    let (target, operand) = assert_default_assertion(&mut context, &source, assertion, owner);
     assert_ne!(target, operand);
     assert_eq!(context.type_to_string(target).unwrap(), "ViteUserConfig");
     assert_eq!(
@@ -456,7 +478,7 @@ fn imported_call_default_assertion_keeps_the_type_only_target_out_of_values() {
             .unwrap()
             .type_checked
     );
-    assert_default_assertion(&context, &source, assertion, owner);
+    assert_default_assertion(&mut context, &source, assertion, owner);
     for symbol in [imported_type, declared_type] {
         assert!(context.store().value_symbol_links(symbol).is_none());
     }
@@ -483,7 +505,7 @@ fn imported_literal_default_assertion_uses_the_interface_as_context_only() {
 
     context.check_source_file(FILE).unwrap();
 
-    let (target, operand) = assert_default_assertion(&context, &source, assertion, owner);
+    let (target, operand) = assert_default_assertion(&mut context, &source, assertion, owner);
     assert_ne!(target, operand);
     assert_eq!(context.type_to_string(target).unwrap(), "ViteUserConfig");
     assert_eq!(
@@ -511,7 +533,7 @@ fn imported_literal_default_assertion_uses_the_interface_as_context_only() {
         &assertion.nodes(),
         &[owner, imported_type, declared_type],
     );
-    assert_default_assertion(&context, &source, assertion, owner);
+    assert_default_assertion(&mut context, &source, assertion, owner);
 }
 
 #[test]
@@ -588,7 +610,7 @@ fn nonoverlapping_default_assertion_reports_ts2352_once() {
 
     context.check_source_file(FILE).unwrap();
 
-    let (target, operand) = assert_default_assertion(&context, &source, assertion, owner);
+    let (target, operand) = assert_default_assertion(&mut context, &source, assertion, owner);
     assert_eq!(
         target,
         context.store().intrinsic_bootstrap().unwrap().string_type
@@ -607,7 +629,7 @@ fn nonoverlapping_default_assertion_reports_ts2352_once() {
     );
     assert!(diagnostic.related_information.is_empty());
     assert_replay_stable(&mut context, &assertion.nodes(), &[owner]);
-    assert_default_assertion(&context, &source, assertion, owner);
+    assert_default_assertion(&mut context, &source, assertion, owner);
 }
 
 #[test]
@@ -680,7 +702,7 @@ fn local_satisfies_keeps_the_operand_type_without_a_deferred_cast() {
     context.check_source_file(FILE).unwrap();
 
     let result = resolved_type(&context, assertion.expression);
-    let target = resolved_type(&context, assertion.target);
+    let target = assertion_target_type(&mut context, &source, assertion, variable);
     assert_eq!(result, resolved_type(&context, assertion.operand));
     assert_ne!(result, target);
     assert_eq!(context.type_to_string(result).unwrap(), "1");
