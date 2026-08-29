@@ -37,6 +37,7 @@ use super::{
     instantiate::PropertyObjectAliasRecovery,
     instantiated_members::{
         InstantiatedIndexRecovery, InstantiatedPropertyAliasCallable, InstantiatedPropertyRecovery,
+        PublishedInterfaceMethodRecovery,
     },
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
@@ -613,6 +614,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_alias_callables: HashMap<TypeId, InstantiatedPropertyAliasCallable>,
+    published_interface_method_recoveries: HashMap<TypeId, PublishedInterfaceMethodRecovery>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
     instantiated_index_recoveries: HashMap<IndexInfoId, InstantiatedIndexRecovery>,
     property_object_alias_recoveries: HashMap<TypeId, PropertyObjectAliasRecovery>,
@@ -784,6 +786,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
             instantiated_property_alias_callables: HashMap::new(),
+            published_interface_method_recoveries: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
             instantiated_index_recoveries: HashMap::new(),
             property_object_alias_recoveries: HashMap::new(),
@@ -5557,6 +5560,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for recovery in self.instantiated_property_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
         }
+        for recovery in self.published_interface_method_recoveries.values_mut() {
+            recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
+        }
         for recovery in self.instantiated_index_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
         }
@@ -9636,6 +9642,72 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn published_interface_method_recovery(
+        &self,
+        type_: TypeId,
+    ) -> Option<&PublishedInterfaceMethodRecovery> {
+        self.observe_relation_type_read(type_);
+        self.published_interface_method_recoveries.get(&type_)
+    }
+
+    pub(super) fn published_interface_callback_recovery(
+        &self,
+        actual: TypeId,
+    ) -> Option<&PublishedInterfaceMethodRecovery> {
+        self.observe_relation_type_read(actual);
+        self.published_interface_method_recoveries
+            .values()
+            .find(|recovery| recovery.contains_callback(actual))
+    }
+
+    pub(super) fn try_reserve_published_interface_method_recoveries(&mut self) -> bool {
+        self.published_interface_method_recoveries
+            .try_reserve(1)
+            .is_ok()
+    }
+
+    /// Only the selected method producer can construct this recovery evidence.
+    pub(super) fn publish_published_interface_method_recovery(
+        &mut self,
+        recovery: PublishedInterfaceMethodRecovery,
+    ) -> bool {
+        let type_ = recovery.result_type();
+        if self
+            .published_interface_method_recoveries
+            .contains_key(&type_)
+            || !recovery.matches_current_type(self)
+        {
+            return false;
+        }
+        self.published_interface_method_recoveries
+            .insert(type_, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_interface_method_recovery_len(&self) -> usize {
+        self.published_interface_method_recoveries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_published_interface_method_recovery_for_test(
+        &mut self,
+        type_: TypeId,
+        recovery: Option<PublishedInterfaceMethodRecovery>,
+    ) -> Option<PublishedInterfaceMethodRecovery> {
+        let previous = match recovery {
+            Some(recovery) => self
+                .published_interface_method_recoveries
+                .insert(type_, recovery),
+            None => self.published_interface_method_recoveries.remove(&type_),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
     pub(super) fn try_reserve_instantiated_property_alias_callables(&mut self) -> bool {
         self.instantiated_property_alias_callables
             .try_reserve(1)
@@ -12732,6 +12804,53 @@ mod tests {
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
+
+    #[test]
+    fn published_interface_method_recovery_misses_are_observed_and_test_writes_invalidate() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let method = bootstrap.number_type;
+        let callback = bootstrap.string_type;
+        let observation = store.begin_relation_read_observation().unwrap();
+        assert!(store.published_interface_method_recovery(method).is_none());
+        assert!(
+            store
+                .published_interface_callback_recovery(callback)
+                .is_none()
+        );
+        let key = CacheHashKey::from_halves(37, 41);
+        assert!(store.commit_relation_cache_writes(
+            observation,
+            RelationKind::Assignable,
+            [(key, RelationComparisonResult::SUCCEEDED)],
+        ));
+        assert!(store.relation_type_is_observable(method));
+        assert!(store.relation_type_is_observable(callback));
+        store.union_cache_needs_validation = false;
+
+        assert!(store.try_reserve_published_interface_method_recoveries());
+        assert_eq!(store.published_interface_method_recovery_len(), 0);
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::SUCCEEDED
+        );
+        assert!(!store.union_cache_needs_validation);
+
+        assert!(
+            store
+                .replace_published_interface_method_recovery_for_test(method, None)
+                .is_none()
+        );
+        assert_eq!(store.published_interface_method_recovery_len(), 0);
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        assert!(store.union_cache_needs_validation);
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)] // One real producer result exercises immutable storage, poisoning, and restoration.

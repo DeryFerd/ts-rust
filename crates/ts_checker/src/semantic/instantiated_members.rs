@@ -363,6 +363,235 @@ pub(super) struct InstantiatedPropertyRecovery {
     identity: Vec<RecoveredPropertyTypeIdentity>,
 }
 
+/// A selected method keeps its own recovery proof, without inventing a member proxy.
+#[derive(Debug)]
+pub(super) struct PublishedInterfaceMethodRecovery {
+    valid: bool,
+    result: TypeId,
+    plan: PublishedInterfaceMethodPlan,
+    mapper: TypeMapperId,
+    array_targets: CanonicalArrayTargets,
+    error_type: TypeId,
+    snapshot: PublishedInterfaceMethodRecoverySnapshot,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PublishedInterfaceMethodRecoverySnapshot {
+    signatures: Vec<RecoveredPropertySignatureIdentity>,
+    identity: Vec<RecoveredPropertyTypeIdentity>,
+    callbacks: Vec<PublishedInterfaceMethodCallback>,
+    signature_metadata: Vec<PublishedMethodSignatureMetadata>,
+    mapper_source_data: Vec<TypeParameterData>,
+    outer_parameter_data: Vec<(TypeId, TypeParameterData)>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PublishedInterfaceMethodCallback {
+    source: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    overload_index: usize,
+    parameter_index: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PublishedMethodSignatureMetadata {
+    signature: SignatureId,
+    resolved_min_argument_count: i32,
+    isolated_signature_type: Option<TypeId>,
+    circular_return: bool,
+    predicate: Option<(
+        super::signatures::TypePredicateKind,
+        i32,
+        String,
+        Option<TypeId>,
+    )>,
+}
+
+/// This reader checks stored identities without entering the result's callable provider.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PublishedInterfaceMethodRecoveryIdentity<'a> {
+    recovery: &'a PublishedInterfaceMethodRecovery,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublishedInterfaceCallbackRecoveryIdentity<'a> {
+    method: PublishedInterfaceMethodRecoveryIdentity<'a>,
+    callback: &'a PublishedInterfaceMethodCallback,
+}
+
+impl PublishedInterfaceMethodRecovery {
+    pub(super) const fn result_type(&self) -> TypeId {
+        self.result
+    }
+
+    pub(super) fn contains_callback(&self, actual: TypeId) -> bool {
+        self.snapshot
+            .callbacks
+            .iter()
+            .any(|callback| callback.actual == actual)
+    }
+
+    pub(super) fn invalidate_for_raw_write(&mut self, symbol: SemanticSymbolId) -> bool {
+        let invalidated = self.valid
+            && (symbol == self.plan.method
+                || self.snapshot.signatures.iter().any(|signature| {
+                    signature
+                        .parameters
+                        .iter()
+                        .any(|(parameter, _)| *parameter == symbol)
+                })
+                || self
+                    .snapshot
+                    .identity
+                    .iter()
+                    .any(|identity| match &identity.shape {
+                        RecoveredPropertyTypeShape::Object { signatures, .. } => {
+                            signatures.iter().any(|signature| {
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .any(|(parameter, _)| *parameter == symbol)
+                                    || signature
+                                        .this_parameter
+                                        .as_ref()
+                                        .is_some_and(|(parameter, _)| *parameter == symbol)
+                            })
+                        }
+                        _ => false,
+                    }));
+        if invalidated {
+            self.valid = false;
+        }
+        invalidated
+    }
+
+    pub(super) fn matches_current_type(&self, store: &CanonicalTypeMapperStore) -> bool {
+        let Some(record) = store.type_payload(self.result) else {
+            return false;
+        };
+        let TypeData::Object(object) = record.data() else {
+            return false;
+        };
+        let signatures = self
+            .snapshot
+            .signatures
+            .iter()
+            .map(|signature| signature.signature)
+            .collect::<Vec<_>>();
+        self.valid
+            && self.result != self.plan.source
+            && record.flags() == TypeFlags::OBJECT
+            && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            && record.symbol() == Some(self.plan.method)
+            && record.alias().is_none()
+            && object.target == Some(self.plan.source)
+            && object.mapper == Some(self.mapper)
+            && object.instantiations == TypeCacheState::Unallocated
+            && object.structured.members.is_none()
+            && object.structured.properties.is_none()
+            && object.structured.index_infos.is_none()
+            && object.structured.constrained == ConstrainedTypeData::default()
+            && object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_none()
+            && object.structured.call_signature_count == signatures.len()
+            && object.structured.signatures.as_deref() == Some(signatures.as_slice())
+            && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                bootstrap.error_type == self.error_type
+                    && store.validate_union_constituent(self.error_type).is_ok()
+            })
+            && plan_published_interface_method(
+                store,
+                Some(self.array_targets),
+                self.plan.receiver,
+                self.plan.method,
+            )
+            .is_ok_and(|plan| plan == self.plan)
+            && store.type_mapper_has_exact_endpoints(
+                self.mapper,
+                &self.plan.mapper_sources,
+                &self.plan.mapper_targets,
+            ) == Some(true)
+            && published_method_recovery_snapshot(
+                store,
+                &self.plan,
+                self.mapper,
+                &signatures,
+                self.array_targets,
+                self.error_type,
+            )
+            .is_some_and(|snapshot| snapshot == self.snapshot)
+    }
+
+    pub(super) fn checked_identity<'a>(
+        &'a self,
+        store: &CanonicalTypeMapperStore,
+    ) -> Option<PublishedInterfaceMethodRecoveryIdentity<'a>> {
+        (store
+            .published_interface_method_recovery(self.result)
+            .is_some_and(|registered| std::ptr::eq(registered, self))
+            && self.matches_current_type(store))
+        .then_some(PublishedInterfaceMethodRecoveryIdentity { recovery: self })
+    }
+}
+
+impl PublishedInterfaceMethodRecoveryIdentity<'_> {
+    pub(super) const fn source_type(self) -> TypeId {
+        self.recovery.plan.source
+    }
+    pub(super) const fn result_type(self) -> TypeId {
+        self.recovery.result
+    }
+    pub(super) const fn method(self) -> SemanticSymbolId {
+        self.recovery.plan.method
+    }
+    pub(super) const fn mapper(self) -> TypeMapperId {
+        self.recovery.mapper
+    }
+
+    pub(super) fn receiver(self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
+        self.recovery
+            .matches_current_type(store)
+            .then_some(self.recovery.plan.receiver)
+    }
+
+    pub(super) fn signature_mapper(
+        self,
+        source: SignatureId,
+        actual: SignatureId,
+    ) -> Option<TypeMapperId> {
+        let index = self
+            .recovery
+            .plan
+            .signatures
+            .iter()
+            .position(|signature| signature.source == source)?;
+        let signature = self.recovery.snapshot.signatures.get(index)?;
+        (signature.signature == actual && signature.target == Some(source))
+            .then_some(signature.mapper)
+            .flatten()
+    }
+}
+
+impl<'a> PublishedInterfaceMethodRecoveryIdentity<'a> {
+    fn callback(
+        self,
+        source: TypeId,
+        actual: TypeId,
+        mapper: TypeMapperId,
+    ) -> Option<PublishedInterfaceCallbackRecoveryIdentity<'a>> {
+        let callback = self.recovery.snapshot.callbacks.iter().find(|callback| {
+            callback.source == source && callback.actual == actual && callback.mapper == mapper
+        })?;
+        Some(PublishedInterfaceCallbackRecoveryIdentity {
+            method: self,
+            callback,
+        })
+    }
+}
+
 /// Records an index result only after its producer observes a caller limit event.
 #[derive(Debug)]
 pub(super) struct InstantiatedIndexRecovery {
@@ -999,6 +1228,246 @@ pub(super) fn property_recovery_type_identity(
     Some(identity)
 }
 
+fn published_recovery_signature_identity(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    roots: &mut Vec<TypeId>,
+) -> Option<RecoveredPropertySignatureIdentity> {
+    let record = store.signature(signature)?;
+    let type_parameter_data = record
+        .type_parameters()
+        .iter()
+        .map(|type_| {
+            let TypeData::TypeParameter(parameter) = store.type_payload(*type_)?.data() else {
+                return None;
+            };
+            let mut parameter = parameter.clone();
+            parameter.constrained = ConstrainedTypeData::default();
+            roots.extend(parameter.constraint);
+            roots.extend(parameter.resolved_default_type);
+            Some(parameter)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let parameters = record
+        .parameters()
+        .iter()
+        .map(|symbol| Some((*symbol, store.value_symbol_links(*symbol)?.clone())))
+        .collect::<Option<Vec<_>>>()?;
+    let this_parameter = match record.this_parameter() {
+        Some(symbol) => Some((symbol, store.value_symbol_links(symbol)?.clone())),
+        None => None,
+    };
+    roots.extend(record.type_parameters());
+    roots.extend(record.resolved_return_type());
+    for (_, links) in parameters.iter().chain(this_parameter.iter()) {
+        roots.extend(links.resolved_type);
+        roots.extend(links.write_type);
+        roots.extend(links.name_type);
+    }
+    if let Some(predicate) = record.resolved_type_predicate() {
+        roots.extend(store.type_predicate(predicate)?.type_id());
+    }
+    Some(RecoveredPropertySignatureIdentity {
+        signature,
+        flags: record.flags(),
+        declaration: record.declaration(),
+        type_parameters: record.type_parameters().to_vec(),
+        type_parameter_data,
+        parameters,
+        this_parameter,
+        min_argument_count: record.min_argument_count(),
+        return_type: record.resolved_return_type(),
+        predicate: record.resolved_type_predicate(),
+        target: record.target(),
+        mapper: record.mapper(),
+        composite: record
+            .composite()
+            .map(|composite| (composite.is_union(), composite.signatures().to_vec())),
+    })
+}
+
+/// Captures all produced signature data before the final method object is published.
+#[allow(clippy::too_many_lines)] // The source and copied callback positions form one proof.
+fn published_method_recovery_snapshot(
+    store: &CanonicalTypeMapperStore,
+    plan: &PublishedInterfaceMethodPlan,
+    mapper: TypeMapperId,
+    signatures: &[SignatureId],
+    array_targets: CanonicalArrayTargets,
+    error_type: TypeId,
+) -> Option<PublishedInterfaceMethodRecoverySnapshot> {
+    if signatures.len() != plan.signatures.len()
+        || store.type_mapper_has_exact_endpoints(mapper, &plan.mapper_sources, &plan.mapper_targets)
+            != Some(true)
+    {
+        return None;
+    }
+    let mut roots = vec![plan.source, plan.receiver, error_type];
+    roots.extend(&plan.mapper_sources);
+    roots.extend(&plan.mapper_targets);
+    let mapper_source_data = plan
+        .mapper_sources
+        .iter()
+        .map(|type_| {
+            let TypeData::TypeParameter(parameter) = store.type_payload(*type_)?.data() else {
+                return None;
+            };
+            let mut parameter = parameter.clone();
+            parameter.constrained = ConstrainedTypeData::default();
+            roots.extend(parameter.constraint);
+            roots.extend(parameter.resolved_default_type);
+            Some(parameter)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut callbacks = Vec::new();
+    let mut copied = Vec::with_capacity(signatures.len());
+    for (overload_index, (&signature, source)) in
+        signatures.iter().zip(&plan.signatures).enumerate()
+    {
+        let record = store.signature(signature)?;
+        let original = store.signature(source.source)?;
+        let signature_mapper = record.mapper()?;
+        if record.target() != Some(source.source)
+            || record.declaration() != original.declaration()
+            || record.parameters().len() != source.parameter_types.len()
+            || record.type_parameters().len() != original.type_parameters().len()
+        {
+            return None;
+        }
+        if original.type_parameters().is_empty() {
+            if signature_mapper != mapper {
+                return None;
+            }
+        } else {
+            let super::mapper::TypeMapperApplication::Composite { first, second } =
+                store.mapper_application(signature_mapper, original.type_parameters()[0])?
+            else {
+                return None;
+            };
+            if second != mapper
+                || store.type_mapper_has_exact_endpoints(
+                    first,
+                    original.type_parameters(),
+                    record.type_parameters(),
+                ) != Some(true)
+            {
+                return None;
+            }
+        }
+        for (parameter_index, (&parameter, &template)) in record
+            .parameters()
+            .iter()
+            .zip(&source.parameter_types)
+            .enumerate()
+        {
+            let actual = store.value_symbol_links(parameter)?.resolved_type?;
+            let mut pending = vec![actual];
+            let mut seen = HashSet::new();
+            while let Some(actual) = pending.pop() {
+                if !seen.insert(actual) {
+                    continue;
+                }
+                match store.type_payload(actual)?.data() {
+                    TypeData::Union(union) => pending.extend(&union.union.types),
+                    TypeData::Object(object) => {
+                        let Some(source) = object
+                            .target
+                            .filter(|source| store.type_has_function_type_provenance(*source))
+                        else {
+                            continue;
+                        };
+                        if object.mapper != Some(signature_mapper)
+                            || function_member_declaring_method(store, source) != Some(plan.method)
+                            || !method_parameter_contains_function(store, template, source)
+                        {
+                            return None;
+                        }
+                        callbacks.push(PublishedInterfaceMethodCallback {
+                            source,
+                            actual,
+                            mapper: signature_mapper,
+                            overload_index,
+                            parameter_index,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        copied.push(published_recovery_signature_identity(
+            store, signature, &mut roots,
+        )?);
+    }
+    let mut outer_parameter_data = Vec::new();
+    let mut seen_parameters = HashSet::new();
+    let identity = loop {
+        let identity = property_recovery_type_identity(store, &roots, Some(array_targets))?;
+        let mut added = false;
+        for entry in &identity {
+            if let TypeData::TypeParameter(parameter) = store.type_payload(entry.type_)?.data()
+                && parameter.target.is_none()
+                && seen_parameters.insert(entry.type_)
+            {
+                if !parameter.is_this_type
+                    && cached_ordinary_type_parameter_owner(store, entry.type_).is_none()
+                {
+                    return None;
+                }
+                let mut parameter = parameter.clone();
+                parameter.constrained = ConstrainedTypeData::default();
+                roots.extend(parameter.constraint);
+                roots.extend(parameter.resolved_default_type);
+                outer_parameter_data.push((entry.type_, parameter));
+                added = true;
+            }
+        }
+        if !added {
+            break identity;
+        }
+    };
+    let mut signature_ids = signatures.to_vec();
+    for entry in &identity {
+        if let RecoveredPropertyTypeShape::Object { signatures, .. } = &entry.shape {
+            signature_ids.extend(signatures.iter().map(|signature| signature.signature));
+        }
+    }
+    signature_ids.sort_unstable();
+    signature_ids.dedup();
+    let signature_metadata = signature_ids
+        .into_iter()
+        .map(|signature| {
+            let record = store.signature(signature)?;
+            let predicate = match record.resolved_type_predicate() {
+                Some(predicate) => {
+                    let predicate = store.type_predicate(predicate)?;
+                    Some((
+                        predicate.kind(),
+                        predicate.parameter_index(),
+                        predicate.parameter_name().to_owned(),
+                        predicate.type_id(),
+                    ))
+                }
+                None => None,
+            };
+            Some(PublishedMethodSignatureMetadata {
+                signature,
+                resolved_min_argument_count: record.resolved_min_argument_count(),
+                isolated_signature_type: record.isolated_signature_type(),
+                circular_return: store.signature_has_circular_return_type(signature),
+                predicate,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(PublishedInterfaceMethodRecoverySnapshot {
+        signatures: copied,
+        identity,
+        callbacks,
+        signature_metadata,
+        mapper_source_data,
+        outer_parameter_data,
+    })
+}
+
 #[derive(Clone, Debug)]
 enum ColdPropertyPlan {
     Reused {
@@ -1038,14 +1507,14 @@ struct ColdIndexValue {
     recovery: Option<(TypeId, Vec<RecoveredPropertyTypeIdentity>)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PublishedInterfaceMethodSignature {
     source: SignatureId,
     parameter_types: Vec<TypeId>,
     return_type: TypeId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PublishedInterfaceMethodPlan {
     method: SemanticSymbolId,
     source: TypeId,
@@ -2510,6 +2979,16 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     if let Some(cached) = cached_published_interface_method(store, &plan, targets)? {
         return mapped_interface_method_value(store, global_types, &plan, cached);
     }
+    if session.recovery_error_type().is_some_and(|error_type| {
+        store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.error_type != error_type)
+            || store.validate_union_constituent(error_type).is_err()
+    }) {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+            plan.receiver,
+        ));
+    }
     if !store.try_reserve_mappers(1)
         || !store.try_reserve_types(1)
         || !store.try_reserve_signatures(plan.signatures.len())
@@ -2519,6 +2998,7 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     let mapper = store
         .new_type_mapper(plan.mapper_sources.clone(), plan.mapper_targets.clone())
         .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
+    let limit_mark = session.limit_event_mark();
     let mut signatures = Vec::with_capacity(plan.signatures.len());
     for source in &plan.signatures {
         let signature = instantiate_generic_method_signature(
@@ -2534,6 +3014,28 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
         )?;
         signatures.push(signature);
     }
+    let recovery = if session.limit_event_occurred_since(limit_mark) {
+        let error_type = session.recovery_error_type().ok_or(
+            GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver),
+        )?;
+        let snapshot = published_method_recovery_snapshot(
+            store,
+            &plan,
+            mapper,
+            &signatures,
+            targets,
+            error_type,
+        )
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+            plan.receiver,
+        ))?;
+        if !store.try_reserve_published_interface_method_recoveries() {
+            return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+        }
+        Some((error_type, snapshot))
+    } else {
+        None
+    };
     let callable = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.method))
         .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
@@ -2542,6 +3044,19 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(
             plan.receiver,
+        ));
+    }
+    if let Some((error_type, snapshot)) = recovery {
+        assert!(store.publish_published_interface_method_recovery(
+            PublishedInterfaceMethodRecovery {
+                valid: true,
+                result: callable,
+                plan: plan.clone(),
+                mapper,
+                array_targets: targets,
+                error_type,
+                snapshot,
+            }
         ));
     }
     mapped_interface_method_value(store, global_types, &plan, callable)
@@ -3324,6 +3839,17 @@ fn cached_published_interface_method(
             .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
                 plan.receiver,
             ))?;
+        if let Some(recovery) = store.published_interface_method_recovery(type_) {
+            if recovery.result_type() != type_
+                || recovery.plan != *plan
+                || recovery.mapper != mapper
+                || recovery.array_targets != targets
+                || recovery.checked_identity(store).is_none()
+            {
+                return Err(invalid());
+            }
+            continue;
+        }
         for (&signature, source) in signatures.iter().zip(&plan.signatures) {
             validate_published_interface_method_signature(
                 store, plan, source, signature, mapper, targets,
@@ -4299,6 +4825,11 @@ pub(super) fn instantiated_function_member_type_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
+    if let Some(matches) =
+        published_interface_callback_recovery_matches(store, source, actual, mapper, array_targets)
+    {
+        return matches;
+    }
     if function_member_declaring_property_alias(store, source).is_some() {
         let Some(origin) = store.instantiated_property_alias_callable(actual) else {
             return false;
@@ -4323,6 +4854,42 @@ pub(super) fn instantiated_function_member_type_matches(
         .is_some()
 }
 
+/// A present recovery record must match both the real callback and this caller's capability.
+pub(super) fn published_interface_callback_recovery_matches(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<bool> {
+    let recovery = store.published_interface_callback_recovery(actual)?;
+    Some(
+        (|| {
+            if array_targets != Some(recovery.array_targets) {
+                return None;
+            }
+            let callback = recovery
+                .checked_identity(store)?
+                .callback(source, actual, mapper)?;
+            instantiated_function_member_projection(
+                store,
+                source,
+                actual,
+                mapper,
+                array_targets,
+                Some(InstantiatedFunctionRecovery::Published(callback)),
+            )
+        })()
+        .is_some(),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum InstantiatedFunctionRecovery<'a> {
+    Property(InstantiatedPropertyRecoveryIdentity<'a>),
+    Published(PublishedInterfaceCallbackRecoveryIdentity<'a>),
+}
+
 #[allow(clippy::too_many_lines)] // The callback and each parameter retain independent source proofs.
 fn instantiated_function_member_projection(
     store: &CanonicalTypeMapperStore,
@@ -4330,7 +4897,7 @@ fn instantiated_function_member_projection(
     actual: TypeId,
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
-    recovery: Option<InstantiatedPropertyRecoveryIdentity<'_>>,
+    recovery: Option<InstantiatedFunctionRecovery<'_>>,
 ) -> Option<ValidatedSingleCallable> {
     let (symbol, template) = function_member_signature(store, source)?;
     if function_member_declaring_property_alias(store, source).is_some() {
@@ -4352,11 +4919,29 @@ fn instantiated_function_member_projection(
     let signature = store.signature(signature_id)?;
     let return_type = signature.resolved_return_type()?;
     let recovered = match recovery {
-        Some(recovery) => {
+        Some(InstantiatedFunctionRecovery::Property(recovery)) => {
             if recovery.source_type() != source
                 || recovery.result_type() != actual
                 || recovery.mapper() != mapper
                 || recovery.signature_mapper(template.source, signature_id) != Some(mapper)
+            {
+                return None;
+            }
+            true
+        }
+        Some(InstantiatedFunctionRecovery::Published(recovery)) => {
+            let callback = recovery.callback;
+            if callback.source != source
+                || callback.actual != actual
+                || callback.mapper != mapper
+                || !recovery
+                    .method
+                    .recovery
+                    .snapshot
+                    .callbacks
+                    .contains(callback)
+                || signature.target() != Some(template.source)
+                || signature.mapper() != Some(mapper)
             {
                 return None;
             }
@@ -4605,11 +5190,61 @@ pub(super) fn instantiated_function_member_owner(
         .then_some(targets)
 }
 
+fn validate_published_interface_callback_callable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let recovery = store.published_interface_callback_recovery(type_)?;
+    let family = CallableFamily::FunctionType;
+    let validated = (|| {
+        let identity = recovery.checked_identity(store)?;
+        let TypeData::Object(object) = store.type_payload(type_)?.data() else {
+            return None;
+        };
+        let source = object.target?;
+        let mapper = object.mapper?;
+        let callback = identity.callback(source, type_, mapper)?;
+        let callable = instantiated_function_member_projection(
+            store,
+            source,
+            type_,
+            mapper,
+            Some(recovery.array_targets),
+            Some(InstantiatedFunctionRecovery::Published(callback)),
+        )?;
+        let mut edges = callable.parameters.clone();
+        edges.extend(callable.return_type);
+        edges.extend([source, recovery.plan.receiver]);
+        if let Some(predicate) = store
+            .signature(callable.signature)?
+            .resolved_type_predicate()
+        {
+            edges.extend(store.type_predicate(predicate)?.type_id());
+        }
+        Some((callable, edges))
+    })();
+    Some(match validated {
+        Some((callable, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection: CallableSetProjection {
+                owner: type_,
+                call_signatures: Box::new([callable]),
+                construct_signatures: Box::new([]),
+            },
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
+}
+
 /// Provides mapped function types before the declaration-only callable provider.
 pub(super) fn validate_instantiated_function_member_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<StoredCallableSetValidation> {
+    if let Some(validation) = validate_published_interface_callback_callable(store, type_) {
+        return Some(validation);
+    }
     let TypeData::Object(object) = store.type_payload(type_)?.data() else {
         return None;
     };
@@ -4636,7 +5271,9 @@ pub(super) fn validate_instantiated_function_member_callable(
                     store, source, type_, mapper, receiver,
                 )? {
                     FunctionPropertyRecovery::Normal => None,
-                    FunctionPropertyRecovery::Recovered(identity) => Some(identity),
+                    FunctionPropertyRecovery::Recovered(identity) => {
+                        Some(InstantiatedFunctionRecovery::Property(identity))
+                    }
                 };
                 (
                     origin.array_targets,
@@ -14227,6 +14864,1258 @@ mod tests {
                 ),
                 before
             );
+        }
+    }
+
+    mod published_array_method_recovery_tests {
+        use super::*;
+        use crate::semantic::callable_sets::validate_stored_callable_set;
+
+        struct Fixture<'arena> {
+            context: CanonicalCheckerContext<'arena>,
+            receiver: TypeId,
+            element: TypeId,
+            source_element: TypeId,
+            this_type: TypeId,
+            readonly: bool,
+            method: SemanticSymbolId,
+            source: TypeId,
+            source_projection: CallableSetProjection,
+            source_callbacks: Vec<CallableSetProjection>,
+        }
+
+        fn library() -> ParseResult {
+            parse_source_file(concat!(
+                "interface Array<T> { ",
+                "filter<S extends T>(predicate: ",
+                "(value: T, index: number, array: T[]) => value is S, thisArg?: any): S[]; ",
+                "filter(predicate: ",
+                "(value: T, index: number, array: T[]) => unknown, thisArg?: any): T[]; ",
+                "} interface ReadonlyArray<T> { ",
+                "filter<S extends T>(predicate: ",
+                "(value: T, index: number, array: readonly T[]) => value is S, ",
+                "thisArg?: any): S[]; ",
+                "filter(predicate: ",
+                "(value: T, index: number, array: readonly T[]) => unknown, ",
+                "thisArg?: any): T[]; }",
+            ))
+        }
+
+        fn projection(store: &CanonicalTypeMapperStore, type_: TypeId) -> CallableSetProjection {
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, type_)
+            else {
+                panic!("the source-owned callable must remain valid: {type_:?}")
+            };
+            projection
+        }
+
+        #[allow(clippy::too_many_lines)] // Bind real library declarations without checking a receiver copy.
+        fn fixture<'arena>(
+            library: &'arena ParseResult,
+            source: &'arena ParseResult,
+        ) -> Fixture<'arena> {
+            assert!(library.diagnostics.is_empty());
+            assert!(source.diagnostics.is_empty());
+            let library_file = FileId::new(20_220);
+            let source_file = FileId::new(20_221);
+            let files = [(library_file, library), (source_file, source)];
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed) in files {
+                let is_library = file == library_file;
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            is_library,
+                            is_library,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed) in files {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let options = CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            };
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                files
+                    .into_iter()
+                    .map(|(file, parsed)| (file, &parsed.arena))
+                    .collect(),
+                options,
+            )
+            .unwrap();
+            let bounds = files.map(|(file, _)| context.file(file).unwrap().1.clone());
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bounds)
+                    .map(|((_, parsed), bound)| (&parsed.arena, bound)),
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    options.name_resolution,
+                ),
+            )
+            .unwrap();
+            let site =
+                source
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::PropertyAccessExpression)
+                            .then_some(NodeRef::new(source.arena.id(), source_file, node))
+                    })
+                    .unwrap();
+            let variable = source_symbol(source, source_file, &context, "values");
+            let globals = context.global_types().clone();
+            let mut setup = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let receiver = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut setup,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_declared_value(variable)
+            .unwrap();
+            let array = context
+                .store()
+                .canonical_array_reference(&globals, receiver)
+                .unwrap()
+                .unwrap();
+            let target = if array.readonly {
+                globals.readonly_array_type
+            } else {
+                globals.array_type
+            };
+            let TypeData::Interface(interface) =
+                context.store().type_payload(target).unwrap().data()
+            else {
+                panic!("the source receiver must retain its real Array target")
+            };
+            let [source_element] = interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("the real Array target must have its source T parameter")
+            };
+            let source_element = *source_element;
+            let this_type = interface.this_type.unwrap();
+            let template = crate::semantic::source_calls::materialize_global_array_callback_method(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut setup,
+                &mut diagnostics,
+                receiver,
+                "filter",
+                site,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            assert_eq!(setup.limit_event_count(), 0);
+            let store = context.store();
+            let method = store.type_payload(template).unwrap().symbol().unwrap();
+            let source_projection = projection(store, template);
+            assert_eq!(source_projection.call_signatures.len(), 2);
+            let source_callbacks = source_projection
+                .call_signatures
+                .iter()
+                .map(|signature| projection(store, signature.parameters[0]))
+                .collect::<Vec<_>>();
+            assert!(!store.types().any(|(_, record)| {
+                    matches!(record.data(), TypeData::Object(object)
+                        if object.target == Some(template)
+                            || source_callbacks.iter().any(|callback| object.target == Some(callback.owner)))
+                }));
+            assert_eq!(store.published_interface_method_recovery_len(), 0);
+            Fixture {
+                context,
+                receiver,
+                element: array.element_type,
+                source_element,
+                this_type,
+                readonly: array.readonly,
+                method,
+                source: template,
+                source_projection,
+                source_callbacks,
+            }
+        }
+
+        fn counts(store: &CanonicalTypeMapperStore) -> ([usize; 12], [usize; 26]) {
+            (
+                [
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.type_resolution_len(),
+                    store.type_alias_len(),
+                    store.type_predicate_len(),
+                    store.cached_signature_len(),
+                    store.callable_signature_parameter_types_len(),
+                    store.published_interface_method_recovery_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+            )
+        }
+
+        fn budget(session: &InstantiationSession) -> (usize, usize, u64) {
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            )
+        }
+
+        fn demand(
+            fixture: &mut Fixture<'_>,
+            session: &mut InstantiationSession,
+        ) -> Result<TypeId, GenericInterfaceMemberError> {
+            let globals = fixture.context.global_types().clone();
+            instantiate_published_generic_interface_method_with_session(
+                fixture.context.store_mut_for_test(),
+                &globals,
+                fixture.receiver,
+                fixture.method,
+                session,
+            )
+        }
+
+        fn recovery_session(store: &CanonicalTypeMapperStore) -> InstantiationSession {
+            InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count: 0,
+                    ..InstantiationLimits::default()
+                },
+                store.intrinsic_bootstrap().unwrap().error_type,
+            )
+            .unwrap()
+        }
+
+        #[allow(clippy::too_many_lines)] // Check both overloads, fresh S, and their real callback copies together.
+        fn assert_mapping(fixture: &Fixture<'_>, actual: TypeId, recovered: bool) {
+            let store = fixture.context.store();
+            let globals = fixture.context.global_types();
+            let source = &fixture.source_projection;
+            let mapped = projection(store, actual);
+            assert_eq!(projection(store, fixture.source), *source);
+            assert_eq!(mapped.call_signatures.len(), 2);
+            let TypeData::Object(method) = store.type_payload(actual).unwrap().data() else {
+                panic!("recovery must keep the copied method object")
+            };
+            let owner_mapper = method.mapper.unwrap();
+            assert_eq!(method.target, Some(fixture.source));
+            assert_eq!(
+                store.type_payload(actual).unwrap().symbol(),
+                Some(fixture.method)
+            );
+            assert_eq!(
+                store.type_mapper_has_exact_endpoints(
+                    owner_mapper,
+                    &[fixture.source_element, fixture.this_type],
+                    &[fixture.element, fixture.receiver],
+                ),
+                Some(true)
+            );
+            let error = store.intrinsic_bootstrap().unwrap().error_type;
+            let expected_element = if recovered { error } else { fixture.element };
+            for (index, (original, copied)) in source
+                .call_signatures
+                .iter()
+                .zip(&mapped.call_signatures)
+                .enumerate()
+            {
+                let original_signature = store.signature(original.signature).unwrap();
+                let copied_signature = store.signature(copied.signature).unwrap();
+                let mapper = copied_signature.mapper().unwrap();
+                assert_ne!(copied.signature, original.signature);
+                assert_eq!(copied_signature.target(), Some(original.signature));
+                assert_eq!(
+                    copied_signature.declaration(),
+                    original_signature.declaration()
+                );
+                assert_eq!(
+                    copied_signature.min_argument_count(),
+                    original_signature.min_argument_count()
+                );
+                assert_eq!(copied_signature.resolved_type_predicate(), None);
+                assert_eq!(copied.parameters.len(), original.parameters.len());
+                assert_eq!(copied.parameters[1], original.parameters[1]);
+                let source_callback = &fixture.source_callbacks[index];
+                assert_eq!(projection(store, original.parameters[0]), *source_callback);
+                let callback = projection(store, copied.parameters[0]);
+                let source_callback_signature = &source_callback.call_signatures[0];
+                let callback_signature = &callback.call_signatures[0];
+                assert_eq!(callback.call_signatures.len(), 1);
+                let callback_record = store.signature(callback_signature.signature).unwrap();
+                let source_callback_record = store
+                    .signature(source_callback_signature.signature)
+                    .unwrap();
+                assert_eq!(
+                    callback_record.target(),
+                    Some(source_callback_signature.signature)
+                );
+                assert_eq!(callback_record.mapper(), Some(mapper));
+                assert_eq!(
+                    callback_record.declaration(),
+                    source_callback_record.declaration()
+                );
+                assert_eq!(
+                    source_callback_signature.parameters[0],
+                    fixture.source_element
+                );
+                assert_eq!(callback_signature.parameters[0], expected_element);
+                assert_eq!(
+                    callback_signature.parameters[1],
+                    source_callback_signature.parameters[1]
+                );
+                assert_eq!(
+                    callback_signature.return_type,
+                    source_callback_signature.return_type
+                );
+                let TypeData::Object(callback_object) =
+                    store.type_payload(callback.owner).unwrap().data()
+                else {
+                    panic!("recovery must keep a copied callback object")
+                };
+                assert_eq!(callback_object.target, Some(source_callback.owner));
+                assert_eq!(callback_object.mapper, Some(mapper));
+                let source_array = store
+                    .canonical_array_reference(globals, source_callback_signature.parameters[2])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(source_array.element_type, fixture.source_element);
+                assert_eq!(source_array.readonly, fixture.readonly);
+                let source_parameters = original_signature.type_parameters();
+                let fresh_parameters = copied_signature.type_parameters();
+                assert_eq!(source_parameters.len(), usize::from(index == 0));
+                assert_eq!(fresh_parameters.len(), source_parameters.len());
+                if let Some(&source_parameter) = source_parameters.first() {
+                    let fresh = fresh_parameters[0];
+                    assert_ne!(fresh, source_parameter);
+                    let TypeData::TypeParameter(original) =
+                        store.type_payload(source_parameter).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let TypeData::TypeParameter(copied) = store.type_payload(fresh).unwrap().data()
+                    else {
+                        panic!("the predicate overload must retain its fresh S parameter")
+                    };
+                    assert_eq!(original.constraint, Some(fixture.source_element));
+                    assert_eq!(copied.constraint, Some(expected_element));
+                    assert_eq!(copied.target, Some(source_parameter));
+                    assert_eq!(copied.mapper, Some(mapper));
+                    assert_eq!(copied.resolved_default_type, None);
+                    let source_predicate = store
+                        .type_predicate(source_callback_record.resolved_type_predicate().unwrap())
+                        .unwrap();
+                    let predicate = store
+                        .type_predicate(callback_record.resolved_type_predicate().unwrap())
+                        .unwrap();
+                    assert_eq!(predicate.kind(), source_predicate.kind());
+                    assert_eq!(
+                        predicate.parameter_index(),
+                        source_predicate.parameter_index()
+                    );
+                    assert_eq!(
+                        predicate.parameter_name(),
+                        source_predicate.parameter_name()
+                    );
+                    assert_eq!(source_predicate.type_id(), Some(source_parameter));
+                    assert_eq!(
+                        predicate.type_id(),
+                        Some(if recovered { error } else { fresh })
+                    );
+                } else {
+                    assert_eq!(mapper, owner_mapper);
+                    assert_eq!(callback_record.resolved_type_predicate(), None);
+                }
+                if recovered {
+                    assert_eq!(callback_signature.parameters[2], error);
+                    assert_eq!(copied.return_type, Some(error));
+                    assert_eq!(
+                        published_interface_callback_recovery_matches(
+                            store,
+                            source_callback.owner,
+                            callback.owner,
+                            mapper,
+                            Some(CanonicalArrayTargets::from_global_types(globals)),
+                        ),
+                        Some(true)
+                    );
+                } else {
+                    let callback_array = store
+                        .canonical_array_reference(globals, callback_signature.parameters[2])
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(callback_array.element_type, fixture.element);
+                    assert_eq!(callback_array.readonly, fixture.readonly);
+                    let returned = store
+                        .canonical_array_reference(globals, copied.return_type.unwrap())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        returned.element_type,
+                        fresh_parameters.first().copied().unwrap_or(fixture.element)
+                    );
+                    assert!(!returned.readonly);
+                }
+            }
+            assert_eq!(
+                store
+                    .value_symbol_links(fixture.method)
+                    .unwrap()
+                    .resolved_type,
+                Some(fixture.source)
+            );
+            if recovered {
+                let recovery = store.published_interface_method_recovery(actual).unwrap();
+                assert_eq!(recovery.result_type(), actual);
+                assert!(recovery.checked_identity(store).is_some());
+                assert_eq!(store.published_interface_method_recovery_len(), 1);
+            } else {
+                assert!(store.published_interface_method_recovery(actual).is_none());
+                assert_eq!(store.published_interface_method_recovery_len(), 0);
+            }
+        }
+
+        fn assert_warm(
+            fixture: &mut Fixture<'_>,
+            actual: TypeId,
+            session: &mut InstantiationSession,
+        ) {
+            let before = counts(fixture.context.store());
+            let session_before = budget(session);
+            let validation = validate_stored_callable_set(fixture.context.store(), actual);
+            for _ in 0..2 {
+                assert_eq!(demand(fixture, session), Ok(actual));
+                assert_eq!(
+                    validate_stored_callable_set(fixture.context.store(), actual),
+                    validation
+                );
+                assert_eq!(counts(fixture.context.store()), before);
+                assert_eq!(budget(session), session_before);
+            }
+            let mut exhausted = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            assert_eq!(demand(fixture, &mut exhausted), Ok(actual));
+            assert_eq!(budget(&exhausted), (0, 0, 0));
+            assert_eq!(counts(fixture.context.store()), before);
+        }
+
+        #[test]
+        fn published_array_filter_zero_count_recovery_keeps_source_and_warm_identity() {
+            let library = library();
+            for readonly in [false, true] {
+                let source = parse_source_file(&format!(
+                    "declare const values: {}number[]; values.filter;",
+                    if readonly { "readonly " } else { "" },
+                ));
+                let mut fixture = fixture(&library, &source);
+                let mut session = recovery_session(fixture.context.store());
+                let actual = demand(&mut fixture, &mut session).unwrap();
+                assert!(session.limit_event_count() > 0);
+                assert_eq!((session.query_count(), session.total_count()), (0, 0));
+                assert_mapping(&fixture, actual, true);
+                assert_warm(&mut fixture, actual, &mut session);
+                let targets = Some(CanonicalArrayTargets::from_global_types(
+                    fixture.context.global_types(),
+                ));
+                let store = fixture.context.store_mut_for_test();
+                let mapper = store
+                    .new_simple_type_mapper(fixture.source_element, fixture.element)
+                    .unwrap();
+                let error = store.intrinsic_bootstrap().unwrap().error_type;
+                let events = session.limit_event_count();
+                assert_eq!(
+                    instantiate_type_with_session(
+                        store,
+                        fixture.source_element,
+                        mapper,
+                        targets,
+                        &mut session
+                    ),
+                    Ok(error)
+                );
+                assert_eq!(
+                    instantiate_type_with_session(
+                        store,
+                        fixture.element,
+                        mapper,
+                        targets,
+                        &mut session
+                    ),
+                    Ok(fixture.element)
+                );
+                assert_eq!(budget(&session), (0, 0, events + 1));
+            }
+        }
+
+        #[test]
+        fn published_array_filter_normal_and_recovering_sessions_keep_warm_identity() {
+            let library = library();
+            for (readonly, recovering) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let source = parse_source_file(&format!(
+                    "declare const values: {}number[]; values.filter;",
+                    if readonly { "readonly " } else { "" },
+                ));
+                let mut fixture = fixture(&library, &source);
+                let mut session = if recovering {
+                    InstantiationSession::new_recovering(
+                        fixture.context.store(),
+                        InstantiationLimits::default(),
+                        fixture
+                            .context
+                            .store()
+                            .intrinsic_bootstrap()
+                            .unwrap()
+                            .error_type,
+                    )
+                    .unwrap()
+                } else {
+                    InstantiationSession::new(InstantiationLimits::default())
+                };
+                let actual = demand(&mut fixture, &mut session).unwrap();
+                assert!(session.query_count() > 0);
+                assert_eq!(session.query_count(), session.total_count());
+                assert_eq!(session.limit_event_count(), 0);
+                assert_mapping(&fixture, actual, false);
+                assert_warm(&mut fixture, actual, &mut session);
+            }
+        }
+
+        #[test]
+        fn published_array_filter_depth_recovery_balances_the_caller_session() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            let mut fixture = fixture(&library, &source);
+            let store = fixture.context.store();
+            let error = store.intrinsic_bootstrap().unwrap().error_type;
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_depth: 1,
+                    ..InstantiationLimits::default()
+                },
+                error,
+            )
+            .unwrap();
+            let actual = demand(&mut fixture, &mut session).unwrap();
+            assert!(session.query_count() > 0);
+            assert!(session.limit_event_count() > 0);
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let store = fixture.context.store_mut_for_test();
+            let mapped = projection(store, actual);
+            assert_eq!(projection(store, fixture.source), fixture.source_projection);
+            assert!(
+                store
+                    .published_interface_method_recovery(actual)
+                    .unwrap()
+                    .checked_identity(store)
+                    .is_some()
+            );
+            let returned = store
+                .canonical_array_reference_with_targets(
+                    targets,
+                    mapped.call_signatures[1].return_type.unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(returned.element_type, error);
+            for signature in &mapped.call_signatures {
+                let callback = projection(store, signature.parameters[0]);
+                assert_eq!(callback.call_signatures[0].parameters[0], fixture.element);
+            }
+            let TypeData::Object(method) = store.type_payload(actual).unwrap().data() else {
+                unreachable!()
+            };
+            let mapper = method.mapper.unwrap();
+            let before = budget(&session);
+            assert_eq!(
+                instantiate_type_with_session(
+                    store,
+                    fixture.source_element,
+                    mapper,
+                    Some(targets),
+                    &mut session,
+                ),
+                Ok(fixture.element)
+            );
+            assert_eq!(budget(&session), (before.0 + 1, before.1 + 1, before.2));
+            assert_warm(&mut fixture, actual, &mut session);
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // The receiver comes from a real generic function parameter query.
+        fn published_array_filter_recovery_keeps_outer_parameter_constraint_and_default() {
+            let library = library();
+            let source = parse_source_file(concat!(
+                "declare function owner<T extends number = number>(items: T[]): void; ",
+                "declare const values: number[]; values.filter;",
+            ));
+            let mut fixture = fixture(&library, &source);
+            let library_file = FileId::new(20_220);
+            let source_file = FileId::new(20_221);
+            let files = [(library_file, &library), (source_file, &source)];
+            let bounds = files.map(|(file, _)| fixture.context.file(file).unwrap().1.clone());
+            let options = fixture.context.options();
+            let globals = fixture.context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bounds)
+                    .map(|((_, parsed), bound)| (&parsed.arena, bound)),
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    options.name_resolution,
+                ),
+            )
+            .unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture
+                .context
+                .store()
+                .get_merged_symbol(bounds[1].symbol(declaration).unwrap())
+                .unwrap();
+            let mut setup = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut setup,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            assert_eq!(setup.limit_event_count(), 0);
+            let store = fixture.context.store();
+            let signature = store
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_deref()
+                .unwrap()[0];
+            let signature = store.signature(signature).unwrap();
+            let [outer] = signature.type_parameters() else {
+                panic!("the source function must retain its declared T")
+            };
+            let outer = *outer;
+            let receiver = store
+                .value_symbol_links(signature.parameters()[0])
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let array = store
+                .canonical_array_reference(&globals, receiver)
+                .unwrap()
+                .unwrap();
+            assert_eq!(array.element_type, outer);
+            assert!(!array.readonly);
+            let TypeData::TypeParameter(original) = store.type_payload(outer).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let original = original.clone();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(original.target, None);
+            assert_eq!(original.mapper, None);
+            assert_eq!(original.constraint, Some(number));
+            assert_eq!(original.resolved_default_type, Some(number));
+            assert!(!store.types().any(|(_, record)| {
+                matches!(record.data(), TypeData::Object(object) if object.target == Some(fixture.source))
+            }));
+            assert_eq!(store.published_interface_method_recovery_len(), 0);
+            fixture.receiver = receiver;
+            fixture.element = outer;
+            let mut session = recovery_session(fixture.context.store());
+            let actual = demand(&mut fixture, &mut session).unwrap();
+            assert!(session.limit_event_count() > 0);
+            assert_mapping(&fixture, actual, true);
+            for field in ["constraint", "default"] {
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_type_parameter_resolution(
+                            outer,
+                            if field == "constraint" {
+                                Some(string)
+                            } else {
+                                original.constraint
+                            },
+                            original.target,
+                            original.mapper,
+                            if field == "default" {
+                                Some(string)
+                            } else {
+                                original.resolved_default_type
+                            },
+                        )
+                );
+                assert_rejected(&mut fixture, actual, &mut session);
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_type_parameter_resolution(
+                            outer,
+                            original.constraint,
+                            original.target,
+                            original.mapper,
+                            original.resolved_default_type,
+                        )
+                );
+                assert_mapping(&fixture, actual, true);
+                assert_warm(&mut fixture, actual, &mut session);
+            }
+        }
+
+        fn assert_rejected(
+            fixture: &mut Fixture<'_>,
+            actual: TypeId,
+            session: &mut InstantiationSession,
+        ) {
+            let expected = GenericInterfaceMemberError::InvalidCachedMembers(fixture.receiver);
+            assert_rejected_with_error(fixture, actual, session, expected);
+        }
+
+        fn assert_rejected_with_error(
+            fixture: &mut Fixture<'_>,
+            actual: TypeId,
+            session: &mut InstantiationSession,
+            expected: GenericInterfaceMemberError,
+        ) {
+            let before = counts(fixture.context.store());
+            let session_before = budget(session);
+            for _ in 0..2 {
+                let store = fixture.context.store();
+                assert!(
+                    store
+                        .published_interface_method_recovery(actual)
+                        .is_none_or(|recovery| recovery.checked_identity(store).is_none())
+                );
+                assert!(matches!(
+                    validate_stored_callable_set(store, actual),
+                    StoredCallableSetValidation::Malformed { .. }
+                ));
+                let signatures = store
+                    .type_payload(actual)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .signatures
+                    .as_deref()
+                    .unwrap();
+                for (source, &signature) in fixture.source_callbacks.iter().zip(signatures) {
+                    let signature = store.signature(signature).unwrap();
+                    let callback = store
+                        .value_symbol_links(signature.parameters()[0])
+                        .unwrap()
+                        .resolved_type
+                        .unwrap();
+                    assert!(matches!(
+                        validate_stored_callable_set(store, callback),
+                        StoredCallableSetValidation::Malformed { .. }
+                    ));
+                    assert_eq!(
+                        published_interface_callback_recovery_matches(
+                            store,
+                            source.owner,
+                            callback,
+                            signature.mapper().unwrap(),
+                            Some(CanonicalArrayTargets::from_global_types(
+                                fixture.context.global_types()
+                            )),
+                        ),
+                        store
+                            .published_interface_callback_recovery(callback)
+                            .map(|_| false)
+                    );
+                }
+                assert_eq!(demand(fixture, session), Err(expected.clone()));
+                assert_eq!(counts(fixture.context.store()), before);
+                assert_eq!(budget(session), session_before);
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Each retained field has a damage check and an exact restore.
+        fn published_array_filter_recovery_records_reject_damage_without_growth() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            for mutation in [
+                "missing",
+                "key",
+                "result",
+                "source",
+                "receiver",
+                "mapper",
+                "error",
+                "array_targets",
+                "foreign_targets",
+            ] {
+                let mut fixture = fixture(&library, &source);
+                let mut session = recovery_session(fixture.context.store());
+                let actual = demand(&mut fixture, &mut session).unwrap();
+                assert_mapping(&fixture, actual, true);
+                let globals = fixture.context.global_types().clone();
+                let mut foreign = CanonicalTypeMapperStore::new();
+                let foreign_type = foreign
+                    .alloc_intrinsic_type(TypeFlags::ANY, "foreign")
+                    .unwrap();
+                let store = fixture.context.store_mut_for_test();
+                let string = store.intrinsic_bootstrap().unwrap().string_type;
+                let wrong_mapper = store
+                    .new_type_mapper(
+                        vec![fixture.source_element, fixture.this_type],
+                        vec![string, fixture.receiver],
+                    )
+                    .unwrap();
+                let mut record = store
+                    .replace_published_interface_method_recovery_for_test(actual, None)
+                    .unwrap();
+                let saved = (
+                    record.result,
+                    record.plan.source,
+                    record.plan.receiver,
+                    record.mapper,
+                    record.error_type,
+                    record.array_targets,
+                );
+                let key = if mutation == "key" {
+                    fixture.element
+                } else {
+                    actual
+                };
+                if mutation == "missing" {
+                    assert_rejected(&mut fixture, actual, &mut session);
+                } else {
+                    match mutation {
+                        "key" => {}
+                        "result" => record.result = fixture.source,
+                        "source" => record.plan.source = fixture.source_callbacks[0].owner,
+                        "receiver" => record.plan.receiver = fixture.source_element,
+                        "mapper" => record.mapper = wrong_mapper,
+                        "error" => record.error_type = string,
+                        "array_targets" => {
+                            record.array_targets =
+                                CanonicalArrayTargets::for_single_target_validation(
+                                    globals.readonly_array_type,
+                                )
+                        }
+                        "foreign_targets" => {
+                            record.array_targets =
+                                CanonicalArrayTargets::for_test(foreign_type, foreign_type)
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        fixture
+                            .context
+                            .store_mut_for_test()
+                            .replace_published_interface_method_recovery_for_test(key, Some(record))
+                            .is_none()
+                    );
+                    assert_rejected(&mut fixture, actual, &mut session);
+                    record = fixture
+                        .context
+                        .store_mut_for_test()
+                        .replace_published_interface_method_recovery_for_test(key, None)
+                        .unwrap();
+                    record.result = saved.0;
+                    record.plan.source = saved.1;
+                    record.plan.receiver = saved.2;
+                    record.mapper = saved.3;
+                    record.error_type = saved.4;
+                    record.array_targets = saved.5;
+                }
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .replace_published_interface_method_recovery_for_test(actual, Some(record))
+                        .is_none()
+                );
+                assert_mapping(&fixture, actual, true);
+                assert_warm(&mut fixture, actual, &mut session);
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Poison real source and copied records without revoking raw symbol links.
+        fn published_array_filter_recovery_graph_rejects_damage_and_accepts_exact_restore() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            let mut fixture = fixture(&library, &source);
+            let mut session = recovery_session(fixture.context.store());
+            let actual = demand(&mut fixture, &mut session).unwrap();
+            assert_mapping(&fixture, actual, true);
+            let store = fixture.context.store_mut_for_test();
+            let mapped = projection(store, actual);
+            let signature_id = mapped.call_signatures[0].signature;
+            let signature = store.signature(signature_id).unwrap();
+            let fresh = signature.type_parameters()[0];
+            let TypeData::TypeParameter(fresh_data) = store.type_payload(fresh).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let fresh_data = fresh_data.clone();
+            let callback = projection(store, mapped.call_signatures[0].parameters[0]);
+            let callback_signature = callback.call_signatures[0].signature;
+            let callback_record = store.signature(callback_signature).unwrap();
+            let callback_return = callback_record.resolved_return_type();
+            let predicate_id = callback_record.resolved_type_predicate().unwrap();
+            let callback_target = callback_record.target();
+            let callback_mapper = callback_record.mapper();
+            let TypeData::Object(method) = store.type_payload(actual).unwrap().data() else {
+                unreachable!()
+            };
+            let owner_mapper = method.mapper.unwrap();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let wrong_mapper = store
+                .new_type_mapper(
+                    vec![fixture.source_element, fixture.this_type],
+                    vec![string, fixture.receiver],
+                )
+                .unwrap();
+            let predicate = store.type_predicate(predicate_id).unwrap();
+            let (kind, index, name) = (
+                predicate.kind(),
+                predicate.parameter_index(),
+                predicate.parameter_name().to_owned(),
+            );
+            let wrong_predicate = store
+                .alloc_type_predicate(kind, index, name, Some(number))
+                .unwrap();
+            let source_signature = fixture.source_projection.call_signatures[1].signature;
+            let source_return = store
+                .signature(source_signature)
+                .unwrap()
+                .resolved_return_type();
+            let mapped_return = mapped.call_signatures[0].return_type;
+            let source_callback = fixture.source_callbacks[0].owner;
+            let other_source_callback = fixture.source_callbacks[1].owner;
+            let other_callback_signature = fixture.source_callbacks[1].call_signatures[0].signature;
+            for mutation in [
+                "source_return",
+                "method_mapper",
+                "constraint",
+                "callback_target",
+                "callback_mapper",
+                "callback_signature",
+                "predicate_missing",
+                "predicate_type",
+                "callback_return",
+                "method_return",
+            ] {
+                let store = fixture.context.store_mut_for_test();
+                assert!(
+                    match mutation {
+                        "source_return" =>
+                            store.set_signature_resolved_return_type(source_signature, Some(number)),
+                        "method_mapper" => store.set_object_target_and_mapper(
+                            actual,
+                            Some(fixture.source),
+                            Some(wrong_mapper)
+                        ),
+                        "constraint" => store.set_type_parameter_resolution(
+                            fresh,
+                            Some(number),
+                            fresh_data.target,
+                            fresh_data.mapper,
+                            fresh_data.resolved_default_type
+                        ),
+                        "callback_target" => store.set_object_target_and_mapper(
+                            callback.owner,
+                            Some(other_source_callback),
+                            callback_mapper
+                        ),
+                        "callback_mapper" => store.set_object_target_and_mapper(
+                            callback.owner,
+                            Some(source_callback),
+                            Some(wrong_mapper)
+                        ),
+                        "callback_signature" => store.set_signature_target_and_mapper(
+                            callback_signature,
+                            Some(other_callback_signature),
+                            callback_mapper
+                        ),
+                        "predicate_missing" =>
+                            store.set_signature_resolved_type_predicate(callback_signature, None),
+                        "predicate_type" => store.set_signature_resolved_type_predicate(
+                            callback_signature,
+                            Some(wrong_predicate)
+                        ),
+                        "callback_return" => store
+                            .set_signature_resolved_return_type(callback_signature, Some(string)),
+                        "method_return" =>
+                            store.set_signature_resolved_return_type(signature_id, Some(number)),
+                        _ => unreachable!(),
+                    },
+                    "{mutation}"
+                );
+                let expected = if mutation == "source_return" {
+                    GenericInterfaceMemberError::InvalidMember(fixture.method)
+                } else {
+                    GenericInterfaceMemberError::InvalidCachedMembers(fixture.receiver)
+                };
+                assert_rejected_with_error(&mut fixture, actual, &mut session, expected);
+                let store = fixture.context.store_mut_for_test();
+                assert!(
+                    store
+                        .published_interface_method_recovery(actual)
+                        .unwrap()
+                        .valid,
+                    "{mutation}"
+                );
+                assert!(
+                    match mutation {
+                        "source_return" => store
+                            .set_signature_resolved_return_type(source_signature, source_return),
+                        "method_mapper" => store.set_object_target_and_mapper(
+                            actual,
+                            Some(fixture.source),
+                            Some(owner_mapper)
+                        ),
+                        "constraint" => store.set_type_parameter_resolution(
+                            fresh,
+                            fresh_data.constraint,
+                            fresh_data.target,
+                            fresh_data.mapper,
+                            fresh_data.resolved_default_type
+                        ),
+                        "callback_target" | "callback_mapper" => store
+                            .set_object_target_and_mapper(
+                                callback.owner,
+                                Some(source_callback),
+                                callback_mapper
+                            ),
+                        "callback_signature" => store.set_signature_target_and_mapper(
+                            callback_signature,
+                            callback_target,
+                            callback_mapper
+                        ),
+                        "predicate_missing" | "predicate_type" => store
+                            .set_signature_resolved_type_predicate(
+                                callback_signature,
+                                Some(predicate_id)
+                            ),
+                        "callback_return" => store.set_signature_resolved_return_type(
+                            callback_signature,
+                            callback_return
+                        ),
+                        "method_return" =>
+                            store.set_signature_resolved_return_type(signature_id, mapped_return),
+                        _ => unreachable!(),
+                    },
+                    "{mutation}"
+                );
+                assert_mapping(&fixture, actual, true);
+                assert_warm(&mut fixture, actual, &mut session);
+            }
+        }
+
+        #[test]
+        fn published_array_filter_recovery_cannot_move_to_a_foreign_store() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            let mut fixture = fixture(&library, &source);
+            let mut session = recovery_session(fixture.context.store());
+            let actual = demand(&mut fixture, &mut session).unwrap();
+            assert_mapping(&fixture, actual, true);
+            let record = fixture
+                .context
+                .store_mut_for_test()
+                .replace_published_interface_method_recovery_for_test(actual, None)
+                .unwrap();
+            let mut foreign = CanonicalTypeMapperStore::new();
+            let before = counts(&foreign);
+            assert!(!foreign.publish_published_interface_method_recovery(record));
+            assert_eq!(counts(&foreign), before);
+        }
+
+        #[test]
+        fn published_array_filter_recovery_raw_symbol_writes_revoke_the_record() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            for site in [
+                "method",
+                "method_parameter",
+                "callback_parameter",
+                "source_callback_parameter",
+            ] {
+                let mut fixture = fixture(&library, &source);
+                let mut session = recovery_session(fixture.context.store());
+                let actual = demand(&mut fixture, &mut session).unwrap();
+                assert_mapping(&fixture, actual, true);
+                let store = fixture.context.store();
+                let mapped = projection(store, actual);
+                let signature = store
+                    .signature(mapped.call_signatures[0].signature)
+                    .unwrap();
+                let callback = projection(store, mapped.call_signatures[0].parameters[0]);
+                let symbol = match site {
+                    "method" => fixture.method,
+                    "method_parameter" => signature.parameters()[0],
+                    "callback_parameter" => store
+                        .signature(callback.call_signatures[0].signature)
+                        .unwrap()
+                        .parameters()[0],
+                    "source_callback_parameter" => store
+                        .signature(fixture.source_callbacks[0].call_signatures[0].signature)
+                        .unwrap()
+                        .parameters()[0],
+                    _ => unreachable!(),
+                };
+                let links = store.value_symbol_links(symbol).unwrap().clone();
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, links.clone())
+                );
+                assert!(
+                    !fixture
+                        .context
+                        .store()
+                        .published_interface_method_recovery(actual)
+                        .unwrap()
+                        .valid,
+                    "{site}"
+                );
+                assert_rejected(&mut fixture, actual, &mut session);
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(symbol, links)
+                );
+                assert_rejected(&mut fixture, actual, &mut session);
+            }
+        }
+
+        #[test]
+        fn published_array_filter_recovery_does_not_grant_outer_array_capability() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            let mut fixture = fixture(&library, &source);
+            let mut session = recovery_session(fixture.context.store());
+            let actual = demand(&mut fixture, &mut session).unwrap();
+            assert_mapping(&fixture, actual, true);
+            let store = fixture.context.store();
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let mapped = projection(store, actual);
+            let before = counts(store);
+            let plan = plan_published_interface_method(
+                store,
+                Some(targets),
+                fixture.receiver,
+                fixture.method,
+            )
+            .unwrap();
+            for wrong in [
+                CanonicalArrayTargets::for_single_target_validation(targets.array_type()),
+                CanonicalArrayTargets::for_single_target_validation(targets.readonly_array_type()),
+            ] {
+                assert_eq!(
+                    cached_published_interface_method(store, &plan, wrong),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                        fixture.receiver
+                    ))
+                );
+            }
+            assert_eq!(
+                cached_published_interface_method(store, &plan, targets),
+                Ok(Some(actual))
+            );
+            for type_ in std::iter::once(actual).chain(
+                mapped
+                    .call_signatures
+                    .iter()
+                    .map(|signature| signature.parameters[0]),
+            ) {
+                assert_eq!(
+                    store.validate_cached_array_capability_with_array_targets(targets, type_),
+                    Ok(())
+                );
+                assert!(matches!(
+                    store.validate_cached_array_capability(type_),
+                    Err(
+                        crate::semantic::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(
+                            _
+                        )
+                    )
+                ));
+            }
+            for (source_callback, signature) in
+                fixture.source_callbacks.iter().zip(&mapped.call_signatures)
+            {
+                assert_eq!(
+                    published_interface_callback_recovery_matches(
+                        store,
+                        source_callback.owner,
+                        signature.parameters[0],
+                        store
+                            .signature(signature.signature)
+                            .unwrap()
+                            .mapper()
+                            .unwrap(),
+                        None
+                    ),
+                    Some(false)
+                );
+            }
+            assert_eq!(counts(store), before);
+            assert_warm(&mut fixture, actual, &mut session);
         }
     }
 

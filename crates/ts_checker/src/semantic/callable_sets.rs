@@ -24,6 +24,9 @@ use super::{
     },
     declared::cached_ordinary_type_parameter_owner,
     instantiate::instantiated_member_type_matches,
+    instantiated_members::{
+        InstantiatedPropertyRecoveryIdentity, PublishedInterfaceMethodRecoveryIdentity,
+    },
     links::ValueSymbolLinks,
     mapper::TypeMapperApplication,
     object_members::{
@@ -81,7 +84,7 @@ pub(super) fn validate_stored_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredCallableSetValidation {
-    if let Some(validation) = validate_stored_recovered_property_callable_set(store, type_) {
+    if let Some(validation) = validate_stored_recovered_method_callable_set(store, type_) {
         return validation;
     }
     if let Some(callable) = super::classes::stored_class_instance_super_callable(store, type_) {
@@ -240,15 +243,81 @@ pub(super) fn validate_stored_callable_set(
     validate_stored_intersection_callable_set(store, type_)
 }
 
+#[derive(Clone, Copy)]
+enum RecoveredMethodIdentity<'a> {
+    Property(InstantiatedPropertyRecoveryIdentity<'a>),
+    Published(PublishedInterfaceMethodRecoveryIdentity<'a>),
+}
+
+impl RecoveredMethodIdentity<'_> {
+    fn source_type(self) -> TypeId {
+        match self {
+            Self::Property(recovery) => recovery.source_type(),
+            Self::Published(recovery) => recovery.source_type(),
+        }
+    }
+
+    fn result_type(self) -> TypeId {
+        match self {
+            Self::Property(recovery) => recovery.result_type(),
+            Self::Published(recovery) => recovery.result_type(),
+        }
+    }
+
+    fn method(self) -> ts_binder::SemanticSymbolId {
+        match self {
+            Self::Property(recovery) => recovery.method(),
+            Self::Published(recovery) => recovery.method(),
+        }
+    }
+
+    fn mapper(self) -> super::TypeMapperId {
+        match self {
+            Self::Property(recovery) => recovery.mapper(),
+            Self::Published(recovery) => recovery.mapper(),
+        }
+    }
+
+    fn signature_mapper(
+        self,
+        source: SignatureId,
+        actual: SignatureId,
+    ) -> Option<super::TypeMapperId> {
+        match self {
+            Self::Property(recovery) => recovery.signature_mapper(source, actual),
+            Self::Published(recovery) => recovery.signature_mapper(source, actual),
+        }
+    }
+
+    fn receiver(self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
+        match self {
+            Self::Property(recovery) => recovery.receiver(store),
+            Self::Published(recovery) => recovery.receiver(store),
+        }
+    }
+}
+
 /// Recovery is a separate producer proof. Normal source and return checks stay unchanged.
-fn validate_stored_recovered_property_callable_set(
+fn validate_stored_recovered_method_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Option<StoredCallableSetValidation> {
-    let recovery = store.instantiated_property_method_recovery(type_)?;
+    let recovery = if let Some(recovery) = store.instantiated_property_method_recovery(type_) {
+        recovery
+            .checked_identity(store)
+            .map(RecoveredMethodIdentity::Property)
+    } else {
+        store
+            .published_interface_method_recovery(type_)?
+            .checked_identity(store)
+            .map(RecoveredMethodIdentity::Published)
+    };
     let family = CallableFamily::DeclaredCallSignatures;
     let validated = (|| {
-        let recovery = recovery.checked_identity(store)?;
+        let recovery = recovery?;
+        if recovery.result_type() != type_ {
+            return None;
+        }
         let StoredCallableSetValidation::Valid {
             projection: source,
             mut edges,
@@ -289,7 +358,7 @@ fn validate_stored_recovered_property_callable_set(
                     .call_signatures
                     .iter()
                     .find(|source| source.signature == target)?;
-                recovered_property_signature_parameters(store, recovery, source, signature)
+                recovered_method_signature_parameters(store, recovery, source, signature)
             })?;
         if !projection.construct_signatures.is_empty()
             || projection.call_signatures.len() != source.call_signatures.len()
@@ -323,9 +392,9 @@ fn validate_stored_recovered_property_callable_set(
 }
 
 /// Checks copied signature identities against the exact result retained by its producer.
-fn recovered_property_signature_parameters(
+fn recovered_method_signature_parameters(
     store: &CanonicalTypeMapperStore,
-    recovery: super::instantiated_members::InstantiatedPropertyRecoveryIdentity<'_>,
+    recovery: RecoveredMethodIdentity<'_>,
     source: &ValidatedSingleCallable,
     actual: SignatureId,
 ) -> Option<Vec<TypeId>> {
