@@ -95,6 +95,7 @@ impl PreparedEntityName {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceNodeFacts {
     kind: SyntaxKind,
+    ordinary_arrow_type_parameters: bool,
     parent: Option<NodeId>,
     start: u32,
     identifier_text: Option<Box<str>>,
@@ -7933,6 +7934,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node).map(|facts| facts.kind)
     }
 
+    /// Ordinary arrow parameters are inside the arrow, unlike reparsed `JSDoc` parameters.
+    pub(super) fn source_arrow_has_ordinary_type_parameters(&self, node: NodeRef) -> bool {
+        self.source_node_fact(node)
+            .is_some_and(|facts| facts.ordinary_arrow_type_parameters)
+    }
+
     /// Returns the registered source offset used to order declarations.
     #[must_use]
     pub(super) fn source_node_start(&self, node: NodeRef) -> Option<u32> {
@@ -8329,6 +8336,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             }
             *slot = Some(SourceNodeFacts {
                 kind: node.kind,
+                ordinary_arrow_type_parameters: matches!(
+                    &node.data,
+                    NodeData::ArrowFunction(function)
+                        if function.type_parameters.as_ref().is_some_and(|parameters| {
+                            !parameters.nodes.is_empty()
+                                && parameters.range.start >= node.range.start
+                        })
+                ),
                 parent: node.parent,
                 start: node.range.start.get(),
                 identifier_text: match &node.data {
@@ -10411,7 +10426,15 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         {
             return None;
         }
-        let query_required = prepared.family == SourceCallableFamily::FunctionDeclaration
+        let ordinary_arrow = prepared.family == SourceCallableFamily::ArrowFunction
+            && self.source_arrow_has_ordinary_type_parameters(prepared.declaration);
+        if prepared.syntax.is_ordinary_typescript_arrow() != ordinary_arrow
+            || ordinary_arrow && prepared.return_annotation.is_none()
+        {
+            return None;
+        }
+        let query_required = (prepared.family == SourceCallableFamily::FunctionDeclaration
+            || ordinary_arrow)
             && prepared.return_annotation.is_some()
             && !prepared.type_parameters.is_empty();
         if query_required != prepared.query_evidence.is_some() {
@@ -10444,6 +10467,10 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             && owner.exports().is_none()
             && owner.parent() == prepared.owner_parent
             && owner.export_symbol().is_none()
+            && (prepared.family != SourceCallableFamily::ArrowFunction
+                || owner.name() == InternalSymbolName::Function.as_ref()
+                    && prepared.owner_parent.is_none()
+                    && prepared.export_local.is_none())
             && self.get_merged_symbol(prepared.owner_symbol) == Some(prepared.owner_symbol);
         let export_route_valid = match (prepared.owner_parent, prepared.export_local) {
             (None, None) => owner.parent().is_none(),
@@ -10816,6 +10843,16 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                 })
             });
         if !plan.requires_type_query_evidence()
+            || plan.family == SourceCallableFamily::ArrowFunction
+                && (!plan.type_parameter_syntax.is_ordinary_typescript_arrow()
+                    || plan.is_async
+                    || plan.body_mode.is_ambient()
+                    || plan.type_predicate.is_some()
+                    || plan.parameters.iter().any(|parameter| {
+                        parameter.is_implicit_any()
+                            || parameter.rest
+                            || parameter.initializer.is_some()
+                    }))
             || !evidence.is_exact(self)
             || plan.family != prepared.family
             || plan.declaration != prepared.declaration

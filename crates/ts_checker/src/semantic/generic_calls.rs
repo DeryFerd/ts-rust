@@ -1724,7 +1724,7 @@ fn optional_generic_parameter_template(
     Ok((generic || valid_fixed_generic_source_parameter_type(store, template)).then_some(template))
 }
 
-/// Authenticates queried declaration metadata without extending call mapping.
+/// Authenticates queried source-callable metadata without extending call mapping.
 fn validate_generic_call_type_query<'store>(
     store: &'store CanonicalTypeMapperStore,
     callee: TypeId,
@@ -1736,7 +1736,9 @@ fn validate_generic_call_type_query<'store>(
     let Some(provenance) = store
         .source_callable_provenance(callee)
         .filter(|provenance| {
-            provenance.family == SourceCallableFamily::FunctionDeclaration
+            (provenance.family == SourceCallableFamily::FunctionDeclaration
+                || provenance.family == SourceCallableFamily::ArrowFunction
+                    && store.source_arrow_has_ordinary_type_parameters(provenance.declaration))
                 && provenance.return_provenance == SourceCallableReturnProvenance::Annotated
         })
     else {
@@ -1751,7 +1753,8 @@ fn validate_generic_call_type_query<'store>(
     let registered = store
         .source_callable_type_parameters(signature)
         .ok_or_else(invalid)?;
-    if provenance.signature != signature
+    if !plan.requires_type_query_evidence()
+        || provenance.signature != signature
         || plan.family != provenance.family
         || plan.declaration != provenance.declaration
         || plan.owner_symbol != provenance.owner_symbol

@@ -1,11 +1,12 @@
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName, SemanticSymbolId,
+    EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
     SourceCheckError, TypeData, TypeId,
+    types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -680,13 +681,424 @@ fn nested_alias_identities(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the two parameter owners, complete signature graph, and replay together.
+fn generic_identity_alias_arrow_keeps_distinct_parameters_and_replays() {
+    let parsed =
+        parse_source_file("type Alias<T> = T; const f = <T>(value: Alias<T>): Alias<T> => value;");
+    let node_ref = |node| NodeRef::new(parsed.arena.id(), FILE, node);
+    let (alias_declaration, alias) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                return None;
+            };
+            Some((node_ref(node), alias))
+        })
+        .unwrap();
+    let [alias_parameter] = alias.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("expected the alias's one type parameter")
+    };
+    let alias_parameter = node_ref(*alias_parameter);
+    let alias_name = node_ref(alias.name);
+    let alias_rhs = node_ref(alias.type_);
+    let (arrow_declaration, arrow) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::ArrowFunction(arrow) = &record.data else {
+                return None;
+            };
+            Some((node_ref(node), arrow))
+        })
+        .unwrap();
+    let [arrow_parameter] = arrow.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+        panic!("expected the arrow's one type parameter")
+    };
+    let arrow_parameter = node_ref(*arrow_parameter);
+    let [parameter] = arrow.parameters.nodes.as_slice() else {
+        panic!("expected one value parameter")
+    };
+    let parameter = node_ref(*parameter);
+    let NodeData::ParameterDeclaration(parameter_data) =
+        &parsed.arena.get(parameter.node).unwrap().data
+    else {
+        panic!("expected the typed value parameter")
+    };
+    let parameter_name = node_ref(parameter_data.name);
+    let parameter_annotation = node_ref(parameter_data.type_.unwrap());
+    let return_annotation = node_ref(arrow.type_.unwrap());
+    let body = node_ref(arrow.body);
+    let variable = node_ref(
+        parsed
+            .arena
+            .get(arrow_declaration.node)
+            .unwrap()
+            .parent
+            .unwrap(),
+    );
+    let NodeData::VariableDeclaration(variable_data) =
+        &parsed.arena.get(variable.node).unwrap().data
+    else {
+        panic!("the arrow must remain the variable initializer")
+    };
+    assert_eq!(variable_data.initializer, Some(arrow_declaration.node));
+    let variable_name = node_ref(variable_data.name);
+    let parameter_names = [alias_parameter, arrow_parameter].map(|node| {
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &parsed.arena.get(node.node).unwrap().data
+        else {
+            panic!("expected a type parameter declaration")
+        };
+        node_ref(parameter.name)
+    });
+    let arguments = [parameter_annotation, return_annotation].map(|node| {
+        let NodeData::TypeReferenceNode(reference) = &parsed.arena.get(node.node).unwrap().data
+        else {
+            panic!("expected the Alias<T> annotation")
+        };
+        let [argument] = reference.type_arguments.as_ref().unwrap().nodes.as_slice() else {
+            panic!("expected the arrow's one type argument")
+        };
+        node_ref(*argument)
+    });
+    let binding = |context: &CanonicalCheckerContext<'_>, node| {
+        let symbol = context.file(FILE).unwrap().1.symbol(node).unwrap();
+        context.store().get_merged_symbol(symbol).unwrap()
+    };
+    let checked = |context: &CanonicalCheckerContext<'_>| {
+        context
+            .store()
+            .source_file_links(context.source_file(FILE).unwrap())
+            .is_some_and(|links| links.type_checked)
+    };
+    let nodes = parsed
+        .arena
+        .iter()
+        .map(|(node, _)| node_ref(node))
+        .collect::<Vec<_>>();
+    let assert_state = |context: &mut CanonicalCheckerContext<'_>| {
+        assert!(checked(context));
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let alias_symbol = binding(context, alias_declaration);
+        let alias_parameter_symbol = binding(context, alias_parameter);
+        let arrow_parameter_symbol = binding(context, arrow_parameter);
+        let owner = binding(context, arrow_declaration);
+        let variable_symbol = binding(context, variable);
+        let value_symbol = binding(context, parameter);
+        assert_ne!(alias_parameter_symbol, arrow_parameter_symbol);
+        assert_ne!(owner, variable_symbol);
+        assert_eq!(
+            context.store().symbol(alias_symbol).unwrap().flags(),
+            SymbolFlags::TYPE_ALIAS
+        );
+        for (symbol, declaration, flags) in [
+            (owner, arrow_declaration, SymbolFlags::FUNCTION),
+            (
+                variable_symbol,
+                variable,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            ),
+            (
+                alias_parameter_symbol,
+                alias_parameter,
+                SymbolFlags::TYPE_PARAMETER,
+            ),
+            (
+                arrow_parameter_symbol,
+                arrow_parameter,
+                SymbolFlags::TYPE_PARAMETER,
+            ),
+        ] {
+            let record = context.store().symbol(symbol).unwrap();
+            assert_eq!(record.flags(), flags);
+            assert_eq!(record.declarations(), Some(&[declaration][..]));
+        }
+        assert_eq!(
+            context.store().symbol(owner).unwrap().value_declaration(),
+            Some(arrow_declaration)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol(variable_symbol)
+                .unwrap()
+                .value_declaration(),
+            Some(variable)
+        );
+        let alias_t = context
+            .store()
+            .declared_type_links(alias_parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let arrow_t = context
+            .store()
+            .declared_type_links(arrow_parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_ne!(alias_t, arrow_t);
+        for (type_, symbol) in [
+            (alias_t, alias_parameter_symbol),
+            (arrow_t, arrow_parameter_symbol),
+        ] {
+            let record = context.store().type_payload(type_).unwrap();
+            assert_eq!(record.flags(), TypeFlags::TYPE_PARAMETER);
+            assert_eq!(record.symbol(), Some(symbol));
+            let TypeData::TypeParameter(parameter) = record.data() else {
+                panic!("expected the binder-owned parameter")
+            };
+            assert_eq!(parameter.target, None);
+            assert_eq!(parameter.mapper, None);
+        }
+        let alias_links = context
+            .store()
+            .type_alias_links(alias_symbol)
+            .cloned()
+            .unwrap();
+        assert_eq!(alias_links.declared_type, Some(alias_t));
+        assert_eq!(alias_links.type_parameters.as_deref(), Some(&[alias_t][..]));
+        // One identity seed and one shared Alias<arrow T> result. Cache keys stay opaque.
+        let mut cached_alias_types = alias_links
+            .instantiations
+            .as_ref()
+            .unwrap()
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        cached_alias_types.sort_unstable();
+        let mut expected_alias_types = [alias_t, arrow_t];
+        expected_alias_types.sort_unstable();
+        assert_eq!(cached_alias_types, expected_alias_types);
+        let callable = context
+            .store()
+            .value_symbol_links(owner)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(variable_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(callable)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(value_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(arrow_t)
+        );
+        let signature = context
+            .store()
+            .signature_links(arrow_declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let record = context.store().type_payload(callable).unwrap();
+        assert_eq!(record.flags(), TypeFlags::OBJECT);
+        assert_eq!(
+            record.object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        );
+        assert_eq!(record.symbol(), Some(owner));
+        let TypeData::Object(object) = record.data() else {
+            panic!("expected the arrow's callable object")
+        };
+        assert_eq!(
+            object.structured.signatures.as_deref(),
+            Some(&[signature][..])
+        );
+        assert_eq!(object.structured.call_signature_count, 1);
+        let record = context.store().signature(signature).unwrap();
+        assert_eq!(record.declaration(), Some(arrow_declaration));
+        assert_eq!(record.type_parameters(), [arrow_t]);
+        assert_eq!(record.parameters(), [value_symbol]);
+        assert_eq!(record.resolved_return_type(), Some(arrow_t));
+        assert_eq!(record.target(), None);
+        assert_eq!(record.mapper(), None);
+        let reference_results = [
+            (alias_rhs, alias_t, alias_parameter_symbol),
+            (parameter_annotation, arrow_t, alias_symbol),
+            (return_annotation, arrow_t, alias_symbol),
+            (arguments[0], arrow_t, arrow_parameter_symbol),
+            (arguments[1], arrow_t, arrow_parameter_symbol),
+        ];
+        // Check publication before public queries can fill any missing cache.
+        for (node, type_, symbol) in reference_results {
+            assert_eq!(
+                context.store().type_node_links(node).unwrap().resolved_type,
+                Some(type_)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(symbol)
+            );
+        }
+        assert_eq!(context.store().type_node_links(arrow_declaration), None);
+        assert_eq!(
+            context.store().type_node_links(body).unwrap().resolved_type,
+            Some(arrow_t)
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(body)
+                .unwrap()
+                .resolved_symbol,
+            Some(value_symbol)
+        );
+        let cache_state = |context: &CanonicalCheckerContext<'_>| {
+            let record = context.store().signature(signature).unwrap();
+            (
+                context.store().type_alias_links(alias_symbol).cloned(),
+                (
+                    record.declaration(),
+                    record.type_parameters().to_vec(),
+                    record.parameters().to_vec(),
+                    record.resolved_return_type(),
+                    record.target(),
+                    record.mapper(),
+                ),
+                nodes
+                    .iter()
+                    .map(|&node| {
+                        (
+                            node,
+                            context.store().node_links(node).cloned(),
+                            context.store().type_node_links(node).cloned(),
+                            context.store().symbol_node_links(node).cloned(),
+                            context.store().signature_links(node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                [
+                    alias_symbol,
+                    alias_parameter_symbol,
+                    arrow_parameter_symbol,
+                    owner,
+                    variable_symbol,
+                    value_symbol,
+                ]
+                .map(|symbol| {
+                    (
+                        symbol,
+                        context.store().value_symbol_links(symbol).cloned(),
+                        context.store().declared_type_links(symbol).cloned(),
+                    )
+                }),
+                context
+                    .store()
+                    .source_file_links(context.source_file(FILE).unwrap())
+                    .cloned(),
+            )
+        };
+        let cached = cache_state(context);
+        let before = counts(context);
+        assert_eq!(
+            context.get_declared_type_of_symbol(alias_symbol).unwrap(),
+            alias_t
+        );
+        for (node, type_, symbol) in reference_results {
+            assert_eq!(context.get_type_from_type_node(node).unwrap(), type_);
+            assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+            let NodeData::TypeReferenceNode(reference) = &parsed.arena.get(node.node).unwrap().data
+            else {
+                panic!("expected the retained reference syntax")
+            };
+            assert_eq!(
+                context
+                    .get_symbol_at_location(node_ref(reference.type_name))
+                    .unwrap(),
+                Some(symbol)
+            );
+        }
+        for (node, type_, symbol) in [
+            (alias_name, alias_t, alias_symbol),
+            (parameter_names[0], alias_t, alias_parameter_symbol),
+            (parameter_names[1], arrow_t, arrow_parameter_symbol),
+            (parameter_name, arrow_t, value_symbol),
+            (body, arrow_t, value_symbol),
+            (variable_name, callable, variable_symbol),
+        ] {
+            assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+            assert_eq!(context.get_symbol_at_location(node).unwrap(), Some(symbol));
+        }
+        assert_eq!(
+            context.get_type_at_location(arrow_declaration).unwrap(),
+            callable
+        );
+        assert_eq!(
+            context.get_symbol_at_location(arrow_declaration).unwrap(),
+            None
+        );
+        assert_eq!(
+            context.get_return_type_of_signature(signature).unwrap(),
+            arrow_t
+        );
+        assert_eq!(cache_state(context), cached);
+        assert_eq!(counts(context), before);
+        assert!(context.diagnostics().is_empty());
+        (alias_t, arrow_t, callable, signature, cached)
+    };
+    for first in [None, Some(parameter_annotation), Some(return_annotation)] {
+        let mut context = context(&parsed);
+        let owner = binding(&context, arrow_declaration);
+        let variable_symbol = binding(&context, variable);
+        assert!(!checked(&context));
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(variable_symbol)
+                .is_none()
+        );
+        assert!(context.store().signature_links(arrow_declaration).is_none());
+        let initial_signatures = context.store().signature_len();
+        let early = first.map(|node| context.get_type_from_type_node(node).unwrap());
+        assert!(!checked(&context));
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(variable_symbol)
+                .is_none()
+        );
+        assert!(context.store().signature_links(arrow_declaration).is_none());
+        assert_eq!(context.store().signature_len(), initial_signatures);
+        assert!(context.diagnostics().is_empty());
+        context.check_source_file(FILE).unwrap();
+        let cold = assert_state(&mut context);
+        if let Some(early) = early {
+            assert_eq!(early, cold.1);
+        }
+        let before = counts(&context);
+        context.recheck_source_file(FILE).unwrap();
+        assert_eq!(assert_state(&mut context), cold);
+        assert_eq!(counts(&context), before);
+    }
+}
+
+#[test]
 fn generic_alias_source_boundary_keeps_recursive_and_const_forms_unsupported() {
     for source in [
         "interface Array<T> {} interface ReadonlyArray<T> {} type Alias<T> = T[]; declare function f<T>(value: Alias<T>): void;",
         "type Alias<T> = Alias<T>[]; declare function f<T>(value: Alias<T>): void;",
         "type First<T> = Second<T>; type Second<T> = First<T>[]; declare function f<T>(value: First<T>): void;",
         "type Alias<T> = T; declare function f<const T>(value: Alias<T>): void;",
-        "type Alias<T> = T; const f = <T>(value: Alias<T>): Alias<T> => value;",
         "type Alias<T> = typeof f; declare function f<T>(value: Alias<T>): void;",
         "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
     ] {

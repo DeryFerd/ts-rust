@@ -17,7 +17,10 @@
 //! `FunctionDeclaration`s, regular and const enums, already-published inferred
 //! or const-asserted object constants, recursive package namespaces,
 //! cross-file namespace constants, and narrowly authenticated cold async-arrow
-//! object constants. Declaration-file
+//! object constants. Direct default imports also accept synchronous TypeScript
+//! arrows with explicit return types and ordinary generic signatures. Their
+//! anonymous function owner remains separate from the default export property.
+//! Declaration-file
 //! bodies are never source checked by this leaf; imported annotations and
 //! authenticated ambient class members are queried lazily.
 //!
@@ -31,6 +34,7 @@
 //! those payloads for the source checker's one combined atomic publication
 //! batch. Importer-first Program order never recursively checks the target
 //! source: `CanonicalTypeQuery` materializes its canonical type lazily.
+//! Default arrow imports likewise leave the provider body and expression cache cold.
 //!
 //! The split follows the pinned TypeScript-Go paths in
 //! `internal/checker/checker.go`: `checkImportDeclaration` proves import
@@ -71,8 +75,9 @@ use super::{
     },
     object_members::{self, PropertyObjectPlan, PropertyObjectState},
     source_arrows::{
-        SourceArrowBodyPlan, SourceArrowError, plan_async_arrow_await_statement,
-        plan_source_arrow_value,
+        SourceArrowBodyPlan, SourceArrowError, SourceDefaultArrowExportPlan,
+        plan_async_arrow_await_statement, plan_source_arrow_value,
+        plan_source_default_arrow_export,
     },
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallablePlan, SourceCallableState,
@@ -637,6 +642,10 @@ enum PreparedSourceImportTarget {
     AnnotatedFunction {
         signature: SignatureId,
     },
+    DefaultArrow {
+        export: Box<SourceDefaultArrowExportPlan>,
+        signature: SignatureId,
+    },
     AmbientClass {
         instance_type: TypeId,
         signature: SignatureId,
@@ -732,6 +741,7 @@ enum PlannedSourceImportValueTarget {
         value: bool,
     },
     AnnotatedFunction(Box<SourceCallablePlan>),
+    DefaultArrow(Box<SourceDefaultArrowExportPlan>),
     AmbientClass(Box<ClassMemberQueryPlan>),
     ConstEnum {
         declaration: NodeRef,
@@ -3625,11 +3635,259 @@ pub(super) fn reject_source_type_import_value_use(
     ))
 }
 
+pub(super) fn plan_source_import_default_arrow_export(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    resolved: &ResolvedSourceImportBinding,
+) -> Result<Option<SourceDefaultArrowExportPlan>, SourceImportError> {
+    let target = resolved.target_symbol;
+    let Some(declaration) = store
+        .symbol(target)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+    else {
+        return Ok(None);
+    };
+    let Some(NodeData::ExportAssignment(assignment)) =
+        host.node(declaration).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    let expression = NodeRef::new(declaration.arena, declaration.file, assignment.expression);
+    if host
+        .node(expression)
+        .is_none_or(|node| node.kind != SyntaxKind::ArrowFunction)
+    {
+        return Ok(None);
+    }
+    if resolved.binding.imported_text != "default"
+        || resolved.immediate_target_symbol != target
+        || host
+            .node(resolved.binding.declaration)
+            .is_none_or(|node| node.kind != SyntaxKind::ImportClause)
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    }
+    let export = plan_source_default_arrow_export(
+        store,
+        host,
+        declaration,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )
+    .map_err(|error| imported_default_arrow_error(target, declaration, error))?;
+    if export.export_symbol != target {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            target,
+        )));
+    }
+    Ok(Some(export))
+}
+
+fn imported_default_arrow_error(
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+    error: SourceArrowError,
+) -> SourceImportError {
+    match error {
+        SourceArrowError::Unsupported(_) => {
+            unsupported(SourceImportUnsupported::TargetDeclaration(declaration))
+        }
+        SourceArrowError::Invariant(_) => {
+            invariant(SourceImportInvariant::InvalidTargetLinks(target))
+        }
+        SourceArrowError::DeclaredType(error) => error.into(),
+        SourceArrowError::LiteralCache(error) => SourceCallableError::LiteralCache(error).into(),
+    }
+}
+
+fn default_arrow_value_is_exact(
+    store: &CanonicalTypeMapperStore,
+    export: &SourceDefaultArrowExportPlan,
+    type_: TypeId,
+    signature: SignatureId,
+) -> bool {
+    store.source_callable_type_for_owner(export.callable.owner_symbol) == Some(type_)
+        && source_callable_state(store, &export.callable, false)
+            == Ok(SourceCallableState::Resolved { type_, signature })
+        && store
+            .source_callable_provenance(type_)
+            .is_some_and(|provenance| {
+                provenance.family == SourceCallableFamily::ArrowFunction
+                    && provenance.declaration == export.expression
+                    && provenance.owner_symbol == export.callable.owner_symbol
+                    && provenance.signature == signature
+            })
+        && store
+            .signature(signature)
+            .is_some_and(|signature| signature.resolved_return_type().is_some())
+        && matches!(
+            validate_stored_source_callable(store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        )
+        && store
+            .value_symbol_links(export.export_symbol)
+            .is_none_or(|links| {
+                links
+                    == &ValueSymbolLinks {
+                        resolved_type: links.resolved_type,
+                        ..ValueSymbolLinks::default()
+                    }
+                    && links.resolved_type.is_none_or(|cached| cached == type_)
+            })
+        && store
+            .type_node_links(export.expression)
+            .is_none_or(|links| {
+                links
+                    == &TypeNodeLinks {
+                        resolved_type: links.resolved_type,
+                        ..TypeNodeLinks::default()
+                    }
+                    && links.resolved_type.is_none_or(|cached| cached == type_)
+            })
+}
+
+pub(super) fn preflight_source_default_arrow_export_value(
+    store: &CanonicalTypeMapperStore,
+    export: &SourceDefaultArrowExportPlan,
+) -> Result<(), SourceImportError> {
+    let invalid = || {
+        invariant(SourceImportInvariant::InvalidTargetLinks(
+            export.export_symbol,
+        ))
+    };
+    preflight_import_target_value_links(store, export.export_symbol)?;
+    if store
+        .type_node_links(export.expression)
+        .is_some_and(|links| {
+            links
+                != &TypeNodeLinks {
+                    resolved_type: links.resolved_type,
+                    ..TypeNodeLinks::default()
+                }
+        })
+    {
+        return Err(invalid());
+    }
+    for cached in [
+        store
+            .value_symbol_links(export.export_symbol)
+            .and_then(|links| links.resolved_type),
+        store
+            .type_node_links(export.expression)
+            .and_then(|links| links.resolved_type),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let signature = store
+            .source_callable_provenance(cached)
+            .map(|provenance| provenance.signature)
+            .ok_or_else(invalid)?;
+        if !default_arrow_value_is_exact(store, export, cached, signature) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_imported_default_arrow(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    export: &SourceDefaultArrowExportPlan,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+) -> Result<(TypeId, SignatureId), SourceImportError> {
+    let invalid = || {
+        invariant(SourceImportInvariant::InvalidTargetLinks(
+            export.export_symbol,
+        ))
+    };
+    preflight_source_default_arrow_export_value(store, export)?;
+    let callable = &export.callable;
+    let roots = callable
+        .type_parameters
+        .iter()
+        .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+        .chain(
+            callable
+                .parameters
+                .iter()
+                .map(|parameter| parameter.explicit_type_node()),
+        )
+        .chain(std::iter::once(callable.return_type.type_node()))
+        .flatten()
+        .collect::<Vec<_>>();
+    if type_import_capabilities
+        .keys()
+        .any(|root| !roots.contains(root))
+    {
+        return Err(invalid());
+    }
+    let capabilities = roots
+        .iter()
+        .filter_map(|root| type_import_capabilities.get(root))
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .with_type_reference_alias_targets(capabilities.iter().copied())?
+    .get_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+    let signature = store
+        .source_callable_provenance(type_)
+        .filter(|provenance| {
+            provenance.family == SourceCallableFamily::ArrowFunction
+                && provenance.declaration == export.expression
+                && provenance.owner_symbol == callable.owner_symbol
+        })
+        .map(|provenance| provenance.signature)
+        .ok_or_else(invalid)?;
+    let return_capabilities = if callable.requires_type_query_evidence() {
+        capabilities
+    } else {
+        callable
+            .return_type
+            .type_node()
+            .and_then(|root| type_import_capabilities.get(&root))
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
+    };
+    CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .with_type_reference_alias_targets(return_capabilities)?
+    .get_return_type_of_signature(signature)?;
+    if !default_arrow_value_is_exact(store, export, type_, signature) {
+        return Err(invalid());
+    }
+    Ok((type_, signature))
+}
+
 /// Lazily types one resolved binding for one proven value read. Cold
 /// export-equals objects publish their authenticated target values first;
 /// import-alias writes remain deferred. The caller owns the
 /// instantiation-session query boundary.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_source_import_value(
     store: &mut CanonicalTypeMapperStore,
     declared_host: &DeclaredTypeHost<'_>,
@@ -3639,6 +3897,31 @@ pub(super) fn prepare_source_import_value(
     diagnostics: &mut CanonicalCheckerDiagnostics,
     resolved: &ResolvedSourceImportBinding,
     read: &PlannedSourceImportRead,
+) -> Result<PreparedSourceImportValue, SourceImportError> {
+    prepare_source_import_value_with_type_import_capabilities(
+        store,
+        declared_host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        resolved,
+        read,
+        &HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_source_import_value_with_type_import_capabilities(
+    store: &mut CanonicalTypeMapperStore,
+    declared_host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    resolved: &ResolvedSourceImportBinding,
+    read: &PlannedSourceImportRead,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
 ) -> Result<PreparedSourceImportValue, SourceImportError> {
     validate_planned_import_read(store, declared_host, resolved, read)?;
     let namespace_aliases = resolved.namespace_aliases.borrow();
@@ -3678,7 +3961,13 @@ pub(super) fn prepare_source_import_value(
         )));
     }
 
-    if cached_target_type.is_none()
+    let default_arrow =
+        plan_source_import_default_arrow_export(store, declared_host, global_types, resolved)?;
+    if default_arrow.is_none() && !type_import_capabilities.is_empty() {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+    }
+    if default_arrow.is_none()
+        && cached_target_type.is_none()
         && store.symbol(target).is_some_and(|symbol| {
             symbol.flags() == SymbolFlags::PROPERTY
                 || symbol.flags() == SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE
@@ -3692,17 +3981,22 @@ pub(super) fn prepare_source_import_value(
         )?;
     }
 
-    let planned_target = plan_direct_import_value_target(
-        store,
-        declared_host,
-        global_types,
-        options,
-        binding.alias_symbol,
-        target,
-        None,
-        &namespace_aliases,
-        &mut HashSet::new(),
-    );
+    let planned_target = match default_arrow {
+        Some(export) => Ok(PlannedSourceImportValueTarget::DefaultArrow(Box::new(
+            export,
+        ))),
+        None => plan_direct_import_value_target(
+            store,
+            declared_host,
+            global_types,
+            options,
+            binding.alias_symbol,
+            target,
+            None,
+            &namespace_aliases,
+            &mut HashSet::new(),
+        ),
+    };
     let planned_target = match planned_target {
         Ok(planned) => planned,
         Err(
@@ -3760,6 +4054,7 @@ pub(super) fn prepare_source_import_value(
         }
         PlannedSourceImportValueTarget::ColdNamespaceConst(namespace) => namespace.declaration,
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
+        PlannedSourceImportValueTarget::DefaultArrow(export) => export.declaration,
         PlannedSourceImportValueTarget::AmbientClass(class) => class.declaration(),
     };
     let same_source_namespace = matches!(
@@ -3890,6 +4185,22 @@ pub(super) fn prepare_source_import_value(
                 PreparedSourceImportTarget::AnnotatedFunction {
                     signature: provenance.signature,
                 },
+            )
+        }
+        PlannedSourceImportValueTarget::DefaultArrow(export) => {
+            let (type_, signature) = materialize_imported_default_arrow(
+                store,
+                declared_host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &export,
+                type_import_capabilities,
+            )?;
+            (
+                type_,
+                PreparedSourceImportTarget::DefaultArrow { export, signature },
             )
         }
         PlannedSourceImportValueTarget::AmbientClass(class) => {
@@ -4051,14 +4362,32 @@ pub(super) fn prepare_source_import_value(
 
 /// Read-only final preflight for payloads that the source checker can append
 /// to its combined atomic publication batch.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn preflight_prepared_source_import_publications(
     store: &CanonicalTypeMapperStore,
     prepared: &[PreparedSourceImportValue],
 ) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
+    preflight_prepared_source_import_publications_impl(store, prepared, None)
+}
+
+pub(super) fn preflight_prepared_source_import_publications_with_host(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    prepared: &[PreparedSourceImportValue],
+) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
+    preflight_prepared_source_import_publications_impl(store, prepared, Some((host, global_types)))
+}
+
+fn preflight_prepared_source_import_publications_impl(
+    store: &CanonicalTypeMapperStore,
+    prepared: &[PreparedSourceImportValue],
+    source: Option<(&DeclaredTypeHost<'_>, &CanonicalGlobalTypes)>,
+) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
     let mut publications = Vec::<PreparedSourceImportPublication>::new();
     let mut publication_indices = HashMap::<SemanticSymbolId, usize>::new();
     for value in prepared {
-        validate_prepared_import_value(store, value)?;
+        validate_prepared_import_value(store, value, source)?;
         if let PreparedSourceImportTarget::ModuleNamespace { properties } = &value.target {
             collect_nested_namespace_publications(
                 properties,
@@ -7132,6 +7461,11 @@ fn materialize_imported_module_member(
             .get_return_type_of_signature(signature)?;
             (type_, None)
         }
+        PlannedSourceImportValueTarget::DefaultArrow(export) => {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                export.declaration,
+            )));
+        }
         PlannedSourceImportValueTarget::AmbientClass(class) => {
             let members =
                 execute_nongeneric_class_member_query(store, host, &class).map_err(|error| {
@@ -7249,6 +7583,11 @@ fn preflight_imported_module_namespace_members(
                     diagnostics,
                 )?
                 .preflight_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
+            }
+            PlannedSourceImportValueTarget::DefaultArrow(export) => {
+                return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                    export.declaration,
+                )));
             }
             PlannedSourceImportValueTarget::AmbientClass(class) => {
                 preflight_nongeneric_class_member_query(store, host, class).map_err(|error| {
@@ -9792,6 +10131,7 @@ fn prepare_value_links(
 fn validate_prepared_import_value(
     store: &CanonicalTypeMapperStore,
     prepared: &PreparedSourceImportValue,
+    source: Option<(&DeclaredTypeHost<'_>, &CanonicalGlobalTypes)>,
 ) -> Result<(), SourceImportError> {
     validate_alias_symbol(
         store,
@@ -9872,6 +10212,34 @@ fn validate_prepared_import_value(
                     validate_stored_source_callable(store, prepared.type_),
                     StoredSourceCallableValidation::Valid(_)
                 )
+        }
+        PreparedSourceImportTarget::DefaultArrow { export, signature } => {
+            if let Some((host, global_types)) = source {
+                let current = plan_source_default_arrow_export(
+                    store,
+                    host,
+                    prepared.target_declaration,
+                    Some(CanonicalArrayTargets::from_global_types(global_types)),
+                )
+                .map_err(|error| {
+                    imported_default_arrow_error(
+                        prepared.target_symbol,
+                        prepared.target_declaration,
+                        error,
+                    )
+                })?;
+                current == **export
+                    && prepared.target_symbol == export.export_symbol
+                    && prepared.target_declaration == export.declaration
+                    && prepared.immediate_target_symbol == export.export_symbol
+                    && prepared.binding.imported_text == "default"
+                    && host
+                        .node(prepared.binding.declaration)
+                        .is_some_and(|node| node.kind == SyntaxKind::ImportClause)
+                    && default_arrow_value_is_exact(store, export, prepared.type_, *signature)
+            } else {
+                false
+            }
         }
         PreparedSourceImportTarget::AmbientClass {
             instance_type,
@@ -21572,6 +21940,335 @@ mod tests {
         let warm = vec![prepare_one(&mut fixture, &warm_resolved[1], &planned_read).unwrap()];
         assert_eq!(warm, prepared);
         publish_for_test(&mut fixture.store, &warm);
+    }
+
+    #[test]
+    fn default_arrow_import_preserves_owners_and_cold_body_through_warm_replay() {
+        let mut fixture = fixture(
+            &[
+                "import identity from './target'; const copied = identity;",
+                "export default <T>(value: T): T => value;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let read_node = identifier_initializer(&fixture, 0, "identity");
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            fixture.bound.get(&fixture.files[0].file).unwrap(),
+            &fixture.store,
+            &plan.bindings[0],
+            read_node,
+            "identity",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap().remove(0);
+        let prepared = prepare_one(&mut fixture, &resolved, &read).unwrap();
+        let PreparedSourceImportTarget::DefaultArrow { export, signature } = &prepared.target
+        else {
+            panic!("the direct default import retains its arrow export proof")
+        };
+        let export = export.as_ref().clone();
+        let signature = *signature;
+        assert_eq!(prepared.target_symbol, export.export_symbol);
+        assert_eq!(prepared.target_declaration, export.declaration);
+        assert_ne!(export.export_symbol, export.callable.owner_symbol);
+        assert_eq!(
+            fixture.store.symbol(export.export_symbol).unwrap().flags(),
+            SymbolFlags::PROPERTY
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(export.callable.owner_symbol)
+                .unwrap()
+                .flags(),
+            SymbolFlags::FUNCTION
+        );
+        let signature_record = fixture.store.signature(signature).unwrap();
+        assert_eq!(signature_record.type_parameters().len(), 1);
+        assert_eq!(
+            signature_record.resolved_return_type(),
+            Some(signature_record.type_parameters()[0])
+        );
+        assert_eq!(
+            fixture
+                .store
+                .source_callable_type_for_owner(export.callable.owner_symbol),
+            Some(prepared.type_)
+        );
+        assert!(fixture.store.type_node_links(export.expression).is_none());
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(export.export_symbol)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+        let source = super::super::SourceFileRef::new(
+            fixture.store.id(),
+            fixture
+                .bound
+                .get(&fixture.files[1].file)
+                .unwrap()
+                .source_file(),
+        );
+        assert!(fixture.store.contains_source_file(source));
+        assert!(
+            fixture
+                .store
+                .source_file_links(source)
+                .is_none_or(|links| !links.type_checked)
+        );
+        let before = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            preflight_prepared_source_import_publications(
+                &fixture.store,
+                std::slice::from_ref(&prepared)
+            ),
+            Err(invariant(SourceImportInvariant::PreparedStateChanged(
+                plan.bindings[0].alias_symbol
+            ))),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            before
+        );
+
+        let publications = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                fixture
+                    .files
+                    .iter()
+                    .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            preflight_prepared_source_import_publications_with_host(
+                &fixture.store,
+                &host,
+                &fixture.global_types,
+                std::slice::from_ref(&prepared),
+            )
+            .unwrap()
+        };
+        for publication in publications {
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(publication.symbol, publication.links)
+            );
+        }
+        let warm_state = (store_state(&fixture.store), fixture.store.signature_len());
+        let warm = prepare_one(&mut fixture, &resolved, &read).unwrap();
+        assert_eq!(warm, prepared);
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm_state
+        );
+        assert!(fixture.store.type_node_links(export.expression).is_none());
+        assert!(
+            fixture
+                .store
+                .source_file_links(source)
+                .is_none_or(|links| !links.type_checked)
+        );
+        for symbol in [
+            export.export_symbol,
+            export.callable.owner_symbol,
+            plan.bindings[0].alias_symbol,
+        ] {
+            let links = fixture.store.value_symbol_links(symbol).unwrap();
+            assert_eq!(links.resolved_type, Some(prepared.type_));
+            assert!(!links.function_or_constructor_checked);
+        }
+    }
+
+    #[test]
+    fn default_arrow_import_rejects_changed_default_entry_cold_and_warm() {
+        for warm in [false, true] {
+            let mut fixture = fixture(
+                &[
+                    "import identity from './target'; const copied = identity;",
+                    "export default <T>(value: T): T => value;",
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let plan = fixture.plan_import(0, 0);
+            let read_node = identifier_initializer(&fixture, 0, "identity");
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                fixture.bound.get(&fixture.files[0].file).unwrap(),
+                &fixture.store,
+                &plan.bindings[0],
+                read_node,
+                "identity",
+                plan.bindings[0].alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap().remove(0);
+            let export = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    fixture
+                        .files
+                        .iter()
+                        .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())),
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                plan_source_import_default_arrow_export(
+                    &fixture.store,
+                    &host,
+                    &fixture.global_types,
+                    &resolved,
+                )
+                .unwrap()
+                .unwrap()
+            };
+            let prepared = warm.then(|| prepare_one(&mut fixture, &resolved, &read).unwrap());
+            if let Some(prepared) = &prepared {
+                let publications = {
+                    let host = DeclaredTypeHost::new_after_global_merge(
+                        fixture.files.iter().map(|file| {
+                            (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())
+                        }),
+                        GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                    )
+                    .unwrap();
+                    preflight_prepared_source_import_publications_with_host(
+                        &fixture.store,
+                        &host,
+                        &fixture.global_types,
+                        std::slice::from_ref(prepared),
+                    )
+                    .unwrap()
+                };
+                for publication in publications {
+                    assert!(
+                        fixture
+                            .store
+                            .set_value_symbol_links(publication.symbol, publication.links)
+                    );
+                }
+            }
+            let exports = fixture
+                .store
+                .symbol(export.module_symbol)
+                .unwrap()
+                .exports()
+                .unwrap();
+            assert_eq!(
+                fixture.store.insert_symbol(
+                    exports,
+                    EscapedName::internal(InternalSymbolName::Default),
+                    export.callable.owner_symbol,
+                ),
+                Some(Some(export.export_symbol))
+            );
+            let poisoned = (
+                store_state(&fixture.store),
+                fixture.store.signature_len(),
+                fixture
+                    .store
+                    .value_symbol_links(export.export_symbol)
+                    .cloned(),
+                fixture
+                    .store
+                    .value_symbol_links(export.callable.owner_symbol)
+                    .cloned(),
+                fixture
+                    .store
+                    .value_symbol_links(plan.bindings[0].alias_symbol)
+                    .cloned(),
+                fixture.store.signature_links(export.expression).cloned(),
+                fixture.store.type_node_links(export.expression).cloned(),
+            );
+            for _ in 0..2 {
+                let expected = Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+                    export.export_symbol,
+                )));
+                assert_eq!(prepare_one(&mut fixture, &resolved, &read), expected);
+                if let Some(prepared) = &prepared {
+                    let host = DeclaredTypeHost::new_after_global_merge(
+                        fixture.files.iter().map(|file| {
+                            (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())
+                        }),
+                        GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        preflight_prepared_source_import_publications_with_host(
+                            &fixture.store,
+                            &host,
+                            &fixture.global_types,
+                            std::slice::from_ref(prepared),
+                        ),
+                        Err(invariant(SourceImportInvariant::InvalidTargetLinks(
+                            export.export_symbol
+                        )))
+                    );
+                }
+                assert_eq!(
+                    fixture
+                        .store
+                        .symbol_table(exports)
+                        .unwrap()
+                        .get(InternalSymbolName::Default.as_ref()),
+                    Some(export.callable.owner_symbol)
+                );
+                assert_eq!(
+                    (
+                        store_state(&fixture.store),
+                        fixture.store.signature_len(),
+                        fixture
+                            .store
+                            .value_symbol_links(export.export_symbol)
+                            .cloned(),
+                        fixture
+                            .store
+                            .value_symbol_links(export.callable.owner_symbol)
+                            .cloned(),
+                        fixture
+                            .store
+                            .value_symbol_links(plan.bindings[0].alias_symbol)
+                            .cloned(),
+                        fixture.store.signature_links(export.expression).cloned(),
+                        fixture.store.type_node_links(export.expression).cloned(),
+                    ),
+                    poisoned
+                );
+            }
+            assert_eq!(
+                fixture.store.insert_symbol(
+                    exports,
+                    EscapedName::internal(InternalSymbolName::Default),
+                    export.export_symbol,
+                ),
+                Some(Some(export.callable.owner_symbol))
+            );
+            let restored = prepare_one(&mut fixture, &resolved, &read).unwrap();
+            if let Some(prepared) = prepared {
+                assert_eq!(restored, prepared);
+                assert_eq!(
+                    (store_state(&fixture.store), fixture.store.signature_len()),
+                    (poisoned.0, poisoned.1)
+                );
+            }
+        }
     }
 
     #[test]

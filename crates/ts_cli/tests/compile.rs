@@ -652,6 +652,8 @@ fn direct_file_transforms_explicit_commonjs_modules() {
 #[test]
 fn creates_project_output_directory() {
     let directory = TestDirectory::new("emit-project");
+    let output_directory = directory.0.join("dist");
+    assert!(!output_directory.exists());
     fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
     fs::write(
         directory.0.join("tsconfig.json"),
@@ -668,12 +670,12 @@ fn creates_project_output_directory() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    let javascript = fs::read_to_string(directory.0.join("dist/main.js")).unwrap();
-    assert!(
-        javascript.contains("export var answer = 42;"),
-        "{javascript}"
-    );
+    assert!(output_directory.is_dir());
+    let javascript = fs::read_to_string(output_directory.join("main.js")).unwrap();
+    assert_eq!(javascript, "export const answer = 42;\n");
     assert!(!javascript.contains("exports.answer"), "{javascript}");
+    assert_eq!(fs::read_dir(output_directory).unwrap().count(), 1);
+    assert!(!directory.0.join("main.js").exists());
 }
 
 #[test]

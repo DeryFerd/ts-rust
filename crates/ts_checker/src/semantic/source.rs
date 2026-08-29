@@ -176,10 +176,11 @@ use super::{
         SourceArrowInvariant, SourceArrowPlan, SourceArrowUnsupported, SourceContextualArrowError,
         SourceContextualArrowInvariant, SourceContextualArrowPlan,
         SourceContextualArrowUnsupported, SourceContextualParameterOrigin,
-        SourceContextualReturnOrigin, SourceContextualSignatureShape,
+        SourceContextualReturnOrigin, SourceContextualSignatureShape, SourceDefaultArrowExportPlan,
         plan_array_arrow_identifier_statement, plan_async_arrow_await_statement,
         plan_contextual_source_arrow, plan_jsdoc_contextual_source_arrow, plan_source_arrow,
-        plan_source_arrow_value, resolve_contextual_arrow_parameter_origins,
+        plan_source_arrow_value, plan_source_default_arrow_export,
+        resolve_contextual_arrow_parameter_origins,
     },
     source_callables::{
         ContextualSourceCallableParameter, PreparedContextualDirectCallSourceCallable,
@@ -242,12 +243,14 @@ use super::{
         ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
         ResolvedSourceTypeImportBinding, SourceImportBindingPlan, SourceImportError,
         SourceImportPlan, SourceImportUnsupported, SourceNamedReexportBindingPlan,
-        SourceNamedReexportPlan, plan_source_import_identifier_read,
-        plan_source_jsdoc_typedef_import, plan_source_type_import_reference,
-        plan_top_level_import_equals, plan_top_level_javascript_require,
-        plan_top_level_named_reexport, plan_top_level_named_specifier_type_import,
-        plan_top_level_named_type_import, plan_top_level_named_value_import,
-        preflight_prepared_source_import_publications, prepare_source_import_value,
+        SourceNamedReexportPlan, plan_source_import_default_arrow_export,
+        plan_source_import_identifier_read, plan_source_jsdoc_typedef_import,
+        plan_source_type_import_reference, plan_top_level_import_equals,
+        plan_top_level_javascript_require, plan_top_level_named_reexport,
+        plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
+        plan_top_level_named_value_import, preflight_prepared_source_import_publications_with_host,
+        preflight_source_default_arrow_export_value,
+        prepare_source_import_value_with_type_import_capabilities,
         reject_source_type_import_value_use, resolve_source_import_binding,
         resolve_source_import_namespace_exports, resolve_source_jsdoc_typedef_import,
         resolve_source_named_reexport_binding, resolve_source_type_import_binding,
@@ -926,6 +929,11 @@ struct PreparedSourceTypeImportValueUse {
     error_type: TypeId,
     prior_links: Option<TypeNodeLinks>,
     publication: TypeNodeLinks,
+}
+
+struct SourceTypeImportExecution<'a> {
+    value_uses: HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    annotation_capabilities: &'a HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2165,6 +2173,7 @@ enum PlannedStatement {
     NamedReexport,
     DefaultAlias(Box<PlannedDefaultAliasExport>),
     DefaultObject(Box<PlannedDefaultObjectExport>),
+    DefaultArrow(Box<PlannedDefaultArrowExport>),
     AmbientExportAssignment(NodeRef),
     AmbientNamespaceExport,
     InvalidModuleSpecifier(NodeRef),
@@ -2236,6 +2245,12 @@ struct PlannedDefaultAliasExport {
 struct PlannedDefaultObjectExport {
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
+    expression: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedDefaultArrowExport {
+    source: SourceDefaultArrowExportPlan,
     expression: PlannedExpression,
 }
 
@@ -3820,6 +3835,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 owner_symbol,
                                 expression,
                             },
+                        )));
+                        continue;
+                    }
+                    if expression_node.kind == SyntaxKind::ArrowFunction {
+                        let Some((store, host)) = self.semantic else {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Arrow(expression),
+                            ));
+                        };
+                        let source = plan_source_default_arrow_export(
+                            store,
+                            host,
+                            statement,
+                            self.array_targets,
+                        )
+                        .map_err(Self::arrow_plan_error)?;
+                        preflight_source_default_arrow_export_value(store, &source)
+                            .map_err(|error| Self::import_plan_error(statement, &error))?;
+                        let expression = self.plan_expression(expression)?;
+                        if !matches!(
+                            &expression.kind,
+                            PlannedExpressionKind::Arrow(arrow)
+                                if arrow.callable == source.callable
+                                    && expression.node == source.expression
+                        ) {
+                            return Err(SourceCheckError::Arrow(source.expression));
+                        }
+                        statements.push(PlannedStatement::DefaultArrow(Box::new(
+                            PlannedDefaultArrowExport { source, expression },
                         )));
                         continue;
                     }
@@ -6979,6 +7023,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(())
     }
 
+    fn plan_callable_type_import_annotation_roots(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<(), SourceCheckError> {
+        for annotation in callable
+            .type_parameters
+            .iter()
+            .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+            .chain(
+                callable
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.explicit_type_node()),
+            )
+            .chain(std::iter::once(callable.return_type.type_node()))
+            .flatten()
+        {
+            self.plan_type_import_annotation_root(annotation)?;
+        }
+        Ok(())
+    }
+
     fn collect_type_import_annotation_graph(
         &self,
         root: NodeRef,
@@ -6999,15 +7065,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         match &record.data {
             NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => {
                 if let Some(alias_symbol) = self.resolved_type_import_alias_for_reference(node)? {
-                    if reference.type_arguments.is_some() {
-                        unsupported.get_or_insert(node);
-                    }
                     references.push(PlannedSourceTypeImportReference {
                         root,
                         node,
                         alias_symbol,
                     });
-                } else if let Some(arguments) = &reference.type_arguments {
+                }
+                if let Some(arguments) = &reference.type_arguments {
                     let name = self.reference(reference.type_name);
                     let name_record = self.node(name)?;
                     if name_record.parent != Some(node.node)
@@ -15148,6 +15212,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         source: SourceArrowPlan,
     ) -> Result<PlannedArrow, SourceCheckError> {
+        self.plan_callable_type_import_annotation_roots(&source.callable)?;
         if let SourceArrowBodyPlan::LinearBlock { block } = source.body {
             let (parameter_initializers, object_parameter_bindings, body) =
                 self.plan_function_body(&source.callable)?;
@@ -20334,6 +20399,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
 
         let mut argument = declaration;
+        let mut default_export = None;
         loop {
             let parent = self
                 .node(argument)?
@@ -20344,6 +20410,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))?;
             let record = self.node(parent)?;
             match &record.data {
+                NodeData::ExportAssignment(export)
+                    if record.kind == SyntaxKind::ExportAssignment
+                        && argument == declaration
+                        && export.expression == declaration.node =>
+                {
+                    let plan =
+                        plan_source_default_arrow_export(store, host, parent, self.array_targets)
+                            .map_err(Self::arrow_plan_error)?;
+                    if plan.expression != declaration {
+                        return Err(SourceCheckError::Arrow(declaration));
+                    }
+                    default_export = Some(plan);
+                    break;
+                }
                 NodeData::ParenthesizedExpression(parenthesized)
                     if record.kind == SyntaxKind::ParenthesizedExpression
                         && parenthesized.expression == argument.node =>
@@ -20582,9 +20662,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
         }
 
-        let (callable, body) =
-            plan_source_arrow_value(store, host, declaration, self.array_targets)
-                .map_err(Self::arrow_plan_error)?;
+        let (callable, body) = match default_export {
+            Some(export) => (export.callable, export.body),
+            None => plan_source_arrow_value(store, host, declaration, self.array_targets)
+                .map_err(Self::arrow_plan_error)?,
+        };
         let expression_statement = match plan_async_arrow_await_statement(store, host, &callable)
             .map_err(Self::arrow_plan_error)?
         {
@@ -20626,20 +20708,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 UnsupportedSourceSyntax::Arrow(declaration),
             ));
         }
-        for annotation in callable
-            .parameters
-            .iter()
-            .filter_map(|parameter| parameter.explicit_type_node())
-            .chain(callable.return_type.type_node())
-        {
-            let references = self.type_import_references.len();
-            self.plan_type_import_annotation_root(annotation)?;
-            if self.type_import_references.len() != references {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Arrow(annotation),
-                ));
-            }
-        }
+        self.plan_callable_type_import_annotation_roots(&callable)?;
 
         self.nested_arrow_depth += 1;
         let result = (|| {
@@ -28192,10 +28261,11 @@ fn preflight_type_import_value_use(
 fn check_type_import_value_use(
     store: &mut CanonicalTypeMapperStore,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     read: &PlannedSourceTypeImportValueUse,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
-    let prepared = preflighted_type_import_value_uses
+    let prepared = type_import_execution
+        .value_uses
         .get(&read.node)
         .ok_or(SourceCheckError::Import(read.node))?;
     if store.type_node_links(read.node) != prepared.prior_links.as_ref() {
@@ -29191,7 +29261,7 @@ fn check_expression_type(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
@@ -29205,7 +29275,7 @@ fn check_expression_type(
         session,
         diagnostics,
         current_flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         expression,
         contextual_type,
         deferred,
@@ -29251,7 +29321,7 @@ fn check_expression_type_with_class_context(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     deferred: &mut Vec<DeferredAssertion>,
@@ -29279,7 +29349,7 @@ fn check_expression_type_with_class_context(
             session,
             diagnostics,
             current_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             operand,
             None,
             deferred,
@@ -29488,12 +29558,9 @@ fn check_expression_type_with_class_context(
             );
             Ok(CheckedExpressionTypes::leaf(error_type, error_type))
         }
-        PlannedExpressionKind::TypeImportValueUse(read) => check_type_import_value_use(
-            store,
-            diagnostics,
-            preflighted_type_import_value_uses,
-            read,
-        ),
+        PlannedExpressionKind::TypeImportValueUse(read) => {
+            check_type_import_value_use(store, diagnostics, type_import_execution, read)
+        }
         PlannedExpressionKind::Template(template) => {
             let mut substitutions = Vec::with_capacity(template.substitutions.len());
             for substitution in &template.substitutions {
@@ -29506,7 +29573,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     substitution,
                     None,
                     deferred,
@@ -29590,7 +29657,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &conditional.condition,
                     None,
                     deferred,
@@ -29693,7 +29760,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     when_true_flow,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &conditional.when_true,
                     contextual_type,
                     deferred,
@@ -29737,7 +29804,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     when_false_flow,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &conditional.when_false,
                     contextual_type,
                     deferred,
@@ -29829,7 +29896,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     property,
                     None,
                     deferred,
@@ -29905,7 +29972,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &property.receiver,
                 None,
                 deferred,
@@ -30034,7 +30101,7 @@ fn check_expression_type_with_class_context(
                                 source,
                                 options,
                                 session,
-                                preflighted_type_import_value_uses,
+                                type_import_execution,
                                 deferred,
                                 context.state,
                                 index,
@@ -30071,7 +30138,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &property.receiver,
                 None,
                 deferred,
@@ -30118,7 +30185,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &element.receiver,
                 None,
                 deferred,
@@ -30133,7 +30200,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &element.index,
                 None,
                 deferred,
@@ -30219,7 +30286,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &binary.left,
                 left_contextual_type,
                 deferred,
@@ -30248,7 +30315,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 narrowed_flow_types.as_ref().unwrap_or(current_flow_types),
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &binary.right,
                 right_contextual_type,
                 deferred,
@@ -30303,7 +30370,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &binary.right,
                 contextual_type,
                 deferred,
@@ -30347,7 +30414,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &assignment.initializer,
                 None,
                 deferred,
@@ -30366,7 +30433,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &binary.left,
                 None,
                 deferred,
@@ -30411,7 +30478,7 @@ fn check_expression_type_with_class_context(
                         session,
                         diagnostics,
                         current_flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         target,
                         None,
                         deferred,
@@ -30426,7 +30493,7 @@ fn check_expression_type_with_class_context(
                         session,
                         diagnostics,
                         current_flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         deferred,
                         checked_target.result,
                         None,
@@ -30461,7 +30528,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 target.result,
                 None,
@@ -30484,7 +30551,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &binary.left,
                 None,
                 deferred,
@@ -30511,7 +30578,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     right_expression,
                     if comma { contextual_type } else { None },
                     deferred,
@@ -30676,7 +30743,7 @@ fn check_expression_type_with_class_context(
             session,
             diagnostics,
             current_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             expression.node,
             arrow,
@@ -30699,7 +30766,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     executor,
                     Some(contextual),
                     deferred,
@@ -30784,7 +30851,7 @@ fn check_expression_type_with_class_context(
                         session,
                         diagnostics,
                         current_flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         argument,
                         contextual,
                         deferred,
@@ -30831,7 +30898,7 @@ fn check_expression_type_with_class_context(
                         session,
                         diagnostics,
                         current_flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         specifier,
                         None,
                         deferred,
@@ -30900,7 +30967,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     expression,
                     call,
@@ -30917,7 +30984,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &call.callee,
                 None,
                 deferred,
@@ -30993,7 +31060,7 @@ fn check_expression_type_with_class_context(
                         session,
                         diagnostics,
                         current_flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         argument,
                         contextual_type,
                         deferred,
@@ -31073,7 +31140,7 @@ fn check_expression_type_with_class_context(
                                 source,
                                 options,
                                 session,
-                                preflighted_type_import_value_uses,
+                                type_import_execution,
                                 deferred,
                                 context.state,
                                 index,
@@ -31109,7 +31176,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 inner,
                 if expression.jsdoc_type.is_some() {
                     None
@@ -31172,7 +31239,7 @@ fn check_expression_type_with_class_context(
                     session,
                     diagnostics,
                     current_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     operand,
                     if recursive_object_operand {
                         None
@@ -31279,7 +31346,7 @@ fn check_expression_type_with_class_context(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 operand,
                 literal_target,
                 deferred,
@@ -31454,7 +31521,7 @@ fn check_expression_type_with_class_context(
                                 session,
                                 diagnostics,
                                 current_flow_types,
-                                preflighted_type_import_value_uses,
+                                type_import_execution,
                                 nested,
                                 nested_context,
                                 deferred,
@@ -31541,7 +31608,7 @@ fn check_planned_source_class(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     class: &PlannedSourceClass,
@@ -31589,7 +31656,7 @@ fn check_planned_source_class(
             source,
             options,
             session,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             &mut state,
             index,
@@ -31697,7 +31764,7 @@ fn check_planned_class_body(
     source: SourceFileRef,
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     state: &mut ClassBodyExecutionState<'_>,
     index: usize,
@@ -31804,7 +31871,7 @@ fn check_planned_class_body(
                     session,
                     diagnostics,
                     &parameter_flow,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     type_,
                     None,
@@ -31857,7 +31924,7 @@ fn check_planned_class_body(
                     session,
                     diagnostics,
                     &flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     target,
                     None,
@@ -31877,7 +31944,7 @@ fn check_planned_class_body(
                     session,
                     diagnostics,
                     &flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     initializer,
                     None,
                     deferred,
@@ -31909,7 +31976,7 @@ fn check_planned_class_body(
             options,
             session,
             diagnostics,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             &mut context,
             &planned.statements,
@@ -32332,7 +32399,7 @@ fn check_class_statements(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     context: &mut ClassBodyExecutionContext<'_, '_, '_>,
     statements: &[PlannedClassStatement],
@@ -32350,7 +32417,7 @@ fn check_class_statements(
                 options,
                 session,
                 diagnostics,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 context,
                 statements,
@@ -32371,7 +32438,7 @@ fn check_class_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &branch.condition,
                     None,
                     deferred,
@@ -32412,7 +32479,7 @@ fn check_class_statements(
                     options,
                     session,
                     diagnostics,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     context,
                     std::slice::from_ref(&branch.then_statement),
@@ -32428,7 +32495,7 @@ fn check_class_statements(
                         options,
                         session,
                         diagnostics,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         deferred,
                         context,
                         std::slice::from_ref(statement),
@@ -32458,7 +32525,7 @@ fn check_class_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -32496,7 +32563,7 @@ fn check_class_statements(
                             session,
                             diagnostics,
                             snapshot.types(),
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             deferred,
                             target,
                             None,
@@ -32516,7 +32583,7 @@ fn check_class_statements(
                             session,
                             diagnostics,
                             snapshot.types(),
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             expression,
                             None,
                             deferred,
@@ -32581,7 +32648,7 @@ fn check_class_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &write.receiver,
                     None,
                     deferred,
@@ -32626,7 +32693,7 @@ fn check_class_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     target.write_type(),
                     None,
@@ -32679,7 +32746,7 @@ fn check_class_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &binding.receiver,
                     None,
                     deferred,
@@ -32755,7 +32822,7 @@ fn check_class_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &assignment.receiver,
                     None,
                     deferred,
@@ -32881,7 +32948,7 @@ fn check_class_statements(
                             session,
                             diagnostics,
                             snapshot.types(),
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             deferred,
                             target,
                             None,
@@ -32900,7 +32967,7 @@ fn check_class_statements(
                             session,
                             diagnostics,
                             snapshot.types(),
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             initializer,
                             None,
                             deferred,
@@ -33000,7 +33067,7 @@ fn check_planned_arrow_argument(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     expression: NodeRef,
     arrow: &PlannedArrowExpression,
@@ -33065,7 +33132,7 @@ fn check_planned_arrow_argument(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &HashMap::new(),
                 deferred,
                 &arrow.callable,
@@ -33136,7 +33203,7 @@ fn check_planned_arrow_argument(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 &arrow.callable,
                 signature,
@@ -33180,7 +33247,7 @@ fn check_planned_arrow_argument(
             session,
             diagnostics,
             current_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             arrow,
             property,
@@ -33220,7 +33287,7 @@ fn check_planned_arrow_argument(
                 session,
                 diagnostics,
                 current_flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 arrow,
                 contextual_type,
@@ -33235,7 +33302,7 @@ fn check_planned_arrow_argument(
         session,
         diagnostics,
         &arrow.callable,
-        &HashMap::new(),
+        type_import_execution.annotation_capabilities,
     )?;
     if options.no_implicit_any {
         let arena = host
@@ -33254,7 +33321,7 @@ fn check_planned_arrow_argument(
         session,
         diagnostics,
         current_flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         &arrow.callable,
         &arrow.parameter_initializers,
@@ -33270,7 +33337,7 @@ fn check_planned_arrow_argument(
             session,
             diagnostics,
             &flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &statement.expression,
             None,
             deferred,
@@ -33331,7 +33398,7 @@ fn check_planned_arrow_argument(
                 session,
                 diagnostics,
                 &flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 &arrow.callable,
                 materialized.signature,
@@ -33361,6 +33428,14 @@ fn check_planned_arrow_argument(
                         session,
                         &mut type_diagnostics,
                     )?
+                    .with_type_reference_alias_targets(
+                        type_import_execution
+                            .annotation_capabilities
+                            .get(&return_type)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    )?
                     .get_type_from_type_node(return_type);
                     merge_retry_diagnostics(diagnostics, type_diagnostics);
                     let target = target?;
@@ -33373,7 +33448,7 @@ fn check_planned_arrow_argument(
                         session,
                         diagnostics,
                         &flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         deferred,
                         target,
                         None,
@@ -33392,10 +33467,13 @@ fn check_planned_arrow_argument(
                         session,
                         diagnostics,
                         &flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         deferred,
                         return_type,
-                        &[],
+                        type_import_execution
+                            .annotation_capabilities
+                            .get(&return_type)
+                            .map_or([].as_slice(), Vec::as_slice),
                         body,
                         *diagnostic_node,
                         None,
@@ -33423,7 +33501,7 @@ fn check_contextual_object_property_arrow(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     arrow: &PlannedArrowExpression,
     property: SemanticSymbolId,
@@ -33498,7 +33576,7 @@ fn check_contextual_object_property_arrow(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         body,
         None,
         deferred,
@@ -33558,7 +33636,7 @@ fn check_contextual_direct_call_arrow(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     arrow: &PlannedArrowExpression,
     contextual_type: TypeId,
@@ -33737,7 +33815,7 @@ fn check_contextual_direct_call_arrow(
                 session,
                 diagnostics,
                 &flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 expression,
                 None,
                 deferred,
@@ -35379,7 +35457,7 @@ fn check_planned_assignment(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     target_type_node: NodeRef,
     type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget],
@@ -35409,7 +35487,7 @@ fn check_planned_assignment(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         target,
         None,
@@ -35482,7 +35560,7 @@ fn check_assignment_to_type(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     target: TypeId,
     target_display_name: Option<&str>,
@@ -35499,7 +35577,7 @@ fn check_assignment_to_type(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         target,
         target_display_name,
@@ -35520,7 +35598,7 @@ fn check_assignment_to_type_with_class_context(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     target: TypeId,
     target_display_name: Option<&str>,
@@ -35542,7 +35620,7 @@ fn check_assignment_to_type_with_class_context(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         expression,
         Some(target),
         deferred,
@@ -35907,7 +35985,7 @@ fn check_compound_assignment(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     assignment: &PlannedAssignment,
     declared_type: TypeId,
@@ -35931,7 +36009,7 @@ fn check_compound_assignment(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &assignment.right,
         None,
         deferred,
@@ -37010,7 +37088,7 @@ fn check_callable_parameter_initializers(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     outer_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     initializers: &[PlannedParameterInitializer],
@@ -37098,7 +37176,7 @@ fn check_callable_parameter_initializers(
                 session,
                 diagnostics,
                 &flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 parameter.type_node,
                 &[],
@@ -37159,7 +37237,7 @@ fn check_callable_parameter_initializers(
                 session,
                 diagnostics,
                 &mut flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 callable,
                 planned,
@@ -37275,7 +37353,7 @@ fn check_callable_object_parameter_bindings(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &mut HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     planned: &PlannedObjectParameterBindings,
@@ -37315,7 +37393,7 @@ fn check_callable_object_parameter_bindings(
                 session,
                 diagnostics,
                 flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 key,
                 None,
                 deferred,
@@ -37386,7 +37464,7 @@ fn check_planned_effect_if_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     statements: &PlannedEffectIfFunctionStatements,
@@ -37400,7 +37478,7 @@ fn check_planned_effect_if_function_statements(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.condition,
         None,
         deferred,
@@ -37422,7 +37500,7 @@ fn check_planned_effect_if_function_statements(
             session,
             diagnostics,
             flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             expression,
             None,
             deferred,
@@ -37441,7 +37519,7 @@ fn check_planned_void_switch_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     statements: &PlannedVoidSwitchFunctionStatements,
 ) -> Result<(), SourceCheckError> {
@@ -37454,7 +37532,7 @@ fn check_planned_void_switch_function_statements(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.discriminant,
         None,
         deferred,
@@ -37482,7 +37560,7 @@ fn check_planned_void_switch_function_statements(
             session,
             diagnostics,
             flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             case,
             None,
             deferred,
@@ -37554,7 +37632,7 @@ fn check_planned_void_switch_function_statements(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -37583,7 +37661,7 @@ fn check_planned_void_switch_function_statements(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     &console.argument,
                     Some(any_type),
                     deferred,
@@ -37610,7 +37688,7 @@ fn check_planned_switch_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     return_type: Option<NodeRef>,
     statements: &PlannedSwitchFunctionStatements,
@@ -37628,7 +37706,7 @@ fn check_planned_switch_function_statements(
             session,
             diagnostics,
             &switch_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &binding.initializer,
             None,
             deferred,
@@ -37652,7 +37730,7 @@ fn check_planned_switch_function_statements(
                     session,
                     diagnostics,
                     &switch_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     key,
                     None,
                     deferred,
@@ -37794,7 +37872,7 @@ fn check_planned_switch_function_statements(
         session,
         diagnostics,
         &switch_flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.discriminant,
         None,
         deferred,
@@ -37848,7 +37926,7 @@ fn check_planned_switch_function_statements(
             session,
             diagnostics,
             &switch_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             case,
             None,
             deferred,
@@ -37915,7 +37993,7 @@ fn check_planned_switch_function_statements(
                 session,
                 diagnostics,
                 &clause_flow,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &binding.initializer,
                 None,
                 deferred,
@@ -37976,7 +38054,7 @@ fn check_planned_switch_function_statements(
                 session,
                 diagnostics,
                 &clause_flow,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 return_type,
                 &[],
@@ -37995,7 +38073,7 @@ fn check_planned_switch_function_statements(
                 session,
                 diagnostics,
                 &clause_flow,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 &value.expression,
                 None,
                 deferred,
@@ -38226,7 +38304,7 @@ fn check_planned_typeof_switch_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     statements: &PlannedTypeofSwitchFunctionStatements,
@@ -38246,7 +38324,7 @@ fn check_planned_typeof_switch_function_statements(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.identifier,
         None,
         deferred,
@@ -38275,7 +38353,7 @@ fn check_planned_typeof_switch_function_statements(
             session,
             diagnostics,
             flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             case,
             None,
             deferred,
@@ -38345,7 +38423,7 @@ fn check_planned_typeof_switch_function_statements(
             session,
             diagnostics,
             &narrowed_flow,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             callable,
             statements.symbol,
@@ -38365,7 +38443,7 @@ fn check_typeof_switch_string_method_call(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     parameter_symbol: SemanticSymbolId,
@@ -38535,7 +38613,7 @@ fn check_typeof_switch_string_method_call(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &property.receiver,
         None,
         deferred,
@@ -38593,7 +38671,7 @@ fn check_typeof_switch_string_method_call(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         argument,
         Some(parameter_type),
         deferred,
@@ -38709,7 +38787,7 @@ fn check_planned_object_shorthand_assignment(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     mut flow_types: HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     assignment: &PlannedObjectShorthandAssignment,
@@ -38731,7 +38809,7 @@ fn check_planned_object_shorthand_assignment(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &assignment.source,
         None,
         deferred,
@@ -38760,7 +38838,7 @@ fn check_planned_object_shorthand_assignment(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &assignment.target,
         None,
         deferred,
@@ -38777,7 +38855,7 @@ fn check_planned_object_shorthand_assignment(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &assignment.initializer,
         None,
         deferred,
@@ -38809,7 +38887,7 @@ fn check_planned_captured_iteration_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &mut HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     statements: &[PlannedCapturedIterationStatement],
@@ -38828,7 +38906,7 @@ fn check_planned_captured_iteration_statements(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     type_import_capabilities,
                     deferred,
                     local,
@@ -38846,7 +38924,7 @@ fn check_planned_captured_iteration_statements(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -38876,7 +38954,7 @@ fn check_planned_captured_iteration_statements(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     condition,
                     None,
                     deferred,
@@ -38915,7 +38993,7 @@ fn check_planned_captured_block_loop_condition(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     iteration: &PlannedCapturedBlockLoop,
 ) -> Result<(), SourceCheckError> {
@@ -38928,7 +39006,7 @@ fn check_planned_captured_block_loop_condition(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &iteration.condition,
         None,
         deferred,
@@ -38963,7 +39041,7 @@ fn check_planned_lexical_iteration(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     iteration: &PlannedLexicalIteration,
@@ -38979,7 +39057,7 @@ fn check_planned_lexical_iteration(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &iteration.iterable,
         None,
         deferred,
@@ -39126,7 +39204,7 @@ fn check_planned_lexical_iteration(
                     session,
                     diagnostics,
                     &mut loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     type_import_capabilities,
                     deferred,
                     local,
@@ -39144,7 +39222,7 @@ fn check_planned_lexical_iteration(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -39197,7 +39275,7 @@ fn check_planned_lexical_iteration(
             session,
             diagnostics,
             &trailing_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             expression,
             None,
             deferred,
@@ -39216,7 +39294,7 @@ fn check_planned_loop_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -39236,7 +39314,7 @@ fn check_planned_loop_function_statements(
             session,
             diagnostics,
             &mut loop_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             type_import_capabilities,
             deferred,
             initializer,
@@ -39257,7 +39335,7 @@ fn check_planned_loop_function_statements(
             session,
             diagnostics,
             &loop_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             callable,
             statements,
@@ -39343,7 +39421,7 @@ fn check_planned_loop_function_statements(
                     session,
                     diagnostics,
                     &mut loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     type_import_capabilities,
                     deferred,
                     local,
@@ -39361,7 +39439,7 @@ fn check_planned_loop_function_statements(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     type_import_capabilities,
                     deferred,
                     callable,
@@ -39380,7 +39458,7 @@ fn check_planned_loop_function_statements(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -39408,7 +39486,7 @@ fn check_planned_loop_function_statements(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     condition,
                     None,
                     deferred,
@@ -39444,7 +39522,7 @@ fn check_planned_loop_function_statements(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     condition,
                     None,
                     deferred,
@@ -39478,7 +39556,7 @@ fn check_planned_loop_function_statements(
                                 session,
                                 diagnostics,
                                 &loop_flow_types,
-                                preflighted_type_import_value_uses,
+                                type_import_execution,
                                 deferred,
                                 annotation,
                                 type_import_capabilities
@@ -39499,7 +39577,7 @@ fn check_planned_loop_function_statements(
                                 session,
                                 diagnostics,
                                 &loop_flow_types,
-                                preflighted_type_import_value_uses,
+                                type_import_execution,
                                 expression,
                                 None,
                                 deferred,
@@ -39531,7 +39609,7 @@ fn check_planned_loop_function_statements(
             session,
             diagnostics,
             &loop_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &incrementor.operand,
             None,
             deferred,
@@ -39558,7 +39636,7 @@ fn check_planned_loop_function_statements(
             session,
             diagnostics,
             base_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             callable,
             statements,
@@ -39593,7 +39671,7 @@ fn check_planned_loop_function_statements(
             session,
             diagnostics,
             &trailing_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             expression,
             None,
             deferred,
@@ -39612,7 +39690,7 @@ fn check_planned_loop_local(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &mut HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     local: &PlannedVariable,
@@ -39631,7 +39709,7 @@ fn check_planned_loop_local(
                 session,
                 diagnostics,
                 flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 type_node,
                 type_import_capabilities
@@ -39664,7 +39742,7 @@ fn check_planned_loop_local(
                 session,
                 diagnostics,
                 flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 initializer,
                 None,
                 deferred,
@@ -39747,7 +39825,7 @@ fn check_planned_loop_condition(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     statements: &PlannedLoopFunctionStatements,
@@ -39770,7 +39848,7 @@ fn check_planned_loop_condition(
                 session,
                 diagnostics,
                 flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 operand,
                 None,
                 deferred,
@@ -39800,7 +39878,7 @@ fn check_planned_loop_condition(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.condition,
         None,
         deferred,
@@ -39887,7 +39965,7 @@ fn check_planned_async_captured_loop(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     return_type: Option<NodeRef>,
@@ -39916,7 +39994,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         base_flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         array_initializer,
         None,
         deferred,
@@ -39951,7 +40029,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         index_initializer,
         None,
         deferred,
@@ -39978,7 +40056,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.condition,
         None,
         deferred,
@@ -39995,7 +40073,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.increment_operand,
         None,
         deferred,
@@ -40015,7 +40093,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &statements.awaited,
         None,
         deferred,
@@ -40038,7 +40116,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         &property.receiver,
         None,
         deferred,
@@ -40055,7 +40133,7 @@ fn check_planned_async_captured_loop(
         session,
         diagnostics,
         &flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         callback,
         None,
         deferred,
@@ -40120,7 +40198,7 @@ fn check_planned_async_captured_loop(
                 session,
                 diagnostics,
                 &flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 expected,
                 None,
@@ -40147,7 +40225,7 @@ fn check_planned_linear_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -40259,7 +40337,7 @@ fn check_planned_linear_function_statements(
                     session,
                     diagnostics,
                     &mut frame,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     type_import_capabilities,
                     deferred,
                     callable,
@@ -40305,7 +40383,7 @@ fn check_planned_linear_function_statements(
                     session,
                     diagnostics,
                     &nested_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     &function.callable,
                     &function.parameter_initializers,
@@ -40326,7 +40404,7 @@ fn check_planned_linear_function_statements(
                             session,
                             diagnostics,
                             &flow_types,
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             deferred,
                             &function.callable,
                             statements,
@@ -40344,7 +40422,7 @@ fn check_planned_linear_function_statements(
                             session,
                             diagnostics,
                             flow_types,
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             type_import_capabilities,
                             deferred,
                             &function.callable,
@@ -40366,7 +40444,7 @@ fn check_planned_linear_function_statements(
                             session,
                             diagnostics,
                             &flow_types,
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             type_import_capabilities,
                             deferred,
                             iteration,
@@ -40385,7 +40463,7 @@ fn check_planned_linear_function_statements(
                             session,
                             diagnostics,
                             &flow_types,
-                            preflighted_type_import_value_uses,
+                            type_import_execution,
                             type_import_capabilities,
                             deferred,
                             &function.callable,
@@ -40406,7 +40484,7 @@ fn check_planned_linear_function_statements(
                     session,
                     diagnostics,
                     &return_flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     &function.callable,
                     materialized.signature,
@@ -40450,7 +40528,7 @@ fn check_planned_linear_function_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     declared_type,
                     None,
@@ -40496,7 +40574,7 @@ fn check_planned_linear_function_statements(
                     session,
                     diagnostics,
                     snapshot.types(),
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -40534,7 +40612,7 @@ fn check_planned_linear_function_statements(
             session,
             diagnostics,
             snapshot.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             return_type,
             &[],
@@ -40557,7 +40635,7 @@ fn check_planned_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -40579,7 +40657,7 @@ fn check_planned_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40598,7 +40676,7 @@ fn check_planned_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         callable,
         &statements.condition,
@@ -40613,7 +40691,7 @@ fn check_planned_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40631,7 +40709,7 @@ fn check_planned_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40653,7 +40731,7 @@ fn check_planned_inferred_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -40674,7 +40752,7 @@ fn check_planned_inferred_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40692,7 +40770,7 @@ fn check_planned_inferred_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         callable,
         &statements.condition,
@@ -40709,7 +40787,7 @@ fn check_planned_inferred_function_statements(
             session,
             diagnostics,
             &mut frame,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             type_import_capabilities,
             deferred,
             callable,
@@ -40731,7 +40809,7 @@ fn check_planned_inferred_function_statements(
             session,
             diagnostics,
             snapshot.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &branch.return_expression,
             None,
             deferred,
@@ -40752,7 +40830,7 @@ fn check_planned_joined_function_statements(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     base_flow_types: HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -40774,7 +40852,7 @@ fn check_planned_joined_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40792,7 +40870,7 @@ fn check_planned_joined_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         callable,
         &statements.condition,
@@ -40806,7 +40884,7 @@ fn check_planned_joined_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40824,7 +40902,7 @@ fn check_planned_joined_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40842,7 +40920,7 @@ fn check_planned_joined_function_statements(
         session,
         diagnostics,
         &mut frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -40865,7 +40943,7 @@ fn check_planned_joined_function_statements(
             session,
             diagnostics,
             snapshot.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             return_type,
             &[],
@@ -40887,7 +40965,7 @@ fn check_planned_source_condition(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     condition: &PlannedSourceCondition,
@@ -40909,7 +40987,7 @@ fn check_planned_source_condition(
                     session,
                     diagnostics,
                     frame,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     deferred,
                     callable,
                     operand,
@@ -40959,7 +41037,7 @@ fn check_planned_source_condition(
                 session,
                 diagnostics,
                 snapshot.types(),
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 expression,
                 None,
                 deferred,
@@ -40992,7 +41070,7 @@ fn check_planned_source_condition(
                 session,
                 diagnostics,
                 frame,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 callable,
                 expression,
@@ -41008,7 +41086,7 @@ fn check_planned_source_condition(
             session,
             diagnostics,
             frame,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             callable,
             condition,
@@ -41022,7 +41100,7 @@ fn check_planned_source_condition(
             session,
             diagnostics,
             frame,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             deferred,
             callable,
             condition,
@@ -41040,7 +41118,7 @@ fn check_planned_truthiness_condition(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     condition: &PlannedExpression,
@@ -41058,7 +41136,7 @@ fn check_planned_truthiness_condition(
         session,
         diagnostics,
         condition_flow.types(),
-        preflighted_type_import_value_uses,
+        type_import_execution,
         condition,
         None,
         deferred,
@@ -41098,7 +41176,7 @@ fn check_planned_typeof_condition(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     condition: &PlannedTypeofCondition,
@@ -41140,7 +41218,7 @@ fn check_planned_typeof_condition(
             session,
             diagnostics,
             condition_flow.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.identifier,
             None,
             deferred,
@@ -41160,7 +41238,7 @@ fn check_planned_typeof_condition(
             session,
             diagnostics,
             condition_flow.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.literal,
             None,
             deferred,
@@ -41175,7 +41253,7 @@ fn check_planned_typeof_condition(
             session,
             diagnostics,
             condition_flow.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.literal,
             None,
             deferred,
@@ -41189,7 +41267,7 @@ fn check_planned_typeof_condition(
             session,
             diagnostics,
             condition_flow.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.identifier,
             None,
             deferred,
@@ -41214,7 +41292,7 @@ fn check_planned_typeof_return(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     condition: &PlannedTypeofCondition,
@@ -41245,7 +41323,7 @@ fn check_planned_typeof_return(
             session,
             diagnostics,
             current_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.identifier,
             None,
             deferred,
@@ -41268,7 +41346,7 @@ fn check_planned_typeof_return(
             session,
             diagnostics,
             current_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.literal,
             None,
             deferred,
@@ -41283,7 +41361,7 @@ fn check_planned_typeof_return(
             session,
             diagnostics,
             current_flow_types,
-            preflighted_type_import_value_uses,
+            type_import_execution,
             &condition.literal,
             None,
             deferred,
@@ -41304,7 +41382,7 @@ fn check_planned_equality_condition(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     condition: &PlannedEqualityCondition,
@@ -41346,7 +41424,7 @@ fn check_planned_equality_condition(
             session,
             diagnostics,
             condition_flow.types(),
-            preflighted_type_import_value_uses,
+            type_import_execution,
             expression,
             None,
             deferred,
@@ -41504,7 +41582,7 @@ fn check_planned_function_statement_prefix(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -41528,7 +41606,7 @@ fn check_planned_function_statement_prefix(
                     session,
                     diagnostics,
                     frame,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     type_import_capabilities,
                     deferred,
                     callable,
@@ -41573,7 +41651,7 @@ fn check_planned_function_statement_prefix(
                     session,
                     diagnostics,
                     &types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -41622,7 +41700,7 @@ fn check_planned_function_locals(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -41650,7 +41728,7 @@ fn check_planned_function_locals(
                 session,
                 diagnostics,
                 snapshot.types(),
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 deferred,
                 type_node,
                 type_import_capabilities
@@ -41682,7 +41760,7 @@ fn check_planned_function_locals(
                 session,
                 diagnostics,
                 snapshot.types(),
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 initializer,
                 None,
                 deferred,
@@ -41825,7 +41903,7 @@ fn check_planned_return_branch(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     frame: &mut SourceFlowFrame<'_, '_>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
@@ -41843,7 +41921,7 @@ fn check_planned_return_branch(
         session,
         diagnostics,
         frame,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         type_import_capabilities,
         deferred,
         callable,
@@ -41865,7 +41943,7 @@ fn check_planned_return_branch(
         session,
         diagnostics,
         snapshot.types(),
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         return_type,
         &[],
@@ -45417,7 +45495,9 @@ fn materialize_checked_source_callable(
         session,
         &mut callable_diagnostics,
     )
-    .and_then(|query| query.with_type_reference_alias_targets(callable_capabilities))
+    .and_then(|query| {
+        query.with_type_reference_alias_targets(callable_capabilities.iter().copied())
+    })
     .and_then(|mut query| {
         query.get_type_of_source_callable(callable.declaration, callable.owner_symbol)
     });
@@ -45455,6 +45535,18 @@ fn materialize_checked_source_callable(
             SourceFunctionInvariant::MissingCallableType(owner),
         ))?;
     if !callable.return_type.is_inferred() {
+        let return_capabilities = if callable.requires_type_query_evidence() {
+            callable_capabilities
+        } else {
+            callable
+                .return_type
+                .type_node()
+                .and_then(|node| type_import_capabilities.get(&node))
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        };
         let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
         let return_result = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
@@ -45464,17 +45556,7 @@ fn materialize_checked_source_callable(
             session,
             &mut return_diagnostics,
         )
-        .and_then(|query| {
-            query.with_type_reference_alias_targets(
-                callable
-                    .return_type
-                    .type_node()
-                    .and_then(|node| type_import_capabilities.get(&node))
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            )
-        })
+        .and_then(|query| query.with_type_reference_alias_targets(return_capabilities))
         .and_then(|mut query| query.get_return_type_of_signature(signature));
         merge_retry_diagnostics(diagnostics, return_diagnostics);
         return_result?;
@@ -45502,6 +45584,108 @@ fn source_callable_type_import_capabilities(
         .flatten()
         .copied()
         .collect()
+}
+
+fn prepare_imported_default_arrow_capabilities(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    resolved: &ResolvedSourceImportBinding,
+) -> Result<HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>, SourceCheckError> {
+    let Some(export) = plan_source_import_default_arrow_export(store, host, global_types, resolved)
+        .map_err(|error| SourcePlanner::import_plan_error(resolved.binding.declaration, &error))?
+    else {
+        return Ok(HashMap::new());
+    };
+    preflight_source_default_arrow_export_value(store, &export)
+        .map_err(|error| SourcePlanner::import_plan_error(resolved.binding.declaration, &error))?;
+    let (arena, bound) = host
+        .source(export.declaration)
+        .ok_or(SourceCheckError::Import(export.declaration))?;
+    let provider = SourceFileRef::new(store.id(), bound.source_file());
+    if !store.contains_source_file(provider) {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::StoreSourceMismatch(provider),
+        ));
+    }
+    let (bindings, references) = {
+        let mut planner = SourcePlanner::new_semantic_with_global_types(
+            arena,
+            bound,
+            provider,
+            store,
+            host,
+            global_types,
+            options,
+        );
+        let source_node = planner.node(provider.node_ref())?;
+        let NodeData::SourceFile(source_data) = &source_node.data else {
+            return Err(SourceCheckError::Import(export.declaration));
+        };
+        let statements = source_data.statements.nodes.clone();
+        for statement in statements {
+            let statement = planner.reference(statement);
+            if planner.node(statement)?.kind != SyntaxKind::ImportDeclaration {
+                continue;
+            }
+            let import = if planner.import_is_type_only(statement)? {
+                Some(
+                    plan_top_level_named_type_import(arena, bound, store, statement)
+                        .map_err(|error| SourcePlanner::import_plan_error(statement, &error))?,
+                )
+            } else {
+                plan_top_level_named_specifier_type_import(arena, bound, store, statement)
+                    .map_err(|error| SourcePlanner::import_plan_error(statement, &error))?
+            };
+            let Some(import) = import else {
+                continue;
+            };
+            for binding in import.bindings {
+                if planner
+                    .type_import_bindings
+                    .insert(binding.alias_symbol, binding.clone())
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Import(binding.declaration));
+                }
+            }
+        }
+        // Only signature roots participate in this demand. The provider body stays unplanned.
+        planner.plan_callable_type_import_annotation_roots(&export.callable)?;
+        (planner.type_import_bindings, planner.type_import_references)
+    };
+    let mut resolved_bindings = HashMap::<SemanticSymbolId, ResolvedSourceTypeImportBinding>::new();
+    let mut capabilities = HashMap::<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>::new();
+    let mut seen_references = HashSet::new();
+    for reference in references {
+        if !seen_references.insert(reference.node) {
+            return Err(SourceCheckError::Import(reference.node));
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            resolved_bindings.entry(reference.alias_symbol)
+        {
+            let binding = bindings
+                .get(&reference.alias_symbol)
+                .ok_or(SourceCheckError::Import(reference.node))?;
+            entry.insert(
+                resolve_source_type_import_binding(store, alias_host, host, binding)
+                    .map_err(|error| SourcePlanner::import_plan_error(reference.node, &error))?,
+            );
+        }
+        let binding = resolved_bindings
+            .get(&reference.alias_symbol)
+            .ok_or(SourceCheckError::Import(reference.node))?;
+        let capability =
+            plan_source_type_import_reference(store, host, binding, reference.root, reference.node)
+                .map_err(|error| SourcePlanner::import_plan_error(reference.node, &error))?;
+        capabilities
+            .entry(reference.root)
+            .or_default()
+            .push(capability);
+    }
+    Ok(capabilities)
 }
 
 #[allow(clippy::too_many_arguments)] // Imported callable preparation shares source query state.
@@ -45665,7 +45849,7 @@ fn publish_checked_source_callable_return(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     signature: SignatureId,
@@ -45680,7 +45864,7 @@ fn publish_checked_source_callable_return(
         session,
         diagnostics,
         flow_types,
-        preflighted_type_import_value_uses,
+        type_import_execution,
         deferred,
         callable,
         signature,
@@ -45699,7 +45883,7 @@ fn publish_checked_source_callable_return_with_class_context(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     signature: SignatureId,
@@ -45731,7 +45915,7 @@ fn publish_checked_source_callable_return_with_class_context(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     expression,
                     None,
                     deferred,
@@ -45910,7 +46094,7 @@ fn check_planned_global_promise_call(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     deferred: &mut Vec<DeferredAssertion>,
     expression: &PlannedExpression,
     call: &SourceCallPlan,
@@ -45968,7 +46152,7 @@ fn check_planned_global_promise_call(
                 session,
                 diagnostics,
                 flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 argument,
                 None,
                 deferred,
@@ -45997,7 +46181,7 @@ fn check_planned_global_promise_call(
                         session,
                         diagnostics,
                         flow_types,
-                        preflighted_type_import_value_uses,
+                        type_import_execution,
                         element,
                         None,
                         deferred,
@@ -46046,7 +46230,7 @@ fn check_planned_global_promise_call(
                     session,
                     diagnostics,
                     flow_types,
-                    preflighted_type_import_value_uses,
+                    type_import_execution,
                     argument,
                     None,
                     deferred,
@@ -46437,7 +46621,7 @@ fn materialize_contextual_source_arrow(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
     type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
     deferred: &mut Vec<DeferredAssertion>,
     arrow: &PlannedContextualArrow,
@@ -46564,7 +46748,7 @@ fn materialize_contextual_source_arrow(
                 session,
                 diagnostics,
                 &flow_types,
-                preflighted_type_import_value_uses,
+                type_import_execution,
                 body,
                 (target_return != void).then_some(target_return),
                 deferred,
@@ -56060,6 +56244,10 @@ pub(super) fn check_source_file(
             session,
             &mut type_import_preflight_diagnostics,
         )?
+        .with_type_reference_alias_targets(source_callable_type_import_capabilities(
+            &arrow.source.callable,
+            &type_import_capabilities,
+        ))?
         .preflight_type_of_source_callable(
             arrow.source.callable.declaration,
             arrow.source.callable.owner_symbol,
@@ -56110,6 +56298,10 @@ pub(super) fn check_source_file(
                 session,
                 &mut type_import_preflight_diagnostics,
             )?
+            .with_type_reference_alias_targets(source_callable_type_import_capabilities(
+                arrow,
+                &type_import_capabilities,
+            ))?
             .preflight_type_of_source_callable(arrow.declaration, arrow.owner_symbol)?;
         }
         if let Some(links) = store.type_node_links(arrow.declaration) {
@@ -56202,14 +56394,18 @@ pub(super) fn check_source_file(
     }
     debug_assert!(type_import_preflight_diagnostics.is_empty());
 
-    let mut preflighted_type_import_value_uses = HashMap::new();
+    let mut type_import_execution = SourceTypeImportExecution {
+        value_uses: HashMap::new(),
+        annotation_capabilities: &type_import_capabilities,
+    };
     for read in &type_import_value_uses {
-        if preflighted_type_import_value_uses.contains_key(&read.node) {
+        if type_import_execution.value_uses.contains_key(&read.node) {
             return Err(SourceCheckError::Import(read.node));
         }
         let prepared =
             preflight_type_import_value_use(arena, bound, store, &resolved_type_imports, read)?;
-        if preflighted_type_import_value_uses
+        if type_import_execution
+            .value_uses
             .insert(read.node, prepared)
             .is_some()
         {
@@ -56474,7 +56670,7 @@ pub(super) fn check_source_file(
                 session,
                 diagnostics,
                 &current_flow_types,
-                &preflighted_type_import_value_uses,
+                &type_import_execution,
                 initializer,
                 None,
                 &mut deferred,
@@ -56585,8 +56781,16 @@ pub(super) fn check_source_file(
             diagnostics,
             resolved,
         )?;
+        let provider_capabilities = prepare_imported_default_arrow_capabilities(
+            store,
+            host,
+            alias_host,
+            global_types,
+            options,
+            resolved,
+        )?;
         session.reset_query();
-        let prepared = prepare_source_import_value(
+        let prepared = prepare_source_import_value_with_type_import_capabilities(
             store,
             host,
             global_types,
@@ -56595,6 +56799,7 @@ pub(super) fn check_source_file(
             diagnostics,
             resolved,
             read,
+            &provider_capabilities,
         )
         .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
         if current_flow_types
@@ -56787,7 +56992,7 @@ pub(super) fn check_source_file(
             session,
             &mut function_diagnostics,
             &current_flow_types,
-            &preflighted_type_import_value_uses,
+            &type_import_execution,
             &mut deferred,
             &function.callable,
             &function.parameter_initializers,
@@ -56805,7 +57010,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     &function.callable,
                     assignment,
@@ -56839,7 +57044,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     &function.callable,
                     condition,
@@ -56907,7 +57112,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     condition,
                     None,
                     &mut deferred,
@@ -56923,7 +57128,7 @@ pub(super) fn check_source_file(
                         session,
                         &mut function_diagnostics,
                         &body_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         expression,
                         None,
                         &mut deferred,
@@ -56957,7 +57162,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     &function.callable,
                     statements,
@@ -56974,7 +57179,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     &function.callable,
                     None,
@@ -56995,7 +57200,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     &function.callable,
@@ -57031,7 +57236,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     &function.callable,
@@ -57052,7 +57257,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     iteration,
@@ -57071,7 +57276,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     &function.callable,
@@ -57127,7 +57332,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     None,
                     statements,
@@ -57164,7 +57369,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     statements,
                 )?;
@@ -57194,7 +57399,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     &function.callable,
                     statements,
@@ -57225,7 +57430,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &statements.condition,
                     None,
                     &mut deferred,
@@ -57273,7 +57478,7 @@ pub(super) fn check_source_file(
                     session,
                     &mut function_diagnostics,
                     body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     &function.callable,
@@ -57299,7 +57504,7 @@ pub(super) fn check_source_file(
             session,
             &mut function_diagnostics,
             &return_flow_types,
-            &preflighted_type_import_value_uses,
+            &type_import_execution,
             &mut deferred,
             &function.callable,
             materialized.signature,
@@ -57813,7 +58018,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     &class,
@@ -58069,7 +58274,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.receiver,
                     None,
                     &mut deferred,
@@ -58087,7 +58292,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.value,
                     None,
                     &mut deferred,
@@ -58217,7 +58422,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &export.expression,
                     None,
                     &mut deferred,
@@ -58235,6 +58440,64 @@ pub(super) fn check_source_file(
                     &mut value_order,
                     export.owner_symbol,
                     object.result,
+                )?;
+            }
+            PlannedStatement::DefaultArrow(export) => {
+                let current = plan_source_default_arrow_export(
+                    store,
+                    host,
+                    export.source.declaration,
+                    Some(CanonicalArrayTargets::from_global_types(global_types)),
+                )
+                .map_err(SourcePlanner::arrow_plan_error)?;
+                if current != export.source
+                    || export.expression.node != current.expression
+                    || !matches!(
+                        &export.expression.kind,
+                        PlannedExpressionKind::Arrow(arrow) if arrow.callable == current.callable
+                    )
+                {
+                    return Err(SourceCheckError::Import(current.declaration));
+                }
+                preflight_source_default_arrow_export_value(store, &current).map_err(|error| {
+                    SourcePlanner::import_plan_error(current.declaration, &error)
+                })?;
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &type_import_execution,
+                    &export.expression,
+                    None,
+                    &mut deferred,
+                )?;
+                if store
+                    .type_node_links(current.expression)
+                    .and_then(|links| links.resolved_type)
+                    != Some(checked.result)
+                    || store.source_callable_type_for_owner(current.callable.owner_symbol)
+                        != Some(checked.result)
+                    || store
+                        .source_callable_provenance(checked.result)
+                        .is_none_or(|provenance| {
+                            provenance.declaration != current.expression
+                                || provenance.owner_symbol != current.callable.owner_symbol
+                                || provenance.family != SourceCallableFamily::ArrowFunction
+                        })
+                {
+                    return Err(SourceCheckError::Import(current.declaration));
+                }
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    current.export_symbol,
+                    checked.result,
                 )?;
             }
             PlannedStatement::AmbientVariables(initializers) => {
@@ -58342,7 +58605,7 @@ pub(super) fn check_source_file(
                             session,
                             &mut function_diagnostics,
                             &captured_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             &function.callable,
                             &function.parameter_initializers,
@@ -58358,7 +58621,7 @@ pub(super) fn check_source_file(
                             session,
                             &mut function_diagnostics,
                             body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
@@ -58387,7 +58650,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &captured_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     &function.callable,
                     &function.parameter_initializers,
@@ -58433,7 +58696,7 @@ pub(super) fn check_source_file(
                                 session,
                                 diagnostics,
                                 &body_flow_types,
-                                &preflighted_type_import_value_uses,
+                                &type_import_execution,
                                 &mut deferred,
                                 expected,
                                 None,
@@ -58448,6 +58711,20 @@ pub(super) fn check_source_file(
                                     SourceFunctionInvariant::InvalidStatementIndex(index),
                                 ))?
                                 .signature;
+                            let return_capabilities =
+                                if function.callable.requires_type_query_evidence() {
+                                    source_callable_type_import_capabilities(
+                                        &function.callable,
+                                        &type_import_capabilities,
+                                    )
+                                } else {
+                                    type_import_capabilities
+                                        .get(&return_type)
+                                        .into_iter()
+                                        .flatten()
+                                        .copied()
+                                        .collect()
+                                };
                             let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
                             let expected = CanonicalTypeQuery::new_with_global_types_and_session(
                                 store,
@@ -58457,13 +58734,7 @@ pub(super) fn check_source_file(
                                 session,
                                 &mut return_diagnostics,
                             )?
-                            .with_type_reference_alias_targets(
-                                type_import_capabilities
-                                    .get(&return_type)
-                                    .into_iter()
-                                    .flatten()
-                                    .copied(),
-                            )?
+                            .with_type_reference_alias_targets(return_capabilities)?
                             .get_return_type_of_signature(signature);
                             merge_retry_diagnostics(diagnostics, return_diagnostics);
                             check_assignment_to_type(
@@ -58475,7 +58746,7 @@ pub(super) fn check_source_file(
                                 session,
                                 diagnostics,
                                 &body_flow_types,
-                                &preflighted_type_import_value_uses,
+                                &type_import_execution,
                                 &mut deferred,
                                 expected?,
                                 None,
@@ -58498,7 +58769,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             &function.callable,
                             condition,
@@ -58536,7 +58807,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             condition,
                             None,
                             &mut deferred,
@@ -58555,7 +58826,7 @@ pub(super) fn check_source_file(
                                 session,
                                 diagnostics,
                                 &body_flow_types,
-                                &preflighted_type_import_value_uses,
+                                &type_import_execution,
                                 &mut deferred,
                                 return_type,
                                 &[],
@@ -58575,7 +58846,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             &function.callable,
                             statements,
@@ -58591,7 +58862,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             &function.callable,
                             Some(return_type),
@@ -58675,7 +58946,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
@@ -58696,7 +58967,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             iteration,
@@ -58714,7 +58985,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
@@ -58733,7 +59004,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             Some(return_type),
                             statements,
@@ -58752,7 +59023,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
@@ -58773,7 +59044,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
@@ -58891,7 +59162,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &captured_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         &callable,
                         &arrow.parameter_initializers,
@@ -58908,7 +59179,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &callable,
@@ -58930,7 +59201,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &body_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &statement.expression,
                             None,
                             &mut deferred,
@@ -59040,7 +59311,7 @@ pub(super) fn check_source_file(
                                     session,
                                     diagnostics,
                                     &body_flow_types,
-                                    &preflighted_type_import_value_uses,
+                                    &type_import_execution,
                                     &mut deferred,
                                     expected,
                                     None,
@@ -59065,7 +59336,7 @@ pub(super) fn check_source_file(
                                     session,
                                     diagnostics,
                                     &body_flow_types,
-                                    &preflighted_type_import_value_uses,
+                                    &type_import_execution,
                                     &mut deferred,
                                     &callable,
                                     materialized.signature,
@@ -59127,7 +59398,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     arrow,
@@ -59193,7 +59464,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         initializer,
                         None,
                         &mut deferred,
@@ -59222,7 +59493,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &block_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         read,
                         None,
                         &mut deferred,
@@ -59253,7 +59524,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &array.initializer,
                         None,
                         &mut deferred,
@@ -59335,7 +59606,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &block_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             initializer,
                             None,
                             &mut deferred,
@@ -59390,7 +59661,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         initializer,
                         None,
                         &mut deferred,
@@ -59608,7 +59879,7 @@ pub(super) fn check_source_file(
                                 session,
                                 diagnostics,
                                 &current_flow_types,
-                                &preflighted_type_import_value_uses,
+                                &type_import_execution,
                                 &mut deferred,
                                 type_node,
                                 type_import_capabilities
@@ -59672,7 +59943,7 @@ pub(super) fn check_source_file(
                                 session,
                                 diagnostics,
                                 &current_flow_types,
-                                &preflighted_type_import_value_uses,
+                                &type_import_execution,
                                 &mut deferred,
                                 declared_type,
                                 annotation.resolved_alias_name(),
@@ -59722,7 +59993,7 @@ pub(super) fn check_source_file(
                                 session,
                                 diagnostics,
                                 &current_flow_types,
-                                &preflighted_type_import_value_uses,
+                                &type_import_execution,
                                 initializer,
                                 None,
                                 &mut deferred,
@@ -60121,7 +60392,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         initializer_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         type_node,
                         type_import_capabilities
@@ -60142,7 +60413,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         initializer_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &variable.initializer,
                         None,
                         &mut deferred,
@@ -60197,7 +60468,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             key,
                             None,
                             &mut deferred,
@@ -60266,7 +60537,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             default,
                             Some(contextual),
                             &mut deferred,
@@ -60399,7 +60670,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         type_node,
                         type_import_capabilities
@@ -60420,7 +60691,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &variable.initializer,
                         None,
                         &mut deferred,
@@ -60490,7 +60761,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             default,
                             Some(contextual),
                             &mut deferred,
@@ -60540,7 +60811,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &variable.initializer,
                     None,
                     &mut deferred,
@@ -60554,7 +60825,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &variable.key,
                     None,
                     &mut deferred,
@@ -60687,7 +60958,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             type_node,
                             &[],
@@ -60704,7 +60975,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             staged_declared_type,
                             None,
@@ -60723,7 +60994,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         &assignment,
                         staged_declared_type,
@@ -60786,7 +61057,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.element.index,
                     None,
                     &mut deferred,
@@ -60834,7 +61105,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     assignment_target,
                     None,
@@ -60946,7 +61217,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.receiver,
                     None,
                     &mut deferred,
@@ -61006,7 +61277,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             method_type,
                             None,
@@ -61046,7 +61317,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &assignment.right,
                             None,
                             &mut deferred,
@@ -61117,7 +61388,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         target,
                         None,
@@ -61136,7 +61407,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &assignment.right,
                         None,
                         &mut deferred,
@@ -61208,7 +61479,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.receiver,
                     None,
                     &mut deferred,
@@ -61260,7 +61531,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         target,
                         None,
@@ -61294,7 +61565,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         target,
                         None,
@@ -61313,7 +61584,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &assignment.right,
                         None,
                         &mut deferred,
@@ -61455,7 +61726,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.left,
                     None,
                     &mut deferred,
@@ -61477,7 +61748,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     member.type_,
                     None,
@@ -61512,7 +61783,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.receiver,
                     None,
                     &mut deferred,
@@ -61557,7 +61828,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         index,
                         None,
                         &mut deferred,
@@ -61586,7 +61857,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.right,
                     None,
                     &mut deferred,
@@ -61648,7 +61919,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.left,
                     None,
                     &mut deferred,
@@ -61681,7 +61952,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     target.result,
                     None,
@@ -61737,7 +62008,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.receiver,
                     None,
                     &mut deferred,
@@ -61786,7 +62057,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     property_type,
                     None,
@@ -61813,7 +62084,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &assignment.right,
                     None,
                     &mut deferred,
@@ -61873,7 +62144,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &control.condition,
                     None,
                     &mut deferred,
@@ -61920,7 +62191,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &control.condition,
                     None,
                     &mut deferred,
@@ -61967,7 +62238,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     iteration.as_ref(),
@@ -61985,7 +62256,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &iteration.iterable,
                     None,
                     &mut deferred,
@@ -62019,7 +62290,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &iteration.body,
                     None,
                     &mut deferred,
@@ -62042,7 +62313,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &iteration.iterable,
                     None,
                     &mut deferred,
@@ -62201,7 +62472,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &loop_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &iteration.capture,
                     None,
                     &mut deferred,
@@ -62233,7 +62504,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             expression,
                             None,
                             &mut deferred,
@@ -62319,7 +62590,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &current_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             initializer,
                             None,
                             &mut deferred,
@@ -62404,7 +62675,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &mut loop_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &type_import_capabilities,
                         &mut deferred,
                         initializer,
@@ -62422,7 +62693,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &loop_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         condition,
                         None,
                         &mut deferred,
@@ -62450,7 +62721,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &loop_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             &function.callable,
                             &function.parameter_initializers,
@@ -62471,7 +62742,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             &function.callable,
@@ -62489,7 +62760,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &mut deferred,
                             &function.callable,
                             materialized.signature,
@@ -62521,7 +62792,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &loop_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             initializer,
                             None,
                             &mut deferred,
@@ -62545,7 +62816,7 @@ pub(super) fn check_source_file(
                             session,
                             diagnostics,
                             &mut loop_flow_types,
-                            &preflighted_type_import_value_uses,
+                            &type_import_execution,
                             &type_import_capabilities,
                             &mut deferred,
                             statements,
@@ -62600,7 +62871,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &loop_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &incrementor.operand,
                         None,
                         &mut deferred,
@@ -62628,7 +62899,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         &iteration,
                     )?;
@@ -62643,7 +62914,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &mut loop_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &type_import_capabilities,
                     &mut deferred,
                     &iteration.statements,
@@ -62660,7 +62931,7 @@ pub(super) fn check_source_file(
                         session,
                         diagnostics,
                         &current_flow_types,
-                        &preflighted_type_import_value_uses,
+                        &type_import_execution,
                         &mut deferred,
                         &iteration,
                     )?;
@@ -62697,7 +62968,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &expression,
                     None,
                     &mut deferred,
@@ -62722,7 +62993,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &current_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &expression,
                     None,
                     &mut deferred,
@@ -62753,7 +63024,7 @@ pub(super) fn check_source_file(
             session,
             diagnostics,
             &captured_flow_types,
-            &preflighted_type_import_value_uses,
+            &type_import_execution,
             &mut deferred,
             &arrow.source.callable,
             &arrow.parameter_initializers,
@@ -62770,7 +63041,7 @@ pub(super) fn check_source_file(
                 session,
                 diagnostics,
                 body_flow_types,
-                &preflighted_type_import_value_uses,
+                &type_import_execution,
                 &type_import_capabilities,
                 &mut deferred,
                 &arrow.source.callable,
@@ -62797,7 +63068,7 @@ pub(super) fn check_source_file(
                     session,
                     diagnostics,
                     &body_flow_types,
-                    &preflighted_type_import_value_uses,
+                    &type_import_execution,
                     &mut deferred,
                     return_type,
                     &[],
@@ -62917,9 +63188,13 @@ pub(super) fn check_source_file(
         diagnostics,
         &deferred,
     )?;
-    let import_publications =
-        preflight_prepared_source_import_publications(store, &prepared_imports)
-            .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;
+    let import_publications = preflight_prepared_source_import_publications_with_host(
+        store,
+        host,
+        global_types,
+        &prepared_imports,
+    )
+    .map_err(|error| SourcePlanner::import_plan_error(source.node_ref(), &error))?;
     publish_staged_variable_state(
         store,
         source.node_ref(),
@@ -82221,6 +82496,350 @@ mod tests {
     }
 
     #[test]
+    fn imported_generic_arrow_capabilities_follow_real_signature_roots() {
+        let importer = parsed("import keep from './provider'; const copied = keep;");
+        let provider = parsed(concat!(
+            "import type { Shape, Cell } from './types'; type Outside = Shape; ",
+            "export default <T extends Shape = Shape>(value: Cell<T>, other: Cell<Shape>): Cell<T> => value;",
+        ));
+        let types = parsed(
+            "export interface Shape { value: number } export interface Cell<T> { value: T }",
+        );
+        let importer_file = FileId::new(98_210);
+        let provider_file = FileId::new(98_211);
+        let types_file = FileId::new(98_212);
+        let files = [
+            (importer_file, &importer),
+            (provider_file, &provider),
+            (types_file, &types),
+        ];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 2,
+                },
+            ],
+        );
+        let bounds = files
+            .iter()
+            .map(|(file, _)| context.file(*file).unwrap().1.clone())
+            .collect::<Vec<_>>();
+        let sources = || {
+            files
+                .iter()
+                .zip(&bounds)
+                .map(|((_, parsed), bound)| (&parsed.arena, bound))
+        };
+        let entries = [(0, 1), (1, 2)].map(|(source, target)| {
+            let (source_file, parsed) = files[source];
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(
+                    parsed.arena.id(),
+                    source_file,
+                    source_module_specifiers(parsed)[0],
+                ),
+                CanonicalResolvedModuleInput::new(
+                    files[target].0,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            )
+        });
+        let manifest = super::super::module_resolution::validate_module_resolution_manifest(
+            CanonicalModuleResolutionManifestInput::new(entries),
+            context.store().symbol_store(),
+            sources().map(|(arena, bound)| (bound.source_file().file, arena, bound)),
+        )
+        .unwrap();
+        assert_eq!(&manifest, context.module_resolutions());
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let mut alias_host =
+            ProductionAliasTargetHost::new(context.store(), sources(), &manifest).unwrap();
+        let import_declaration = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let import = plan_top_level_named_value_import(
+            &importer.arena,
+            &bounds[0],
+            context.store(),
+            import_declaration,
+        )
+        .unwrap();
+        let resolved = resolve_source_import_binding(
+            context.store_mut_for_test(),
+            &mut alias_host,
+            &import.bindings[0],
+        )
+        .unwrap();
+        let read = plan_source_import_identifier_read(
+            &importer.arena,
+            &bounds[0],
+            context.store(),
+            &import.bindings[0],
+            variable_initializer(&importer, importer_file, "copied"),
+            "keep",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let capabilities = prepare_imported_default_arrow_capabilities(
+            context.store_mut_for_test(),
+            &host,
+            &mut alias_host,
+            &globals,
+            options,
+            &resolved,
+        )
+        .unwrap();
+        let export =
+            plan_source_import_default_arrow_export(context.store(), &host, &globals, &resolved)
+                .unwrap()
+                .unwrap();
+        let first_root = export.callable.parameters[0].explicit_type_node().unwrap();
+        let nested_root = export.callable.parameters[1].explicit_type_node().unwrap();
+        let return_root = export.callable.return_type.type_node().unwrap();
+        let constraint_root = export.callable.type_parameters[0].constraint.unwrap();
+        let default_root = export.callable.type_parameters[0].default_type.unwrap();
+        assert_eq!(capabilities.len(), 5);
+        for root in [first_root, return_root, constraint_root, default_root] {
+            assert_eq!(capabilities.get(&root).unwrap().len(), 1);
+        }
+        assert_eq!(capabilities.get(&nested_root).unwrap().len(), 2);
+        let nested_shape = type_reference_nodes(&provider, provider_file, "Shape")
+            .into_iter()
+            .find(|node| provider.arena.get(node.node).unwrap().parent == Some(nested_root.node))
+            .unwrap();
+        let outside = type_reference_nodes(&provider, provider_file, "Shape")
+            .into_iter()
+            .find(|node| {
+                provider
+                    .arena
+                    .get(node.node)
+                    .unwrap()
+                    .parent
+                    .and_then(|parent| provider.arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::TypeAliasDeclaration)
+            })
+            .unwrap();
+        assert!(!capabilities.contains_key(&outside));
+        let type_import_declaration = provider
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    provider.arena.id(),
+                    provider_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let type_import = plan_top_level_named_type_import(
+            &provider.arena,
+            &bounds[1],
+            context.store(),
+            type_import_declaration,
+        )
+        .unwrap();
+        let shape_binding = type_import
+            .bindings
+            .iter()
+            .find(|binding| binding.imported_text == "Shape")
+            .unwrap();
+        let shape = resolve_source_type_import_binding(
+            context.store_mut_for_test(),
+            &mut alias_host,
+            &host,
+            shape_binding,
+        )
+        .unwrap();
+        let nested_capability = plan_source_type_import_reference(
+            context.store(),
+            &host,
+            &shape,
+            nested_root,
+            nested_shape,
+        )
+        .unwrap();
+        let outside_capability =
+            plan_source_type_import_reference(context.store(), &host, &shape, outside, outside)
+                .unwrap();
+        let mut omitted = capabilities.clone();
+        omitted
+            .get_mut(&nested_root)
+            .unwrap()
+            .retain(|capability| *capability != nested_capability);
+        assert_eq!(omitted.get(&nested_root).unwrap().len(), 1);
+        let first_retained_reference = [
+            first_root,
+            nested_root,
+            return_root,
+            constraint_root,
+            default_root,
+        ]
+        .into_iter()
+        .min()
+        .unwrap();
+        let mut surplus = capabilities.clone();
+        assert_eq!(surplus.insert(outside, vec![outside_capability]), None);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut prepared_before = None;
+        for _ in 0..2 {
+            for (invalid, expected) in [
+                (
+                    &omitted,
+                    SourceImportError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::ImportAliasCapabilityUnsupported(
+                            first_retained_reference,
+                        ),
+                    )),
+                ),
+                (
+                    &surplus,
+                    SourceImportError::Invariant(
+                        super::super::source_imports::SourceImportInvariant::InvalidTargetLinks(
+                            export.export_symbol,
+                        ),
+                    ),
+                ),
+            ] {
+                let before = observable_state(&context, provider_file);
+                let count = (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark(),
+                );
+                assert_eq!(
+                    prepare_source_import_value_with_type_import_capabilities(
+                        context.store_mut_for_test(),
+                        &host,
+                        &globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        &resolved,
+                        &read,
+                        invalid,
+                    ),
+                    Err(expected)
+                );
+                assert_eq!(observable_state(&context, provider_file), before);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_mark()
+                    ),
+                    count
+                );
+                assert!(diagnostics.is_empty());
+            }
+            let before = observable_state(&context, provider_file);
+            let prepared = prepare_source_import_value_with_type_import_capabilities(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                &resolved,
+                &read,
+                &capabilities,
+            )
+            .unwrap();
+            if let Some(previous) = prepared_before.as_ref() {
+                assert_eq!(&prepared, previous);
+                assert_eq!(observable_state(&context, provider_file), before);
+            }
+            let signature = context
+                .store()
+                .source_callable_provenance(prepared.type_)
+                .unwrap()
+                .signature;
+            let type_parameter = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters()[0];
+            let first_type = context
+                .store()
+                .type_node_links(first_root)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let first = validate_direct_generic_reference(context.store(), first_type).unwrap();
+            assert_eq!(first.type_arguments, [type_parameter]);
+            let nested_type = context
+                .store()
+                .type_node_links(nested_root)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let nested = validate_direct_generic_reference(context.store(), nested_type).unwrap();
+            assert_eq!(
+                nested.type_arguments,
+                [context
+                    .store()
+                    .type_node_links(nested_shape)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()]
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(first_type)
+            );
+            assert!(context.store().type_node_links(export.expression).is_none());
+            assert!(!is_type_checked(&context, provider_file));
+            let publications = preflight_prepared_source_import_publications_with_host(
+                context.store(),
+                &host,
+                &globals,
+                std::slice::from_ref(&prepared),
+            )
+            .unwrap();
+            for publication in publications {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(publication.symbol, publication.links)
+                );
+            }
+            prepared_before = Some(prepared);
+        }
+        assert!(diagnostics.is_empty());
+        assert!(!is_type_checked(&context, importer_file));
+        assert!(!is_type_checked(&context, provider_file));
+        assert!(!is_type_checked(&context, types_file));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Check the local proxy, default owner, and both import forms together.
     fn named_default_function_preserves_local_export_and_import_types() {
         let provider = parsed(concat!(
@@ -84262,6 +84881,233 @@ mod tests {
         let warm = observable_state(&context, consumer_file);
         context.recheck_source_file(consumer_file).unwrap();
         assert_eq!(observable_state(&context, consumer_file), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check both imported signature roots and the real body across replay.
+    fn generic_function_return_replays_complete_imported_signature_roots() {
+        let source = parsed(concat!(
+            "import type { Shape } from './types'; ",
+            "function keep<T>(value: Shape): Shape { return value; }",
+        ));
+        let types = parsed("export interface Shape { value: number }");
+        let file = FileId::new(98_220);
+        let types_file = FileId::new(98_221);
+        let mut context = external_context_with_import_routes(
+            &[(file, &source), (types_file, &types)],
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let declaration = function_declaration(&source, file, "keep");
+        let NodeData::FunctionDeclaration(function) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the original generic function")
+        };
+        let [parameter] = function.parameters.nodes.as_slice() else {
+            panic!("expected one value parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &source.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("expected the explicitly typed parameter")
+        };
+        let parameter_annotation =
+            NodeRef::new(source.arena.id(), file, parameter_data.type_.unwrap());
+        let return_annotation = NodeRef::new(source.arena.id(), file, function.type_.unwrap());
+        assert_eq!(
+            type_reference_nodes(&source, file, "Shape"),
+            [parameter_annotation, return_annotation],
+        );
+        let [type_parameter] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("expected the function's type parameter")
+        };
+        let type_parameter = NodeRef::new(source.arena.id(), file, *type_parameter);
+        let statement = function_return_statement(&source, file, "keep");
+        let NodeData::ReturnStatement(return_statement) =
+            &source.arena.get(statement.node).unwrap().data
+        else {
+            panic!("expected the original return statement")
+        };
+        let body = NodeRef::new(
+            source.arena.id(),
+            file,
+            return_statement.expression.unwrap(),
+        );
+        let shape_declaration = types
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    types.arena.id(),
+                    types_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (owner, parameter_symbol, type_parameter_symbol) = {
+            let (_, bound) = context.file(file).unwrap();
+            (
+                bound.symbol(declaration).unwrap(),
+                bound.symbol(parameter).unwrap(),
+                bound.symbol(type_parameter).unwrap(),
+            )
+        };
+        let shape_symbol = context
+            .file(types_file)
+            .unwrap()
+            .1
+            .symbol(shape_declaration)
+            .unwrap();
+        let alias = source_import_alias_symbol(&context, &source, file, "Shape");
+        assert_ne!(alias, shape_symbol);
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+        assert!(context.store().signature_links(declaration).is_none());
+        assert!(context.store().type_node_links(body).is_none());
+        assert!(!is_type_checked(&context, file));
+        assert!(!is_type_checked(&context, types_file));
+
+        context.check_source_file(file).unwrap();
+
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let shape = context
+            .store()
+            .declared_type_links(shape_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let parameter_type = context
+            .store()
+            .declared_type_links(type_parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_ne!(parameter_type, shape);
+        let check = |context: &CanonicalCheckerContext<'_>| {
+            assert!(is_type_checked(context, file));
+            assert!(!is_type_checked(context, types_file));
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(callable)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .unwrap()
+                    .resolved_type,
+                Some(callable),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(declaration)
+                    .unwrap()
+                    .resolved_signature
+                    .signature(),
+                Some(signature),
+            );
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(record.parameters(), [parameter_symbol]);
+            assert_eq!(record.type_parameters(), [parameter_type]);
+            assert_eq!(record.resolved_return_type(), Some(shape));
+            assert_eq!(
+                context
+                    .store()
+                    .callable_signature_parameter_types(signature),
+                Some(&[shape][..]),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(parameter_symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(shape),
+            );
+            let evidence = context
+                .store()
+                .source_callable_type_query(signature)
+                .unwrap();
+            assert_eq!(
+                evidence.callable().family,
+                SourceCallableFamily::FunctionDeclaration
+            );
+            assert!(evidence.callable().requires_type_query_evidence());
+            assert!(evidence.is_exact(context.store()));
+            for node in [parameter_annotation, return_annotation] {
+                assert_eq!(evidence.annotation_type(node), Some(shape));
+                assert_eq!(resolved_node_type(context, node), shape);
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(node)
+                        .unwrap()
+                        .resolved_symbol,
+                    Some(shape_symbol),
+                );
+            }
+            assert_eq!(resolved_node_type(context, body), shape);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(body)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(parameter_symbol),
+            );
+        };
+        let caches = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().signature_links(declaration).cloned(),
+                context.store().value_symbol_links(owner).cloned(),
+                context
+                    .store()
+                    .value_symbol_links(parameter_symbol)
+                    .cloned(),
+                context
+                    .store()
+                    .declared_type_links(type_parameter_symbol)
+                    .cloned(),
+                context.store().declared_type_links(shape_symbol).cloned(),
+                context.store().alias_symbol_links(alias).cloned(),
+                [parameter_annotation, return_annotation, body].map(|node| {
+                    (
+                        context.store().type_node_links(node).cloned(),
+                        context.store().symbol_node_links(node).cloned(),
+                    )
+                }),
+                context.store().source_callable_type_query_len(),
+            )
+        };
+        check(&context);
+        let warm = observable_state(&context, file);
+        let cached = caches(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            check(&context);
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(caches(&context), cached);
+        }
     }
 
     #[test]
@@ -102645,7 +103491,8 @@ class Foo2 {
     }
 
     #[test]
-    fn unsupported_source_arrow_keeps_the_complete_plan_atomic() {
+    #[allow(clippy::too_many_lines)] // Check cold planning, signature ownership, body execution, and replay together.
+    fn source_generic_arrow_checks_body_and_replays_exact_signature() {
         let source = parsed(concat!(
             "const ready = (): void => {}; ",
             "const generic = <T>(value: T): T => value;",
@@ -102654,25 +103501,331 @@ class Foo2 {
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
         let ready = variable_initializer(&source, file, "ready");
         let generic = variable_initializer(&source, file, "generic");
-        let (_, bound) = context.file(file).unwrap();
-        let ready_owner = bound.symbol(ready).unwrap();
-        let before = observable_state(&context, file);
-
-        assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Arrow(generic)
-            ))
+        let NodeData::ArrowFunction(generic_arrow) = &source.arena.get(generic.node).unwrap().data
+        else {
+            panic!("the generic initializer must remain an actual arrow")
+        };
+        let parameter_declaration =
+            NodeRef::new(source.arena.id(), file, generic_arrow.parameters.nodes[0]);
+        let type_parameter_declaration = NodeRef::new(
+            source.arena.id(),
+            file,
+            generic_arrow.type_parameters.as_ref().unwrap().nodes[0],
         );
+        let body = arrow_body(&source, file, "generic");
+        let (ready_owner, generic_owner, parameter_symbol, type_parameter_symbol) = {
+            let (_, bound) = context.file(file).unwrap();
+            (
+                bound.symbol(ready).unwrap(),
+                bound.symbol(generic).unwrap(),
+                bound.symbol(parameter_declaration).unwrap(),
+                bound.symbol(type_parameter_declaration).unwrap(),
+            )
+        };
+        let ready_variable = variable_symbol(&context, &source, file, "ready");
+        let generic_variable = variable_symbol(&context, &source, file, "generic");
+        let before = observable_state(&context, file);
+        let evidence_count = context.store().source_callable_type_query_len();
+        let (ready_plan, generic_plan) = {
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let plan = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            )
+            .finish()
+            .unwrap();
+            assert!(matches!(
+                plan.statements.as_slice(),
+                [PlannedStatement::Arrow(0), PlannedStatement::Arrow(1)]
+            ));
+            let [ready_plan, generic_plan] = plan.arrows.as_slice() else {
+                panic!("the unchanged source must plan its two arrows in order")
+            };
+            assert!(matches!(ready_plan.body, PlannedArrowBody::Empty));
+            assert!(
+                matches!(&generic_plan.body, PlannedArrowBody::Return { expression, .. } if expression.node == body)
+            );
+            (
+                ready_plan.source.callable.clone(),
+                generic_plan.source.callable.clone(),
+            )
+        };
         assert_eq!(observable_state(&context, file), before);
+        assert_eq!(
+            context.store().source_callable_type_query_len(),
+            evidence_count
+        );
+        for (declaration, owner, variable) in [
+            (ready, ready_owner, ready_variable),
+            (generic, generic_owner, generic_variable),
+        ] {
+            assert_ne!(owner, variable);
+            let symbol = context.store().symbol(owner).unwrap();
+            assert_eq!(symbol.flags(), SymbolFlags::FUNCTION);
+            assert_eq!(symbol.name(), InternalSymbolName::Function.as_ref());
+            assert_eq!(symbol.declarations(), Some(&[declaration][..]));
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().value_symbol_links(variable).is_none());
+            assert!(context.store().signature_links(declaration).is_none());
+        }
+        assert!(context.store().type_node_links(body).is_none());
+        assert!(!is_type_checked(&context, file));
+
+        context.check_source_file(file).unwrap();
+
+        let ready_type = variable_value_type(&context, &source, file, "ready");
+        let generic_type = variable_value_type(&context, &source, file, "generic");
+        assert_ne!(ready_type, generic_type);
+        let ready_signature = context
+            .store()
+            .source_callable_provenance(ready_type)
+            .unwrap()
+            .signature;
+        let generic_signature = context
+            .store()
+            .source_callable_provenance(generic_type)
+            .unwrap()
+            .signature;
+        assert_ne!(ready_signature, generic_signature);
+        for (declaration, owner, type_, signature) in [
+            (ready, ready_owner, ready_type, ready_signature),
+            (generic, generic_owner, generic_type, generic_signature),
+        ] {
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(type_)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_callable_type_for_declaration(declaration),
+                Some(type_)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .unwrap()
+                    .resolved_type,
+                Some(type_)
+            );
+            let provenance = context.store().source_callable_provenance(type_).unwrap();
+            assert_eq!(provenance.family, SourceCallableFamily::ArrowFunction);
+            assert_eq!(provenance.declaration, declaration);
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(provenance.signature, signature);
+            assert!(matches!(
+                validate_stored_source_callable(context.store(), type_),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+        }
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        let no_constraint = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .no_constraint_type;
+        let ready_record = context.store().signature(ready_signature).unwrap();
+        assert!(ready_record.parameters().is_empty());
+        assert!(ready_record.type_parameters().is_empty());
+        assert_eq!(ready_record.resolved_return_type(), Some(void));
+        assert!(!ready_plan.requires_type_query_evidence());
         assert!(
             context
                 .store()
-                .source_callable_type_for_owner(ready_owner)
+                .source_callable_type_query(ready_signature)
                 .is_none()
         );
-        assert!(context.store().value_symbol_links(ready_owner).is_none());
-        assert!(!is_type_checked(&context, file));
+
+        let type_parameter = context
+            .store()
+            .declared_type_links(type_parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_payload(type_parameter)
+                .unwrap()
+                .symbol(),
+            Some(type_parameter_symbol)
+        );
+        let generic_record = context.store().signature(generic_signature).unwrap();
+        assert_eq!(generic_record.parameters(), &[parameter_symbol]);
+        assert_eq!(generic_record.type_parameters(), &[type_parameter]);
+        assert_eq!(generic_record.resolved_return_type(), Some(type_parameter));
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(generic_signature),
+            Some(&[type_parameter][..])
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(parameter_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(type_parameter)
+        );
+        let evidence = context
+            .store()
+            .source_callable_type_query(generic_signature)
+            .unwrap();
+        assert!(evidence.matches_plan(&generic_plan));
+        assert!(evidence.callable().requires_type_query_evidence());
+        assert!(
+            evidence
+                .callable()
+                .type_parameter_syntax
+                .is_ordinary_typescript_arrow()
+        );
+        assert!(evidence.is_exact(context.store()));
+        let [resolved] = evidence.type_parameters() else {
+            panic!("the generic signature must retain one resolved type parameter")
+        };
+        assert_eq!(resolved.provenance.declaration, type_parameter_declaration);
+        assert_eq!(resolved.provenance.symbol, type_parameter_symbol);
+        assert_eq!(resolved.provenance.type_parameter, type_parameter);
+        assert_eq!(resolved.provenance.constraint, None);
+        assert_eq!(resolved.provenance.default_type, None);
+        assert_eq!(resolved.constraint, no_constraint);
+        assert_eq!(resolved.default_type, no_constraint);
+        assert_eq!(evidence.base_constraints(), &[no_constraint]);
+        let parameter_annotation = generic_plan.parameters[0].explicit_type_node().unwrap();
+        let return_annotation = generic_plan.return_type.type_node().unwrap();
+        assert_eq!(
+            evidence.annotation_type(parameter_annotation),
+            Some(type_parameter)
+        );
+        assert_eq!(
+            evidence.annotation_type(return_annotation),
+            Some(type_parameter)
+        );
+        assert_eq!(resolved_node_type(&context, body), type_parameter);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(body)
+                .and_then(|links| links.resolved_symbol),
+            Some(parameter_symbol)
+        );
+        assert_eq!(
+            context.store().source_callable_type_query_len(),
+            evidence_count + 1
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        let value_symbols = [
+            ready_owner,
+            generic_owner,
+            ready_variable,
+            generic_variable,
+            parameter_symbol,
+        ];
+        let value_links =
+            value_symbols.map(|symbol| context.store().value_symbol_links(symbol).cloned());
+        let signature_links =
+            [ready, generic].map(|node| context.store().signature_links(node).cloned());
+        let signature_state = |context: &CanonicalCheckerContext<'_>| {
+            [ready_signature, generic_signature].map(|id| {
+                let signature = context.store().signature(id).unwrap();
+                (
+                    id,
+                    signature.declaration(),
+                    signature.parameters().to_vec(),
+                    signature.type_parameters().to_vec(),
+                    signature.resolved_return_type(),
+                )
+            })
+        };
+        let signatures = signature_state(&context);
+        let body_links = context.store().type_node_links(body).cloned();
+        let body_symbol_links = context.store().symbol_node_links(body).cloned();
+        let parameter_links = context
+            .store()
+            .declared_type_links(type_parameter_symbol)
+            .cloned();
+        let provenance = context
+            .store()
+            .source_callable_type_parameters(generic_signature)
+            .unwrap()
+            .to_vec();
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(
+                context.store().source_callable_type_query_len(),
+                evidence_count + 1
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "ready"),
+                ready_type
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "generic"),
+                generic_type
+            );
+            assert_eq!(
+                value_symbols.map(|symbol| context.store().value_symbol_links(symbol).cloned()),
+                value_links
+            );
+            assert_eq!(
+                [ready, generic].map(|node| context.store().signature_links(node).cloned()),
+                signature_links
+            );
+            assert_eq!(signature_state(&context), signatures);
+            assert_eq!(context.store().type_node_links(body), body_links.as_ref());
+            assert_eq!(
+                context.store().symbol_node_links(body),
+                body_symbol_links.as_ref()
+            );
+            assert_eq!(
+                context.store().declared_type_links(type_parameter_symbol),
+                parameter_links.as_ref()
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_callable_type_parameters(generic_signature),
+                Some(provenance.as_slice())
+            );
+            let evidence = context
+                .store()
+                .source_callable_type_query(generic_signature)
+                .unwrap();
+            assert!(evidence.matches_plan(&generic_plan));
+            assert!(evidence.is_exact(context.store()));
+            assert_eq!(
+                evidence.annotation_type(parameter_annotation),
+                Some(type_parameter)
+            );
+            assert_eq!(
+                evidence.annotation_type(return_annotation),
+                Some(type_parameter)
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(is_type_checked(&context, file));
+        }
     }
 
     #[test]
@@ -105559,7 +106712,10 @@ class Foo2 {
             options,
             &mut session,
             &mut diagnostics,
-            &HashMap::new(),
+            &SourceTypeImportExecution {
+                value_uses: HashMap::new(),
+                annotation_capabilities: &capabilities,
+            },
             &mut Vec::new(),
             &mut execution,
             std::slice::from_ref(first),

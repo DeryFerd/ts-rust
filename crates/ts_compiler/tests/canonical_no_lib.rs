@@ -223,9 +223,12 @@ fn canonical_no_default_lib_directive_keeps_library_selection() {
         assert!(!program.options().no_lib);
         assert!(program.source_files()[0].file_name.ends_with("/main.ts"));
         assert_eq!(
-            program.source_file("/__typescript/lib/lib.d.ts").is_some(),
+            program
+                .source_file("/__typescript/lib/lib.es2025.full.d.ts")
+                .is_some(),
             has_default_root,
         );
+        assert!(program.source_file("/__typescript/lib/lib.d.ts").is_none());
         assert_eq!(
             program
                 .source_file("/__typescript/lib/lib.es5.d.ts")

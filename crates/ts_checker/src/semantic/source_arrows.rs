@@ -1,4 +1,4 @@
-//! Planning for exact arrow values in direct top-level declarations.
+//! Planning for exact arrow values in direct declarations and default exports.
 //!
 //! The installed path proves an unannotated top-level declaration of the form
 //! `var|let|const name = (parameters): Return => body`. A separate read-only
@@ -6,7 +6,8 @@
 //! concise, and single-return bodies without resolving `Context` or fabricating
 //! parameter types. Both retain the ordinary variable symbol separately from
 //! the binder's anonymous FUNCTION owner and preserve the export route when
-//! present. Publication remains deferred to source dispatch.
+//! present. Direct default exports retain their PROPERTY export owner separately
+//! from the anonymous FUNCTION owner. Publication remains deferred to source dispatch.
 
 use std::collections::HashSet;
 
@@ -213,6 +214,17 @@ pub(super) struct SourceArrowPlan {
     pub(super) body: SourceArrowBodyPlan,
 }
 
+/// Exact default-export syntax and its distinct export and callable owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceDefaultArrowExportPlan {
+    pub(super) declaration: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) module_symbol: SemanticSymbolId,
+    pub(super) export_symbol: SemanticSymbolId,
+    pub(super) callable: SourceCallablePlan,
+    pub(super) body: SourceArrowBodyPlan,
+}
+
 /// Valid TypeScript source shapes intentionally deferred beyond this direct,
 /// noncontextual arrow cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +237,7 @@ pub(super) enum SourceArrowUnsupported {
     VariableAnnotation(NodeRef),
     MissingInitializer(NodeRef),
     NonArrowInitializer(NodeRef),
+    DefaultExportSyntax(NodeRef),
     ComplexBlock(NodeRef),
     BareReturn(NodeRef),
     JsDocContext(NodeRef),
@@ -242,6 +255,8 @@ pub(super) enum SourceArrowInvariant {
     InvalidVariableName(NodeRef),
     InvalidVariableType(NodeRef),
     InvalidInitializer(NodeRef),
+    InvalidExportAssignment(NodeRef),
+    InvalidExportSymbol(NodeRef),
     InvalidOwnerSymbol(NodeRef),
     InvalidBody(NodeRef),
     Variable(VariableInvariant),
@@ -268,6 +283,7 @@ impl SourceArrowError {
                 | SourceArrowUnsupported::VariableAnnotation(node)
                 | SourceArrowUnsupported::MissingInitializer(node)
                 | SourceArrowUnsupported::NonArrowInitializer(node)
+                | SourceArrowUnsupported::DefaultExportSyntax(node)
                 | SourceArrowUnsupported::ComplexBlock(node)
                 | SourceArrowUnsupported::BareReturn(node)
                 | SourceArrowUnsupported::JsDocContext(node) => Some(node),
@@ -284,6 +300,8 @@ impl SourceArrowError {
                 | SourceArrowInvariant::InvalidVariableName(node)
                 | SourceArrowInvariant::InvalidVariableType(node)
                 | SourceArrowInvariant::InvalidInitializer(node)
+                | SourceArrowInvariant::InvalidExportAssignment(node)
+                | SourceArrowInvariant::InvalidExportSymbol(node)
                 | SourceArrowInvariant::InvalidOwnerSymbol(node)
                 | SourceArrowInvariant::InvalidBody(node) => Some(node),
                 SourceArrowInvariant::Variable(_) => None,
@@ -1950,6 +1968,185 @@ pub(super) fn plan_source_arrow(
     })
 }
 
+/// Proves one direct TypeScript default arrow export without resolving its types.
+#[allow(clippy::too_many_lines)] // Keep the export syntax and binder proof atomic.
+pub(super) fn plan_source_default_arrow_export(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceDefaultArrowExportPlan, SourceArrowError> {
+    let record = preflight_node(store, host, declaration)?;
+    let invalid_assignment =
+        || invariant(SourceArrowInvariant::InvalidExportAssignment(declaration));
+    let NodeData::ExportAssignment(assignment) = &record.data else {
+        return Err(invalid_assignment());
+    };
+    if record.kind != SyntaxKind::ExportAssignment
+        || record.flags.0 != 0
+        || assignment.flow_node.is_some()
+        || assignment.modifiers.is_some()
+        || assignment.symbol.is_some()
+        || assignment.type_.is_some()
+        || assignment.facts != 0
+    {
+        return Err(invalid_assignment());
+    }
+    if assignment.is_export_equals {
+        return Err(unsupported(SourceArrowUnsupported::DefaultExportSyntax(
+            declaration,
+        )));
+    }
+
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(invalid_assignment)?;
+    let facts = bound.source_facts().ok_or_else(invalid_assignment)?;
+    if facts.is_javascript_file() || facts.is_declaration_file() || !facts.is_external_module() {
+        return Err(unsupported(SourceArrowUnsupported::DefaultExportSyntax(
+            declaration,
+        )));
+    }
+    let source = bound.source_file();
+    if record.parent != Some(source.node) {
+        return Err(unsupported(SourceArrowUnsupported::NestedDeclaration(
+            declaration,
+        )));
+    }
+    let source_record = preflight_node(store, host, source)?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invariant(SourceArrowInvariant::InvalidSourceFile(source)));
+    };
+    if source_record.kind != SyntaxKind::SourceFile
+        || source_record.parent.is_some()
+        || !range_contains(source_record.range, record.range)
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidSourceFile(source)));
+    }
+
+    let expression = NodeRef::new(declaration.arena, declaration.file, assignment.expression);
+    let expression_record = preflight_node(store, host, expression)?;
+    if expression_record.parent != Some(declaration.node)
+        || expression_record.flags.0 != 0
+        || !range_contains(record.range, expression_record.range)
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidInitializer(
+            expression,
+        )));
+    }
+    let NodeData::ArrowFunction(arrow) = &expression_record.data else {
+        return Err(unsupported(SourceArrowUnsupported::NonArrowInitializer(
+            expression,
+        )));
+    };
+    if expression_record.kind != SyntaxKind::ArrowFunction || arrow.facts != 0 {
+        return Err(invariant(SourceArrowInvariant::InvalidInitializer(
+            expression,
+        )));
+    }
+    if arrow.type_.is_none() {
+        return Err(unsupported(SourceArrowUnsupported::DefaultExportSyntax(
+            expression,
+        )));
+    }
+    for parameter in &arrow.parameters.nodes {
+        let parameter = NodeRef::new(expression.arena, expression.file, *parameter);
+        let parameter_record = preflight_node(store, host, parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(invariant(SourceArrowInvariant::Callable(
+                SourceCallableInvariant::InvalidParameter(parameter),
+            )));
+        };
+        let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let name_record = preflight_node(store, host, name)?;
+        if parameter_data.type_.is_none()
+            || parameter_data.initializer.is_some()
+            || parameter_data.dot_dot_dot_token.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || !matches!(name_record.data, NodeData::Identifier(_))
+        {
+            return Err(unsupported(SourceArrowUnsupported::DefaultExportSyntax(
+                parameter,
+            )));
+        }
+    }
+
+    let module_symbol = bound
+        .symbol(source)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidSourceFile(source)))?;
+    let module = store
+        .symbol(module_symbol)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidSourceFile(source)))?;
+    if module.flags() != SymbolFlags::VALUE_MODULE
+        || module.check_flags() != CheckFlags::NONE
+        || module.name() != facts.source_file_symbol_name()
+        || module.declarations() != Some(&[source])
+        || module.value_declaration() != Some(source)
+        || module.members().is_some()
+        || module.parent().is_some()
+        || module.export_symbol().is_some()
+        || bound.local_symbol(source).is_some()
+        || store.get_merged_symbol(module_symbol) != Some(module_symbol)
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidSourceFile(source)));
+    }
+    let invalid_export = || invariant(SourceArrowInvariant::InvalidExportSymbol(declaration));
+    let export_symbol = bound.symbol(declaration).ok_or_else(invalid_export)?;
+    let export = store.symbol(export_symbol).ok_or_else(invalid_export)?;
+    if export_symbol == module_symbol
+        || export.flags() != SymbolFlags::PROPERTY
+        || export.check_flags() != CheckFlags::NONE
+        || export.name() != InternalSymbolName::Default.as_ref()
+        || export.declarations() != Some(&[declaration])
+        || export.value_declaration() != Some(declaration)
+        || export.members().is_some()
+        || export.exports().is_some()
+        || export.parent() != Some(module_symbol)
+        || export.export_symbol().is_some()
+        || bound.local_symbol(declaration).is_some()
+        || store.get_merged_symbol(export_symbol) != Some(export_symbol)
+        || module
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::Default.as_ref()))
+            != Some(export_symbol)
+    {
+        return Err(invalid_export());
+    }
+
+    let (callable, body) = plan_source_arrow_value(store, host, expression, array_targets)?;
+    if callable.owner_symbol == export_symbol || callable.owner_symbol == module_symbol {
+        return Err(invariant(SourceArrowInvariant::InvalidOwnerSymbol(
+            expression,
+        )));
+    }
+    if callable.is_async {
+        return Err(unsupported(SourceArrowUnsupported::Callable(
+            SourceCallableUnsupported::Async(expression),
+        )));
+    }
+    if callable.body_mode.is_ambient() {
+        return Err(unsupported(SourceArrowUnsupported::DefaultExportSyntax(
+            expression,
+        )));
+    }
+    Ok(SourceDefaultArrowExportPlan {
+        declaration,
+        expression,
+        module_symbol,
+        export_symbol,
+        callable,
+        body,
+    })
+}
+
 /// Proves an arrow callable and its body independently of its containing
 /// expression, without publishing checker state.
 pub(super) fn plan_source_arrow_value(
@@ -2676,6 +2873,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         IntrinsicBootstrapOptions,
+        declared::DeclaredTypeHostError,
         jsdoc::plan_javascript_source_jsdoc,
         production::GlobalMergeCompletion,
         source_callables::{SourceCallableState, source_callable_state},
@@ -2782,6 +2980,29 @@ mod tests {
             plan_source_arrow(&self.store, &host, self.declarations()[index], None)
         }
 
+        fn default_export_declaration(&self) -> NodeRef {
+            self.parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                        self.parsed.arena.id(),
+                        self.file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        }
+
+        fn default_export_plan(&self) -> Result<SourceDefaultArrowExportPlan, SourceArrowError> {
+            plan_source_default_arrow_export(
+                &self.store,
+                &self.host(),
+                self.default_export_declaration(),
+                None,
+            )
+        }
+
         fn contextual_plan(
             &self,
             index: usize,
@@ -2870,6 +3091,423 @@ mod tests {
             source_callable_state(&fixture.store, &plan.callable, true).unwrap(),
             SourceCallableState::Cold
         );
+    }
+
+    #[test]
+    fn default_arrow_exports_keep_module_export_and_callable_owners_distinct() {
+        for (source, type_parameter_count) in [
+            ("export default (): number => 1;", 0),
+            ("export default (value: number): number => value;", 0),
+            ("export default <T>(value: T): T => value;", 1),
+            (
+                "export default <T = string>(value: T): T => { return value; };",
+                1,
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            );
+            let plan = fixture.default_export_plan().unwrap();
+            assert_eq!(plan.declaration, fixture.default_export_declaration());
+            let NodeData::ExportAssignment(assignment) = &fixture
+                .parsed
+                .arena
+                .get(plan.declaration.node)
+                .unwrap()
+                .data
+            else {
+                panic!("the export retains its actual assignment node")
+            };
+            assert_eq!(assignment.expression, plan.expression.node);
+            assert!(!assignment.is_export_equals);
+            assert_eq!(plan.callable.declaration, plan.expression);
+            assert_eq!(plan.callable.family, SourceCallableFamily::ArrowFunction);
+            assert_eq!(plan.callable.type_parameters.len(), type_parameter_count);
+            assert!(plan.callable.return_type.type_node().is_some());
+            assert!(!plan.callable.is_async);
+            assert_ne!(plan.module_symbol, plan.export_symbol);
+            assert_ne!(plan.export_symbol, plan.callable.owner_symbol);
+            assert_ne!(plan.module_symbol, plan.callable.owner_symbol);
+            assert_eq!(
+                fixture.bound.symbol(plan.expression),
+                Some(plan.callable.owner_symbol)
+            );
+            assert_eq!(
+                fixture.bound.symbol(plan.declaration),
+                Some(plan.export_symbol)
+            );
+            assert_eq!(
+                fixture.bound.symbol(fixture.bound.source_file()),
+                Some(plan.module_symbol)
+            );
+            let export = fixture.store.symbol(plan.export_symbol).unwrap();
+            assert_eq!(export.flags(), SymbolFlags::PROPERTY);
+            assert_eq!(export.name(), InternalSymbolName::Default.as_ref());
+            assert_eq!(export.declarations(), Some(&[plan.declaration][..]));
+            assert_eq!(export.parent(), Some(plan.module_symbol));
+            let owner = fixture.store.symbol(plan.callable.owner_symbol).unwrap();
+            assert_eq!(owner.flags(), SymbolFlags::FUNCTION);
+            assert_eq!(owner.name(), InternalSymbolName::Function.as_ref());
+            assert_eq!(owner.declarations(), Some(&[plan.expression][..]));
+            assert!(owner.parent().is_none());
+            assert_eq!(
+                plan_source_arrow_value(&fixture.store, &fixture.host(), plan.expression, None),
+                Ok((plan.callable.clone(), plan.body)),
+            );
+
+            for _ in 0..2 {
+                assert_eq!(fixture.default_export_plan(), Ok(plan.clone()));
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.mapper_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.symbol_len(),
+                        fixture.store.symbol_store().symbol_table_len(),
+                        fixture.store.checker_link_allocated_lengths(),
+                        fixture.store.relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                assert!(fixture.store.type_node_links(plan.expression).is_none());
+                assert!(fixture.store.signature_links(plan.expression).is_none());
+                assert!(
+                    fixture
+                        .store
+                        .value_symbol_links(plan.export_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_callable_type_for_owner(plan.callable.owner_symbol)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_arrow_exports_reject_changed_owners_and_default_entries_without_writes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            ModuleOwner,
+            ExportOwner,
+            CallableOwner,
+            DefaultEntry,
+        }
+
+        for poison in [
+            Poison::ModuleOwner,
+            Poison::ExportOwner,
+            Poison::CallableOwner,
+            Poison::DefaultEntry,
+        ] {
+            let mut fixture = Fixture::new("export default (value: number): number => value;");
+            let plan = fixture.default_export_plan().unwrap();
+            let exports = fixture
+                .store
+                .symbol(plan.module_symbol)
+                .unwrap()
+                .exports()
+                .unwrap();
+            let expected = match poison {
+                Poison::ModuleOwner => {
+                    assert!(fixture.store.set_symbol_declarations(
+                        plan.module_symbol,
+                        Some(vec![plan.declaration]),
+                        Some(plan.declaration),
+                    ));
+                    SourceArrowInvariant::InvalidSourceFile(fixture.bound.source_file())
+                }
+                Poison::ExportOwner => {
+                    assert!(fixture.store.set_symbol_declarations(
+                        plan.export_symbol,
+                        Some(vec![plan.expression]),
+                        Some(plan.expression),
+                    ));
+                    SourceArrowInvariant::InvalidExportSymbol(plan.declaration)
+                }
+                Poison::CallableOwner => {
+                    assert!(fixture.store.set_symbol_flags(
+                        plan.callable.owner_symbol,
+                        SymbolFlags::PROPERTY,
+                        CheckFlags::NONE,
+                    ));
+                    SourceArrowInvariant::InvalidOwnerSymbol(plan.expression)
+                }
+                Poison::DefaultEntry => {
+                    assert_eq!(
+                        fixture.store.insert_symbol(
+                            exports,
+                            EscapedName::internal(InternalSymbolName::Default),
+                            plan.callable.owner_symbol,
+                        ),
+                        Some(Some(plan.export_symbol)),
+                    );
+                    SourceArrowInvariant::InvalidExportSymbol(plan.declaration)
+                }
+            };
+            let poisoned_owners = (
+                fixture
+                    .store
+                    .symbol(plan.module_symbol)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec(),
+                fixture
+                    .store
+                    .symbol(plan.export_symbol)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec(),
+                fixture
+                    .store
+                    .symbol(plan.callable.owner_symbol)
+                    .unwrap()
+                    .flags(),
+                fixture
+                    .store
+                    .symbol_table(exports)
+                    .unwrap()
+                    .get(InternalSymbolName::Default.as_ref()),
+            );
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            );
+
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture.default_export_plan(),
+                    Err(SourceArrowError::Invariant(expected)),
+                    "{poison:?}"
+                );
+                assert_eq!(
+                    (
+                        fixture
+                            .store
+                            .symbol(plan.module_symbol)
+                            .unwrap()
+                            .declarations()
+                            .unwrap()
+                            .to_vec(),
+                        fixture
+                            .store
+                            .symbol(plan.export_symbol)
+                            .unwrap()
+                            .declarations()
+                            .unwrap()
+                            .to_vec(),
+                        fixture
+                            .store
+                            .symbol(plan.callable.owner_symbol)
+                            .unwrap()
+                            .flags(),
+                        fixture
+                            .store
+                            .symbol_table(exports)
+                            .unwrap()
+                            .get(InternalSymbolName::Default.as_ref()),
+                    ),
+                    poisoned_owners,
+                );
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.mapper_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.symbol_len(),
+                        fixture.store.symbol_store().symbol_table_len(),
+                        fixture.store.checker_link_allocated_lengths(),
+                        fixture.store.relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                assert!(fixture.store.type_node_links(plan.expression).is_none());
+                assert!(fixture.store.signature_links(plan.expression).is_none());
+                assert!(
+                    fixture
+                        .store
+                        .value_symbol_links(plan.export_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_callable_type_for_owner(plan.callable.owner_symbol)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_arrow_exports_reject_changed_source_fields_before_host_creation() {
+        for poison_field in [true, false] {
+            let mut fixture = Fixture::new(concat!(
+                "const other = (value: number): number => value; ",
+                "export default (value: number): number => value;",
+            ));
+            let plan = fixture.default_export_plan().unwrap();
+            let other = fixture.plan(0).unwrap();
+            if poison_field {
+                let NodeData::ExportAssignment(assignment) = &mut fixture
+                    .parsed
+                    .arena
+                    .get_mut(plan.declaration.node)
+                    .unwrap()
+                    .data
+                else {
+                    panic!("the export retains its actual assignment node")
+                };
+                assignment.expression = other.callable.declaration.node;
+            } else {
+                fixture
+                    .parsed
+                    .arena
+                    .get_mut(plan.expression.node)
+                    .unwrap()
+                    .parent = Some(other.variable_declaration.node);
+            }
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    DeclaredTypeHost::new_after_global_merge(
+                        [(&fixture.parsed.arena, &fixture.bound)],
+                        GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                    ),
+                    Err(DeclaredTypeHostError::ArenaRevisionMismatch { file, expected, actual })
+                        if file == fixture.file
+                            && expected == fixture.bound.node_arena_revision()
+                            && actual == fixture.parsed.arena.revision()
+                            && expected != actual
+                ));
+                let NodeData::ExportAssignment(assignment) = &fixture
+                    .parsed
+                    .arena
+                    .get(plan.declaration.node)
+                    .unwrap()
+                    .data
+                else {
+                    panic!("the export retains its actual assignment node")
+                };
+                assert_eq!(
+                    assignment.expression,
+                    if poison_field {
+                        other.callable.declaration.node
+                    } else {
+                        plan.expression.node
+                    },
+                );
+                assert_eq!(
+                    fixture
+                        .parsed
+                        .arena
+                        .get(plan.expression.node)
+                        .unwrap()
+                        .parent,
+                    Some(if poison_field {
+                        plan.declaration.node
+                    } else {
+                        other.variable_declaration.node
+                    }),
+                );
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.mapper_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.symbol_len(),
+                        fixture.store.symbol_store().symbol_table_len(),
+                        fixture.store.checker_link_allocated_lengths(),
+                        fixture.store.relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                assert!(fixture.store.type_node_links(plan.expression).is_none());
+                assert!(fixture.store.signature_links(plan.expression).is_none());
+                assert!(
+                    fixture
+                        .store
+                        .value_symbol_links(plan.export_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_callable_type_for_owner(plan.callable.owner_symbol)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .store
+                        .source_callable_type_for_owner(other.callable.owner_symbol)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_arrow_exports_keep_other_expression_and_signature_shapes_unsupported() {
+        for source in [
+            "export = (value: number): number => value;",
+            "export default (value: number) => value;",
+            "export default async (): number => 1;",
+            "export default (value): number => 1;",
+            "export default (value: number = 1): number => value;",
+            "export default (...values: number[]): number => 1;",
+            "export default ({ value }: { value: number }): number => value;",
+            "export default ((value: number): number => value);",
+            "export default { value: 1 };",
+        ] {
+            let fixture = Fixture::new(source);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert!(
+                matches!(
+                    fixture.default_export_plan(),
+                    Err(SourceArrowError::Unsupported(_))
+                ),
+                "{source}"
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]
@@ -4475,12 +5113,182 @@ mod tests {
     #[test]
     fn preserves_shared_callable_unsupported_reasons() {
         let generic = Fixture::new("const f = <T>(x: T): T => x;");
+        let before = (
+            generic.store.type_len(),
+            generic.store.mapper_len(),
+            generic.store.signature_len(),
+            generic.store.symbol_len(),
+            generic.store.symbol_store().symbol_table_len(),
+            generic.store.checker_link_allocated_lengths(),
+            generic.store.source_callable_provenance_lengths(),
+            generic.store.source_callable_type_query_len(),
+            generic.store.relation_state_snapshot(),
+        );
+        let declaration = generic.declarations()[0];
+        let NodeData::VariableDeclaration(variable) =
+            &generic.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the original source has one variable declaration")
+        };
+        let reference = |node| NodeRef::new(generic.parsed.arena.id(), generic.file, node);
+        let arrow_node = reference(variable.initializer.unwrap());
+        let arrow_record = generic.parsed.arena.get(arrow_node.node).unwrap();
+        assert_eq!(arrow_record.kind, SyntaxKind::ArrowFunction);
+        let NodeData::ArrowFunction(arrow) = &arrow_record.data else {
+            panic!("the initializer is the actual arrow function")
+        };
+        let [type_parameter_node] = arrow.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("the original arrow declares one type parameter")
+        };
+        let type_parameter_declaration = reference(*type_parameter_node);
+        let [parameter_node] = arrow.parameters.nodes.as_slice() else {
+            panic!("the original arrow declares one value parameter")
+        };
+        let parameter_declaration = reference(*parameter_node);
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &generic.parsed.arena.get(*parameter_node).unwrap().data
+        else {
+            panic!("the value parameter retains its source declaration")
+        };
+        let parameter_annotation = reference(parameter_data.type_.unwrap());
+        let return_annotation = reference(arrow.type_.unwrap());
+        let body = reference(arrow.body);
+        assert_eq!(
+            generic.parsed.arena.get(body.node).unwrap().kind,
+            SyntaxKind::Identifier
+        );
         assert!(matches!(
-            generic.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::Callable(SourceCallableUnsupported::GenericSignature(_))
-            ))
+            &generic.parsed.arena.get(body.node).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "x"
         ));
+
+        let plan = generic.plan(0).unwrap();
+        assert_eq!(plan.variable_declaration, declaration);
+        assert_eq!(plan.variable_name, reference(variable.name));
+        assert_eq!(
+            generic.bound.symbol(declaration),
+            Some(plan.variable_symbol)
+        );
+        assert_eq!(plan.callable.declaration, arrow_node);
+        assert_eq!(plan.callable.family, SourceCallableFamily::ArrowFunction);
+        assert_eq!(
+            generic.bound.symbol(arrow_node),
+            Some(plan.callable.owner_symbol)
+        );
+        assert_ne!(plan.variable_symbol, plan.callable.owner_symbol);
+        assert_eq!(
+            generic.store.symbol(plan.variable_symbol).unwrap().flags(),
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        let owner = generic.store.symbol(plan.callable.owner_symbol).unwrap();
+        assert_eq!(owner.flags(), SymbolFlags::FUNCTION);
+        assert_eq!(owner.name(), InternalSymbolName::Function.as_ref());
+        assert_eq!(owner.declarations(), Some(&[arrow_node][..]));
+        assert_eq!(owner.value_declaration(), Some(arrow_node));
+        assert!(plan.callable.owner_parent.is_none());
+        assert!(plan.callable.export_local.is_none());
+        assert!(
+            plan.callable
+                .type_parameter_syntax
+                .is_ordinary_typescript_arrow()
+        );
+        assert!(plan.callable.requires_type_query_evidence());
+        assert!(!plan.callable.is_async);
+        assert!(!plan.callable.body_mode.is_ambient());
+        assert_eq!(plan.callable.min_argument_count, 1);
+        assert_eq!(plan.callable.flags, SignatureFlags::NONE);
+        let [type_parameter] = plan.callable.type_parameters.as_slice() else {
+            panic!("the source plan retains exactly one type parameter")
+        };
+        assert_eq!(type_parameter.declaration, type_parameter_declaration);
+        assert_eq!(
+            generic.bound.symbol(type_parameter_declaration),
+            Some(type_parameter.symbol)
+        );
+        assert_eq!(
+            generic
+                .store
+                .symbol(type_parameter.symbol)
+                .unwrap()
+                .name()
+                .as_utf8(),
+            Some("T")
+        );
+        assert!(type_parameter.constraint.is_none());
+        assert!(type_parameter.default_type.is_none());
+        let [parameter] = plan.callable.parameters.as_slice() else {
+            panic!("the source plan retains exactly one value parameter")
+        };
+        assert_eq!(parameter.declaration, parameter_declaration);
+        assert_eq!(
+            generic.bound.symbol(parameter_declaration),
+            Some(parameter.symbol)
+        );
+        assert_eq!(
+            generic
+                .store
+                .symbol(parameter.symbol)
+                .unwrap()
+                .name()
+                .as_utf8(),
+            Some("x")
+        );
+        assert_eq!(parameter.explicit_type_node(), Some(parameter_annotation));
+        assert!(!parameter.is_implicit_any());
+        assert!(!parameter.optional);
+        assert!(!parameter.rest);
+        assert!(parameter.initializer.is_none());
+        assert_eq!(
+            plan.callable.return_type.type_node(),
+            Some(return_annotation)
+        );
+        assert!(plan.callable.type_predicate.is_none());
+        assert_eq!(plan.callable.body, body);
+        assert_eq!(
+            plan.body,
+            SourceArrowBodyPlan::ConciseExpression { expression: body }
+        );
+
+        for _ in 0..2 {
+            assert_eq!(generic.plan(0), Ok(plan.clone()));
+            assert_eq!(
+                (
+                    generic.store.type_len(),
+                    generic.store.mapper_len(),
+                    generic.store.signature_len(),
+                    generic.store.symbol_len(),
+                    generic.store.symbol_store().symbol_table_len(),
+                    generic.store.checker_link_allocated_lengths(),
+                    generic.store.source_callable_provenance_lengths(),
+                    generic.store.source_callable_type_query_len(),
+                    generic.store.relation_state_snapshot(),
+                ),
+                before,
+            );
+            for node in [arrow_node, parameter_annotation, return_annotation, body] {
+                assert!(generic.store.type_node_links(node).is_none());
+            }
+            for symbol in [
+                plan.variable_symbol,
+                plan.callable.owner_symbol,
+                parameter.symbol,
+            ] {
+                assert!(generic.store.value_symbol_links(symbol).is_none());
+            }
+            assert!(
+                generic
+                    .store
+                    .declared_type_links(type_parameter.symbol)
+                    .is_none()
+            );
+            assert!(generic.store.signature_links(arrow_node).is_none());
+            assert!(
+                generic
+                    .store
+                    .source_callable_type_for_owner(plan.callable.owner_symbol)
+                    .is_none()
+            );
+        }
 
         let missing_parameter_type = Fixture::new("const f = (x): number => x;");
         assert!(matches!(

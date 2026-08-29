@@ -433,10 +433,17 @@ impl TypeQueryPlan {
             .iter()
             .any(|(node, body)| groups.get(node) == groups.get(body))
         {
+            let kind = store
+                .source_node_kind(callable.declaration)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                        callable.declaration,
+                    ))
+                })?;
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax {
                     node: callable.declaration,
-                    kind: SyntaxKind::FunctionDeclaration,
+                    kind,
                 },
             ));
         }
@@ -13967,11 +13974,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     maximum: local_count,
                 }
             } else {
-                if exact_import.is_some() {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::TypeArgumentsUnsupported(node),
-                    ));
-                }
                 let target = self.preflight_direct_generic_reference_target(
                     node,
                     symbol,
@@ -25343,7 +25345,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let return_type_node = callable.return_type.type_node().ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
         })?;
-        self.require_type_reference_alias_root_capability(return_type_node)?;
+        // Queried signatures replay every signature input. Their retained plan
+        // already requires the exact constraint, default, parameter and return roots.
+        if queried_plan.is_none() {
+            self.require_type_reference_alias_root_capability(return_type_node)?;
+        }
         let cached_return = source_callables::validate_lazy_source_callable_return(
             self.store, &callable, signature,
         )
@@ -54343,6 +54349,171 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check the query's capability boundary before and after lazy return publication.
+    fn generic_arrow_return_replays_exact_signature_import_capabilities() {
+        let mut fixture = fixture_with_module_state(
+            concat!(
+                "import type { Remote as Local } from 'pkg'; ",
+                "type Remote<X> = X; ",
+                "const keep = <T>(value: Local<T>): Local<T> => value; ",
+                "let outside: Local<string>;",
+            ),
+            CanonicalModuleState::External,
+        );
+        let binding = named_node(&fixture, SyntaxKind::ImportSpecifier, "Local");
+        let alias = node_symbol(&fixture, binding);
+        let target = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Remote");
+        assert!(fixture.store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(target),
+                alias_target: crate::semantic::AliasTargetState::Resolved(target),
+                referenced: false,
+                type_only_declaration: Some(binding),
+            },
+        ));
+        let declaration = variable_initializer_node(&fixture, "keep");
+        let owner = node_symbol(&fixture, declaration);
+        let outside = variable_type_node(&fixture, "outside");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let parameter_root = callable.parameters[0].explicit_type_node().unwrap();
+        let return_root = callable.return_type.type_node().unwrap();
+        let capability = |root| {
+            CanonicalTypeReferenceAliasTarget::new(root, root, binding, alias, target, target)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .with_type_reference_alias_targets([capability(parameter_root), capability(return_root)])
+        .unwrap();
+        for missing in [parameter_root, return_root] {
+            let removed = query.type_reference_alias_targets.remove(&missing).unwrap();
+            let before = function_store_state(query.store);
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference {
+                        node: missing,
+                        alias
+                    },
+                )),
+            );
+            assert_eq!(function_store_state(query.store), before);
+            assert!(
+                query
+                    .store
+                    .declared_type_links(callable.type_parameters[0].symbol)
+                    .is_none()
+            );
+            assert_eq!(
+                query.type_reference_alias_targets.insert(missing, removed),
+                None
+            );
+        }
+        query = query
+            .with_type_reference_alias_targets([capability(outside)])
+            .unwrap();
+        let before = function_store_state(query.store);
+        let first_reference = [parameter_root, return_root, outside]
+            .into_iter()
+            .min()
+            .unwrap();
+        assert_eq!(
+            query.get_type_of_source_callable(declaration, owner),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(first_reference),
+            )),
+        );
+        assert_eq!(function_store_state(query.store), before);
+        assert_eq!(
+            query.type_reference_alias_targets.remove(&outside),
+            Some(capability(outside))
+        );
+
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        let parameter = query.store.signature(signature).unwrap().type_parameters()[0];
+        assert_eq!(
+            query.store.callable_signature_parameter_types(signature),
+            Some(&[parameter][..])
+        );
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert_eq!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .annotation_type(return_root),
+            None
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        let warm = function_store_state(query.store);
+        assert_eq!(
+            query.get_type_of_source_callable(declaration, owner),
+            Ok(type_)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        assert_eq!(function_store_state(query.store), warm);
+        assert!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(query.store)
+        );
+        for missing in [parameter_root, return_root] {
+            let removed = query.type_reference_alias_targets.remove(&missing).unwrap();
+            assert_eq!(
+                query.get_return_type_of_signature(signature),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::ImportAliasTypeReference {
+                        node: missing,
+                        alias
+                    },
+                )),
+            );
+            assert_eq!(function_store_state(query.store), warm);
+            assert_eq!(
+                query
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(parameter)
+            );
+            assert_eq!(
+                query.type_reference_alias_targets.insert(missing, removed),
+                None
+            );
+        }
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        assert_eq!(function_store_state(query.store), warm);
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
     fn malformed_literal_payloads_and_operators_fail_before_semantic_writes() {
         let mut malformed_number = fixture_with_mutation("type Bad = 1;", |parsed| {
             let numeric = parsed
@@ -71162,6 +71333,113 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the actual arrow kind and complete no-write state together.
+    fn generic_arrow_qualified_alias_cycle_rejects_before_links_and_retries() {
+        let mut fixture = fixture(
+            "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; const f = <T>(value: Alias<T>): void => {};",
+        );
+        let declaration = variable_initializer_node(&fixture, "f");
+        let owner = node_symbol(&fixture, declaration);
+        assert_eq!(
+            fixture.store.source_node_kind(declaration),
+            Some(SyntaxKind::ArrowFunction),
+        );
+        let nodes = fixture
+            .parsed
+            .arena
+            .iter()
+            .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            .collect::<Vec<_>>();
+        let symbols = nodes
+            .iter()
+            .filter_map(|node| fixture.files[&fixture.file].symbol(*node))
+            .collect::<Vec<_>>();
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                function_store_state(store),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.source_callable_provenance_lengths(),
+                store.source_callable_type_query_len(),
+                nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            store.node_links(*node).cloned(),
+                            store.type_node_links(*node).cloned(),
+                            store.symbol_node_links(*node).cloned(),
+                            store.signature_links(*node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                symbols
+                    .iter()
+                    .map(|symbol| {
+                        (
+                            store.declared_type_links(*symbol).cloned(),
+                            store.type_alias_links(*symbol).cloned(),
+                            store.value_symbol_links(*symbol).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let before = snapshot(&fixture.store);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let session_before = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                query.preflight_type_of_source_callable(declaration, owner),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind: SyntaxKind::ArrowFunction,
+                    },
+                )),
+            );
+            assert_eq!(snapshot(query.store), before);
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: declaration,
+                        kind: SyntaxKind::ArrowFunction,
+                    },
+                )),
+            );
+            assert_eq!(snapshot(query.store), before);
+            let session = query.instantiation_session.as_deref().unwrap();
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark(),
+                ),
+                session_before,
+            );
+            assert!(query.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn source_callable_query_alias_cycle_keeps_partial_cache_an_invariant() {
         let mut fixture = fixture(
             "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
@@ -71503,6 +71781,450 @@ mod tests {
         assert!(evidence.is_exact(&fixture.store));
         assert_eq!(fixture.store.type_len(), warm_types);
         assert_eq!(fixture.store.signature_len(), initial_signatures);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check one arrow across annotation, signature and return query order.
+    fn generic_arrow_query_keeps_annotation_first_return_and_parameter_ownership() {
+        let mut fixture = fixture("const identity = <T>(value: T): T => value;");
+        let declaration = variable_initializer_node(&fixture, "identity");
+        let owner = node_symbol(&fixture, declaration);
+        let variable = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "identity");
+        let NodeData::ArrowFunction(arrow) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the initializer must be the actual arrow");
+        };
+        let body = NodeRef::new(declaration.arena, declaration.file, arrow.body);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        assert!(callable.requires_type_query_evidence());
+        assert_eq!(callable.family, SourceCallableFamily::ArrowFunction);
+        assert_ne!(owner, variable);
+        assert_eq!(
+            fixture.store.symbol(owner).unwrap().flags(),
+            SymbolFlags::FUNCTION
+        );
+        assert_eq!(fixture.store.symbol(owner).unwrap().parent(), None);
+        assert_eq!(
+            fixture.store.symbol(owner).unwrap().value_declaration(),
+            Some(declaration)
+        );
+        let return_node = callable.return_type.type_node().unwrap();
+        let parameter_node = callable.parameters[0].explicit_type_node().unwrap();
+        let type_parameter_symbol = callable.type_parameters[0].symbol;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let before = function_store_state(query.store);
+        query
+            .preflight_type_of_source_callable(declaration, owner)
+            .unwrap();
+        assert_eq!(function_store_state(query.store), before);
+
+        let parameter = query.get_type_from_type_node(return_node).unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(query.store, parameter),
+            Some(type_parameter_symbol)
+        );
+        assert!(query.store.signature_links(declaration).is_none());
+        assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        assert_eq!(
+            query.store.signature(signature).unwrap().type_parameters(),
+            [parameter]
+        );
+        assert_eq!(
+            query.store.callable_signature_parameter_types(signature),
+            Some(&[parameter][..])
+        );
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        let evidence = query.store.source_callable_type_query(signature).unwrap();
+        assert!(evidence.matches_plan(&callable));
+        assert!(evidence.is_exact(query.store));
+        assert_eq!(evidence.annotation_type(parameter_node), Some(parameter));
+        assert_eq!(evidence.annotation_type(return_node), None);
+        assert_eq!(
+            evidence.type_parameters()[0].provenance.symbol,
+            type_parameter_symbol
+        );
+        assert_eq!(
+            query.store.source_callable_type_for_owner(owner),
+            Some(type_)
+        );
+        assert_eq!(query.store.source_callable_type_for_owner(variable), None);
+        assert!(query.store.value_symbol_links(variable).is_none());
+        assert!(query.store.type_node_links(body).is_none());
+
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        assert_eq!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .annotation_type(return_node),
+            Some(parameter)
+        );
+        let warm = function_store_state(query.store);
+        assert_eq!(query.get_type_from_type_node(parameter_node), Ok(parameter));
+        assert_eq!(
+            query.get_type_of_source_callable(declaration, owner),
+            Ok(type_)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        assert_eq!(function_store_state(query.store), warm);
+        assert!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(query.store)
+        );
+        assert!(query.store.value_symbol_links(variable).is_none());
+        assert!(query.store.type_node_links(body).is_none());
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep every poisoned cache pair on the same cold declaration.
+    fn generic_arrow_query_rejects_partial_and_foreign_parameter_caches_before_publication() {
+        let mut fixture = fixture(concat!(
+            "const first = <T>(value: T): T => value; ",
+            "const second = <T>(value: T): T => value;",
+        ));
+        let declaration = variable_initializer_node(&fixture, "first");
+        let owner = node_symbol(&fixture, declaration);
+        let foreign_declaration = variable_initializer_node(&fixture, "second");
+        let foreign_owner = node_symbol(&fixture, foreign_declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let foreign_callable = source_callables::plan_source_callable(
+            &fixture.store,
+            &host,
+            foreign_declaration,
+            foreign_owner,
+            None,
+        )
+        .unwrap();
+        let annotation = callable.parameters[0].explicit_type_node().unwrap();
+        let symbol = callable.type_parameters[0].symbol;
+        let foreign_symbol = foreign_callable.type_parameters[0].symbol;
+        assert_ne!(symbol, foreign_symbol);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let foreign = query
+            .get_type_from_type_node(foreign_callable.return_type.type_node().unwrap())
+            .unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(query.store, foreign),
+            Some(foreign_symbol)
+        );
+        for (cached_symbol, cached_type, expected) in [
+            (
+                symbol,
+                None,
+                TypeNodeUnavailable::InvalidTypeReference(annotation),
+            ),
+            (
+                symbol,
+                Some(foreign),
+                TypeNodeUnavailable::InvalidTypeReference(annotation),
+            ),
+            (
+                foreign_symbol,
+                Some(foreign),
+                TypeNodeUnavailable::InvalidCachedSymbol {
+                    node: annotation,
+                    symbol: foreign_symbol,
+                },
+            ),
+        ] {
+            let symbol_links = SymbolNodeLinks {
+                resolved_symbol: Some(cached_symbol),
+            };
+            let type_links = TypeNodeLinks {
+                resolved_type: cached_type,
+                ..TypeNodeLinks::default()
+            };
+            assert!(
+                query
+                    .store
+                    .set_symbol_node_links(annotation, symbol_links.clone())
+            );
+            assert!(
+                query
+                    .store
+                    .set_type_node_links(annotation, type_links.clone())
+            );
+            let before = function_store_state(query.store);
+            assert_eq!(
+                query.preflight_type_of_source_callable(declaration, owner),
+                Err(DeclaredTypeError::TypeNodeUnavailable(expected))
+            );
+            assert_eq!(function_store_state(query.store), before);
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Err(DeclaredTypeError::TypeNodeUnavailable(expected))
+            );
+            assert_eq!(function_store_state(query.store), before);
+            assert_eq!(
+                query.store.symbol_node_links(annotation),
+                Some(&symbol_links)
+            );
+            assert_eq!(query.store.type_node_links(annotation), Some(&type_links));
+            assert!(query.store.declared_type_links(symbol).is_none());
+            assert!(query.store.signature_links(declaration).is_none());
+            assert!(
+                query
+                    .store
+                    .value_symbol_links(callable.parameters[0].symbol)
+                    .is_none()
+            );
+            assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        }
+        assert!(
+            query
+                .store
+                .set_symbol_node_links(annotation, SymbolNodeLinks::default())
+        );
+        assert!(
+            query
+                .store
+                .set_type_node_links(annotation, TypeNodeLinks::default())
+        );
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        let parameter = query.store.signature(signature).unwrap().type_parameters()[0];
+        assert_ne!(parameter, foreign);
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(query.store, parameter),
+            Some(symbol)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        let warm = function_store_state(query.store);
+        assert_eq!(
+            query.get_type_of_source_callable(declaration, owner),
+            Ok(type_)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(parameter));
+        assert_eq!(function_store_state(query.store), warm);
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Follow one borrowed session through default and nested return demands.
+    fn generic_arrow_query_keeps_caller_session_through_defaults_and_nested_returns() {
+        let mut fixture =
+            fixture("const keep = <T, U extends T = T>(value: (item: U) => U): U => value as any;");
+        let declaration = variable_initializer_node(&fixture, "keep");
+        let owner = node_symbol(&fixture, declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let constraint_node = callable.type_parameters[1].constraint.unwrap();
+        let default_node = callable.type_parameters[1].default_type.unwrap();
+        let callback_node = callable.parameters[0].explicit_type_node().unwrap();
+        let return_node = callable.return_type.type_node().unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (number, error, no_constraint) = (
+            bootstrap.number_type,
+            bootstrap.error_type,
+            bootstrap.no_constraint_type,
+        );
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let before = session.limit_event_mark();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions {
+                strict_function_types: Some(true),
+                ..CanonicalTypeQueryOptions::default()
+            },
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let first_t = query.get_type_from_type_node(constraint_node).unwrap();
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                query.store,
+                first_t,
+                &[first_t],
+                &[number],
+                None,
+                query.instantiation_session.as_deref_mut().unwrap(),
+            ),
+            Ok(number),
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.limit_event_mark(), before);
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        let parameters = query
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let [t, u] = parameters.as_slice() else {
+            panic!("keep must retain its two ordered parameters");
+        };
+        assert_eq!(*t, first_t);
+        for (type_, symbol) in [
+            (*t, callable.type_parameters[0].symbol),
+            (*u, callable.type_parameters[1].symbol),
+        ] {
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(query.store, type_),
+                Some(symbol)
+            );
+        }
+        let evidence = query.store.source_callable_type_query(signature).unwrap();
+        assert!(evidence.is_exact(query.store));
+        assert_eq!(evidence.annotation_type(constraint_node), Some(*t));
+        assert_eq!(evidence.annotation_type(default_node), Some(*t));
+        assert_eq!(evidence.base_constraints(), [no_constraint, no_constraint]);
+        assert_eq!(evidence.annotation_type(return_node), None);
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        let TypeData::TypeParameter(u_data) = query.store.type_payload(*u).unwrap().data() else {
+            panic!("U must remain a type parameter after limit recovery");
+        };
+        assert_eq!(u_data.constraint, Some(*t));
+        assert_eq!(u_data.resolved_default_type, Some(*t));
+        let callback_signature = function_signature(query.store, callback_node);
+        assert_eq!(
+            query
+                .store
+                .callable_signature_parameter_types(callback_signature),
+            Some(&[*u][..])
+        );
+        assert_eq!(
+            query
+                .store
+                .signature(callback_signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(session.limit_event_occurred_since(before));
+        let after_default = session.limit_event_mark();
+        let [diagnostic] = query.diagnostics.as_slice() else {
+            panic!("default substitution must report one limit diagnostic");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2589);
+        assert_eq!(diagnostic.node, Some(default_node));
+
+        assert_eq!(
+            query.get_return_type_of_signature(callback_signature),
+            Ok(*u)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(*u));
+        let warm = function_store_state(query.store);
+        assert_eq!(
+            query.get_type_of_source_callable(declaration, owner),
+            Ok(type_)
+        );
+        assert_eq!(
+            query.get_return_type_of_signature(callback_signature),
+            Ok(*u)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(*u));
+        assert_eq!(function_store_state(query.store), warm);
+        assert_eq!(
+            query
+                .instantiation_session
+                .as_deref()
+                .unwrap()
+                .limit_event_mark(),
+            after_default
+        );
+        assert_eq!(query.diagnostics.len(), 1);
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                query.store,
+                *t,
+                &[*t],
+                &[number],
+                None,
+                query.instantiation_session.as_deref_mut().unwrap(),
+            ),
+            Ok(error),
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(session.limit_event_occurred_since(after_default));
+        assert_eq!(function_store_state(query.store), warm);
+        assert!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(query.store)
+        );
     }
 
     #[test]
