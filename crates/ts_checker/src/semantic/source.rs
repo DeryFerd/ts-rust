@@ -35062,11 +35062,36 @@ fn check_deferred_assertions(
         session.reset_query();
         let (operand, widened) =
             assertion_operand_types(store, global_types, assertion.operand_type)?;
-        if store.are_types_comparable_with_global_types(
+        let limit_mark = session.limit_event_mark();
+        let comparable = store.is_type_related_to_with_session(
             assertion.target_type,
             widened,
-            global_types,
-        )? {
+            super::RelationKind::Comparable,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
+        )? || store.is_type_related_to_with_session(
+            widened,
+            assertion.target_type,
+            super::RelationKind::Comparable,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
+        )?;
+        if session.limit_event_occurred_since(limit_mark) {
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(assertion.node),
+                    range_override: None,
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2589).ok_or(SourceCheckError::MissingDiagnostic(2589))?,
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        if comparable {
             continue;
         }
         if let Some((expression, checked)) = &assertion.array_operand
@@ -93638,6 +93663,170 @@ class Foo2 {
                 .is_none()
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn deferred_assertion_comparison_keeps_the_caller_session_and_direction() {
+        let library = parsed("interface Cell<T> { value: T }");
+        let source =
+            parsed("declare var input: Cell<string>; const output = input as Cell<number>;");
+        let library_file = FileId::new(198_640);
+        let file = FileId::new(198_641);
+        let options = CanonicalCheckerOptions {
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(library_file, &library), (file, &source)], options);
+        context.check_source_file(library_file).unwrap();
+        let operand = context
+            .get_type_from_type_node(variable_type_node(&source, file, "input"))
+            .unwrap();
+        let node = variable_initializer(&source, file, "output");
+        let NodeData::AsExpression(assertion) = &source.arena.get(node.node).unwrap().data else {
+            panic!("the source must retain its assertion");
+        };
+        let target = context
+            .get_type_from_type_node(NodeRef::new(node.arena, file, assertion.type_))
+            .unwrap();
+        for reference in [operand, target] {
+            assert!(
+                context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .properties
+                    .is_none()
+            );
+        }
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let before = session.limit_event_mark();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        check_deferred_assertions(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            &[DeferredAssertion {
+                node,
+                operand_type: operand,
+                target_type: target,
+                array_operand: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(session.limit_event_occurred_since(before));
+        // The first relation is assertion target -> widened operand. Its target
+        // property recovers, so the reverse direction must not run.
+        for (reference, expected, recovered) in
+            [(operand, Some(error), true), (target, None, false)]
+        {
+            let properties = context
+                .store()
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_deref()
+                .unwrap();
+            let [property] = properties else {
+                panic!("Cell must retain its one property");
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(*property)
+                    .unwrap()
+                    .resolved_type,
+                expected
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .instantiated_property_recovery(*property)
+                    .is_some(),
+                recovered
+            );
+        }
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the assertion must own one instantiation-limit diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.node, Some(node));
+        assert_eq!(
+            source.arena.get(node.node).unwrap().kind,
+            SyntaxKind::AsExpression
+        );
+        assert_eq!(diagnostic.range_override, None);
+        assert_eq!(diagnostic.diagnostic.code(), 2589);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type instantiation is excessively deep and possibly infinite."
+        );
+        assert!(diagnostic.related_information.is_empty());
+        let after = session.limit_event_mark();
+        let parameter = context
+            .store()
+            .symbol_table(library_bound.locals(library_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("Cell")
+            .unwrap();
+        let declared = context
+            .store()
+            .declared_type_links(parameter)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(declared).unwrap().data()
+        else {
+            panic!("Cell must retain its declared target");
+        };
+        let parameter = interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            super::super::instantiate::instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter,
+                &[parameter],
+                &[number],
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &mut session,
+            ),
+            Ok(error)
+        );
+        assert!(session.limit_event_occurred_since(after));
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
     }
 
     #[test]

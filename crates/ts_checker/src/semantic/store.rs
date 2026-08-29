@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -64,7 +64,8 @@ use super::{
     source_imports::SourceFileNamespaceIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
-        ConstructorAnnotationProof, SourceCallableAliasResolution, UnionAliasInstantiationProof,
+        ConstructorAnnotationProof, SourceCallableAliasResolution, SourceCallableTypeQueryEvidence,
+        UnionAliasInstantiationProof,
     },
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
@@ -449,7 +450,7 @@ pub(super) struct SourceCallableTypeParameterProvenance {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ResolvedSourceCallableTypeParameter {
     pub(super) provenance: SourceCallableTypeParameterProvenance,
-    /// The declared constraint, or the canonical `no_constraint_type`.
+    /// The effective direct constraint, or the canonical `no_constraint_type`.
     pub(super) constraint: TypeId,
     /// The declared default, or the canonical `no_constraint_type`.
     pub(super) default_type: TypeId,
@@ -470,6 +471,7 @@ pub(super) struct PreparedSourceGenericCallablePublication<'a> {
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
     pub(super) type_parameters: Vec<ResolvedSourceCallableTypeParameter>,
+    pub(super) query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
     pub(super) parameters: Vec<SemanticSymbolId>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
@@ -629,6 +631,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     source_callable_type_parameters:
         HashMap<SignatureId, Box<[SourceCallableTypeParameterProvenance]>>,
+    source_callable_type_queries: HashMap<SignatureId, Arc<SourceCallableTypeQueryEvidence>>,
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
@@ -782,6 +785,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_types_by_owner: HashMap::new(),
             source_callable_types_by_signature: HashMap::new(),
             source_callable_type_parameters: HashMap::new(),
+            source_callable_type_queries: HashMap::new(),
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
             source_file_namespace_identities: HashMap::new(),
@@ -1742,6 +1746,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .try_reserve(additional)
                 .is_ok()
             && self
+                .source_callable_type_queries
+                .try_reserve(additional)
+                .is_ok()
+            && self
                 .checked_source_callable_returns
                 .try_reserve(additional)
                 .is_ok()
@@ -1755,6 +1763,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_callable_type_parameters
             .get(&signature)
             .map(Box::as_ref)
+    }
+
+    pub(super) fn source_callable_type_query(
+        &self,
+        signature: SignatureId,
+    ) -> Option<&SourceCallableTypeQueryEvidence> {
+        self.observe_relation_signature_read(signature);
+        self.source_callable_type_queries
+            .get(&signature)
+            .map(Arc::as_ref)
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_callable_type_query_len(&self) -> usize {
+        self.source_callable_type_queries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_callable_type_query_for_test(
+        &mut self,
+        signature: SignatureId,
+        replacement: Option<Arc<SourceCallableTypeQueryEvidence>>,
+    ) -> Option<Arc<SourceCallableTypeQueryEvidence>> {
+        match replacement {
+            Some(replacement) => self
+                .source_callable_type_queries
+                .insert(signature, replacement),
+            None => self.source_callable_type_queries.remove(&signature),
+        }
     }
 
     #[cfg(test)]
@@ -1824,6 +1861,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     signature.type_parameters().is_empty()
                         && !self
                             .source_callable_type_parameters
+                            .contains_key(&provenance.signature)
+                        && !self
+                            .source_callable_type_queries
                             .contains_key(&provenance.signature)
                 });
         let array_targets_valid = provenance.array_targets.is_none_or(|targets| {
@@ -10101,7 +10141,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         }
         true
     }
+}
 
+impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Publishes the type, signature, generic metadata, provenance reverse
     /// maps, owner barrier, optional return annotation, and signature link as
     /// one prevalidated transaction.
@@ -10113,13 +10155,34 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         &mut self,
         prepared: PreparedSourceGenericCallablePublication<'_>,
     ) -> Option<(TypeId, SignatureId)> {
-        let resolution_states = self.validate_source_generic_type_parameters(
-            prepared.syntax,
-            prepared.declaration,
-            &prepared.type_parameters,
-        )?;
-        let generic_return_type_parameter_valid = self
-            .source_generic_return_type_parameter_is_exact(
+        let next_signature_local =
+            NonZeroU32::new(u32::try_from(self.signature_len().checked_add(1)?).ok()?)?;
+        let next_signature =
+            <SignatureId as super::ids::ArenaId>::from_parts(self.id(), next_signature_local);
+        if self
+            .source_callable_type_queries
+            .contains_key(&next_signature)
+        {
+            return None;
+        }
+        let query_required = prepared.family == SourceCallableFamily::FunctionDeclaration
+            && prepared.return_annotation.is_some()
+            && !prepared.type_parameters.is_empty();
+        if query_required != prepared.query_evidence.is_some() {
+            return None;
+        }
+        let resolution_states = match prepared.query_evidence.as_deref() {
+            Some(evidence) => {
+                self.validate_source_generic_query_publication(&prepared, evidence)?
+            }
+            None => self.validate_source_generic_type_parameters(
+                prepared.syntax,
+                prepared.declaration,
+                &prepared.type_parameters,
+            )?,
+        };
+        let generic_return_type_parameter_valid = query_required
+            || self.source_generic_return_type_parameter_is_exact(
                 prepared.syntax,
                 prepared.return_annotation,
                 prepared.generic_return_type_parameter,
@@ -10241,7 +10304,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                             .iter()
                             .map(|parameter| parameter.provenance.type_parameter))
                 });
-        let has_rest_parameter = prepared.flags == SignatureFlags::HAS_REST_PARAMETER;
+        let has_rest_parameter = if query_required {
+            prepared.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+        } else {
+            prepared.flags == SignatureFlags::HAS_REST_PARAMETER
+        };
+        let flags_valid = if query_required {
+            prepared.flags.bits()
+                & !(SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES).bits()
+                == 0
+        } else {
+            prepared.flags == SignatureFlags::NONE || has_rest_parameter
+        };
         let minimum_argument_count_valid =
             usize::try_from(prepared.min_argument_count).is_ok_and(|minimum| {
                 minimum
@@ -10269,7 +10343,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if prepared.type_parameters.is_empty()
             || prepared.syntax.declaration() != prepared.declaration
             || !source_family_matches
-            || prepared.flags != SignatureFlags::NONE && !has_rest_parameter
+            || !flags_valid
             || has_rest_parameter
                 && (prepared.family != SourceCallableFamily::FunctionDeclaration
                     || prepared.parameters.is_empty()
@@ -10311,6 +10385,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                             || provenance.type_parameter == row.type_parameter
                     })
                 })
+            })
+            || self.source_callable_type_queries.values().any(|evidence| {
+                evidence.callable().declaration == prepared.declaration
+                    || evidence.callable().owner_symbol == prepared.owner_symbol
             })
         {
             return None;
@@ -10387,6 +10465,13 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .insert(signature, provenance_rows)
                 .is_none()
         );
+        if let Some(evidence) = prepared.query_evidence {
+            assert!(
+                self.source_callable_type_queries
+                    .insert(signature, evidence)
+                    .is_none()
+            );
+        }
         for alias in alias_annotations {
             let resolution = alias_resolutions
                 .iter()
@@ -10469,6 +10554,174 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         Some((type_, signature))
     }
 
+    fn validate_source_generic_query_publication(
+        &self,
+        prepared: &PreparedSourceGenericCallablePublication<'_>,
+        evidence: &SourceCallableTypeQueryEvidence,
+    ) -> Option<Vec<SourceTypeParameterResolutionState>> {
+        let plan = evidence.callable();
+        let expected_return_parameter = prepared
+            .syntax
+            .generic_return_type_parameter_declaration()
+            .and_then(|declaration| {
+                evidence.type_parameters().iter().find_map(|row| {
+                    (row.provenance.declaration == declaration)
+                        .then_some(row.provenance.type_parameter)
+                })
+            });
+        if !plan.requires_type_query_evidence()
+            || !evidence.is_exact(self)
+            || plan.family != prepared.family
+            || plan.declaration != prepared.declaration
+            || plan.owner_symbol != prepared.owner_symbol
+            || plan.owner_parent != prepared.owner_parent
+            || plan.export_local != prepared.export_local
+            || plan.type_parameter_syntax.as_ref() != prepared.syntax
+            || evidence.type_parameters() != prepared.type_parameters.as_slice()
+            || evidence.base_constraints().len() != prepared.type_parameters.len()
+            || !plan
+                .parameters
+                .iter()
+                .map(|row| row.symbol)
+                .eq(prepared.parameters.iter().copied())
+            || plan.flags != prepared.flags
+            || plan.min_argument_count != prepared.min_argument_count
+            || plan.return_type.annotation_identity()
+                != prepared
+                    .return_annotation
+                    .map(|annotation| (annotation, prepared.return_null_literal_identity))
+            || plan.array_targets != prepared.array_targets
+            || expected_return_parameter != prepared.generic_return_type_parameter
+            || plan.type_parameters.len() != prepared.type_parameters.len()
+        {
+            return None;
+        }
+        let mut declarations = HashSet::with_capacity(prepared.type_parameters.len());
+        let mut symbols = HashSet::with_capacity(prepared.type_parameters.len());
+        let mut identities = HashSet::with_capacity(prepared.type_parameters.len());
+        let computed = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+        for ((planned, row), base) in plan
+            .type_parameters
+            .iter()
+            .zip(&prepared.type_parameters)
+            .zip(evidence.base_constraints())
+        {
+            let provenance = row.provenance;
+            let record = self.type_payload(provenance.type_parameter)?;
+            let TypeData::TypeParameter(data) = record.data() else {
+                return None;
+            };
+            let symbol = self.symbol(provenance.symbol)?;
+            if provenance.declaration != planned.declaration
+                || provenance.symbol != planned.symbol
+                || provenance.constraint != planned.constraint
+                || provenance.default_type != planned.default_type
+                || !declarations.insert(provenance.declaration)
+                || !symbols.insert(provenance.symbol)
+                || !identities.insert(provenance.type_parameter)
+                || record.flags() != TypeFlags::TYPE_PARAMETER
+                || record.object_flags() != ObjectFlags::NONE && record.object_flags() != computed
+                || record.symbol() != Some(provenance.symbol)
+                || record.alias().is_some()
+                || data.is_this_type
+                || data.target.is_some()
+                || data.mapper.is_some()
+                || data.constraint != Some(row.constraint)
+                || data.resolved_default_type != Some(row.default_type)
+                || data.constrained.resolved_base_constraint != Some(*base)
+                || self.type_payload(row.constraint).is_none()
+                || self.type_payload(row.default_type).is_none()
+                || self.type_payload(*base).is_none()
+                || symbol.flags() != SymbolFlags::TYPE_PARAMETER
+                || symbol.check_flags() != CheckFlags::NONE
+                || symbol.declarations() != Some(&[provenance.declaration])
+                || symbol.value_declaration().is_some()
+                || symbol.members().is_some()
+                || symbol.exports().is_some()
+                || symbol.parent().is_some()
+                || symbol.export_symbol().is_some()
+                || self.get_merged_symbol(provenance.symbol) != Some(provenance.symbol)
+                || self.declared_type_links(provenance.symbol)
+                    != Some(&DeclaredTypeLinks {
+                        declared_type: Some(provenance.type_parameter),
+                        ..DeclaredTypeLinks::default()
+                    })
+                || self.source_node_kind(provenance.declaration) != Some(SyntaxKind::TypeParameter)
+                || self.source_node_parent(provenance.declaration)
+                    != Some(SourceNodeParent::Parent(prepared.declaration))
+            {
+                return None;
+            }
+        }
+        Some(vec![
+            SourceTypeParameterResolutionState::Warm;
+            prepared.type_parameters.len()
+        ])
+    }
+
+    /// Replaces the retained query and publishes its demanded return together.
+    pub(super) fn publish_source_callable_query_return(
+        &mut self,
+        signature: SignatureId,
+        evidence: Arc<SourceCallableTypeQueryEvidence>,
+        return_type: TypeId,
+    ) -> bool {
+        let Some(previous) = self.source_callable_type_query(signature) else {
+            return false;
+        };
+        let plan = evidence.callable();
+        let Some(return_node) = plan.return_type.type_node() else {
+            return false;
+        };
+        let input_roots = plan
+            .type_parameters
+            .iter()
+            .flat_map(|row| [row.constraint, row.default_type])
+            .flatten()
+            .chain(
+                plan.parameters
+                    .iter()
+                    .filter_map(|row| row.explicit_type_node()),
+            );
+        if !plan.requires_type_query_evidence()
+            || !previous.matches_plan(plan)
+            || !previous.is_exact(self)
+            || !evidence.is_exact(self)
+            || previous.type_parameters() != evidence.type_parameters()
+            || previous.base_constraints() != evidence.base_constraints()
+            || input_roots.into_iter().any(|root| {
+                previous.annotation_type(root).is_none()
+                    || previous.annotation_type(root) != evidence.annotation_type(root)
+            })
+            || evidence.annotation_type(return_node) != Some(return_type)
+            || previous
+                .annotation_type(return_node)
+                .is_some_and(|old| old != return_type)
+            || self.type_payload(return_type).is_none()
+            || self.signature_has_circular_return_type(signature)
+            || self
+                .checked_source_callable_return_type(signature)
+                .is_some()
+            || !super::source_callables::validate_lazy_source_callable_return(self, plan, signature)
+                .is_ok_and(|resolved| resolved.is_none())
+        {
+            return false;
+        }
+        let previous = self
+            .source_callable_type_queries
+            .insert(signature, evidence);
+        assert!(
+            previous.is_some(),
+            "the queried source signature was prevalidated"
+        );
+        let published = self.set_signature_resolved_return_type(signature, Some(return_type));
+        assert!(published, "the queried source return was prevalidated");
+        true
+    }
+}
+
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     fn source_generic_return_type_parameter_is_exact(
         &self,
         syntax: &SourceCallableTypeParameterSyntaxProof,
@@ -15234,6 +15487,7 @@ mod tests {
                 owner_parent: plan.owner_parent,
                 export_local: plan.export_local,
                 type_parameters: vec![resolved],
+                query_evidence: None,
                 parameters,
                 flags: plan.flags,
                 min_argument_count: minimum,
@@ -15384,6 +15638,7 @@ mod tests {
                 owner_parent: plan.owner_parent,
                 export_local: plan.export_local,
                 type_parameters: vec![resolved],
+                query_evidence: None,
                 parameters: vec![value],
                 flags: plan.flags,
                 min_argument_count: 1,

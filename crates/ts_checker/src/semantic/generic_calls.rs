@@ -49,8 +49,9 @@ use super::{
         StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
         valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
     },
-    store::CachedSignatureLookup,
+    store::{CachedSignatureLookup, SourceCallableFamily, SourceCallableReturnProvenance},
     tuple_types::CanonicalTupleTypeRequest,
+    type_nodes::SourceCallableTypeQueryEvidence,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags, VarianceFlags},
 };
@@ -1297,6 +1298,12 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
         .intrinsic_bootstrap()
         .map(|bootstrap| bootstrap.no_constraint_type)
         .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+    let query_evidence = validate_generic_call_type_query(
+        store,
+        callee,
+        callable.signature,
+        signature.type_parameters(),
+    )?;
     let mut type_parameters = Vec::with_capacity(signature.type_parameters().len());
     for type_parameter in signature.type_parameters().iter().copied() {
         if type_parameters
@@ -1310,6 +1317,7 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             type_parameter,
             &type_parameters,
             no_constraint,
+            query_evidence,
         )?;
         type_parameters.push(GenericCallTypeParameter {
             type_: type_parameter,
@@ -1716,11 +1724,75 @@ fn optional_generic_parameter_template(
     Ok((generic || valid_fixed_generic_source_parameter_type(store, template)).then_some(template))
 }
 
+/// Authenticates queried declaration metadata without extending call mapping.
+fn validate_generic_call_type_query<'store>(
+    store: &'store CanonicalTypeMapperStore,
+    callee: TypeId,
+    signature: SignatureId,
+    type_parameters: &[TypeId],
+) -> Result<Option<&'store SourceCallableTypeQueryEvidence>, GenericCallVectorError> {
+    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
+    let evidence = store.source_callable_type_query(signature);
+    let Some(provenance) = store
+        .source_callable_provenance(callee)
+        .filter(|provenance| {
+            provenance.family == SourceCallableFamily::FunctionDeclaration
+                && provenance.return_provenance == SourceCallableReturnProvenance::Annotated
+        })
+    else {
+        return if evidence.is_some() {
+            Err(invalid().into())
+        } else {
+            Ok(None)
+        };
+    };
+    let evidence = evidence.ok_or_else(invalid)?;
+    let plan = evidence.callable();
+    let registered = store
+        .source_callable_type_parameters(signature)
+        .ok_or_else(invalid)?;
+    if provenance.signature != signature
+        || plan.family != provenance.family
+        || plan.declaration != provenance.declaration
+        || plan.owner_symbol != provenance.owner_symbol
+        || plan.owner_parent != provenance.owner_parent
+        || plan.export_local != provenance.export_local
+        || plan.flags != provenance.flags
+        || plan.array_targets != provenance.array_targets
+        || plan.return_type.annotation_identity().is_none()
+        || plan.return_type.annotation_identity()
+            != store.function_signature_return_annotation(signature)
+        || store
+            .signature(signature)
+            .and_then(super::signatures::Signature::declaration)
+            != Some(plan.declaration)
+        || store.source_callable_type_for_signature(signature) != Some(callee)
+        || store.source_callable_type_for_declaration(plan.declaration) != Some(callee)
+        || store.source_callable_type_for_owner(plan.owner_symbol) != Some(callee)
+        || registered.len() != type_parameters.len()
+        || evidence.type_parameters().len() != type_parameters.len()
+        || evidence.base_constraints().len() != type_parameters.len()
+        || type_parameters
+            .iter()
+            .zip(registered)
+            .zip(evidence.type_parameters())
+            .any(|((type_parameter, registered), resolved)| {
+                *type_parameter != resolved.provenance.type_parameter
+                    || *registered != resolved.provenance
+            })
+        || !evidence.is_exact(store)
+    {
+        return Err(invalid().into());
+    }
+    Ok(Some(evidence))
+}
+
 fn validate_generic_call_type_parameter(
     store: &CanonicalTypeMapperStore,
     type_parameter: TypeId,
     earlier: &[GenericCallTypeParameter],
     no_constraint: TypeId,
+    query_evidence: Option<&SourceCallableTypeQueryEvidence>,
 ) -> Result<(Option<TypeId>, Option<TypeId>, TypeId), GenericCallVectorError> {
     let record = store.type_payload(type_parameter).ok_or(
         GenericCallVectorInvariant::InvalidTypeParameter(type_parameter),
@@ -1761,6 +1833,51 @@ fn validate_generic_call_type_parameter(
             .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
                 type_parameter,
             ))?;
+    if let Some(evidence) = query_evidence {
+        let invalid = || GenericCallVectorInvariant::InvalidTypeParameter(type_parameter);
+        let resolved = evidence
+            .type_parameters()
+            .get(earlier.len())
+            .ok_or_else(invalid)?;
+        let base_constraint = evidence
+            .base_constraints()
+            .get(earlier.len())
+            .copied()
+            .ok_or_else(invalid)?;
+        if resolved.provenance.type_parameter != type_parameter
+            || resolved.provenance.symbol != symbol
+            || !earlier
+                .iter()
+                .map(|parameter| parameter.type_)
+                .eq(evidence.type_parameters()[..earlier.len()]
+                    .iter()
+                    .map(|parameter| parameter.provenance.type_parameter))
+            || constraint != resolved.constraint
+            || default_type != resolved.default_type
+            || data.constrained.resolved_base_constraint != Some(base_constraint)
+        {
+            return Err(invalid().into());
+        }
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
+        for dependency in [constraint, default_type, base_constraint] {
+            if dependency == bootstrap.circular_constraint_type
+                || dependency == bootstrap.resolving_default_type
+            {
+                return Err(GenericCallVectorUnsupported::TypeParameterDependency {
+                    type_parameter,
+                    dependency,
+                }
+                .into());
+            }
+        }
+        return Ok((
+            (constraint != no_constraint).then_some(constraint),
+            (default_type != no_constraint).then_some(default_type),
+            base_constraint,
+        ));
+    }
     let base_constraint = if constraint == no_constraint {
         no_constraint
     } else {

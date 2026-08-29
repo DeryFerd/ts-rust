@@ -9,7 +9,7 @@
 //! and validates the resulting store shape.
 //! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use ts_ast::{ModifierList, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -48,6 +48,7 @@ use super::{
         SemanticStore, SourceCallableInferredReturnCycle, SourceCallableProvenance,
         SourceCallableReturnProvenance, SourceCallableTypeParameterProvenance, SourceNodeParent,
     },
+    type_nodes::SourceCallableTypeQueryEvidence,
     type_records::{
         ConstrainedTypeData, InterfaceTypeData, StructuredTypeData, TypeCacheState, TypeData,
         TypeRecord,
@@ -666,6 +667,12 @@ pub(super) struct SourceCallablePlan {
 }
 
 impl SourceCallablePlan {
+    pub(super) fn requires_type_query_evidence(&self) -> bool {
+        self.family == SourceCallableFamily::FunctionDeclaration
+            && !self.type_parameters.is_empty()
+            && self.return_type.type_node().is_some()
+    }
+
     pub(super) fn alias_annotations(&self) -> &[SourceCallableAliasAnnotation] {
         self.type_parameter_syntax.alias_annotations()
     }
@@ -2566,6 +2573,74 @@ pub(super) fn plan_source_callable(
     )
 }
 
+/// Finds the source scope of an exact callable annotation without resolving types.
+pub(super) fn plan_enclosing_source_callable_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SourceCallablePlan>, SourceCallableError> {
+    let mut ancestors = HashSet::new();
+    let mut current = annotation;
+    loop {
+        if !ancestors.insert(current) {
+            return Err(invariant(SourceCallableInvariant::InvalidSyntax(current)));
+        }
+        let record = preflight_node(store, host, current)?;
+        match &record.data {
+            NodeData::FunctionDeclaration(function)
+                if record.kind == SyntaxKind::FunctionDeclaration =>
+            {
+                let Some(type_parameters) = function.type_parameters.as_ref() else {
+                    return Ok(None);
+                };
+                if type_parameters.nodes.is_empty() || function.type_.is_none() {
+                    return Ok(None);
+                }
+                let contains =
+                    |node| ancestors.contains(&NodeRef::new(current.arena, current.file, node));
+                let mut owns_annotation = function.type_.is_some_and(contains);
+                for node in &type_parameters.nodes {
+                    let parameter = NodeRef::new(current.arena, current.file, *node);
+                    let parameter_record = preflight_node(store, host, parameter)?;
+                    let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+                        return Err(invariant(SourceCallableInvariant::InvalidSyntax(parameter)));
+                    };
+                    owns_annotation |= data.constraint.is_some_and(contains)
+                        || data.default_type.is_some_and(contains);
+                }
+                for node in &function.parameters.nodes {
+                    let parameter = NodeRef::new(current.arena, current.file, *node);
+                    let parameter_record = preflight_node(store, host, parameter)?;
+                    let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+                        return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                            parameter,
+                        )));
+                    };
+                    owns_annotation |= data.type_.is_some_and(contains);
+                }
+                if !owns_annotation {
+                    return Ok(None);
+                }
+                let owner = host
+                    .bound_file(current)
+                    .and_then(|bound| bound.symbol(current))
+                    .ok_or_else(|| {
+                        invariant(SourceCallableInvariant::InvalidOwnerSymbol(current))
+                    })?;
+                let plan = plan_source_callable(store, host, current, owner, array_targets)?;
+                return Ok(plan.requires_type_query_evidence().then_some(plan));
+            }
+            NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_) => return Ok(None),
+            _ => {}
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        current = NodeRef::new(current.arena, current.file, parent);
+    }
+}
+
 /// Plans one declaration belonging to an exact local ambient overload group.
 ///
 /// Publication and warm validation remain owned by `source_overloads`; this
@@ -2706,6 +2781,7 @@ fn plan_source_callable_with_owner_shape(
         view.family,
         view.type_parameters,
         view.parameters,
+        view.family == SourceCallableFamily::FunctionDeclaration && view.return_type.is_some(),
     )?;
     let type_parameter_syntax =
         prove_source_type_parameter_syntax(store, host, declaration, &type_parameters)?;
@@ -3577,7 +3653,7 @@ fn plan_source_callable_with_owner_shape(
         && !plan.type_parameters.is_empty()
         && plan.generic_return_type_parameter_index.is_none();
     plan.type_parameter_syntax.inferred_empty_body_is_exact = inferred_empty_body_is_exact;
-    if !plan.type_parameters.is_empty() {
+    if !plan.type_parameters.is_empty() && !plan.requires_type_query_evidence() {
         let mut aliases = Vec::new();
         for annotation in plan
             .parameters
@@ -5382,6 +5458,7 @@ fn plan_exact_source_type_parameters(
     family: SourceCallableFamily,
     type_parameters: Option<&NodeList>,
     parameters: &NodeList,
+    query_annotations: bool,
 ) -> Result<Vec<SourceCallableTypeParameterPlan>, SourceCallableError> {
     let Some(type_parameters) = type_parameters else {
         return Ok(Vec::new());
@@ -5480,7 +5557,14 @@ fn plan_exact_source_type_parameters(
                 || bound_record.range.start < previous_child_end
                 || bound_record.range.end > record.range.end
                 || !is_source_type_syntax_kind(bound_record.kind)
-                || !is_exact_source_type_parameter_bound(store, host, declaration, bound, &result)?
+                || !query_annotations
+                    && !is_exact_source_type_parameter_bound(
+                        store,
+                        host,
+                        declaration,
+                        bound,
+                        &result,
+                    )?
             {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::GenericSignature(bound),
@@ -5489,13 +5573,14 @@ fn plan_exact_source_type_parameters(
             previous_child_end = bound_record.range.end;
         }
         if let (Some(constraint), Some(default_type)) = (constraint, default_type)
+            && !query_annotations
             && !source_type_parameter_bounds_are_compatible(store, host, constraint, default_type)?
         {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::GenericSignature(default_type),
             ));
         }
-        if default_seen && default_type.is_none() {
+        if !query_annotations && default_seen && default_type.is_none() {
             return Err(SourceCallableError::Unsupported(
                 SourceCallableUnsupported::GenericSignature(type_parameter),
             ));
@@ -6425,6 +6510,40 @@ fn validate_exact_generic_annotation_shape(
         .type_predicate
         .and_then(|predicate| predicate.narrowed_type)
         .unwrap_or(return_identity_node);
+    if plan.requires_type_query_evidence() {
+        for parameter in &plan.parameters {
+            let rest_is_exact = !parameter.rest
+                || match plan.array_targets {
+                    Some(targets) => is_exact_source_generic_array_annotation(
+                        store,
+                        host,
+                        parameter.identity_node,
+                        &plan.type_parameters,
+                        targets,
+                    )?,
+                    None => false,
+                };
+            if parameter.is_implicit_any() || parameter.initializer.is_some() || !rest_is_exact {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::GenericSignature(plan.declaration),
+                ));
+            }
+        }
+        if plan.type_predicate.is_some() {
+            return Ok(None);
+        }
+        for (index, type_parameter) in plan.type_parameters.iter().enumerate() {
+            if is_naked_source_type_parameter_annotation(
+                store,
+                host,
+                generic_return_identity,
+                type_parameter,
+            )? {
+                return Ok(Some(index));
+            }
+        }
+        return Ok(None);
+    }
     let ambient_namespace = plan.body_mode.is_ambient()
         && plan.owner_parent.is_some()
         && host
@@ -8872,7 +8991,7 @@ pub(super) fn source_callable_state(
         )));
     }
     for (parameter, expected) in plan.parameters.iter().zip(published_parameter_types) {
-        validate_parameter_links(store, plan, parameter, *expected)?;
+        validate_parameter_links(store, plan, signature, parameter, *expected)?;
     }
     validate_cached_return_type(store, plan, signature)?;
     if plan.return_type.is_inferred() && resolved_return_type.is_none() {
@@ -9174,7 +9293,7 @@ pub(super) fn publish_jsdoc_parameterized_source_callable(
             plan.declaration,
         )));
     }
-    let pending = begin_source_callable(store, plan, &[])?
+    let pending = begin_source_callable(store, plan, &[], None)?
         .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
     finalize_source_callable_structure(store, plan, pending)?;
     if !store.set_callable_signature_parameter_types_batch(vec![(
@@ -9457,7 +9576,7 @@ pub(super) fn publish_jsdoc_contextual_source_callable(
         )));
     }
 
-    let pending = begin_source_callable(store, &contextual, &[])?
+    let pending = begin_source_callable(store, &contextual, &[], None)?
         .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
     finalize_source_callable_structure(store, &contextual, pending)?;
     if !parameter_types.is_empty()
@@ -9617,7 +9736,7 @@ pub(super) fn publish_array_filter_predicate_source_callable(
         )));
     }
 
-    let pending = begin_source_callable(store, &contextual, &[])?
+    let pending = begin_source_callable(store, &contextual, &[], None)?
         .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
     finalize_source_callable_structure(store, &contextual, pending)?;
     if !store.set_callable_signature_parameter_types_batch(vec![(
@@ -10181,7 +10300,21 @@ pub(super) fn begin_source_callable(
     store: &mut CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
     resolved_type_parameters: &[ResolvedSourceCallableTypeParameter],
+    query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
 ) -> Result<Result<PendingSourceCallable, TypeId>, SourceCallableError> {
+    if match query_evidence.as_deref() {
+        Some(evidence) => {
+            !plan.requires_type_query_evidence()
+                || !evidence.matches_plan(plan)
+                || !evidence.is_exact(store)
+                || evidence.type_parameters() != resolved_type_parameters
+        }
+        None => plan.requires_type_query_evidence(),
+    } {
+        return Err(invariant(SourceCallableInvariant::Publication(
+            plan.declaration,
+        )));
+    }
     match source_callable_state(store, plan, true)? {
         SourceCallableState::AwaitingInferredReturn { type_, .. }
         | SourceCallableState::Resolved { type_, .. } => return Ok(Err(type_)),
@@ -10225,6 +10358,7 @@ pub(super) fn begin_source_callable(
                 owner_parent: plan.owner_parent,
                 export_local: plan.export_local,
                 type_parameters: resolved_type_parameters.to_vec(),
+                query_evidence,
                 parameters: plan
                     .parameters
                     .iter()
@@ -10396,7 +10530,7 @@ pub(super) fn materialize_anonymous_source_function_expression(
                     plan.declaration,
                 )));
             }
-            let Ok(pending) = begin_source_callable(store, plan, &[])? else {
+            let Ok(pending) = begin_source_callable(store, plan, &[], None)? else {
                 return Err(invariant(SourceCallableInvariant::Publication(
                     plan.declaration,
                 )));
@@ -10514,6 +10648,19 @@ pub(super) fn publish_source_callable_parameter_types(
                 })?,
             )
         };
+        let query_evidence = if callable.plan.requires_type_query_evidence() {
+            Some(
+                validated_source_callable_type_query(store, signature)
+                    .filter(|evidence| evidence.matches_plan(&callable.plan))
+                    .ok_or_else(|| {
+                        invariant(SourceCallableInvariant::Publication(
+                            callable.plan.declaration,
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
         for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
             if !parameter_symbols.insert(parameter.symbol) {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterSymbol(
@@ -10527,7 +10674,11 @@ pub(super) fn publish_source_callable_parameter_types(
                     parameter.declaration,
                 )));
             }
-            let cached = parameter.base_type(store).ok_or_else(|| {
+            let cached = match query_evidence {
+                Some(evidence) => evidence.annotation_type(parameter.type_node),
+                None => parameter.base_type(store),
+            }
+            .ok_or_else(|| {
                 invariant(SourceCallableInvariant::InvalidParameterCache(
                     parameter.declaration,
                 ))
@@ -10554,30 +10705,31 @@ pub(super) fn publish_source_callable_parameter_types(
                         prepared,
                     )
                     .is_err()
-                || generic_type_parameters
-                    .as_ref()
-                    .is_some_and(|type_parameters| {
-                        !(valid_generic_source_parameter_type(
-                            store,
-                            callable.plan.array_targets,
-                            supplied_base,
-                            type_parameters,
-                        ) || valid_source_callable_alias_type(
-                            store,
-                            parameter.identity_node,
-                            supplied_base,
-                            type_parameters,
-                            callable.plan.array_targets,
-                        ) || !parameter.rest
-                            && valid_fixed_generic_source_parameter_type(store, supplied_base)
-                            || callable.plan.family == SourceCallableFamily::ArrowFunction
-                                && valid_optional_generic_source_parameter_type(
-                                    store,
-                                    callable.plan.array_targets,
-                                    supplied_base,
-                                    type_parameters,
-                                ))
-                    })
+                || query_evidence.is_none()
+                    && generic_type_parameters
+                        .as_ref()
+                        .is_some_and(|type_parameters| {
+                            !(valid_generic_source_parameter_type(
+                                store,
+                                callable.plan.array_targets,
+                                supplied_base,
+                                type_parameters,
+                            ) || valid_source_callable_alias_type(
+                                store,
+                                parameter.identity_node,
+                                supplied_base,
+                                type_parameters,
+                                callable.plan.array_targets,
+                            ) || !parameter.rest
+                                && valid_fixed_generic_source_parameter_type(store, supplied_base)
+                                || callable.plan.family == SourceCallableFamily::ArrowFunction
+                                    && valid_optional_generic_source_parameter_type(
+                                        store,
+                                        callable.plan.array_targets,
+                                        supplied_base,
+                                        type_parameters,
+                                    ))
+                        })
             {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
                     parameter.declaration,
@@ -10776,6 +10928,7 @@ pub(super) fn publish_lazy_source_callable_return(
     plan: &SourceCallablePlan,
     signature: SignatureId,
     return_type: TypeId,
+    query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
 ) -> Result<TypeId, SourceCallableError> {
     let Some((return_identity_node, return_null_literal_identity)) =
         plan.return_type.annotation_identity()
@@ -10786,7 +10939,26 @@ pub(super) fn publish_lazy_source_callable_return(
     };
     let annotation =
         cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
+    if plan.requires_type_query_evidence() {
+        let evidence = query_evidence
+            .filter(|evidence| evidence.matches_plan(plan))
+            .ok_or_else(|| {
+                invariant(SourceCallableInvariant::InvalidSignatureCache(
+                    plan.declaration,
+                ))
+            })?;
+        if annotation != Some(return_type)
+            || !store.publish_source_callable_query_return(signature, evidence, return_type)
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            )));
+        }
+        validate_cached_return_type(store, plan, signature)?;
+        return Ok(return_type);
+    }
     if store.type_payload(return_type).is_none()
+        || query_evidence.is_some()
         || store.signature_has_circular_return_type(signature)
         || validate_lazy_source_callable_return(store, plan, signature)?.is_some()
         || annotation != Some(return_type)
@@ -11854,6 +12026,7 @@ pub(super) fn validate_stored_source_callable(
         || signature_record.composite().is_some()
         || !valid_stored_generic_source_signature(
             store,
+            signature,
             signature_record,
             expected_parameter_types,
             provenance.array_targets,
@@ -12041,7 +12214,20 @@ pub(super) fn validate_stored_source_callable(
     if let Some(return_type) = signature_record.resolved_return_type() {
         let annotation =
             cached_annotation_identity(store, return_identity_node, return_null_literal_identity);
-        let valid_return = if !type_parameter_edges.is_empty()
+        let valid_return = if provenance.family == SourceCallableFamily::FunctionDeclaration
+            && !type_parameter_edges.is_empty()
+        {
+            validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+                evidence
+                    .callable()
+                    .return_type
+                    .type_node()
+                    .and_then(|root| evidence.annotation_type(root))
+                    == Some(return_type)
+                    && store.circular_return_annotation_type(signature).is_none()
+                    && annotation == Some(return_type)
+            })
+        } else if !type_parameter_edges.is_empty()
             && (store.circular_return_annotation_type(signature).is_some()
                 || !valid_source_generic_return_type(
                     store,
@@ -12058,7 +12244,8 @@ pub(super) fn validate_stored_source_callable(
                     provenance.generic_return_type_parameter,
                     &type_parameter_edges,
                     provenance.array_targets,
-                )) {
+                ))
+        {
             false
         } else if let Some(circular_annotation) = store.circular_return_annotation_type(signature) {
             let valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
@@ -12090,6 +12277,7 @@ pub(super) fn validate_stored_source_callable(
 
 fn valid_stored_generic_source_signature(
     store: &CanonicalTypeMapperStore,
+    signature_id: SignatureId,
     signature: &Signature,
     parameter_types: Option<&[TypeId]>,
     array_targets: Option<CanonicalArrayTargets>,
@@ -12097,6 +12285,35 @@ fn valid_stored_generic_source_signature(
 ) -> bool {
     if type_parameters.is_empty() {
         return true;
+    }
+    if signature.declaration().is_some_and(|declaration| {
+        store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration)
+    }) && store
+        .function_signature_return_annotation(signature_id)
+        .is_some()
+    {
+        let Some(evidence) = validated_source_callable_type_query(store, signature_id) else {
+            return false;
+        };
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return false;
+        };
+        return parameter_types.is_none_or(|types| {
+            types.len() == evidence.callable().parameters.len()
+                && types
+                    .iter()
+                    .zip(&evidence.callable().parameters)
+                    .all(|(type_, parameter)| {
+                        let Some(base) = evidence.annotation_type(parameter.type_node) else {
+                            return false;
+                        };
+                        if bootstrap.options.strict_null_checks && parameter.optional {
+                            valid_optional_type(store, array_targets, base, *type_)
+                        } else {
+                            base == *type_
+                        }
+                    })
+        });
     }
     let Ok(minimum_argument_count) = usize::try_from(signature.min_argument_count()) else {
         return false;
@@ -12696,7 +12913,7 @@ fn valid_stored_source_generic_return_provenance(
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     if type_parameters.is_empty() {
-        return expected.is_none();
+        return expected.is_none() && store.source_callable_type_query(signature).is_none();
     }
     if return_provenance == SourceCallableReturnProvenance::Inferred {
         return expected.is_none()
@@ -12708,6 +12925,26 @@ fn valid_stored_source_generic_return_provenance(
     let Some((annotation, _)) = store.function_signature_return_annotation(signature) else {
         return false;
     };
+    if store
+        .signature(signature)
+        .and_then(Signature::declaration)
+        .is_some_and(|declaration| {
+            store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration)
+        })
+    {
+        return validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+            evidence
+                .type_parameters()
+                .iter()
+                .map(|row| row.provenance.type_parameter)
+                .eq(type_parameters.iter().copied())
+                && expected
+                    == evidence
+                        .callable()
+                        .generic_return_type_parameter_index
+                        .and_then(|index| type_parameters.get(index).copied())
+        });
+    }
     if let Some(proof) = store.source_callable_alias_annotation(annotation) {
         if expected.is_some() || !proof.source_is_exact(store) {
             return false;
@@ -13026,10 +13263,9 @@ fn valid_stored_source_type_parameters(
     type_parameters: &[TypeId],
 ) -> Option<Vec<TypeId>> {
     if type_parameters.is_empty() {
-        return store
-            .source_callable_type_parameters(signature)
-            .is_none()
-            .then(Vec::new);
+        return (store.source_callable_type_parameters(signature).is_none()
+            && store.source_callable_type_query(signature).is_none())
+        .then(Vec::new);
     }
     if contextual
         || family != SourceCallableFamily::FunctionDeclaration
@@ -13041,6 +13277,18 @@ fn valid_stored_source_type_parameters(
     if provenances.len() != type_parameters.len() {
         return None;
     }
+    let query_required = family == SourceCallableFamily::FunctionDeclaration
+        && store
+            .function_signature_return_annotation(signature)
+            .is_some();
+    let query_evidence = if query_required {
+        Some(validated_source_callable_type_query(store, signature)?)
+    } else {
+        if store.source_callable_type_query(signature).is_some() {
+            return None;
+        }
+        None
+    };
     let no_constraint = store.intrinsic_bootstrap()?.no_constraint_type;
     let mut declarations = HashSet::with_capacity(type_parameters.len());
     let mut symbols = HashSet::with_capacity(type_parameters.len());
@@ -13073,27 +13321,42 @@ fn valid_stored_source_type_parameters(
         };
         let constraint = type_parameter_data.constraint?;
         let default_type = type_parameter_data.resolved_default_type?;
-        let constraint_valid = match provenance.constraint {
-            Some(node) => {
-                constraint != no_constraint
-                    && store.source_node_parent(node)
-                        == Some(SourceNodeParent::Parent(provenance.declaration))
-                    && store.source_type_node_result_is_exact(node, constraint, &resolved)
+        let constraint_valid = if let Some(evidence) = query_evidence {
+            evidence
+                .type_parameters()
+                .get(index)
+                .is_some_and(|row| row.provenance == *provenance && row.constraint == constraint)
+        } else {
+            match provenance.constraint {
+                Some(node) => {
+                    constraint != no_constraint
+                        && store.source_node_parent(node)
+                            == Some(SourceNodeParent::Parent(provenance.declaration))
+                        && store.source_type_node_result_is_exact(node, constraint, &resolved)
+                }
+                None => constraint == no_constraint,
             }
-            None => constraint == no_constraint,
         };
-        let default_valid = match provenance.default_type {
-            Some(node) => {
-                default_type != no_constraint
-                    && store.source_node_parent(node)
-                        == Some(SourceNodeParent::Parent(provenance.declaration))
-                    && store.source_type_node_result_is_exact(node, default_type, &resolved)
+        let default_valid = if let Some(evidence) = query_evidence {
+            evidence.type_parameters().get(index).is_some_and(|row| {
+                row.provenance == *provenance && row.default_type == default_type
+            })
+        } else {
+            match provenance.default_type {
+                Some(node) => {
+                    default_type != no_constraint
+                        && store.source_node_parent(node)
+                            == Some(SourceNodeParent::Parent(provenance.declaration))
+                        && store.source_type_node_result_is_exact(node, default_type, &resolved)
+                }
+                None => default_type == no_constraint,
             }
-            None => default_type == no_constraint,
         };
-        let trailing_default_valid = !default_seen || provenance.default_type.is_some();
+        let trailing_default_valid =
+            query_evidence.is_some() || !default_seen || provenance.default_type.is_some();
         default_seen |= provenance.default_type.is_some();
-        let compatible_constraint_default_pair = provenance.constraint.is_none()
+        let compatible_constraint_default_pair = query_evidence.is_some()
+            || provenance.constraint.is_none()
             || provenance.default_type.is_none()
             || source_type_parameter_default_is_assignable(store, constraint, default_type);
         if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
@@ -13115,7 +13378,9 @@ fn valid_stored_source_type_parameters(
         {
             return None;
         }
-        let expected_base = if provenance.constraint.is_none() {
+        let expected_base = if let Some(evidence) = query_evidence {
+            *evidence.base_constraints().get(index)?
+        } else if provenance.constraint.is_none() {
             no_constraint
         } else if let Some(earlier) = resolved[..index]
             .iter()
@@ -13125,11 +13390,15 @@ fn valid_stored_source_type_parameters(
         } else {
             constraint
         };
-        if type_parameter_data
-            .constrained
-            .resolved_base_constraint
-            .is_some_and(|base| base != expected_base)
-        {
+        let base_is_exact = if query_evidence.is_some() {
+            type_parameter_data.constrained.resolved_base_constraint == Some(expected_base)
+        } else {
+            type_parameter_data
+                .constrained
+                .resolved_base_constraint
+                .is_none_or(|base| base == expected_base)
+        };
+        if !base_is_exact {
             return None;
         }
         resolved.push(ResolvedSourceCallableTypeParameter {
@@ -13140,6 +13409,74 @@ fn valid_stored_source_type_parameters(
         expected_bases.push(expected_base);
     }
     Some(type_parameters.to_vec())
+}
+
+/// Checks the retained query against the signature that owns it.
+fn validated_source_callable_type_query(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Option<&SourceCallableTypeQueryEvidence> {
+    let evidence = store.source_callable_type_query(signature)?;
+    let plan = evidence.callable();
+    let record = store.signature(signature)?;
+    let type_ = store.source_callable_type_for_signature(signature)?;
+    let provenance = store.source_callable_provenance(type_)?;
+    let rows = store.source_callable_type_parameters(signature)?;
+    let expected_return_parameter = plan
+        .generic_return_type_parameter_index
+        .and_then(|index| evidence.type_parameters().get(index))
+        .map(|row| row.provenance.type_parameter);
+    if !plan.requires_type_query_evidence()
+        || !valid_source_callable_plan_owner(store, plan)
+        || !evidence.is_exact(store)
+        || record.declaration() != Some(plan.declaration)
+        || record.flags() != plan.flags
+        || record.min_argument_count() != plan.min_argument_count
+        || !record
+            .parameters()
+            .iter()
+            .copied()
+            .eq(plan.parameters.iter().map(|row| row.symbol))
+        || !record.type_parameters().iter().copied().eq(evidence
+            .type_parameters()
+            .iter()
+            .map(|row| row.provenance.type_parameter))
+        || rows.len() != evidence.type_parameters().len()
+        || !rows
+            .iter()
+            .copied()
+            .eq(evidence.type_parameters().iter().map(|row| row.provenance))
+        || evidence.base_constraints().len() != rows.len()
+        || plan.type_parameters.len() != rows.len()
+        || !plan.type_parameters.iter().zip(rows).all(|(planned, row)| {
+            planned.declaration == row.declaration
+                && planned.symbol == row.symbol
+                && planned.constraint == row.constraint
+                && planned.default_type == row.default_type
+        })
+        || store.source_callable_type_for_owner(plan.owner_symbol) != Some(type_)
+        || store.source_callable_type_for_declaration(plan.declaration) != Some(type_)
+        || store.function_signature_return_annotation(signature)
+            != plan.return_type.annotation_identity()
+        || provenance
+            != (SourceCallableProvenance {
+                family: plan.family,
+                declaration: plan.declaration,
+                owner_symbol: plan.owner_symbol,
+                owner_parent: plan.owner_parent,
+                export_local: plan.export_local,
+                signature,
+                flags: plan.flags,
+                return_provenance: SourceCallableReturnProvenance::Annotated,
+                array_targets: plan.array_targets,
+                generic_return_type_parameter: expected_return_parameter,
+                contextual_target: None,
+                contextual_variable: None,
+            })
+    {
+        return None;
+    }
+    Some(evidence)
 }
 
 fn valid_stored_function_export_route(
@@ -13249,12 +13586,20 @@ fn validate_signature(
                         })
             })
     };
+    let query_evidence_matches = if plan.requires_type_query_evidence() {
+        store
+            .source_callable_type_query(signature)
+            .is_some_and(|evidence| evidence.matches_plan(plan))
+    } else {
+        store.source_callable_type_query(signature).is_none()
+    };
     if record.flags() != plan.flags
         || record.min_argument_count() != plan.min_argument_count
         || record.resolved_min_argument_count() != -1
         || record.declaration() != Some(plan.declaration)
         || record.type_parameters() != expected_type_parameters
         || !exact_type_parameter_provenance
+        || !query_evidence_matches
         || valid_stored_source_type_parameters(
             store,
             plan.declaration,
@@ -13345,6 +13690,7 @@ fn default_parameter_links(store: &CanonicalTypeMapperStore, symbol: SemanticSym
 fn validate_parameter_links(
     store: &CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
+    signature: SignatureId,
     parameter: &SourceCallableParameterPlan,
     expected: TypeId,
 ) -> Result<(), SourceCallableError> {
@@ -13368,7 +13714,14 @@ fn validate_parameter_links(
             parameter.declaration,
         )));
     }
-    let base = parameter.base_type(store).ok_or_else(|| {
+    let base = if plan.requires_type_query_evidence() {
+        store
+            .source_callable_type_query(signature)
+            .and_then(|evidence| evidence.annotation_type(parameter.type_node))
+    } else {
+        parameter.base_type(store)
+    }
+    .ok_or_else(|| {
         invariant(SourceCallableInvariant::InvalidParameterCache(
             parameter.declaration,
         ))
@@ -13460,6 +13813,39 @@ fn validate_cached_return_type(
     else {
         unreachable!("the inferred return branch returned")
     };
+    if store
+        .checked_source_callable_return_type(signature)
+        .is_some()
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+    if plan.requires_type_query_evidence() {
+        let valid = validated_source_callable_type_query(store, signature)
+            .filter(|evidence| evidence.matches_plan(plan))
+            .is_some_and(|evidence| {
+                circular_annotation.is_none()
+                    && resolved.is_none_or(|return_type| {
+                        plan.return_type
+                            .type_node()
+                            .and_then(|root| evidence.annotation_type(root))
+                            == Some(return_type)
+                            && cached_annotation_identity(
+                                store,
+                                return_identity_node,
+                                return_null_literal_identity,
+                            ) == Some(return_type)
+                    })
+            });
+        return if valid {
+            Ok(())
+        } else {
+            Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            )))
+        };
+    }
     if resolved.is_none() {
         return if circular_annotation.is_some() {
             Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
@@ -13667,11 +14053,13 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
         DeclaredTypeLinks, IntrinsicBootstrapOptions,
         global_types::initialize_global_library_types,
+        instantiate::{InstantiationLimits, InstantiationSession},
         jsdoc::resolve_planned_jsdoc_callback_signature,
         production::GlobalMergeCompletion,
-        source::{SourceCheckError, UnsupportedSourceSyntax},
-        source_functions::SourceFunctionUnsupported,
-        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
+        type_nodes::{
+            CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable,
+            source_callable_type_query_evidence_for_test,
+        },
     };
 
     struct QueryFixture {
@@ -13810,10 +14198,12 @@ mod tests {
                 GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
             )
             .unwrap();
-            CanonicalTypeQuery::new(
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            CanonicalTypeQuery::new_with_session_for_test(
                 &mut self.store,
                 &host,
                 CanonicalTypeQueryOptions::default(),
+                &mut session,
                 diagnostics,
             )?
             .get_type_of_source_callable(declaration, owner)
@@ -13830,10 +14220,12 @@ mod tests {
                 GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
             )
             .unwrap();
-            CanonicalTypeQuery::new(
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            CanonicalTypeQuery::new_with_session_for_test(
                 &mut self.store,
                 &host,
                 CanonicalTypeQueryOptions::default(),
+                &mut session,
                 diagnostics,
             )?
             .preflight_type_of_source_callable(declaration, owner)
@@ -13849,10 +14241,12 @@ mod tests {
                 GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
             )
             .unwrap();
-            CanonicalTypeQuery::new(
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            CanonicalTypeQuery::new_with_session_for_test(
                 &mut self.store,
                 &host,
                 CanonicalTypeQueryOptions::default(),
+                &mut session,
                 diagnostics,
             )?
             .get_return_type_of_signature(signature)
@@ -13868,64 +14262,34 @@ mod tests {
                 GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
             )
             .unwrap();
-            CanonicalTypeQuery::new(
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            CanonicalTypeQuery::new_with_session_for_test(
                 &mut self.store,
                 &host,
                 CanonicalTypeQueryOptions::default(),
+                &mut session,
                 diagnostics,
             )?
             .get_type_from_type_node(node)
         }
 
-        fn query_type_parameter_result(
+        fn query_callable_evidence(
             &mut self,
-            node: NodeRef,
-            diagnostics: &mut CanonicalCheckerDiagnostics,
-        ) -> Result<TypeId, DeclaredTypeError> {
-            let error = match self.query_type_node(node, diagnostics) {
-                Ok(type_) => return Ok(type_),
-                Err(error) => error,
-            };
-            if !matches!(
-                error,
-                DeclaredTypeError::TypeNodeUnavailable(
-                    TypeNodeUnavailable::MissingTypeReference(reference)
-                        | TypeNodeUnavailable::InvalidTypeReference(reference)
-                ) if reference == node
-            ) {
-                return Err(error);
-            }
-            let Some(NodeData::TypeReferenceNode(reference)) =
-                self.parsed.arena.get(node.node).map(|record| &record.data)
-            else {
-                return Err(error);
-            };
-            let Some(NodeData::Identifier(name)) = self
-                .parsed
-                .arena
-                .get(reference.type_name)
-                .map(|record| &record.data)
-            else {
-                return Err(error);
-            };
-            let target = self.parsed.arena.iter().find_map(|(_, record)| {
-                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
-                    return None;
-                };
-                let NodeData::Identifier(alias_name) = &self.parsed.arena.get(alias.name)?.data
-                else {
-                    return None;
-                };
-                (alias_name.text == name.text).then_some(NodeRef::new(
-                    node.arena,
-                    node.file,
-                    alias.type_,
-                ))
-            });
-            match target {
-                Some(target) => self.query_type_node(target, diagnostics),
-                None => Err(error),
-            }
+            plan: &SourceCallablePlan,
+        ) -> Result<Arc<SourceCallableTypeQueryEvidence>, DeclaredTypeError> {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            source_callable_type_query_evidence_for_test(
+                &mut self.store,
+                &host,
+                plan,
+                None,
+                &mut session,
+            )
         }
     }
 
@@ -14097,12 +14461,15 @@ mod tests {
             .expect("expected a generic function declaration")
     }
 
-    fn publication_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 5], usize) {
+    fn publication_state(
+        store: &CanonicalTypeMapperStore,
+    ) -> (usize, usize, [usize; 5], usize, usize) {
         (
             store.types().len(),
             store.signature_len(),
             store.source_callable_provenance_lengths(),
             store.callable_signature_parameter_types_len(),
+            store.source_callable_type_query_len(),
         )
     }
 
@@ -14114,6 +14481,7 @@ mod tests {
         mappers: usize,
         cached_signatures: usize,
         source_callable_provenance: [usize; 5],
+        source_callable_type_queries: usize,
         callable_parameter_types: usize,
         checker_links: [usize; 26],
     }
@@ -14126,6 +14494,7 @@ mod tests {
             mappers: store.mapper_len(),
             cached_signatures: store.cached_signature_len(),
             source_callable_provenance: store.source_callable_provenance_lengths(),
+            source_callable_type_queries: store.source_callable_type_query_len(),
             callable_parameter_types: store.callable_signature_parameter_types_len(),
             checker_links: store.checker_link_allocated_lengths(),
         }
@@ -16129,7 +16498,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_keyof_constraint_rejects_nonordinary_interface_targets() {
+    fn generic_keyof_constraint_syntax_defers_type_operations_to_queries() {
         for (index, source) in [
             concat!(
                 "type Choices = { left: string }; ",
@@ -16166,9 +16535,7 @@ mod tests {
             assert!(
                 matches!(
                     plan_source_callable(&fixture.store, &host, declaration, owner, None),
-                    Err(SourceCallableError::Unsupported(
-                        SourceCallableUnsupported::GenericSignature(_)
-                    ))
+                    Ok(plan) if plan.requires_type_query_evidence()
                 ),
                 "source: {source}",
             );
@@ -16184,6 +16551,7 @@ mod tests {
         export_local: Option<SemanticSymbolId>,
         syntax: SourceCallableTypeParameterSyntaxProof,
         resolved: Vec<ResolvedSourceCallableTypeParameter>,
+        query_evidence: Option<Arc<SourceCallableTypeQueryEvidence>>,
         parameters: Vec<SemanticSymbolId>,
         return_annotation: NodeRef,
         generic_return_type_parameter: Option<TypeId>,
@@ -16200,6 +16568,7 @@ mod tests {
                     owner_parent: self.owner_parent,
                     export_local: self.export_local,
                     type_parameters: self.resolved.clone(),
+                    query_evidence: self.query_evidence.clone(),
                     parameters: self.parameters.clone(),
                     flags: SignatureFlags::NONE,
                     min_argument_count: i32::try_from(self.parameters.len()).unwrap(),
@@ -16224,6 +16593,7 @@ mod tests {
                     owner_parent: self.owner_parent,
                     export_local: self.export_local,
                     type_parameters: resolved,
+                    query_evidence: self.query_evidence.clone(),
                     parameters: self.parameters.clone(),
                     flags: SignatureFlags::NONE,
                     min_argument_count: i32::try_from(self.parameters.len()).unwrap(),
@@ -16238,6 +16608,18 @@ mod tests {
 
     fn staged_generic_publication(source: &str, file: FileId) -> StagedGenericPublication {
         let mut fixture = QueryFixture::new(source, file);
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let symbols = fixture
+            .store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            fixture.store.merge_global_symbol(globals, symbol).unwrap();
+        }
         let declaration = fixture
             .parsed
             .arena
@@ -16250,149 +16632,287 @@ mod tests {
                 ))
             })
             .expect("source has one function declaration");
-        let (type_parameter_nodes, parameter_nodes, return_type) = {
-            let NodeData::FunctionDeclaration(function) =
-                &fixture.parsed.arena.get(declaration.node).unwrap().data
-            else {
-                unreachable!()
-            };
-            (
-                function
-                    .type_parameters
-                    .as_ref()
-                    .expect("metadata fixture is generic")
-                    .nodes
-                    .clone(),
-                function.parameters.nodes.clone(),
-                function
-                    .type_
-                    .expect("generic fixture has a return annotation"),
-            )
-        };
-        let type_parameter_declarations = type_parameter_nodes
-            .iter()
-            .map(|node| NodeRef::new(declaration.arena, file, *node))
-            .collect::<Vec<_>>();
-        let plans = type_parameter_declarations
-            .iter()
-            .map(|declaration| {
-                let NodeData::TypeParameterDeclaration(data) =
-                    &fixture.parsed.arena.get(declaration.node).unwrap().data
-                else {
-                    unreachable!()
-                };
-                SourceCallableTypeParameterPlan {
-                    declaration: *declaration,
-                    symbol: fixture.bound.symbol(*declaration).unwrap(),
-                    constraint: data
-                        .constraint
-                        .map(|node| NodeRef::new(declaration.arena, file, node)),
-                    default_type: data
-                        .default_type
-                        .map(|node| NodeRef::new(declaration.arena, file, node)),
-                }
-            })
-            .collect::<Vec<_>>();
-        let return_annotation = NodeRef::new(declaration.arena, file, return_type);
-        let (mut syntax, generic_return_type_parameter_index, generic_fixed_return_is_exact) = {
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let plan = {
             let host = DeclaredTypeHost::new_after_global_merge(
                 [(&fixture.parsed.arena, &fixture.bound)],
                 GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
             )
             .unwrap();
-            let proof =
-                prove_source_type_parameter_syntax(&fixture.store, &host, declaration, &plans)
-                    .unwrap();
-            let index = plans.iter().position(|plan| {
-                is_naked_source_type_parameter_annotation(
-                    &fixture.store,
-                    &host,
-                    return_annotation,
-                    plan,
-                )
-                .unwrap()
-            });
-            let fixed = index.is_none()
-                && is_exact_source_generic_mapper_annotation(
-                    &fixture.store,
-                    &host,
-                    return_annotation,
-                    &plans,
-                    None,
-                )
-                .unwrap();
-            (proof, index, fixed)
+            plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap()
         };
-        syntax.generic_return_type_parameter_declaration =
-            generic_return_type_parameter_index.map(|index| plans[index].declaration);
-        syntax.generic_fixed_return_is_exact = generic_fixed_return_is_exact;
-        let type_parameter_symbols = type_parameter_declarations
-            .iter()
-            .map(|declaration| fixture.bound.symbol(*declaration).unwrap())
-            .collect::<Vec<_>>();
-        let type_parameters = type_parameter_symbols
-            .iter()
-            .map(|symbol| execute_type_parameter(&mut fixture.store, *symbol))
-            .collect::<Vec<_>>();
-        let parameter_symbols = parameter_nodes
-            .iter()
-            .map(|node| {
-                fixture
-                    .bound
-                    .symbol(NodeRef::new(declaration.arena, file, *node))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let no_constraint = fixture
-            .store
-            .intrinsic_bootstrap()
-            .unwrap()
-            .no_constraint_type;
-        let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        let resolved = plans
-            .iter()
-            .zip(type_parameter_symbols)
-            .zip(type_parameters.iter().copied())
-            .map(
-                |((plan, symbol), type_parameter)| ResolvedSourceCallableTypeParameter {
-                    provenance: SourceCallableTypeParameterProvenance {
-                        declaration: plan.declaration,
-                        symbol,
-                        type_parameter,
-                        constraint: plan.constraint,
-                        default_type: plan.default_type,
-                    },
-                    constraint: plan.constraint.map_or(no_constraint, |node| {
-                        fixture
-                            .query_type_parameter_result(node, &mut diagnostics)
-                            .unwrap()
-                    }),
-                    default_type: plan.default_type.map_or(no_constraint, |node| {
-                        fixture
-                            .query_type_parameter_result(node, &mut diagnostics)
-                            .unwrap()
-                    }),
-                },
-            )
-            .collect::<Vec<_>>();
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let owner = fixture.bound.symbol(declaration).unwrap();
-        let owner_parent = fixture.store.symbol(owner).unwrap().parent();
-        let export_local = fixture.bound.local_symbol(declaration);
-        let generic_return_type_parameter =
-            generic_return_type_parameter_index.map(|index| type_parameters[index]);
+        let evidence = fixture.query_callable_evidence(&plan).unwrap();
+        let resolved = evidence.type_parameters().to_vec();
+        let generic_return_type_parameter = plan
+            .generic_return_type_parameter_index
+            .map(|index| resolved[index].provenance.type_parameter);
         StagedGenericPublication {
             fixture,
             declaration,
             owner,
-            owner_parent,
-            export_local,
-            syntax,
+            owner_parent: plan.owner_parent,
+            export_local: plan.export_local,
+            syntax: *plan.type_parameter_syntax,
             resolved,
-            parameters: parameter_symbols,
-            return_annotation,
+            query_evidence: Some(evidence),
+            parameters: plan
+                .parameters
+                .iter()
+                .map(|parameter| parameter.symbol)
+                .collect(),
+            return_annotation: plan.return_type.annotation_identity().unwrap().0,
             generic_return_type_parameter,
         }
+    }
+
+    #[test]
+    fn generic_callable_annotation_scope_excludes_body_annotations() {
+        let fixture = QueryFixture::new(
+            "function identity<T extends string = string>(value: T): T { let local: T; return value; }",
+            FileId::new(23_198),
+        );
+        let (declaration, _, _, _) = fixture.generic_parts();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        let parameter = plan.type_parameters[0];
+        for root in [
+            parameter.constraint.unwrap(),
+            parameter.default_type.unwrap(),
+            plan.parameters[0].type_node,
+            plan.return_type.type_node().unwrap(),
+        ] {
+            assert_eq!(
+                plan_enclosing_source_callable_annotation(&fixture.store, &host, root, None),
+                Ok(Some(plan.clone())),
+            );
+        }
+        let body_annotation = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            })
+            .unwrap();
+        assert_eq!(
+            plan_enclosing_source_callable_annotation(&fixture.store, &host, body_annotation, None),
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn queried_source_callable_replay_requires_its_retained_evidence() {
+        let mut fixture = QueryFixture::new(
+            "function identity<T>(value: T): T { return value; }",
+            FileId::new(23_199),
+        );
+        let (declaration, _, _, _) = fixture.generic_parts();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        let evidence = fixture
+            .store
+            .replace_source_callable_type_query_for_test(signature, None)
+            .expect("the annotated generic signature owns query evidence");
+        let before = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Malformed,
+        );
+        assert!(
+            fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .is_err()
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        assert!(
+            fixture
+                .store
+                .replace_source_callable_type_query_for_test(signature, Some(evidence),)
+                .is_none()
+        );
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(type_)
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn queried_source_callable_rejects_same_name_foreign_parameter_bindings() {
+        let mut staged = staged_generic_publication(
+            concat!(
+                "declare function first<T>(value: T): T; ",
+                "declare function second<T>(value: T): T;",
+            ),
+            FileId::new(23_202),
+        );
+        let original = staged.resolved[0].provenance;
+        let foreign_declaration = staged
+            .fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let node = NodeRef::new(staged.declaration.arena, staged.declaration.file, node);
+                (record.kind == SyntaxKind::TypeParameter && node != original.declaration)
+                    .then_some(node)
+            })
+            .unwrap();
+        let foreign = staged.fixture.bound.symbol(foreign_declaration).unwrap();
+        let foreign_type = execute_type_parameter(&mut staged.fixture.store, foreign);
+        assert_ne!(original.type_parameter, foreign_type);
+        assert_ne!(original.symbol, foreign);
+        assert_eq!(
+            staged.fixture.store.symbol(original.symbol).unwrap().name(),
+            staged.fixture.store.symbol(foreign).unwrap().name(),
+        );
+        let annotation = staged
+            .query_evidence
+            .as_ref()
+            .unwrap()
+            .callable()
+            .parameters[0]
+            .type_node;
+        assert!(staged.fixture.store.set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(foreign)
+            },
+        ));
+        let before = generic_transaction_state(&staged.fixture.store);
+        assert_eq!(staged.publish(), None);
+        assert_eq!(generic_transaction_state(&staged.fixture.store), before);
+        assert!(staged.fixture.store.set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(original.symbol)
+            },
+        ));
+        assert!(staged.publish().is_some());
+    }
+
+    #[test]
+    fn queried_generic_literal_parameter_retains_signature_flags() {
+        let mut fixture = QueryFixture::new(
+            "declare function literal<T>(value: 'fixed'): T;",
+            FileId::new(23_201),
+        );
+        let (declaration, _, _, _) = fixture.generic_parts();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            fixture.store.signature(signature).unwrap().flags(),
+            SignatureFlags::HAS_LITERAL_TYPES,
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Valid(_),
+        ));
+        let parameter = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(parameter)
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn queried_return_publication_rejects_another_declarations_equal_type() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "declare function first<T>(value: T): string; ",
+                "declare function second<U>(value: U): string;",
+            ),
+            FileId::new(23_200),
+        );
+        let declarations = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut signatures = Vec::new();
+        for declaration in declarations {
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let type_ = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            signatures.push(
+                fixture
+                    .store
+                    .source_callable_provenance(type_)
+                    .unwrap()
+                    .signature,
+            );
+        }
+        let [first, second] = signatures.as_slice() else {
+            panic!("the fixture has two source signatures");
+        };
+        let string = fixture.query_return(*second, &mut diagnostics).unwrap();
+        let other = fixture
+            .store
+            .replace_source_callable_type_query_for_test(*second, None)
+            .expect("the demanded return retains its query evidence");
+        let before = generic_transaction_state(&fixture.store);
+        assert!(!fixture.store.publish_source_callable_query_return(
+            *first,
+            Arc::clone(&other),
+            string,
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .signature(*first)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        assert!(
+            fixture
+                .store
+                .replace_source_callable_type_query_for_test(*second, Some(other),)
+                .is_none()
+        );
+        assert_eq!(fixture.query_return(*first, &mut diagnostics), Ok(string));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     fn assert_exact_warm_type_parameter_annotation(
@@ -16440,6 +16960,10 @@ mod tests {
             GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
+        assert_eq!(
+            plan_enclosing_source_callable_annotation(&fixture.store, &host, name, None),
+            Ok(None),
+        );
         assert!(matches!(
             prove_source_type_parameter_syntax(
                 &fixture.store,
@@ -16567,6 +17091,113 @@ mod tests {
     }
 
     #[test]
+    fn source_generic_publication_rejects_an_orphan_next_signature_evidence_entry() {
+        let mut staged = staged_generic_publication(
+            concat!(
+                "declare function first<T>(value: T): T; ",
+                "declare function second<U>(value: U): U;",
+            ),
+            FileId::new(23_203),
+        );
+        let second = staged
+            .fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let node = NodeRef::new(staged.declaration.arena, staged.declaration.file, node);
+                (record.kind == SyntaxKind::FunctionDeclaration && node != staged.declaration)
+                    .then_some(node)
+            })
+            .unwrap();
+        let second_owner = staged.fixture.bound.symbol(second).unwrap();
+        let second_plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&staged.fixture.parsed.arena, &staged.fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_source_callable(&staged.fixture.store, &host, second, second_owner, None).unwrap()
+        };
+        let orphan = staged
+            .fixture
+            .query_callable_evidence(&second_plan)
+            .unwrap();
+        assert!(orphan.is_exact(&staged.fixture.store));
+        assert!(
+            staged
+                .query_evidence
+                .as_ref()
+                .unwrap()
+                .is_exact(&staged.fixture.store)
+        );
+        assert!(
+            staged
+                .fixture
+                .store
+                .source_callable_type_for_declaration(staged.declaration)
+                .is_none()
+        );
+        assert!(
+            staged
+                .fixture
+                .store
+                .source_callable_type_for_declaration(second)
+                .is_none()
+        );
+        let local = std::num::NonZeroU32::new(
+            u32::try_from(staged.fixture.store.signature_len().checked_add(1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let next_signature = <SignatureId as crate::semantic::ids::ArenaId>::from_parts(
+            staged.fixture.store.id(),
+            local,
+        );
+        assert!(staged.fixture.store.signature(next_signature).is_none());
+        assert!(
+            staged
+                .fixture
+                .store
+                .replace_source_callable_type_query_for_test(
+                    next_signature,
+                    Some(Arc::clone(&orphan)),
+                )
+                .is_none()
+        );
+
+        let before = generic_transaction_state(&staged.fixture.store);
+        assert_eq!(staged.publish(), None);
+        assert_eq!(generic_transaction_state(&staged.fixture.store), before);
+        let retained = staged
+            .fixture
+            .store
+            .source_callable_type_query(next_signature)
+            .unwrap();
+        assert!(std::ptr::eq(retained, orphan.as_ref()));
+        assert!(retained.matches_plan(&second_plan));
+        assert!(retained.is_exact(&staged.fixture.store));
+
+        let removed = staged
+            .fixture
+            .store
+            .replace_source_callable_type_query_for_test(next_signature, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&removed, &orphan));
+        let (_, signature) = staged
+            .publish()
+            .expect("removing the orphan restores publication");
+        assert_eq!(signature, next_signature);
+        assert!(std::ptr::eq(
+            staged
+                .fixture
+                .store
+                .source_callable_type_query(signature)
+                .unwrap(),
+            staged.query_evidence.as_deref().unwrap(),
+        ));
+    }
+
+    #[test]
     fn keyword_type_parameter_results_reject_poisoned_semantic_links() {
         let source = "function identity<T extends string>(value: T): T { return value; }";
 
@@ -16690,7 +17321,7 @@ mod tests {
     }
 
     #[test]
-    fn unproven_alias_and_composite_default_results_fail_closed() {
+    fn alias_and_composite_defaults_require_query_evidence() {
         for (index, source) in [
             "type Alias = string; function identity<T extends Alias>(value: T): T { return value; }",
             "type Alias = string; function identity<T = Alias>(value: T): T { return value; }",
@@ -16703,9 +17334,12 @@ mod tests {
                 source,
                 FileId::new(976 + u32::try_from(index).unwrap()),
             );
+            let evidence = staged.query_evidence.take();
             let before = generic_transaction_state(&staged.fixture.store);
             assert_eq!(staged.publish(), None, "{source}");
             assert_eq!(generic_transaction_state(&staged.fixture.store), before);
+            staged.query_evidence = evidence;
+            assert!(staged.publish().is_some(), "{source}");
         }
     }
 
@@ -17086,27 +17720,16 @@ mod tests {
         .unwrap();
         let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
         drop(host);
-        let type_parameter_plan = plan.type_parameters[0];
-        let type_parameter = execute_type_parameter(&mut fixture.store, type_parameter_plan.symbol);
-        let no_constraint = fixture
-            .store
-            .intrinsic_bootstrap()
-            .unwrap()
-            .no_constraint_type;
-        let resolved_type_parameters = [ResolvedSourceCallableTypeParameter {
-            provenance: SourceCallableTypeParameterProvenance {
-                declaration: type_parameter_plan.declaration,
-                symbol: type_parameter_plan.symbol,
-                type_parameter,
-                constraint: None,
-                default_type: None,
-            },
-            constraint: no_constraint,
-            default_type: no_constraint,
-        }];
-        let pending = begin_source_callable(&mut fixture.store, &plan, &resolved_type_parameters)
-            .unwrap()
-            .unwrap();
+        let evidence = fixture.query_callable_evidence(&plan).unwrap();
+        let resolved_type_parameters = evidence.type_parameters().to_vec();
+        let pending = begin_source_callable(
+            &mut fixture.store,
+            &plan,
+            &resolved_type_parameters,
+            Some(Arc::clone(&evidence)),
+        )
+        .unwrap()
+        .unwrap();
         finalize_source_callable_structure(&mut fixture.store, &plan, pending).unwrap();
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let base_type = fixture
@@ -17140,9 +17763,14 @@ mod tests {
         assert_eq!(publication_state(&fixture.store), published);
         assert_eq!(fixture.store.checker_link_allocated_lengths(), link_lengths);
 
-        let retried = begin_source_callable(&mut fixture.store, &plan, &resolved_type_parameters)
-            .unwrap()
-            .unwrap();
+        let retried = begin_source_callable(
+            &mut fixture.store,
+            &plan,
+            &resolved_type_parameters,
+            Some(evidence),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(retried, pending);
         assert_eq!(publication_state(&fixture.store), published);
         assert_eq!(fixture.store.checker_link_allocated_lengths(), link_lengths);
@@ -17759,7 +18387,7 @@ mod tests {
                         Err(expected)
                     );
                     assert_eq!(
-                        begin_source_callable(&mut fixture.store, &method_plan, &[]),
+                        begin_source_callable(&mut fixture.store, &method_plan, &[], None),
                         Err(expected)
                     );
                     assert_eq!(publication_state(&fixture.store), before);
@@ -17859,7 +18487,7 @@ mod tests {
         assert_eq!(publication_state(&fixture.store), before);
 
         reserve_source_callable_capacities(&mut fixture.store, &[&plan]).unwrap();
-        let pending = begin_source_callable(&mut fixture.store, &plan, &[])
+        let pending = begin_source_callable(&mut fixture.store, &plan, &[], None)
             .unwrap()
             .unwrap();
         finalize_source_callable_structure(&mut fixture.store, &plan, pending).unwrap();
@@ -19114,7 +19742,7 @@ mod tests {
         drop(host);
 
         reserve_source_callable_capacities(&mut fixture.store, &[&plan]).unwrap();
-        let pending = begin_source_callable(&mut fixture.store, &plan, &[])
+        let pending = begin_source_callable(&mut fixture.store, &plan, &[], None)
             .unwrap()
             .unwrap();
         finalize_source_callable_structure(&mut fixture.store, &plan, pending).unwrap();
@@ -21111,7 +21739,7 @@ mod tests {
         drop(host);
 
         reserve_source_callable_capacities(&mut fixture.store, &[&imported]).unwrap();
-        let pending = begin_source_callable(&mut fixture.store, &imported, &[])
+        let pending = begin_source_callable(&mut fixture.store, &imported, &[], None)
             .unwrap()
             .unwrap();
         finalize_source_callable_structure(&mut fixture.store, &imported, pending).unwrap();
@@ -22008,7 +22636,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_generic_array_parameter_syntax_requires_an_array_capability() {
+    fn generic_array_annotation_syntax_defers_array_operations_to_queries() {
         let annotations = [
             "T[]".to_owned(),
             "Array<T>".to_owned(),
@@ -22029,12 +22657,10 @@ mod tests {
                 GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
             )
             .unwrap();
-            assert!(matches!(
-                plan_source_callable(&fixture.store, &host, declaration, owner, None),
-                Err(SourceCallableError::Unsupported(
-                    SourceCallableUnsupported::GenericSignature(_)
-                ))
-            ));
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            assert!(plan.requires_type_query_evidence());
+            assert_eq!(plan.array_targets, None);
             let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
             let targets = CanonicalArrayTargets::for_test(
                 bootstrap.empty_generic_type,
@@ -22141,7 +22767,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_namespace_constructor_parameters_reject_other_signature_shapes() {
+    fn ambient_generic_constructor_annotation_syntax_defers_to_queries() {
         for (index, constructor) in [
             "new (args: any[]) => T",
             "new (...args: string[]) => T",
@@ -22179,12 +22805,9 @@ mod tests {
             let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
             let before = generic_transaction_state(&fixture.store);
 
-            assert!(matches!(
-                plan_source_callable(&fixture.store, &host, declaration, owner, None),
-                Err(SourceCallableError::Unsupported(
-                    SourceCallableUnsupported::GenericSignature(_)
-                ))
-            ));
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            assert!(plan.requires_type_query_evidence());
             assert_eq!(generic_transaction_state(&fixture.store), before);
         }
     }
@@ -22626,7 +23249,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_literal_defaults_are_rejected_before_publication() {
+    fn incompatible_literal_defaults_keep_queried_metadata_and_issue_diagnostics() {
         for (index, source) in [
             "declare function text<T extends string = 1>(value: T): T;",
             "declare function numeric<T extends number = 'wrong'>(value: T): T;",
@@ -22635,7 +23258,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let fixture =
+            let mut fixture =
                 QueryFixture::new(source, FileId::new(1_130 + u32::try_from(index).unwrap()));
             let (declaration, _, _, _) = fixture.generic_parts();
             let owner = fixture.bound.symbol(declaration).unwrap();
@@ -22646,13 +23269,30 @@ mod tests {
             .unwrap();
             let before = generic_transaction_state(&fixture.store);
 
-            assert!(matches!(
-                plan_source_callable(&fixture.store, &host, declaration, owner, None),
-                Err(SourceCallableError::Unsupported(
-                    SourceCallableUnsupported::GenericSignature(_)
-                ))
-            ));
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            assert!(plan.requires_type_query_evidence());
             assert_eq!(generic_transaction_state(&fixture.store), before);
+            drop(host);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_),
+            ));
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("the invalid default has one diagnostic: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2344);
+            let warm = generic_transaction_state(&fixture.store);
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable)
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), warm);
+            assert_eq!(diagnostics.len(), 1);
         }
     }
 
@@ -22712,22 +23352,46 @@ mod tests {
             },
         ));
         let before = generic_transaction_state(context.store());
-        let (_, bound) = context.file(file).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let global_types = context.global_types().clone();
         let host = DeclaredTypeHost::new_after_global_merge(
-            [(&parsed.arena, bound)],
+            [(&parsed.arena, &bound)],
             GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
-        assert!(
-            plan_source_callable(
-                context.store(),
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(matches!(
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
                 &host,
-                declaration,
-                owner,
-                Some(array_targets),
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
             )
-            .is_err()
-        );
+            .unwrap()
+            .preflight_type_of_source_callable(declaration, owner),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node)
+            )) if node == inner_reference
+        ));
+        assert_eq!(generic_transaction_state(context.store()), before);
+        assert!(matches!(
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, owner),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node)
+            )) if node == inner_reference
+        ));
         assert_eq!(generic_transaction_state(context.store()), before);
     }
 
@@ -23179,54 +23843,775 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
-    #[test]
-    fn unsupported_generic_signature_shapes_publish_nothing() {
-        for (index, source) in [
-            "function f<T extends U, U>(value: T): T { return value; }",
-            "function f<T extends T>(value: T): T { return value; }",
-            "function f<T extends string | number>(value: T): T { return value; }",
-            "function f<T extends string = number>(): string { return ''; }",
-            "function f<T>(value: (item: T) => T): T { return value as any; }",
-            "function f<T>(value: T): { value: T } { return { value }; }",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let parsed = parse_source_file(source);
-            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-            let file = FileId::new(960 + u32::try_from(index).unwrap());
-            let (declaration, type_parameter_declaration) =
-                function_and_type_parameter(&parsed, file);
-            let mut context = bind_context(&parsed, file);
-            let (owner, type_parameter_symbol) = {
-                let (_, bound) = context.file(file).unwrap();
-                (
-                    bound.symbol(declaration).unwrap(),
-                    bound.symbol(type_parameter_declaration).unwrap(),
+    fn assert_checked_queried_generic_signature(
+        source: &str,
+        file: FileId,
+        assert_case: impl Fn(
+            &ParseResult,
+            &mut CanonicalCheckerContext<'_>,
+            &SourceCallablePlan,
+            SignatureId,
+        ),
+    ) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (declaration, _) = function_and_type_parameter(&parsed, file);
+        let mut context = bind_context(&parsed, file);
+        let result = context.check_source_file(file);
+        assert_eq!(result, Ok(()), "source: {source}\nresult: {result:?}");
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, context.file(file).unwrap().1)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_source_callable(
+                context.store(),
+                &host,
+                declaration,
+                owner,
+                Some(CanonicalArrayTargets::from_global_types(
+                    context.global_types(),
+                )),
+            )
+            .unwrap()
+        };
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let assert_publication = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            let bound = context.file(file).unwrap().1;
+            assert!(plan.requires_type_query_evidence());
+            assert_eq!(bound.symbol(declaration), Some(owner));
+            assert_eq!(store.get_merged_symbol(owner), Some(owner));
+            assert_eq!(store.source_callable_type_for_owner(owner), Some(callable));
+            assert_eq!(
+                store.source_callable_type_for_declaration(declaration),
+                Some(callable)
+            );
+            assert_eq!(
+                store.source_callable_type_for_signature(signature),
+                Some(callable)
+            );
+            assert_eq!(
+                store.value_symbol_links(owner),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(callable),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            let provenance = store.source_callable_provenance(callable).unwrap();
+            assert_eq!(provenance.family, SourceCallableFamily::FunctionDeclaration);
+            assert_eq!(provenance.declaration, declaration);
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(provenance.signature, signature);
+            let record = store.signature(signature).unwrap();
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(record.flags(), plan.flags);
+            assert_eq!(record.min_argument_count(), plan.min_argument_count);
+            assert_eq!(record.type_parameters().len(), plan.type_parameters.len());
+            let evidence = store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.matches_plan(&plan));
+            assert!(evidence.is_exact(store));
+            let rows = store.source_callable_type_parameters(signature).unwrap();
+            assert_eq!(rows.len(), plan.type_parameters.len());
+            assert_eq!(evidence.type_parameters().len(), rows.len());
+            assert_eq!(evidence.base_constraints().len(), rows.len());
+            for (index, parameter) in plan.type_parameters.iter().enumerate() {
+                let type_ = record.type_parameters()[index];
+                assert_eq!(bound.symbol(parameter.declaration), Some(parameter.symbol));
+                assert_eq!(
+                    cached_ordinary_type_parameter_owner(store, type_),
+                    Some(parameter.symbol)
+                );
+                assert_eq!(
+                    store
+                        .declared_type_links(parameter.symbol)
+                        .unwrap()
+                        .declared_type,
+                    Some(type_),
+                );
+                assert_eq!(
+                    rows[index],
+                    SourceCallableTypeParameterProvenance {
+                        declaration: parameter.declaration,
+                        symbol: parameter.symbol,
+                        type_parameter: type_,
+                        constraint: parameter.constraint,
+                        default_type: parameter.default_type,
+                    },
+                );
+                assert_eq!(evidence.type_parameters()[index].provenance, rows[index]);
+                assert_queried_generic_parameter_resolution(
+                    store,
+                    type_,
+                    evidence.type_parameters()[index].constraint,
+                    evidence.base_constraints()[index],
+                    evidence.type_parameters()[index].default_type,
+                );
+            }
+            let parameters = plan
+                .parameters
+                .iter()
+                .map(|parameter| parameter.symbol)
+                .collect::<Vec<_>>();
+            assert_eq!(record.parameters(), parameters.as_slice());
+            let parameter_types = plan
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    let type_ = evidence.annotation_type(parameter.type_node).unwrap();
+                    assert_eq!(bound.symbol(parameter.declaration), Some(parameter.symbol));
+                    assert_eq!(
+                        store
+                            .value_symbol_links(parameter.symbol)
+                            .unwrap()
+                            .resolved_type,
+                        Some(type_),
+                    );
+                    type_
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                store.callable_signature_parameter_types(signature),
+                Some(parameter_types.as_slice())
+            );
+            let return_type = record.resolved_return_type().unwrap();
+            let return_node = plan.return_type.type_node().unwrap();
+            assert_eq!(evidence.annotation_type(return_node), Some(return_type));
+            let (return_identity, null_literal_identity) =
+                plan.return_type.annotation_identity().unwrap();
+            assert_eq!(
+                cached_annotation_identity(store, return_identity, null_literal_identity),
+                Some(return_type)
+            );
+            if !matches!(
+                store.source_node_kind(return_node),
+                Some(
+                    SyntaxKind::AnyKeyword
+                        | SyntaxKind::UnknownKeyword
+                        | SyntaxKind::StringKeyword
+                        | SyntaxKind::NumberKeyword
+                        | SyntaxKind::BigIntKeyword
+                        | SyntaxKind::BooleanKeyword
+                        | SyntaxKind::SymbolKeyword
+                        | SyntaxKind::VoidKeyword
+                        | SyntaxKind::UndefinedKeyword
+                        | SyntaxKind::NullKeyword
+                        | SyntaxKind::NeverKeyword
+                        | SyntaxKind::ObjectKeyword
+                        | SyntaxKind::IntrinsicKeyword
                 )
-            };
-            let before = publication_state(context.store());
+            ) {
+                assert_eq!(
+                    store.type_node_links(return_node).unwrap().resolved_type,
+                    Some(return_type)
+                );
+            }
             assert!(matches!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::Callable(_))
-                ))
+                validate_stored_source_callable(store, callable),
+                StoredSourceCallableValidation::Valid(_),
             ));
-            assert_eq!(publication_state(context.store()), before);
-            assert!(
-                context
+        };
+        assert_case(&parsed, &mut context, &plan, signature);
+        assert_publication(&context);
+        let return_type = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(return_type)
+        );
+        let type_parameters = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let evidence = context
+            .store()
+            .source_callable_type_query(signature)
+            .unwrap();
+        let parameter_rows = evidence.type_parameters().to_vec();
+        let base_constraints = evidence.base_constraints().to_vec();
+        let before = generic_transaction_state(context.store());
+        let diagnostics = context.diagnostics().clone();
+        let result = context.recheck_source_file(file);
+        assert_eq!(result, Ok(()), "source: {source}\nresult: {result:?}");
+        assert_case(&parsed, &mut context, &plan, signature);
+        assert_publication(&context);
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(return_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters(),
+            type_parameters.as_slice()
+        );
+        let evidence = context
+            .store()
+            .source_callable_type_query(signature)
+            .unwrap();
+        assert_eq!(evidence.type_parameters(), parameter_rows.as_slice());
+        assert_eq!(evidence.base_constraints(), base_constraints.as_slice());
+        assert!(
+            context
+                .store()
+                .source_file_links(context.source_file(file).unwrap())
+                .unwrap()
+                .type_checked
+        );
+        assert_eq!(
+            generic_transaction_state(context.store()),
+            before,
+            "source: {source}"
+        );
+        assert_eq!(context.diagnostics(), &diagnostics, "source: {source}");
+    }
+
+    fn assert_queried_generic_parameter_resolution(
+        store: &CanonicalTypeMapperStore,
+        parameter: TypeId,
+        constraint: TypeId,
+        base: TypeId,
+        default_type: TypeId,
+    ) {
+        let TypeData::TypeParameter(data) = store.type_payload(parameter).unwrap().data() else {
+            panic!("the signature must retain the canonical type parameter")
+        };
+        assert_eq!(data.constraint, Some(constraint));
+        assert_eq!(data.constrained.resolved_base_constraint, Some(base));
+        assert_eq!(data.resolved_default_type, Some(default_type));
+        assert!(data.target.is_none());
+        assert!(data.mapper.is_none());
+    }
+
+    fn queried_generic_body_return(parsed: &ParseResult, plan: &SourceCallablePlan) -> NodeRef {
+        let NodeData::Block(body) = &parsed.arena.get(plan.body.node).unwrap().data else {
+            panic!("the original source has a function body")
+        };
+        let [statement] = body.statements.nodes.as_slice() else {
+            panic!("the original body has one return statement")
+        };
+        let record = parsed.arena.get(*statement).unwrap();
+        assert_eq!(record.parent, Some(plan.body.node));
+        let NodeData::ReturnStatement(returned) = &record.data else {
+            panic!("the original body returns its expression")
+        };
+        let expression = returned.expression.unwrap();
+        assert_eq!(
+            parsed.arena.get(expression).unwrap().parent,
+            Some(*statement)
+        );
+        NodeRef::new(plan.declaration.arena, plan.declaration.file, expression)
+    }
+
+    fn assert_queried_generic_identity_body(
+        parsed: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        plan: &SourceCallablePlan,
+        signature: SignatureId,
+        parameter: TypeId,
+    ) {
+        let store = context.store();
+        assert_eq!(
+            store.callable_signature_parameter_types(signature),
+            Some([parameter].as_slice())
+        );
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            Some(parameter)
+        );
+        let returned = queried_generic_body_return(parsed, plan);
+        assert_eq!(
+            store.type_node_links(returned).unwrap().resolved_type,
+            Some(parameter)
+        );
+        assert_eq!(
+            store.symbol_node_links(returned).unwrap().resolved_symbol,
+            Some(plan.parameters[0].symbol)
+        );
+    }
+
+    #[test]
+    fn queried_generic_signature_forward_constraint_preserves_ordered_parameters() {
+        assert_checked_queried_generic_signature(
+            "function f<T extends U, U>(value: T): T { return value; }",
+            FileId::new(960),
+            |parsed, context, plan, signature| {
+                let store = context.store();
+                let [first, second] = store.signature(signature).unwrap().type_parameters() else {
+                    panic!("the original signature has ordered T and U parameters")
+                };
+                assert_ne!(first, second);
+                let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
+                assert_queried_generic_parameter_resolution(
+                    store,
+                    *first,
+                    *second,
+                    no_constraint,
+                    no_constraint,
+                );
+                assert_queried_generic_parameter_resolution(
+                    store,
+                    *second,
+                    no_constraint,
+                    no_constraint,
+                    no_constraint,
+                );
+                let constraint = plan.type_parameters[0].constraint.unwrap();
+                assert_eq!(
+                    store.type_node_links(constraint).unwrap().resolved_type,
+                    Some(*second)
+                );
+                assert_eq!(
+                    store.symbol_node_links(constraint).unwrap().resolved_symbol,
+                    Some(plan.type_parameters[1].symbol)
+                );
+                assert_queried_generic_identity_body(parsed, context, plan, signature, *first);
+                assert!(context.diagnostics().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn queried_generic_signature_self_constraint_reports_circular_constraint() {
+        assert_checked_queried_generic_signature(
+            "function f<T extends T>(value: T): T { return value; }",
+            FileId::new(961),
+            |parsed, context, plan, signature| {
+                let store = context.store();
+                let [parameter] = store.signature(signature).unwrap().type_parameters() else {
+                    panic!("the original signature has one type parameter")
+                };
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                assert_queried_generic_parameter_resolution(
+                    store,
+                    *parameter,
+                    *parameter,
+                    bootstrap.circular_constraint_type,
+                    bootstrap.no_constraint_type,
+                );
+                let constraint = plan.type_parameters[0].constraint.unwrap();
+                assert_eq!(
+                    store.type_node_links(constraint).unwrap().resolved_type,
+                    Some(*parameter)
+                );
+                assert_eq!(
+                    store.symbol_node_links(constraint).unwrap().resolved_symbol,
+                    Some(plan.type_parameters[0].symbol)
+                );
+                assert!(plan.type_parameters[0].default_type.is_none());
+                assert_queried_generic_identity_body(parsed, context, plan, signature, *parameter);
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the self constraint must report exactly TS2313")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2313);
+                assert_eq!(diagnostic.node, Some(constraint));
+                assert_eq!(diagnostic.diagnostic.arguments, ["T"]);
+                assert!(diagnostic.range_override.is_none());
+                assert!(diagnostic.diagnostic.details.is_empty());
+                assert!(diagnostic.related_information.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn queried_generic_signature_union_constraint_preserves_union_identity() {
+        assert_checked_queried_generic_signature(
+            "function f<T extends string | number>(value: T): T { return value; }",
+            FileId::new(962),
+            |parsed, context, plan, signature| {
+                let store = context.store();
+                let [parameter] = store.signature(signature).unwrap().type_parameters() else {
+                    panic!("the original signature has one type parameter")
+                };
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let constraint = store
+                    .type_node_links(plan.type_parameters[0].constraint.unwrap())
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let TypeData::Union(union) = store.type_payload(constraint).unwrap().data() else {
+                    panic!("the constraint must remain the string-number union")
+                };
+                assert_eq!(union.union.types.len(), 2);
+                assert!(union.union.types.contains(&bootstrap.string_type));
+                assert!(union.union.types.contains(&bootstrap.number_type));
+                assert_queried_generic_parameter_resolution(
+                    store,
+                    *parameter,
+                    constraint,
+                    constraint,
+                    bootstrap.no_constraint_type,
+                );
+                assert_queried_generic_identity_body(parsed, context, plan, signature, *parameter);
+                assert!(context.diagnostics().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn queried_generic_signature_incompatible_default_reports_constraint_error() {
+        assert_checked_queried_generic_signature(
+            "function f<T extends string = number>(): string { return ''; }",
+            FileId::new(963),
+            |parsed, context, plan, signature| {
+                let constraint = plan.type_parameters[0].constraint.unwrap();
+                let default_type = plan.type_parameters[0].default_type.unwrap();
+                let return_annotation = plan.return_type.type_node().unwrap();
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let string_type = bootstrap.string_type;
+                let number_type = bootstrap.number_type;
+                let before_queries = generic_transaction_state(context.store());
+                for (node, expected) in [
+                    (constraint, string_type),
+                    (default_type, number_type),
+                    (return_annotation, string_type),
+                ] {
+                    assert!(context.store().type_node_links(node).is_none());
+                    assert_eq!(context.get_type_from_type_node(node), Ok(expected));
+                    assert!(context.store().type_node_links(node).is_none());
+                }
+                assert_eq!(generic_transaction_state(context.store()), before_queries);
+                let store = context.store();
+                let record = store.signature(signature).unwrap();
+                let [parameter] = record.type_parameters() else {
+                    panic!("the original signature has one type parameter")
+                };
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                assert_queried_generic_parameter_resolution(
+                    store,
+                    *parameter,
+                    bootstrap.string_type,
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                );
+                assert!(record.parameters().is_empty());
+                assert_eq!(
+                    store.callable_signature_parameter_types(signature),
+                    Some([].as_slice())
+                );
+                let returned = queried_generic_body_return(parsed, plan);
+                let NodeData::StringLiteral(syntax) =
+                    &parsed.arena.get(returned.node).unwrap().data
+                else {
+                    panic!("the original body must return its empty string literal")
+                };
+                assert!(syntax.text.is_empty());
+                let body_type = store
+                    .type_node_links(returned)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let body_record = store.type_payload(body_type).unwrap();
+                assert_eq!(body_record.flags(), TypeFlags::STRING_LITERAL);
+                let TypeData::Literal(literal) = body_record.data() else {
+                    panic!("the cached body type must retain its string literal payload")
+                };
+                assert!(matches!(
+                    &literal.value,
+                    crate::semantic::type_records::LiteralValue::String(value) if value.is_empty()
+                ));
+                assert_eq!(literal.regular_type, bootstrap.empty_string_type);
+                assert!(store.validate_union_constituent(body_type).is_ok());
+                assert_eq!(record.resolved_return_type(), Some(bootstrap.string_type));
+                let evidence = store.source_callable_type_query(signature).unwrap();
+                assert_eq!(
+                    evidence.annotation_type(constraint),
+                    Some(bootstrap.string_type)
+                );
+                assert_eq!(
+                    evidence.annotation_type(default_type),
+                    Some(bootstrap.number_type)
+                );
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the incompatible default must report exactly TS2344")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2344);
+                assert_eq!(diagnostic.node, Some(default_type));
+                assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+                assert!(diagnostic.range_override.is_none());
+                assert!(diagnostic.diagnostic.details.is_empty());
+                assert!(diagnostic.related_information.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn queried_generic_signature_callback_preserves_outer_type_parameter() {
+        assert_checked_queried_generic_signature(
+            "function f<T>(value: (item: T) => T): T { return value as any; }",
+            FileId::new(964),
+            |parsed, context, plan, signature| {
+                let parameter = context
                     .store()
-                    .declared_type_links(type_parameter_symbol)
-                    .is_none()
-            );
-            assert!(
-                context
+                    .signature(signature)
+                    .unwrap()
+                    .type_parameters()[0];
+                let annotation = plan.parameters[0].type_node;
+                let NodeData::FunctionTypeNode(function) =
+                    &parsed.arena.get(annotation.node).unwrap().data
+                else {
+                    panic!("the parameter annotation is an ordinary function type")
+                };
+                assert!(function.type_parameters.is_none());
+                let [nested_parameter] = function.parameters.nodes.as_slice() else {
+                    panic!("the callback has one value parameter")
+                };
+                let nested_parameter =
+                    NodeRef::new(annotation.arena, annotation.file, *nested_parameter);
+                let nested_owner = context
+                    .file(annotation.file)
+                    .unwrap()
+                    .1
+                    .symbol(nested_parameter)
+                    .unwrap();
+                let nested_signature = context
                     .store()
-                    .source_callable_type_for_owner(owner)
-                    .is_none()
-            );
-            assert!(context.diagnostics().is_empty());
-        }
+                    .signature_links(annotation)
+                    .unwrap()
+                    .resolved_signature
+                    .signature()
+                    .unwrap();
+                assert_eq!(
+                    context.get_return_type_of_signature(nested_signature),
+                    Ok(parameter)
+                );
+                let store = context.store();
+                let callback = store
+                    .type_node_links(annotation)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let nested = store.signature(nested_signature).unwrap();
+                assert_eq!(nested.declaration(), Some(annotation));
+                assert!(nested.type_parameters().is_empty());
+                assert_eq!(nested.parameters(), [nested_owner]);
+                assert_eq!(nested.resolved_return_type(), Some(parameter));
+                assert_eq!(
+                    store.callable_signature_parameter_types(nested_signature),
+                    Some([parameter].as_slice())
+                );
+                assert_eq!(
+                    store
+                        .value_symbol_links(nested_owner)
+                        .unwrap()
+                        .resolved_type,
+                    Some(parameter)
+                );
+                let NodeData::ParameterDeclaration(nested_parameter_data) =
+                    &parsed.arena.get(nested_parameter.node).unwrap().data
+                else {
+                    panic!("the nested signature parameter keeps its source annotation")
+                };
+                let nested_annotation = NodeRef::new(
+                    annotation.arena,
+                    annotation.file,
+                    nested_parameter_data.type_.unwrap(),
+                );
+                assert_eq!(
+                    store
+                        .type_node_links(nested_annotation)
+                        .unwrap()
+                        .resolved_type,
+                    Some(parameter)
+                );
+                assert_eq!(
+                    store
+                        .symbol_node_links(nested_annotation)
+                        .unwrap()
+                        .resolved_symbol,
+                    Some(plan.type_parameters[0].symbol)
+                );
+                let nested_return =
+                    NodeRef::new(annotation.arena, annotation.file, function.type_.unwrap());
+                assert_eq!(
+                    store.type_node_links(nested_return).unwrap().resolved_type,
+                    Some(parameter)
+                );
+                assert!(matches!(
+                    validate_stored_function_type(store, callback),
+                    StoredFunctionTypeValidation::Valid(_)
+                ));
+                assert_eq!(
+                    store.callable_signature_parameter_types(signature),
+                    Some([callback].as_slice())
+                );
+                assert_eq!(
+                    store.signature(signature).unwrap().resolved_return_type(),
+                    Some(parameter)
+                );
+                let returned = queried_generic_body_return(parsed, plan);
+                let NodeData::AsExpression(assertion) =
+                    &parsed.arena.get(returned.node).unwrap().data
+                else {
+                    panic!("the original body must keep its as-any assertion")
+                };
+                let operand = NodeRef::new(returned.arena, returned.file, assertion.expression);
+                let target = NodeRef::new(returned.arena, returned.file, assertion.type_);
+                let any_type = store.intrinsic_bootstrap().unwrap().any_type;
+                assert_eq!(
+                    parsed.arena.get(target.node).unwrap().kind,
+                    SyntaxKind::AnyKeyword
+                );
+                assert!(store.type_node_links(target).is_none());
+                assert_eq!(
+                    store.type_node_links(returned).unwrap().resolved_type,
+                    Some(any_type)
+                );
+                assert_eq!(
+                    store.type_node_links(operand).unwrap().resolved_type,
+                    Some(callback)
+                );
+                assert_eq!(
+                    store.symbol_node_links(operand).unwrap().resolved_symbol,
+                    Some(plan.parameters[0].symbol)
+                );
+                let before_query = generic_transaction_state(context.store());
+                assert_eq!(context.get_type_from_type_node(target), Ok(any_type));
+                assert!(context.store().type_node_links(target).is_none());
+                assert_eq!(generic_transaction_state(context.store()), before_query);
+                assert!(context.diagnostics().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn queried_generic_signature_object_return_preserves_property_type_parameter() {
+        assert_checked_queried_generic_signature(
+            "function f<T>(value: T): { value: T } { return { value }; }",
+            FileId::new(965),
+            |parsed, context, plan, signature| {
+                let store = context.store();
+                let record = store.signature(signature).unwrap();
+                let [parameter] = record.type_parameters() else {
+                    panic!("the original signature has one type parameter")
+                };
+                assert_eq!(
+                    store.callable_signature_parameter_types(signature),
+                    Some([*parameter].as_slice())
+                );
+                let annotation = plan.return_type.type_node().unwrap();
+                let NodeData::TypeLiteralNode(literal) =
+                    &parsed.arena.get(annotation.node).unwrap().data
+                else {
+                    panic!("the return annotation must remain its property type literal")
+                };
+                let [property] = literal.members.nodes.as_slice() else {
+                    panic!("the return type has one value property")
+                };
+                let property = NodeRef::new(annotation.arena, annotation.file, *property);
+                let NodeData::PropertyDeclaration(property_data) =
+                    &parsed.arena.get(property.node).unwrap().data
+                else {
+                    panic!("the return type member is a property signature")
+                };
+                let property_owner = context
+                    .file(property.file)
+                    .unwrap()
+                    .1
+                    .symbol(property)
+                    .unwrap();
+                let property_type =
+                    NodeRef::new(property.arena, property.file, property_data.type_.unwrap());
+                assert_eq!(
+                    store.type_node_links(property_type).unwrap().resolved_type,
+                    Some(*parameter)
+                );
+                assert_eq!(
+                    store
+                        .value_symbol_links(property_owner)
+                        .unwrap()
+                        .resolved_type,
+                    Some(*parameter)
+                );
+                let return_type = record.resolved_return_type().unwrap();
+                let return_members = store
+                    .type_payload(return_type)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                assert_eq!(
+                    return_members.properties.as_deref(),
+                    Some([property_owner].as_slice())
+                );
+                assert_eq!(
+                    store
+                        .symbol_table(return_members.members.unwrap())
+                        .unwrap()
+                        .get_source("value"),
+                    Some(property_owner)
+                );
+                let returned = queried_generic_body_return(parsed, plan);
+                let NodeData::ObjectLiteralExpression(object) =
+                    &parsed.arena.get(returned.node).unwrap().data
+                else {
+                    panic!("the original body returns its shorthand object")
+                };
+                let [shorthand] = object.properties.nodes.as_slice() else {
+                    panic!("the body object has one shorthand property")
+                };
+                let NodeData::ShorthandPropertyAssignment(shorthand) =
+                    &parsed.arena.get(*shorthand).unwrap().data
+                else {
+                    panic!("the original value property must remain shorthand")
+                };
+                let value = NodeRef::new(returned.arena, returned.file, shorthand.name);
+                assert_eq!(
+                    store.type_node_links(value).unwrap().resolved_type,
+                    Some(*parameter)
+                );
+                assert_eq!(
+                    store.symbol_node_links(value).unwrap().resolved_symbol,
+                    Some(plan.parameters[0].symbol)
+                );
+                let body_type = store
+                    .type_node_links(returned)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let body_members = store
+                    .type_payload(body_type)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap();
+                let body_property = store
+                    .symbol_table(body_members.members.unwrap())
+                    .unwrap()
+                    .get_source("value")
+                    .unwrap();
+                assert_eq!(
+                    body_members.properties.as_deref(),
+                    Some([body_property].as_slice())
+                );
+                assert_eq!(
+                    store
+                        .value_symbol_links(body_property)
+                        .unwrap()
+                        .resolved_type,
+                    Some(*parameter)
+                );
+                assert!(context.diagnostics().is_empty());
+            },
+        );
     }
 
     #[test]

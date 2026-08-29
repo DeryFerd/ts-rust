@@ -19,6 +19,7 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId,
     RelationUnavailable, SymbolTableId, TypeId, VariableInvariant,
     callables::{StoredSingleCallableValidation, validate_stored_single_callable},
+    declared::cached_ordinary_type_parameter_owner,
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
@@ -414,6 +415,11 @@ fn preflight_contextual_type_graph(
                 )?;
             }
             return Ok(());
+        }
+        if flags == TypeFlags::TYPE_PARAMETER
+            && cached_ordinary_type_parameter_owner(store, contextual_type).is_some()
+        {
+            return validate_contextual_union(store, global_types, contextual_type);
         }
         if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
@@ -1661,6 +1667,26 @@ mod tests {
             .expect("the fixture contains one annotated object named value")
     }
 
+    fn generic_object_return_nodes(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (NodeRef, NodeRef, NodeRef) {
+        let find = |kind| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap()
+        };
+        (
+            find(SyntaxKind::TypeParameter),
+            find(SyntaxKind::TypeLiteral),
+            find(SyntaxKind::ObjectLiteralExpression),
+        )
+    }
+
     fn mapped_record_expression(
         parsed: &ParseResult,
         store: &CanonicalTypeMapperStore,
@@ -2227,6 +2253,262 @@ mod tests {
                 PreparedExpression::Literal(LiteralTreatment::Regular),
             ])),
         );
+    }
+
+    #[test]
+    fn contextual_object_graph_preserves_source_type_parameter_leaves() {
+        let parsed =
+            parse_source_file("function f<T>(value: T): { value: T } { return { value }; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(965);
+        let mut context = mapped_record_context(&parsed, file);
+        let (declaration, annotation, object) = generic_object_return_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let symbol = bound.symbol(declaration).unwrap();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let store = context.store_mut_for_test();
+        let parameter = store
+            .declared_type_links(symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(store, parameter),
+            Some(symbol),
+        );
+        let TypeData::TypeParameter(original) = store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the source query must retain the declared type parameter")
+        };
+        let original = original.clone();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        for _ in 0..2 {
+            for global_types in [None, Some(&globals)] {
+                preflight_contextual_type_graph(
+                    store,
+                    &host,
+                    global_types,
+                    target,
+                    &mut HashSet::new(),
+                    &mut HashSet::new(),
+                )
+                .unwrap();
+                let contextual = resolve_contextual_property_object(store, &host, target)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(contextual.get_source("value"), Some(parameter));
+                assert_eq!(
+                    identifier_treatment(
+                        store,
+                        global_types,
+                        parameter,
+                        Some(parameter),
+                        ExpressionLocation::Mutable,
+                    ),
+                    Ok(LiteralTreatment::Identity),
+                );
+                assert!(matches!(
+                    store.type_payload(parameter).map(TypeRecord::data),
+                    Some(TypeData::TypeParameter(data)) if data == &original
+                ));
+                assert_eq!(
+                    cached_ordinary_type_parameter_owner(store, parameter),
+                    Some(symbol),
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                assert!(store.type_node_links(object).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_type_parameter_leaves_reject_changed_owners_and_caches() {
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            DeclaredCache,
+            ValueDeclaration,
+            Declaration,
+            InstantiationTarget,
+        }
+
+        for poison in [
+            Poison::DeclaredCache,
+            Poison::ValueDeclaration,
+            Poison::Declaration,
+            Poison::InstantiationTarget,
+        ] {
+            let parsed =
+                parse_source_file("function f<T>(value: T): { value: T } { return { value }; }");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(965);
+            let mut context = mapped_record_context(&parsed, file);
+            let (declaration, annotation, object) = generic_object_return_nodes(&parsed, file);
+            let target = context.get_type_from_type_node(annotation).unwrap();
+            let bound = context.file(file).unwrap().1.clone();
+            let symbol = bound.symbol(declaration).unwrap();
+            let globals = context.global_types().clone();
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let store = context.store_mut_for_test();
+            let parameter = store
+                .declared_type_links(symbol)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            preflight_contextual_type_graph(
+                store,
+                &host,
+                Some(&globals),
+                target,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+            )
+            .unwrap();
+
+            let expected = match poison {
+                Poison::DeclaredCache => {
+                    let mut links = store.declared_type_links(symbol).unwrap().clone();
+                    links.declared_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+                    assert!(store.set_declared_type_links(symbol, links));
+                    RelationUnavailable::UnsupportedStructuredType(parameter)
+                }
+                Poison::ValueDeclaration => {
+                    assert!(store.set_symbol_declarations(
+                        symbol,
+                        Some(vec![declaration]),
+                        Some(declaration),
+                    ));
+                    RelationUnavailable::UnsupportedUnionConstituent(parameter)
+                }
+                Poison::Declaration => {
+                    assert!(store.set_symbol_declarations(symbol, Some(vec![object]), None));
+                    RelationUnavailable::UnsupportedUnionConstituent(parameter)
+                }
+                Poison::InstantiationTarget => {
+                    let TypeData::TypeParameter(data) =
+                        store.type_payload(parameter).unwrap().data()
+                    else {
+                        panic!("the source query must retain the declared type parameter")
+                    };
+                    let data = data.clone();
+                    assert!(store.set_type_parameter_resolution(
+                        parameter,
+                        data.constraint,
+                        Some(parameter),
+                        data.mapper,
+                        data.resolved_default_type,
+                    ));
+                    RelationUnavailable::UnsupportedStructuredType(parameter)
+                }
+            };
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(store, parameter),
+                match poison {
+                    Poison::ValueDeclaration | Poison::Declaration => Some(symbol),
+                    Poison::DeclaredCache | Poison::InstantiationTarget => None,
+                },
+            );
+            let poisoned_links = store.declared_type_links(symbol).unwrap().clone();
+            let TypeData::TypeParameter(poisoned_data) =
+                store.type_payload(parameter).unwrap().data()
+            else {
+                panic!("poisoning must not replace the type parameter payload")
+            };
+            let poisoned_data = poisoned_data.clone();
+            let poisoned_checks = store.symbol(symbol).unwrap().check_flags();
+            let poisoned_value_declaration = store.symbol(symbol).unwrap().value_declaration();
+            let poisoned_declarations = store
+                .symbol(symbol)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+
+            for global_types in [None, Some(&globals), None, Some(&globals)] {
+                assert_eq!(
+                    preflight_contextual_type_graph(
+                        store,
+                        &host,
+                        global_types,
+                        parameter,
+                        &mut HashSet::new(),
+                        &mut HashSet::new(),
+                    ),
+                    Err(SourceCheckError::RelationUnavailable(expected)),
+                    "{poison:?}",
+                );
+                assert!(
+                    preflight_contextual_type_graph(
+                        store,
+                        &host,
+                        global_types,
+                        target,
+                        &mut HashSet::new(),
+                        &mut HashSet::new(),
+                    )
+                    .is_err(),
+                    "{poison:?}",
+                );
+                assert_eq!(store.declared_type_links(symbol), Some(&poisoned_links));
+                assert!(matches!(
+                    store.type_payload(parameter).map(TypeRecord::data),
+                    Some(TypeData::TypeParameter(data)) if data == &poisoned_data
+                ));
+                assert_eq!(store.symbol(symbol).unwrap().check_flags(), poisoned_checks);
+                assert_eq!(
+                    store.symbol(symbol).unwrap().value_declaration(),
+                    poisoned_value_declaration,
+                );
+                assert_eq!(
+                    store.symbol(symbol).unwrap().declarations(),
+                    Some(poisoned_declarations.as_slice()),
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    ),
+                    before,
+                    "{poison:?}",
+                );
+                assert!(store.type_node_links(object).is_none());
+            }
+        }
     }
 
     #[test]

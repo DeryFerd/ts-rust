@@ -31820,6 +31820,7 @@ mod tests {
             &mut fixture.store,
             &callable,
             &[],
+            None,
         )
         .unwrap()
         .unwrap();

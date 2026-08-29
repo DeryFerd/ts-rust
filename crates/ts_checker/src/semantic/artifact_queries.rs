@@ -3384,29 +3384,9 @@ impl CanonicalCheckerContext<'_> {
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type)
         {
-            let type_ = self.validate_artifact_type(node, type_)?;
-            if !flags.contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
-                || !self.options().intrinsic.strict_null_checks
-            {
-                return Ok(Some(type_));
-            }
-
-            let sentinel = self
-                .store()
-                .intrinsic_bootstrap()
-                .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?
-                .undefined_or_missing_type;
-            if type_ == sentinel
-                || matches!(
-                    self.store().type_payload(type_).map(TypeRecord::data),
-                    Some(TypeData::Union(union)) if union.union.types.contains(&sentinel)
-                )
-            {
-                return Ok(Some(type_));
-            }
-
-            let read_type = self.artifact_union_type(&[type_, sentinel])?;
-            return self.validate_artifact_type(node, read_type).map(Some);
+            return self
+                .optional_property_artifact_type(node, flags, type_)
+                .map(Some);
         }
 
         if super::source_namespaces::has_pure_module_flags(flags)
@@ -3442,7 +3422,9 @@ impl CanonicalCheckerContext<'_> {
         }
 
         if let Some(type_) = self.declaration_file_annotation_type(node, symbol)? {
-            return Ok(Some(type_));
+            return self
+                .optional_property_artifact_type(node, flags, type_)
+                .map(Some);
         }
 
         if flags.intersects(SymbolFlags::EXPORT_VALUE) {
@@ -3480,6 +3462,38 @@ impl CanonicalCheckerContext<'_> {
         }
 
         Ok(None)
+    }
+
+    // Apply declaration-name optionality without changing the stored annotation or value type.
+    fn optional_property_artifact_type(
+        &mut self,
+        node: NodeRef,
+        flags: SymbolFlags,
+        type_: TypeId,
+    ) -> Result<TypeId, CanonicalArtifactQueryError> {
+        let type_ = self.validate_artifact_type(node, type_)?;
+        if !flags.contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+            || !self.options().intrinsic.strict_null_checks
+        {
+            return Ok(type_);
+        }
+
+        let sentinel = self
+            .store()
+            .intrinsic_bootstrap()
+            .ok_or(CanonicalArtifactQueryError::InvalidType { node, type_ })?
+            .undefined_or_missing_type;
+        if type_ == sentinel
+            || matches!(
+                self.store().type_payload(type_).map(TypeRecord::data),
+                Some(TypeData::Union(union)) if union.union.types.contains(&sentinel)
+            )
+        {
+            return Ok(type_);
+        }
+
+        let read_type = self.artifact_union_type(&[type_, sentinel])?;
+        self.validate_artifact_type(node, read_type)
     }
 
     fn type_node_artifact_type(&mut self, node: NodeRef) -> Result<TypeId, DeclaredTypeError> {
@@ -10568,6 +10582,211 @@ mod tests {
                     .and_then(|links| links.resolved_symbol),
                 Some(unknown)
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare cold reads, raw annotations, and warm state in each strictness mode.
+    fn declaration_file_optional_property_names_preserve_raw_annotations_and_lazy_siblings() {
+        let parsed = parse_source_file(concat!(
+            "interface Model<T> { value?: T; fixed?: string; required: T; ",
+            "unused?: T extends string ? number : boolean; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        for (index, (strict_null_checks, exact_optional_property_types)) in
+            [(true, true), (true, false), (false, false)]
+                .into_iter()
+                .enumerate()
+        {
+            let file = FileId::new(6_260 + u32::try_from(index).unwrap());
+            let mut context = context_with_source_kind(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+                true,
+            );
+            let properties = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let (name, annotation) = match &record.data {
+                        NodeData::PropertySignatureDeclaration(property) => {
+                            (property.name, property.type_)
+                        }
+                        NodeData::PropertyDeclaration(property) => (property.name, property.type_?),
+                        _ => return None,
+                    };
+                    let declaration = NodeRef::new(parsed.arena.id(), file, node);
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, name),
+                        NodeRef::new(parsed.arena.id(), file, annotation),
+                        context.file(file).unwrap().1.symbol(declaration).unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(properties.len(), 4);
+            let parameter = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::TypeParameter).then(|| {
+                        context
+                            .file(file)
+                            .unwrap()
+                            .1
+                            .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                            .unwrap()
+                    })
+                })
+                .unwrap();
+            let (string, undefined, missing, sentinel) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.string_type,
+                    bootstrap.undefined_type,
+                    bootstrap.missing_type,
+                    bootstrap.undefined_or_missing_type,
+                )
+            };
+            assert_ne!(undefined, missing);
+            assert_eq!(
+                sentinel,
+                if exact_optional_property_types {
+                    missing
+                } else {
+                    undefined
+                }
+            );
+            for (name, annotation, symbol) in &properties {
+                assert!(context.store().type_node_links(*name).is_none());
+                assert!(context.store().type_node_links(*annotation).is_none());
+                assert!(context.store().value_symbol_links(*symbol).is_none());
+            }
+
+            let mut results = Vec::new();
+            for (name, annotation, symbol) in &properties[..3] {
+                let NodeData::Identifier(identifier) = &parsed.arena.get(name.node).unwrap().data
+                else {
+                    panic!("the property name must be an identifier")
+                };
+                let optional = identifier.text != "required";
+                let read_type = context.get_type_at_location(*name).unwrap();
+                let raw_type = context.get_type_from_type_node(*annotation).unwrap();
+                let (expected_raw, expected_text) = if identifier.text == "fixed" {
+                    (
+                        string,
+                        if strict_null_checks {
+                            "string | undefined"
+                        } else {
+                            "string"
+                        },
+                    )
+                } else {
+                    (
+                        context
+                            .store()
+                            .declared_type_links(parameter)
+                            .unwrap()
+                            .declared_type
+                            .unwrap(),
+                        if strict_null_checks && optional {
+                            "T | undefined"
+                        } else {
+                            "T"
+                        },
+                    )
+                };
+                assert_eq!(raw_type, expected_raw);
+                assert_eq!(context.type_to_string(read_type).unwrap(), expected_text);
+                if strict_null_checks && optional {
+                    let TypeData::Union(union) =
+                        context.store().type_payload(read_type).unwrap().data()
+                    else {
+                        panic!("an optional declaration name must have a canonical union")
+                    };
+                    assert_eq!(union.union.types.len(), 2);
+                    assert!(union.union.types.contains(&raw_type));
+                    assert!(union.union.types.contains(&sentinel));
+                    assert!(
+                        !union
+                            .union
+                            .types
+                            .contains(&if exact_optional_property_types {
+                                undefined
+                            } else {
+                                missing
+                            })
+                    );
+                } else {
+                    assert_eq!(read_type, raw_type);
+                }
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(*annotation)
+                        .is_none_or(|links| {
+                            links.resolved_type == Some(raw_type)
+                                && links.outer_type_parameters.is_none()
+                        })
+                );
+                assert!(context.store().value_symbol_links(*symbol).is_none());
+                results.push((*name, *annotation, read_type, raw_type));
+            }
+
+            let source = context.source_file(file).unwrap();
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.type_alias_len(),
+                        store.mapper_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.signature_len(),
+                        store.index_info_len(),
+                        store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.source_file_links(source).cloned(),
+                    properties
+                        .iter()
+                        .map(|(name, annotation, symbol)| {
+                            (
+                                store.type_node_links(*name).cloned(),
+                                store.type_node_links(*annotation).cloned(),
+                                store.value_symbol_links(*symbol).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let warm = snapshot(&context);
+            for _ in 0..2 {
+                for (name, annotation, read_type, raw_type) in &results {
+                    assert_eq!(context.get_type_at_location(*name), Ok(*read_type));
+                    assert_eq!(context.get_type_from_type_node(*annotation), Ok(*raw_type));
+                }
+                assert_eq!(snapshot(&context), warm);
+            }
+            let (unused_name, unused_annotation, unused_symbol) = properties[3];
+            assert!(context.store().type_node_links(unused_name).is_none());
+            assert!(context.store().type_node_links(unused_annotation).is_none());
+            assert!(context.store().value_symbol_links(unused_symbol).is_none());
+            assert!(
+                context
+                    .store()
+                    .source_file_links(source)
+                    .is_none_or(|links| !links.type_checked)
+            );
+            assert!(context.diagnostics().is_empty());
         }
     }
 

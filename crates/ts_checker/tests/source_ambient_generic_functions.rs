@@ -1,7 +1,7 @@
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName, SemanticSymbolId,
+    EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnosticRange, CanonicalCheckerOptions,
@@ -1013,61 +1013,384 @@ fn optional_generic_ambient_functions_preserve_arity_and_inferred_returns() {
     }
 }
 
+fn assert_ambient_generic_typed_boundary(source: &str, file: FileId) {
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+    let result = context.check_source_file(file);
+    assert!(
+        matches!(&result, Err(SourceCheckError::Unsupported(_))),
+        "fixture unexpectedly escaped its typed boundary: {source}; actual result: {result:?}",
+    );
+    assert!(context.diagnostics().is_empty());
+    assert!(!is_type_checked(&context, file));
+}
+
 #[test]
-fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundaries() {
-    for (index, (source, declaration_file, module_state)) in [
-        (
-            "declare function constant<const T>(value: T): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function shaped<T extends { id: number }>(value: T): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function initialized<T>(value: T = undefined): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function withThis<T>(this: T, value: T): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function destructured<T>([value]: T[]): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function merged<T>(value: T): T;\
-             declare function merged<T>(value: T): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare namespace Nested { function member<T>(value: T): T; }",
-            false,
-            CanonicalModuleState::Script,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let parsed = parse_source_file(source);
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let file = FileId::new(2_310 + u32::try_from(index).unwrap());
-        let mut context = checker_context(&parsed, file, declaration_file, module_state);
-        assert!(
-            matches!(
-                context.check_source_file(file),
-                Err(SourceCheckError::Unsupported(_))
-            ),
-            "fixture unexpectedly escaped its typed boundary: {source}",
+fn ambient_generic_boundary_const_type_parameter() {
+    assert_ambient_generic_typed_boundary(
+        "declare function constant<const T>(value: T): T;",
+        FileId::new(2_310),
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the constraint, signature, and replay checks together.
+fn ambient_generic_object_constraint_retains_declared_members_and_replays() {
+    let parsed =
+        parse_source_file("declare function shaped<T extends { id: number }>(value: T): T;");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_311);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+    let function = function_parts(&parsed, file, "shaped");
+    assert_eq!(function.type_parameters.len(), 1);
+    assert_eq!(function.parameters.len(), 1);
+    let owner = merged_symbol(&context, file, function.declaration);
+    let type_parameter_symbol = merged_symbol(&context, file, function.type_parameters[0]);
+    let parameter_symbol = merged_symbol(&context, file, function.parameters[0]);
+    let annotation = parameter_type(&parsed, file, function.parameters[0]);
+    let (constraint_node, default_node) =
+        type_parameter_bounds(&parsed, file, function.type_parameters[0]);
+    let constraint_node = constraint_node.unwrap();
+    assert_eq!(default_node, None);
+    let constraint_symbol = merged_symbol(&context, file, constraint_node);
+    let NodeData::TypeLiteralNode(literal) = &parsed.arena.get(constraint_node.node).unwrap().data
+    else {
+        panic!("the constraint must retain its declared type literal")
+    };
+    let [property_node] = literal.members.nodes.as_slice() else {
+        panic!("the constraint must declare exactly one property")
+    };
+    let property_node = NodeRef::new(parsed.arena.id(), file, *property_node);
+    let property_symbol = merged_symbol(&context, file, property_node);
+    let NodeData::PropertyDeclaration(property) =
+        &parsed.arena.get(property_node.node).unwrap().data
+    else {
+        panic!("id must be a property declaration")
+    };
+    let property_name = NodeRef::new(parsed.arena.id(), file, property.name);
+    let property_annotation = NodeRef::new(parsed.arena.id(), file, property.type_.unwrap());
+    assert!(property.postfix_token.is_none());
+    assert_eq!(
+        parsed.arena.get(property_annotation.node).unwrap().kind,
+        SyntaxKind::NumberKeyword,
+    );
+    assert!(!is_type_checked(&context, file));
+    assert!(
+        context
+            .store()
+            .signature_links(function.declaration)
+            .is_none()
+    );
+    assert!(
+        context
+            .store()
+            .declared_type_links(type_parameter_symbol)
+            .is_none()
+    );
+    assert!(context.store().value_symbol_links(owner).is_none());
+
+    context.check_source_file(file).unwrap();
+
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+    assert!(is_type_checked(&context, file));
+    let (number, no_constraint) = {
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        (bootstrap.number_type, bootstrap.no_constraint_type)
+    };
+    let type_parameter = context
+        .store()
+        .declared_type_links(type_parameter_symbol)
+        .and_then(|links| links.declared_type)
+        .unwrap();
+    assert_eq!(
+        type_parameters_for_function(&context, file, &function),
+        [type_parameter],
+    );
+    let parameter_symbol_record = context.store().symbol(type_parameter_symbol).unwrap();
+    assert_eq!(parameter_symbol_record.flags(), SymbolFlags::TYPE_PARAMETER);
+    assert_eq!(
+        parameter_symbol_record.declarations(),
+        Some(&[function.type_parameters[0]][..]),
+    );
+    let parameter_record = context.store().type_payload(type_parameter).unwrap();
+    assert_eq!(parameter_record.flags(), TypeFlags::TYPE_PARAMETER);
+    assert_eq!(parameter_record.symbol(), Some(type_parameter_symbol));
+    let TypeData::TypeParameter(parameter) = parameter_record.data() else {
+        panic!("T must retain its canonical type-parameter record")
+    };
+    let constraint = parameter.constraint.unwrap();
+    assert_eq!(
+        parameter.constrained.resolved_base_constraint,
+        Some(constraint),
+    );
+    assert_eq!(parameter.resolved_default_type, Some(no_constraint));
+    assert_eq!(parameter.target, None);
+    assert_eq!(parameter.mapper, None);
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(constraint_node)
+            .unwrap()
+            .resolved_type,
+        Some(constraint),
+    );
+
+    let constraint_record = context.store().type_payload(constraint).unwrap();
+    assert_eq!(constraint_record.flags(), TypeFlags::OBJECT);
+    assert_eq!(
+        constraint_record.object_flags(),
+        ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED,
+    );
+    assert_eq!(constraint_record.symbol(), Some(constraint_symbol));
+    assert_eq!(constraint_record.alias(), None);
+    let TypeData::Object(object) = constraint_record.data() else {
+        panic!("the direct constraint must be its declared anonymous object")
+    };
+    assert_eq!(object.target, None);
+    assert_eq!(object.mapper, None);
+    assert_eq!(
+        object.structured.properties.as_deref(),
+        Some(&[property_symbol][..]),
+    );
+    assert_eq!(object.structured.call_signature_count, 0);
+    assert!(object.structured.signatures.is_none());
+    assert!(object.structured.index_infos.is_none());
+    let members = object.structured.members.unwrap();
+    assert_eq!(
+        context.store().symbol(constraint_symbol).unwrap().members(),
+        Some(members),
+    );
+    let members = context.store().symbol_table(members).unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members.get_source("id"), Some(property_symbol));
+    let property_record = context.store().symbol(property_symbol).unwrap();
+    assert_eq!(property_record.flags(), SymbolFlags::PROPERTY);
+    assert_eq!(property_record.name().as_utf8(), Some("id"));
+    assert_eq!(property_record.declarations(), Some(&[property_node][..]));
+    assert_eq!(property_record.value_declaration(), Some(property_node));
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(property_symbol)
+            .unwrap()
+            .resolved_type,
+        Some(number),
+    );
+
+    let signature = signature_for_declaration(&context, function.declaration);
+    let callable = context
+        .store()
+        .value_symbol_links(owner)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let callable_record = context.store().type_payload(callable).unwrap();
+    assert_eq!(callable_record.flags(), TypeFlags::OBJECT);
+    assert_eq!(
+        callable_record.object_flags(),
+        ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED,
+    );
+    assert_eq!(callable_record.symbol(), Some(owner));
+    assert_eq!(callable_record.alias(), None);
+    let TypeData::Object(object) = callable_record.data() else {
+        panic!("shaped must retain its canonical callable object")
+    };
+    assert_eq!(
+        object.structured.signatures.as_deref(),
+        Some(&[signature][..]),
+    );
+    assert_eq!(object.structured.call_signature_count, 1);
+    let signature_record = context.store().signature(signature).unwrap();
+    assert_eq!(signature_record.declaration(), Some(function.declaration));
+    assert_eq!(signature_record.type_parameters(), [type_parameter]);
+    assert_eq!(signature_record.parameters(), [parameter_symbol]);
+    assert_eq!(
+        signature_record.resolved_return_type(),
+        Some(type_parameter)
+    );
+    assert_eq!(signature_record.min_argument_count(), 1);
+    assert_eq!(signature_record.target(), None);
+    assert_eq!(signature_record.mapper(), None);
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(parameter_symbol)
+            .unwrap()
+            .resolved_type,
+        Some(type_parameter),
+    );
+    for node in [annotation, function.return_type] {
+        assert_eq!(
+            context.store().type_node_links(node).unwrap().resolved_type,
+            Some(type_parameter),
         );
-        assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(node)
+                .unwrap()
+                .resolved_symbol,
+            Some(type_parameter_symbol),
+        );
+        assert_eq!(
+            context.get_type_from_type_node(node).unwrap(),
+            type_parameter,
+        );
     }
+    assert_eq!(
+        context.get_type_from_type_node(constraint_node).unwrap(),
+        constraint,
+    );
+    assert_eq!(
+        context
+            .get_type_from_type_node(property_annotation)
+            .unwrap(),
+        number,
+    );
+    assert_eq!(context.get_type_at_location(property_name).unwrap(), number);
+    assert_eq!(
+        context.get_symbol_at_location(property_name).unwrap(),
+        Some(property_symbol),
+    );
+    assert_eq!(
+        context.get_return_type_of_signature(signature).unwrap(),
+        type_parameter,
+    );
+
+    let snapshot = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        let signature = store.signature(signature).unwrap();
+        let TypeData::TypeParameter(parameter) = store.type_payload(type_parameter).unwrap().data()
+        else {
+            panic!("T must keep its type-parameter payload")
+        };
+        let TypeData::Object(constraint_object) = store.type_payload(constraint).unwrap().data()
+        else {
+            panic!("the constraint must keep its object payload")
+        };
+        let TypeData::Object(callable_object) = store.type_payload(callable).unwrap().data() else {
+            panic!("shaped must keep its callable payload")
+        };
+        (
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+            ),
+            (
+                [type_parameter, constraint, callable].map(|type_| {
+                    let record = store.type_payload(type_).unwrap();
+                    (
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                    )
+                }),
+                parameter.clone(),
+                constraint_object.clone(),
+                callable_object.clone(),
+            ),
+            (
+                signature.declaration(),
+                signature.type_parameters().to_vec(),
+                signature.parameters().to_vec(),
+                signature.resolved_return_type(),
+                signature.target(),
+                signature.mapper(),
+            ),
+            store.signature_links(function.declaration).cloned(),
+            store.declared_type_links(type_parameter_symbol).cloned(),
+            [owner, parameter_symbol, property_symbol]
+                .map(|symbol| store.value_symbol_links(symbol).cloned()),
+            [
+                constraint_node,
+                annotation,
+                function.return_type,
+                property_annotation,
+            ]
+            .map(|node| {
+                (
+                    store.type_node_links(node).cloned(),
+                    store.symbol_node_links(node).cloned(),
+                )
+            }),
+            is_type_checked(context, file),
+            context.diagnostics().clone(),
+        )
+    };
+    let warm = snapshot(&context);
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        signature_for_declaration(&context, function.declaration),
+        signature,
+    );
+    assert_eq!(
+        context.get_type_at_location(function.declaration).unwrap(),
+        callable,
+    );
+    assert_eq!(
+        context.get_type_from_type_node(constraint_node).unwrap(),
+        constraint,
+    );
+    assert_eq!(
+        context
+            .get_type_at_location(function.parameters[0])
+            .unwrap(),
+        type_parameter,
+    );
+    assert_eq!(
+        context.get_return_type_of_signature(signature).unwrap(),
+        type_parameter,
+    );
+    assert_eq!(snapshot(&context), warm);
+    assert!(context.diagnostics().is_empty());
+    assert!(is_type_checked(&context, file));
+}
+
+#[test]
+fn ambient_generic_boundary_parameter_initializer() {
+    assert_ambient_generic_typed_boundary(
+        "declare function initialized<T>(value: T = undefined): T;",
+        FileId::new(2_312),
+    );
+}
+
+#[test]
+fn ambient_generic_boundary_this_parameter() {
+    assert_ambient_generic_typed_boundary(
+        "declare function withThis<T>(this: T, value: T): T;",
+        FileId::new(2_313),
+    );
+}
+
+#[test]
+fn ambient_generic_boundary_array_binding() {
+    assert_ambient_generic_typed_boundary(
+        "declare function destructured<T>([value]: T[]): T;",
+        FileId::new(2_314),
+    );
+}
+
+#[test]
+fn ambient_generic_boundary_merged_declarations() {
+    assert_ambient_generic_typed_boundary(
+        "declare function merged<T>(value: T): T;\
+         declare function merged<T>(value: T): T;",
+        FileId::new(2_315),
+    );
+}
+
+#[test]
+fn ambient_generic_boundary_namespace_member() {
+    assert_ambient_generic_typed_boundary(
+        "declare namespace Nested { function member<T>(value: T): T; }",
+        FileId::new(2_316),
+    );
 }

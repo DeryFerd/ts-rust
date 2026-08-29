@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use ts_ast::{NodeData, NodeFlags, NodeRef, SyntaxKind, TypeAliasDeclarationData};
 use ts_binder::{
@@ -31,6 +32,7 @@ use super::{
         record_conditional_alias_declaration, validate_conditional_alias_declaration,
         validate_conditional_reference_result,
     },
+    constraints::{get_base_constraint_of_type, get_constraint_of_type},
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, get_declared_class_interface_or_type_parameter,
@@ -89,11 +91,14 @@ use super::{
     source_callables::{
         self, CallableTypePredicatePlan, PendingSourceCallableParameterTypes,
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableError,
-        SourceCallableFamily,
+        SourceCallableFamily, SourceCallablePlan,
     },
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
-    store::{SourceCallableInferredReturnCycle, SourceNodeParent},
+    store::{
+        ResolvedSourceCallableTypeParameter, SourceCallableInferredReturnCycle,
+        SourceCallableTypeParameterProvenance, SourceNodeParent,
+    },
     structured_members,
     template_types::{StringMappingKind, TemplateTypeError},
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
@@ -360,6 +365,693 @@ impl ConstructorAnnotationProof {
 }
 
 impl TypeQueryPlan {
+    fn source_callable_results_are_exact(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        callable: &SourceCallablePlan,
+        parameters: &[ResolvedSourceCallableTypeParameter],
+        results: &BTreeMap<NodeRef, TypeId>,
+    ) -> bool {
+        if results.keys().any(|node| !self.nodes.contains(node)) {
+            return false;
+        }
+        // Return-only dependencies may become warm after input publication.
+        // Check their planned bindings too, without requiring an old result.
+        self.nodes.iter().all(|node| {
+            self.cached_source_callable_type(store, callable, parameters, *node)
+                .is_ok_and(|cached| {
+                    results
+                        .get(node)
+                        .is_none_or(|expected| cached == Some(*expected))
+                })
+        })
+    }
+
+    fn cached_source_callable_type(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        callable: &SourceCallablePlan,
+        parameters: &[ResolvedSourceCallableTypeParameter],
+        root: NodeRef,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        self.cached_source_callable_type_worker(
+            store,
+            callable,
+            parameters,
+            root,
+            &mut HashSet::new(),
+        )
+    }
+
+    /// Replays the existing plan's cache edges. This does not resolve names or
+    /// decide which annotation syntax the query supports.
+    #[allow(clippy::too_many_lines)]
+    fn cached_source_callable_type_worker(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        callable: &SourceCallablePlan,
+        parameters: &[ResolvedSourceCallableTypeParameter],
+        node: NodeRef,
+        active: &mut HashSet<NodeRef>,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        if !self.nodes.contains(&node) || !active.insert(node) {
+            return Err(invalid());
+        }
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(&invalid)?;
+        let child = |child, active: &mut HashSet<NodeRef>| {
+            self.cached_source_callable_type_worker(store, callable, parameters, child, active)
+        };
+        let cached = store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let mut needs_node_cache = true;
+        let expected = if let Some(reference) = self.references.get(&node) {
+            let symbol = store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol);
+            if symbol.is_some() != cached.is_some()
+                || symbol.is_some_and(|symbol| symbol != reference.symbol)
+                || store.get_merged_symbol(reference.symbol) != Some(reference.symbol)
+                || reference.import_alias.is_some_and(|alias| {
+                    store.alias_symbol_links(alias).is_none_or(|links| {
+                        links.alias_target != super::AliasTargetState::Resolved(reference.symbol)
+                    })
+                })
+            {
+                return Err(invalid());
+            }
+            let arguments = reference
+                .type_arguments
+                .iter()
+                .map(|node| child(*node, active))
+                .collect::<Result<Option<Vec<_>>, _>>()?;
+            if cached.is_none() {
+                None
+            } else if reference.arity != PlannedTypeReferenceArity::Valid {
+                Some(bootstrap.error_type)
+            } else if let Some(parameter) = parameters
+                .iter()
+                .find(|parameter| parameter.provenance.symbol == reference.symbol)
+            {
+                if !reference.type_arguments.is_empty()
+                    || cached_ordinary_type_parameter_owner(
+                        store,
+                        parameter.provenance.type_parameter,
+                    ) != Some(reference.symbol)
+                {
+                    return Err(invalid());
+                }
+                Some(parameter.provenance.type_parameter)
+            } else if let Some(target) = reference.global_array_target {
+                let [argument] = arguments.as_deref().ok_or_else(&invalid)? else {
+                    return Err(invalid());
+                };
+                Self::cached_source_callable_array(store, target, *argument, cached, node)?
+            } else if reference.direct_generic {
+                let value = cached.ok_or_else(&invalid)?;
+                let reference_type =
+                    validate_direct_generic_reference(store, value).map_err(|_| invalid())?;
+                let mut arguments = arguments.ok_or_else(&invalid)?;
+                if store
+                    .declared_type_links(reference.symbol)
+                    .and_then(|links| links.declared_type)
+                    != Some(reference_type.target)
+                    || reference_type.type_arguments.get(..arguments.len())
+                        != Some(arguments.as_slice())
+                    || reference_type.type_arguments.len()
+                        != arguments.len() + reference.direct_generic_defaults.len()
+                {
+                    return Err(invalid());
+                }
+                let Some(TypeData::Interface(target)) = store
+                    .type_payload(reference_type.target)
+                    .map(TypeRecord::data)
+                else {
+                    return Err(invalid());
+                };
+                let target_parameters = target
+                    .reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .ok_or_else(&invalid)?;
+                if target_parameters.len() != reference_type.type_arguments.len() {
+                    return Err(invalid());
+                }
+                for constraint in &reference.direct_generic_constraints {
+                    let parameter = target_parameters
+                        .iter()
+                        .copied()
+                        .find(|parameter| {
+                            cached_ordinary_type_parameter_owner(store, *parameter)
+                                == Some(constraint.parameter)
+                        })
+                        .ok_or_else(&invalid)?;
+                    let expected = child(constraint.node, active)?.ok_or_else(&invalid)?;
+                    if !matches!(store.type_payload(parameter).map(TypeRecord::data),
+                        Some(TypeData::TypeParameter(data)) if data.constraint == Some(expected))
+                    {
+                        return Err(invalid());
+                    }
+                }
+                for default in &reference.direct_generic_defaults {
+                    let index = arguments.len();
+                    let parameter = target_parameters.get(index).copied().ok_or_else(&invalid)?;
+                    if cached_ordinary_type_parameter_owner(store, parameter)
+                        != Some(default.parameter)
+                    {
+                        return Err(invalid());
+                    }
+                    let raw = child(default.node, active)?.ok_or_else(&invalid)?;
+                    if !matches!(store.type_payload(parameter).map(TypeRecord::data),
+                        Some(TypeData::TypeParameter(data)) if data.resolved_default_type == Some(raw))
+                    {
+                        return Err(invalid());
+                    }
+                    let argument = if let Some(earlier) = default.earlier_parameter {
+                        let earlier_index = target_parameters[..index]
+                            .iter()
+                            .position(|parameter| {
+                                cached_ordinary_type_parameter_owner(store, *parameter)
+                                    == Some(earlier)
+                            })
+                            .ok_or_else(&invalid)?;
+                        if target_parameters[earlier_index] != raw {
+                            return Err(invalid());
+                        }
+                        arguments[earlier_index]
+                    } else {
+                        raw
+                    };
+                    arguments.push(argument);
+                }
+                if reference_type.type_arguments != arguments {
+                    return Err(invalid());
+                }
+                Some(value)
+            } else if let Some(alias) = self.aliases.get(&reference.symbol) {
+                let declared = child(alias.type_node, active)?.ok_or_else(&invalid)?;
+                let links = store
+                    .type_alias_links(reference.symbol)
+                    .ok_or_else(&invalid)?;
+                if links.declared_type != Some(declared) || links.is_constructor_declared_property {
+                    return Err(invalid());
+                }
+                if alias.type_parameters.is_empty() {
+                    if links.type_parameters.is_some() || links.instantiations.is_some() {
+                        return Err(invalid());
+                    }
+                    Some(declared)
+                } else {
+                    let alias_parameters = links.type_parameters.as_deref().ok_or_else(&invalid)?;
+                    if alias_parameters.len() != alias.type_parameters.len()
+                        || alias_parameters.iter().zip(&alias.type_parameters).any(
+                            |(type_, planned)| {
+                                cached_ordinary_type_parameter_owner(store, *type_)
+                                    != Some(planned.symbol)
+                                    || !store.source_declaration_belongs_to_symbol(
+                                        planned.declaration,
+                                        planned.symbol,
+                                    )
+                            },
+                        )
+                    {
+                        return Err(invalid());
+                    }
+                    let provided = arguments.ok_or_else(&invalid)?;
+                    if declared == bootstrap.intrinsic_marker_type
+                        && symbol_is_string_mapping_intrinsic(store, reference.symbol)
+                    {
+                        let [argument] = provided.as_slice() else {
+                            return Err(invalid());
+                        };
+                        store
+                            .cached_resolved_string_mapping_type(reference.symbol, *argument)
+                            .map_err(|_| invalid())?
+                    } else {
+                        let identity = reference
+                            .alias_owner
+                            .map(|owner| {
+                                let metadata = self.aliases.get(&owner).ok_or_else(&invalid)?;
+                                let links = store.type_alias_links(owner).ok_or_else(&invalid)?;
+                                let arguments =
+                                    links.type_parameters.as_deref().unwrap_or_default();
+                                if metadata.type_parameters.len() != arguments.len()
+                                    || metadata.type_parameters.iter().zip(arguments).any(
+                                        |(planned, type_)| {
+                                            cached_ordinary_type_parameter_owner(store, *type_)
+                                                != Some(planned.symbol)
+                                        },
+                                    )
+                                {
+                                    return Err(invalid());
+                                }
+                                let global = store
+                                    .symbol_store()
+                                    .assigned_global_symbol_id(owner)
+                                    .ok_or_else(&invalid)?;
+                                Ok((owner, global, arguments))
+                            })
+                            .transpose()?;
+                        let key = type_alias_instantiation_cache_key(
+                            &provided,
+                            identity.map(|(_, global, arguments)| (global, arguments)),
+                        );
+                        let value = links
+                            .instantiations
+                            .as_ref()
+                            .and_then(|instantiations| instantiations.get(&key))
+                            .copied()
+                            .ok_or_else(&invalid)?;
+                        let mut arguments = provided;
+                        for parameter in alias.type_parameters.iter().skip(arguments.len()) {
+                            let default =
+                                child(parameter.default_type.ok_or_else(&invalid)?, active)?
+                                    .ok_or_else(&invalid)?;
+                            let substituted = super::instantiate::cached_instantiation_with_vector(
+                                store,
+                                default,
+                                &alias_parameters[..arguments.len()],
+                                &arguments,
+                                callable.array_targets,
+                                None,
+                            )
+                            .map_err(|_| invalid())?
+                            .ok_or_else(&invalid)?;
+                            arguments.push(substituted);
+                        }
+                        let result = super::instantiate::cached_instantiation_with_vector(
+                            store,
+                            declared,
+                            alias_parameters,
+                            &arguments,
+                            callable.array_targets,
+                            identity.map(|(owner, _, arguments)| (owner, arguments)),
+                        )
+                        .map_err(|_| invalid())?;
+                        if result != Some(value) {
+                            return Err(invalid());
+                        }
+                        Some(value)
+                    }
+                }
+            } else {
+                let declared = store
+                    .declared_type_links(reference.symbol)
+                    .and_then(|links| links.declared_type)
+                    .ok_or_else(&invalid)?;
+                let record = store.type_payload(declared).ok_or_else(&invalid)?;
+                if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+                    enums::validate_enum_type_union_constituent(store, declared)
+                        .ok_or_else(&invalid)?;
+                    Some(match record.data() {
+                        TypeData::Literal(literal) => literal.regular_type,
+                        _ => declared,
+                    })
+                } else {
+                    if record.symbol() != Some(reference.symbol)
+                        || matches!(record.data(), TypeData::TypeParameter(_))
+                            && cached_ordinary_type_parameter_owner(store, declared)
+                                != Some(reference.symbol)
+                    {
+                        return Err(invalid());
+                    }
+                    Some(declared)
+                }
+            }
+        } else if let Some(array) = self.arrays.get(&node) {
+            if let Some(fallback) = array.fallback {
+                if preflight_generic_global_type_target(store, array.target)
+                    .ok()
+                    .flatten()
+                    != Some(fallback)
+                {
+                    return Err(invalid());
+                }
+                Some(fallback)
+            } else if let Some(element) = child(array.element_type, active)? {
+                Self::cached_source_callable_array(store, array.target, element, cached, node)?
+            } else {
+                None
+            }
+        } else if let Some(tuple) = self.tuples.get(&node).or_else(|| {
+            self.tuples
+                .values()
+                .find(|tuple| tuple.readonly_operator() == Some(node))
+        }) {
+            let elements = if tuple.requires_element_resolution() {
+                tuple
+                    .elements()
+                    .iter()
+                    .map(|element| child(element.type_node(), active))
+                    .collect::<Result<Option<Vec<_>>, _>>()?
+            } else {
+                Some(Vec::new())
+            };
+            Self::cached_source_callable_tuple(
+                store,
+                callable.array_targets,
+                tuple,
+                elements.as_deref(),
+            )?
+        } else if let Some(target) = self.keyofs.get(&node) {
+            if let Some(target) = child(*target, active)? {
+                let plan = plan_nongeneric_keyof_type(store, target).map_err(|_| invalid())?;
+                cached_nongeneric_keyof_type(store, &plan).map_err(|_| invalid())?
+            } else {
+                None
+            }
+        } else if let Some(union) = self.unions.get(&node) {
+            let constituents = union
+                .types
+                .iter()
+                .map(|node| child(*node, active))
+                .collect::<Result<Option<Vec<_>>, _>>()?;
+            if let Some(constituents) = constituents {
+                let alias = union.alias_symbol.map(|symbol| {
+                    (
+                        symbol,
+                        store
+                            .type_alias_links(symbol)
+                            .and_then(|links| links.type_parameters.as_deref())
+                            .unwrap_or_default(),
+                    )
+                });
+                store
+                    .cached_literal_union_type_with_alias(
+                        &constituents,
+                        alias,
+                        callable.array_targets,
+                    )
+                    .map_err(type_construction_error)?
+            } else {
+                None
+            }
+        } else if let Some(template) = self.templates.get(&node) {
+            let types = template
+                .types
+                .iter()
+                .map(|node| child(*node, active))
+                .collect::<Result<Option<Vec<_>>, _>>()?;
+            if let Some(types) = types {
+                store
+                    .cached_resolved_template_literal_type(&template.texts, &types)
+                    .map_err(|_| invalid())?
+            } else {
+                None
+            }
+        } else if let Some(literal) = self.literals.get(&node) {
+            match literal {
+                PlannedLiteralType::Null => {
+                    needs_node_cache = false;
+                    Some(bootstrap.null_type)
+                }
+                PlannedLiteralType::String(value) => bootstrap.cached_string_literal_type(value),
+                PlannedLiteralType::Number { value, .. } => {
+                    bootstrap.cached_number_literal_type(*value)
+                }
+                PlannedLiteralType::BigInt { value, .. } => {
+                    bootstrap.cached_bigint_literal_type(value)
+                }
+                PlannedLiteralType::Boolean(value) => Some(if *value {
+                    bootstrap.regular_true_type
+                } else {
+                    bootstrap.regular_false_type
+                }),
+            }
+        } else if store.source_node_kind(node) == Some(SyntaxKind::ParenthesizedType) {
+            needs_node_cache = false;
+            let children = store.source_direct_children(node).ok_or_else(&invalid)?;
+            let [inner] = children.as_slice() else {
+                return Err(invalid());
+            };
+            child(*inner, active)?
+        } else {
+            needs_node_cache = !store.source_node_kind(node).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    SyntaxKind::AnyKeyword
+                        | SyntaxKind::UnknownKeyword
+                        | SyntaxKind::StringKeyword
+                        | SyntaxKind::NumberKeyword
+                        | SyntaxKind::BigIntKeyword
+                        | SyntaxKind::BooleanKeyword
+                        | SyntaxKind::SymbolKeyword
+                        | SyntaxKind::VoidKeyword
+                        | SyntaxKind::UndefinedKeyword
+                        | SyntaxKind::NullKeyword
+                        | SyntaxKind::NeverKeyword
+                        | SyntaxKind::ObjectKeyword
+                        | SyntaxKind::IntrinsicKeyword
+                )
+            });
+            source_callables::cached_annotation_identity(store, node, false)
+        };
+        if store.type_node_links(node).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && (links.outer_type_parameters.is_some()
+                    || links.resolved_type.is_none()
+                    || links.resolved_type != expected)
+        }) || expected.is_some_and(|type_| store.type_payload(type_).is_none())
+            || !self.references.contains_key(&node)
+                && !self.jsdoc_imports.contains_key(&node)
+                && store
+                    .symbol_node_links(node)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return Err(invalid());
+        }
+        if let Some(type_) = cached {
+            if let Some(object) = self.type_literals.get(&node) {
+                if !matches!(object_members::type_literal_state(store, object),
+                    Ok(Some(PropertyObjectState::Resolved(actual) | PropertyObjectState::EmptyBootstrap(actual)))
+                        if actual == type_)
+                {
+                    return Err(invalid());
+                }
+                let mut properties = Vec::with_capacity(object.properties.len());
+                for property in &object.properties {
+                    let type_ = if object
+                        .methods
+                        .iter()
+                        .any(|method| method.symbol == property.symbol)
+                    {
+                        store
+                            .value_symbol_links(property.symbol)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or_else(&invalid)?
+                    } else {
+                        child(property.type_node, active)?.ok_or_else(&invalid)?
+                    };
+                    properties.push(type_);
+                }
+                object_members::validate_resolved_property_types(store, object, &properties)
+                    .map_err(property_object_error)?;
+            }
+            if let Some(function) = self.functions.get(&node)
+                && !matches!(functions::function_type_state(store, function, false),
+                    Ok(functions::FunctionTypeState::Resolved { type_: actual, .. }) if actual == type_)
+            {
+                return Err(invalid());
+            }
+            if self.constructors.contains_key(&node)
+                && !matches!(
+                    validate_stored_callable_set(store, type_),
+                    StoredCallableSetValidation::Valid { .. }
+                )
+            {
+                return Err(invalid());
+            }
+            if self.conditionals.contains_key(&node) {
+                conditional_query_alias(store, node).map_err(|_| invalid())?;
+            }
+            if self.mapped_types.contains_key(&node) {
+                store
+                    .validate_deferred_mapped_type(type_)
+                    .map_err(|_| invalid())?;
+            }
+            if let Some(query) = self.type_queries.get(&node)
+                && (store
+                    .symbol_node_links(query.name)
+                    .and_then(|links| links.resolved_symbol)
+                    != Some(query.symbol)
+                    || query.type_.is_some_and(|expected| expected != type_))
+            {
+                return Err(invalid());
+            }
+            if let Some(import) = self.jsdoc_imports.get(&node)
+                && store
+                    .symbol_node_links(import.imported_name)
+                    .and_then(|links| links.resolved_symbol)
+                    != Some(import.target_symbol)
+            {
+                return Err(invalid());
+            }
+        }
+        active.remove(&node);
+        if needs_node_cache && cached.is_none() {
+            Ok(None)
+        } else {
+            Ok(expected)
+        }
+    }
+
+    fn cached_source_callable_array(
+        store: &CanonicalTypeMapperStore,
+        target: TypeId,
+        element: TypeId,
+        cached: Option<TypeId>,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        validate_generic_global_type_instantiation(store, target, cached).map_err(|_| invalid())?;
+        if preflight_generic_global_type_target(store, target)
+            .map_err(|_| invalid())?
+            .is_none()
+        {
+            let Some(TypeData::TypeReference(reference)) =
+                store.type_payload(cached).map(TypeRecord::data)
+            else {
+                return Err(invalid());
+            };
+            if reference.object.target != Some(target)
+                || reference.resolved_type_arguments.as_deref() != Some(&[element])
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(Some(cached))
+    }
+
+    fn cached_source_callable_tuple(
+        store: &CanonicalTypeMapperStore,
+        array_targets: Option<CanonicalArrayTargets>,
+        plan: &TupleTypeNodePlan,
+        base_types: Option<&[TypeId]>,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTupleType(plan.tuple()));
+        let tuple = store
+            .type_node_links(plan.tuple())
+            .and_then(|links| links.resolved_type);
+        let operator = plan
+            .readonly_operator()
+            .and_then(|node| store.type_node_links(node))
+            .and_then(|links| links.resolved_type);
+        if operator.is_some() && operator != tuple {
+            return Err(invalid());
+        }
+        let Some(cached) = tuple else {
+            return Ok(None);
+        };
+        if plan
+            .cached_type()
+            .is_some_and(|expected| expected != cached)
+            || [Some(plan.tuple()), plan.readonly_operator()]
+                .into_iter()
+                .flatten()
+                .any(|node| {
+                    store.type_node_links(node).is_some_and(|links| {
+                        links != &TypeNodeLinks::default()
+                            && (links.outer_type_parameters.is_some()
+                                || links.resolved_type != Some(cached))
+                    }) || store
+                        .symbol_node_links(node)
+                        .is_some_and(|links| links != &SymbolNodeLinks::default())
+                })
+        {
+            return Err(invalid());
+        }
+        let base_types = base_types.ok_or_else(&invalid)?;
+        match plan.destination() {
+            tuple_type_nodes::TupleTypeNodeDestination::Array { target, fallback } => {
+                if let Some(fallback) = fallback {
+                    if !base_types.is_empty()
+                        || preflight_generic_global_type_target(store, *target)
+                            .map_err(|_| invalid())?
+                            != Some(*fallback)
+                        || cached != *fallback
+                    {
+                        return Err(invalid());
+                    }
+                    validate_generic_global_type_instantiation(store, *target, cached)
+                        .map_err(|_| invalid())?;
+                    Ok(Some(cached))
+                } else {
+                    let [element] = base_types else {
+                        return Err(invalid());
+                    };
+                    Self::cached_source_callable_array(
+                        store,
+                        *target,
+                        *element,
+                        Some(cached),
+                        plan.tuple(),
+                    )
+                }
+            }
+            tuple_type_nodes::TupleTypeNodeDestination::Tuple {
+                key,
+                existing_target,
+            } => {
+                let shape = store
+                    .canonical_tuple_shape(cached)
+                    .map_err(|_| invalid())?
+                    .ok_or_else(&invalid)?;
+                if shape.element_infos() != plan.element_infos()
+                    || shape.is_readonly() != plan.readonly()
+                    || existing_target.is_some_and(|target| target != shape.target())
+                    || store
+                        .canonical_tuple_target(key)
+                        .is_none_or(|target| target.target != shape.target())
+                    || base_types.len() != plan.elements().len()
+                    || base_types.len() != shape.element_types().len()
+                {
+                    return Err(invalid());
+                }
+                let bootstrap = store.intrinsic_bootstrap().ok_or_else(&invalid)?;
+                for ((element, base), actual) in plan
+                    .elements()
+                    .iter()
+                    .zip(base_types)
+                    .zip(shape.element_types())
+                {
+                    let expected = if bootstrap.options.strict_null_checks
+                        && element.info().flags() == ElementFlags::OPTIONAL
+                    {
+                        let sentinel = bootstrap.undefined_or_missing_type;
+                        let record = store.type_payload(*base).ok_or_else(&invalid)?;
+                        if *base == sentinel
+                            || record
+                                .flags()
+                                .intersects(TypeFlags::ANY | TypeFlags::UNKNOWN)
+                            || matches!(record.data(), TypeData::Union(union) if union.union.types.contains(&sentinel))
+                        {
+                            *base
+                        } else {
+                            store
+                                .cached_literal_union_type_with_alias(
+                                    &[*base, sentinel],
+                                    None,
+                                    array_targets,
+                                )
+                                .map_err(type_construction_error)?
+                                .ok_or_else(&invalid)?
+                        }
+                    } else {
+                        *base
+                    };
+                    if *actual != expected {
+                        return Err(invalid());
+                    }
+                }
+                Ok(Some(cached))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // Checks each admitted source shape against its own provider.
     fn cached_annotation_type(
         &self,
@@ -1357,6 +2049,7 @@ enum PlannedLiteralType {
 
 #[derive(Debug, Default)]
 struct TypeQueryPlan {
+    nodes: BTreeSet<NodeRef>,
     arrays: BTreeMap<NodeRef, PlannedArrayType>,
     indexed_accesses: BTreeMap<NodeRef, ConcreteIndexedAccessPlan>,
     recovered_indexed_accesses: BTreeMap<NodeRef, PlannedRecoveredIndexedAccess>,
@@ -1401,6 +2094,131 @@ struct TypeQueryPlan {
     tuples: BTreeMap<NodeRef, TupleTypeNodePlan>,
     unique_symbols: BTreeMap<NodeRef, PlannedUniqueSymbolType>,
     pending_function_proofs: Vec<PendingFunctionTypeProof>,
+}
+
+/// The normal query's source-owned inputs for one generic signature.
+/// Only the query producer can create this evidence. Stored consumers replay
+/// its binding and provider checks before using an annotation result.
+#[derive(Debug)]
+pub(super) struct SourceCallableTypeQueryEvidence {
+    callable: SourceCallablePlan,
+    type_parameters: Box<[ResolvedSourceCallableTypeParameter]>,
+    base_constraints: Box<[TypeId]>,
+    annotation_results: BTreeMap<NodeRef, TypeId>,
+    plan: TypeQueryPlan,
+}
+
+impl SourceCallableTypeQueryEvidence {
+    pub(super) fn callable(&self) -> &SourceCallablePlan {
+        &self.callable
+    }
+
+    pub(super) fn matches_plan(&self, callable: &SourceCallablePlan) -> bool {
+        self.callable == *callable
+    }
+
+    pub(super) fn type_parameters(&self) -> &[ResolvedSourceCallableTypeParameter] {
+        &self.type_parameters
+    }
+
+    pub(super) fn base_constraints(&self) -> &[TypeId] {
+        &self.base_constraints
+    }
+
+    pub(super) fn annotation_type(&self, annotation: NodeRef) -> Option<TypeId> {
+        self.annotation_results.get(&annotation).copied()
+    }
+
+    pub(super) fn is_exact(&self, store: &CanonicalTypeMapperStore) -> bool {
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return false;
+        };
+        if self.callable.type_parameters.len() != self.type_parameters.len()
+            || self.type_parameters.len() != self.base_constraints.len()
+            || self.type_parameters.is_empty()
+            || self.callable.type_parameter_syntax.declaration() != self.callable.declaration
+        {
+            return false;
+        }
+        for ((planned, resolved), base) in self
+            .callable
+            .type_parameters
+            .iter()
+            .zip(&self.type_parameters)
+            .zip(&self.base_constraints)
+        {
+            let provenance = resolved.provenance;
+            if provenance.declaration != planned.declaration
+                || provenance.symbol != planned.symbol
+                || provenance.constraint != planned.constraint
+                || provenance.default_type != planned.default_type
+                || cached_ordinary_type_parameter_owner(store, provenance.type_parameter)
+                    != Some(planned.symbol)
+                || store.source_node_parent(planned.declaration)
+                    != Some(SourceNodeParent::Parent(self.callable.declaration))
+            {
+                return false;
+            }
+            let Some(TypeData::TypeParameter(data)) = store
+                .type_payload(provenance.type_parameter)
+                .map(TypeRecord::data)
+            else {
+                return false;
+            };
+            let constraint = match planned.constraint {
+                Some(node) => {
+                    let Some(raw) = self.annotation_type(node) else {
+                        return false;
+                    };
+                    if raw == bootstrap.any_type {
+                        bootstrap.unknown_type
+                    } else {
+                        raw
+                    }
+                }
+                None => bootstrap.no_constraint_type,
+            };
+            let default_type = match planned.default_type {
+                Some(node) => match self.annotation_type(node) {
+                    Some(result) => result,
+                    None => return false,
+                },
+                None => bootstrap.no_constraint_type,
+            };
+            if resolved.constraint != constraint
+                || resolved.default_type != default_type
+                || data.constraint != Some(constraint)
+                || data.resolved_default_type != Some(default_type)
+                || data.constrained.resolved_base_constraint != Some(*base)
+            {
+                return false;
+            }
+        }
+        let required = self
+            .callable
+            .type_parameters
+            .iter()
+            .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+            .chain(
+                self.callable
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.explicit_type_node()),
+            )
+            .flatten();
+        if required
+            .into_iter()
+            .any(|node| !self.annotation_results.contains_key(&node))
+        {
+            return false;
+        }
+        self.plan.source_callable_results_are_exact(
+            store,
+            &self.callable,
+            &self.type_parameters,
+            &self.annotation_results,
+        )
+    }
 }
 
 /// Created only after a canonical query resolves a source callable annotation.
@@ -2639,6 +3457,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     lazy_interface_values: bool,
     check_merged_global_interface_members: bool,
     source_callable_alias_planning: bool,
+    source_callable_scope: Option<Box<SourceCallablePlan>>,
 }
 
 impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
@@ -2672,6 +3491,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             lazy_interface_values: false,
             check_merged_global_interface_members: false,
             source_callable_alias_planning: false,
+            source_callable_scope: None,
         }
     }
 
@@ -2685,6 +3505,92 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
     fn finish(self) -> TypeQueryPlan {
         self.plan
+    }
+
+    fn with_source_callable_scope(
+        mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<Self, DeclaredTypeError> {
+        for parameter in &callable.type_parameters {
+            preflight_type_parameter_symbol(
+                self.store,
+                self.host,
+                parameter.symbol,
+                &mut HashSet::new(),
+            )?;
+            if preflight_node(self.store, self.host, parameter.declaration)?.parent
+                != Some(callable.declaration.node)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                ));
+            }
+        }
+        self.replay_cached_annotations = true;
+        self.source_callable_scope = Some(Box::new(callable.clone()));
+        Ok(self)
+    }
+
+    fn with_enclosing_source_callable_scope(
+        self,
+        node: NodeRef,
+    ) -> Result<Self, DeclaredTypeError> {
+        match source_callables::plan_enclosing_source_callable_annotation(
+            self.store,
+            self.host,
+            node,
+            self.array_targets,
+        )
+        .map_err(|error| source_callable_error(error, SourceCallableFamily::FunctionDeclaration))?
+        {
+            Some(callable) => self.with_source_callable_scope(&callable),
+            None => Ok(self),
+        }
+    }
+
+    fn source_callable_owns_type_parameter_reference(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(callable) = self.source_callable_scope.as_deref() else {
+            return Ok(false);
+        };
+        if !callable
+            .type_parameters
+            .iter()
+            .any(|parameter| parameter.symbol == symbol)
+        {
+            return Ok(false);
+        }
+        let roots = callable
+            .type_parameters
+            .iter()
+            .flat_map(|parameter| [parameter.constraint, parameter.default_type])
+            .chain(
+                callable
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.explicit_type_node()),
+            )
+            .chain(std::iter::once(callable.return_type.type_node()))
+            .flatten()
+            .collect::<HashSet<_>>();
+        let mut current = node;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            if roots.contains(&current) {
+                return Ok(true);
+            }
+            if current == callable.declaration {
+                break;
+            }
+            let Some(parent) = preflight_node(self.store, self.host, current)?.parent else {
+                break;
+            };
+            current = NodeRef::new(current.arena, current.file, parent);
+        }
+        Ok(false)
     }
 
     fn plan_source_callable_inputs(
@@ -2866,6 +3772,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
+        if self.source_callable_scope.is_some() {
+            self.plan.nodes.insert(node);
+        }
         if record.flags.0 & NODE_FLAG_JSDOC != 0 {
             return Err(type_node_unavailable(TypeNodeUnavailable::JsDoc(node)));
         }
@@ -12527,7 +13436,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !flags.intersects(SymbolFlags::ENUM | SymbolFlags::ENUM_MEMBER)
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
-                || !self.is_authenticated_generic_alias_union_type_parameter(node, symbol)?
+                || !self.source_callable_owns_type_parameter_reference(node, symbol)?
+                    && !self.is_authenticated_generic_alias_union_type_parameter(node, symbol)?
                     && !self
                         .is_authenticated_declared_signature_union_type_parameter(node, symbol)?
                     && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?
@@ -21232,6 +22142,43 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     pending_function_parameters: Vec<FunctionTypePlan>,
 }
 
+#[cfg(test)]
+pub(super) fn source_callable_type_query_evidence_for_test(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+    global_types: Option<CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<Arc<SourceCallableTypeQueryEvidence>, DeclaredTypeError> {
+    let source = source_callables::plan_source_callable(
+        store,
+        host,
+        callable.declaration,
+        callable.owner_symbol,
+        callable.array_targets,
+    )
+    .map_err(|error| source_callable_error(error, callable.family))?;
+    if source != *callable {
+        return Err(type_node_unavailable(
+            TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+        ));
+    }
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    let mut query = CanonicalTypeQuery::new(
+        store,
+        host,
+        CanonicalTypeQueryOptions::default(),
+        &mut diagnostics,
+    )?;
+    query.array_type = global_types.as_ref().map(|globals| globals.array_type);
+    query.global_types = global_types;
+    query.instantiation_session = Some(session);
+    let plan = query.plan_source_callable_type_inputs(callable)?;
+    query
+        .resolve_source_callable_type_inputs(callable, plan)
+        .map(|(evidence, _)| evidence)
+}
+
 impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     /// Opens a query session over one store and diagnostic owner.
     ///
@@ -21303,6 +22250,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ) -> Result<Self, DeclaredTypeError> {
         let mut query =
             Self::new_with_global_types(store, host, global_types, options, diagnostics)?;
+        query.instantiation_session = Some(instantiation_session);
+        Ok(query)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_session_for_test(
+        store: &'store mut CanonicalTypeMapperStore,
+        host: &'host DeclaredTypeHost<'arena>,
+        options: impl Into<CanonicalTypeQueryOptions>,
+        instantiation_session: &'store mut InstantiationSession,
+        diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+    ) -> Result<Self, DeclaredTypeError> {
+        let mut query = Self::new(store, host, options, diagnostics)?;
         query.instantiation_session = Some(instantiation_session);
         Ok(query)
     }
@@ -21706,7 +22666,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         )
-        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target)
+        .with_enclosing_source_callable_scope(node)?;
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
@@ -21767,7 +22728,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
         )
-        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target)
+        .with_enclosing_source_callable_scope(node)?;
         planner.lazy_interface_values = lazy_interface_values;
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
@@ -22296,6 +23258,456 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
+    fn plan_source_callable_type_inputs(
+        &self,
+        callable: &SourceCallablePlan,
+    ) -> Result<TypeQueryPlan, DeclaredTypeError> {
+        self.require_source_callable_alias_capabilities(callable)?;
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            callable.array_targets,
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        )
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target)
+        .with_source_callable_scope(callable)?;
+        planner.plan_source_callable_inputs(callable)?;
+        if let Some(return_type) = callable.return_type.type_node() {
+            planner.plan_type_node(return_type)?;
+        }
+        let plan = planner.finish();
+        // Check existing cache pairs before execution can complete a partial pair.
+        // Source parameter identities may still be cold at this point.
+        for node in &plan.nodes {
+            plan.cached_source_callable_type(self.store, callable, &[], *node)?;
+        }
+        for reference in plan.references.values() {
+            if reference.arity != PlannedTypeReferenceArity::Valid {
+                continue;
+            }
+            let Some(alias) = plan
+                .aliases
+                .get(&reference.symbol)
+                .filter(|alias| !alias.type_parameters.is_empty())
+            else {
+                continue;
+            };
+            if let Some(fallback) = self.direct_array_fallback(alias.type_node, &plan) {
+                // The known fallback has no parameter identities to allocate.
+                self.validate_direct_alias_type(reference.symbol, fallback, &[])?;
+            }
+        }
+        Ok(plan)
+    }
+
+    fn resolve_source_callable_type_inputs(
+        &mut self,
+        callable: &SourceCallablePlan,
+        plan: TypeQueryPlan,
+    ) -> Result<(Arc<SourceCallableTypeQueryEvidence>, PreparedTypeQueryTypes), DeclaredTypeError>
+    {
+        let (cold_types, optional_unions) =
+            source_callables::reserve_source_callable_capacities(self.store, &[callable])
+                .map_err(|error| source_callable_error(error, callable.family))?;
+        let mut prepared =
+            self.prepare_literal_types_with_additional(&plan, optional_unions, cold_types)?;
+        let parameters = callable
+            .type_parameters
+            .iter()
+            .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
+            .collect::<Vec<_>>();
+        let result = (|| {
+            self.seed_pending_function_parameters(&plan, &mut prepared)?;
+            let bootstrap =
+                self.store
+                    .intrinsic_bootstrap()
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?;
+            let no_constraint = bootstrap.no_constraint_type;
+            let any_type = bootstrap.any_type;
+            let unknown_type = bootstrap.unknown_type;
+            let mut annotation_results = BTreeMap::new();
+            let mut resolved = Vec::with_capacity(parameters.len());
+            for (parameter, type_parameter) in callable
+                .type_parameters
+                .iter()
+                .zip(parameters.iter().copied())
+            {
+                let constraint = if let Some(node) = parameter.constraint {
+                    let raw = self.execute_type_node(node, &plan, &mut prepared)?;
+                    annotation_results.insert(node, raw);
+                    if raw == any_type { unknown_type } else { raw }
+                } else {
+                    no_constraint
+                };
+                let default_type = if let Some(node) = parameter.default_type {
+                    let raw = self.execute_type_node(node, &plan, &mut prepared)?;
+                    annotation_results.insert(node, raw);
+                    raw
+                } else {
+                    no_constraint
+                };
+                let Some(TypeData::TypeParameter(data)) = self
+                    .store
+                    .type_payload(type_parameter)
+                    .map(TypeRecord::data)
+                else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                    ));
+                };
+                if data.target.is_some()
+                    || data.mapper.is_some()
+                    || data.constraint.is_some_and(|cached| cached != constraint)
+                    || data
+                        .resolved_default_type
+                        .is_some_and(|cached| cached != default_type)
+                    || !self.store.set_type_parameter_resolution(
+                        type_parameter,
+                        Some(constraint),
+                        None,
+                        None,
+                        Some(default_type),
+                    )
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                    ));
+                }
+                resolved.push(ResolvedSourceCallableTypeParameter {
+                    provenance: SourceCallableTypeParameterProvenance {
+                        declaration: parameter.declaration,
+                        symbol: parameter.symbol,
+                        type_parameter,
+                        constraint: parameter.constraint,
+                        default_type: parameter.default_type,
+                    },
+                    constraint,
+                    default_type,
+                });
+            }
+            let mut base_constraints = Vec::with_capacity(parameters.len());
+            let mut default_seen = false;
+            for (index, (parameter, resolved)) in
+                callable.type_parameters.iter().zip(&resolved).enumerate()
+            {
+                let type_parameter = resolved.provenance.type_parameter;
+                get_base_constraint_of_type(self.store, type_parameter).map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
+                        node: parameter.constraint.unwrap_or(parameter.declaration),
+                        symbol: parameter.symbol,
+                    })
+                })?;
+                let Some(TypeData::TypeParameter(data)) = self
+                    .store
+                    .type_payload(type_parameter)
+                    .map(TypeRecord::data)
+                else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+                    ));
+                };
+                let base = data.constrained.resolved_base_constraint.ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(
+                        parameter.declaration,
+                    ))
+                })?;
+                base_constraints.push(base);
+                let circular = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| base == bootstrap.circular_constraint_type);
+                if circular && let Some(constraint) = parameter.constraint {
+                    let name = self
+                        .store
+                        .symbol(parameter.symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        .unwrap_or("")
+                        .to_owned();
+                    self.diagnostics.lookup_or_issue(
+                        Some(constraint),
+                        Diagnostic::with_arguments(
+                            message_by_code(2313).expect("TS2313 is in the diagnostic catalog"),
+                            [name.as_str()],
+                        ),
+                    );
+                }
+                if let Some(default_node) = parameter.default_type {
+                    default_seen = true;
+                    for (reference_node, reference) in &plan.references {
+                        if callable.type_parameters[index..]
+                            .iter()
+                            .any(|later| later.symbol == reference.symbol)
+                            && self.source_type_node_is_within(*reference_node, default_node)?
+                        {
+                            self.diagnostics.lookup_or_issue(
+                                Some(*reference_node),
+                                Diagnostic::new(
+                                    message_by_code(2744)
+                                        .expect("TS2744 is in the diagnostic catalog"),
+                                ),
+                            );
+                        }
+                    }
+                    self.check_source_type_parameter_default(
+                        type_parameter,
+                        resolved.default_type,
+                        default_node,
+                    )?;
+                } else if default_seen {
+                    self.diagnostics.lookup_or_issue(
+                        Some(parameter.declaration),
+                        Diagnostic::new(
+                            message_by_code(2706).expect("TS2706 is in the diagnostic catalog"),
+                        ),
+                    );
+                }
+            }
+            for parameter in &callable.parameters {
+                let node = parameter.explicit_type_node().ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
+                        callable.declaration,
+                    ))
+                })?;
+                annotation_results
+                    .insert(node, self.execute_type_node(node, &plan, &mut prepared)?);
+            }
+            self.flush_pending_function_parameters(&plan, &mut prepared)?;
+            self.capture_source_callable_query_results(
+                callable,
+                &plan,
+                &resolved,
+                &mut annotation_results,
+            )?;
+            Ok::<_, DeclaredTypeError>((resolved, base_constraints, annotation_results))
+        })();
+        self.pending_function_parameters.clear();
+        prepared.clear_pending_function_types();
+        let (type_parameters, base_constraints, annotation_results) = result?;
+        let evidence = Arc::new(SourceCallableTypeQueryEvidence {
+            callable: callable.clone(),
+            type_parameters: type_parameters.into_boxed_slice(),
+            base_constraints: base_constraints.into_boxed_slice(),
+            annotation_results,
+            plan,
+        });
+        if !evidence.is_exact(self.store) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+            ));
+        }
+        Ok((evidence, prepared))
+    }
+
+    fn capture_source_callable_query_results(
+        &self,
+        callable: &SourceCallablePlan,
+        plan: &TypeQueryPlan,
+        parameters: &[ResolvedSourceCallableTypeParameter],
+        results: &mut BTreeMap<NodeRef, TypeId>,
+    ) -> Result<(), DeclaredTypeError> {
+        let return_root = callable.return_type.type_node();
+        for node in &plan.nodes {
+            let result =
+                plan.cached_source_callable_type(self.store, callable, parameters, *node)?;
+            if let Some(result) = result {
+                // Only the lazy-return producer may add this root. A prior
+                // annotation query does not publish a signature return.
+                if return_root == Some(*node) && !results.contains_key(node) {
+                    continue;
+                }
+                if results
+                    .insert(*node, result)
+                    .is_some_and(|previous| previous != result)
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(*node),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn source_type_node_is_within(
+        &self,
+        node: NodeRef,
+        root: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let mut current = node;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            if current == root {
+                return Ok(true);
+            }
+            let Some(parent) = preflight_node(self.store, self.host, current)?.parent else {
+                break;
+            };
+            current = NodeRef::new(current.arena, current.file, parent);
+        }
+        Ok(false)
+    }
+
+    fn check_source_type_parameter_default(
+        &mut self,
+        parameter: TypeId,
+        default_type: TypeId,
+        default_node: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let symbol =
+            cached_ordinary_type_parameter_owner(self.store, parameter).ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(default_node))
+            })?;
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
+                node: default_node,
+                symbol,
+            })
+        };
+        let constraint =
+            get_constraint_of_type(self.store, parameter).map_err(|_| unsupported())?;
+        let Some(constraint) = constraint else {
+            return Ok(());
+        };
+        let session = self
+            .instantiation_session
+            .as_deref_mut()
+            .ok_or_else(unsupported)?;
+        let limit_mark = session.limit_event_mark();
+        let substituted = instantiate_type_with_vector_and_session(
+            self.store,
+            constraint,
+            &[parameter],
+            &[default_type],
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            session,
+        )
+        .map_err(|_| unsupported())?;
+        let assignable = self
+            .store
+            .is_type_assignable_to_with_session(
+                default_type,
+                substituted,
+                self.global_types.as_ref(),
+                self.options.strict_function_types,
+                session,
+            )
+            .map_err(|_| unsupported())?;
+        if session.limit_event_occurred_since(limit_mark) {
+            self.diagnostics.lookup_or_issue(
+                Some(default_node),
+                Diagnostic::new(
+                    message_by_code(2589).expect("TS2589 is in the diagnostic catalog"),
+                ),
+            );
+        }
+        if !assignable {
+            let display = if let Some(global_types) = self.global_types.as_ref() {
+                get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                    self.store,
+                    self.host,
+                    global_types,
+                    default_type,
+                    substituted,
+                    CanonicalTypeFormatFlags::NONE,
+                )
+            } else {
+                get_type_names_for_assignability_error_with_host_and_flags(
+                    self.store,
+                    self.host,
+                    default_type,
+                    substituted,
+                    CanonicalTypeFormatFlags::NONE,
+                )
+            }
+            .map_err(|_| unsupported())?;
+            self.diagnostics.lookup_or_issue(
+                Some(default_node),
+                Diagnostic::with_arguments(
+                    message_by_code(2344).expect("TS2344 is in the diagnostic catalog"),
+                    [display.source, display.target],
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn get_type_of_queried_source_callable(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let plan = self.plan_source_callable_type_inputs(callable)?;
+        match source_callables::source_callable_state(self.store, callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
+            source_callables::SourceCallableState::Cold => {}
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+                ));
+            }
+        }
+        let (evidence, mut prepared) = self.resolve_source_callable_type_inputs(callable, plan)?;
+        let pending = match source_callables::begin_source_callable(
+            self.store,
+            callable,
+            evidence.type_parameters(),
+            Some(Arc::clone(&evidence)),
+        )
+        .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            Ok(pending) => pending,
+            Err(type_) => return Ok(type_),
+        };
+        source_callables::finalize_source_callable_structure(self.store, callable, pending)
+            .map_err(|error| source_callable_error(error, callable.family))?;
+        if callable.parameters.is_empty() {
+            return match source_callables::source_callable_state(self.store, callable, false)
+                .map_err(|error| source_callable_error(error, callable.family))?
+            {
+                source_callables::SourceCallableState::Resolved { type_, signature }
+                    if type_ == pending.type_ && signature == pending.signature =>
+                {
+                    Ok(type_)
+                }
+                _ => Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(callable.declaration),
+                )),
+            };
+        }
+        let base_types = callable
+            .parameters
+            .iter()
+            .map(|parameter| {
+                parameter
+                    .explicit_type_node()
+                    .and_then(|node| evidence.annotation_type(node))
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
+                            callable.declaration,
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        source_callables::publish_source_callable_parameter_types(
+            self.store,
+            self.global_types.as_ref(),
+            &[PendingSourceCallableParameterTypes {
+                plan: callable.clone(),
+                base_types,
+            }],
+            &mut prepared,
+        )
+        .map_err(|error| source_callable_error(error, callable.family))?;
+        Ok(pending.type_)
+    }
+
     /// Proves the complete annotated type-node closure of one source callable
     /// without allocating its object, signature, or parameter-value caches.
     ///
@@ -22337,6 +23749,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
+        if callable.requires_type_query_evidence() {
+            let plan = self.plan_source_callable_type_inputs(&callable)?;
+            source_callables::source_callable_state(self.store, &callable, true)
+                .map_err(|error| source_callable_error(error, callable.family))?;
+            let (cold_types, optional_unions) =
+                source_callables::reserve_source_callable_capacities(self.store, &[&callable])
+                    .map_err(|error| source_callable_error(error, callable.family))?;
+            drop(self.prepare_literal_types_with_additional(&plan, optional_unions, cold_types)?);
+            return Ok(());
+        }
         self.preflight_source_callable_alias_annotations(&callable)?;
         let mut planner = TypeQueryPlanner::new(
             self.store,
@@ -22407,6 +23829,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         )
         .map_err(|error| source_callable_error(error, family))?;
         self.require_source_callable_alias_capabilities(&callable)?;
+        if callable.requires_type_query_evidence() {
+            return self.get_type_of_queried_source_callable(&callable);
+        }
         self.preflight_source_callable_alias_annotations(&callable)?;
         let mut planner = TypeQueryPlanner::new(
             self.store,
@@ -22547,6 +23972,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store,
             &callable,
             &resolved_type_parameters,
+            None,
         )
         .map_err(|error| source_callable_error(error, callable.family))?
         {
@@ -23189,6 +24615,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.store, &callable, signature,
         )
         .map_err(|error| source_callable_signature_error(error, callable.family, signature))?;
+        let queried_plan = callable
+            .requires_type_query_evidence()
+            .then(|| self.plan_source_callable_type_inputs(&callable))
+            .transpose()?;
         self.preflight_source_callable_alias_annotations(&callable)?;
         if callable.return_type.is_inferred() {
             self.reject_type_reference_alias_capabilities()?;
@@ -23254,16 +24684,38 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Ok(return_type);
         }
-        let mut planner = TypeQueryPlanner::new(
-            self.store,
-            self.host,
-            self.array_type,
-            array_targets,
-            self.options.strict_builtin_iterator_return,
-            &self.type_reference_alias_targets,
-        );
-        planner.plan_type_node(return_type_node)?;
-        let plan = planner.finish();
+        let inputs = if queried_plan.is_some() {
+            let evidence = self
+                .store
+                .source_callable_type_query(signature)
+                .filter(|evidence| {
+                    evidence.matches_plan(&callable) && evidence.is_exact(self.store)
+                })
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                })?;
+            Some((
+                evidence.type_parameters.to_vec(),
+                evidence.base_constraints.to_vec(),
+                evidence.annotation_results.clone(),
+            ))
+        } else {
+            None
+        };
+        let plan = if let Some(plan) = queried_plan {
+            plan
+        } else {
+            let mut planner = TypeQueryPlanner::new(
+                self.store,
+                self.host,
+                self.array_type,
+                array_targets,
+                self.options.strict_builtin_iterator_return,
+                &self.type_reference_alias_targets,
+            );
+            planner.plan_type_node(return_type_node)?;
+            planner.finish()
+        };
         let mut prepared = self.prepare_literal_types(&plan)?;
         if !self.store.try_reserve_circular_return_signatures(1) {
             prepared.clear_pending_function_types();
@@ -23320,6 +24772,38 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.pending_function_parameters.clear();
         prepared.clear_pending_function_types();
         if cycle_free {
+            let query_evidence =
+                if let Some((type_parameters, base_constraints, mut annotation_results)) = inputs {
+                    if annotation_results
+                        .insert(return_type_node, resolved)
+                        .is_some_and(|previous| previous != resolved)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                        ));
+                    }
+                    self.capture_source_callable_query_results(
+                        &callable,
+                        &plan,
+                        &type_parameters,
+                        &mut annotation_results,
+                    )?;
+                    let evidence = Arc::new(SourceCallableTypeQueryEvidence {
+                        callable: callable.clone(),
+                        type_parameters: type_parameters.into_boxed_slice(),
+                        base_constraints: base_constraints.into_boxed_slice(),
+                        annotation_results,
+                        plan,
+                    });
+                    if !evidence.is_exact(self.store) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidFunctionSignature(signature),
+                        ));
+                    }
+                    Some(evidence)
+                } else {
+                    None
+                };
             for proof in callable
                 .alias_annotations()
                 .iter()
@@ -23356,7 +24840,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
             }
             source_callables::publish_lazy_source_callable_return(
-                self.store, &callable, signature, resolved,
+                self.store,
+                &callable,
+                signature,
+                resolved,
+                query_evidence,
             )
             .map_err(|error| source_callable_signature_error(error, callable.family, signature))
         } else {
@@ -27511,6 +28999,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(resolved)
+    }
+
+    fn direct_array_fallback(&self, mut node: NodeRef, plan: &TypeQueryPlan) -> Option<TypeId> {
+        loop {
+            if let Some(array) = plan.arrays.get(&node).or_else(|| {
+                plan.arrays
+                    .values()
+                    .find(|array| array.readonly_operator == Some(node))
+            }) {
+                return array.fallback;
+            }
+            let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
+                return None;
+            };
+            node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+        }
     }
 
     fn direct_type_literal_plan_node(
@@ -34137,10 +35641,12 @@ mod tests {
             &fixture.parsed.arena,
             fixture.files.get(&fixture.file).unwrap(),
         );
-        CanonicalTypeQuery::new(
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        CanonicalTypeQuery::new_with_session_for_test(
             &mut fixture.store,
             &host,
             CanonicalTypeQueryOptions::default(),
+            &mut session,
             diagnostics,
         )?
         .get_type_of_source_callable(declaration, owner)
@@ -67256,6 +68762,918 @@ mod tests {
             Ok(intersection),
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_query_evidence_replays_alias_and_argument_caches() {
+        let mut fixture = fixture(concat!(
+            "type StringOr<V> = V | string; ",
+            "declare function use<B, T extends StringOr<B>>(value: T): T;",
+        ));
+        let initial_signatures = fixture.store.signature_len();
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "use");
+        let owner = node_symbol(&fixture, declaration);
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "StringOr");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let evidence = source_callable_type_query_evidence_for_test(
+            &mut fixture.store,
+            &host,
+            &callable,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert!(evidence.is_exact(&fixture.store));
+        assert_eq!(fixture.store.signature_len(), initial_signatures);
+        let warm_types = fixture.store.type_len();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+
+        let alias_links = fixture.store.type_alias_links(alias).cloned().unwrap();
+        let mut changed = alias_links.clone();
+        changed.declared_type = Some(number);
+        assert!(fixture.store.set_type_alias_links(alias, changed));
+        assert!(!evidence.is_exact(&fixture.store));
+        assert!(fixture.store.set_type_alias_links(alias, alias_links));
+
+        let argument = *evidence
+            .plan
+            .references
+            .iter()
+            .find_map(|(node, reference)| {
+                (reference.symbol == callable.type_parameters[0].symbol).then_some(node)
+            })
+            .unwrap();
+        let type_links = fixture.store.type_node_links(argument).cloned().unwrap();
+        let symbol_links = fixture.store.symbol_node_links(argument).cloned().unwrap();
+        assert!(fixture.store.set_type_node_links(
+            argument,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(!evidence.is_exact(&fixture.store));
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(argument, type_links.clone())
+        );
+        assert!(
+            fixture
+                .store
+                .set_symbol_node_links(argument, SymbolNodeLinks::default())
+        );
+        assert!(!evidence.is_exact(&fixture.store));
+        assert!(fixture.store.set_symbol_node_links(argument, symbol_links));
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(argument, TypeNodeLinks::default())
+        );
+        assert!(!evidence.is_exact(&fixture.store));
+        assert!(fixture.store.set_type_node_links(argument, type_links));
+        assert!(evidence.is_exact(&fixture.store));
+        assert_eq!(fixture.store.type_len(), warm_types);
+        assert_eq!(fixture.store.signature_len(), initial_signatures);
+    }
+
+    #[test]
+    fn source_callable_query_keeps_annotation_first_return_unpublished() {
+        let mut fixture = fixture("declare function identity<T>(value: T): T;");
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "identity");
+        let owner = node_symbol(&fixture, declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let return_node = callable.return_type.type_node().unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let returned = query.get_type_from_type_node(return_node).unwrap();
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = query
+            .store
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert_eq!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .annotation_type(return_node),
+            None
+        );
+        let parameters = query
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        assert_eq!(parameters, [returned]);
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+        assert_eq!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .annotation_type(return_node),
+            Some(returned)
+        );
+        let counts = (
+            query.store.type_len(),
+            query.store.signature_len(),
+            query.store.mapper_len(),
+        );
+        assert_eq!(
+            query.get_type_of_source_callable(declaration, owner),
+            Ok(type_)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+        assert_eq!(
+            query.store.signature(signature).unwrap().type_parameters(),
+            parameters
+        );
+        assert_eq!(
+            (
+                query.store.type_len(),
+                query.store.signature_len(),
+                query.store.mapper_len()
+            ),
+            counts
+        );
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_query_replays_raw_optional_property_annotations() {
+        let parsed = parse_source_file("declare function f<T>(x: { value?: T }): void;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        for (index, (strict_null_checks, exact_optional_property_types)) in
+            [(false, false), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let file = FileId::new(198_523 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/generic-optional-property.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+            context.check_source_file(file).unwrap();
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let (parameter, object_node, object, property, property_name, property_annotation) = {
+                let evidence = context
+                    .store()
+                    .source_callable_type_query(signature)
+                    .unwrap();
+                assert!(evidence.is_exact(context.store()));
+                let [parameter] = evidence.type_parameters() else {
+                    panic!("f must retain its one type parameter");
+                };
+                let object_node = evidence.callable.parameters[0]
+                    .explicit_type_node()
+                    .unwrap();
+                let object = evidence.annotation_type(object_node).unwrap();
+                let [property] = evidence.plan.type_literals[&object_node]
+                    .properties
+                    .as_slice()
+                else {
+                    panic!("the type literal must retain its one property");
+                };
+                assert!(property.optional);
+                assert_eq!(
+                    evidence.annotation_type(property.type_node),
+                    Some(parameter.provenance.type_parameter)
+                );
+                (
+                    parameter.provenance.type_parameter,
+                    object_node,
+                    object,
+                    property.symbol,
+                    property.name_node,
+                    property.type_node,
+                )
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type,
+                Some(parameter),
+            );
+            let read = context.get_type_at_location(property_name).unwrap();
+            if strict_null_checks {
+                let sentinel = context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_or_missing_type;
+                let TypeData::Union(union) = context.store().type_payload(read).unwrap().data()
+                else {
+                    panic!("a strict optional property read must retain its sentinel");
+                };
+                assert_eq!(union.union.types.len(), 2);
+                assert!(union.union.types.contains(&parameter));
+                assert!(union.union.types.contains(&sentinel));
+            } else {
+                assert_eq!(read, parameter);
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type,
+                Some(parameter),
+            );
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(context.store())
+            );
+            assert_eq!(
+                context.get_type_from_type_node(property_annotation),
+                Ok(parameter)
+            );
+            assert_eq!(context.get_type_from_type_node(object_node), Ok(object));
+            let counts = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            );
+            context.check_source_file(file).unwrap();
+            assert_eq!(context.get_type_at_location(property_name).unwrap(), read);
+            assert_eq!(context.get_type_from_type_node(object_node), Ok(object));
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .unwrap()
+                    .resolved_type,
+                Some(parameter)
+            );
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(context.store())
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .union_cache_len(),
+                ),
+                counts,
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn source_callable_query_replays_canonical_tuple_elements() {
+        for (strict_null_checks, exact_optional_property_types) in
+            [(false, false), (true, false), (true, true)]
+        {
+            let mut fixture = fixture_with_intrinsic(
+                "declare function f<T>(x: [T], y: readonly [T?]): void;",
+                IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types,
+                },
+            );
+            let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
+            let owner = node_symbol(&fixture, declaration);
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let evidence = source_callable_type_query_evidence_for_test(
+                &mut fixture.store,
+                &host,
+                &callable,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            assert!(evidence.is_exact(&fixture.store));
+            let parameter = evidence.type_parameters()[0].provenance.type_parameter;
+            let first_node = callable.parameters[0].explicit_type_node().unwrap();
+            let first = evidence.annotation_type(first_node).unwrap();
+            let second_node = callable.parameters[1].explicit_type_node().unwrap();
+            let second = evidence.annotation_type(second_node).unwrap();
+            let first_shape = fixture.store.canonical_tuple_shape(first).unwrap().unwrap();
+            assert_eq!(first_shape.element_types(), &[parameter]);
+            assert!(!first_shape.is_readonly());
+            let second_shape = fixture
+                .store
+                .canonical_tuple_shape(second)
+                .unwrap()
+                .unwrap();
+            assert!(second_shape.is_readonly());
+            assert_eq!(
+                second_shape.element_infos()[0].flags(),
+                ElementFlags::OPTIONAL
+            );
+            let [optional] = second_shape.element_types() else {
+                panic!("expected one tuple element");
+            };
+            if strict_null_checks {
+                let sentinel = fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_or_missing_type;
+                let TypeData::Union(union) = fixture.store.type_payload(*optional).unwrap().data()
+                else {
+                    panic!("the optional tuple element must keep its sentinel");
+                };
+                assert_eq!(union.union.types.len(), 2);
+                assert!(union.union.types.contains(&parameter));
+                assert!(union.union.types.contains(&sentinel));
+            } else {
+                assert_eq!(*optional, parameter);
+            }
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let counts = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            );
+            for tuple in [first, second] {
+                let TypeData::TypeReference(reference) =
+                    fixture.store.type_payload(tuple).unwrap().data()
+                else {
+                    panic!("the tuple annotation must have an instantiated reference");
+                };
+                let original_node = reference.node;
+                let original_arguments = reference.resolved_type_arguments.clone();
+                assert!(fixture.store.set_type_reference_resolution(
+                    tuple,
+                    original_node,
+                    Some(vec![number])
+                ));
+                assert!(!evidence.is_exact(&fixture.store));
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.mapper_len()
+                    ),
+                    counts
+                );
+                assert!(fixture.store.set_type_reference_resolution(
+                    tuple,
+                    original_node,
+                    original_arguments
+                ));
+                assert!(evidence.is_exact(&fixture.store));
+            }
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ =
+                query_source_callable(&mut fixture, declaration, owner, &mut diagnostics).unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(type_)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some(&[first, second][..])
+            );
+            let warm = function_store_state(&fixture.store);
+            assert_eq!(
+                query_source_callable(&mut fixture, declaration, owner, &mut diagnostics),
+                Ok(type_)
+            );
+            assert_eq!(function_store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_callable_query_replays_direct_generic_defaults_and_constraints() {
+        let mut fixture = fixture(concat!(
+            "interface Pair<A, B extends string = string> {} ",
+            "interface Same<A, B = A> {} ",
+            "declare function f<T>(x: Pair<T>, y: Same<T>): void;",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
+        let owner = node_symbol(&fixture, declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let evidence = source_callable_type_query_evidence_for_test(
+            &mut fixture.store,
+            &host,
+            &callable,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert!(evidence.is_exact(&fixture.store));
+        let parameter = evidence.type_parameters()[0].provenance.type_parameter;
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        for (index, expected) in [[parameter, string], [parameter, parameter]]
+            .into_iter()
+            .enumerate()
+        {
+            let node = callable.parameters[index].explicit_type_node().unwrap();
+            let type_ = evidence.annotation_type(node).unwrap();
+            let reference = validate_direct_generic_reference(&fixture.store, type_).unwrap();
+            assert_eq!(reference.type_arguments, expected);
+            let target = reference.target;
+            let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let target_parameters = interface.reference.resolved_type_arguments.clone().unwrap();
+            let trailing = target_parameters[1];
+            let TypeData::TypeParameter(data) =
+                fixture.store.type_payload(trailing).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let constraint = data.constraint;
+            let default_type = data.resolved_default_type;
+            assert_eq!(
+                default_type,
+                Some(if index == 0 {
+                    string
+                } else {
+                    target_parameters[0]
+                })
+            );
+            let unrelated_arguments = if index == 0 {
+                [number, string]
+            } else {
+                [number, number]
+            };
+            fixture
+                .store
+                .create_direct_generic_reference_type(target, &unrelated_arguments)
+                .unwrap();
+            assert!(
+                evidence.is_exact(&fixture.store),
+                "another valid instance must not change this query"
+            );
+            let counts = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            );
+            for changed_default in [Some(number), None] {
+                assert!(fixture.store.set_type_parameter_resolution(
+                    trailing,
+                    constraint,
+                    None,
+                    None,
+                    changed_default
+                ));
+                assert!(!evidence.is_exact(&fixture.store));
+                assert_eq!(
+                    (
+                        fixture.store.type_len(),
+                        fixture.store.signature_len(),
+                        fixture.store.mapper_len()
+                    ),
+                    counts
+                );
+                assert!(fixture.store.set_type_parameter_resolution(
+                    trailing,
+                    constraint,
+                    None,
+                    None,
+                    default_type
+                ));
+                assert!(evidence.is_exact(&fixture.store));
+            }
+            if constraint.is_some() {
+                assert!(fixture.store.set_type_parameter_resolution(
+                    trailing,
+                    Some(number),
+                    None,
+                    None,
+                    default_type
+                ));
+                assert!(!evidence.is_exact(&fixture.store));
+                assert!(fixture.store.set_type_parameter_resolution(
+                    trailing,
+                    constraint,
+                    None,
+                    None,
+                    default_type
+                ));
+                assert!(evidence.is_exact(&fixture.store));
+            }
+        }
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ =
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics).unwrap();
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics),
+            Ok(type_)
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_query_replays_intrinsic_string_mapping_results() {
+        let mut fixture = fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "declare function f<T>(x: Uppercase<\"foo\">): Uppercase<\"foo\">;",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "f");
+        let owner = node_symbol(&fixture, declaration);
+        let uppercase = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Uppercase");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ =
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics).unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        let (annotation, result) = {
+            let evidence = fixture.store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.is_exact(&fixture.store));
+            let annotation = evidence.callable.parameters[0]
+                .explicit_type_node()
+                .unwrap();
+            (annotation, evidence.annotation_type(annotation).unwrap())
+        };
+        let TypeData::Literal(literal) = fixture.store.type_payload(result).unwrap().data() else {
+            panic!("the string mapping must return a literal");
+        };
+        assert_eq!(literal.value, LiteralValue::String("FOO".to_owned()));
+        let input = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_string_literal_type("foo")
+            .unwrap();
+        let key = type_alias_instantiation_cache_key(&[input], None);
+        let alias_links = fixture.store.type_alias_links(uppercase).unwrap();
+        assert_eq!(alias_links.instantiations.as_ref().unwrap().len(), 1);
+        assert!(
+            !alias_links
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .contains_key(&key)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .cached_resolved_string_mapping_type(uppercase, input),
+            Ok(Some(result))
+        );
+        let raw = fixture
+            .store
+            .regular_string_literal_type("bar".to_owned())
+            .unwrap();
+        fixture
+            .store
+            .get_string_mapping_type(uppercase, raw)
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(&fixture.store)
+        );
+        let original = fixture.store.type_node_links(annotation).cloned().unwrap();
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(input),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(
+            !fixture
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(&fixture.store)
+        );
+        assert!(fixture.store.set_type_node_links(annotation, original));
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(result)
+        );
+        let counts = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+        assert_eq!(
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics),
+            Ok(type_)
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(result)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len()
+            ),
+            counts
+        );
+        assert!(
+            !fixture
+                .store
+                .type_alias_links(uppercase)
+                .unwrap()
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .contains_key(&key)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_default_check_keeps_caller_session_through_relation() {
+        let mut fixture = fixture(concat!(
+            "interface Cell<X> { value: X } ",
+            "declare function f<T extends Cell<T> = Cell<never>>(x: T): T;",
+        ));
+        let cell_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Cell");
+        let parameter_symbol = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let parameter_node = named_node(&fixture, SyntaxKind::TypeParameter, "T");
+        let NodeData::TypeParameterDeclaration(parameter_syntax) =
+            &fixture.parsed.arena.get(parameter_node.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let default_node = NodeRef::new(
+            parameter_node.arena,
+            parameter_node.file,
+            parameter_syntax.default_type.unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cell = query_declared(
+            &mut fixture,
+            cell_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let x = match fixture.store.type_payload(cell).unwrap().data() {
+            TypeData::Interface(interface) => interface.all_type_parameters.as_ref().unwrap()[0],
+            _ => unreachable!(),
+        };
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let members =
+            object_members::plan_generic_interface(&fixture.store, &host, cell_symbol).unwrap();
+        assert!(fixture.store.publish_interface_no_base_resolution(cell));
+        object_members::publish_generic_interface_declared_members(
+            &mut fixture.store,
+            &members,
+            cell,
+            &[x],
+        )
+        .unwrap();
+        let parameter = execute_type_parameter(&mut fixture.store, parameter_symbol);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (never, number, error) = (
+            bootstrap.never_type,
+            bootstrap.number_type,
+            bootstrap.error_type,
+        );
+        let constraint = fixture
+            .store
+            .create_direct_generic_reference_type(cell, &[parameter])
+            .unwrap();
+        let default_type = fixture
+            .store
+            .create_direct_generic_reference_type(cell, &[never])
+            .unwrap();
+        let substituted = fixture
+            .store
+            .create_direct_generic_reference_type(cell, &[default_type])
+            .unwrap();
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameter,
+            Some(constraint),
+            None,
+            None,
+            Some(default_type),
+        ));
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits {
+                max_count: 3,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut fixture.store,
+                parameter,
+                &[parameter],
+                &[number],
+                None,
+                &mut session,
+            ),
+            Ok(number)
+        );
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        let before = session.limit_event_mark();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions {
+                strict_function_types: Some(true),
+                ..CanonicalTypeQueryOptions::default()
+            },
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        query
+            .check_source_type_parameter_default(parameter, default_type, default_node)
+            .unwrap();
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (3, 3));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(session.limit_event_occurred_since(before));
+        let after = session.limit_event_mark();
+        for (reference, expected_type, expected_recovery) in [
+            (default_type, None, false),
+            (substituted, Some(error), true),
+        ] {
+            let properties = query
+                .store
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_deref()
+                .unwrap();
+            let [property] = properties else {
+                panic!("Cell must keep its one property");
+            };
+            assert_eq!(
+                query
+                    .store
+                    .value_symbol_links(*property)
+                    .unwrap()
+                    .resolved_type,
+                expected_type
+            );
+            assert_eq!(
+                query
+                    .store
+                    .instantiated_property_recovery(*property)
+                    .is_some(),
+                expected_recovery
+            );
+        }
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                query.store,
+                parameter,
+                &[parameter],
+                &[number],
+                None,
+                query.instantiation_session.as_deref_mut().unwrap(),
+            ),
+            Ok(error)
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (3, 3));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        assert!(session.limit_event_occurred_since(after));
+        assert!(session.limit_event_mark() > after);
+        let TypeData::TypeParameter(parameter) =
+            query.store.type_payload(parameter).unwrap().data()
+        else {
+            unreachable!()
+        };
+        assert_eq!(parameter.constraint, Some(constraint));
+        let [diagnostic] = query.diagnostics.as_slice() else {
+            panic!("expected one limit diagnostic");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2589);
+        assert_eq!(diagnostic.node, Some(default_node));
     }
 
     #[test]

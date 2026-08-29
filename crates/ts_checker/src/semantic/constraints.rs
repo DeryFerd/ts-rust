@@ -17,6 +17,9 @@ use super::{
     instantiate::{InstantiationError, canonical_anonymous_union, instantiate_type},
     intersection_types::IntersectionTypeError,
     mapper::CanonicalTypeMapperStore,
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     template_types::TemplateTypeError,
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -243,15 +246,65 @@ impl<'store> ConstraintSession<'store> {
     }
 
     fn classify_constraint(&self, type_: TypeId) -> Result<BaseConstraint, ConstraintError> {
-        if self.store.type_payload(type_).is_none() {
-            Err(ConstraintError::InvalidCachedConstraint(type_))
-        } else if type_ == self.no_constraint {
+        let record = self
+            .store
+            .type_payload(type_)
+            .ok_or(ConstraintError::InvalidCachedConstraint(type_))?;
+        if type_ == self.no_constraint {
             Ok(BaseConstraint::None)
         } else if type_ == self.circular_constraint {
             Ok(BaseConstraint::Circular)
+        } else if matches!(record.data(), TypeData::Object(_))
+            && !matches!(
+                validate_resolved_declared_property_object(self.store, type_),
+                DeclaredPropertyObjectValidation::Valid(_)
+            )
+        {
+            Err(ConstraintError::UnsupportedBaseType(type_))
         } else {
+            if matches!(
+                record.data(),
+                TypeData::Union(_) | TypeData::Intersection(_)
+            ) {
+                self.validate_cached_constraint_objects(type_)?;
+            }
             Ok(BaseConstraint::Type(type_))
         }
+    }
+
+    fn validate_cached_constraint_objects(&self, type_: TypeId) -> Result<(), ConstraintError> {
+        let mut pending = vec![type_];
+        let mut visited = HashSet::new();
+        while let Some(type_) = pending.pop() {
+            if !visited.insert(type_) {
+                continue;
+            }
+            let record = self
+                .store
+                .type_payload(type_)
+                .ok_or(ConstraintError::InvalidCachedConstraint(type_))?;
+            if type_ == self.no_constraint || type_ == self.circular_constraint {
+                continue;
+            }
+            match record.data() {
+                TypeData::Union(data) => {
+                    pending.extend(data.union.types.iter().rev().copied());
+                }
+                TypeData::Intersection(data) => {
+                    pending.extend(data.intersection.types.iter().rev().copied());
+                }
+                TypeData::Object(_)
+                    if !matches!(
+                        validate_resolved_declared_property_object(self.store, type_),
+                        DeclaredPropertyObjectValidation::Valid(_)
+                    ) =>
+                {
+                    return Err(ConstraintError::UnsupportedBaseType(type_));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn constraint_of_type_parameter(
@@ -331,6 +384,14 @@ impl<'store> ConstraintSession<'store> {
                 | TypeData::UniqueEsSymbol(_)
                 | TypeData::Interface(_)
                 | TypeData::Tuple(_) => ConstraintKind::Leaf,
+                TypeData::Object(_)
+                    if matches!(
+                        validate_resolved_declared_property_object(self.store, type_),
+                        DeclaredPropertyObjectValidation::Valid(_)
+                    ) =>
+                {
+                    ConstraintKind::Leaf
+                }
                 TypeData::TypeReference(reference)
                     if reference.object.target.is_some()
                         && reference.resolved_type_arguments.is_some() =>
@@ -746,13 +807,17 @@ pub(super) fn get_base_constraint_of_type_with_limits(
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeRef, SyntaxKind};
-    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
-    use ts_parser::parse_source_file;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SymbolData, SymbolFlags,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
         mapper::TypeMapper,
+        object_members::DeclaredPropertyObjectProof,
         signatures::IndexFlags,
         type_records::{TypeData, TypeRecord},
         types::ObjectFlags,
@@ -784,6 +849,441 @@ mod tests {
             constraint = parameter;
         }
         constraint
+    }
+
+    fn declared_object_context(
+        parsed: &ParseResult,
+    ) -> (CanonicalCheckerContext<'_>, Vec<(NodeRef, TypeId)>) {
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(92);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/object-constraints.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let aliases = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let ts_ast::NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, alias.type_),
+                ))
+            })
+            .map(|(declaration, body)| {
+                let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+                let symbol = context.store().get_merged_symbol(symbol).unwrap();
+                let type_ = context.get_declared_type_of_symbol(symbol).unwrap();
+                (body, symbol, type_)
+            })
+            .collect::<Vec<_>>();
+        let objects = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .map(|node| {
+                let type_ = context.get_type_from_type_node(node).unwrap();
+                let record = context.store().type_payload(type_).unwrap();
+                assert!(matches!(record.data(), TypeData::Object(_)));
+                let owner = context.file(file).unwrap().1.symbol(node).unwrap();
+                assert_eq!(record.symbol(), Some(owner));
+                assert_eq!(
+                    context.store().symbol(owner).unwrap().declarations(),
+                    Some(&[node][..])
+                );
+                let node_links = context.store().type_node_links(node).unwrap();
+                assert_eq!(node_links.resolved_type, Some(type_));
+                assert!(node_links.outer_type_parameters.is_none());
+                if let Some((_, alias_symbol, declared_type)) =
+                    aliases.iter().find(|(body, _, _)| *body == node)
+                {
+                    assert_eq!(type_, *declared_type);
+                    let alias = context.store().type_alias(record.alias().unwrap()).unwrap();
+                    assert_eq!(alias.symbol(), Some(*alias_symbol));
+                    assert!(alias.type_arguments().is_none());
+                    let links = context.store().type_alias_links(*alias_symbol).unwrap();
+                    assert_eq!(links.declared_type, Some(type_));
+                    assert!(links.type_parameters.is_none());
+                    assert!(links.instantiations.is_none());
+                    assert!(!links.is_constructor_declared_property);
+                    assert!(
+                        context
+                            .store()
+                            .type_alias_declared_type_owners(type_)
+                            .is_some_and(|owners| owners.contains(alias_symbol))
+                    );
+                } else {
+                    assert!(record.alias().is_none());
+                }
+                assert_eq!(
+                    validate_resolved_declared_property_object(context.store(), type_),
+                    DeclaredPropertyObjectValidation::Valid(
+                        DeclaredPropertyObjectProof::TypeLiteral
+                    )
+                );
+                (node, type_)
+            })
+            .collect();
+        (context, objects)
+    }
+
+    #[test]
+    fn declared_type_literal_bounds_preserve_exact_identity() {
+        let parsed = parse_source_file("type Empty = {}; type Shape = { value: number };");
+        let (mut context, objects) = declared_object_context(&parsed);
+        assert_eq!(objects.len(), 2);
+        let store = context.store_mut_for_test();
+        for (_, object) in objects {
+            let parameter = constrained_chain(store, 1, object);
+            let before = (store.type_len(), store.mapper_len(), store.signature_len());
+            assert_eq!(get_constraint_of_type(store, parameter), Ok(Some(object)));
+            assert_eq!(
+                get_base_constraint_of_type(store, parameter),
+                Ok(Some(object))
+            );
+            assert_eq!(
+                get_base_constraint_of_type_with_limits(
+                    store,
+                    parameter,
+                    ConstraintLimits { max_count: 0 },
+                ),
+                Ok(Some(object))
+            );
+            assert_eq!(
+                store
+                    .type_payload(object)
+                    .unwrap()
+                    .data()
+                    .constrained()
+                    .unwrap()
+                    .resolved_base_constraint,
+                None
+            );
+            assert_eq!(
+                (store.type_len(), store.mapper_len(), store.signature_len()),
+                before
+            );
+            assert!(store.type_resolution_is_empty());
+        }
+    }
+
+    #[test]
+    fn declared_type_literal_bounds_reject_changed_owner_and_node_cache() {
+        for warm in [false, true] {
+            for change_owner in [false, true] {
+                let parsed = parse_source_file(concat!(
+                    "type First = { value: number }; ",
+                    "type Second = { value: number };",
+                ));
+                let (mut context, objects) = declared_object_context(&parsed);
+                let [(node, object), (_, other)] = objects.as_slice() else {
+                    panic!("expected two declared type literals");
+                };
+                let (node, object, other) = (*node, *object, *other);
+                let store = context.store_mut_for_test();
+                let owner = store.type_payload(object).unwrap().symbol().unwrap();
+                let other_owner = store.type_payload(other).unwrap().symbol().unwrap();
+                let links = store.type_node_links(node).cloned().unwrap();
+                let parameter = constrained_chain(store, 1, object);
+                let parameter_state = |store: &CanonicalTypeMapperStore| {
+                    let TypeData::TypeParameter(data) =
+                        store.type_payload(parameter).unwrap().data()
+                    else {
+                        unreachable!();
+                    };
+                    (
+                        data.constraint,
+                        data.target,
+                        data.mapper,
+                        data.resolved_default_type,
+                        data.constrained.resolved_base_constraint,
+                    )
+                };
+                if warm {
+                    assert_eq!(
+                        get_base_constraint_of_type(store, parameter),
+                        Ok(Some(object))
+                    );
+                }
+                let before_parameter = parameter_state(store);
+                assert_eq!(
+                    before_parameter,
+                    (Some(object), None, None, None, warm.then_some(object))
+                );
+                if change_owner {
+                    assert!(store.set_type_symbol(object, Some(other_owner)));
+                } else {
+                    let mut changed = links.clone();
+                    changed.resolved_type = Some(other);
+                    assert!(store.set_type_node_links(node, changed));
+                }
+                let poisoned_owner = store.type_payload(object).unwrap().symbol();
+                let poisoned_links = store.type_node_links(node).cloned().unwrap();
+                assert_eq!(
+                    validate_resolved_declared_property_object(store, object),
+                    DeclaredPropertyObjectValidation::Malformed
+                );
+                let counts = |store: &CanonicalTypeMapperStore| {
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.index_info_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                    )
+                };
+                let before = counts(store);
+                for base_query in [false, true] {
+                    let result = if base_query {
+                        get_base_constraint_of_type(store, parameter)
+                    } else {
+                        get_constraint_of_type(store, parameter)
+                    };
+                    assert_eq!(result, Err(ConstraintError::UnsupportedBaseType(object)));
+                    assert_eq!(parameter_state(store), before_parameter);
+                    assert_eq!(store.type_payload(object).unwrap().symbol(), poisoned_owner);
+                    assert_eq!(store.type_node_links(node), Some(&poisoned_links));
+                    assert_eq!(counts(store), before);
+                    assert!(store.type_resolution_is_empty());
+                }
+                if change_owner {
+                    assert!(store.set_type_symbol(object, Some(owner)));
+                } else {
+                    assert!(store.set_type_node_links(node, links.clone()));
+                }
+                assert_eq!(get_constraint_of_type(store, parameter), Ok(Some(object)));
+                assert_eq!(
+                    get_base_constraint_of_type(store, parameter),
+                    Ok(Some(object))
+                );
+                assert_eq!(
+                    get_base_constraint_of_type_with_limits(
+                        store,
+                        parameter,
+                        ConstraintLimits { max_count: 0 },
+                    ),
+                    Ok(Some(object))
+                );
+                assert_eq!(
+                    parameter_state(store),
+                    (Some(object), None, None, None, Some(object))
+                );
+                assert_eq!(store.type_payload(object).unwrap().symbol(), Some(owner));
+                assert_eq!(store.type_node_links(node), Some(&links));
+                assert_eq!(counts(store), before);
+                assert!(store.type_resolution_is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_declared_type_literal_bounds_reject_changed_owner_and_node_cache() {
+        for (source, kind) in [
+            (
+                "type Wrapped = { value: number } | string; type Other = { value: number };",
+                SyntaxKind::UnionType,
+            ),
+            (
+                concat!(
+                    "type Wrapped = { value: number } & { tag: string }; ",
+                    "type Other = { value: number };",
+                ),
+                SyntaxKind::IntersectionType,
+            ),
+        ] {
+            for warm in [false, true] {
+                for change_owner in [false, true] {
+                    let parsed = parse_source_file(source);
+                    let (mut context, objects) = declared_object_context(&parsed);
+                    let (node, object) = objects[0];
+                    let (_, other) = *objects.last().unwrap();
+                    assert_ne!(object, other);
+                    let wrapper_node = parsed
+                        .arena
+                        .iter()
+                        .find_map(|(id, record)| {
+                            (record.kind == kind).then_some(NodeRef::new(
+                                parsed.arena.id(),
+                                node.file,
+                                id,
+                            ))
+                        })
+                        .unwrap();
+                    let wrapper = context.get_type_from_type_node(wrapper_node).unwrap();
+                    let store = context.store_mut_for_test();
+                    assert!(matches!(
+                        (kind, store.type_payload(wrapper).unwrap().data()),
+                        (SyntaxKind::UnionType, TypeData::Union(_))
+                            | (SyntaxKind::IntersectionType, TypeData::Intersection(_))
+                    ));
+                    let owner = store.type_payload(object).unwrap().symbol().unwrap();
+                    let other_owner = store.type_payload(other).unwrap().symbol().unwrap();
+                    let links = store.type_node_links(node).cloned().unwrap();
+                    let wrapper_links = store.type_node_links(wrapper_node).cloned().unwrap();
+                    let parameter = constrained_chain(store, 1, wrapper);
+                    let base_cache = |store: &CanonicalTypeMapperStore, type_: TypeId| {
+                        store
+                            .type_payload(type_)
+                            .unwrap()
+                            .data()
+                            .constrained()
+                            .unwrap()
+                            .resolved_base_constraint
+                    };
+                    assert_eq!(base_cache(store, parameter), None);
+                    assert_eq!(base_cache(store, wrapper), None);
+                    if warm {
+                        assert_eq!(
+                            get_base_constraint_of_type(store, parameter),
+                            Ok(Some(wrapper))
+                        );
+                    }
+                    let expected_base = warm.then_some(wrapper);
+                    assert_eq!(base_cache(store, parameter), expected_base);
+                    assert_eq!(base_cache(store, wrapper), expected_base);
+                    if change_owner {
+                        assert!(store.set_type_symbol(object, Some(other_owner)));
+                    } else {
+                        let mut changed = links.clone();
+                        changed.resolved_type = Some(other);
+                        assert!(store.set_type_node_links(node, changed));
+                    }
+                    let poisoned_owner = store.type_payload(object).unwrap().symbol();
+                    let poisoned_links = store.type_node_links(node).cloned().unwrap();
+                    assert_eq!(
+                        validate_resolved_declared_property_object(store, object),
+                        DeclaredPropertyObjectValidation::Malformed
+                    );
+                    let counts = |store: &CanonicalTypeMapperStore| {
+                        (
+                            store.type_len(),
+                            store.mapper_len(),
+                            store.signature_len(),
+                            store.symbol_len(),
+                            store.index_info_len(),
+                            store.symbol_store().symbol_table_len(),
+                            store.checker_link_allocated_lengths(),
+                        )
+                    };
+                    let before = counts(store);
+                    for (query_type, base_query) in [
+                        (parameter, false),
+                        (parameter, true),
+                        (wrapper, false),
+                        (wrapper, true),
+                    ] {
+                        let result = if base_query {
+                            get_base_constraint_of_type(store, query_type)
+                        } else {
+                            get_constraint_of_type(store, query_type)
+                        };
+                        assert_eq!(result, Err(ConstraintError::UnsupportedBaseType(object)));
+                        assert_eq!(base_cache(store, parameter), expected_base);
+                        assert_eq!(base_cache(store, wrapper), expected_base);
+                        assert_eq!(store.type_payload(object).unwrap().symbol(), poisoned_owner);
+                        assert_eq!(store.type_node_links(node), Some(&poisoned_links));
+                        assert_eq!(store.type_node_links(wrapper_node), Some(&wrapper_links));
+                        assert_eq!(counts(store), before);
+                        assert!(store.type_resolution_is_empty());
+                    }
+                    if change_owner {
+                        assert!(store.set_type_symbol(object, Some(owner)));
+                    } else {
+                        assert!(store.set_type_node_links(node, links.clone()));
+                    }
+                    assert_eq!(get_constraint_of_type(store, parameter), Ok(Some(wrapper)));
+                    assert_eq!(
+                        get_base_constraint_of_type_with_limits(
+                            store,
+                            parameter,
+                            ConstraintLimits { max_count: 0 },
+                        ),
+                        Ok(Some(wrapper))
+                    );
+                    assert_eq!(
+                        get_base_constraint_of_type_with_limits(
+                            store,
+                            wrapper,
+                            ConstraintLimits { max_count: 0 },
+                        ),
+                        Ok(Some(wrapper))
+                    );
+                    assert_eq!(base_cache(store, parameter), Some(wrapper));
+                    assert_eq!(base_cache(store, wrapper), Some(wrapper));
+                    assert_eq!(store.type_payload(object).unwrap().symbol(), Some(owner));
+                    assert_eq!(store.type_node_links(node), Some(&links));
+                    assert_eq!(store.type_node_links(wrapper_node), Some(&wrapper_links));
+                    assert_eq!(counts(store), before);
+                    assert!(store.type_resolution_is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_constraint_object_validation_keeps_sentinels_and_rejects_foreign_ids() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let leaves = [
+            bootstrap.no_constraint_type,
+            bootstrap.circular_constraint_type,
+            bootstrap.number_type,
+        ];
+        let foreign = initialized_store();
+        let foreign_string = foreign.intrinsic_bootstrap().unwrap().string_type;
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        let session =
+            ConstraintSession::new(&mut store, ConstraintLimits { max_count: 0 }).unwrap();
+        for type_ in leaves {
+            assert_eq!(session.validate_cached_constraint_objects(type_), Ok(()));
+        }
+        assert_eq!(
+            session.validate_cached_constraint_objects(foreign_string),
+            Err(ConstraintError::InvalidCachedConstraint(foreign_string))
+        );
+        assert_eq!(session.count, 0);
+        assert!(session.store.type_resolution_is_empty());
+        assert_eq!(
+            (
+                session.store.type_len(),
+                session.store.mapper_len(),
+                session.store.checker_link_allocated_lengths(),
+            ),
+            before
+        );
     }
 
     #[test]
