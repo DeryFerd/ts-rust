@@ -66,6 +66,7 @@ use super::{
         instantiate_type_with_vector_and_alias_and_session,
         instantiate_type_with_vector_and_session,
     },
+    instantiated_members::instantiated_function_member_signature_return,
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
     },
@@ -25684,14 +25685,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .global_types
                     .as_ref()
                     .map(CanonicalArrayTargets::from_global_types);
-                if preflight_generic_call_signature_return_target(
+                let member_return = instantiated_function_member_signature_return(
                     self.store,
-                    array_targets,
                     signature,
+                    array_targets,
                 )
+                .transpose()
                 .map_err(|_| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
-                })? != target
+                })?;
+                if member_return.is_none()
+                    && preflight_generic_call_signature_return_target(
+                        self.store,
+                        array_targets,
+                        signature,
+                    )
+                    .map_err(|_| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    })? != target
                 {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::InvalidFunctionSignature(signature),
@@ -25704,6 +25717,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 let result = (|| {
                     self.get_return_type_of_signature(target)?;
+                    if let Some(expected) = member_return {
+                        let actual = instantiated_function_member_signature_return(
+                            self.store,
+                            signature,
+                            array_targets,
+                        )
+                        .and_then(Result::ok)
+                        .filter(|actual| *actual == expected)
+                        .ok_or_else(|| {
+                            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                                signature,
+                            ))
+                        })?;
+                        return Ok(actual);
+                    }
                     if let Some(session) = self.instantiation_session.as_deref_mut() {
                         demand_generic_call_signature_return_with_session(
                             self.store,
@@ -78104,6 +78132,384 @@ mod tests {
                 assert!(diagnostics.is_empty());
             }
         }
+    }
+
+    struct MappedMemberReturnFixture {
+        source: Fixture,
+        globals: CanonicalGlobalTypes,
+        session: InstantiationSession,
+        diagnostics: CanonicalCheckerDiagnostics,
+        receiver: TypeId,
+        parameter: TypeId,
+    }
+
+    fn mapped_member_return_fixture() -> MappedMemberReturnFixture {
+        let mut source = global_array_fixture(concat!(
+            "type Observer<A> = { next: (value: A) => void; project: (value: A) => A; }; ",
+            "declare function factory<T>(observer: Observer<T>): void; ",
+            "declare const separate: Observer<number>;",
+        ));
+        let globals = initialize_fixture_global_types(&mut source);
+        let declaration = named_node(&source, SyntaxKind::FunctionDeclaration, "factory");
+        let owner = node_symbol(&source, declaration);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let (receiver, parameter) = {
+            let host = post_global_host(
+                &source.parsed.arena,
+                source.files.get(&source.file).unwrap(),
+            );
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                &mut source.store,
+                &host,
+                &globals,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = function_signature(query.store, declaration);
+            let signature = query.store.signature(signature).unwrap();
+            let [parameter] = signature.type_parameters() else {
+                panic!("the factory owns one source type parameter")
+            };
+            let [observer] = signature.parameters() else {
+                panic!("the factory has its original observer parameter")
+            };
+            let receiver = query
+                .store
+                .value_symbol_links(*observer)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            (receiver, *parameter)
+        };
+        MappedMemberReturnFixture {
+            source,
+            globals,
+            session,
+            diagnostics,
+            receiver,
+            parameter,
+        }
+    }
+
+    fn demand_mapped_member_return_callable(
+        fixture: &mut MappedMemberReturnFixture,
+        receiver: TypeId,
+        name: &str,
+    ) -> (TypeId, SignatureId) {
+        use crate::semantic::instantiated_members::{
+            demand_property_object_alias_property, resolve_property_object_alias_members,
+        };
+
+        let host = post_global_host(
+            &fixture.source.parsed.arena,
+            fixture.source.files.get(&fixture.source.file).unwrap(),
+        );
+        let members =
+            resolve_property_object_alias_members(&mut fixture.source.store, receiver).unwrap();
+        let property = fixture
+            .source
+            .store
+            .symbol_table(members.members.unwrap())
+            .unwrap()
+            .get_source(name)
+            .unwrap();
+        assert!(members.properties.contains(&property));
+        let callable = demand_property_object_alias_property(
+            &mut fixture.source.store,
+            &host,
+            &fixture.globals,
+            CanonicalCheckerOptions::default(),
+            &mut fixture.session,
+            &mut fixture.diagnostics,
+            receiver,
+            property,
+        )
+        .unwrap();
+        let TypeData::Object(object) = fixture.source.store.type_payload(callable).unwrap().data()
+        else {
+            panic!("the selected property has its real mapped function type")
+        };
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the property owns one call signature")
+        };
+        (callable, *signature)
+    }
+
+    #[test]
+    fn mapped_function_member_return_queries_keep_lexical_types_and_the_caller_session() {
+        let mut fixture = mapped_member_return_fixture();
+        let receiver = fixture.receiver;
+        let (_, next) = demand_mapped_member_return_callable(&mut fixture, receiver, "next");
+        let (_, project) = demand_mapped_member_return_callable(&mut fixture, receiver, "project");
+        let separate_node = variable_type_node(&fixture.source, "separate");
+        let separate = {
+            let host = post_global_host(
+                &fixture.source.parsed.arena,
+                fixture.source.files.get(&fixture.source.file).unwrap(),
+            );
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                &mut fixture.source.store,
+                &host,
+                &fixture.globals,
+                CanonicalTypeQueryOptions::default(),
+                &mut fixture.session,
+                &mut fixture.diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(separate_node)
+            .unwrap()
+        };
+        assert_ne!(separate, receiver);
+        let (_, other) = demand_mapped_member_return_callable(&mut fixture, separate, "project");
+        assert_ne!(project, other);
+        let alias = named_symbol(
+            &fixture.source,
+            SyntaxKind::TypeAliasDeclaration,
+            "Observer",
+        );
+        let [alias_parameter] = fixture
+            .source
+            .store
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the alias owns one separate type parameter")
+        };
+        let alias_parameter = *alias_parameter;
+        assert_ne!(alias_parameter, fixture.parameter);
+        assert!(
+            cached_ordinary_type_parameter_owner(&fixture.source.store, fixture.parameter)
+                .is_some()
+        );
+        let bootstrap = fixture.source.store.intrinsic_bootstrap().unwrap();
+        let void = bootstrap.void_type;
+        let number = bootstrap.number_type;
+        let expected = [(next, void), (project, fixture.parameter), (other, number)];
+        for (signature, returned) in expected {
+            let record = fixture.source.store.signature(signature).unwrap();
+            assert!(record.type_parameters().is_empty());
+            let source = record.target().unwrap();
+            assert!(record.mapper().is_some());
+            assert_eq!(record.resolved_return_type(), Some(returned));
+            assert_eq!(
+                fixture
+                    .source
+                    .store
+                    .source_callable_type_for_signature(source),
+                None
+            );
+            let source_record = fixture.source.store.signature(source).unwrap();
+            assert_eq!(
+                fixture
+                    .source
+                    .store
+                    .source_node_kind(source_record.declaration().unwrap()),
+                Some(SyntaxKind::FunctionType)
+            );
+            assert_eq!(
+                fixture
+                    .source
+                    .store
+                    .callable_signature_parameter_types(source),
+                Some(&[alias_parameter][..])
+            );
+            assert_eq!(
+                source_record.resolved_return_type(),
+                Some(if signature == next {
+                    void
+                } else {
+                    alias_parameter
+                })
+            );
+        }
+        assert!(fixture.session.total_count() > 0);
+        let before = format!("{:?}", fixture.source.store);
+        let session_before = format!("{:?}", fixture.session);
+        let host = post_global_host(
+            &fixture.source.parsed.arena,
+            fixture.source.files.get(&fixture.source.file).unwrap(),
+        );
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut fixture.source.store,
+            &host,
+            &fixture.globals,
+            CanonicalTypeQueryOptions::default(),
+            &mut fixture.session,
+            &mut fixture.diagnostics,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            for (signature, returned) in expected {
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert!(query.resolving_instantiated_signatures.is_empty());
+                assert_eq!(format!("{:?}", query.store), before);
+                assert_eq!(
+                    format!("{:?}", query.instantiation_session.as_deref().unwrap()),
+                    session_before
+                );
+            }
+        }
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn mapped_function_member_return_queries_reject_outer_damage_before_target_publication() {
+        let mut fixture = mapped_member_return_fixture();
+        let receiver = fixture.receiver;
+        let (_, mapped) = demand_mapped_member_return_callable(&mut fixture, receiver, "project");
+        let source = fixture
+            .source
+            .store
+            .signature(mapped)
+            .unwrap()
+            .target()
+            .unwrap();
+        let original_return = fixture
+            .source
+            .store
+            .signature(source)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let mapped_return = fixture.parameter;
+        let number = fixture
+            .source
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        let invalid = type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(mapped));
+        for changed_return in [Some(number), None, Some(mapped_return)] {
+            assert!(
+                fixture
+                    .source
+                    .store
+                    .set_signature_resolved_return_type(mapped, changed_return)
+            );
+            assert!(
+                fixture
+                    .source
+                    .store
+                    .set_signature_resolved_return_type(source, None)
+            );
+            let before = format!("{:?}", fixture.source.store);
+            let session_before = format!("{:?}", fixture.session);
+            let host = post_global_host(
+                &fixture.source.parsed.arena,
+                fixture.source.files.get(&fixture.source.file).unwrap(),
+            );
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                &mut fixture.source.store,
+                &host,
+                &fixture.globals,
+                CanonicalTypeQueryOptions::default(),
+                &mut fixture.session,
+                &mut fixture.diagnostics,
+            )
+            .unwrap();
+            for _ in 0..2 {
+                assert_eq!(query.get_return_type_of_signature(mapped), Err(invalid));
+                assert_eq!(
+                    query
+                        .store
+                        .signature(source)
+                        .unwrap()
+                        .resolved_return_type(),
+                    None
+                );
+                assert!(query.resolving_instantiated_signatures.is_empty());
+                assert_eq!(format!("{:?}", query.store), before);
+                assert_eq!(
+                    format!("{:?}", query.instantiation_session.as_deref().unwrap()),
+                    session_before
+                );
+            }
+            // The source FunctionType still owns its normal lazy return query.
+            assert_eq!(
+                query.get_return_type_of_signature(source),
+                Ok(original_return)
+            );
+            assert_eq!(
+                query
+                    .store
+                    .signature(source)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(original_return)
+            );
+        }
+        assert!(
+            fixture
+                .source
+                .store
+                .set_signature_resolved_return_type(mapped, Some(mapped_return))
+        );
+        let (alias_declaration, _, alias_body) = alias_parts(&fixture.source, "Observer");
+        let alias = node_symbol(&fixture.source, alias_declaration);
+        let before = format!("{:?}", fixture.source.store);
+        let session_before = format!("{:?}", fixture.session);
+        let host = post_global_host(
+            &fixture.source.parsed.arena,
+            fixture.source.files.get(&fixture.source.file).unwrap(),
+        );
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut fixture.source.store,
+            &host,
+            &fixture.globals,
+            CanonicalTypeQueryOptions::default(),
+            &mut fixture.session,
+            &mut fixture.diagnostics,
+        )
+        .unwrap();
+        assert!(query.resolving_instantiated_signatures.insert(mapped));
+        assert_eq!(query.get_return_type_of_signature(mapped), Err(invalid));
+        assert_eq!(query.resolving_instantiated_signatures.len(), 1);
+        assert!(query.resolving_instantiated_signatures.remove(&mapped));
+        // A surplus root must not be ignored because the mapped return is cached.
+        let surplus = CanonicalTypeReferenceAliasTarget::new(
+            alias_declaration,
+            alias_body,
+            alias_declaration,
+            alias,
+            alias,
+            alias,
+        );
+        assert_eq!(
+            query
+                .type_reference_alias_targets
+                .insert(alias_body, surplus),
+            None
+        );
+        assert_eq!(
+            query.get_return_type_of_signature(mapped),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::ImportAliasCapabilityUnsupported(alias_body),
+            ))
+        );
+        assert!(query.resolving_instantiated_signatures.is_empty());
+        assert_eq!(
+            query.type_reference_alias_targets.remove(&alias_body),
+            Some(surplus)
+        );
+        assert_eq!(
+            query.get_return_type_of_signature(mapped),
+            Ok(mapped_return)
+        );
+        assert_eq!(format!("{:?}", query.store), before);
+        assert_eq!(
+            format!("{:?}", query.instantiation_session.as_deref().unwrap()),
+            session_before
+        );
+        assert!(query.diagnostics.is_empty());
     }
 
     #[test]
