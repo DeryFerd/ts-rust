@@ -741,7 +741,7 @@ fn nested_for_of_observer_call_keeps_the_outer_type_parameter() {
         source_property,
         symbol(
             &checker,
-            only_node(&provider, PROVIDER, SyntaxKind::PropertySignature)
+            only_node(&provider, PROVIDER, SyntaxKind::PropertyDeclaration)
         )
     );
     assert_ne!(property, source_property);
