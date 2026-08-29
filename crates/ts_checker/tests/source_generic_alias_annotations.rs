@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, TypeData, TypeId,
+    TypeData, TypeId,
     types::{ObjectFlags, TypeFlags},
 };
 use ts_parser::{ParseResult, parse_source_file};
@@ -366,36 +366,313 @@ fn unsupported_alias_dependencies_do_not_publish_an_earlier_callable() {
 }
 
 #[test]
-fn unsupported_alias_instantiation_does_not_publish_a_callable_or_grow_on_retry() {
+#[allow(clippy::too_many_lines)] // One source check proves the full published alias and callable.
+fn property_object_alias_parameter_publishes_exact_callable_and_replays() {
     let parsed = parse_source_file(concat!(
         "type Alias<T> = { value: T }; ",
         "declare function make<T>(value: Alias<T>): T;",
     ));
     let mut context = context(&parsed);
-    assert!(matches!(
-        context.check_source_file(FILE),
-        Err(SourceCheckError::DeclaredType(_))
-    ));
-    let before = counts(&context);
-    assert!(matches!(
-        context.check_source_file(FILE),
-        Err(SourceCheckError::DeclaredType(_))
-    ));
-    assert_eq!(counts(&context), before);
-    let declaration = parsed
+    let result = context.check_source_file(FILE);
+    assert_eq!(result, Ok(()));
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+    let node_ref = |node| NodeRef::new(parsed.arena.id(), FILE, node);
+    let (alias_declaration, alias_parameter_node, literal) = parsed
         .arena
         .iter()
         .find_map(|(node, record)| {
-            (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
-                parsed.arena.id(),
-                FILE,
-                node,
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                return None;
+            };
+            Some((
+                node_ref(node),
+                node_ref(alias.type_parameters.as_ref()?.nodes[0]),
+                node_ref(alias.type_),
             ))
         })
         .unwrap();
-    let owner = context.file(FILE).unwrap().1.symbol(declaration).unwrap();
-    assert!(context.store().value_symbol_links(owner).is_none());
-    assert!(context.store().signature_links(declaration).is_none());
+    let (declaration, type_parameter_node, parameter_node, return_annotation) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::FunctionDeclaration(function) = &record.data else {
+                return None;
+            };
+            Some((
+                node_ref(node),
+                node_ref(function.type_parameters.as_ref()?.nodes[0]),
+                node_ref(function.parameters.nodes[0]),
+                node_ref(function.type_?),
+            ))
+        })
+        .unwrap();
+    let NodeData::ParameterDeclaration(parameter) =
+        &parsed.arena.get(parameter_node.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let parameter_annotation = node_ref(parameter.type_.unwrap());
+    let [
+        alias_owner,
+        alias_parameter_owner,
+        source_symbol,
+        owner,
+        type_parameter_owner,
+        parameter,
+    ] = [
+        alias_declaration,
+        alias_parameter_node,
+        literal,
+        declaration,
+        type_parameter_node,
+        parameter_node,
+    ]
+    .map(|node| context.file(FILE).unwrap().1.symbol(node).unwrap());
+    let signature = context
+        .store()
+        .signature_links(declaration)
+        .unwrap()
+        .resolved_signature
+        .signature()
+        .unwrap();
+    let callable = context
+        .store()
+        .value_symbol_links(owner)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let TypeData::Object(callable_data) = context.store().type_payload(callable).unwrap().data()
+    else {
+        panic!("make must publish its callable object")
+    };
+    assert_eq!(callable_data.structured.call_signature_count, 1);
+    assert_eq!(
+        callable_data.structured.signatures.as_deref(),
+        Some([signature].as_slice())
+    );
+    let record = context.store().signature(signature).unwrap();
+    assert_eq!(record.declaration(), Some(declaration));
+    assert_eq!(record.parameters(), &[parameter]);
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(record.type_parameters().len(), 1);
+    assert_eq!(record.target(), None);
+    assert_eq!(record.mapper(), None);
+    let function_parameter = record.type_parameters()[0];
+    assert_eq!(record.resolved_return_type(), Some(function_parameter));
+    assert_eq!(
+        context
+            .store()
+            .type_payload(function_parameter)
+            .unwrap()
+            .symbol(),
+        Some(type_parameter_owner)
+    );
+    assert_eq!(
+        context
+            .store()
+            .declared_type_links(type_parameter_owner)
+            .unwrap()
+            .declared_type,
+        Some(function_parameter)
+    );
+    let instance = context
+        .store()
+        .value_symbol_links(parameter)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let links = context.store().type_alias_links(alias_owner).unwrap();
+    let target = links.declared_type.unwrap();
+    let alias_parameters = links.type_parameters.as_deref().unwrap();
+    assert_eq!(alias_parameters.len(), 1);
+    let alias_parameter = alias_parameters[0];
+    assert_ne!(alias_parameter, function_parameter);
+    assert_ne!(target, instance);
+    assert_ne!(source_symbol, alias_owner);
+    assert_eq!(
+        context
+            .store()
+            .type_payload(alias_parameter)
+            .unwrap()
+            .symbol(),
+        Some(alias_parameter_owner)
+    );
+    assert_eq!(
+        context
+            .store()
+            .declared_type_links(alias_parameter_owner)
+            .unwrap()
+            .declared_type,
+        Some(alias_parameter)
+    );
+    let instance_record = context.store().type_payload(instance).unwrap();
+    assert_eq!(instance_record.symbol(), Some(source_symbol));
+    let TypeData::Object(instance_data) = instance_record.data() else {
+        panic!("Alias<make.T> must be an instantiated object")
+    };
+    assert_eq!(instance_data.target, Some(target));
+    let mapper = instance_data.mapper.unwrap();
+    assert_eq!(
+        context.store().mapper_kind(mapper),
+        Some(ts_checker::semantic::TypeMapperKind::Simple)
+    );
+    assert_eq!(
+        context.store().map_type(mapper, alias_parameter),
+        Some(function_parameter)
+    );
+    let metadata = context
+        .store()
+        .type_alias(instance_record.alias().unwrap())
+        .unwrap();
+    assert_eq!(metadata.symbol(), Some(alias_owner));
+    assert_eq!(
+        metadata.type_arguments(),
+        Some([function_parameter].as_slice())
+    );
+    let target_record = context.store().type_payload(target).unwrap();
+    assert_eq!(target_record.symbol(), Some(source_symbol));
+    let target_alias = context
+        .store()
+        .type_alias(target_record.alias().unwrap())
+        .unwrap();
+    assert_eq!(target_alias.symbol(), Some(alias_owner));
+    assert_eq!(
+        target_alias.type_arguments(),
+        Some([alias_parameter].as_slice())
+    );
+    let TypeData::Object(target_data) = target_record.data() else {
+        panic!("the original alias must retain its type-literal object")
+    };
+    assert_eq!(target_data.target, None);
+    assert_eq!(target_data.mapper, None);
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(literal)
+            .unwrap()
+            .resolved_type,
+        Some(target)
+    );
+    let requests = links.instantiations.as_ref().unwrap();
+    assert!(requests.values().any(|type_| *type_ == target));
+    assert!(requests.values().any(|type_| *type_ == instance));
+    let ts_checker::semantic::type_records::TypeCacheState::Allocated(instantiations) =
+        &target_data.instantiations
+    else {
+        panic!("the original object must own its canonical instantiation cache")
+    };
+    assert!(instantiations.values().any(|type_| *type_ == instance));
+
+    let query_nodes = [parameter_annotation, return_annotation];
+    let query_links = query_nodes.map(|node| context.store().type_node_links(node).cloned());
+    for (links, expected) in query_links.iter().zip([instance, function_parameter]) {
+        assert_eq!(
+            links.as_ref().and_then(|links| links.resolved_type),
+            Some(expected)
+        );
+    }
+    let query_counts = (
+        counts(&context),
+        context.store().type_alias_len(),
+        context.store().symbol_store().symbol_table_len(),
+    );
+    assert_eq!(
+        context.get_type_from_type_node(parameter_annotation),
+        Ok(instance)
+    );
+    assert_eq!(
+        context.get_type_from_type_node(return_annotation),
+        Ok(function_parameter)
+    );
+    assert_eq!(
+        context.get_return_type_of_signature(signature),
+        Ok(function_parameter)
+    );
+    assert_eq!(
+        (
+            counts(&context),
+            context.store().type_alias_len(),
+            context.store().symbol_store().symbol_table_len()
+        ),
+        query_counts
+    );
+    assert_eq!(
+        query_nodes.map(|node| context.store().type_node_links(node).cloned()),
+        query_links
+    );
+    let state = |context: &CanonicalCheckerContext<'_>| {
+        let store = context.store();
+        let signature = store.signature(signature).unwrap();
+        (
+            (
+                counts(context),
+                store.type_alias_len(),
+                store.symbol_store().symbol_table_len(),
+            ),
+            store.type_alias_links(alias_owner).cloned(),
+            [target, instance, callable].map(|type_| {
+                let record = store.type_payload(type_).unwrap();
+                let TypeData::Object(object) = record.data() else {
+                    panic!("published object identities must remain objects")
+                };
+                (
+                    record.flags(),
+                    record.object_flags(),
+                    record.symbol(),
+                    record.alias(),
+                    object.clone(),
+                )
+            }),
+            [owner, parameter].map(|symbol| store.value_symbol_links(symbol).cloned()),
+            [alias_parameter_owner, type_parameter_owner]
+                .map(|symbol| store.declared_type_links(symbol).cloned()),
+            [
+                literal,
+                alias_parameter_node,
+                type_parameter_node,
+                parameter_annotation,
+                return_annotation,
+            ]
+            .map(|node| store.type_node_links(node).cloned()),
+            store.signature_links(declaration).cloned(),
+            (
+                signature.declaration(),
+                signature.parameters().to_vec(),
+                signature.type_parameters().to_vec(),
+                signature.min_argument_count(),
+                signature.target(),
+                signature.mapper(),
+                signature.resolved_return_type(),
+            ),
+            context.diagnostics().clone(),
+        )
+    };
+    let before = state(&context);
+    for forced in [false, true] {
+        if forced {
+            context.recheck_source_file(FILE).unwrap();
+        } else {
+            context.check_source_file(FILE).unwrap();
+        }
+        assert_eq!(
+            context.get_type_from_type_node(parameter_annotation),
+            Ok(instance)
+        );
+        assert_eq!(
+            context.get_type_from_type_node(return_annotation),
+            Ok(function_parameter)
+        );
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(function_parameter)
+        );
+        assert_eq!(state(&context), before);
+        assert!(context.diagnostics().is_empty());
+    }
 }
 
 #[test]
@@ -1111,7 +1388,8 @@ fn generic_alias_source_boundary_keeps_recursive_and_const_forms_unsupported() {
 }
 
 #[test]
-fn unsupported_return_only_alias_does_not_publish_any_callable() {
+#[allow(clippy::too_many_lines)] // Both declarations and wrapper forms must retain separate owners.
+fn return_only_property_object_alias_publishes_distinct_callables_and_replays() {
     for annotation in ["Unsupported<T>", "(Unsupported<T>)"] {
         let parsed = parse_source_file(&format!(
             "type Identity<Value> = Value; type Unsupported<Value> = {{ value: Value }}; \
@@ -1119,21 +1397,427 @@ fn unsupported_return_only_alias_does_not_publish_any_callable() {
              declare function later<T>(): {annotation};"
         ));
         let mut context = context(&parsed);
-        assert!(context.check_source_file(FILE).is_err());
-        for (node, record) in parsed.arena.iter() {
-            if record.kind != SyntaxKind::FunctionDeclaration {
-                continue;
-            }
-            let declaration = NodeRef::new(parsed.arena.id(), FILE, node);
-            let owner = context.file(FILE).unwrap().1.symbol(declaration).unwrap();
-            assert!(
-                context.store().value_symbol_links(owner).is_none(),
-                "unsupported return-only alias published {declaration:?}: {annotation}"
-            );
-            assert!(context.store().signature_links(declaration).is_none());
+        let result = context.check_source_file(FILE);
+        assert_eq!(result, Ok(()), "{annotation}");
+        assert!(
+            context.diagnostics().is_empty(),
+            "{annotation}: {:?}",
+            context.diagnostics()
+        );
+        let node_ref = |node| NodeRef::new(parsed.arena.id(), FILE, node);
+        let alias_parts = |expected: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then(|| {
+                        (
+                            node_ref(node),
+                            node_ref(alias.type_parameters.as_ref().unwrap().nodes[0]),
+                            node_ref(alias.type_),
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let (identity_declaration, identity_parameter_node, identity_rhs) = alias_parts("Identity");
+        let (alias_declaration, alias_parameter_node, literal) = alias_parts("Unsupported");
+        let function_parts = |expected: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(function.name?)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then(|| {
+                        (
+                            node_ref(node),
+                            node_ref(function.type_parameters.as_ref().unwrap().nodes[0]),
+                            function
+                                .parameters
+                                .nodes
+                                .iter()
+                                .copied()
+                                .map(node_ref)
+                                .collect::<Vec<_>>(),
+                            node_ref(function.type_.unwrap()),
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let (first_declaration, first_type_parameter_node, first_parameters, first_return) =
+            function_parts("first");
+        let (later_declaration, later_type_parameter_node, later_parameters, later_return) =
+            function_parts("later");
+        let [first_parameter_node] = first_parameters.as_slice() else {
+            panic!("first must retain its single value parameter")
+        };
+        assert!(later_parameters.is_empty());
+        let NodeData::ParameterDeclaration(parameter) =
+            &parsed.arena.get(first_parameter_node.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let first_parameter_annotation = node_ref(parameter.type_.unwrap());
+        let mut later_reference = later_return;
+        while let NodeData::ParenthesizedTypeNode(wrapper) =
+            &parsed.arena.get(later_reference.node).unwrap().data
+        {
+            later_reference = node_ref(wrapper.type_);
         }
-        let before = counts(&context);
-        assert!(context.check_source_file(FILE).is_err());
-        assert_eq!(counts(&context), before);
+        assert!(matches!(
+            parsed.arena.get(later_reference.node).unwrap().data,
+            NodeData::TypeReferenceNode(_)
+        ));
+        let bound_symbol = |node| context.file(FILE).unwrap().1.symbol(node).unwrap();
+        let declarations = [first_declaration, later_declaration];
+        let owners = declarations.map(bound_symbol);
+        let parameter_owners =
+            [first_type_parameter_node, later_type_parameter_node].map(bound_symbol);
+        let first_parameter = bound_symbol(*first_parameter_node);
+        let alias_owner = bound_symbol(alias_declaration);
+        let alias_parameter_owner = bound_symbol(alias_parameter_node);
+        let identity_owner = bound_symbol(identity_declaration);
+        let identity_parameter_owner = bound_symbol(identity_parameter_node);
+        let source_symbol = bound_symbol(literal);
+        let signatures = declarations.map(|declaration| {
+            context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap()
+        });
+        let callables = owners.map(|owner| {
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        });
+        assert_ne!(signatures[0], signatures[1]);
+        assert_ne!(callables[0], callables[1]);
+        for ((declaration, signature), callable) in
+            declarations.into_iter().zip(signatures).zip(callables)
+        {
+            let TypeData::Object(object) = context.store().type_payload(callable).unwrap().data()
+            else {
+                panic!("each function must publish its own callable object")
+            };
+            assert_eq!(object.structured.call_signature_count, 1);
+            assert_eq!(
+                object.structured.signatures.as_deref(),
+                Some([signature].as_slice())
+            );
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.declaration(), Some(declaration));
+            assert_eq!(record.type_parameters().len(), 1);
+            assert_eq!(record.target(), None);
+            assert_eq!(record.mapper(), None);
+        }
+        let first_signature = context.store().signature(signatures[0]).unwrap();
+        assert_eq!(first_signature.parameters(), &[first_parameter]);
+        assert_eq!(first_signature.min_argument_count(), 1);
+        let later_signature = context.store().signature(signatures[1]).unwrap();
+        assert!(later_signature.parameters().is_empty());
+        assert_eq!(later_signature.min_argument_count(), 0);
+        let parameters = signatures.map(|signature| {
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters()[0]
+        });
+        assert_ne!(parameters[0], parameters[1]);
+        for (parameter, owner) in parameters.into_iter().zip(parameter_owners) {
+            assert_eq!(
+                context.store().type_payload(parameter).unwrap().symbol(),
+                Some(owner)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type,
+                Some(parameter)
+            );
+        }
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(first_parameter)
+                .unwrap()
+                .resolved_type,
+            Some(parameters[0])
+        );
+        let identity_links = context.store().type_alias_links(identity_owner).unwrap();
+        let identity_parameter = identity_links.type_parameters.as_ref().unwrap()[0];
+        assert_eq!(
+            identity_links.type_parameters.as_deref(),
+            Some([identity_parameter].as_slice())
+        );
+        assert_eq!(identity_links.declared_type, Some(identity_parameter));
+        assert_eq!(
+            context
+                .store()
+                .type_payload(identity_parameter)
+                .unwrap()
+                .symbol(),
+            Some(identity_parameter_owner)
+        );
+        let links = context.store().type_alias_links(alias_owner).unwrap();
+        let target = links.declared_type.unwrap();
+        let alias_parameter = links.type_parameters.as_ref().unwrap()[0];
+        assert_eq!(
+            links.type_parameters.as_deref(),
+            Some([alias_parameter].as_slice())
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_payload(alias_parameter)
+                .unwrap()
+                .symbol(),
+            Some(alias_parameter_owner)
+        );
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(alias_parameter_owner)
+                .unwrap()
+                .declared_type,
+            Some(alias_parameter)
+        );
+        assert_ne!(identity_parameter, alias_parameter);
+        for parameter in parameters {
+            assert_ne!(parameter, identity_parameter);
+            assert_ne!(parameter, alias_parameter);
+        }
+        let instance = context
+            .store()
+            .type_node_links(later_reference)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_ne!(instance, target);
+        assert_ne!(instance, parameters[0]);
+        assert_ne!(source_symbol, alias_owner);
+        let record = context.store().type_payload(instance).unwrap();
+        assert_eq!(record.symbol(), Some(source_symbol));
+        let TypeData::Object(instance_data) = record.data() else {
+            panic!("later must return Unsupported<later.T>, not the template")
+        };
+        assert_eq!(instance_data.target, Some(target));
+        let mapper = instance_data.mapper.unwrap();
+        assert_eq!(
+            context.store().mapper_kind(mapper),
+            Some(ts_checker::semantic::TypeMapperKind::Simple)
+        );
+        assert_eq!(
+            context.store().map_type(mapper, alias_parameter),
+            Some(parameters[1])
+        );
+        let metadata = context.store().type_alias(record.alias().unwrap()).unwrap();
+        assert_eq!(metadata.symbol(), Some(alias_owner));
+        assert_eq!(metadata.type_arguments(), Some([parameters[1]].as_slice()));
+        let target_record = context.store().type_payload(target).unwrap();
+        assert_eq!(target_record.symbol(), Some(source_symbol));
+        let target_alias = context
+            .store()
+            .type_alias(target_record.alias().unwrap())
+            .unwrap();
+        assert_eq!(target_alias.symbol(), Some(alias_owner));
+        assert_eq!(
+            target_alias.type_arguments(),
+            Some([alias_parameter].as_slice())
+        );
+        let TypeData::Object(target_data) = target_record.data() else {
+            panic!("Unsupported must retain its original type-literal object")
+        };
+        assert_eq!(target_data.target, None);
+        assert_eq!(target_data.mapper, None);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(literal)
+                .unwrap()
+                .resolved_type,
+            Some(target)
+        );
+        let requests = links.instantiations.as_ref().unwrap();
+        assert!(requests.values().any(|type_| *type_ == target));
+        assert!(requests.values().any(|type_| *type_ == instance));
+        let ts_checker::semantic::type_records::TypeCacheState::Allocated(instantiations) =
+            &target_data.instantiations
+        else {
+            panic!("the original object must own its canonical instantiation cache")
+        };
+        assert!(instantiations.values().any(|type_| *type_ == instance));
+
+        let query_counts = (
+            counts(&context),
+            context.store().type_alias_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+        let queries = [
+            (first_parameter_annotation, parameters[0]),
+            (first_return, parameters[0]),
+            (later_return, instance),
+            (later_reference, instance),
+        ];
+        for (signature, expected) in signatures.into_iter().zip([parameters[0], instance]) {
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(expected)
+            );
+        }
+        for (node, expected) in [
+            (first_parameter_annotation, parameters[0]),
+            (first_return, parameters[0]),
+            (later_reference, instance),
+        ] {
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(expected)
+            );
+        }
+        let query_links = queries.map(|(node, _)| context.store().type_node_links(node).cloned());
+        for (node, expected) in queries {
+            assert_eq!(
+                context.get_type_from_type_node(node),
+                Ok(expected),
+                "{annotation}"
+            );
+        }
+        assert_eq!(
+            context.get_return_type_of_signature(signatures[0]),
+            Ok(parameters[0])
+        );
+        assert_eq!(
+            context.get_return_type_of_signature(signatures[1]),
+            Ok(instance)
+        );
+        assert_eq!(
+            (
+                counts(&context),
+                context.store().type_alias_len(),
+                context.store().symbol_store().symbol_table_len()
+            ),
+            query_counts
+        );
+        assert_eq!(
+            queries.map(|(node, _)| context.store().type_node_links(node).cloned()),
+            query_links
+        );
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                (
+                    counts(context),
+                    store.type_alias_len(),
+                    store.symbol_store().symbol_table_len(),
+                ),
+                [identity_owner, alias_owner].map(|owner| store.type_alias_links(owner).cloned()),
+                [target, instance, callables[0], callables[1]].map(|type_| {
+                    let record = store.type_payload(type_).unwrap();
+                    let TypeData::Object(object) = record.data() else {
+                        panic!("published object identities must remain objects")
+                    };
+                    (
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        object.clone(),
+                    )
+                }),
+                [owners[0], owners[1], first_parameter]
+                    .map(|owner| store.value_symbol_links(owner).cloned()),
+                [
+                    identity_parameter_owner,
+                    alias_parameter_owner,
+                    parameter_owners[0],
+                    parameter_owners[1],
+                ]
+                .map(|owner| store.declared_type_links(owner).cloned()),
+                [
+                    identity_rhs,
+                    literal,
+                    identity_parameter_node,
+                    alias_parameter_node,
+                    first_type_parameter_node,
+                    later_type_parameter_node,
+                    first_parameter_annotation,
+                    first_return,
+                    later_return,
+                    later_reference,
+                ]
+                .map(|node| store.type_node_links(node).cloned()),
+                declarations.map(|declaration| store.signature_links(declaration).cloned()),
+                signatures.map(|signature| {
+                    let signature = store.signature(signature).unwrap();
+                    (
+                        signature.declaration(),
+                        signature.parameters().to_vec(),
+                        signature.type_parameters().to_vec(),
+                        signature.min_argument_count(),
+                        signature.target(),
+                        signature.mapper(),
+                        signature.resolved_return_type(),
+                    )
+                }),
+                context.diagnostics().clone(),
+            )
+        };
+        let before = state(&context);
+        for forced in [false, true] {
+            if forced {
+                context.recheck_source_file(FILE).unwrap();
+            } else {
+                context.check_source_file(FILE).unwrap();
+            }
+            for (node, expected) in queries {
+                assert_eq!(
+                    context.get_type_from_type_node(node),
+                    Ok(expected),
+                    "{annotation}"
+                );
+            }
+            assert_eq!(
+                context.get_return_type_of_signature(signatures[0]),
+                Ok(parameters[0])
+            );
+            assert_eq!(
+                context.get_return_type_of_signature(signatures[1]),
+                Ok(instance)
+            );
+            assert_eq!(state(&context), before, "{annotation}");
+            assert!(
+                context.diagnostics().is_empty(),
+                "{annotation}: {:?}",
+                context.diagnostics()
+            );
+        }
     }
 }

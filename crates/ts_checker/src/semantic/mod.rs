@@ -56,6 +56,7 @@ mod merge;
 mod module_exports;
 pub mod module_resolution;
 pub mod name_resolution;
+mod object_aliases;
 mod object_diagnostics;
 mod object_members;
 mod primitive_operators;

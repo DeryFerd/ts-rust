@@ -41,6 +41,9 @@ use super::{
         SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     mapped_types::{MappedTypeModifiers, plan_mapped_type_declaration},
+    object_aliases::{
+        property_object_alias_nonempty_projection, property_object_alias_template_matches,
+    },
     reference_types::validate_direct_generic_reference,
     signatures::{ElementFlags, IndexFlags, Signature, SignatureFlags, TypePredicateKind},
     store::{
@@ -58,7 +61,13 @@ use super::{
 };
 
 #[cfg(test)]
-use super::declared::execute_type_parameter;
+use super::{
+    declared::execute_type_parameter,
+    object_aliases::{
+        property_object_alias_identity_source_header, property_object_alias_projection,
+        validate_property_object_alias_source_argument,
+    },
+};
 
 pub(super) use super::store::SourceCallableFamily;
 
@@ -373,6 +382,22 @@ impl SourceCallableAliasAnnotation {
             let links = store.type_alias_links(alias.symbol)?;
             let declared = links.declared_type?;
             let parameters = links.type_parameters.as_deref().unwrap_or_default();
+            let body_is_exact = match property_object_alias_template_matches(
+                store,
+                alias.symbol,
+                alias.body,
+                declared,
+                parameters,
+            ) {
+                Ok(true) => true,
+                Ok(false) => source_callable_alias_body_cache_is_exact(
+                    store,
+                    alias,
+                    declared,
+                    &self.declarations,
+                ),
+                Err(_) => return None,
+            };
             if links.is_constructor_declared_property
                 || if alias.parameters.is_empty() {
                     links.type_parameters.is_some() || links.instantiations.is_some()
@@ -395,12 +420,7 @@ impl SourceCallableAliasAnnotation {
                                 )
                             })
                     })
-                || store.type_node_links(alias.body)
-                    != Some(&TypeNodeLinks {
-                        resolved_type: Some(declared),
-                        outer_type_parameters: None,
-                    })
-                    && !store.source_type_node_result_is_exact(alias.body, declared, &[])
+                || !body_is_exact
             {
                 return None;
             }
@@ -484,6 +504,109 @@ fn source_alias_parameter_identity_is_exact<MapperPayload>(
             .declared_type_links(symbol)
             .and_then(|links| links.declared_type)
             == Some(type_)
+}
+
+/// Transparent wrapper aliases keep the result on their inner reference.
+/// This checks source and cache identity only, not the instance mapper.
+#[allow(clippy::too_many_lines)] // Keep the source edge and cache checks together.
+fn source_callable_alias_body_cache_is_exact<M>(
+    store: &SemanticStore<TypeRecord, M>,
+    alias: &SourceCallableAliasDeclaration,
+    declared: TypeId,
+    declarations: &[SourceCallableAliasDeclaration],
+) -> bool {
+    let old_body_is_exact = || {
+        store.type_node_links(alias.body)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(declared),
+                outer_type_parameters: None,
+            })
+            || store.source_type_node_result_is_exact(alias.body, declared, &[])
+    };
+    if store.source_node_kind(alias.body) != Some(SyntaxKind::ParenthesizedType) {
+        return old_body_is_exact();
+    }
+    let mut node = alias.body;
+    let mut wrappers = Vec::new();
+    let mut seen = HashSet::from([node]);
+    while store.source_node_kind(node) == Some(SyntaxKind::ParenthesizedType) {
+        let Some(children) = store.source_direct_children(node) else {
+            return false;
+        };
+        let [child] = children.as_slice() else {
+            return false;
+        };
+        if child.arena != alias.body.arena
+            || child.file != alias.body.file
+            || store.source_node_parent(*child) != Some(SourceNodeParent::Parent(node))
+            || !seen.insert(*child)
+        {
+            return false;
+        }
+        wrappers.push(node);
+        node = *child;
+    }
+    if store.source_node_kind(node) != Some(SyntaxKind::TypeReference) {
+        return old_body_is_exact();
+    }
+    if store.source_direct_type_annotation(alias.declaration) != Some(alias.body)
+        || store.source_node_parent(alias.body) != Some(SourceNodeParent::Parent(alias.declaration))
+        || store.type_node_links(node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(declared),
+                outer_type_parameters: None,
+            })
+        || wrappers.iter().any(|wrapper| {
+            store.type_node_links(*wrapper).is_some_and(|links| {
+                links.resolved_type.is_some_and(|type_| type_ != declared)
+                    || links.outer_type_parameters.is_some()
+            }) || store
+                .symbol_node_links(*wrapper)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        })
+    {
+        return false;
+    }
+    let Some(referenced) = store
+        .symbol_node_links(node)
+        .and_then(|links| links.resolved_symbol)
+        .and_then(|symbol| declarations.iter().find(|alias| alias.symbol == symbol))
+    else {
+        return false;
+    };
+    let Some(children) = store.source_direct_children(node) else {
+        return false;
+    };
+    let Some((&name, arguments)) = children.split_first() else {
+        return false;
+    };
+    store.source_node_kind(name) == Some(SyntaxKind::Identifier)
+        && store.source_identifier_text(name).is_some_and(|text| {
+            store
+                .symbol(referenced.symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                == Some(text)
+                && alias.parameters.iter().all(|parameter| {
+                    store
+                        .symbol(parameter.symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        != Some(text)
+                })
+        })
+        && arguments.len() == referenced.parameters.len()
+        && children.iter().all(|child| {
+            child.arena == node.arena
+                && child.file == node.file
+                && store.source_node_parent(*child) == Some(SourceNodeParent::Parent(node))
+        })
+        && store
+            .type_node_links(name)
+            .is_none_or(|links| links == &TypeNodeLinks::default())
+        && store.symbol_node_links(name).is_none_or(|links| {
+            links
+                .resolved_symbol
+                .is_none_or(|symbol| symbol == referenced.symbol)
+        })
 }
 
 fn source_alias_keyof_constraint_cache_is_exact<MapperPayload>(
@@ -13204,7 +13327,7 @@ fn valid_source_callable_alias_type(
     annotation: NodeRef,
     result: TypeId,
     type_parameters: &[TypeId],
-    _array_targets: Option<CanonicalArrayTargets>,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
     store
         .source_callable_alias_resolution(annotation)
@@ -13213,7 +13336,114 @@ fn valid_source_callable_alias_type(
                 && resolution.parameters() == type_parameters
                 && resolution.is_exact(store)
                 && store.source_callable_alias_annotation(annotation) == Some(resolution.proof())
+                && source_callable_property_alias_cache_is_exact(
+                    store,
+                    resolution.proof(),
+                    resolution.snapshot(),
+                    type_parameters,
+                    array_targets,
+                )
+                .is_some()
         })
+}
+
+/// A generic snapshot proves source templates, not mapped results. Only
+/// participating property aliases add canonical mapper and cache checks here.
+fn source_callable_property_alias_cache_is_exact(
+    store: &CanonicalTypeMapperStore,
+    proof: &SourceCallableAliasAnnotation,
+    snapshot: &SourceCallableAliasSnapshot,
+    type_parameters: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<bool> {
+    if proof.declarations.len() != snapshot.declarations.len() {
+        return None;
+    }
+    let mut property_alias = false;
+    for (alias, (declared, parameters)) in proof.declarations.iter().zip(&snapshot.declarations) {
+        if !property_object_alias_template_matches(
+            store,
+            alias.symbol,
+            alias.body,
+            *declared,
+            parameters,
+        )
+        .ok()?
+        {
+            continue;
+        }
+        let projection = property_object_alias_nonempty_projection(store, *declared).ok()??;
+        if projection.type_ != *declared
+            || projection.target != *declared
+            || projection.mapper.is_some()
+            || projection.alias_symbol != alias.symbol
+            || projection.parameters.as_slice() != parameters.as_ref()
+            || projection.arguments.as_slice() != parameters.as_ref()
+            || projection.identity_symbol != alias.symbol
+            || projection.identity_arguments.as_slice() != parameters.as_ref()
+        {
+            return None;
+        }
+        property_alias = true;
+    }
+    for (_, argument) in &proof.arguments {
+        if let SourceCallableAliasArgument::Alias(alias) = argument {
+            let nested = alias.snapshot(store, type_parameters)?;
+            property_alias |= source_callable_property_alias_cache_is_exact(
+                store,
+                alias,
+                &nested,
+                type_parameters,
+                array_targets,
+            )?;
+        }
+    }
+    if !property_alias {
+        return Some(false);
+    }
+    let (declared, parameters) = snapshot.declarations.first()?;
+    let template = property_object_alias_nonempty_projection(store, *declared).ok()?;
+    let result = property_object_alias_nonempty_projection(store, snapshot.result).ok()?;
+    if let Some(template) = &template {
+        let result = result.as_ref()?;
+        if template.target != result.target
+            || template.alias_symbol != result.alias_symbol
+            || template.parameters != result.parameters
+            || template.identity_symbol != result.identity_symbol
+        {
+            return None;
+        }
+    }
+    if template.is_some() || result.is_some() {
+        let expected = super::instantiate::cached_instantiation_with_vector(
+            store,
+            *declared,
+            parameters,
+            &snapshot.arguments,
+            array_targets,
+            None,
+        )
+        .ok()?;
+        let recovered_request = super::type_nodes::cached_property_object_alias_request_matches(
+            store,
+            proof.declarations.first()?.symbol,
+            *declared,
+            parameters,
+            &snapshot.arguments,
+            None,
+            snapshot.result,
+            array_targets,
+        )
+        .ok()?;
+        let requires_recovered_request = template.is_some()
+            && store
+                .property_object_alias_recovery(snapshot.result)
+                .is_some();
+        if !recovered_request && (expected != Some(snapshot.result) || requires_recovered_request) {
+            return None;
+        }
+    }
+    Some(true)
 }
 
 fn valid_source_generic_return_type(
@@ -15760,6 +15990,1271 @@ mod tests {
             constraint
         ));
         assert!(diagnostics.is_empty());
+    }
+
+    fn merge_property_alias_snapshot_globals(fixture: &mut QueryFixture) {
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let symbols = fixture
+            .store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            fixture.store.merge_global_symbol(globals, symbol).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both source wrappers share the same poison and restore checks.
+    fn property_alias_callable_snapshots_keep_template_and_instance_proofs_separate() {
+        for body in ["{ value: Value }", "(({ value: Value }))"] {
+            let mut fixture = QueryFixture::new(
+                &format!(
+                    "type Empty<Value> = {{}}; type Box<Value> = {body}; \
+                     declare function copy<T>(value: Box<T>): Box<T>;"
+                ),
+                FileId::new(95_140),
+            );
+            merge_property_alias_snapshot_globals(&mut fixture);
+            let (declaration, owner, _) = helper_arity_declaration(&fixture);
+            let annotation = helper_parameter_annotation(&fixture);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let result = fixture.query_return(signature, &mut diagnostics).unwrap();
+            let parameters = fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .type_parameters()
+                .to_vec();
+            let (alias_declaration, alias_body) = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &fixture.parsed.arena.get(alias.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == "Box").then_some((
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, alias.type_),
+                    ))
+                })
+                .unwrap();
+            let alias_symbol = fixture
+                .store
+                .get_merged_symbol(fixture.bound.symbol(alias_declaration).unwrap())
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .source_direct_type_annotation(alias_declaration),
+                Some(alias_body)
+            );
+            let alias_links = fixture
+                .store
+                .type_alias_links(alias_symbol)
+                .unwrap()
+                .clone();
+            let target = alias_links.declared_type.unwrap();
+            let own_parameters = alias_links.type_parameters.as_deref().unwrap();
+            let return_annotation = fixture
+                .store
+                .function_signature_return_annotation(signature)
+                .unwrap()
+                .0;
+            let parameter_symbol = fixture.store.signature(signature).unwrap().parameters()[0];
+            let query_is_exact = |store: &CanonicalTypeMapperStore| {
+                validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+                    evidence.is_exact(store)
+                        && store.source_callable_type_for_signature(signature) == Some(callable)
+                        && evidence.callable().declaration == declaration
+                        && evidence.callable().owner_symbol == owner
+                        && evidence.annotation_type(annotation) == Some(result)
+                        && evidence.annotation_type(return_annotation) == Some(result)
+                        && evidence
+                            .type_parameters()
+                            .iter()
+                            .map(|row| row.provenance.type_parameter)
+                            .eq(parameters.iter().copied())
+                        && [annotation, return_annotation].into_iter().all(|node| {
+                            store.type_node_links(node)
+                                == Some(&TypeNodeLinks {
+                                    resolved_type: Some(result),
+                                    outer_type_parameters: None,
+                                })
+                        })
+                        && store.value_symbol_links(parameter_symbol)
+                            == Some(&ValueSymbolLinks {
+                                resolved_type: Some(result),
+                                ..ValueSymbolLinks::default()
+                            })
+                        && store
+                            .signature(signature)
+                            .and_then(Signature::resolved_return_type)
+                            == Some(result)
+                })
+            };
+            assert!(
+                fixture
+                    .store
+                    .source_callable_alias_annotation(annotation)
+                    .is_none()
+            );
+            let projection = property_object_alias_projection(&fixture.store, result)
+                .unwrap()
+                .unwrap();
+            assert_eq!(projection.target, target);
+            assert_ne!(own_parameters, parameters.as_slice());
+            let rhs = projection.declaration;
+            let rhs_links = fixture.store.type_node_links(rhs).unwrap().clone();
+            let body_links = fixture.store.type_node_links(alias_body).cloned();
+            let target_cache = match fixture.store.type_payload(target).unwrap().data() {
+                TypeData::Object(object) => object.instantiations.clone(),
+                _ => panic!("the alias template must retain its object type"),
+            };
+            assert_eq!(
+                rhs_links.outer_type_parameters.as_deref(),
+                Some(own_parameters)
+            );
+            let matches_template = |store: &CanonicalTypeMapperStore| {
+                property_object_alias_template_matches(
+                    store,
+                    alias_symbol,
+                    alias_body,
+                    target,
+                    own_parameters,
+                )
+            };
+            assert_eq!(matches_template(&fixture.store), Ok(true));
+            assert!(query_is_exact(&fixture.store));
+            let mut before = generic_transaction_state(&fixture.store);
+            for poison in 0..6 {
+                if poison >= 4 && rhs == alias_body {
+                    continue;
+                }
+                let absent_wrapper =
+                    poison >= 4 && fixture.store.type_node_links(alias_body).is_none();
+                match poison {
+                    0 => assert!(fixture.store.set_type_node_links(
+                        rhs,
+                        TypeNodeLinks {
+                            outer_type_parameters: Some(parameters.clone()),
+                            ..rhs_links.clone()
+                        }
+                    )),
+                    1 => assert!(fixture.store.set_type_symbol(target, Some(owner))),
+                    2 => {
+                        let mut links = alias_links.clone();
+                        links
+                            .instantiations
+                            .as_mut()
+                            .unwrap()
+                            .remove(&type_list_key(own_parameters));
+                        assert!(fixture.store.set_type_alias_links(alias_symbol, links));
+                    }
+                    3 => {
+                        let mut cache = target_cache.clone();
+                        let TypeCacheState::Allocated(entries) = &mut cache else {
+                            panic!("the instance must retain its target cache");
+                        };
+                        entries.retain(|_, value| *value != target);
+                        assert!(fixture.store.set_object_instantiations(target, cache));
+                    }
+                    4 => assert!(fixture.store.set_type_node_links(
+                        alias_body,
+                        TypeNodeLinks {
+                            outer_type_parameters: Some(own_parameters.to_vec()),
+                            ..body_links.clone().unwrap_or_default()
+                        }
+                    )),
+                    5 => assert!(fixture.store.set_type_node_links(
+                        alias_body,
+                        TypeNodeLinks {
+                            resolved_type: Some(result),
+                            ..body_links.clone().unwrap_or_default()
+                        }
+                    )),
+                    _ => unreachable!(),
+                }
+                if absent_wrapper {
+                    let [_, _, type_node_links, ..] = &mut before.checker_links;
+                    *type_node_links += 1;
+                }
+                for _ in 0..2 {
+                    assert!(
+                        matches_template(&fixture.store).is_err(),
+                        "{body}, poison {poison}"
+                    );
+                    assert!(
+                        !fixture
+                            .store
+                            .source_callable_type_query(signature)
+                            .unwrap()
+                            .is_exact(&fixture.store)
+                    );
+                    assert!(!query_is_exact(&fixture.store));
+                    assert_eq!(generic_transaction_state(&fixture.store), before);
+                }
+                assert!(fixture.store.set_type_node_links(rhs, rhs_links.clone()));
+                if poison >= 4 {
+                    assert!(
+                        fixture.store.set_type_node_links(
+                            alias_body,
+                            body_links.clone().unwrap_or_default()
+                        )
+                    );
+                }
+                assert!(
+                    fixture
+                        .store
+                        .set_type_symbol(target, Some(projection.source_symbol))
+                );
+                assert!(
+                    fixture
+                        .store
+                        .set_type_alias_links(alias_symbol, alias_links.clone())
+                );
+                assert!(
+                    fixture
+                        .store
+                        .set_object_instantiations(target, target_cache.clone())
+                );
+                assert_eq!(matches_template(&fixture.store), Ok(true));
+                assert!(
+                    fixture
+                        .store
+                        .source_callable_type_query(signature)
+                        .unwrap()
+                        .is_exact(&fixture.store)
+                );
+                assert!(query_is_exact(&fixture.store));
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+            }
+            if rhs != alias_body {
+                assert!(
+                    property_object_alias_template_matches(
+                        &fixture.store,
+                        alias_symbol,
+                        rhs,
+                        target,
+                        own_parameters,
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                property_object_alias_template_matches(
+                    &fixture.store,
+                    alias_symbol,
+                    alias_body,
+                    target,
+                    &parameters,
+                )
+                .is_err()
+            );
+
+            for missing_mapper in [true, false] {
+                if missing_mapper {
+                    assert!(
+                        fixture
+                            .store
+                            .set_object_target_and_mapper(result, Some(target), None)
+                    );
+                } else {
+                    let mut cache = target_cache.clone();
+                    let TypeCacheState::Allocated(entries) = &mut cache else {
+                        unreachable!();
+                    };
+                    entries.retain(|_, value| *value != result);
+                    assert!(fixture.store.set_object_instantiations(target, cache));
+                }
+                for _ in 0..2 {
+                    // The mapper-free proof must not pretend to validate an instance.
+                    assert_eq!(matches_template(&fixture.store), Ok(true));
+                    assert!(
+                        !fixture
+                            .store
+                            .source_callable_type_query(signature)
+                            .unwrap()
+                            .is_exact(&fixture.store)
+                    );
+                    assert!(!query_is_exact(&fixture.store));
+                    assert_eq!(generic_transaction_state(&fixture.store), before);
+                }
+                assert!(fixture.store.set_object_target_and_mapper(
+                    result,
+                    Some(target),
+                    projection.mapper
+                ));
+                assert!(
+                    fixture
+                        .store
+                        .set_object_instantiations(target, target_cache.clone())
+                );
+                assert!(query_is_exact(&fixture.store));
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+            }
+            let empty_symbol = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::TypeAliasDeclaration(empty) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &fixture.parsed.arena.get(empty.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == "Empty").then(|| {
+                        fixture.bound.symbol(NodeRef::new(
+                            fixture.parsed.arena.id(),
+                            fixture.file,
+                            empty.type_,
+                        ))
+                    })?
+                })
+                .unwrap();
+            assert!(fixture.store.set_type_symbol(result, Some(empty_symbol)));
+            for _ in 0..2 {
+                assert_eq!(matches_template(&fixture.store), Ok(true));
+                assert!(property_object_alias_nonempty_projection(&fixture.store, result).is_err());
+                assert!(!query_is_exact(&fixture.store));
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_type_symbol(result, Some(projection.source_symbol))
+            );
+            assert!(query_is_exact(&fixture.store));
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics).unwrap(),
+                result
+            );
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable)
+            );
+            assert_eq!(
+                property_object_alias_projection(&fixture.store, result),
+                Ok(Some(projection.clone()))
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare both root vectors before and after the same mapper poison.
+    fn property_alias_callable_snapshots_keep_reduced_and_dependent_root_mappers() {
+        for (root_name, root_source, annotation_text) in [
+            (
+                "Identity",
+                "type Identity<Outer> = Outer;",
+                "Identity<Box<T>>",
+            ),
+            ("Wrapped", "type Wrapped<Outer> = Box<Outer>;", "Wrapped<T>"),
+        ] {
+            let mut fixture = QueryFixture::new(
+                &format!(
+                    "type Box<Value> = {{ value: Value }}; {root_source} \
+                     declare function copy<T>(value: {annotation_text}): {annotation_text};"
+                ),
+                FileId::new(95_142),
+            );
+            merge_property_alias_snapshot_globals(&mut fixture);
+            let (declaration, owner, _) = helper_arity_declaration(&fixture);
+            let annotation = helper_parameter_annotation(&fixture);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let result = fixture.query_return(signature, &mut diagnostics).unwrap();
+            let function_parameters = fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .type_parameters()
+                .to_vec();
+            let (root_declaration, root_body) = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &fixture.parsed.arena.get(alias.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == root_name).then_some((
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, alias.type_),
+                    ))
+                })
+                .unwrap();
+            let root_symbol = fixture
+                .store
+                .get_merged_symbol(fixture.bound.symbol(root_declaration).unwrap())
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .source_direct_type_annotation(root_declaration),
+                Some(root_body)
+            );
+            let root_links = fixture.store.type_alias_links(root_symbol).unwrap().clone();
+            let root_declared = root_links.declared_type.as_ref().unwrap();
+            let root_parameters = root_links.type_parameters.as_deref().unwrap();
+            let NodeData::TypeReferenceNode(reference) =
+                &fixture.parsed.arena.get(annotation.node).unwrap().data
+            else {
+                panic!("the parameter annotation must retain its actual alias reference");
+            };
+            let root_arguments = reference
+                .type_arguments
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|node| {
+                    let node = NodeRef::new(annotation.arena, annotation.file, *node);
+                    fixture
+                        .store
+                        .type_node_links(node)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let return_annotation = fixture
+                .store
+                .function_signature_return_annotation(signature)
+                .unwrap()
+                .0;
+            let parameter_symbol = fixture.store.signature(signature).unwrap().parameters()[0];
+            let query_is_exact = |store: &CanonicalTypeMapperStore| {
+                validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+                    evidence.is_exact(store)
+                        && store.source_callable_type_for_signature(signature) == Some(callable)
+                        && evidence.callable().declaration == declaration
+                        && evidence.callable().owner_symbol == owner
+                        && evidence.annotation_type(annotation) == Some(result)
+                        && evidence.annotation_type(return_annotation) == Some(result)
+                        && evidence
+                            .type_parameters()
+                            .iter()
+                            .map(|row| row.provenance.type_parameter)
+                            .eq(function_parameters.iter().copied())
+                        && [annotation, return_annotation].into_iter().all(|node| {
+                            store.type_node_links(node)
+                                == Some(&TypeNodeLinks {
+                                    resolved_type: Some(result),
+                                    outer_type_parameters: None,
+                                })
+                        })
+                        && store.value_symbol_links(parameter_symbol)
+                            == Some(&ValueSymbolLinks {
+                                resolved_type: Some(result),
+                                ..ValueSymbolLinks::default()
+                            })
+                        && store
+                            .signature(signature)
+                            .and_then(Signature::resolved_return_type)
+                            == Some(result)
+                })
+            };
+            assert!(
+                fixture
+                    .store
+                    .source_callable_alias_annotation(annotation)
+                    .is_none()
+            );
+            let projection = property_object_alias_projection(&fixture.store, result)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fixture.store.symbol(root_symbol).unwrap().name().as_utf8(),
+                Some(root_name)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(projection.alias_symbol)
+                    .unwrap()
+                    .name()
+                    .as_utf8(),
+                Some("Box")
+            );
+            assert_ne!(root_symbol, projection.alias_symbol);
+            assert_ne!(root_parameters, function_parameters.as_slice());
+            assert_ne!(root_parameters, projection.parameters.as_slice());
+            assert_ne!(projection.parameters, function_parameters);
+            assert_eq!(projection.arguments, function_parameters);
+            let visible_symbol = if root_name == "Identity" {
+                projection.alias_symbol
+            } else {
+                root_symbol
+            };
+            let identity_id = fixture.store.type_payload(result).unwrap().alias().unwrap();
+            let identity = fixture.store.type_alias(identity_id).unwrap();
+            assert_eq!(identity.symbol(), Some(visible_symbol));
+            assert_eq!(
+                identity.type_arguments(),
+                Some(function_parameters.as_slice())
+            );
+            assert_eq!(projection.identity_symbol, visible_symbol);
+            assert_eq!(projection.identity_arguments, function_parameters);
+            let original = property_object_alias_projection(&fixture.store, projection.target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(original.type_, original.target);
+            assert_eq!(original.alias_symbol, projection.alias_symbol);
+            assert_eq!(original.source_symbol, projection.source_symbol);
+            assert_eq!(original.parameters, projection.parameters);
+            assert_eq!(original.arguments, projection.parameters);
+            assert_eq!(original.identity_symbol, projection.alias_symbol);
+            assert_eq!(original.identity_arguments, projection.parameters);
+            assert!(original.mapper.is_none());
+            if root_name == "Identity" {
+                assert_eq!(*root_declared, root_parameters[0]);
+                assert_eq!(root_arguments.as_slice(), &[result]);
+            } else {
+                let root = property_object_alias_projection(&fixture.store, *root_declared)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(root.target, projection.target);
+                assert_eq!(root.alias_symbol, projection.alias_symbol);
+                assert_eq!(root.arguments.as_slice(), root_parameters);
+                assert_eq!(root.identity_symbol, root_symbol);
+                assert_eq!(root.identity_arguments.as_slice(), root_parameters);
+                let root_identity = fixture
+                    .store
+                    .type_payload(*root_declared)
+                    .unwrap()
+                    .alias()
+                    .unwrap();
+                assert_ne!(root_identity, identity_id);
+                let root_identity = fixture.store.type_alias(root_identity).unwrap();
+                assert_eq!(root_identity.symbol(), Some(root_symbol));
+                assert_eq!(root_identity.type_arguments(), Some(root_parameters));
+                assert_eq!(root_arguments.as_slice(), function_parameters.as_slice());
+            }
+            let parameter = fixture.store.signature(signature).unwrap().parameters()[0];
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(parameter)
+                    .unwrap()
+                    .resolved_type,
+                Some(result)
+            );
+            let before = generic_transaction_state(&fixture.store);
+            for _ in 0..2 {
+                assert!(query_is_exact(&fixture.store));
+                assert_eq!(
+                    fixture
+                        .query_callable(declaration, owner, &mut diagnostics)
+                        .unwrap(),
+                    callable
+                );
+                assert_eq!(
+                    fixture.query_return(signature, &mut diagnostics).unwrap(),
+                    result
+                );
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+            }
+            if root_name == "Wrapped" {
+                let original_identity = fixture
+                    .store
+                    .type_payload(projection.target)
+                    .unwrap()
+                    .alias()
+                    .unwrap();
+                let owner_links = fixture.store.type_alias_links(root_symbol).unwrap().clone();
+                let source_links = fixture
+                    .store
+                    .type_alias_links(projection.alias_symbol)
+                    .unwrap()
+                    .clone();
+                let global_owner = fixture
+                    .store
+                    .symbol_store()
+                    .assigned_global_symbol_id(root_symbol)
+                    .unwrap();
+                let body_request = super::super::type_nodes::type_alias_instantiation_cache_key(
+                    root_parameters,
+                    Some((global_owner, root_parameters)),
+                );
+                for poison in 0..4 {
+                    match poison {
+                        0 => assert!(
+                            fixture
+                                .store
+                                .set_type_alias(result, Some(original_identity))
+                        ),
+                        1 => {
+                            assert!(fixture.store.set_type_alias_arguments(
+                                identity_id,
+                                Some(root_parameters.to_vec())
+                            ))
+                        }
+                        2 => {
+                            let mut links = owner_links.clone();
+                            assert_eq!(
+                                links
+                                    .instantiations
+                                    .as_mut()
+                                    .unwrap()
+                                    .remove(&type_list_key(root_parameters)),
+                                Some(*root_declared)
+                            );
+                            assert!(fixture.store.set_type_alias_links(root_symbol, links));
+                        }
+                        3 => {
+                            let mut links = source_links.clone();
+                            assert_eq!(
+                                links.instantiations.as_mut().unwrap().remove(&body_request),
+                                Some(*root_declared)
+                            );
+                            assert!(
+                                fixture
+                                    .store
+                                    .set_type_alias_links(projection.alias_symbol, links)
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    for _ in 0..2 {
+                        assert!(property_object_alias_projection(&fixture.store, result).is_err());
+                        assert!(!query_is_exact(&fixture.store));
+                        assert_eq!(generic_transaction_state(&fixture.store), before);
+                    }
+                    assert!(fixture.store.set_type_alias(result, Some(identity_id)));
+                    assert!(
+                        fixture.store.set_type_alias_arguments(
+                            identity_id,
+                            Some(function_parameters.clone())
+                        )
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_alias_links(root_symbol, owner_links.clone())
+                    );
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_alias_links(projection.alias_symbol, source_links.clone())
+                    );
+                    assert_eq!(
+                        property_object_alias_projection(&fixture.store, result)
+                            .unwrap()
+                            .unwrap(),
+                        projection
+                    );
+                    assert!(query_is_exact(&fixture.store));
+                    assert_eq!(generic_transaction_state(&fixture.store), before);
+                }
+            }
+            assert!(fixture.store.set_object_target_and_mapper(
+                result,
+                Some(projection.target),
+                None
+            ));
+            for _ in 0..2 {
+                assert_eq!(
+                    property_object_alias_projection(&fixture.store, projection.target),
+                    Ok(Some(original.clone()))
+                );
+                assert!(
+                    !fixture
+                        .store
+                        .source_callable_type_query(signature)
+                        .unwrap()
+                        .is_exact(&fixture.store)
+                );
+                assert!(!query_is_exact(&fixture.store));
+                assert!(
+                    fixture
+                        .query_callable(declaration, owner, &mut diagnostics)
+                        .is_err()
+                );
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+            }
+            assert!(fixture.store.set_object_target_and_mapper(
+                result,
+                Some(projection.target),
+                projection.mapper
+            ));
+            assert!(query_is_exact(&fixture.store));
+            assert_eq!(
+                fixture
+                    .query_callable(declaration, owner, &mut diagnostics)
+                    .unwrap(),
+                callable
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics).unwrap(),
+                result
+            );
+            assert_eq!(
+                property_object_alias_projection(&fixture.store, result),
+                Ok(Some(projection.clone()))
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold wrappers, exact inner caches, and poison restoration.
+    fn property_alias_callable_snapshots_accept_parenthesized_wrapper_bodies() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "type Box<Value> = { value: Value }; ",
+                "type Wrapped<U> = (Box<U>); ",
+                "declare function copy<T>(value: Wrapped<T>): Wrapped<T>;",
+            ),
+            FileId::new(95_144),
+        );
+        merge_property_alias_snapshot_globals(&mut fixture);
+        let (declaration, owner, _) = helper_arity_declaration(&fixture);
+        let annotation = helper_parameter_annotation(&fixture);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let result = fixture.query_return(signature, &mut diagnostics).unwrap();
+        let parameters = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let (alias_declaration, alias_body) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (name.text == "Wrapped").then_some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, alias.type_),
+                ))
+            })
+            .unwrap();
+        let alias_symbol = fixture
+            .store
+            .get_merged_symbol(fixture.bound.symbol(alias_declaration).unwrap())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .source_direct_type_annotation(alias_declaration),
+            Some(alias_body)
+        );
+        let alias_links = fixture
+            .store
+            .type_alias_links(alias_symbol)
+            .unwrap()
+            .clone();
+        let declared = alias_links.declared_type.as_ref().unwrap();
+        let own_parameters = alias_links.type_parameters.as_deref().unwrap();
+        let return_annotation = fixture
+            .store
+            .function_signature_return_annotation(signature)
+            .unwrap()
+            .0;
+        let parameter_symbol = fixture.store.signature(signature).unwrap().parameters()[0];
+        let query_is_exact = |store: &CanonicalTypeMapperStore| {
+            validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+                evidence.is_exact(store)
+                    && store.source_callable_type_for_signature(signature) == Some(callable)
+                    && evidence.callable().declaration == declaration
+                    && evidence.callable().owner_symbol == owner
+                    && evidence.annotation_type(annotation) == Some(result)
+                    && evidence.annotation_type(return_annotation) == Some(result)
+                    && evidence
+                        .type_parameters()
+                        .iter()
+                        .map(|row| row.provenance.type_parameter)
+                        .eq(parameters.iter().copied())
+                    && [annotation, return_annotation].into_iter().all(|node| {
+                        store.type_node_links(node)
+                            == Some(&TypeNodeLinks {
+                                resolved_type: Some(result),
+                                outer_type_parameters: None,
+                            })
+                    })
+                    && store.value_symbol_links(parameter_symbol)
+                        == Some(&ValueSymbolLinks {
+                            resolved_type: Some(result),
+                            ..ValueSymbolLinks::default()
+                        })
+                    && store
+                        .signature(signature)
+                        .and_then(Signature::resolved_return_type)
+                        == Some(result)
+            })
+        };
+        assert!(
+            fixture
+                .store
+                .source_callable_alias_annotation(annotation)
+                .is_none()
+        );
+        let NodeData::ParenthesizedTypeNode(parenthesized) =
+            &fixture.parsed.arena.get(alias_body.node).unwrap().data
+        else {
+            panic!("the wrapper must retain its actual parenthesized RHS");
+        };
+        let inner = NodeRef::new(alias_body.arena, alias_body.file, parenthesized.type_);
+        let inner_links = fixture.store.type_node_links(inner).unwrap().clone();
+        let body_links = fixture.store.type_node_links(alias_body).cloned();
+        let body_symbol = fixture.store.symbol_node_links(alias_body).cloned();
+        let projection = property_object_alias_projection(&fixture.store, result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture.store.source_node_kind(inner),
+            Some(SyntaxKind::TypeReference)
+        );
+        assert_eq!(inner_links.resolved_type, Some(*declared));
+        assert!(
+            body_links
+                .as_ref()
+                .is_none_or(|links| links == &TypeNodeLinks::default())
+        );
+        assert!(
+            body_symbol
+                .as_ref()
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
+        );
+        assert_ne!(own_parameters, parameters.as_slice());
+        assert_eq!(projection.arguments, parameters);
+        assert_eq!(projection.identity_symbol, alias_symbol);
+        assert_eq!(projection.identity_arguments, parameters);
+        assert_ne!(projection.alias_symbol, alias_symbol);
+        assert_eq!(
+            fixture
+                .store
+                .symbol(projection.alias_symbol)
+                .unwrap()
+                .name()
+                .as_utf8(),
+            Some("Box")
+        );
+        let mut before = generic_transaction_state(&fixture.store);
+        for _ in 0..2 {
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(&fixture.store)
+            );
+            assert!(query_is_exact(&fixture.store));
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable)
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(result)
+            );
+            assert_eq!(
+                fixture.store.type_node_links(alias_body).cloned(),
+                body_links
+            );
+            assert_eq!(
+                fixture.store.symbol_node_links(alias_body).cloned(),
+                body_symbol
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+        }
+        for poison in 0..4 {
+            match poison {
+                0 => assert!(
+                    fixture
+                        .store
+                        .set_type_node_links(inner, TypeNodeLinks::default())
+                ),
+                1 | 2 => {
+                    let allocate = fixture.store.type_node_links(alias_body).is_none();
+                    let links = if poison == 1 {
+                        TypeNodeLinks {
+                            resolved_type: Some(result),
+                            outer_type_parameters: None,
+                        }
+                    } else {
+                        TypeNodeLinks {
+                            resolved_type: None,
+                            outer_type_parameters: Some(own_parameters.to_vec()),
+                        }
+                    };
+                    assert!(fixture.store.set_type_node_links(alias_body, links));
+                    let [_, _, type_node_links, ..] = &mut before.checker_links;
+                    *type_node_links += usize::from(allocate);
+                }
+                3 => {
+                    let allocate = fixture.store.symbol_node_links(alias_body).is_none();
+                    assert!(fixture.store.set_symbol_node_links(
+                        alias_body,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(projection.alias_symbol)
+                        }
+                    ));
+                    let [_, symbol_node_links, ..] = &mut before.checker_links;
+                    *symbol_node_links += usize::from(allocate);
+                }
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                assert!(
+                    !fixture
+                        .store
+                        .source_callable_type_query(signature)
+                        .unwrap()
+                        .is_exact(&fixture.store)
+                );
+                assert!(!query_is_exact(&fixture.store));
+                assert_eq!(generic_transaction_state(&fixture.store), before);
+            }
+            match poison {
+                0 => assert!(
+                    fixture
+                        .store
+                        .set_type_node_links(inner, inner_links.clone())
+                ),
+                1 | 2 => assert!(
+                    fixture
+                        .store
+                        .set_type_node_links(alias_body, body_links.clone().unwrap_or_default())
+                ),
+                3 => assert!(
+                    fixture
+                        .store
+                        .set_symbol_node_links(alias_body, body_symbol.clone().unwrap_or_default())
+                ),
+                _ => unreachable!(),
+            }
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(&fixture.store)
+            );
+            assert!(query_is_exact(&fixture.store));
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable)
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(result)
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+        }
+        assert_eq!(fixture.store.type_node_links(inner), Some(&inner_links));
+        assert_eq!(
+            property_object_alias_projection(&fixture.store, result)
+                .unwrap()
+                .unwrap(),
+            projection
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check source spelling after both parameter caches change together.
+    fn property_alias_wrapper_source_arguments_reject_coherent_parameter_cache_poison() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "type Pair<A, B> = { first: A; second: B }; ",
+                "type Flip<X, Y> = Pair<(Y), X>; ",
+                "declare function copy<T, U>(value: Flip<T, U>): Flip<T, U>;",
+            ),
+            FileId::new(95_143),
+        );
+        merge_property_alias_snapshot_globals(&mut fixture);
+        let (declaration, owner, _) = helper_arity_declaration(&fixture);
+        let annotation = helper_parameter_annotation(&fixture);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let result = fixture.query_return(signature, &mut diagnostics).unwrap();
+        let parameters = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let (alias_declaration, alias_body) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (name.text == "Flip").then_some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, alias.type_),
+                ))
+            })
+            .unwrap();
+        let alias_symbol = fixture
+            .store
+            .get_merged_symbol(fixture.bound.symbol(alias_declaration).unwrap())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .source_direct_type_annotation(alias_declaration),
+            Some(alias_body)
+        );
+        let alias_links = fixture
+            .store
+            .type_alias_links(alias_symbol)
+            .unwrap()
+            .clone();
+        let alias_parameters = alias_links.type_parameters.as_deref().unwrap();
+        let return_annotation = fixture
+            .store
+            .function_signature_return_annotation(signature)
+            .unwrap()
+            .0;
+        let parameter_symbol = fixture.store.signature(signature).unwrap().parameters()[0];
+        let query_is_exact = |store: &CanonicalTypeMapperStore| {
+            validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+                evidence.is_exact(store)
+                    && store.source_callable_type_for_signature(signature) == Some(callable)
+                    && evidence.callable().declaration == declaration
+                    && evidence.callable().owner_symbol == owner
+                    && evidence.annotation_type(annotation) == Some(result)
+                    && evidence.annotation_type(return_annotation) == Some(result)
+                    && evidence
+                        .type_parameters()
+                        .iter()
+                        .map(|row| row.provenance.type_parameter)
+                        .eq(parameters.iter().copied())
+                    && [annotation, return_annotation].into_iter().all(|node| {
+                        store.type_node_links(node)
+                            == Some(&TypeNodeLinks {
+                                resolved_type: Some(result),
+                                outer_type_parameters: None,
+                            })
+                    })
+                    && store.value_symbol_links(parameter_symbol)
+                        == Some(&ValueSymbolLinks {
+                            resolved_type: Some(result),
+                            ..ValueSymbolLinks::default()
+                        })
+                    && store
+                        .signature(signature)
+                        .and_then(Signature::resolved_return_type)
+                        == Some(result)
+            })
+        };
+        assert!(
+            fixture
+                .store
+                .source_callable_alias_annotation(annotation)
+                .is_none()
+        );
+        let header =
+            property_object_alias_identity_source_header(&fixture.store, alias_symbol).unwrap();
+        let own_parameters = header
+            .parameters
+            .iter()
+            .map(|(_, symbol)| {
+                fixture
+                    .store
+                    .declared_type_links(*symbol)
+                    .unwrap()
+                    .declared_type
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(own_parameters.as_slice(), alias_parameters);
+        assert!(query_is_exact(&fixture.store));
+        let NodeData::TypeReferenceNode(reference) =
+            &fixture.parsed.arena.get(alias_body.node).unwrap().data
+        else {
+            panic!("the wrapper RHS must be the actual Pair reference");
+        };
+        let argument = NodeRef::new(
+            alias_body.arena,
+            alias_body.file,
+            reference.type_arguments.as_ref().unwrap().nodes[0],
+        );
+        let NodeData::ParenthesizedTypeNode(parenthesized) =
+            &fixture.parsed.arena.get(argument.node).unwrap().data
+        else {
+            panic!("the first forwarded argument must retain its source parentheses");
+        };
+        let inner = NodeRef::new(argument.arena, argument.file, parenthesized.type_);
+        let argument_links = fixture.store.type_node_links(inner).unwrap().clone();
+        let argument_symbol = fixture.store.symbol_node_links(inner).unwrap().clone();
+        let wrapper_links = fixture.store.type_node_links(argument).cloned();
+        let before = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            validate_property_object_alias_source_argument(
+                &fixture.store,
+                &header,
+                argument,
+                own_parameters[1]
+            ),
+            Ok(())
+        );
+        assert!(
+            validate_property_object_alias_source_argument(
+                &fixture.store,
+                &header,
+                inner,
+                own_parameters[1]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fixture.store.type_node_links(argument).cloned(),
+            wrapper_links
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        assert!(fixture.store.set_type_node_links(
+            inner,
+            TypeNodeLinks {
+                resolved_type: Some(own_parameters[0]),
+                outer_type_parameters: None,
+            }
+        ));
+        assert!(fixture.store.set_symbol_node_links(
+            inner,
+            SymbolNodeLinks {
+                resolved_symbol: Some(header.parameters[0].1),
+            }
+        ));
+        for _ in 0..2 {
+            for expected in &own_parameters {
+                assert_eq!(
+                    validate_property_object_alias_source_argument(
+                        &fixture.store,
+                        &header,
+                        argument,
+                        *expected
+                    ),
+                    Err(super::super::relater::RelationUnavailable::Symbol(
+                        alias_symbol
+                    ))
+                );
+            }
+            assert!(property_object_alias_projection(&fixture.store, result).is_err());
+            assert!(!query_is_exact(&fixture.store));
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+        }
+        assert!(fixture.store.set_type_node_links(inner, argument_links));
+        assert!(fixture.store.set_symbol_node_links(inner, argument_symbol));
+        assert_eq!(
+            validate_property_object_alias_source_argument(
+                &fixture.store,
+                &header,
+                argument,
+                own_parameters[1]
+            ),
+            Ok(())
+        );
+        let projection = property_object_alias_projection(&fixture.store, result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.arguments, vec![parameters[1], parameters[0]]);
+        assert_eq!(projection.identity_symbol, alias_symbol);
+        assert_eq!(projection.identity_arguments, parameters);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable)
+        );
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(result)
+        );
+        assert_eq!(
+            fixture.store.type_node_links(argument).cloned(),
+            wrapper_links
+        );
+        assert!(query_is_exact(&fixture.store));
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn property_alias_template_matcher_leaves_other_source_families_unchanged() {
+        let fixture = QueryFixture::new(
+            concat!(
+                "type Empty<T> = {}; type Method<T> = { value(): T }; ",
+                "type Callable<T> = (value: T) => T; ",
+                "type Mapped<T> = { [K in keyof T]: T[K] }; ",
+                "type Scalar<T> = string;",
+            ),
+            FileId::new(95_141),
+        );
+        let before = generic_transaction_state(&fixture.store);
+        let target = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        for (node, record) in fixture.parsed.arena.iter() {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                continue;
+            };
+            let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let body = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+            assert_eq!(
+                property_object_alias_template_matches(&fixture.store, owner, body, target, &[],),
+                Ok(false)
+            );
+        }
+        assert_eq!(generic_transaction_state(&fixture.store), before);
     }
 
     #[test]

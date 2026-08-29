@@ -36509,7 +36509,9 @@ pub(super) fn retry_source_generic_member_failure(
             )? {
                 return Ok(());
             }
-            if super::instantiated_members::resolve_members_with_array_targets_and_session(
+            if super::object_aliases::property_object_alias_projection(store, type_)?.is_some() {
+                super::instantiated_members::resolve_property_object_alias_members(store, type_)?;
+            } else if super::instantiated_members::resolve_members_with_array_targets_and_session(
                 store,
                 type_,
                 array_targets,
@@ -36523,6 +36525,29 @@ pub(super) fn retry_source_generic_member_failure(
         RelationUnavailable::UnresolvedPropertyType(symbol) => {
             if !resolved_properties.insert(symbol) {
                 return Err(error.into());
+            }
+            for &candidate in candidates {
+                if super::object_aliases::property_object_alias_projection(store, candidate)?
+                    .is_some()
+                    && super::instantiated_members::validate_property_object_alias_members_with_array_targets(
+                        store,
+                        candidate,
+                        array_targets,
+                    )?
+                    .is_some_and(|members| members.properties.contains(&symbol))
+                {
+                    super::instantiated_members::demand_property_object_alias_property(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        candidate,
+                        symbol,
+                    )?;
+                    return Ok(());
+                }
             }
             let reference = candidates.iter().copied().find(|candidate| {
                 super::instantiated_members::validate_generic_interface_members(
@@ -57569,7 +57594,7 @@ pub(super) fn check_source_file(
                     if check_interface_members {
                         query.get_declared_interface_for_source_check(symbol)
                     } else {
-                        query.get_declared_type_of_symbol(symbol)
+                        query.check_type_alias_declaration(symbol)
                     }
                 });
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);

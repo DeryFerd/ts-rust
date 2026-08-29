@@ -374,7 +374,12 @@ fn elaborate_known_properties(
     let CheckedExpressionShape::Object(checked_properties) = &checked.shape else {
         return Err(invalid_structure(checked.result));
     };
-    let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
+    let Some(target) = store.resolved_declared_property_object_with_global_types(
+        host,
+        target_type,
+        global_types,
+    )?
+    else {
         return Ok(Vec::new());
     };
     let source_types = resolved_source_property_types(store, plan, checked.result)?;
@@ -727,7 +732,12 @@ fn shape_or_generic_diagnostic(
     )? {
         return Ok(diagnostic);
     }
-    let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
+    let Some(target) = store.resolved_declared_property_object_with_global_types(
+        host,
+        target_type,
+        global_types,
+    )?
+    else {
         return generic_assignability_diagnostic(
             store,
             host,
@@ -943,7 +953,12 @@ fn discriminated_union_excess_property_diagnostic(
                 return Err(invalid_structure(constituent));
             }
         }
-        let Some(target) = store.resolved_declared_property_object(host, constituent)? else {
+        let Some(target) = store.resolved_declared_property_object_with_global_types(
+            host,
+            constituent,
+            global_types,
+        )?
+        else {
             return Ok(None);
         };
         targets.push((constituent, target));
@@ -1150,7 +1165,12 @@ pub(super) fn excess_object_argument_diagnostic(
     if state.type_id() != source_type || !state.is_resolved() {
         return Err(invalid_structure(source_type));
     }
-    let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
+    let Some(target) = store.resolved_declared_property_object_with_global_types(
+        host,
+        target_type,
+        global_types,
+    )?
+    else {
         return Ok(None);
     };
     let Some(excess) = first_excess_property(store, host, plan, &target, target_type)? else {
@@ -1546,10 +1566,10 @@ pub(super) fn missing_declared_property_diagnostic(
     }
 
     let source = store
-        .resolved_declared_property_object(host, source_type)?
+        .resolved_declared_property_object_with_global_types(host, source_type, global_types)?
         .ok_or_else(|| invalid_structure(source_type))?;
     let target = store
-        .resolved_declared_property_object(host, target_type)?
+        .resolved_declared_property_object_with_global_types(host, target_type, global_types)?
         .ok_or_else(|| invalid_structure(target_type))?;
     let mut missing = Vec::new();
     for property in target.properties() {
@@ -1811,6 +1831,7 @@ pub(super) fn declared_property_mismatch_details(
 fn diagnostic_properties(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     type_: TypeId,
 ) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
     match validate_class_heritage_members(store, type_) {
@@ -1854,7 +1875,7 @@ fn diagnostic_properties(
         DeclaredPropertyTypeGraphValidation::Malformed => return Err(invalid_structure(type_)),
     }
     store
-        .resolved_declared_property_object(host, type_)?
+        .resolved_declared_property_object_with_global_types(host, type_, global_types)?
         .map(|properties| properties.properties().to_vec())
         .ok_or_else(|| invalid_structure(type_))
         .map(Some)
@@ -1997,10 +2018,10 @@ fn recursive_declared_property_mismatch_details_inner(
     indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
-    let Some(source) = diagnostic_properties(store, host, source_type)? else {
+    let Some(source) = diagnostic_properties(store, host, global_types, source_type)? else {
         return Ok(None);
     };
-    let Some(target) = diagnostic_properties(store, host, target_type)? else {
+    let Some(target) = diagnostic_properties(store, host, global_types, target_type)? else {
         return Ok(None);
     };
     if target

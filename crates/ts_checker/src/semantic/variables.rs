@@ -3,7 +3,7 @@
 //! The source checker owns expression execution and type publication. This module
 //! proves the binder/resolver route for ordinary top-level variables, object and
 //! array binding elements, object parameter bindings, already-planned local reads,
-//! and authenticated ambient globals from other script declaration files without
+//! and authenticated ambient globals from other scripts without
 //! mutating checker state.
 
 use std::collections::HashSet;
@@ -68,7 +68,7 @@ pub(super) struct PlannedIdentifierRead {
     pub(super) value_symbol: SemanticSymbolId,
 }
 
-/// One authenticated global read backed by another script declaration file.
+/// One authenticated global read backed by an ambient declaration in another script.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCrossFileGlobalRead {
     pub(super) type_node: NodeRef,
@@ -1705,10 +1705,7 @@ pub(super) fn plan_cross_file_global_identifier_read(
     let (declaration_arena, declaration_bound) =
         host.source(declaration).ok_or_else(unsupported)?;
     let facts = declaration_bound.source_facts().ok_or_else(unsupported)?;
-    if !facts.is_declaration_file()
-        || facts.is_javascript_file()
-        || facts.is_external_or_common_js_module()
-    {
+    if facts.is_javascript_file() || facts.is_external_or_common_js_module() {
         return Err(unsupported());
     }
 
@@ -1721,6 +1718,17 @@ pub(super) fn plan_cross_file_global_identifier_read(
     let binding = variable_binding_flags(record.flags()).ok_or_else(unsupported)?;
     if !host.symbol_matches(store, declaration, routed.target) {
         return Err(VariableInvariant::InvalidSymbolShape(routed.target).into());
+    }
+    if !facts.is_declaration_file()
+        && !authenticated_script_declare_const(
+            store,
+            declaration_arena,
+            declaration_bound,
+            declaration,
+            routed.target,
+        )?
+    {
+        return Err(unsupported());
     }
     let (name_node, type_node) = authenticated_cross_file_global_declaration(
         store,
@@ -1883,6 +1891,92 @@ fn authenticated_cross_file_global_declaration(
         return Err(invalid());
     }
     Ok(Some((name_node, type_node)))
+}
+
+/// A normal script needs an explicit ambient const.
+/// Source checking also permits AST-only inputs. Retained text must match.
+fn authenticated_script_declare_const(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<bool, VariableInvariant> {
+    let invalid = || VariableInvariant::InvalidSymbolShape(symbol);
+    let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+        return Err(invalid());
+    };
+    let source = bound.source_file();
+    let statement_node =
+        binding_child_node(arena, store, statement, source).map_err(|_| invalid())?;
+    let list_node = binding_child_node(arena, store, list, statement).map_err(|_| invalid())?;
+    binding_child_node(arena, store, declaration, list).map_err(|_| invalid())?;
+    let NodeData::VariableStatement(statement_data) = &statement_node.data else {
+        return Err(invalid());
+    };
+    let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
+        return Err(invalid());
+    };
+    let Some(modifiers) = statement_data.modifiers.as_ref() else {
+        return Ok(false);
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+    let modifier_node =
+        binding_child_node(arena, store, modifier, statement).map_err(|_| invalid())?;
+    if modifier_node.kind != SyntaxKind::DeclareKeyword
+        || list_node.flags.0 != VariableBindingKind::Const.declaration_flags()
+    {
+        return Ok(false);
+    }
+    if statement_node.kind != SyntaxKind::VariableStatement
+        || statement_node.flags.0 != 0
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || list_node.kind != SyntaxKind::VariableDeclarationList
+        || list_data.declarations.range != list_node.range
+        || list_data.declarations.has_trailing_comma
+        || list_data.facts != 0
+        || list_data
+            .declarations
+            .nodes
+            .iter()
+            .filter(|&&node| node == declaration.node)
+            .count()
+            != 1
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != statement_node.range.start
+        || modifiers.list.range.end >= list_node.range.start
+        || modifier_node.flags.0 != 0
+        || !matches!(modifier_node.data, NodeData::Token(_))
+        || modifier_node.range.start != statement_node.range.start
+        || modifier_node.range.end >= modifiers.list.range.end
+        || modifier_node.range.end >= list_node.range.start
+        || bound.block_scope_container(declaration) != Some(source)
+        || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+        || store.source_node_parent(source) != Some(SourceNodeParent::Root)
+        || store
+            .source_direct_children(source)
+            .is_none_or(|children| children.iter().filter(|&&node| node == statement).count() != 1)
+        || store
+            .symbol(symbol)
+            .is_none_or(|record| record.flags() != VariableBindingKind::Const.symbol_flags())
+        || arena.source_text().is_some_and(|text| {
+            text.get(
+                modifier_node.range.start.get() as usize..modifier_node.range.end.get() as usize,
+            ) != Some("declare")
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 /// Resolves an authenticated recovered anonymous-module `var` redeclaration.
@@ -2622,7 +2716,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, ValueSymbolLinks, production::GlobalMergeCompletion,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        SymbolNodeLinks, ValueSymbolLinks, production::GlobalMergeCompletion,
     };
 
     struct BindingFixture {
@@ -2670,6 +2765,373 @@ mod tests {
             bound,
             store,
         }
+    }
+
+    struct CrossFileReadFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        declaration: NodeRef,
+        annotation: NodeRef,
+        read: NodeRef,
+        symbol: SemanticSymbolId,
+    }
+
+    impl CrossFileReadFixture<'_> {
+        fn plan(&self) -> Result<PlannedCrossFileGlobalRead, VariablePlanError> {
+            let state = || {
+                let store = self.context.store();
+                (
+                    [
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.mapper_len(),
+                        store.type_alias_len(),
+                        store.signature_len(),
+                        store.symbol_store().symbol_table_len(),
+                    ],
+                    store.checker_link_allocated_lengths(),
+                    store.value_symbol_links(self.symbol).cloned(),
+                    store.symbol_node_links(self.read).cloned(),
+                    store.node_links(self.read).cloned(),
+                    store.type_node_links(self.annotation).cloned(),
+                    [self.declaration.file, self.read.file].map(|file| {
+                        self.context
+                            .source_file(file)
+                            .and_then(|source| store.source_file_links(source))
+                            .cloned()
+                    }),
+                    self.context.diagnostics().clone(),
+                )
+            };
+            let before = state();
+            let declaration_source = self.context.file(self.declaration.file).unwrap();
+            let (arena, bound) = self.context.file(self.read.file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [declaration_source, (arena, bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let result = plan_cross_file_global_identifier_read(
+                arena,
+                bound,
+                self.context.store(),
+                &host,
+                self.read,
+                "shared",
+                self.declaration,
+            );
+            assert_eq!(state(), before);
+            result
+        }
+    }
+
+    fn cross_file_read_fixture<'arena>(
+        declaration: &'arena ParseResult,
+        reader: &'arena ParseResult,
+    ) -> CrossFileReadFixture<'arena> {
+        let declaration_file = FileId::new(10_450);
+        let reader_file = FileId::new(10_451);
+        let sources = [(declaration_file, declaration), (reader_file, reader)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/cross-file-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in sources {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (declaration, annotation) = declaration
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(declaration.arena.id(), declaration_file, node),
+                    NodeRef::new(declaration.arena.id(), declaration_file, variable.type_?),
+                ))
+            })
+            .unwrap();
+        let read = reader
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    reader.arena.id(),
+                    reader_file,
+                    variable.initializer?,
+                ))
+            })
+            .unwrap();
+        let symbol = context
+            .file(declaration_file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .unwrap();
+        CrossFileReadFixture {
+            context,
+            declaration,
+            annotation,
+            read,
+            symbol,
+        }
+    }
+
+    #[test]
+    fn script_ambient_const_cross_file_reads_preserve_reader_first_and_warm_identity() {
+        for retained_text in [true, false] {
+            let mut declaration = parse_source_file("declare const shared: number;");
+            if !retained_text {
+                let mut arena = NodeArena::new();
+                for (id, node) in declaration.arena.iter() {
+                    assert_eq!(arena.alloc(node.clone()), id);
+                }
+                declaration.arena = arena;
+            }
+            let reader = parse_source_file("const observed = shared;");
+            let mut fixture = cross_file_read_fixture(&declaration, &reader);
+            let expected = PlannedCrossFileGlobalRead {
+                type_node: fixture.annotation,
+                read: PlannedIdentifierRead {
+                    resolved_symbol: fixture.symbol,
+                    value_symbol: fixture.symbol,
+                },
+            };
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(fixture.symbol)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .symbol_node_links(fixture.read)
+                    .is_none()
+            );
+            assert_eq!(fixture.plan(), Ok(expected));
+            fixture
+                .context
+                .check_source_file(fixture.read.file)
+                .unwrap();
+            assert!(fixture.context.diagnostics().is_empty());
+            let number = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .number_type;
+            assert_eq!(
+                fixture.context.store().value_symbol_links(fixture.symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            assert_eq!(
+                fixture.context.store().symbol_node_links(fixture.read),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(fixture.symbol)
+                }),
+            );
+            assert!(
+                fixture
+                    .context
+                    .source_file(fixture.declaration.file)
+                    .and_then(|source| fixture.context.store().source_file_links(source))
+                    .is_none_or(|links| !links.type_checked)
+            );
+            assert_eq!(fixture.plan(), Ok(expected));
+            fixture
+                .context
+                .check_source_file(fixture.declaration.file)
+                .unwrap();
+            assert_eq!(fixture.plan(), Ok(expected));
+            fixture
+                .context
+                .recheck_source_file(fixture.read.file)
+                .unwrap();
+            assert_eq!(fixture.plan(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn script_cross_file_reads_require_explicit_const_and_declare() {
+        for source in [
+            "const shared: number;",
+            "const shared: number = 1;",
+            "declare let shared: number;",
+            "declare var shared: number;",
+        ] {
+            let declaration = parse_source_file(source);
+            let reader = parse_source_file("const observed = shared;");
+            let fixture = cross_file_read_fixture(&declaration, &reader);
+            assert_eq!(
+                fixture.plan(),
+                Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::CrossFileDeclaration {
+                        node: fixture.read,
+                        declaration: fixture.declaration,
+                    }
+                )),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn script_ambient_const_cross_file_reads_reject_malformed_statements_without_writes() {
+        for malformed in ["statement_flags", "modifier_flags", "range", "spelling"] {
+            let mut declaration = parse_source_file("declare const shared: number;");
+            let statement = declaration
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::VariableStatement).then_some(node)
+                })
+                .unwrap();
+            let NodeData::VariableStatement(statement_data) =
+                &declaration.arena.get(statement).unwrap().data
+            else {
+                unreachable!()
+            };
+            let modifier = statement_data.modifiers.as_ref().unwrap().list.nodes[0];
+            match malformed {
+                "statement_flags" => {
+                    declaration.arena.get_mut(statement).unwrap().flags = ts_ast::NodeFlags(1);
+                }
+                "modifier_flags" => {
+                    let NodeData::VariableStatement(statement) =
+                        &mut declaration.arena.get_mut(statement).unwrap().data
+                    else {
+                        unreachable!()
+                    };
+                    statement.modifiers.as_mut().unwrap().flags = ts_ast::ModifierFlags(1);
+                }
+                "range" => {
+                    let modifier = declaration.arena.get_mut(modifier).unwrap();
+                    modifier.range.start = modifier.range.end;
+                }
+                "spelling" => declaration
+                    .arena
+                    .set_source_text("invalid const shared: number;"),
+                _ => unreachable!(),
+            }
+            let reader = parse_source_file("const observed = shared;");
+            let fixture = cross_file_read_fixture(&declaration, &reader);
+            assert_eq!(
+                fixture.plan(),
+                Err(VariablePlanError::Invariant(
+                    VariableInvariant::InvalidSymbolShape(fixture.symbol)
+                )),
+                "{malformed}",
+            );
+        }
+    }
+
+    #[test]
+    fn script_ambient_const_cross_file_reads_reject_value_and_identifier_cache_poison() {
+        let declaration = parse_source_file("declare const shared: number;");
+        let reader = parse_source_file("const observed = shared;");
+        let mut fixture = cross_file_read_fixture(&declaration, &reader);
+        fixture
+            .context
+            .check_source_file(fixture.read.file)
+            .unwrap();
+        let expected = fixture.plan().unwrap();
+        let original_value = fixture
+            .context
+            .store()
+            .value_symbol_links(fixture.symbol)
+            .unwrap()
+            .clone();
+        let number = original_value.resolved_type.unwrap();
+        let mut poisoned_value = original_value.clone();
+        poisoned_value.write_type = Some(number);
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_value_symbol_links(fixture.symbol, poisoned_value)
+        );
+        assert_eq!(
+            fixture.plan(),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidValueLinks(fixture.symbol)
+            )),
+        );
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_value_symbol_links(fixture.symbol, original_value)
+        );
+        assert_eq!(fixture.plan(), Ok(expected));
+
+        let original_identifier = fixture
+            .context
+            .store()
+            .symbol_node_links(fixture.read)
+            .unwrap()
+            .clone();
+        let foreign = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .unknown_symbol;
+        assert!(fixture.context.store_mut_for_test().set_symbol_node_links(
+            fixture.read,
+            SymbolNodeLinks {
+                resolved_symbol: Some(foreign)
+            },
+        ));
+        assert_eq!(
+            fixture.plan(),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node: fixture.read,
+                    cached: Some(foreign),
+                    expected: fixture.symbol,
+                }
+            )),
+        );
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_node_links(fixture.read, original_identifier)
+        );
+        assert_eq!(fixture.plan(), Ok(expected));
     }
 
     fn binding_declaration(fixture: &BindingFixture) -> NodeRef {

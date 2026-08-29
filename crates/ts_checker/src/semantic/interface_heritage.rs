@@ -25,6 +25,7 @@ use super::{
     declared::{explicit_type_parameter_symbols, preflight_node},
     global_types::preflight_generic_global_type_target,
     mapped_types::plan_mapped_type_declaration,
+    object_aliases::property_object_alias_source_header,
     types::ObjectFlags,
 };
 
@@ -1190,6 +1191,7 @@ fn plan_concrete_interface_type_arguments(
     Ok(planned)
 }
 
+#[allow(clippy::too_many_lines)] // Interface and alias parameters keep their separate source owners.
 fn authenticate_concrete_interface_type_argument(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1258,48 +1260,54 @@ fn authenticate_concrete_interface_type_argument(
     }
 
     if let Some(arguments) = reference.type_arguments.as_ref() {
-        let declarations = owner.declarations().ok_or_else(unsupported)?;
-        let Some(declaration) = declarations.iter().find_map(|declaration| {
-            let record = host.node(*declaration)?;
-            let NodeData::InterfaceDeclaration(interface) = &record.data else {
-                return None;
+        if owner.flags() == SymbolFlags::TYPE_ALIAS {
+            authenticate_property_object_alias_argument(
+                store, host, argument, name, symbol, arguments,
+            )?;
+        } else {
+            let declarations = owner.declarations().ok_or_else(unsupported)?;
+            let Some(declaration) = declarations.iter().find_map(|declaration| {
+                let record = host.node(*declaration)?;
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                Some((*declaration, interface.type_parameters.as_ref()?))
+            }) else {
+                return Err(unsupported());
             };
-            Some((*declaration, interface.type_parameters.as_ref()?))
-        }) else {
-            return Err(unsupported());
-        };
-        if arguments.nodes.is_empty()
-            || arguments.has_trailing_comma
-            || declaration.1.nodes.len() != arguments.nodes.len()
-            || !host.symbol_matches(store, declaration.0, symbol)
-            || arguments.range.start < name_record.range.end
-            || arguments.range.end != record.range.end
-        {
-            return Err(unsupported());
-        }
-        let mut checked_parameters = HashSet::new();
-        let parameters = explicit_type_parameter_symbols(
-            store,
-            host,
-            declaration.0,
-            Some(declaration.1),
-            &mut checked_parameters,
-        )
-        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        if parameters.len() != arguments.nodes.len() {
-            return Err(unsupported());
-        }
-        for (parameter, parameter_symbol) in declaration.1.nodes.iter().zip(&parameters) {
-            authenticate_heritage_type_parameter(
+            if arguments.nodes.is_empty()
+                || arguments.has_trailing_comma
+                || declaration.1.nodes.len() != arguments.nodes.len()
+                || !host.symbol_matches(store, declaration.0, symbol)
+                || arguments.range.start < name_record.range.end
+                || arguments.range.end != record.range.end
+            {
+                return Err(unsupported());
+            }
+            let mut checked_parameters = HashSet::new();
+            let parameters = explicit_type_parameter_symbols(
                 store,
                 host,
                 declaration.0,
-                symbol,
-                NodeRef::new(declaration.0.arena, declaration.0.file, *parameter),
-                *parameter_symbol,
-                argument,
-                HeritageTypeParameterAnnotations::Defer,
-            )?;
+                Some(declaration.1),
+                &mut checked_parameters,
+            )
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+            if parameters.len() != arguments.nodes.len() {
+                return Err(unsupported());
+            }
+            for (parameter, parameter_symbol) in declaration.1.nodes.iter().zip(&parameters) {
+                authenticate_heritage_type_parameter(
+                    store,
+                    host,
+                    declaration.0,
+                    symbol,
+                    NodeRef::new(declaration.0.arena, declaration.0.file, *parameter),
+                    *parameter_symbol,
+                    argument,
+                    HeritageTypeParameterAnnotations::Defer,
+                )?;
+            }
         }
         let mut previous_end = name_record.range.end;
         for nested in &arguments.nodes {
@@ -1316,6 +1324,102 @@ fn authenticate_concrete_interface_type_argument(
             authenticate_concrete_interface_type_argument(store, host, nested, depth + 1)?;
             previous_end = nested_record.range.end;
         }
+    }
+    Ok(())
+}
+
+fn authenticate_property_object_alias_argument(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    argument: NodeRef,
+    name: NodeRef,
+    symbol: SemanticSymbolId,
+    arguments: &NodeList,
+) -> Result<(), DirectInterfaceHeritageError> {
+    let unsupported = || DirectInterfaceHeritageError::Unsupported {
+        node: argument,
+        kind: SyntaxKind::TypeReference,
+    };
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return Err(unsupported());
+    };
+    let record = preflight_node(store, host, *declaration)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+        return Err(unsupported());
+    };
+    let Some(parameters) = alias.type_parameters.as_ref() else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::TypeAliasDeclaration
+        || record.flags.0 != 0
+        || !host.symbol_matches(store, *declaration, symbol)
+    {
+        return Err(unsupported());
+    }
+    let mut rhs = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(rhs) {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        }
+        let record =
+            preflight_node(store, host, rhs).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        if record.kind != SyntaxKind::ParenthesizedType {
+            break;
+        }
+        let NodeData::ParenthesizedTypeNode(wrapper) = &record.data else {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        };
+        if record.flags.0 != 0 {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        }
+        rhs = NodeRef::new(rhs.arena, rhs.file, wrapper.type_);
+    }
+    let header = property_object_alias_source_header(store, rhs)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+        .ok_or_else(unsupported)?;
+    let name_record =
+        preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let argument_record =
+        preflight_node(store, host, argument).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if arguments.nodes.is_empty()
+        || arguments.has_trailing_comma
+        || parameters.nodes.len() != arguments.nodes.len()
+        || header.parameters.len() != arguments.nodes.len()
+        || header.alias_declaration != *declaration
+        || header.alias_symbol != symbol
+        || arguments.range.start < name_record.range.end
+        || arguments.range.end != argument_record.range.end
+    {
+        return Err(unsupported());
+    }
+    let mut checked_parameters = HashSet::new();
+    let symbols = explicit_type_parameter_symbols(
+        store,
+        host,
+        *declaration,
+        Some(parameters),
+        &mut checked_parameters,
+    )
+    .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if symbols.len() != header.parameters.len()
+        || parameters
+            .nodes
+            .iter()
+            .zip(&symbols)
+            .zip(&header.parameters)
+            .any(
+                |((&parameter, &symbol), &(source_parameter, source_symbol))| {
+                    NodeRef::new(declaration.arena, declaration.file, parameter) != source_parameter
+                        || symbol != source_symbol
+                },
+            )
+    {
+        return Err(DirectInterfaceHeritageError::Invalid);
     }
     Ok(())
 }

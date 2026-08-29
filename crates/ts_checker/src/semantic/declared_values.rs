@@ -1,4 +1,4 @@
-//! Lazy annotated values and selected ordinary interface properties.
+//! Lazy annotated values and selected source-owned properties.
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -10,8 +10,11 @@ use super::{
     RelationUnavailable, TypeId,
     declared::{cached_interface_type, preflight_class_or_interface_reference, preflight_node},
     links::ValueSymbolLinks,
+    object_aliases::{PropertyObjectAliasProjection, property_object_alias_projection},
     object_members::{
+        DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         cached_planned_type_identity, missing_signature_initializer, preflight_readonly_modifier,
+        validate_resolved_declared_property_object,
     },
     relater::ResolvedOwnProperty,
     store::SourceNodeParent,
@@ -437,22 +440,10 @@ fn plan_property_owner(
         return Err(invalid());
     };
     let parent_node = preflight_node(store, host, parent)?;
-    let NodeData::InterfaceDeclaration(interface) = &parent_node.data else {
-        return Err(unsupported_value(parent, parent_node.kind));
-    };
-    if !owner_record.flags().contains(SymbolFlags::INTERFACE)
-        || owner_record.flags().contains(SymbolFlags::CLASS)
-        || !host.symbol_matches(store, parent, owner)
+    if !host.symbol_matches(store, parent, owner)
         || owner_record
             .declarations()
             .is_none_or(|declarations| !declarations.contains(&parent))
-        || interface
-            .members
-            .nodes
-            .iter()
-            .filter(|member| **member == declaration.node)
-            .count()
-            != 1
         || owner_record
             .members()
             .and_then(|members| store.symbol_table(members))
@@ -462,7 +453,60 @@ fn plan_property_owner(
     {
         return Err(invalid());
     }
-    preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
+    match &parent_node.data {
+        NodeData::InterfaceDeclaration(interface)
+            if parent_node.kind == SyntaxKind::InterfaceDeclaration =>
+        {
+            if !owner_record.flags().contains(SymbolFlags::INTERFACE)
+                || owner_record.flags().contains(SymbolFlags::CLASS)
+                || interface
+                    .members
+                    .nodes
+                    .iter()
+                    .filter(|member| **member == declaration.node)
+                    .count()
+                    != 1
+            {
+                return Err(invalid());
+            }
+            preflight_class_or_interface_reference(store, host, owner, owner_record.flags())?;
+        }
+        NodeData::TypeLiteralNode(literal) if parent_node.kind == SyntaxKind::TypeLiteral => {
+            let receiver = store
+                .type_node_links(parent)
+                .and_then(|links| links.resolved_type)
+                .ok_or_else(|| unsupported_value(parent, parent_node.kind))?;
+            let projection = property_object_alias_projection(store, receiver)
+                .map_err(|_| invalid())?
+                .ok_or_else(|| unsupported_value(parent, parent_node.kind))?;
+            if projection.type_ != projection.target
+                || projection.declaration != parent
+                || projection.source_symbol != owner
+                || literal
+                    .members
+                    .nodes
+                    .iter()
+                    .filter(|member| **member == declaration.node)
+                    .count()
+                    != 1
+                || projection
+                    .properties
+                    .iter()
+                    .filter(|property| {
+                        property.symbol == symbol
+                            && property.declaration == declaration
+                            && property.readonly == readonly
+                            && property.optional == question.is_some()
+                    })
+                    .count()
+                    != 1
+            {
+                return Err(invalid());
+            }
+            preflight_property_object_alias_rhs(store, host, &projection, symbol)?;
+        }
+        _ => return Err(unsupported_value(parent, parent_node.kind)),
+    }
     let optional = if let Some(question) = question {
         let question = NodeRef::new(declaration.arena, declaration.file, question);
         let question_node = preflight_node(store, host, question)?;
@@ -491,14 +535,58 @@ fn plan_property_owner(
     Ok(())
 }
 
+fn preflight_property_object_alias_rhs(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    projection: &PropertyObjectAliasProjection,
+    property: SemanticSymbolId,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || invalid_value(property);
+    let mut current = projection.declaration;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current) {
+            return Err(invalid());
+        }
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(current) else {
+            return Err(invalid());
+        };
+        let node = preflight_node(store, host, current)?;
+        let parent_node = preflight_node(store, host, parent)?;
+        if node.parent != Some(parent.node) {
+            return Err(invalid());
+        }
+        match &parent_node.data {
+            NodeData::ParenthesizedTypeNode(wrapper)
+                if parent_node.kind == SyntaxKind::ParenthesizedType
+                    && wrapper.type_ == current.node =>
+            {
+                current = parent;
+            }
+            NodeData::TypeAliasDeclaration(alias)
+                if parent_node.kind == SyntaxKind::TypeAliasDeclaration
+                    && alias.type_ == current.node
+                    && host.symbol_matches(store, parent, projection.alias_symbol)
+                    && store
+                        .symbol(projection.alias_symbol)
+                        .and_then(|symbol| symbol.declarations())
+                        == Some(&[parent]) =>
+            {
+                return Ok(());
+            }
+            _ => return Err(invalid()),
+        }
+    }
+}
+
 pub(super) enum SelectedDeclaredProperty {
     Missing,
     Unresolved(SemanticSymbolId),
     Resolved(ResolvedOwnProperty),
 }
 
-/// Reads one ordinary member from an authenticated, unresolved interface.
-/// Complete members and generic instances retain their existing providers.
+/// Reads one ordinary member from an interface or an exact alias source object.
+/// Generic instances retain their separate lazy member provider.
 pub(super) fn selected_declared_property(
     store: &CanonicalTypeMapperStore,
     receiver: TypeId,
@@ -508,6 +596,22 @@ pub(super) fn selected_declared_property(
     let record = store
         .type_payload(receiver)
         .ok_or(RelationUnavailable::Type(receiver))?;
+    if matches!(record.data(), TypeData::Object(_)) {
+        let Some(projection) = property_object_alias_projection(store, receiver)? else {
+            return Ok(None);
+        };
+        if projection.type_ != projection.target {
+            return Ok(None);
+        }
+        let Some(index) = projection
+            .properties
+            .iter()
+            .position(|property| property.name.as_ref() == name)
+        else {
+            return Ok(Some(SelectedDeclaredProperty::Missing));
+        };
+        return selected_property_object_alias_property(store, &projection, index).map(Some);
+    }
     let TypeData::Interface(interface) = record.data() else {
         return Ok(None);
     };
@@ -668,6 +772,104 @@ pub(super) fn selected_declared_property(
             readonly,
         },
     )))
+}
+
+/// Reads the original annotation cache without resolving any other property.
+pub(super) fn selected_property_object_alias_property(
+    store: &CanonicalTypeMapperStore,
+    projection: &PropertyObjectAliasProjection,
+    index: usize,
+) -> Result<SelectedDeclaredProperty, RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(projection.target);
+    let property = projection.properties.get(index).ok_or_else(invalid)?;
+    let symbol = store.symbol(property.symbol).ok_or_else(invalid)?;
+    let expected_flags = SymbolFlags::PROPERTY
+        | if property.optional {
+            SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        };
+    let expected_checks = if property.readonly {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    };
+    if symbol.flags() != expected_flags
+        || symbol.check_flags() != CheckFlags::NONE && symbol.check_flags() != expected_checks
+        || symbol.name() != property.name.as_ref()
+        || symbol.declarations() != Some(&[property.declaration])
+        || symbol.value_declaration() != Some(property.declaration)
+        || symbol.members().is_some()
+        || symbol.exports().is_some()
+        || symbol.export_symbol().is_some()
+        || store.get_merged_symbol(property.symbol) != Some(property.symbol)
+        || store.get_parent_of_symbol(property.symbol) != Some(projection.source_symbol)
+        || !matches!(
+            store.source_node_kind(property.declaration),
+            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+        )
+        || store.source_node_parent(property.declaration)
+            != Some(SourceNodeParent::Parent(projection.declaration))
+        || store.source_direct_type_annotation(property.declaration) != Some(property.type_node)
+    {
+        return Err(invalid());
+    }
+    let links = store
+        .value_symbol_links(property.symbol)
+        .cloned()
+        .unwrap_or_default();
+    if links
+        != (ValueSymbolLinks {
+            resolved_type: links.resolved_type,
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    let Some(type_) = links.resolved_type else {
+        if store.declared_value_provenance(property.symbol).is_some() {
+            return Err(invalid());
+        }
+        return Ok(SelectedDeclaredProperty::Unresolved(property.symbol));
+    };
+    if symbol.check_flags() != expected_checks
+        || store.type_payload(type_).is_none()
+        || !store.source_direct_type_annotation_is_exact(property.type_node, type_)
+        || cached_planned_type_identity(store, property.type_node) != Some(type_)
+        || store.source_type_operator(property.type_node) == Some(SyntaxKind::UniqueKeyword)
+            && store.type_payload(type_).is_none_or(|record| {
+                record.symbol() != Some(property.symbol)
+                    || record.flags() != TypeFlags::UNIQUE_ES_SYMBOL
+                    || record.object_flags() != ObjectFlags::NONE
+                    || record.alias().is_some()
+                    || !matches!(record.data(), TypeData::UniqueEsSymbol(_))
+            })
+    {
+        return Err(invalid());
+    }
+    if let Some(provenance) = store.declared_value_provenance(property.symbol) {
+        if provenance.annotation != property.type_node
+            || provenance.readonly != Some(property.readonly)
+            || !provenance.is_current(store, property.symbol)
+        {
+            return Err(invalid());
+        }
+    } else if !store.type_payload(projection.target).is_some_and(|record| {
+        record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+    }) || !matches!(
+        validate_resolved_declared_property_object(store, projection.target),
+        DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral)
+    ) {
+        return Err(invalid());
+    }
+    Ok(SelectedDeclaredProperty::Resolved(ResolvedOwnProperty {
+        symbol: property.symbol,
+        type_,
+        optional: property.optional,
+        readonly: property.readonly,
+    }))
 }
 
 fn cold_member_names_are_exact(

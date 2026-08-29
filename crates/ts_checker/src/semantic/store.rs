@@ -34,6 +34,7 @@ use super::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
     },
+    instantiate::PropertyObjectAliasRecovery,
     instantiated_members::{InstantiatedIndexRecovery, InstantiatedPropertyRecovery},
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
@@ -66,9 +67,9 @@ use super::{
     source_meta::ImportMetaExpressionIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
-        ConstructorAnnotationProof, SourceCallableAliasResolution,
-        SourceCallableInterfaceReturnProof, SourceCallableTypeQueryEvidence,
-        UnionAliasInstantiationProof,
+        ConstructorAnnotationProof, PropertyObjectAliasRequestRecovery,
+        SourceCallableAliasResolution, SourceCallableInterfaceReturnProof,
+        SourceCallableTypeQueryEvidence, UnionAliasInstantiationProof,
     },
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
@@ -612,6 +613,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
     instantiated_index_recoveries: HashMap<IndexInfoId, InstantiatedIndexRecovery>,
+    property_object_alias_recoveries: HashMap<TypeId, PropertyObjectAliasRecovery>,
+    property_object_alias_request_recoveries:
+        HashMap<(SemanticSymbolId, CacheHashKey), PropertyObjectAliasRequestRecovery>,
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
@@ -777,6 +781,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_value_provenance: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
             instantiated_index_recoveries: HashMap::new(),
+            property_object_alias_recoveries: HashMap::new(),
+            property_object_alias_request_recoveries: HashMap::new(),
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
             source_class_provenance: HashMap::new(),
@@ -5471,6 +5477,34 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.instantiated_index_recoveries.get(&index)
     }
 
+    pub(super) fn property_object_alias_recovery(
+        &self,
+        type_: TypeId,
+    ) -> Option<&PropertyObjectAliasRecovery> {
+        self.observe_relation_type_read(type_);
+        self.property_object_alias_recoveries.get(&type_)
+    }
+
+    pub(super) fn try_reserve_property_object_alias_recoveries(&mut self) -> bool {
+        self.property_object_alias_recoveries.try_reserve(1).is_ok()
+    }
+
+    pub(super) fn property_object_alias_request_recovery(
+        &self,
+        symbol: SemanticSymbolId,
+        key: CacheHashKey,
+    ) -> Option<&PropertyObjectAliasRequestRecovery> {
+        self.observe_relation_symbol_read(symbol);
+        self.property_object_alias_request_recoveries
+            .get(&(symbol, key))
+    }
+
+    pub(super) fn try_reserve_property_object_alias_request_recoveries(&mut self) -> bool {
+        self.property_object_alias_request_recoveries
+            .try_reserve(1)
+            .is_ok()
+    }
+
     pub(super) fn try_reserve_instantiated_index_recoveries(&mut self, additional: usize) -> bool {
         self.instantiated_index_recoveries
             .try_reserve(additional)
@@ -9482,6 +9516,44 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    /// The source alias producer records its supplied inputs after real recovery.
+    pub(super) fn publish_property_object_alias_request_recovery(
+        &mut self,
+        recovery: PropertyObjectAliasRequestRecovery,
+    ) -> bool {
+        let key = recovery.cache_key();
+        if self
+            .property_object_alias_request_recoveries
+            .contains_key(&key)
+            || !recovery.matches_current_row(self)
+        {
+            return false;
+        }
+        self.property_object_alias_request_recoveries
+            .insert(key, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    /// Only the real anonymous-object producer can create this immutable record.
+    pub(super) fn publish_property_object_alias_recovery(
+        &mut self,
+        recovery: PropertyObjectAliasRecovery,
+    ) -> bool {
+        let result = recovery.result();
+        if self.property_object_alias_recoveries.contains_key(&result)
+            || !recovery.matches_current_result(self)
+        {
+            return false;
+        }
+        self.property_object_alias_recoveries
+            .insert(result, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
     /// Publishes one source-checked partial construct's immutable parameter list.
     /// The interface's complete callable set is not published by this operation.
     pub(super) fn set_partial_declared_construct_parameter_types(
@@ -12457,6 +12529,763 @@ mod tests {
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One real producer result exercises immutable storage, poisoning, and restoration.
+    fn property_alias_recovery_records_require_the_exact_result_and_publish_once() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics,
+            instantiate::{
+                InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+            },
+            object_aliases::property_object_alias_projection,
+            type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
+        };
+
+        let parsed = parse_source_file("type Box<T>={value:T};");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(90_071);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/property-alias-recovery.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let declaration = node_ref_of_kind(&parsed.arena, file, SyntaxKind::TypeAliasDeclaration);
+        let symbol = binder.file(file).unwrap().symbol(declaration).unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = bootstrap.globals;
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let error = bootstrap.error_type;
+        assert_eq!(store.merge_global_symbol(globals, symbol), Ok(symbol));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, files.get(&file).unwrap())],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(symbol)
+        .unwrap();
+        let parameters = store
+            .type_alias_links(symbol)
+            .unwrap()
+            .type_parameters
+            .clone()
+            .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let recovered = instantiate_type_with_vector_and_session(
+            &mut store,
+            target,
+            &parameters,
+            &[string],
+            None,
+            &mut session,
+        )
+        .unwrap();
+        let other = instantiate_type_with_vector_and_session(
+            &mut store,
+            target,
+            &parameters,
+            &[number],
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert_ne!(recovered, other);
+        assert_eq!(session.limit_event_count(), 2);
+        assert_eq!(store.property_object_alias_recoveries.len(), 2);
+        let projection = property_object_alias_projection(&store, recovered)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.arguments, [string]);
+        assert_eq!(projection.identity_arguments, [error]);
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let stable = counts(&store);
+        let retained = store
+            .property_object_alias_recovery(recovered)
+            .unwrap()
+            .clone();
+        assert!(retained.matches_current_result(&store));
+        assert!(store.try_reserve_property_object_alias_recoveries());
+        assert!(!store.publish_property_object_alias_recovery(retained.clone()));
+        assert_eq!(counts(&store), stable);
+        assert_eq!(store.property_object_alias_recoveries.len(), 2);
+
+        let saved = store
+            .property_object_alias_recoveries
+            .remove(&recovered)
+            .unwrap();
+        assert!(property_object_alias_projection(&store, recovered).is_err());
+        assert_eq!(counts(&store), stable);
+        assert!(
+            store
+                .property_object_alias_recoveries
+                .insert(target, saved)
+                .is_none()
+        );
+        assert!(property_object_alias_projection(&store, target).is_err());
+        assert!(property_object_alias_projection(&store, recovered).is_err());
+        let saved = store
+            .property_object_alias_recoveries
+            .remove(&target)
+            .unwrap();
+        assert!(
+            store
+                .property_object_alias_recoveries
+                .insert(recovered, saved)
+                .is_none()
+        );
+        assert_eq!(
+            property_object_alias_projection(&store, recovered)
+                .unwrap()
+                .unwrap()
+                .type_,
+            recovered
+        );
+        assert_eq!(counts(&store), stable);
+
+        let other_mapper = property_object_alias_projection(&store, other)
+            .unwrap()
+            .unwrap()
+            .mapper;
+        let saved = store
+            .property_object_alias_recoveries
+            .remove(&recovered)
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(recovered, Some(target), other_mapper));
+        assert!(!store.publish_property_object_alias_recovery(retained));
+        assert!(store.property_object_alias_recovery(recovered).is_none());
+        assert_eq!(counts(&store), stable);
+        assert!(store.set_object_target_and_mapper(recovered, Some(target), projection.mapper));
+        assert!(store.publish_property_object_alias_recovery(saved));
+        assert_eq!(store.property_object_alias_recoveries.len(), 2);
+        assert!(
+            store
+                .property_object_alias_recovery(recovered)
+                .unwrap()
+                .matches_current_result(&store)
+        );
+        assert_eq!(
+            property_object_alias_projection(&store, recovered)
+                .unwrap()
+                .unwrap()
+                .arguments,
+            [string]
+        );
+        assert_eq!(
+            property_object_alias_projection(&store, other)
+                .unwrap()
+                .unwrap()
+                .arguments,
+            [number]
+        );
+        assert_eq!(counts(&store), stable);
+        assert!(diagnostics.is_empty());
+        for property in projection.properties {
+            assert!(store.type_node_links(property.type_node).is_none());
+            assert!(store.value_symbol_links(property.symbol).is_none());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Two real requests share an output but keep separate immutable input records.
+    fn property_alias_request_recovery_keeps_inputs_when_results_share_an_identity() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics,
+            global_types::initialize_global_library_types,
+            instantiate::{
+                InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+            },
+            type_nodes::{
+                CanonicalTypeQuery, CanonicalTypeQueryOptions,
+                cached_property_object_alias_request_matches, type_alias_instantiation_cache_key,
+            },
+        };
+
+        let parsed = parse_source_file(concat!(
+            "interface Object{} interface Function{} interface IArguments{} ",
+            "interface String{} interface Number{} interface Boolean{} interface RegExp{} ",
+            "interface Array<T>{} interface ReadonlyArray<T>{} ",
+            "type Box<T>={value:T}; type Wrapped<U>=Box<U>; ",
+            "declare const left:Wrapped<string>; declare const right:Wrapped<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(90_072);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/property-alias-requests.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.get(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = bootstrap.globals;
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let error = bootstrap.error_type;
+        let symbols = store
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let alias = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Wrapped")
+            .unwrap();
+        let nodes = parsed
+            .arena
+            .iter()
+            .filter_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nodes.len(), 2);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let global_types =
+            initialize_global_library_types(&mut store, &host, globals, false).unwrap();
+        assert!(global_types.diagnostics().is_empty());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = CanonicalTypeQuery::new_with_global_types(
+            &mut store,
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let parameters = store
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .clone()
+            .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let mut results = Vec::new();
+        for &node in &nodes {
+            results.push(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    &mut store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(node)
+                .unwrap(),
+            );
+        }
+        assert_eq!(results[0], results[1]);
+        let result = results[0];
+        assert_eq!(session.query_count(), 2);
+        assert_eq!(session.limit_event_count(), 4);
+        assert_eq!(diagnostics.as_slice().len(), 2);
+        let left_key = type_alias_instantiation_cache_key(&[string], None);
+        let right_key = type_alias_instantiation_cache_key(&[number], None);
+        assert_ne!(left_key, right_key);
+        assert_eq!(store.property_object_alias_request_recoveries.len(), 2);
+        let left = store
+            .property_object_alias_request_recovery(alias, left_key)
+            .unwrap()
+            .clone();
+        let right = store
+            .property_object_alias_request_recovery(alias, right_key)
+            .unwrap()
+            .clone();
+        assert_eq!(left.result(), result);
+        assert_eq!(right.result(), result);
+        assert!(left.matches_current_row(&store));
+        assert!(right.matches_current_row(&store));
+        let targets =
+            crate::semantic::array_types::CanonicalArrayTargets::from_global_types(&global_types);
+        for argument in [string, number] {
+            assert_eq!(
+                cached_property_object_alias_request_matches(
+                    &store,
+                    alias,
+                    declared,
+                    &parameters,
+                    &[argument],
+                    None,
+                    result,
+                    Some(targets),
+                ),
+                Ok(true)
+            );
+        }
+        let normal_number = instantiate_type_with_vector_and_session(
+            &mut store,
+            declared,
+            &parameters,
+            &[number],
+            Some(targets),
+            &mut InstantiationSession::new(InstantiationLimits::default()),
+        )
+        .unwrap();
+        assert_ne!(normal_number, result);
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+                store.property_object_alias_recoveries.len(),
+                store.property_object_alias_request_recoveries.len(),
+            )
+        };
+        let stable = counts(&store);
+        assert!(!store.publish_property_object_alias_request_recovery(left.clone()));
+        assert_eq!(counts(&store), stable);
+        assert_eq!(
+            store
+                .property_object_alias_request_recoveries
+                .insert((alias, left_key), right.clone()),
+            Some(left.clone())
+        );
+        assert!(
+            cached_property_object_alias_request_matches(
+                &store,
+                alias,
+                declared,
+                &parameters,
+                &[string],
+                None,
+                result,
+                Some(targets),
+            )
+            .is_err()
+        );
+        assert!(
+            CanonicalTypeQuery::new_with_global_types(
+                &mut store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(nodes[0])
+            .is_err()
+        );
+        assert_eq!(counts(&store), stable);
+        assert_eq!(
+            store
+                .property_object_alias_request_recoveries
+                .insert((alias, left_key), left.clone()),
+            Some(right)
+        );
+        assert_eq!(
+            store
+                .property_object_alias_request_recoveries
+                .remove(&(alias, left_key)),
+            Some(left.clone())
+        );
+        let missing = counts(&store);
+        assert!(
+            CanonicalTypeQuery::new_with_global_types(
+                &mut store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(nodes[0])
+            .is_err()
+        );
+        assert_eq!(counts(&store), missing);
+        assert!(store.publish_property_object_alias_request_recovery(left.clone()));
+        assert_eq!(counts(&store), stable);
+        let source_rows = store.type_alias_links(alias).cloned().unwrap();
+        let saved_right = store
+            .property_object_alias_request_recoveries
+            .remove(&(alias, right_key))
+            .unwrap();
+        let missing = counts(&store);
+        assert!(
+            store
+                .property_object_alias_recovery(result)
+                .unwrap()
+                .matches_current_result(&store)
+        );
+        assert_eq!(store.type_alias_links(alias), Some(&source_rows));
+        assert!(
+            crate::semantic::object_aliases::property_object_alias_projection(
+                &store,
+                normal_number
+            )
+            .is_err()
+        );
+        assert_eq!(counts(&store), missing);
+        assert!(store.publish_property_object_alias_request_recovery(saved_right));
+        assert_eq!(
+            crate::semantic::object_aliases::property_object_alias_projection(
+                &store,
+                normal_number
+            )
+            .unwrap()
+            .unwrap()
+            .type_,
+            normal_number
+        );
+        assert_eq!(counts(&store), stable);
+        let original = store.type_alias_links(alias).cloned().unwrap();
+        for replacement in [None, Some(normal_number)] {
+            let mut poisoned = original.clone();
+            let entries = poisoned.instantiations.as_mut().unwrap();
+            if let Some(replacement) = replacement {
+                assert_eq!(entries.insert(left_key, replacement), Some(result));
+            } else {
+                assert_eq!(entries.remove(&left_key), Some(result));
+            }
+            assert!(store.set_type_alias_links(alias, poisoned));
+            assert!(
+                cached_property_object_alias_request_matches(
+                    &store,
+                    alias,
+                    declared,
+                    &parameters,
+                    &[string],
+                    None,
+                    result,
+                    Some(targets),
+                )
+                .is_err()
+            );
+            assert!(
+                CanonicalTypeQuery::new_with_global_types(
+                    &mut store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(nodes[0])
+                .is_err()
+            );
+            assert_eq!(counts(&store), stable);
+            assert!(store.set_type_alias_links(alias, original.clone()));
+        }
+        let mut warm_session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 0,
+                max_count: 0,
+            },
+            error,
+        )
+        .unwrap();
+        for node in nodes {
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    &mut store,
+                    &host,
+                    &global_types,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut warm_session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(node),
+                Ok(result)
+            );
+        }
+        assert_eq!(warm_session.total_count(), 0);
+        assert_eq!(warm_session.limit_event_count(), 0);
+        assert_eq!(diagnostics.as_slice().len(), 2);
+        assert_eq!(counts(&store), stable);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Delete only the branded source-frame request record, then restore the same result.
+    fn property_alias_branded_source_frame_requires_its_recovery_request() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics,
+            global_types::initialize_global_library_types,
+            instantiate::{InstantiationLimits, InstantiationSession},
+            object_aliases::property_object_alias_projection,
+            type_nodes::{
+                CanonicalTypeQuery, CanonicalTypeQueryOptions, type_alias_instantiation_cache_key,
+            },
+        };
+        let parsed = parse_source_file(concat!(
+            "interface Object{} interface Function{} interface IArguments{} ",
+            "interface String{} interface Number{} interface Boolean{} interface RegExp{} ",
+            "interface Array<T>{} interface ReadonlyArray<T>{} ",
+            "type Box<T>={value:T}; type Wrapped<U>=Box<U>; type StringBox=Wrapped<string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(90_073);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/branded-property-alias-request.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.get(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = bootstrap.globals;
+        let string = bootstrap.string_type;
+        let error = bootstrap.error_type;
+        let symbols = store
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let wrapped = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("Wrapped")
+            .unwrap();
+        let alias = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("StringBox")
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let global_types =
+            initialize_global_library_types(&mut store, &host, globals, false).unwrap();
+        assert!(global_types.diagnostics().is_empty());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut store,
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let projection = property_object_alias_projection(&store, result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.identity_symbol, alias);
+        assert!(projection.identity_arguments.is_empty());
+        assert_eq!(projection.arguments, [error]);
+        assert_eq!(session.total_count(), 2);
+        assert_eq!(session.limit_event_count(), 1);
+        let identity = store
+            .symbol_store()
+            .assigned_global_symbol_id(alias)
+            .unwrap();
+        let key = type_alias_instantiation_cache_key(&[string], Some((identity, &[])));
+        let source_rows = store.type_alias_links(wrapped).cloned().unwrap();
+        assert_eq!(
+            source_rows.instantiations.as_ref().unwrap().get(&key),
+            Some(&result)
+        );
+        let target_rows = match store.type_payload(projection.target).unwrap().data() {
+            crate::semantic::type_records::TypeData::Object(object) => {
+                object.instantiations.clone()
+            }
+            _ => panic!("the source Box target stays anonymous"),
+        };
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+                store.property_object_alias_recoveries.len(),
+                store.property_object_alias_request_recoveries.len(),
+            )
+        };
+        let stable = counts(&store);
+        let saved = store
+            .property_object_alias_request_recoveries
+            .remove(&(wrapped, key))
+            .unwrap();
+        assert_eq!(saved.result(), result);
+        let missing = counts(&store);
+        assert!(
+            store
+                .property_object_alias_recovery(result)
+                .unwrap()
+                .matches_current_result(&store)
+        );
+        assert_eq!(store.type_alias_links(wrapped), Some(&source_rows));
+        assert_eq!(
+            match store.type_payload(projection.target).unwrap().data() {
+                crate::semantic::type_records::TypeData::Object(object) => &object.instantiations,
+                _ => panic!("the target identity does not change"),
+            },
+            &target_rows
+        );
+        assert!(property_object_alias_projection(&store, result).is_err());
+        assert!(
+            CanonicalTypeQuery::new_with_global_types(
+                &mut store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias)
+            .is_err()
+        );
+        assert_eq!(counts(&store), missing);
+        assert!(store.publish_property_object_alias_request_recovery(saved));
+        assert_eq!(
+            property_object_alias_projection(&store, result)
+                .unwrap()
+                .unwrap()
+                .type_,
+            result
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new_with_global_types(
+                &mut store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(result)
+        );
+        assert_eq!(counts(&store), stable);
+        assert_eq!(store.type_alias_links(wrapped), Some(&source_rows));
+        assert_eq!(session.total_count(), 2);
+        assert_eq!(session.limit_event_count(), 1);
+        assert_eq!(diagnostics.as_slice().len(), 1);
+        for property in projection.properties {
+            assert!(store.type_node_links(property.type_node).is_none());
+            assert!(store.value_symbol_links(property.symbol).is_none());
+        }
+    }
 
     #[test]
     fn source_keyword_result_requires_exact_null_identity_and_unpoisoned_links() {

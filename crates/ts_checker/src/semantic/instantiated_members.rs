@@ -1,4 +1,4 @@
-//! Lazy members for direct local generic-interface references.
+//! Lazy members for generic-interface references and property-object aliases.
 //!
 //! This is the declared-member prefix of pinned `resolveTypeReferenceMembers`,
 //! `resolveObjectTypeMembers`, `instantiateSymbolTable`, and
@@ -8,8 +8,11 @@
 //! explicit arguments with that reference for the implicit `this` type
 //! parameter, creates a mapper when properties require one, and preserves
 //! source-owned methods and index signatures.
+//!
+//! Property-object aliases keep their type-literal target and exact alias
+//! mapper. Their source annotations and instantiated property types stay lazy.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
@@ -18,7 +21,9 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId, TypeMapperId,
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId, RelationUnavailable, SignatureId,
+    SourceCheckError, TypeId, TypeMapperId,
     array_types::{CanonicalArrayReference, CanonicalArrayTargets},
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
@@ -29,6 +34,7 @@ use super::{
         ValidatedSingleCallable,
     },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
+    declared_values::{SelectedDeclaredProperty, selected_property_object_alias_property},
     functions::{
         FunctionTypeDisplayError, StoredFunctionTypeValidation, function_type_display_projection,
         validate_stored_function_type,
@@ -40,6 +46,10 @@ use super::{
         instantiated_member_type_matches,
     },
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
+    object_aliases::{
+        PropertyObjectAliasProjection, cached_property_object_alias_physical_arguments,
+        property_object_alias_projection,
+    },
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         validate_resolved_declared_property_object,
@@ -53,6 +63,7 @@ use super::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
     },
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
+    type_nodes::CanonicalTypeQuery,
     type_records::{
         ConstrainedTypeData, LiteralValue, ObjectTypeData, StructuredTypeData, TypeCacheState,
         TypeData, TypeDataKind, TypeParameterData,
@@ -118,6 +129,15 @@ impl InstantiatedInterfaceMembers {
     pub fn properties(&self) -> &[SemanticSymbolId] {
         &self.properties
     }
+}
+
+/// The source binder table or the exact lazy table of one object-alias instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PropertyObjectAliasMembers {
+    pub(super) receiver: TypeId,
+    pub(super) target: TypeId,
+    pub(super) members: Option<SymbolTableId>,
+    pub(super) properties: Vec<SemanticSymbolId>,
 }
 
 /// One property selected from a direct generic-interface reference.
@@ -1115,6 +1135,963 @@ pub(super) fn instantiate_generic_index_info_with_array_targets(
     store
         .alloc_index_info(key, instantiated, readonly, declaration, components)
         .ok_or(GenericInterfaceMemberError::Capacity(value))
+}
+
+/// A source template exposes its binder table without completing all annotations.
+/// Only an instance with a cold structured table returns `None`.
+pub(super) fn validate_property_object_alias_members(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> Result<Option<PropertyObjectAliasMembers>, RelationUnavailable> {
+    validate_property_object_alias_members_with_array_targets(store, receiver, None)
+}
+
+#[allow(clippy::too_many_lines)] // Source state and exact proxy state are checked together.
+pub(super) fn validate_property_object_alias_members_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PropertyObjectAliasMembers>, RelationUnavailable> {
+    let projection = property_object_alias_projection(store, receiver)?
+        .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+    reject_mismatched_property_object_alias_values(store, &projection)?;
+    validate_property_object_alias_cache_cycles(store, &projection, array_targets)?;
+    let (source_members, original_types) =
+        validate_property_object_alias_source_members(store, &projection)?;
+    if projection.type_ == projection.target {
+        return Ok(Some(PropertyObjectAliasMembers {
+            receiver,
+            target: projection.target,
+            members: source_members,
+            properties: projection
+                .properties
+                .iter()
+                .map(|property| property.symbol)
+                .collect(),
+        }));
+    }
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let record = store.type_payload(receiver).ok_or_else(invalid)?;
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        if structured != &StructuredTypeData::default() {
+            return Err(invalid());
+        }
+        return Ok(None);
+    }
+    let mapper = projection.mapper.ok_or_else(invalid)?;
+    let (members, properties) =
+        property_object_alias_member_table(store, receiver, projection.properties.len())?;
+    if properties.is_empty() && members.is_some() {
+        return Err(invalid());
+    }
+    for ((&property, source), original) in properties
+        .iter()
+        .zip(&projection.properties)
+        .zip(original_types)
+    {
+        let record = store.symbol(property).ok_or_else(invalid)?;
+        let target = store.symbol(source.symbol).ok_or_else(invalid)?;
+        if members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(source.name.as_ref()))
+            != Some(property)
+        {
+            return Err(invalid());
+        }
+        if property == source.symbol {
+            let original = original.ok_or_else(invalid)?;
+            if !matches!(
+                instantiable_member_type_contains_variables(
+                    store,
+                    original,
+                    &projection.parameters,
+                    array_targets,
+                ),
+                Ok(false)
+            ) {
+                return Err(invalid());
+            }
+            continue;
+        }
+        let links = store.value_symbol_links(property).ok_or_else(invalid)?;
+        let expected_checks = CheckFlags::INSTANTIATED
+            | if source.readonly {
+                CheckFlags::READONLY
+            } else {
+                CheckFlags::NONE
+            };
+        if record.flags() != target.flags() | SymbolFlags::TRANSIENT
+            || record.check_flags() != expected_checks
+            || record.name() != target.name()
+            || record.declarations() != target.declarations()
+            || record.value_declaration() != target.value_declaration()
+            || record.parent() != target.parent()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(property) != Some(property)
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    target: Some(source.symbol),
+                    mapper: Some(mapper),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(invalid());
+        }
+        // A proxy created while its source was cold remains a proxy even if
+        // that source later resolves to a constant type.
+        match (original, links.resolved_type) {
+            (Some(original), Some(cached)) => {
+                let validation_targets = array_targets.or_else(|| {
+                    store
+                        .instantiated_property_recovery(property)
+                        .and_then(|recovery| recovery.array_targets)
+                });
+                if store.type_payload(cached).is_none()
+                    || !cached_instantiated_property_value_matches(
+                        store,
+                        property,
+                        original,
+                        mapper,
+                        Some(cached),
+                        validation_targets,
+                    )
+                {
+                    return Err(invalid());
+                }
+            }
+            (_, None) if store.instantiated_property_recovery(property).is_none() => {}
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(Some(PropertyObjectAliasMembers {
+        receiver,
+        target: projection.target,
+        members,
+        properties: properties.to_vec(),
+    }))
+}
+
+/// Direct parameters and scalar unions can reject a wrong result before its graph is read.
+fn reject_mismatched_property_object_alias_values(
+    store: &CanonicalTypeMapperStore,
+    projection: &PropertyObjectAliasProjection,
+) -> Result<(), RelationUnavailable> {
+    if projection.type_ == projection.target {
+        return Ok(());
+    }
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(projection.type_);
+    let record = store.type_payload(projection.type_).ok_or_else(invalid)?;
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Ok(());
+    }
+    let (_, properties) =
+        property_object_alias_member_table(store, projection.type_, projection.properties.len())?;
+    for (&property, source) in properties.iter().zip(&projection.properties) {
+        let Some(original) = store
+            .value_symbol_links(source.symbol)
+            .and_then(|links| links.resolved_type)
+        else {
+            continue;
+        };
+        let Some(links) = store.value_symbol_links(property) else {
+            continue;
+        };
+        let Some(cached) = links.resolved_type else {
+            continue;
+        };
+        let expected = if let Some(index) = projection
+            .parameters
+            .iter()
+            .position(|parameter| *parameter == original)
+        {
+            *projection.arguments.get(index).ok_or_else(invalid)?
+        } else if let Some(expected) =
+            cached_scalar_property_object_alias_union(store, projection, original)
+        {
+            expected
+        } else {
+            continue;
+        };
+        if cached != expected
+            && !store
+                .instantiated_property_recovery(property)
+                .is_some_and(|recovery| recovery.matches_published_links(Some(links)))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// Only scalar source and mapped leaves can use this recursive cache reader here.
+fn cached_scalar_property_object_alias_union(
+    store: &CanonicalTypeMapperStore,
+    projection: &PropertyObjectAliasProjection,
+    original: TypeId,
+) -> Option<TypeId> {
+    let record = store.type_payload(original)?;
+    let TypeData::Union(union) = record.data() else {
+        return None;
+    };
+    if record.alias().is_some() || union.origin.is_some() {
+        return None;
+    }
+    for source in &union.union.types {
+        let mapped = match projection
+            .parameters
+            .iter()
+            .position(|parameter| parameter == source)
+        {
+            Some(index) => *projection.arguments.get(index)?,
+            None => *source,
+        };
+        let record = store.type_payload(mapped)?;
+        if record.alias().is_some()
+            || !matches!(record.data(), TypeData::Intrinsic(_) | TypeData::Literal(_))
+        {
+            return None;
+        }
+    }
+    cached_instantiation_with_vector(
+        store,
+        original,
+        &projection.parameters,
+        &projection.arguments,
+        None,
+        None,
+    )
+    .ok()
+    .flatten()
+}
+
+/// Stops alias member edges from re-entering a fresh union validation walk.
+/// This guard does not replace any source, mapper, or value-cache check.
+#[allow(clippy::too_many_lines)] // Read raw edges once, then find complete cyclic components.
+fn validate_property_object_alias_cache_cycles(
+    store: &CanonicalTypeMapperStore,
+    projection: &PropertyObjectAliasProjection,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), RelationUnavailable> {
+    let receiver = projection.type_;
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let mut graph = HashMap::<TypeId, Vec<TypeId>>::new();
+    let mut reverse = HashMap::<TypeId, Vec<TypeId>>::new();
+    let mut aliases = HashSet::new();
+    let mut pending = vec![receiver];
+    while let Some(type_) = pending.pop() {
+        if graph.contains_key(&type_) {
+            continue;
+        }
+        let record = store.type_payload(type_).ok_or_else(invalid)?;
+        let mut children = Vec::new();
+        let mut properties = Vec::new();
+        let mut signatures = Vec::new();
+        let mut indexes = Vec::new();
+        let mut source_nodes = Vec::new();
+        if let Some(alias) = record.alias() {
+            let alias = store.type_alias(alias).ok_or_else(invalid)?;
+            children.extend(alias.type_arguments().unwrap_or_default());
+        }
+        let is_array = cached_property_alias_array_identity(store, type_, array_targets);
+        let argument_only = matches!(record.data(), TypeData::TypeReference(_))
+            || matches!(record.data(), TypeData::Interface(interface)
+                if record.object_flags().contains(ObjectFlags::REFERENCE)
+                    && interface.all_type_parameters.as_deref().unwrap_or_default().iter()
+                        .any(|parameter| Some(*parameter) != interface.this_type));
+        // Ordinary references and the admitted Record mapped union follow arguments only.
+        let mut member_sources = Vec::new();
+        if !is_array && !argument_only && !matches!(record.data(), TypeData::Mapped(_)) {
+            member_sources.push((type_, false));
+            if let TypeData::Interface(interface) = record.data() {
+                for &base in interface.resolved_base_types.as_deref().unwrap_or_default() {
+                    member_sources.push((base, true));
+                }
+            }
+        }
+        let mut seen_member_sources = HashSet::new();
+        while let Some((member_type, inherited)) = member_sources.pop() {
+            if !seen_member_sources.insert((member_type, inherited))
+                || cached_property_alias_array_identity(store, member_type, array_targets)
+            {
+                continue;
+            }
+            let member_record = store.type_payload(member_type).ok_or_else(invalid)?;
+            let target = match member_record.data() {
+                TypeData::Object(object) => object.target,
+                TypeData::TypeReference(reference) => reference.object.target,
+                TypeData::Interface(interface) => interface.reference.object.target,
+                TypeData::Tuple(tuple) => tuple.interface.reference.object.target,
+                _ => None,
+            };
+            if let Some(target) = target.filter(|target| *target != member_type) {
+                children.push(target);
+                if inherited {
+                    member_sources.push((target, true));
+                }
+            }
+            if inherited && let TypeData::Interface(interface) = member_record.data() {
+                for &base in interface.resolved_base_types.as_deref().unwrap_or_default() {
+                    children.push(base);
+                    member_sources.push((base, true));
+                }
+                indexes.extend(
+                    interface
+                        .declared_index_infos
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(structured) = member_record.data().structured() {
+                properties.extend(structured.properties.as_deref().unwrap_or_default());
+                signatures.extend(structured.signatures.as_deref().unwrap_or_default());
+                indexes.extend(structured.index_infos.as_deref().unwrap_or_default());
+            }
+            if let Some(declarations) = member_record
+                .symbol()
+                .and_then(|symbol| store.symbol(symbol))
+                .and_then(ts_binder::semantic::Symbol::declarations)
+            {
+                for &declaration in declarations {
+                    if !matches!(
+                        (member_record.data(), store.source_node_kind(declaration)),
+                        (TypeData::Object(_), Some(SyntaxKind::TypeLiteral))
+                            | (
+                                TypeData::Interface(_) | TypeData::TypeReference(_),
+                                Some(SyntaxKind::InterfaceDeclaration)
+                            )
+                    ) {
+                        continue;
+                    }
+                    if matches!(member_record.data(), TypeData::Object(_))
+                        && cached_property_alias_source_declaration(store, declaration)
+                    {
+                        aliases.insert(member_type);
+                    }
+                    for source in store
+                        .source_direct_children(declaration)
+                        .unwrap_or_default()
+                    {
+                        if !matches!(
+                            store.source_node_kind(source),
+                            Some(
+                                SyntaxKind::PropertySignature
+                                    | SyntaxKind::PropertyDeclaration
+                                    | SyntaxKind::MethodSignature
+                                    | SyntaxKind::CallSignature
+                                    | SyntaxKind::ConstructSignature
+                                    | SyntaxKind::IndexSignature
+                                    | SyntaxKind::GetAccessor
+                                    | SyntaxKind::SetAccessor
+                            )
+                        ) {
+                            continue;
+                        }
+                        source_nodes.push(source);
+                    }
+                }
+            }
+        }
+        if type_ == receiver {
+            aliases.insert(type_);
+            children.extend(&projection.arguments);
+            properties.extend(projection.properties.iter().map(|property| property.symbol));
+        } else if matches!(record.data(), TypeData::Object(_))
+            && let Some(arguments) = cached_property_object_alias_physical_arguments(store, type_)
+                .map_err(|_| invalid())?
+        {
+            children.extend(arguments);
+        }
+        match record.data() {
+            TypeData::Union(union) => {
+                children.extend(&union.union.types);
+                children.extend(union.origin);
+            }
+            TypeData::TypeReference(reference) => {
+                children.extend(
+                    reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+            }
+            TypeData::Interface(interface) => {
+                children.extend(
+                    interface
+                        .reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+                if !is_array && !argument_only {
+                    children.extend(interface.resolved_base_types.as_deref().unwrap_or_default());
+                    indexes.extend(
+                        interface
+                            .declared_index_infos
+                            .as_deref()
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            TypeData::Tuple(tuple) => {
+                children.extend(
+                    tuple
+                        .interface
+                        .reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+            }
+            TypeData::TemplateLiteral(template) => children.extend(&template.types),
+            TypeData::StringMapping(mapping) => children.push(mapping.target),
+            TypeData::Index(index) => children.push(index.target),
+            TypeData::IndexedAccess(access) => {
+                children.extend([access.object_type, access.index_type]);
+            }
+            _ => {}
+        }
+        let mut seen_source_nodes = HashSet::new();
+        while let Some(node) = source_nodes.pop() {
+            if !seen_source_nodes.insert(node)
+                || matches!(
+                    store.source_node_kind(node),
+                    Some(
+                        SyntaxKind::Block
+                            | SyntaxKind::FunctionExpression
+                            | SyntaxKind::ArrowFunction
+                            | SyntaxKind::ClassExpression
+                    )
+                )
+            {
+                continue;
+            }
+            children.extend(
+                store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+            );
+            if let Some(symbol) = store.source_declaration_symbol(node) {
+                properties.push(symbol);
+                properties.extend(
+                    store
+                        .late_bound_links(symbol)
+                        .and_then(|links| links.late_symbol),
+                );
+            }
+            signatures.extend(
+                store
+                    .signature_links(node)
+                    .and_then(|links| links.resolved_signature.signature()),
+            );
+            source_nodes.extend(store.source_direct_children(node).unwrap_or_default());
+        }
+        let mut seen_signatures = HashSet::new();
+        while let Some(signature) = signatures.pop() {
+            if !seen_signatures.insert(signature) {
+                continue;
+            }
+            let signature = store.signature(signature).ok_or_else(invalid)?;
+            children.extend(signature.resolved_return_type());
+            children.extend(store.circular_return_annotation_type(signature.id()));
+            children.extend(
+                store
+                    .inferred_source_return_cycle(signature.id())
+                    .map(|cycle| cycle.body_type),
+            );
+            children.extend(signature.type_parameters());
+            for parameter in signature.type_parameters() {
+                if let Some(TypeData::TypeParameter(parameter)) = store
+                    .type_payload(*parameter)
+                    .map(super::type_records::TypeRecord::data)
+                {
+                    children.extend(parameter.constraint);
+                    children.extend(parameter.resolved_default_type);
+                }
+            }
+            if let Some(predicate) = signature.resolved_type_predicate() {
+                children.extend(
+                    store
+                        .type_predicate(predicate)
+                        .ok_or_else(invalid)?
+                        .type_id(),
+                );
+            }
+            properties.extend(signature.parameters());
+            properties.extend(signature.this_parameter());
+            signatures.extend(
+                signature
+                    .target()
+                    .filter(|target| *target != signature.id()),
+            );
+        }
+        let mut seen_properties = HashSet::new();
+        while let Some(property) = properties.pop() {
+            if !seen_properties.insert(property) {
+                continue;
+            }
+            store.symbol(property).ok_or_else(invalid)?;
+            if let Some(links) = store.value_symbol_links(property) {
+                children.extend(links.resolved_type);
+                properties.extend(links.target.filter(|target| *target != property));
+            }
+        }
+        for index in indexes {
+            let index = store.index_info(index).ok_or_else(invalid)?;
+            children.extend([index.key_type(), index.value_type()]);
+        }
+        children.sort_unstable();
+        children.dedup();
+        for &child in &children {
+            reverse.entry(child).or_default().push(type_);
+        }
+        pending.extend(&children);
+        graph.insert(type_, children);
+    }
+
+    // Two iterative passes find complete components. Ignoring an ordinary
+    // back edge during a single DFS can hide an alias in that same component.
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    let mut pending = vec![(receiver, false)];
+    while let Some((type_, leaving)) = pending.pop() {
+        if leaving {
+            order.push(type_);
+        } else if visited.insert(type_) {
+            pending.push((type_, true));
+            pending.extend(graph[&type_].iter().rev().map(|&child| (child, false)));
+        }
+    }
+    let mut assigned = HashSet::new();
+    for type_ in order.into_iter().rev() {
+        if !assigned.insert(type_) {
+            continue;
+        }
+        let mut component = vec![type_];
+        let mut pending = vec![type_];
+        while let Some(type_) = pending.pop() {
+            for &parent in reverse.get(&type_).into_iter().flatten() {
+                if assigned.insert(parent) {
+                    component.push(parent);
+                    pending.push(parent);
+                }
+            }
+        }
+        let cyclic = component.len() > 1 || graph[&type_].contains(&type_);
+        if cyclic && component.iter().any(|type_| aliases.contains(type_)) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(receiver));
+        }
+    }
+    Ok(())
+}
+
+fn cached_property_alias_array_identity(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let target = match record.data() {
+        TypeData::TypeReference(reference) => reference.object.target,
+        TypeData::Interface(interface)
+            if record.object_flags().contains(ObjectFlags::INTERFACE) =>
+        {
+            interface.reference.object.target
+        }
+        _ => return false,
+    };
+    [Some(type_), target].into_iter().flatten().any(|type_| {
+        array_targets.is_some_and(|targets| {
+            type_ == targets.array_type() || type_ == targets.readonly_array_type()
+        }) || store
+            .type_payload(type_)
+            .and_then(super::type_records::TypeRecord::symbol)
+            .is_some_and(|symbol| store.symbol_is_registered_global_array(symbol))
+    })
+}
+
+/// Recognizes the source family without validating or resolving its caches.
+fn cached_property_alias_source_declaration(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> bool {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::TypeLiteral)
+        || store
+            .source_direct_children(declaration)
+            .is_none_or(|children| {
+                children.is_empty()
+                    || children.iter().any(|child| {
+                        !matches!(
+                            store.source_node_kind(*child),
+                            Some(SyntaxKind::PropertySignature | SyntaxKind::PropertyDeclaration)
+                        ) || store
+                            .source_child_with_kind(*child, SyntaxKind::ComputedPropertyName)
+                            .is_some()
+                    })
+            })
+    {
+        return false;
+    }
+    let mut node = declaration;
+    while let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(node) {
+        match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType)
+                if store.source_direct_children(parent).as_deref() == Some(&[node]) =>
+            {
+                node = parent;
+            }
+            Some(SyntaxKind::TypeAliasDeclaration) => {
+                return store.source_direct_type_annotation(parent) == Some(node)
+                    && store
+                        .source_direct_children(parent)
+                        .is_some_and(|children| {
+                            children.iter().any(|child| {
+                                store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter)
+                            })
+                        });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn validate_property_object_alias_source_members(
+    store: &CanonicalTypeMapperStore,
+    projection: &PropertyObjectAliasProjection,
+) -> Result<(Option<SymbolTableId>, Vec<Option<TypeId>>), RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(projection.target);
+    let record = store.type_payload(projection.target).ok_or_else(invalid)?;
+    let structured = record.data().structured().ok_or_else(invalid)?;
+    let source_members = store
+        .symbol(projection.source_symbol)
+        .ok_or_else(invalid)?
+        .members();
+    let complete = record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED);
+    if complete {
+        let (members, properties) = property_object_alias_member_table(
+            store,
+            projection.target,
+            projection.properties.len(),
+        )?;
+        if members != source_members
+            || !properties
+                .iter()
+                .copied()
+                .eq(projection.properties.iter().map(|property| property.symbol))
+        {
+            return Err(invalid());
+        }
+    } else if structured != &StructuredTypeData::default() {
+        return Err(invalid());
+    }
+    let mut original_types = Vec::with_capacity(projection.properties.len());
+    for (index, property) in projection.properties.iter().enumerate() {
+        let type_ = match selected_property_object_alias_property(store, projection, index)? {
+            SelectedDeclaredProperty::Resolved(property) => Some(property.type_),
+            SelectedDeclaredProperty::Unresolved(symbol)
+                if symbol == property.symbol && !complete =>
+            {
+                None
+            }
+            _ => return Err(invalid()),
+        };
+        original_types.push(type_);
+    }
+    Ok((source_members, original_types))
+}
+
+fn property_object_alias_member_table(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+    count: usize,
+) -> Result<(Option<SymbolTableId>, &[SemanticSymbolId]), RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let structured = store
+        .type_payload(receiver)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?;
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    if properties.len() != count
+        || structured.properties.is_some() == properties.is_empty()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || structured.index_infos.is_some()
+        || structured.constrained != ConstrainedTypeData::default()
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || match structured.members {
+            Some(members) => store
+                .symbol_table(members)
+                .is_none_or(|table| table.len() != count),
+            None => count != 0,
+        }
+    {
+        return Err(invalid());
+    }
+    Ok((structured.members, properties))
+}
+
+/// Creates only member names and proxies. Original annotations remain lazy.
+pub(super) fn resolve_property_object_alias_members(
+    store: &mut CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> Result<PropertyObjectAliasMembers, RelationUnavailable> {
+    if let Some(members) = validate_property_object_alias_members(store, receiver)? {
+        return Ok(members);
+    }
+    let projection = property_object_alias_projection(store, receiver)?
+        .ok_or(RelationUnavailable::UnsupportedStructuredType(receiver))?;
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let mapper = projection.mapper.ok_or_else(invalid)?;
+    let (_, original_types) = validate_property_object_alias_source_members(store, &projection)?;
+    let mut properties = Vec::with_capacity(projection.properties.len());
+    let mut proxy_count = 0;
+    for (source, original) in projection.properties.iter().zip(original_types) {
+        if original.is_some_and(|original| {
+            matches!(
+                instantiable_member_type_contains_variables(
+                    store,
+                    original,
+                    &projection.parameters,
+                    None
+                ),
+                Ok(false)
+            )
+        }) {
+            properties.push(ColdPropertyPlan::Reused {
+                symbol: source.symbol,
+                name: source.name.clone(),
+            });
+        } else {
+            properties.push(
+                prepare_cold_property_proxy(store, source.symbol, source.readonly)
+                    .map_err(|error| property_object_alias_member_error(receiver, &error))?,
+            );
+            proxy_count += 1;
+        }
+    }
+    let count = properties.len();
+    let table = if count == 0 {
+        None
+    } else {
+        Some(
+            prepare_member_table(receiver, count)
+                .map_err(|error| property_object_alias_member_error(receiver, &error))?,
+        )
+    };
+    if !store.try_reserve_checker_symbol_allocations(proxy_count, usize::from(count != 0))
+        || !store.try_reserve_value_symbol_links(proxy_count)
+    {
+        return Err(RelationUnavailable::UnionValidationCapacity(receiver));
+    }
+    let (members, properties) =
+        publish_prepared_property_table(store, ColdMembersPlan { table, properties }, Some(mapper));
+    assert!(store.set_structured_type_members(
+        receiver,
+        members,
+        (!properties.is_empty()).then(|| properties.clone()),
+        None,
+        None,
+        None,
+    ));
+    Ok(PropertyObjectAliasMembers {
+        receiver,
+        target: projection.target,
+        members,
+        properties,
+    })
+}
+
+/// Resolves one original annotation, then maps only that property's value.
+#[allow(clippy::too_many_arguments)] // The source owner supplies the query session and diagnostics.
+#[allow(clippy::too_many_lines)] // Keep cold resolution, caller-session mapping, and publication together.
+pub(super) fn demand_property_object_alias_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+) -> Result<TypeId, SourceCheckError> {
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+    let members =
+        validate_property_object_alias_members_with_array_targets(store, receiver, array_targets)?
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(receiver))?;
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+    let index = members
+        .properties
+        .iter()
+        .position(|symbol| *symbol == property)
+        .ok_or_else(invalid)?;
+    let projection = property_object_alias_projection(store, receiver)?.ok_or_else(invalid)?;
+    let source = projection
+        .properties
+        .get(index)
+        .ok_or_else(invalid)?
+        .clone();
+    if let Some(type_) = store
+        .value_symbol_links(property)
+        .and_then(|links| links.resolved_type)
+    {
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .preflight_type_of_declared_value(source.symbol)?;
+        return Ok(type_);
+    }
+    if session.recovery_error_type().is_some_and(|error_type| {
+        store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.error_type != error_type)
+            || store.validate_union_constituent(error_type).is_err()
+    }) {
+        return Err(invalid().into());
+    }
+    let template = match selected_property_object_alias_property(store, &projection, index)? {
+        SelectedDeclaredProperty::Resolved(property) => {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .preflight_type_of_declared_value(source.symbol)?;
+            property.type_
+        }
+        SelectedDeclaredProperty::Unresolved(symbol) if symbol == source.symbol => {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_of_declared_value(source.symbol)?
+        }
+        _ => return Err(invalid().into()),
+    };
+    reject_mismatched_property_object_alias_values(store, &projection)?;
+    validate_property_object_alias_cache_cycles(store, &projection, array_targets)?;
+    if !matches!(
+        selected_property_object_alias_property(store, &projection, index)?,
+        SelectedDeclaredProperty::Resolved(property) if property.type_ == template
+    ) {
+        return Err(invalid().into());
+    }
+    if projection.type_ == projection.target {
+        return Ok(template);
+    }
+    let mapper = projection.mapper.ok_or_else(invalid)?;
+    let limit_mark = session.limit_event_mark();
+    let instantiated =
+        instantiate_generic_member_type(store, template, mapper, array_targets, session)
+            .map_err(|error| property_object_alias_member_error(receiver, &error))?;
+    let links = store
+        .value_symbol_links(property)
+        .cloned()
+        .ok_or_else(invalid)?;
+    if links
+        != (ValueSymbolLinks {
+            target: Some(source.symbol),
+            mapper: Some(mapper),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invalid().into());
+    }
+    let recovery = if session.recovery_error_type().is_some()
+        && session.limit_event_occurred_since(limit_mark)
+    {
+        let identity =
+            property_recovery_type_identity(store, &[template, instantiated], array_targets)
+                .ok_or_else(invalid)?;
+        if !store.try_reserve_instantiated_property_recoveries() {
+            return Err(RelationUnavailable::UnionValidationCapacity(receiver).into());
+        }
+        Some(InstantiatedPropertyRecovery {
+            valid: true,
+            method: false,
+            symbol: property,
+            target: source.symbol,
+            template,
+            mapper,
+            result: instantiated,
+            array_targets,
+            identity,
+        })
+    } else {
+        if !cached_instantiated_property_type_matches(
+            store,
+            template,
+            instantiated,
+            mapper,
+            array_targets,
+        ) {
+            return Err(invalid().into());
+        }
+        None
+    };
+    assert!(store.set_value_symbol_links(
+        property,
+        ValueSymbolLinks {
+            resolved_type: Some(instantiated),
+            ..links
+        }
+    ));
+    if let Some(recovery) = recovery {
+        assert!(store.publish_instantiated_property_recovery(recovery));
+    }
+    Ok(instantiated)
+}
+
+fn property_object_alias_member_error(
+    receiver: TypeId,
+    error: &GenericInterfaceMemberError,
+) -> RelationUnavailable {
+    match error {
+        GenericInterfaceMemberError::UnsupportedTarget(type_)
+        | GenericInterfaceMemberError::UnsupportedPropertyType(type_) => {
+            RelationUnavailable::UnsupportedStructuredType(*type_)
+        }
+        GenericInterfaceMemberError::UnsupportedMember(symbol) => {
+            RelationUnavailable::UnsupportedProperty(*symbol)
+        }
+        GenericInterfaceMemberError::Capacity(type_) => {
+            RelationUnavailable::UnionValidationCapacity(*type_)
+        }
+        GenericInterfaceMemberError::Reference(_)
+        | GenericInterfaceMemberError::InvalidTarget(_)
+        | GenericInterfaceMemberError::InvalidMember(_)
+        | GenericInterfaceMemberError::InvalidCachedMembers(_)
+        | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+            RelationUnavailable::InvalidStructuredMembers(receiver)
+        }
+    }
 }
 
 pub(super) fn resolve_members_with_array_targets(
@@ -5592,6 +6569,38 @@ fn valid_instantiated_index_info(
     value_matches && (source == actual) == (source_info.value_type() == actual_info.value_type())
 }
 
+fn prepare_cold_property_proxy(
+    store: &CanonicalTypeMapperStore,
+    source: SemanticSymbolId,
+    readonly: bool,
+) -> Result<ColdPropertyPlan, GenericInterfaceMemberError> {
+    let target = store
+        .symbol(source)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(source))?;
+    let mut data = SymbolData::new(
+        target.flags() | SymbolFlags::TRANSIENT,
+        target.name().to_owned(),
+    );
+    data.check_flags = CheckFlags::INSTANTIATED
+        | (target.check_flags()
+            & (CheckFlags::LATE | CheckFlags::OPTIONAL_PARAMETER | CheckFlags::REST_PARAMETER))
+        | if readonly {
+            CheckFlags::READONLY
+        } else {
+            CheckFlags::NONE
+        };
+    data.declarations = target.declarations().map(<[_]>::to_vec);
+    data.value_declaration = target.value_declaration();
+    data.parent = target.parent();
+    Ok(ColdPropertyPlan::Proxy {
+        target: source,
+        data,
+        name_type: store
+            .value_symbol_links(source)
+            .and_then(|links| links.name_type),
+    })
+}
+
 fn prepare_cold_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
@@ -5628,24 +6637,11 @@ fn prepare_cold_members(
         let target = store
             .symbol(source.symbol)
             .ok_or(GenericInterfaceMemberError::InvalidMember(source.symbol))?;
-        let mut data =
-            SymbolData::new(target.flags() | SymbolFlags::TRANSIENT, source.name.clone());
-        data.check_flags = CheckFlags::INSTANTIATED
-            | (target.check_flags()
-                & (CheckFlags::READONLY
-                    | CheckFlags::LATE
-                    | CheckFlags::OPTIONAL_PARAMETER
-                    | CheckFlags::REST_PARAMETER));
-        data.declarations = target.declarations().map(<[_]>::to_vec);
-        data.value_declaration = target.value_declaration();
-        data.parent = target.parent();
-        properties.push(ColdPropertyPlan::Proxy {
-            target: source.symbol,
-            data,
-            name_type: store
-                .value_symbol_links(source.symbol)
-                .and_then(|links| links.name_type),
-        });
+        properties.push(prepare_cold_property_proxy(
+            store,
+            source.symbol,
+            target.check_flags().contains(CheckFlags::READONLY),
+        )?);
     }
     for inherited in &shape.inherited_properties {
         let name = store
@@ -5758,10 +6754,6 @@ fn publish_cold_members(
     indexes: ColdIndexValues,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
-    let ColdMembersPlan {
-        table,
-        properties: planned_properties,
-    } = plan;
     let ColdIndexValues {
         mapper,
         mapper_sources,
@@ -5836,42 +6828,7 @@ fn publish_cold_members(
         index_infos.push(index);
     }
     index_infos.extend_from_slice(&shape.inherited_index_infos);
-    let members = table.map(|table| store.alloc_prepared_symbol_table(table));
-    let mut properties = Vec::with_capacity(planned_properties.len());
-    for property in planned_properties {
-        let (name, symbol) = match property {
-            ColdPropertyPlan::Reused { symbol, name } => (name, symbol),
-            ColdPropertyPlan::Proxy {
-                target,
-                data,
-                name_type,
-            } => {
-                let name = data.name.clone();
-                let symbol = store
-                    .alloc_symbol(data)
-                    .expect("reserved instantiated property allocation must succeed");
-                assert!(store.set_value_symbol_links(
-                    symbol,
-                    ValueSymbolLinks {
-                        target: Some(target),
-                        mapper,
-                        name_type,
-                        ..ValueSymbolLinks::default()
-                    },
-                ));
-                (name, symbol)
-            }
-        };
-        assert_eq!(
-            store.insert_symbol(
-                members.expect("every planned property has a prepared member table"),
-                name,
-                symbol,
-            ),
-            Some(None)
-        );
-        properties.push(symbol);
-    }
+    let (members, properties) = publish_prepared_property_table(store, plan, mapper);
     assert!(store.set_structured_type_members(
         shape.reference,
         members,
@@ -5890,6 +6847,52 @@ fn publish_cold_members(
         members,
         properties,
     })
+}
+
+fn publish_prepared_property_table(
+    store: &mut CanonicalTypeMapperStore,
+    plan: ColdMembersPlan,
+    mapper: Option<TypeMapperId>,
+) -> (Option<SymbolTableId>, Vec<SemanticSymbolId>) {
+    let members = plan
+        .table
+        .map(|table| store.alloc_prepared_symbol_table(table));
+    let mut properties = Vec::with_capacity(plan.properties.len());
+    for property in plan.properties {
+        let (name, symbol) = match property {
+            ColdPropertyPlan::Reused { symbol, name } => (name, symbol),
+            ColdPropertyPlan::Proxy {
+                target,
+                data,
+                name_type,
+            } => {
+                let name = data.name.clone();
+                let symbol = store
+                    .alloc_symbol(data)
+                    .expect("reserved instantiated property allocation must succeed");
+                assert!(store.set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        target: Some(target),
+                        mapper,
+                        name_type,
+                        ..ValueSymbolLinks::default()
+                    }
+                ));
+                (name, symbol)
+            }
+        };
+        assert_eq!(
+            store.insert_symbol(
+                members.expect("every planned property has a prepared member table"),
+                name,
+                symbol,
+            ),
+            Some(None),
+        );
+        properties.push(symbol);
+    }
+    (members, properties)
 }
 
 fn prepare_member_table(
@@ -5984,6 +6987,1413 @@ mod tests {
             .symbol(declaration)
             .and_then(|symbol| context.store().get_merged_symbol(symbol))
             .unwrap()
+    }
+
+    fn property_object_alias_variable_type(
+        parsed: &ParseResult,
+        file: FileId,
+        context: &mut CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> TypeId {
+        let symbol = source_symbol(parsed, file, context, name);
+        let annotation = context
+            .store()
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
+            .unwrap();
+        context.get_type_from_type_node(annotation).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the raw cycle before any reader can start a fresh graph walk.
+    fn property_object_alias_cycle_guard_follows_nested_physical_recovery_arguments() {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T }; ",
+            "type Root<T> = { value: Box<T> | undefined }; ",
+            "declare const left: Root<string>; declare const right: Root<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_812);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = checker_context(&parsed, file, options);
+        let roots = ["left", "right"]
+            .map(|name| property_object_alias_variable_type(&parsed, file, &mut context, name));
+        assert_ne!(roots[0], roots[1]);
+        let globals = context.global_types().clone();
+        let array_targets = CanonicalArrayTargets::from_global_types(&globals);
+        let targets = Some(array_targets);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let members = roots.map(|receiver| {
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap()
+        });
+        let properties = members.each_ref().map(|members| members.properties[0]);
+        let values = [0, 1].map(|index| {
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                roots[index],
+                properties[index],
+            )
+            .unwrap()
+        });
+        let root_projection = property_object_alias_projection(context.store(), roots[0])
+            .unwrap()
+            .unwrap();
+        let source_value = context
+            .store()
+            .value_symbol_links(root_projection.properties[0].symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            cached_scalar_property_object_alias_union(
+                context.store(),
+                &root_projection,
+                source_value,
+            ),
+            None,
+        );
+        let box_symbol = source_symbol(&parsed, file, &context, "Box");
+        let box_target = context.get_declared_type_of_symbol(box_symbol).unwrap();
+        let box_projection = property_object_alias_projection(context.store(), box_target)
+            .unwrap()
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let error = bootstrap.error_type;
+        let undefined = bootstrap.undefined_type;
+        let mut recovering = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let hidden_arguments = [roots[1], roots[0]];
+        let recovered = hidden_arguments.map(|argument| {
+            instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                box_target,
+                &box_projection.parameters,
+                &[argument],
+                targets,
+                &mut recovering,
+            )
+            .unwrap()
+        });
+        assert_ne!(recovered[0], recovered[1]);
+        assert_eq!(
+            (
+                recovering.query_count(),
+                recovering.total_count(),
+                recovering.limit_event_count(),
+            ),
+            (2, 2, 2),
+        );
+        let receivers = [roots[0], roots[1], recovered[0], recovered[1]];
+        let projections = receivers.map(|receiver| {
+            property_object_alias_projection(context.store(), receiver)
+                .unwrap()
+                .unwrap()
+        });
+        for (index, projection) in projections[2..].iter().enumerate() {
+            assert_eq!(projection.target, box_target);
+            assert_eq!(projection.alias_symbol, box_symbol);
+            assert_eq!(projection.identity_symbol, box_symbol);
+            assert_eq!(projection.arguments, [hidden_arguments[index]]);
+            assert_eq!(projection.identity_arguments, [error]);
+            let recovery = context
+                .store()
+                .property_object_alias_recovery(projection.type_)
+                .unwrap();
+            assert!(recovery.matches_current_result(context.store()));
+            assert!(!recovery.physical_slot_recovered(0));
+            assert!(recovery.identity_slot_recovered(0));
+        }
+        let poisoned_values = recovered.map(|receiver| {
+            context
+                .store_mut_for_test()
+                .literal_union_type_with_alias_and_array_targets(
+                    &[receiver, undefined],
+                    None,
+                    targets,
+                )
+                .unwrap()
+        });
+        let original_links = properties.map(|property| {
+            context
+                .store()
+                .value_symbol_links(property)
+                .cloned()
+                .unwrap()
+        });
+        let objects = [
+            root_projection.target,
+            box_target,
+            roots[0],
+            roots[1],
+            recovered[0],
+            recovered[1],
+        ];
+        let symbols = [
+            root_projection.properties[0].symbol,
+            box_projection.properties[0].symbol,
+            properties[0],
+            properties[1],
+        ];
+        let nodes = [
+            root_projection.declaration,
+            box_projection.declaration,
+            root_projection.properties[0].type_node,
+            box_projection.properties[0].type_node,
+        ];
+        let unions = [
+            source_value,
+            values[0],
+            values[1],
+            poisoned_values[0],
+            poisoned_values[1],
+        ];
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                (
+                    property_recovery_store_counts(store),
+                    store.type_alias_len(),
+                ),
+                objects.map(|type_| {
+                    let record = store.type_payload(type_).unwrap();
+                    let TypeData::Object(object) = record.data() else {
+                        panic!("the alias keeps its anonymous object")
+                    };
+                    let alias = store.type_alias(record.alias().unwrap()).unwrap();
+                    (
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        alias.id(),
+                        alias.symbol(),
+                        alias.type_arguments().map(<[TypeId]>::to_vec),
+                        object.clone(),
+                    )
+                }),
+                [root_projection.alias_symbol, box_symbol]
+                    .map(|symbol| store.type_alias_links(symbol).cloned()),
+                symbols.map(|symbol| store.value_symbol_links(symbol).cloned()),
+                nodes.map(|node| store.type_node_links(node).cloned()),
+                unions.map(|type_| {
+                    let TypeData::Union(union) = store.type_payload(type_).unwrap().data() else {
+                        panic!("the property keeps its union")
+                    };
+                    union.clone()
+                }),
+                recovered.map(|type_| {
+                    let recovery = store.property_object_alias_recovery(type_).unwrap();
+                    (
+                        recovery.result(),
+                        recovery.error_type(),
+                        recovery.physical_slot_recovered(0),
+                        recovery.identity_slot_recovered(0),
+                    )
+                }),
+            )
+        };
+        let before = snapshot(context.store());
+        let session_before = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        for index in 0..2 {
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                properties[index],
+                ValueSymbolLinks {
+                    resolved_type: Some(poisoned_values[index]),
+                    ..original_links[index].clone()
+                },
+            ));
+        }
+        let poisoned = snapshot(context.store());
+        assert_eq!(poisoned.0, before.0);
+        // left -> recovered[0] -> right -> recovered[1] -> left.
+        // Both recovered objects hide their physical edge behind a visible error.
+        for _ in 0..2 {
+            for projection in &projections {
+                assert_eq!(
+                    validate_property_object_alias_cache_cycles(
+                        context.store(),
+                        projection,
+                        targets,
+                    ),
+                    Err(RelationUnavailable::UnsupportedStructuredType(
+                        projection.type_
+                    )),
+                );
+            }
+            for receiver in receivers {
+                assert_eq!(
+                    validate_property_object_alias_members_with_array_targets(
+                        context.store(),
+                        receiver,
+                        targets,
+                    ),
+                    Err(RelationUnavailable::UnsupportedStructuredType(receiver)),
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .validate_cached_array_capability_with_array_targets(
+                            array_targets,
+                            receiver
+                        ),
+                    Err(LiteralTypeCacheError::UnsupportedUnionConstituent(receiver)),
+                );
+            }
+            for index in 0..2 {
+                assert_eq!(
+                    demand_property_object_alias_property(
+                        context.store_mut_for_test(),
+                        &host,
+                        &globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        roots[index],
+                        properties[index],
+                    ),
+                    Err(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::UnsupportedStructuredType(roots[index]),
+                    )),
+                );
+                assert!(
+                    context
+                        .store()
+                        .property_object_alias_recovery(recovered[index])
+                        .unwrap()
+                        .matches_current_result(context.store())
+                );
+            }
+            assert_eq!(snapshot(context.store()), poisoned);
+        }
+        for index in 0..2 {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(properties[index], original_links[index].clone())
+            );
+        }
+        assert_eq!(snapshot(context.store()), before);
+        for index in 0..2 {
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    roots[index],
+                    targets,
+                ),
+                Ok(Some(members[index].clone())),
+            );
+            assert_eq!(
+                demand_property_object_alias_property(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    roots[index],
+                    properties[index],
+                ),
+                Ok(values[index]),
+            );
+        }
+        for receiver in receivers {
+            assert_eq!(
+                context
+                    .store()
+                    .validate_cached_array_capability_with_array_targets(array_targets, receiver),
+                Ok(()),
+            );
+        }
+        assert_eq!(snapshot(context.store()), before);
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark()
+            ),
+            session_before,
+        );
+        assert_eq!(
+            (
+                recovering.query_count(),
+                recovering.total_count(),
+                recovering.limit_event_count()
+            ),
+            (2, 2, 2),
+        );
+        for receiver in [box_target, recovered[0], recovered[1]] {
+            assert!(
+                !context
+                    .store()
+                    .type_payload(receiver)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+        }
+        assert!(
+            context
+                .store()
+                .value_symbol_links(box_projection.properties[0].symbol)
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        assert!(diagnostics.is_empty());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep rejection and exact restore in the same source fixture.
+    fn property_object_alias_rejects_union_cache_reentry_and_reuses_restored_ids() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T }; declare const box: Box<string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_804);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = checker_context(&parsed, file, options);
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "box");
+        let globals = context.global_types().clone();
+        let array_targets = CanonicalArrayTargets::from_global_types(&globals);
+        let targets = Some(array_targets);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        let property = members.properties[0];
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                receiver,
+                property,
+            ),
+            Ok(string)
+        );
+        let invalid_union = context
+            .store_mut_for_test()
+            .literal_union_type_with_alias_and_array_targets(&[receiver, undefined], None, targets)
+            .unwrap();
+        let original = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let before = (
+            property_recovery_store_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(invalid_union),
+                ..original.clone()
+            }
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Err(RelationUnavailable::InvalidStructuredMembers(receiver)),
+            );
+            assert_eq!(
+                demand_property_object_alias_property(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    receiver,
+                    property,
+                ),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::InvalidStructuredMembers(receiver)
+                ))
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .validate_cached_array_capability_with_array_targets(array_targets, receiver),
+                Err(
+                    crate::semantic::bootstrap::LiteralTypeCacheError::InvalidCachedUnion(receiver)
+                ),
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().type_alias_len()
+                ),
+                before
+            );
+            assert!(diagnostics.is_empty());
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, original)
+        );
+        assert_eq!(
+            validate_property_object_alias_members_with_array_targets(
+                context.store(),
+                receiver,
+                targets
+            ),
+            Ok(Some(members)),
+        );
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                receiver,
+                property,
+            ),
+            Ok(string)
+        );
+        assert_eq!(
+            (
+                property_recovery_store_counts(context.store()),
+                context.store().type_alias_len()
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The two routes share the same original and poisoned proxy.
+    fn property_object_alias_rejects_holder_union_and_cold_original_cycles() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T | undefined }; ",
+            "interface Holder { box: Box<string> } ",
+            "type Relay<U> = { item: Holder }; ",
+            "declare const box: Box<string>; declare const holder: Holder; ",
+            "declare const relay: Relay<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_806);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = checker_context(&parsed, file, options);
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "box");
+        let holder = property_object_alias_variable_type(&parsed, file, &mut context, "holder");
+        let relay = property_object_alias_variable_type(&parsed, file, &mut context, "relay");
+        assert_eq!(
+            validate_resolved_declared_property_object(context.store(), holder),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
+        );
+        assert_eq!(
+            super::super::object_members::resolved_declared_property_types(context.store(), holder),
+            Some(vec![receiver])
+        );
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        let property = members.properties[0];
+        let value = demand_property_object_alias_property(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            receiver,
+            property,
+        )
+        .unwrap();
+        let projection = property_object_alias_projection(context.store(), receiver)
+            .unwrap()
+            .unwrap();
+        let original_type = context
+            .store()
+            .value_symbol_links(projection.properties[0].symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            cached_scalar_property_object_alias_union(context.store(), &projection, original_type),
+            Some(value)
+        );
+        let relay_source = property_object_alias_projection(context.store(), relay)
+            .unwrap()
+            .unwrap()
+            .target;
+        let relay_members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), relay_source)
+                .unwrap();
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                relay_source,
+                relay_members.properties[0],
+            ),
+            Ok(holder)
+        );
+        for type_ in [relay_source, relay] {
+            assert!(
+                !context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+        }
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        let direct_union = context
+            .store_mut_for_test()
+            .literal_union_type_with_alias_and_array_targets(&[holder, undefined], None, targets)
+            .unwrap();
+        let cold_union = context
+            .store_mut_for_test()
+            .literal_union_type_with_alias_and_array_targets(&[relay, undefined], None, targets)
+            .unwrap();
+        let original = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let before = (
+            property_recovery_store_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        for candidate in [direct_union, cold_union] {
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                property,
+                ValueSymbolLinks {
+                    resolved_type: Some(candidate),
+                    ..original.clone()
+                }
+            ));
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_property_object_alias_cache_cycles(
+                        context.store(),
+                        &projection,
+                        targets
+                    ),
+                    Err(RelationUnavailable::UnsupportedStructuredType(receiver))
+                );
+                assert_eq!(
+                    validate_property_object_alias_members_with_array_targets(
+                        context.store(),
+                        receiver,
+                        targets
+                    ),
+                    Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+                );
+                assert_eq!(
+                    demand_property_object_alias_property(
+                        context.store_mut_for_test(),
+                        &host,
+                        &globals,
+                        options,
+                        &mut session,
+                        &mut diagnostics,
+                        receiver,
+                        property,
+                    ),
+                    Err(SourceCheckError::RelationUnavailable(
+                        RelationUnavailable::InvalidStructuredMembers(receiver)
+                    ))
+                );
+                assert_eq!(
+                    (
+                        property_recovery_store_counts(context.store()),
+                        context.store().type_alias_len()
+                    ),
+                    before
+                );
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, original.clone())
+            );
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Ok(Some(members.clone()))
+            );
+            assert_eq!(
+                demand_property_object_alias_property(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    receiver,
+                    property,
+                ),
+                Ok(value)
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().type_alias_len()
+                ),
+                before
+            );
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Use a real inherited proxy before poisoning the alias cache.
+    fn property_object_alias_cycle_guard_follows_generic_heritage_proxies() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T | undefined }; ",
+            "interface Base<U> { inherited: U | undefined } ",
+            "interface Holder extends Base<Box<string>> {} ",
+            "declare const box: Box<string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_808);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = checker_context(&parsed, file, options);
+        context.check_source_file(file).unwrap();
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "box");
+        let holder_symbol = source_symbol(&parsed, file, &context, "Holder");
+        let holder = context
+            .store()
+            .declared_type_links(holder_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(holder).unwrap().data()
+        else {
+            panic!("Holder must keep its source interface identity");
+        };
+        let base = interface.resolved_base_types.as_ref().unwrap()[0];
+        let inherited = context
+            .store()
+            .symbol_table(interface.reference.object.structured.members.unwrap())
+            .unwrap()
+            .get_source("inherited")
+            .unwrap();
+        let inherited_value = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property(base, "inherited", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited_value.symbol(), inherited);
+        assert!(matches!(
+            context
+                .store()
+                .type_payload(inherited_value.type_id())
+                .unwrap()
+                .data(),
+            TypeData::Union(_)
+        ));
+        let inherited_links = context
+            .store()
+            .value_symbol_links(inherited)
+            .unwrap()
+            .clone();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        let property = members.properties[0];
+        let value = demand_property_object_alias_property(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            receiver,
+            property,
+        )
+        .unwrap();
+        let projection = property_object_alias_projection(context.store(), receiver)
+            .unwrap()
+            .unwrap();
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        let candidate = context
+            .store_mut_for_test()
+            .literal_union_type_with_alias_and_array_targets(&[holder, undefined], None, targets)
+            .unwrap();
+        let original = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let before = property_recovery_store_counts(context.store());
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(candidate),
+                ..original.clone()
+            }
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                validate_property_object_alias_cache_cycles(context.store(), &projection, targets),
+                Err(RelationUnavailable::UnsupportedStructuredType(receiver))
+            );
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+            );
+            assert_eq!(
+                context.store().value_symbol_links(inherited),
+                Some(&inherited_links)
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), before);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(property, original)
+        );
+        assert_eq!(
+            validate_property_object_alias_members_with_array_targets(
+                context.store(),
+                receiver,
+                targets
+            ),
+            Ok(Some(members))
+        );
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                receiver,
+                property,
+            ),
+            Ok(value)
+        );
+        assert_eq!(property_recovery_store_counts(context.store()), before);
+        assert!(diagnostics.is_empty());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep two cold library annotation routes and exact replay together.
+    fn property_object_alias_cycle_guard_reads_cold_library_annotations() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface ColdProperty { p: (Holder) } ",
+            "interface ColdMethod { method(): Holder }",
+        ));
+        let parsed = parse_source_file(concat!(
+            "type Box<T> = { value: T | undefined }; ",
+            "interface Holder { box: Box<string> } declare const box: Box<string>; ",
+            "declare const holder: Holder;",
+        ));
+        let library_file = FileId::new(19_809);
+        let file = FileId::new(19_810);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, default_library) in
+            [(&library, library_file, true), (&parsed, file, false)]
+        {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!(
+                            "\"/project/alias-cycle-{}.ts\"",
+                            file.index()
+                        )),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (file, &parsed.arena)],
+            options,
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "box");
+        let holder = property_object_alias_variable_type(&parsed, file, &mut context, "holder");
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        let property = members.properties[0];
+        let value = demand_property_object_alias_property(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            receiver,
+            property,
+        )
+        .unwrap();
+        let projection = property_object_alias_projection(context.store(), receiver)
+            .unwrap()
+            .unwrap();
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        let mut candidates = Vec::new();
+        let mut cold_members = Vec::new();
+        for (owner_name, member_name) in [("ColdProperty", "p"), ("ColdMethod", "method")] {
+            let owner = source_symbol(&library, library_file, &context, owner_name);
+            let type_ = context
+                .store_mut_for_test()
+                .get_declared_type_of_symbol(&host, owner)
+                .unwrap();
+            let member = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .members()
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source(member_name))
+                .unwrap();
+            let declaration = context
+                .store()
+                .symbol(member)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let annotation = context
+                .store()
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            let query_node = if context.store().source_node_kind(annotation)
+                == Some(SyntaxKind::ParenthesizedType)
+            {
+                context.store().source_direct_children(annotation).unwrap()[0]
+            } else {
+                annotation
+            };
+            assert_eq!(context.get_type_from_type_node(query_node), Ok(holder));
+            if query_node != annotation {
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(annotation)
+                        .is_none_or(|links| links.resolved_type.is_none())
+                );
+            }
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(member)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            let TypeData::Interface(interface) =
+                context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("the library identity must remain an interface");
+            };
+            assert!(!interface.declared_members_resolved);
+            assert_eq!(
+                interface.reference.object.structured,
+                StructuredTypeData::default()
+            );
+            candidates.push(
+                context
+                    .store_mut_for_test()
+                    .literal_union_type_with_alias_and_array_targets(
+                        &[type_, undefined],
+                        None,
+                        targets,
+                    )
+                    .unwrap(),
+            );
+            cold_members.push((type_, member));
+        }
+        let original = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .clone();
+        let before = property_recovery_store_counts(context.store());
+        for candidate in candidates {
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                property,
+                ValueSymbolLinks {
+                    resolved_type: Some(candidate),
+                    ..original.clone()
+                }
+            ));
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_property_object_alias_cache_cycles(
+                        context.store(),
+                        &projection,
+                        targets
+                    ),
+                    Err(RelationUnavailable::UnsupportedStructuredType(receiver))
+                );
+                assert_eq!(
+                    validate_property_object_alias_members_with_array_targets(
+                        context.store(),
+                        receiver,
+                        targets
+                    ),
+                    Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+                );
+                assert_eq!(property_recovery_store_counts(context.store()), before);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, original.clone())
+            );
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Ok(Some(members.clone()))
+            );
+            assert_eq!(
+                demand_property_object_alias_property(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    receiver,
+                    property,
+                ),
+                Ok(value)
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), before);
+        }
+        for (type_, member) in cold_members {
+            assert!(
+                !context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(member)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+        }
+        assert!(diagnostics.is_empty());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Warm the unrelated generic template before querying its concrete argument.
+    fn property_object_alias_cycle_guard_keeps_direct_generic_arguments_lazy() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T }; interface Wrap<U> { next: Box<Wrap<U>> } ",
+            "declare const box: Box<Wrap<string>>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_811);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = checker_context(&parsed, file, options);
+        context.check_source_file(file).unwrap();
+        let wrap = source_symbol(&parsed, file, &context, "Wrap");
+        let next = context
+            .store()
+            .symbol(wrap)
+            .unwrap()
+            .members()
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("next"))
+            .unwrap();
+        let source_box = context
+            .store()
+            .value_symbol_links(next)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let source_projection = property_object_alias_projection(context.store(), source_box)
+            .unwrap()
+            .unwrap();
+        let source_wrap = source_projection.arguments[0];
+        let globals = context.global_types().clone();
+        let array_targets = CanonicalArrayTargets::from_global_types(&globals);
+        let targets = Some(array_targets);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let source_members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), source_box)
+                .unwrap();
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                source_box,
+                source_members.properties[0],
+            ),
+            Ok(source_wrap)
+        );
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "box");
+        let projection = property_object_alias_projection(context.store(), receiver)
+            .unwrap()
+            .unwrap();
+        let concrete_wrap = projection.arguments[0];
+        assert_ne!(concrete_wrap, source_wrap);
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                receiver,
+                members.properties[0],
+            ),
+            Ok(concrete_wrap)
+        );
+        let before = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Ok(Some(members.clone()))
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .validate_cached_array_capability_with_array_targets(array_targets, receiver),
+                Ok(())
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), before);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(next)
+                    .unwrap()
+                    .resolved_type,
+                Some(source_box)
+            );
+        }
+        assert!(diagnostics.is_empty());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn property_object_alias_cycle_guard_keeps_ordinary_recursive_interfaces() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Node { next: Node } type Box<T> = { value: T }; ",
+            "declare const box: Box<Node>; declare const node: Node;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_807);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = checker_context(&parsed, file, options);
+        let receiver = property_object_alias_variable_type(&parsed, file, &mut context, "box");
+        let node = property_object_alias_variable_type(&parsed, file, &mut context, "node");
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        let globals = context.global_types().clone();
+        let array_targets = CanonicalArrayTargets::from_global_types(&globals);
+        let targets = Some(array_targets);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                receiver,
+                members.properties[0],
+            ),
+            Ok(node)
+        );
+        let before = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Ok(Some(members.clone()))
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .validate_cached_array_capability_with_array_targets(array_targets, receiver),
+                Ok(())
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), before);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both nested member caches must keep their identities on replay.
+    fn property_object_alias_cycle_guard_accepts_acyclic_nested_instances() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T }; ",
+            "declare const nested: Box<Box<string>>; declare const direct: Box<string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_805);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = checker_context(&parsed, file, options);
+        let outer = property_object_alias_variable_type(&parsed, file, &mut context, "nested");
+        let inner = property_object_alias_variable_type(&parsed, file, &mut context, "direct");
+        assert_eq!(
+            property_object_alias_projection(context.store(), outer)
+                .unwrap()
+                .unwrap()
+                .arguments,
+            [inner]
+        );
+        let outer_members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), outer).unwrap();
+        let inner_members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), inner).unwrap();
+        let globals = context.global_types().clone();
+        let array_targets = CanonicalArrayTargets::from_global_types(&globals);
+        let targets = Some(array_targets);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for (receiver, property, expected) in [
+            (outer, outer_members.properties[0], inner),
+            (inner, inner_members.properties[0], string),
+        ] {
+            assert_eq!(
+                demand_property_object_alias_property(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    receiver,
+                    property,
+                ),
+                Ok(expected)
+            );
+        }
+        let before = (
+            property_recovery_store_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        for (receiver, members, expected) in [
+            (outer, outer_members, inner),
+            (inner, inner_members, string),
+        ] {
+            assert_eq!(
+                validate_property_object_alias_members_with_array_targets(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Ok(Some(members.clone())),
+            );
+            assert_eq!(
+                demand_property_object_alias_property(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    receiver,
+                    members.properties[0],
+                ),
+                Ok(expected)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .validate_cached_array_capability_with_array_targets(array_targets, receiver),
+                Ok(())
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().type_alias_len()
+                ),
+                before
+            );
+        }
+        assert!(diagnostics.is_empty());
     }
 
     fn publish_generic_target_for_test(

@@ -2,8 +2,9 @@
 //!
 //! The full-vector branch admits one stored signature with ordered type
 //! parameters, fixed or optional parameters whose targets are naked type
-//! parameters, canonical nested Array/interface references, or authenticated
-//! fixed primitives and callbacks, homogeneous Array rest parameters, and a
+//! parameters, canonical nested Array/interface references, nonempty property
+//! aliases in explicit calls, or authenticated fixed primitives and callbacks,
+//! homogeneous Array rest parameters, and a
 //! mapper-supported return. It owns
 //! declaration-order
 //! inference/default/constraint finalization, overload-failure projection, and
@@ -43,6 +44,7 @@ use super::{
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
+    object_aliases::property_object_alias_nonempty_projection,
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
     signatures::{ElementFlags, IndexFlags, SignatureFlags},
     source_callables::{
@@ -1492,6 +1494,52 @@ fn validate_generic_parameter_template(
         }
     }
 
+    if let Some(projection) = property_object_alias_nonempty_projection(store, type_)? {
+        if active_types.contains(&type_) {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+        }
+        let identity_arguments = if projection.identity_arguments == projection.arguments {
+            &[]
+        } else {
+            projection.identity_arguments.as_slice()
+        };
+        let active_depth = active_types.len();
+        active_types.push(type_);
+        let result = projection
+            .arguments
+            .iter()
+            .copied()
+            .try_fold(true, |valid, argument| {
+                validate_generic_parameter_template(
+                    store,
+                    argument,
+                    type_parameters,
+                    array_targets,
+                    signature,
+                    active_types,
+                )
+                .map(|contains_type_parameter| valid && contains_type_parameter)
+            })
+            .and_then(|valid| {
+                identity_arguments
+                    .iter()
+                    .copied()
+                    .try_for_each(|argument| {
+                        validate_generic_mapper_type(
+                            store,
+                            argument,
+                            type_parameters,
+                            array_targets,
+                            signature,
+                            active_types,
+                        )
+                    })
+                    .map(|()| valid)
+            });
+        active_types.truncate(active_depth);
+        return result;
+    }
+
     let Some(reference) = validate_generic_interface_reference(store, type_, signature)? else {
         return Ok(false);
     };
@@ -2073,6 +2121,35 @@ fn validate_generic_mapper_type(
     let record = store
         .type_payload(type_)
         .ok_or(GenericCallVectorUnsupported::InstantiationType { signature, type_ })?;
+    if let Some(projection) = property_object_alias_nonempty_projection(store, type_)? {
+        if active_types.contains(&type_) {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+        }
+        let identity_arguments = if projection.identity_arguments == projection.arguments {
+            &[]
+        } else {
+            projection.identity_arguments.as_slice()
+        };
+        let active_depth = active_types.len();
+        active_types.push(type_);
+        let result = projection
+            .arguments
+            .iter()
+            .chain(identity_arguments)
+            .copied()
+            .try_for_each(|argument| {
+                validate_generic_mapper_type(
+                    store,
+                    argument,
+                    type_parameters,
+                    array_targets,
+                    signature,
+                    active_types,
+                )
+            });
+        active_types.truncate(active_depth);
+        return result;
+    }
     match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(()),
         TypeData::TypeParameter(_) if type_parameters.contains(&type_) => Ok(()),
@@ -2611,8 +2688,21 @@ fn collect_generic_call_inferences(
         }
     }
 
-    let target_reference = validate_generic_interface_reference(store, target, signature)?
-        .expect("signature validation admitted a canonical generic interface target");
+    if property_object_alias_nonempty_projection(store, target)?.is_some() {
+        return Err(GenericCallVectorUnsupported::NonNakedParameter {
+            signature,
+            index: 0,
+            type_: target,
+        }
+        .into());
+    }
+    let target_reference = validate_generic_interface_reference(store, target, signature)?.ok_or(
+        GenericCallVectorUnsupported::NonNakedParameter {
+            signature,
+            index: 0,
+            type_: target,
+        },
+    )?;
     let source_target = store
         .type_payload(source)
         .and_then(|record| match record.data() {
@@ -3615,6 +3705,66 @@ fn generic_call_type_instantiation_matches(
     let Some(template_record) = store.type_payload(template) else {
         return false;
     };
+    match property_object_alias_nonempty_projection(store, template) {
+        Err(_) => return false,
+        Ok(Some(template_projection)) => {
+            let Ok(Some(actual_projection)) =
+                property_object_alias_nonempty_projection(store, actual)
+            else {
+                return false;
+            };
+            if active_templates.contains(&template)
+                || template_projection.target != actual_projection.target
+                || template_projection.declaration != actual_projection.declaration
+                || template_projection.source_symbol != actual_projection.source_symbol
+                || template_projection.alias_symbol != actual_projection.alias_symbol
+                || template_projection.identity_symbol != actual_projection.identity_symbol
+                || template_projection.parameters != actual_projection.parameters
+                || template_projection.arguments.len() != template_projection.parameters.len()
+                || actual_projection.arguments.len() != actual_projection.parameters.len()
+                || template_projection.arguments.len() != actual_projection.arguments.len()
+                || template_projection.identity_arguments.len()
+                    != actual_projection.identity_arguments.len()
+            {
+                return false;
+            }
+            let (template_identity_arguments, actual_identity_arguments): (&[TypeId], &[TypeId]) =
+                if template_projection.identity_arguments == template_projection.arguments
+                    && actual_projection.identity_arguments == actual_projection.arguments
+                {
+                    (&[], &[])
+                } else {
+                    (
+                        template_projection.identity_arguments.as_slice(),
+                        actual_projection.identity_arguments.as_slice(),
+                    )
+                };
+            active_templates.push(template);
+            let matches = template_projection
+                .arguments
+                .iter()
+                .zip(&actual_projection.arguments)
+                .chain(
+                    template_identity_arguments
+                        .iter()
+                        .zip(actual_identity_arguments),
+                )
+                .all(|(&template, &actual)| {
+                    generic_call_type_instantiation_matches(
+                        store,
+                        array_targets,
+                        template,
+                        actual,
+                        sources,
+                        targets,
+                        active_templates,
+                    )
+                });
+            active_templates.pop();
+            return matches;
+        }
+        Ok(None) => {}
+    }
     match template_record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
             template == actual
@@ -5330,14 +5480,15 @@ mod tests {
         EscapedName, SymbolData,
     };
     use ts_jsnum::Number;
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, SemanticStore, VarianceLinks, bootstrap::UnionReduction,
-        instantiate::InstantiationLimits, mapper::TypeMapper, type_records::TypeRecord,
-        types::ObjectFlags,
+        CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalGlobalTypeInitializationError,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, SourceCheckError,
+        SourceFunctionUnsupported, UnsupportedSourceSyntax, VarianceLinks,
+        bootstrap::UnionReduction, instantiate::InstantiationLimits, mapper::TypeMapper,
+        type_records::TypeRecord, types::ObjectFlags,
     };
 
     const EXACT_SOURCE: IdentityTypeParameterCacheProvenance =
@@ -6020,6 +6171,1450 @@ mod tests {
             unions_of_unions: bootstrap.union_of_union_cache_len(),
             union_validation_scans: store.union_cache_validation_scan_count(),
         }
+    }
+
+    fn property_alias_call_context<'arena>(
+        sources: &[(FileId, &'arena ParseResult)],
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    *file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/property-alias-call-{file:?}.ts\"")),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in sources {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, *file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn property_alias_variable_nodes(
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> (Option<NodeRef>, Option<NodeRef>) {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == name).then(|| {
+                    let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+                    (
+                        variable.type_.map(reference),
+                        variable.initializer.map(reference),
+                    )
+                })
+            })
+            .unwrap_or_else(|| panic!("missing variable {name}"))
+    }
+
+    fn property_alias_call_state(
+        store: &CanonicalTypeMapperStore,
+        call: NodeRef,
+    ) -> (SignatureId, TypeId) {
+        (
+            store
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap(),
+            store
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type)
+                .unwrap(),
+        )
+    }
+
+    fn property_alias_declaration_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing alias {name}"));
+        context
+            .store()
+            .get_merged_symbol(context.file(file).unwrap().1.symbol(declaration).unwrap())
+            .unwrap()
+    }
+
+    fn property_alias_original_callable(
+        store: &CanonicalTypeMapperStore,
+        call: NodeRef,
+    ) -> ValidatedSingleCallable {
+        let (selected, _) = property_alias_call_state(store, call);
+        let target = store.signature(selected).unwrap().target().unwrap();
+        let owner = store.source_callable_type_for_signature(target).unwrap();
+        match validate_stored_single_callable(store, owner) {
+            StoredSingleCallableValidation::Valid { callable, .. } => callable,
+            other => panic!("expected a source generic callable: {other:?}"),
+        }
+    }
+
+    fn property_alias_cross_file_call_error(
+        store: &CanonicalTypeMapperStore,
+        parsed: &ParseResult,
+        call: NodeRef,
+        callable: &ValidatedSingleCallable,
+    ) -> SourceCheckError {
+        let NodeData::CallExpression(data) = &parsed.arena.get(call.node).unwrap().data else {
+            panic!("the source must retain its call expression")
+        };
+        let declaration = store
+            .signature(callable.signature)
+            .unwrap()
+            .declaration()
+            .unwrap();
+        assert_ne!(declaration.file, call.file);
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+            SourceFunctionUnsupported::IdentifierNotHoisted {
+                node: NodeRef::new(call.arena, call.file, data.expression),
+                symbol: store
+                    .type_payload(callable.owner)
+                    .unwrap()
+                    .symbol()
+                    .unwrap(),
+                declaration,
+            },
+        ))
+    }
+
+    fn assert_property_alias_call_is_unpublished(store: &CanonicalTypeMapperStore, call: NodeRef) {
+        assert_eq!(
+            store
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            None,
+        );
+        assert_eq!(
+            store
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            None,
+        );
+    }
+
+    fn assert_property_alias_sibling_is_cold(store: &CanonicalTypeMapperStore, type_: TypeId) {
+        let projection = property_object_alias_nonempty_projection(store, type_)
+            .unwrap()
+            .unwrap();
+        let sibling = projection
+            .properties
+            .iter()
+            .find(|property| property.name == EscapedName::source("untouched"))
+            .unwrap();
+        assert_eq!(
+            store
+                .value_symbol_links(sibling.symbol)
+                .and_then(|links| links.resolved_type),
+            None,
+        );
+        assert_eq!(
+            store
+                .type_node_links(sibling.type_node)
+                .and_then(|links| links.resolved_type),
+            None,
+        );
+        let TypeData::Object(object) = store.type_payload(type_).unwrap().data() else {
+            panic!("the alias must retain its property object")
+        };
+        if let Some(members) = object.structured.members {
+            let sibling = store
+                .symbol_table(members)
+                .unwrap()
+                .get_source("untouched")
+                .unwrap();
+            assert_eq!(
+                store
+                    .value_symbol_links(sibling)
+                    .and_then(|links| links.resolved_type),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn property_alias_explicit_copy_and_read_preserve_calls_and_cold_siblings() {
+        let declarations = parse_source_file("type Box<T> = { value: T; untouched: T };");
+        let parsed = parse_source_file(concat!(
+            "declare function copy<U>(value: Box<U>): Box<U>; ",
+            "function read<U>(value: Box<U>): U { return value.value; } ",
+            "declare const input: Box<string>; ",
+            "const copied: Box<string> = copy<string>(input); ",
+            "const value: string = read<string>(input);",
+        ));
+        let file = FileId::new(96_510);
+        let mut context =
+            property_alias_call_context(&[(FileId::new(96_508), &declarations), (file, &parsed)]);
+        let annotation = property_alias_variable_nodes(&parsed, file, "input")
+            .0
+            .unwrap();
+        let concrete = context.get_type_from_type_node(annotation).unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let copy = property_alias_variable_nodes(&parsed, file, "copied")
+            .1
+            .unwrap();
+        let read = property_alias_variable_nodes(&parsed, file, "value")
+            .1
+            .unwrap();
+        let copy_state = property_alias_call_state(context.store(), copy);
+        let read_state = property_alias_call_state(context.store(), read);
+        assert_eq!(copy_state.1, concrete);
+        assert_eq!(read_state.1, string);
+        for call in [copy, read] {
+            let callable = property_alias_original_callable(context.store(), call);
+            let parameters = context
+                .store()
+                .signature(callable.signature)
+                .unwrap()
+                .type_parameters();
+            let projection =
+                property_object_alias_nonempty_projection(context.store(), callable.parameters[0])
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(projection.arguments, parameters);
+            assert_ne!(projection.parameters, parameters);
+            assert_property_alias_sibling_is_cold(context.store(), callable.parameters[0]);
+        }
+        assert_property_alias_sibling_is_cold(context.store(), concrete);
+        let warm = (
+            vector_cache_graph_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(concrete));
+        assert_eq!(property_alias_call_state(context.store(), copy), copy_state);
+        assert_eq!(property_alias_call_state(context.store(), read), read_state);
+        assert_eq!(
+            (
+                vector_cache_graph_counts(context.store()),
+                context.store().type_alias_len()
+            ),
+            warm,
+        );
+        assert_property_alias_sibling_is_cold(context.store(), concrete);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Nested alias and Array arguments share the same source calls.
+    fn property_alias_nested_and_array_calls_keep_effective_arguments() {
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T; untouched: T }; ",
+        ));
+        let parsed = parse_source_file(concat!(
+            "declare function nested<U>(value: Box<Box<U>>): Box<Box<U>>; ",
+            "declare function arrays<U>(value: Box<U[]>): Box<U[]>; ",
+            "declare const nestedInput: Box<Box<string>>; ",
+            "declare const arrayInput: Box<string[]>; ",
+            "declare const readonlyInput: Box<readonly string[]>; ",
+            "const nestedCopy = nested<string>(nestedInput); ",
+            "const arrayCopy = arrays<string>(arrayInput);",
+        ));
+        let file = FileId::new(96_511);
+        let mut context =
+            property_alias_call_context(&[(FileId::new(96_509), &declarations), (file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let mut states = Vec::new();
+        for (input, output) in [("nestedInput", "nestedCopy"), ("arrayInput", "arrayCopy")] {
+            let annotation = property_alias_variable_nodes(&parsed, file, input)
+                .0
+                .unwrap();
+            let concrete = context.get_type_from_type_node(annotation).unwrap();
+            let call = property_alias_variable_nodes(&parsed, file, output)
+                .1
+                .unwrap();
+            let state = property_alias_call_state(context.store(), call);
+            assert_eq!(state.1, concrete);
+            let callable = property_alias_original_callable(context.store(), call);
+            let parameters = context
+                .store()
+                .signature(callable.signature)
+                .unwrap()
+                .type_parameters();
+            let template = callable.parameters[0];
+            let mut active = Vec::new();
+            assert_eq!(
+                validate_generic_parameter_template(
+                    context.store(),
+                    template,
+                    parameters,
+                    Some(targets),
+                    callable.signature,
+                    &mut active,
+                ),
+                Ok(true),
+            );
+            assert_eq!(
+                validate_generic_mapper_type(
+                    context.store(),
+                    template,
+                    parameters,
+                    Some(targets),
+                    callable.signature,
+                    &mut active,
+                ),
+                Ok(()),
+            );
+            assert!(generic_call_type_instantiation_matches(
+                context.store(),
+                Some(targets),
+                template,
+                concrete,
+                parameters,
+                &[string],
+                &mut active,
+            ));
+            assert!(active.is_empty());
+            assert_property_alias_sibling_is_cold(context.store(), template);
+            assert_property_alias_sibling_is_cold(context.store(), concrete);
+            states.push((call, state));
+        }
+        let array_call = states[1].0;
+        let callable = property_alias_original_callable(context.store(), array_call);
+        let projection =
+            property_object_alias_nonempty_projection(context.store(), callable.parameters[0])
+                .unwrap()
+                .unwrap();
+        let array = context
+            .store()
+            .canonical_array_reference_with_targets(targets, projection.arguments[0])
+            .unwrap()
+            .unwrap();
+        let parameters = context
+            .store()
+            .signature(callable.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        assert_eq!(array.element_type, parameters[0]);
+        assert!(!array.readonly);
+        let readonly = context
+            .get_type_from_type_node(
+                property_alias_variable_nodes(&parsed, file, "readonlyInput")
+                    .0
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!generic_call_type_instantiation_matches(
+            context.store(),
+            Some(targets),
+            callable.parameters[0],
+            readonly,
+            &parameters,
+            &[string],
+            &mut Vec::new(),
+        ));
+        let warm = (
+            vector_cache_graph_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        for (call, state) in states {
+            assert_eq!(property_alias_call_state(context.store(), call), state);
+        }
+        assert_eq!(
+            (
+                vector_cache_graph_counts(context.store()),
+                context.store().type_alias_len()
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn property_alias_wrong_explicit_argument_keeps_ts2345_and_warm_call() {
+        let parsed = parse_source_file(concat!(
+            "type Box<T> = { value: T }; ",
+            "declare function copy<U>(value: Box<U>): Box<U>; ",
+            "declare const input: Box<number>; ",
+            "const copied = copy<string>(input);",
+        ));
+        let file = FileId::new(96_512);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        let call = property_alias_variable_nodes(&parsed, file, "copied")
+            .1
+            .unwrap();
+        let NodeData::CallExpression(call_data) = &parsed.arena.get(call.node).unwrap().data else {
+            panic!("the initializer must remain a call")
+        };
+        let argument = NodeRef::new(parsed.arena.id(), file, call_data.arguments.nodes[0]);
+        let diagnostics = context.diagnostics().as_slice().to_vec();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one argument diagnostic: {diagnostics:?}")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(diagnostic.node, Some(argument));
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["Box<number>", "Box<string>"]
+        );
+        let state = property_alias_call_state(context.store(), call);
+        assert_eq!(context.type_to_string(state.1).unwrap(), "Box<string>");
+        let warm = vector_cache_graph_counts(context.store());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(property_alias_call_state(context.store(), call), state);
+        assert_eq!(context.diagnostics().as_slice(), diagnostics);
+        assert_eq!(vector_cache_graph_counts(context.store()), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source graph supplies both valid and damaged cache owners.
+    fn property_alias_call_checks_reject_bad_projections_and_restore_warm_calls() {
+        let parsed = parse_source_file(concat!(
+            "type Box<T> = { value: T }; type Other<T> = { value: T }; ",
+            "declare function copy<U>(value: Box<U>): Box<U>; ",
+            "declare const input: Box<string>; declare const other: Other<string>; ",
+            "const copied = copy<string>(input);",
+        ));
+        let file = FileId::new(96_513);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let call = property_alias_variable_nodes(&parsed, file, "copied")
+            .1
+            .unwrap();
+        let state = property_alias_call_state(context.store(), call);
+        let callable = property_alias_original_callable(context.store(), call);
+        let template = callable.parameters[0];
+        let parameters = context
+            .store()
+            .signature(callable.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let other = context
+            .get_type_from_type_node(
+                property_alias_variable_nodes(&parsed, file, "other")
+                    .0
+                    .unwrap(),
+            )
+            .unwrap();
+        let (string, number, error_type) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.error_type,
+            )
+        };
+        let store = context.store_mut_for_test();
+        assert!(!generic_call_type_instantiation_matches(
+            store,
+            targets,
+            template,
+            other,
+            &parameters,
+            &[string],
+            &mut Vec::new(),
+        ));
+        assert_eq!(
+            validate_generic_parameter_template(
+                store,
+                state.1,
+                &parameters,
+                targets,
+                callable.signature,
+                &mut Vec::new(),
+            ),
+            Ok(false),
+            "concrete aliases must not become generic parameter templates",
+        );
+        let template_projection = property_object_alias_nonempty_projection(store, template)
+            .unwrap()
+            .unwrap();
+        let mut parent_active = vec![other];
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                template_projection.target,
+                &parameters,
+                targets,
+                callable.signature,
+                &mut parent_active,
+            ),
+            Err(GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::InstantiationType {
+                    signature: callable.signature,
+                    type_: template_projection.parameters[0],
+                }
+            )),
+            "the alias owner's parameter is not the call signature's parameter",
+        );
+        assert_eq!(parent_active, [other]);
+        let mut active = vec![template];
+        assert_eq!(
+            validate_generic_parameter_template(
+                store,
+                template,
+                &parameters,
+                targets,
+                callable.signature,
+                &mut active,
+            ),
+            Err(GenericCallVectorError::Relation(
+                RelationUnavailable::InvalidStructuredMembers(template)
+            )),
+        );
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                template,
+                &parameters,
+                targets,
+                callable.signature,
+                &mut active,
+            ),
+            Err(GenericCallVectorError::Relation(
+                RelationUnavailable::InvalidStructuredMembers(template)
+            )),
+        );
+        assert!(!generic_call_type_instantiation_matches(
+            store,
+            targets,
+            template,
+            state.1,
+            &parameters,
+            &[string],
+            &mut active,
+        ));
+        assert_eq!(active, [template]);
+        assert!(generic_call_type_instantiation_matches(
+            store,
+            targets,
+            template,
+            error_type,
+            &parameters,
+            &[string],
+            &mut active,
+        ));
+        assert_eq!(active, [template]);
+
+        for type_ in [template, state.1] {
+            let original = property_object_alias_nonempty_projection(store, type_)
+                .unwrap()
+                .unwrap();
+            let wrong_mapper = store
+                .new_type_mapper(original.parameters.clone(), vec![number])
+                .unwrap();
+            assert!(store.set_object_target_and_mapper(
+                type_,
+                Some(original.target),
+                Some(wrong_mapper)
+            ));
+            let before = vector_cache_graph_counts(store);
+            let mut active = Vec::new();
+            assert!(matches!(
+                validate_generic_parameter_template(
+                    store,
+                    type_,
+                    &parameters,
+                    targets,
+                    callable.signature,
+                    &mut active,
+                ),
+                Err(GenericCallVectorError::Relation(_)),
+            ));
+            assert!(matches!(
+                validate_generic_mapper_type(
+                    store,
+                    type_,
+                    &parameters,
+                    targets,
+                    callable.signature,
+                    &mut active,
+                ),
+                Err(GenericCallVectorError::Relation(_)),
+            ));
+            assert!(!generic_call_type_instantiation_matches(
+                store,
+                targets,
+                template,
+                state.1,
+                &parameters,
+                &[string],
+                &mut active,
+            ));
+            assert!(active.is_empty());
+            assert_eq!(vector_cache_graph_counts(store), before);
+            assert!(store.set_object_target_and_mapper(
+                type_,
+                Some(original.target),
+                original.mapper
+            ));
+            assert_eq!(
+                property_object_alias_nonempty_projection(store, type_),
+                Ok(Some(original))
+            );
+        }
+
+        let projection = property_object_alias_nonempty_projection(store, state.1)
+            .unwrap()
+            .unwrap();
+        let alias = store.type_payload(state.1).unwrap().alias().unwrap();
+        assert!(store.set_type_alias_arguments(alias, Some(Vec::new())));
+        let before = vector_cache_graph_counts(store);
+        assert!(!generic_call_type_instantiation_matches(
+            store,
+            targets,
+            template,
+            state.1,
+            &parameters,
+            &[string],
+            &mut Vec::new(),
+        ));
+        assert_eq!(vector_cache_graph_counts(store), before);
+        assert!(store.set_type_alias_arguments(alias, Some(projection.arguments)));
+        assert!(generic_call_type_instantiation_matches(
+            store,
+            targets,
+            template,
+            state.1,
+            &parameters,
+            &[string],
+            &mut Vec::new(),
+        ));
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(property_alias_call_state(context.store(), call), state);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Complete the retained shell without bypassing the source boundary.
+    fn property_alias_explicit_calls_keep_the_callers_instantiation_budget() {
+        let declarations = parse_source_file(concat!(
+            "type Box<T> = { value: T }; ",
+            "declare function copy<U>(value: Box<U>): Box<U>; ",
+            "declare const text: Box<string>; declare const input: Box<number>; ",
+            "const first = copy<string>(text);",
+        ));
+        let usage = parse_source_file("const second = copy<number>(input);");
+        let declarations_file = FileId::new(96_514);
+        let usage_file = FileId::new(96_515);
+        let mut context = property_alias_call_context(&[
+            (declarations_file, &declarations),
+            (usage_file, &usage),
+        ]);
+        context.check_source_file(declarations_file).unwrap();
+        let first = property_alias_variable_nodes(&declarations, declarations_file, "first")
+            .1
+            .unwrap();
+        let first_state = property_alias_call_state(context.store(), first);
+        let callable = property_alias_original_callable(context.store(), first);
+        let input = context
+            .get_type_from_type_node(
+                property_alias_variable_nodes(&declarations, declarations_file, "input")
+                    .0
+                    .unwrap(),
+            )
+            .unwrap();
+        let globals = context.global_types().clone();
+        let array_targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let strict_function_types = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let parameter = store
+            .signature(callable.signature)
+            .unwrap()
+            .type_parameters()[0];
+        let mapper = store.signature(first_state.0).unwrap().mapper().unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            instantiate_type_with_session(store, parameter, mapper, array_targets, &mut session),
+            Ok(string)
+        );
+        assert_eq!(session.query_count(), 1);
+        let explicit = [number];
+        let arguments = [input];
+        let request = vector_request(callable.owner, Some(&explicit), &arguments);
+        let expected = GenericCallVectorError::Instantiation(InstantiationError::CountLimit {
+            count: 1,
+            limit: 1,
+        });
+        assert_eq!(
+            resolve_generic_call_vector_with_session(
+                store,
+                &globals,
+                strict_function_types,
+                request,
+                None,
+                &mut session,
+            ),
+            Err(expected),
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+        let cached =
+            match store.cached_signature(callable.signature, type_list_key(&[number]), &[number]) {
+                CachedSignatureLookup::Hit(signature) => signature,
+                other => panic!("the failed demand must retain its checked shell: {other:?}"),
+            };
+        let cached_mapper = store.signature(cached).unwrap().mapper().unwrap();
+        let before = vector_cache_graph_counts(store);
+        assert_eq!(
+            resolve_generic_call_vector_with_session(
+                store,
+                &globals,
+                strict_function_types,
+                request,
+                None,
+                &mut session,
+            ),
+            Err(GenericCallVectorError::Instantiation(
+                InstantiationError::CountLimit { count: 1, limit: 1 }
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(store), before);
+        assert_eq!(session.query_count(), 1);
+
+        let second = property_alias_variable_nodes(&usage, usage_file, "second")
+            .1
+            .unwrap();
+        let source_error =
+            property_alias_cross_file_call_error(context.store(), &usage, second, &callable);
+        assert_eq!(context.check_source_file(usage_file), Err(source_error),);
+        assert_property_alias_call_is_unpublished(context.store(), second);
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let store = context.store_mut_for_test();
+        let mut completion_session = InstantiationSession::new(InstantiationLimits::default());
+        let completed = resolve_generic_call_vector_with_session(
+            store,
+            &globals,
+            strict_function_types,
+            request,
+            None,
+            &mut completion_session,
+        )
+        .unwrap();
+        assert_eq!(
+            completed.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(completed.projection.instantiation.signature, cached);
+        assert_eq!(completed.projection.instantiation.mapper, cached_mapper);
+        assert_eq!(
+            materialize_generic_call_vector_source(store, &completed, None),
+            Ok(GenericCallVectorSourceMaterialization {
+                call_signature: cached,
+                call_mapper: cached_mapper,
+                checked_instantiation: Some(GenericCallVectorCachedInstantiation {
+                    signature: cached,
+                    mapper: cached_mapper,
+                }),
+            }),
+        );
+        assert_eq!(
+            demand_generic_call_vector_return_with_session(
+                store,
+                &completed,
+                &mut completion_session
+            ),
+            Ok(input),
+        );
+        assert_eq!(
+            store.signature(cached).unwrap().resolved_return_type(),
+            Some(input)
+        );
+        assert_property_alias_call_is_unpublished(store, second);
+        let warm = vector_cache_graph_counts(store);
+        let mut exhausted = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 0,
+        });
+        let replay = resolve_generic_call_vector_with_session(
+            store,
+            &globals,
+            strict_function_types,
+            request,
+            None,
+            &mut exhausted,
+        )
+        .unwrap();
+        assert_eq!(replay.projection.instantiation.signature, cached);
+        assert_eq!(replay.projection.instantiation.mapper, cached_mapper);
+        assert_eq!(
+            demand_generic_call_vector_return_with_session(store, &replay, &mut exhausted),
+            Ok(input)
+        );
+        assert_eq!(exhausted.query_count(), 0);
+        assert_eq!(vector_cache_graph_counts(store), warm);
+        assert_property_alias_call_is_unpublished(store, second);
+    }
+
+    #[test]
+    fn property_alias_inferred_calls_return_non_naked_parameter_without_publication() {
+        let declarations = parse_source_file(concat!(
+            "type Box<T> = { value: T }; ",
+            "declare function copy<U>(value: Box<U>): Box<U>; ",
+            "declare const input: Box<string>; const explicit = copy<string>(input);",
+        ));
+        let usage = parse_source_file("const inferred = copy(input);");
+        let declarations_file = FileId::new(96_516);
+        let usage_file = FileId::new(96_517);
+        let mut context = property_alias_call_context(&[
+            (declarations_file, &declarations),
+            (usage_file, &usage),
+        ]);
+        context.check_source_file(declarations_file).unwrap();
+        let explicit = property_alias_variable_nodes(&declarations, declarations_file, "explicit")
+            .1
+            .unwrap();
+        let (_, input) = property_alias_call_state(context.store(), explicit);
+        let callable = property_alias_original_callable(context.store(), explicit);
+        let globals = context.global_types().clone();
+        let strict_function_types = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let before = vector_cache_graph_counts(store);
+        assert_eq!(
+            resolve_generic_call_vector_with_session(
+                store,
+                &globals,
+                strict_function_types,
+                vector_request(callable.owner, None, &[input]),
+                None,
+                &mut InstantiationSession::new(InstantiationLimits::default()),
+            ),
+            Err(GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::NonNakedParameter {
+                    signature: callable.signature,
+                    index: 0,
+                    type_: callable.parameters[0],
+                }
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(store), before);
+        let call = property_alias_variable_nodes(&usage, usage_file, "inferred")
+            .1
+            .unwrap();
+        let source_error =
+            property_alias_cross_file_call_error(context.store(), &usage, call, &callable);
+        assert_eq!(context.check_source_file(usage_file), Err(source_error),);
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            None
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(call)
+                .and_then(|links| links.resolved_type),
+            None
+        );
+    }
+
+    #[test]
+    fn property_alias_same_file_calls_publish_explicit_and_reject_inferred() {
+        let parsed = parse_source_file(concat!(
+            "type Box<T> = { value: T }; ",
+            "declare function copy<U>(value: Box<U>): Box<U>; ",
+            "declare const input: Box<number>; ",
+            "const copied = copy<number>(input); const inferred = copy(input);",
+        ));
+        let file = FileId::new(96_518);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        let input = context
+            .get_type_from_type_node(
+                property_alias_variable_nodes(&parsed, file, "input")
+                    .0
+                    .unwrap(),
+            )
+            .unwrap();
+        let inferred = property_alias_variable_nodes(&parsed, file, "inferred")
+            .1
+            .unwrap();
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Call(inferred)),
+        );
+        let copied = property_alias_variable_nodes(&parsed, file, "copied")
+            .1
+            .unwrap();
+        let callable = property_alias_original_callable(context.store(), copied);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let cached = match context.store().cached_signature(
+            callable.signature,
+            type_list_key(&[number]),
+            &[number],
+        ) {
+            CachedSignatureLookup::Hit(signature) => signature,
+            other => {
+                panic!("the explicit source call must retain its checked signature: {other:?}")
+            }
+        };
+        assert_eq!(
+            property_alias_call_state(context.store(), copied),
+            (cached, input)
+        );
+        assert_property_alias_call_is_unpublished(context.store(), inferred);
+        assert!(context.diagnostics().is_empty());
+        let warm = vector_cache_graph_counts(context.store());
+        assert_eq!(
+            context.recheck_source_file(file),
+            Err(SourceCheckError::Call(inferred)),
+        );
+        assert_eq!(
+            property_alias_call_state(context.store(), copied),
+            (cached, input)
+        );
+        assert_property_alias_call_is_unpublished(context.store(), inferred);
+        assert_eq!(vector_cache_graph_counts(context.store()), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn property_alias_wrapped_copy_and_read_keep_visible_identity() {
+        let declarations = parse_source_file(concat!(
+            "type Box<T> = { value: T; untouched: T }; ",
+            "type Wrapped<T> = Box<T>;",
+        ));
+        let parsed = parse_source_file(concat!(
+            "declare function copy<U>(value: Wrapped<U>): Wrapped<U>; ",
+            "function read<U>(value: Wrapped<U>): U { return value.value; } ",
+            "declare const input: Wrapped<string>; ",
+            "const copied: Wrapped<string> = copy<string>(input); ",
+            "const value: string = read<string>(input);",
+        ));
+        let declarations_file = FileId::new(96_519);
+        let file = FileId::new(96_520);
+        let mut context =
+            property_alias_call_context(&[(declarations_file, &declarations), (file, &parsed)]);
+        let annotation = property_alias_variable_nodes(&parsed, file, "input")
+            .0
+            .unwrap();
+        let concrete = context.get_type_from_type_node(annotation).unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let box_symbol =
+            property_alias_declaration_symbol(&context, &declarations, declarations_file, "Box");
+        let wrapped_symbol = property_alias_declaration_symbol(
+            &context,
+            &declarations,
+            declarations_file,
+            "Wrapped",
+        );
+        assert_ne!(box_symbol, wrapped_symbol);
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let copy = property_alias_variable_nodes(&parsed, file, "copied")
+            .1
+            .unwrap();
+        let read = property_alias_variable_nodes(&parsed, file, "value")
+            .1
+            .unwrap();
+        let copy_state = property_alias_call_state(context.store(), copy);
+        let read_state = property_alias_call_state(context.store(), read);
+        assert_eq!(copy_state.1, concrete);
+        assert_eq!(read_state.1, string);
+        for call in [copy, read] {
+            let callable = property_alias_original_callable(context.store(), call);
+            let parameters = context
+                .store()
+                .signature(callable.signature)
+                .unwrap()
+                .type_parameters();
+            for (type_, arguments) in [
+                (callable.parameters[0], parameters),
+                (concrete, std::slice::from_ref(&string)),
+            ] {
+                let projection = property_object_alias_nonempty_projection(context.store(), type_)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(projection.alias_symbol, box_symbol);
+                assert_eq!(projection.identity_symbol, wrapped_symbol);
+                assert_eq!(projection.arguments, arguments);
+                assert_eq!(projection.identity_arguments, arguments);
+                assert_ne!(projection.parameters, parameters);
+                let record = context.store().type_payload(type_).unwrap();
+                let identity = context.store().type_alias(record.alias().unwrap()).unwrap();
+                assert_eq!(identity.symbol(), Some(wrapped_symbol));
+                assert_eq!(identity.type_arguments(), Some(arguments));
+                assert_property_alias_sibling_is_cold(context.store(), type_);
+            }
+        }
+        let warm = (
+            vector_cache_graph_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(concrete));
+        assert_eq!(property_alias_call_state(context.store(), copy), copy_state);
+        assert_eq!(property_alias_call_state(context.store(), read), read_state);
+        assert_eq!(
+            (
+                vector_cache_graph_counts(context.store()),
+                context.store().type_alias_len()
+            ),
+            warm,
+        );
+        assert_property_alias_sibling_is_cold(context.store(), concrete);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The calls separate property mapping from visible identity.
+    fn property_alias_factories_keep_reordered_unused_fixed_and_nested_identity() {
+        let declarations = parse_source_file(concat!(
+            "type Box<T> = { value: T; untouched: T }; ",
+            "type Pair<A, B> = { first: A; second: B; untouched: A }; ",
+            "type Reordered<A, B> = Pair<B, A>; ",
+            "type Phantom<T, Tag> = Box<T>; type Fixed<Tag> = Box<string>; ",
+            "type Wrapped<T> = Box<T>; type Middle<T> = Wrapped<T>; ",
+            "type Outer<T> = Middle<T>;",
+        ));
+        let parsed = parse_source_file(concat!(
+            "declare function reorder<A, B>(first: A, second: B): Reordered<A, B>; ",
+            "declare function phantom<T, Tag>(value: T, tag: Tag): Phantom<T, Tag>; ",
+            "declare function fixed<Tag>(tag: Tag): Fixed<Tag>; ",
+            "declare function chain<T>(value: T): Outer<T>; ",
+            "declare const text: string; declare const count: number; ",
+            "const reversed: Reordered<string, number> = reorder<string, number>(text, count); ",
+            "const phantomNumber: Phantom<string, number> = phantom<string, number>(text, count); ",
+            "const phantomString: Phantom<string, string> = phantom<string, string>(text, text); ",
+            "const fixedNumber: Fixed<number> = fixed<number>(count); ",
+            "const fixedString: Fixed<string> = fixed<string>(text); ",
+            "const chained: Outer<string> = chain<string>(text); ",
+            "declare const raw: Box<string>; declare const wrapped: Wrapped<string>; ",
+            "declare const middle: Middle<string>;",
+        ));
+        let declarations_file = FileId::new(96_521);
+        let file = FileId::new(96_522);
+        let mut context =
+            property_alias_call_context(&[(declarations_file, &declarations), (file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let call = |name| {
+            property_alias_variable_nodes(&parsed, file, name)
+                .1
+                .unwrap()
+        };
+        let mut states = Vec::new();
+        for (name, original_alias, visible_alias, property_arguments, identity_arguments) in [
+            (
+                "reversed",
+                "Pair",
+                "Reordered",
+                vec![number, string],
+                vec![string, number],
+            ),
+            (
+                "phantomNumber",
+                "Box",
+                "Phantom",
+                vec![string],
+                vec![string, number],
+            ),
+            (
+                "phantomString",
+                "Box",
+                "Phantom",
+                vec![string],
+                vec![string, string],
+            ),
+            ("fixedNumber", "Box", "Fixed", vec![string], vec![number]),
+            ("fixedString", "Box", "Fixed", vec![string], vec![string]),
+            ("chained", "Box", "Outer", vec![string], vec![string]),
+        ] {
+            let annotation = property_alias_variable_nodes(&parsed, file, name)
+                .0
+                .unwrap();
+            let concrete = context.get_type_from_type_node(annotation).unwrap();
+            let state = property_alias_call_state(context.store(), call(name));
+            assert_eq!(state.1, concrete);
+            let projection = property_object_alias_nonempty_projection(context.store(), concrete)
+                .unwrap()
+                .unwrap();
+            let visible_symbol = property_alias_declaration_symbol(
+                &context,
+                &declarations,
+                declarations_file,
+                visible_alias,
+            );
+            assert_eq!(
+                projection.alias_symbol,
+                property_alias_declaration_symbol(
+                    &context,
+                    &declarations,
+                    declarations_file,
+                    original_alias,
+                ),
+            );
+            assert_eq!(projection.identity_symbol, visible_symbol);
+            assert_eq!(projection.arguments, property_arguments);
+            assert_eq!(projection.identity_arguments, identity_arguments);
+            let record = context.store().type_payload(concrete).unwrap();
+            let identity = context.store().type_alias(record.alias().unwrap()).unwrap();
+            assert_eq!(identity.symbol(), Some(visible_symbol));
+            assert_eq!(
+                identity.type_arguments(),
+                Some(identity_arguments.as_slice())
+            );
+            let callable = property_alias_original_callable(context.store(), call(name));
+            let parameters = context
+                .store()
+                .signature(callable.signature)
+                .unwrap()
+                .type_parameters();
+            let template = callable.return_type.unwrap();
+            let template_projection =
+                property_object_alias_nonempty_projection(context.store(), template)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(template_projection.identity_symbol, visible_symbol);
+            assert_eq!(template_projection.identity_arguments, parameters);
+            assert!(generic_call_type_instantiation_matches(
+                context.store(),
+                None,
+                template,
+                concrete,
+                parameters,
+                &identity_arguments,
+                &mut Vec::new(),
+            ));
+            assert_property_alias_sibling_is_cold(context.store(), template);
+            assert_property_alias_sibling_is_cold(context.store(), concrete);
+            states.push((call(name), state));
+        }
+        for (expected, different) in [
+            ("phantomNumber", "phantomString"),
+            ("fixedNumber", "fixedString"),
+        ] {
+            let callable = property_alias_original_callable(context.store(), call(expected));
+            let (_, expected) = property_alias_call_state(context.store(), call(expected));
+            let (_, different) = property_alias_call_state(context.store(), call(different));
+            assert_ne!(expected, different);
+            let projection = property_object_alias_nonempty_projection(context.store(), expected)
+                .unwrap()
+                .unwrap();
+            let different_projection =
+                property_object_alias_nonempty_projection(context.store(), different)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(projection.arguments, different_projection.arguments);
+            assert_eq!(
+                projection.identity_symbol,
+                different_projection.identity_symbol
+            );
+            assert_ne!(
+                projection.identity_arguments,
+                different_projection.identity_arguments
+            );
+            assert!(!generic_call_type_instantiation_matches(
+                context.store(),
+                None,
+                callable.return_type.unwrap(),
+                different,
+                context
+                    .store()
+                    .signature(callable.signature)
+                    .unwrap()
+                    .type_parameters(),
+                &projection.identity_arguments,
+                &mut Vec::new(),
+            ));
+        }
+        let chain = property_alias_original_callable(context.store(), call("chained"));
+        let (_, chained) = property_alias_call_state(context.store(), call("chained"));
+        let projection = property_object_alias_nonempty_projection(context.store(), chained)
+            .unwrap()
+            .unwrap();
+        for name in ["raw", "wrapped", "middle"] {
+            let different = context
+                .get_type_from_type_node(
+                    property_alias_variable_nodes(&parsed, file, name)
+                        .0
+                        .unwrap(),
+                )
+                .unwrap();
+            let different_projection =
+                property_object_alias_nonempty_projection(context.store(), different)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(projection.target, different_projection.target);
+            assert_eq!(projection.arguments, different_projection.arguments);
+            assert_ne!(
+                projection.identity_symbol,
+                different_projection.identity_symbol
+            );
+            assert!(!generic_call_type_instantiation_matches(
+                context.store(),
+                None,
+                chain.return_type.unwrap(),
+                different,
+                context
+                    .store()
+                    .signature(chain.signature)
+                    .unwrap()
+                    .type_parameters(),
+                &[string],
+                &mut Vec::new(),
+            ));
+        }
+        let warm = (
+            vector_cache_graph_counts(context.store()),
+            context.store().type_alias_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        for (call, state) in states {
+            assert_eq!(property_alias_call_state(context.store(), call), state);
+        }
+        assert_eq!(
+            (
+                vector_cache_graph_counts(context.store()),
+                context.store().type_alias_len()
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Visible arguments retain parameter and Array authority.
+    fn property_alias_visible_arguments_use_the_callers_mapper_authority() {
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T }; type Phantom<T, Tag> = Box<T>; ",
+            "type Fixed<Tag> = Box<string>;",
+        ));
+        let parsed = parse_source_file(concat!(
+            "declare function phantom<T, Tag>(value: T, tag: Tag): Phantom<T, Tag>; ",
+            "declare function fixed<Tag>(tag: Tag): Fixed<Tag>; ",
+            "declare const text: string; declare const count: number; ",
+            "const tagged: Phantom<string, number> = phantom<string, number>(text, count); ",
+            "const constant: Fixed<number> = fixed<number>(count); ",
+            "declare const arrayIdentity: Phantom<string, string[]>;",
+        ));
+        let declarations_file = FileId::new(96_523);
+        let file = FileId::new(96_524);
+        let mut context =
+            property_alias_call_context(&[(declarations_file, &declarations), (file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let array_identity = context
+            .get_type_from_type_node(
+                property_alias_variable_nodes(&parsed, file, "arrayIdentity")
+                    .0
+                    .unwrap(),
+            )
+            .unwrap();
+        let store = context.store();
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let call = |name| {
+            property_alias_variable_nodes(&parsed, file, name)
+                .1
+                .unwrap()
+        };
+        let callable = property_alias_original_callable(store, call("tagged"));
+        let parameters = store
+            .signature(callable.signature)
+            .unwrap()
+            .type_parameters();
+        let template = callable.return_type.unwrap();
+        let projection = property_object_alias_nonempty_projection(store, template)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.arguments, &parameters[..1]);
+        assert_eq!(projection.identity_arguments, parameters);
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mut active = vec![number];
+        let before = (vector_cache_graph_counts(store), store.type_alias_len());
+        assert_eq!(
+            validate_generic_parameter_template(
+                store,
+                template,
+                parameters,
+                Some(targets),
+                callable.signature,
+                &mut active,
+            ),
+            Ok(true),
+        );
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                template,
+                parameters,
+                Some(targets),
+                callable.signature,
+                &mut active,
+            ),
+            Ok(()),
+        );
+        let invalid = || {
+            GenericCallVectorError::Unsupported(GenericCallVectorUnsupported::InstantiationType {
+                signature: callable.signature,
+                type_: parameters[1],
+            })
+        };
+        assert_eq!(
+            validate_generic_parameter_template(
+                store,
+                template,
+                &parameters[..1],
+                Some(targets),
+                callable.signature,
+                &mut active,
+            ),
+            Err(invalid()),
+        );
+        assert_eq!(active, [number]);
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                template,
+                &parameters[..1],
+                Some(targets),
+                callable.signature,
+                &mut active,
+            ),
+            Err(invalid()),
+        );
+        assert_eq!(active, [number]);
+        let fixed = property_alias_original_callable(store, call("constant"));
+        assert_eq!(
+            validate_generic_parameter_template(
+                store,
+                fixed.return_type.unwrap(),
+                store.signature(fixed.signature).unwrap().type_parameters(),
+                Some(targets),
+                fixed.signature,
+                &mut active,
+            ),
+            Ok(false),
+        );
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                array_identity,
+                &[],
+                Some(targets),
+                callable.signature,
+                &mut active,
+            ),
+            Ok(()),
+        );
+        let projection = property_object_alias_nonempty_projection(store, array_identity)
+            .unwrap()
+            .unwrap();
+        let array = projection.identity_arguments[1];
+        assert_eq!(
+            store
+                .canonical_array_reference_with_targets(targets, array)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            store.intrinsic_bootstrap().unwrap().string_type,
+        );
+        assert_eq!(
+            validate_generic_mapper_type(
+                store,
+                array_identity,
+                &[],
+                Some(CanonicalArrayTargets::for_test(
+                    number,
+                    targets.readonly_array_type(),
+                )),
+                callable.signature,
+                &mut active,
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidArrayType {
+                    signature: callable.signature,
+                    type_: array,
+                    error: ArrayTypeError::GlobalType(
+                        CanonicalGlobalTypeInitializationError::InvalidGenericTarget(number),
+                    ),
+                }
+            )),
+        );
+        assert_eq!(active, [number]);
+        assert_eq!(
+            (vector_cache_graph_counts(store), store.type_alias_len()),
+            before
+        );
     }
 
     fn fresh_string(store: &mut CanonicalTypeMapperStore, value: &str) -> TypeId {

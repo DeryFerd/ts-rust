@@ -56,6 +56,7 @@ use super::{
     instantiated_members::{
         GenericInterfaceMemberError, demand_instantiated_property_type,
         resolve_members_with_array_targets_and_session, validate_generic_interface_members,
+        validate_property_object_alias_members_with_array_targets,
     },
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, TypeNodeLinks, ValueSymbolLinks},
@@ -64,6 +65,7 @@ use super::{
         ResolvedMappedTypeMembers,
     },
     mapper::TypeMapper,
+    object_aliases::property_object_alias_projection,
     reference_types::validate_direct_generic_reference,
     relation::{
         ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
@@ -368,6 +370,19 @@ fn validate_class_members_relation_endpoint(
     Ok(())
 }
 
+fn validate_property_object_alias_relation_endpoint(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), RelationUnavailable> {
+    if property_object_alias_projection(store, type_)?.is_some() {
+        // Identity and cached relations still check any published member values.
+        // An authenticated cold instance needs no member demand here.
+        validate_property_object_alias_members_with_array_targets(store, type_, array_targets)?;
+    }
+    Ok(())
+}
+
 /// Rejects strict nullish sources only after proving the generic target's cache.
 /// A valid cold target needs no member publication or property value demand.
 fn authenticated_nullish_generic_nonmatch(
@@ -601,6 +616,7 @@ enum ObjectPropertyOrigin {
     FiniteMappedRecord(TypeId),
     Mapped(TypeId),
     GenericReference(TypeId),
+    PropertyObjectAlias(TypeId),
     Intersection(TypeId),
     FreshObjectLiteral(SemanticSymbolId),
     DerivedObjectLiteral {
@@ -613,7 +629,10 @@ impl ObjectPropertyOrigin {
     fn is_declared(self) -> bool {
         matches!(
             self,
-            Self::Declared | Self::ValidatedClass | Self::InterfaceHeritage(_)
+            Self::Declared
+                | Self::ValidatedClass
+                | Self::InterfaceHeritage(_)
+                | Self::PropertyObjectAlias(_)
         )
     }
 }
@@ -709,6 +728,7 @@ struct RelaterSession<'store> {
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
     inherited_property_references: HashMap<SemanticSymbolId, TypeId>,
     mapped_property_receivers: HashMap<SemanticSymbolId, TypeId>,
+    property_object_alias_receivers: HashMap<SemanticSymbolId, TypeId>,
     instantiation_session: RelationInstantiationSession<'store>,
     observation: RelationObservationToken,
     pending: PendingRelationCache,
@@ -830,6 +850,7 @@ impl<'store> RelaterSession<'store> {
             validated_unions: HashMap::new(),
             inherited_property_references: HashMap::new(),
             mapped_property_receivers: HashMap::new(),
+            property_object_alias_receivers: HashMap::new(),
             instantiation_session: RelationInstantiationSession::Owned(instantiation_session),
             observation,
             pending: PendingRelationCache::default(),
@@ -1487,6 +1508,7 @@ impl<'store> RelaterSession<'store> {
             ObjectPropertyOrigin::Declared
                 | ObjectPropertyOrigin::InterfaceHeritage(_)
                 | ObjectPropertyOrigin::GenericReference(_)
+                | ObjectPropertyOrigin::PropertyObjectAlias(_)
         );
         for &property in &members.properties {
             let record = self.store.symbol(property).ok_or_else(invalid)?;
@@ -1989,9 +2011,19 @@ impl<'store> RelaterSession<'store> {
         }
         validate_direct_interface_heritage_relation_endpoint(self.store, original_source)?;
         validate_class_members_relation_endpoint(self.store, original_source)?;
+        validate_property_object_alias_relation_endpoint(
+            self.store,
+            original_source,
+            self.global_types.map(|globals| globals.array_targets),
+        )?;
         if original_target != original_source {
             validate_direct_interface_heritage_relation_endpoint(self.store, original_target)?;
             validate_class_members_relation_endpoint(self.store, original_target)?;
+            validate_property_object_alias_relation_endpoint(
+                self.store,
+                original_target,
+                self.global_types.map(|globals| globals.array_targets),
+            )?;
         }
         let original_source = self.reduced_intersection_type(original_source)?;
         let original_target = self.reduced_intersection_type(original_target)?;
@@ -5503,6 +5535,24 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        if let Some(receiver) = self.property_object_alias_receivers.get(&symbol).copied() {
+            let members = validate_property_object_alias_members_with_array_targets(
+                self.store,
+                receiver,
+                self.global_types.map(|globals| globals.array_targets),
+            )?
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(receiver))?;
+            if !members.properties.contains(&symbol) {
+                return Err(RelationUnavailable::UnsupportedProperty(symbol));
+            }
+            // The source adapter owns the host and caller session needed for
+            // a cold annotation. A store-only relation must return that demand.
+            return self
+                .store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .ok_or(RelationUnavailable::UnresolvedPropertyType(symbol));
+        }
         if let Some(receiver) = self.mapped_property_receivers.get(&symbol).copied() {
             self.store
                 .validate_mapped_type_relation_endpoint(receiver)
@@ -5937,12 +5987,29 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
             self.mapped_property_receivers.insert(symbol, receiver);
         }
+        if let ObjectPropertyOrigin::PropertyObjectAlias(receiver) = origin {
+            let members = validate_property_object_alias_members_with_array_targets(
+                self.store,
+                receiver,
+                self.global_types.map(|globals| globals.array_targets),
+            )?
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(receiver))?;
+            if !members.properties.contains(&symbol) {
+                return Err(RelationUnavailable::UnsupportedProperty(symbol));
+            }
+            // The alias provider proves both source-symbol reuse and exact
+            // proxy target/mapper links before this origin accepts a property.
+            self.property_object_alias_receivers
+                .insert(symbol, receiver);
+        }
         let record = self
             .store
             .symbol(symbol)
             .ok_or(RelationUnavailable::Symbol(symbol))?;
         match origin {
-            ObjectPropertyOrigin::Mapped(_) => return Ok(record),
+            ObjectPropertyOrigin::Mapped(_) | ObjectPropertyOrigin::PropertyObjectAlias(_) => {
+                return Ok(record);
+            }
             ObjectPropertyOrigin::Intersection(owner) => {
                 return if self
                     .intersection_projection(owner)?
@@ -6194,7 +6261,8 @@ impl<'store> RelaterSession<'store> {
                 | ObjectPropertyOrigin::Intersection(_)
                 | ObjectPropertyOrigin::SyntheticStructural(_)
                 | ObjectPropertyOrigin::FiniteMappedRecord(_)
-                | ObjectPropertyOrigin::Mapped(_) => {
+                | ObjectPropertyOrigin::Mapped(_)
+                | ObjectPropertyOrigin::PropertyObjectAlias(_) => {
                     unreachable!("literal property origins return before declared validation")
                 }
             };
@@ -6465,6 +6533,15 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<(), RelationUnavailable> {
+        if property_object_alias_projection(self.store, type_id)?.is_some() {
+            return validate_property_object_alias_members_with_array_targets(
+                self.store,
+                type_id,
+                self.global_types.map(|globals| globals.array_targets),
+            )?
+            .map(|_| ())
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(type_id));
+        }
         let record = self
             .store
             .type_payload(type_id)
@@ -7055,6 +7132,29 @@ impl<'store> RelaterSession<'store> {
                     error
                 }
             })?;
+        if property_object_alias_projection(self.store, type_id)?.is_some() {
+            let members = validate_property_object_alias_members_with_array_targets(
+                self.store,
+                type_id,
+                self.global_types.map(|globals| globals.array_targets),
+            )?
+            .ok_or(RelationUnavailable::UnresolvedStructuredMembers(type_id))?;
+            if let Some(table) = members.members {
+                self.observe_symbol_table(table);
+            }
+            let origin = ObjectPropertyOrigin::PropertyObjectAlias(type_id);
+            for &property in &members.properties {
+                self.property_symbol(property, origin)?;
+            }
+            return Ok(ResolvedObjectMembers {
+                members: members.members,
+                properties: members.properties,
+                index_infos: Vec::new(),
+                property_origin: origin,
+                call_signature: None,
+                exact_callable: false,
+            });
+        }
         if matches!(
             self.store.type_payload(type_id).map(TypeRecord::data),
             Some(TypeData::Mapped(_))
@@ -7918,12 +8018,87 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         type_id: TypeId,
     ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
+        self.resolved_declared_property_object_with_optional_global_types(host, type_id, None)
+    }
+
+    /// Retains the caller's array capability while validating lazy alias values.
+    pub(super) fn resolved_declared_property_object_with_global_types(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        type_id: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
+        self.resolved_declared_property_object_with_optional_global_types(
+            host,
+            type_id,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+        )
+    }
+
+    fn resolved_declared_property_object_with_optional_global_types(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        type_id: TypeId,
+        global_types: Option<RelationGlobalTypes>,
+    ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
         let flags = self
             .type_payload(type_id)
             .map(TypeRecord::flags)
             .ok_or(RelationUnavailable::Type(type_id))?;
         if !flags.intersects(TypeFlags::OBJECT) {
             return Ok(None);
+        }
+
+        if let Some(projection) = property_object_alias_projection(self, type_id)? {
+            if !host.symbol_matches(self, projection.declaration, projection.source_symbol)
+                || projection.properties.iter().any(|property| {
+                    !host.symbol_matches(self, property.declaration, property.symbol)
+                })
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            let bootstrap = self.relation_bootstrap_facts()?;
+            let mut session = RelaterSession::new_with_global_types(
+                self,
+                RelationKind::Assignable,
+                bootstrap,
+                global_types,
+            );
+            let resolved = session.resolved_object_members(type_id, false)?;
+            if resolved.properties.len() != projection.properties.len()
+                || !matches!(
+                    resolved.property_origin,
+                    ObjectPropertyOrigin::PropertyObjectAlias(receiver) if receiver == type_id
+                )
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            let mut properties = Vec::with_capacity(resolved.properties.len());
+            let mut by_name = HashMap::with_capacity(resolved.properties.len());
+            for (symbol, planned) in resolved.properties.into_iter().zip(projection.properties) {
+                let record = session.property_symbol(symbol, resolved.property_origin)?;
+                if record.name() != planned.name.as_ref()
+                    || record.flags().contains(SymbolFlags::OPTIONAL) != planned.optional
+                {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                let type_ = session.property_type(symbol)?;
+                let index = properties.len();
+                if by_name.insert(planned.name.clone(), index).is_some() {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                properties.push(ResolvedDeclaredProperty {
+                    symbol,
+                    name: planned.name,
+                    type_,
+                    optional: planned.optional,
+                    declaration: planned.declaration,
+                });
+            }
+            return Ok(Some(ResolvedDeclaredPropertyObject {
+                properties,
+                by_name,
+            }));
         }
 
         let ownerless_synthetic = self.type_payload(type_id).is_some_and(|record| {
@@ -7939,7 +8114,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         });
         if ownerless_synthetic {
             let bootstrap = self.relation_bootstrap_facts()?;
-            let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+            let mut session = RelaterSession::new_with_global_types(
+                self,
+                RelationKind::Assignable,
+                bootstrap,
+                global_types,
+            );
             let resolved = session.resolved_object_members(type_id, false)?;
             return if matches!(
                 resolved.property_origin,
@@ -8100,7 +8280,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
 
         let bootstrap = self.relation_bootstrap_facts()?;
-        let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+        let mut session = RelaterSession::new_with_global_types(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            global_types,
+        );
         let resolved = session.resolved_object_members(type_id, false)?;
         if let Some((plan, property_types)) = plan {
             if plan.heritage.is_some() {
@@ -8733,9 +8918,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
         validate_direct_interface_heritage_relation_endpoint(self, source)?;
         validate_class_members_relation_endpoint(self, source)?;
+        validate_property_object_alias_relation_endpoint(
+            self,
+            source,
+            global_types.map(|globals| globals.array_targets),
+        )?;
         if target != source {
             validate_direct_interface_heritage_relation_endpoint(self, target)?;
             validate_class_members_relation_endpoint(self, target)?;
+            validate_property_object_alias_relation_endpoint(
+                self,
+                target,
+                global_types.map(|globals| globals.array_targets),
+            )?;
         }
         self.admit_callable_relation_type(source, strict_function_types)?;
         if target != source {

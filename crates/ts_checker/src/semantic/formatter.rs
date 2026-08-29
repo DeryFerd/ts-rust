@@ -26,6 +26,7 @@ use ts_scanner::is_identifier_text;
 use super::{
     ArrayTypeError, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
     DeclaredTypeHostError, EmptyTupleTypeError, IndexInfoId, SignatureId, TypeAliasId, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, validate_stored_callable_set,
@@ -44,9 +45,11 @@ use super::{
     derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
+    instantiated_members::validate_property_object_alias_members_with_array_targets,
     keyof_types,
     links::{ResolvedSignatureState, SignatureLinks, ValueSymbolLinks},
     mapped_types::plan_mapped_type_declaration,
+    object_aliases::property_object_alias_projection,
     object_members,
     reference_types::validate_direct_generic_reference,
     signatures::{ElementFlags, IndexFlags, SignatureFlags, TypePredicateKind},
@@ -1127,10 +1130,42 @@ fn display_object_type(
             .is_some_and(|structured| structured.call_signature_count == 0),
     };
     if let Some(alias) = record.alias() {
-        if single_callable_family(store, type_id).is_some() {
+        let arguments = if single_callable_family(store, type_id).is_some() {
             validate_opaque_single_callable_alias(store, type_id)?;
+            None
         } else {
-            validate_property_object_alias(store, host, type_id, record, alias)?;
+            validate_property_object_alias(store, host, global_types, type_id, record, alias)?
+        };
+        if let Some(arguments) = arguments {
+            if !visiting.insert(type_id) {
+                return Err(TypeDisplayUnavailable::CyclicType(type_id));
+            }
+            let result = (|| {
+                let mut result = display_alias_name(store, host, type_id, alias, state)?;
+                if !arguments.is_empty() {
+                    result.push('<');
+                    state.add(2);
+                    for (index, argument) in arguments.iter().enumerate() {
+                        if index != 0 {
+                            result.push_str(", ");
+                            state.add(2);
+                        }
+                        result.push_str(&display_type_worker(
+                            store,
+                            host,
+                            global_types,
+                            *argument,
+                            flags,
+                            state,
+                            visiting,
+                        )?);
+                    }
+                    result.push('>');
+                }
+                Ok(result)
+            })();
+            visiting.remove(&type_id);
+            return result;
         }
         return display_alias_name(store, host, type_id, alias, state);
     }
@@ -4681,10 +4716,24 @@ fn interface_property_annotation_matches(
 fn validate_property_object_alias(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     record: &TypeRecord,
     alias: TypeAliasId,
-) -> Result<(), TypeDisplayUnavailable> {
+) -> Result<Option<Vec<TypeId>>, TypeDisplayUnavailable> {
+    if let Some(projection) = property_object_alias_projection(store, type_id)
+        .map_err(|_| TypeDisplayUnavailable::Alias { type_id, alias })?
+    {
+        // Validate existing caches, but do not resolve a table or annotation
+        // just to print an alias and its actual arguments.
+        validate_property_object_alias_members_with_array_targets(
+            store,
+            type_id,
+            global_types.map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(|_| TypeDisplayUnavailable::Alias { type_id, alias })?;
+        return Ok(Some(projection.identity_arguments));
+    }
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
     };
@@ -4760,7 +4809,7 @@ fn validate_property_object_alias(
     {
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
     }
-    Ok(())
+    Ok(None)
 }
 
 fn valid_display_type_alias_owner(
@@ -7533,6 +7582,222 @@ mod tests {
                 })
             })
             .expect("the test source contains the requested variable")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold readers, argument corruption, and exact repair together.
+    fn lazy_property_object_alias_consumers_reject_changed_arguments() {
+        let parsed = parse_source_file(concat!(
+            "type Box<T> = { value: T }; ",
+            "declare const text: Box<string>; declare const count: Box<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_801);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let [text, count] = ["text", "count"].map(|name| {
+            context
+                .get_type_from_type_node(variable_type_node(&parsed, file, name))
+                .unwrap()
+        });
+        let projection = property_object_alias_projection(context.store(), text)
+            .unwrap()
+            .unwrap();
+        let alias = context.store().type_payload(text).unwrap().alias().unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().type_alias_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+            )
+        };
+        let before = snapshot(&context);
+        assert_ne!(text, count);
+        assert_eq!(context.type_to_string(text).unwrap(), "Box<string>");
+        assert_eq!(context.type_to_string(count).unwrap(), "Box<number>");
+        assert_eq!(context.type_to_string(projection.target).unwrap(), "Box<T>");
+        assert_eq!(context.store().validate_union_constituent(text), Ok(()));
+        assert_eq!(
+            context.store().validate_cached_array_capability(text),
+            Ok(())
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_identical_to(text, text),
+            Ok(true)
+        );
+        assert_eq!(snapshot(&context), before);
+        for receiver in [projection.target, text, count] {
+            assert!(
+                !context
+                    .store()
+                    .type_payload(receiver)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+        }
+        assert!(projection.properties.iter().all(|property| {
+            context
+                .store()
+                .value_symbol_links(property.symbol)
+                .is_none_or(|links| links.resolved_type.is_none())
+        }));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(alias, Some(vec![number]))
+        );
+        let poisoned = snapshot(&context);
+        assert_eq!(
+            context.type_to_string(text),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: text,
+                alias
+            })
+        );
+        assert_eq!(
+            context.store().validate_union_constituent(text),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(text))
+        );
+        assert_eq!(
+            context.store().validate_cached_array_capability(text),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(text))
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_identical_to(text, text),
+            Err(super::super::relater::RelationUnavailable::InvalidStructuredMembers(text))
+        );
+        assert_eq!(snapshot(&context), poisoned);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(alias, Some(projection.arguments))
+        );
+        assert_eq!(context.type_to_string(text).unwrap(), "Box<string>");
+        assert_eq!(context.store().validate_union_constituent(text), Ok(()));
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_identical_to(text, text),
+            Ok(true)
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check one cold field, its mapped union, and both reader capabilities.
+    fn lazy_property_object_alias_context_keeps_array_union_capability() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Bag<T> = { value: T[] | undefined }; ",
+            "declare const bag: Bag<string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_803);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = parsed_context(&parsed, file, options);
+        let globals = context.global_types().clone();
+        let bag = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "bag"))
+            .unwrap();
+        let members = crate::semantic::instantiated_members::resolve_property_object_alias_members(
+            context.store_mut_for_test(),
+            bag,
+        )
+        .unwrap();
+        let [property] = members.properties.as_slice() else {
+            panic!("Bag has one property");
+        };
+        let property = *property;
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolved_declared_property_object_with_global_types(&host, bag, &globals,),
+            Err(super::super::relater::RelationUnavailable::UnresolvedPropertyType(property))
+        );
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        let value = crate::semantic::instantiated_members::demand_property_object_alias_property(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            bag,
+            property,
+        )
+        .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(value).unwrap().data() else {
+            panic!("the strict field type retains its undefined union");
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&bootstrap.undefined_type));
+        assert!(union.union.types.iter().any(|type_| {
+            context
+                .store()
+                .canonical_array_reference(&globals, *type_)
+                .unwrap()
+                .is_some_and(|array| array.element_type == bootstrap.string_type)
+        }));
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolved_declared_property_object(&host, bag),
+            Err(super::super::relater::RelationUnavailable::InvalidStructuredMembers(bag))
+        );
+        let object = context
+            .store_mut_for_test()
+            .resolved_declared_property_object_with_global_types(&host, bag, &globals)
+            .unwrap()
+            .unwrap();
+        let [resolved] = object.properties() else {
+            panic!("the alias view retains one property");
+        };
+        assert_eq!(resolved.symbol, property);
+        assert_eq!(resolved.type_, value);
+        assert_eq!(context.type_to_string(bag).unwrap(), "Bag<string>");
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
+        );
+        assert!(diagnostics.as_slice().is_empty());
+        assert!(context.diagnostics().is_empty());
     }
 
     fn function_type_nodes(parsed: &ParseResult, file: FileId) -> Vec<NodeRef> {

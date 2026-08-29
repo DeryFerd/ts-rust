@@ -50,12 +50,15 @@ use super::{
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     indexed_access_types::cached_deferred_indexed_access_type,
+    instantiated_members::validate_property_object_alias_members_with_array_targets,
     links::{LateBoundLinks, SignatureLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::{TypeMapper, TypeMapperApplication},
+    object_aliases::property_object_alias_projection,
     object_members,
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
+    relater::RelationUnavailable,
     relation::RelationStateSnapshot,
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{SemanticStore, SourceNodeParent},
@@ -437,6 +440,11 @@ type SourceInterfaceEdges<'source> =
 struct CachedArrayWalk<'source> {
     visited: HashSet<TypeId>,
     source_interfaces: Option<&'source SourceInterfaceEdges<'source>>,
+}
+
+struct PropertyObjectAliasTypeEdges {
+    arguments: Vec<TypeId>,
+    properties: Vec<TypeId>,
 }
 
 impl<'globals> UnionArrayValidation<'globals> {
@@ -2520,6 +2528,59 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
+    fn property_object_alias_type_edges(
+        &self,
+        type_: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<Option<PropertyObjectAliasTypeEdges>, LiteralTypeCacheError> {
+        let invalid = |error| match error {
+            RelationUnavailable::MissingBootstrap => LiteralTypeCacheError::BootstrapUninitialized,
+            RelationUnavailable::UnionValidationCapacity(_) => LiteralTypeCacheError::Capacity,
+            RelationUnavailable::UnsupportedStructuredType(unsupported)
+            | RelationUnavailable::UnsupportedUnionConstituent(unsupported) => {
+                LiteralTypeCacheError::UnsupportedUnionConstituent(unsupported)
+            }
+            _ => LiteralTypeCacheError::InvalidCachedUnion(type_),
+        };
+        let Some(projection) = property_object_alias_projection(self, type_).map_err(invalid)?
+        else {
+            return Ok(None);
+        };
+        let members =
+            validate_property_object_alias_members_with_array_targets(self, type_, array_targets)
+                .map_err(invalid)?;
+        let mut property_types = Vec::new();
+        for property in projection.properties {
+            if let Some(type_) = self
+                .value_symbol_links(property.symbol)
+                .and_then(|links| links.resolved_type)
+            {
+                property_types.push(type_);
+            }
+        }
+        if let Some(members) = members {
+            for property in members.properties {
+                if let Some(type_) = self
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type)
+                {
+                    property_types.push(type_);
+                }
+            }
+        }
+        // A cold member adds no type edge. Existing source and proxy values
+        // still participate even when the instance table has not been queried.
+        Ok(Some(PropertyObjectAliasTypeEdges {
+            // The visible alias can retain arguments unused by the source mapper.
+            arguments: projection
+                .arguments
+                .into_iter()
+                .chain(projection.identity_arguments)
+                .collect(),
+            properties: property_types,
+        }))
+    }
+
     fn validate_cached_array_capability_worker(
         &self,
         type_: TypeId,
@@ -2602,6 +2663,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(_) | TypeData::Interface(_) => {
+                if let Some(edges) =
+                    self.property_object_alias_type_edges(type_, array_validation.targets())?
+                {
+                    for edge in edges.arguments.into_iter().chain(edges.properties) {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 let recognized_library_interface = matches!(record.data(), TypeData::Interface(_))
                     && !record.object_flags().contains(ObjectFlags::REFERENCE)
                     && record.symbol().is_some_and(|symbol| {
@@ -2877,7 +2951,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(())
     }
 
-    fn symbol_is_registered_global_array(&self, symbol: SemanticSymbolId) -> bool {
+    pub(super) fn symbol_is_registered_global_array(&self, symbol: SemanticSymbolId) -> bool {
         let Some(globals) = self
             .intrinsic_bootstrap
             .as_ref()
@@ -4312,6 +4386,35 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(object) => {
+                if let Some(edges) =
+                    self.property_object_alias_type_edges(type_, array_validation.targets())?
+                {
+                    if !visiting.insert(type_) {
+                        return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                    }
+                    let result = (|| {
+                        for argument in edges.arguments {
+                            self.validate_union_constituent_worker(
+                                argument,
+                                array_validation,
+                                visiting,
+                                array_visited,
+                                allowed_pending,
+                            )?;
+                        }
+                        for property_type in edges.properties {
+                            self.validate_cached_array_capability_worker(
+                                property_type,
+                                array_validation,
+                                array_visited,
+                                allowed_pending,
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    visiting.remove(&type_);
+                    return result;
+                }
                 if record.symbol().is_some_and(|owner| {
                     self.symbol(owner)
                         .is_some_and(|owner| owner.flags().intersects(SymbolFlags::ENUM))
@@ -7051,6 +7154,276 @@ mod tests {
             .type_node_links(expression)
             .and_then(|links| links.resolved_type)
             .expect("the expression was checked")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check argument edges before and source-member edges after one demand.
+    fn lazy_property_object_alias_array_edges_keep_caller_capabilities() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T; items: string[] }; ",
+            "declare const nested: Box<string[]>; declare const plain: Box<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_802);
+        let mut context = checker_context(file, &parsed);
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let options = context.options();
+        let [nested, plain] = ["nested", "plain"].map(|name| {
+            let annotation = parsed
+                .arena
+                .iter()
+                .find_map(|(_, node)| {
+                    let NodeData::VariableDeclaration(variable) = &node.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name)
+                        .then_some(variable.type_)
+                        .flatten()
+                        .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            context.get_type_from_type_node(annotation).unwrap()
+        });
+        let nested_projection = property_object_alias_projection(context.store(), nested)
+            .unwrap()
+            .unwrap();
+        let projection = property_object_alias_projection(context.store(), plain)
+            .unwrap()
+            .unwrap();
+        let array = nested_projection.arguments[0];
+        let check_array_edges = |store: &TestStore, receiver| {
+            assert_eq!(
+                store.validate_cached_array_capability(receiver),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, receiver),
+                Ok(())
+            );
+            assert_eq!(
+                store.validate_union_constituent_with_array_targets(targets, receiver),
+                Ok(())
+            );
+        };
+        check_array_edges(context.store(), nested);
+        assert_eq!(
+            context.store().validate_cached_array_capability(plain),
+            Ok(())
+        );
+        assert_eq!(context.store().validate_union_constituent(plain), Ok(()));
+        assert!(projection.properties.iter().all(|property| {
+            context
+                .store()
+                .value_symbol_links(property.symbol)
+                .is_none_or(|links| links.resolved_type.is_none())
+        }));
+
+        let property = projection
+            .properties
+            .iter()
+            .find(|property| property.name.as_utf8() == Some("items"))
+            .unwrap()
+            .symbol;
+        let bound = context.file(file).unwrap().1.clone();
+        let host = crate::semantic::DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            crate::semantic::instantiated_members::demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                projection.target,
+                property,
+            )
+            .unwrap(),
+            array
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        check_array_edges(context.store(), plain);
+        check_array_edges(context.store(), nested);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
+        );
+        for receiver in [projection.target, nested, plain] {
+            assert!(
+                !context
+                    .store()
+                    .type_payload(receiver)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+        }
+        assert!(diagnostics.as_slice().is_empty());
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the visible-only array argument and both edge checks together.
+    fn visible_property_alias_arguments_keep_array_capabilities() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Box<T> = { value: T }; type Wrapped<T> = Box<string>; ",
+            "declare const wrapped: Wrapped<string[]>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19_809);
+        let mut context = checker_context(file, &parsed);
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let [box_alias, wrapped_alias] = ["Box", "Wrapped"].map(|name| {
+            context
+                .store()
+                .symbol_table(context.globals())
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap()
+        });
+        let annotation = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let wrapped = context.get_type_from_type_node(annotation).unwrap();
+        let projection = property_object_alias_projection(context.store(), wrapped)
+            .unwrap()
+            .unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(projection.alias_symbol, box_alias);
+        assert_eq!(projection.identity_symbol, wrapped_alias);
+        assert_eq!(projection.arguments, [string]);
+        assert_eq!(projection.identity_arguments.len(), 1);
+        let array = projection.identity_arguments[0];
+        assert_ne!(array, string);
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_reference(&globals, array)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            string
+        );
+        assert!(projection.properties.iter().all(|property| {
+            context
+                .store()
+                .value_symbol_links(property.symbol)
+                .is_none_or(|links| links.resolved_type.is_none())
+        }));
+        let object_snapshot = |store: &TestStore, type_| {
+            let record = store.type_payload(type_).unwrap();
+            let TypeData::Object(object) = record.data() else {
+                panic!("expected a property alias object");
+            };
+            let alias = store.type_alias(record.alias().unwrap()).unwrap();
+            (
+                record.flags(),
+                record.object_flags(),
+                record.symbol(),
+                alias.id(),
+                alias.symbol(),
+                alias.type_arguments().map(<[TypeId]>::to_vec),
+                object.clone(),
+            )
+        };
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let record = store.type_payload(array).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("expected the source array argument");
+            };
+            (
+                checker_state(store),
+                [projection.target, wrapped].map(|type_| object_snapshot(store, type_)),
+                (
+                    record.flags(),
+                    record.object_flags(),
+                    record.symbol(),
+                    record.alias(),
+                    reference.clone(),
+                ),
+                [box_alias, wrapped_alias].map(|symbol| store.type_alias_links(symbol).cloned()),
+                store.type_node_links(annotation).cloned(),
+                projection
+                    .properties
+                    .iter()
+                    .map(|property| store.value_symbol_links(property.symbol).cloned())
+                    .collect::<Vec<_>>(),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+            )
+        };
+        let before = snapshot(context.store());
+        for _ in 0..2 {
+            let store = context.store();
+            assert_eq!(
+                store.validate_cached_array_capability(wrapped),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+            );
+            assert_eq!(
+                store.validate_union_constituent(wrapped),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, wrapped),
+                Ok(())
+            );
+            assert_eq!(
+                store.validate_union_constituent_with_array_targets(targets, wrapped),
+                Ok(())
+            );
+            for type_ in [projection.target, wrapped] {
+                assert!(
+                    !store
+                        .type_payload(type_)
+                        .unwrap()
+                        .object_flags()
+                        .contains(ObjectFlags::MEMBERS_RESOLVED)
+                );
+            }
+            assert_eq!(snapshot(store), before);
+            assert_eq!(context.get_type_from_type_node(annotation), Ok(wrapped));
+            assert_eq!(
+                property_object_alias_projection(context.store(), wrapped),
+                Ok(Some(projection.clone()))
+            );
+            assert_eq!(snapshot(context.store()), before);
+        }
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

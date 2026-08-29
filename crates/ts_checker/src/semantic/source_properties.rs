@@ -1748,6 +1748,8 @@ pub(super) fn check_direct_source_property_with_source(
         receiver_type,
         session,
         |store, receiver, name, session| {
+            let property_alias =
+                super::object_aliases::property_object_alias_projection(store, receiver)?.is_some();
             let target = store
                 .type_payload(receiver)
                 .and_then(|record| match record.data() {
@@ -1767,7 +1769,10 @@ pub(super) fn check_direct_source_property_with_source(
                         if !interface.declared_members_resolved
                             && !record.object_flags().contains(ObjectFlags::CLASS))
                 });
-            if !cold_interface && !is_cold_direct_nongeneric_interface(store, receiver) {
+            if !property_alias
+                && !cold_interface
+                && !is_cold_direct_nongeneric_interface(store, receiver)
+            {
                 return resolve_direct_source_own_property(
                     store,
                     Some(global_types),

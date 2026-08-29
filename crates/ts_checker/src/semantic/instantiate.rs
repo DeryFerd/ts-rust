@@ -5,8 +5,9 @@
 //! Array/ReadonlyArray references under an explicit target capability, direct
 //! full-arity generic class/interface references, indexed accesses,
 //! authenticated deferred intersections, template literals, intrinsic string
-//! mappings, and unions with canonical alias arguments and union origins. Other object and
-//! signature instantiation needs its owning caches and is rejected.
+//! mappings, ordinary property-object aliases, and unions with canonical alias
+//! arguments and union origins. Other object and signature instantiation needs
+//! its owning caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,6 +26,10 @@ use super::{
     keyof_types::plan_nongeneric_keyof_type,
     mapped_types::{MappedTypeError, MappedTypeModifiers, escaped_property_name_from_type},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
+    object_aliases::{
+        PropertyObjectAliasProjection, property_object_alias_identity_source_header,
+        property_object_alias_projection, validate_property_object_alias_arguments,
+    },
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
     },
@@ -34,10 +39,11 @@ use super::{
     },
     store::SourceNodeParent,
     template_types::TemplateTypeError,
-    type_records::{StructuredTypeData, TypeData, TypeRecord},
+    type_nodes::type_alias_instantiation_cache_key,
+    type_records::{StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{AccessFlags, ObjectFlags, TypeFlags},
 };
-use ts_ast::SyntaxKind;
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags};
 
 /// Pinned checker limits for one instantiation query.
@@ -232,6 +238,153 @@ enum InstantiationLimitPolicy {
 #[allow(dead_code)] // Installed ahead of the source-call diagnostic owner.
 pub(super) struct InstantiationLimitEventMark(u64);
 
+/// Exact object fields produced by a real argument-level recovery.
+/// Only the anonymous-object producer can construct this record.
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
+pub(super) struct PropertyObjectAliasRecovery {
+    result: TypeId,
+    target: TypeId,
+    declaration: NodeRef,
+    source_symbol: SemanticSymbolId,
+    alias_symbol: SemanticSymbolId,
+    parameters: Vec<TypeId>,
+    mapper: TypeMapperId,
+    arguments: Vec<TypeId>,
+    identity: TypeAliasId,
+    identity_symbol: SemanticSymbolId,
+    identity_arguments: Vec<TypeId>,
+    error_type: TypeId,
+    physical_recovery: Vec<bool>,
+    identity_recovery: Vec<bool>,
+}
+
+impl PropertyObjectAliasRecovery {
+    pub(super) const fn result(&self) -> TypeId {
+        self.result
+    }
+
+    pub(super) const fn error_type(&self) -> TypeId {
+        self.error_type
+    }
+
+    pub(super) fn physical_slot_recovered(&self, index: usize) -> bool {
+        self.physical_recovery.get(index) == Some(&true)
+    }
+
+    pub(super) fn identity_slot_recovered(&self, index: usize) -> bool {
+        self.identity_recovery.get(index) == Some(&true)
+    }
+
+    /// Check direct source and result fields without entering full projection.
+    #[allow(clippy::too_many_lines)] // One retained record binds both independent argument lists.
+    pub(super) fn matches_current_result(&self, store: &CanonicalTypeMapperStore) -> bool {
+        if store.intrinsic_bootstrap().is_none_or(|bootstrap| {
+            bootstrap.error_type != self.error_type
+                || !store.type_payload(self.error_type).is_some_and(|record| {
+                    record.flags() == TypeFlags::ANY
+                        && matches!(record.data(), TypeData::Intrinsic(data) if data.intrinsic_name == "error")
+                })
+                || store.validate_union_constituent(self.error_type).is_err()
+        }) || self.physical_recovery.len() != self.arguments.len()
+            || self.identity_recovery.len() != self.identity_arguments.len()
+            || !self
+                .physical_recovery
+                .iter()
+                .chain(&self.identity_recovery)
+                .any(|marked| *marked)
+            || self
+                .physical_recovery
+                .iter()
+                .zip(&self.arguments)
+                .any(|(marked, argument)| *marked && *argument != self.error_type)
+            || self
+                .identity_recovery
+                .iter()
+                .zip(&self.identity_arguments)
+                .any(|(marked, argument)| *marked && *argument != self.error_type)
+            || validate_property_object_alias_arguments(store, &self.arguments).is_err()
+            || validate_property_object_alias_arguments(store, &self.identity_arguments).is_err()
+        {
+            return false;
+        }
+        let Ok(source) = property_object_alias_identity_source_header(store, self.alias_symbol)
+        else {
+            return false;
+        };
+        let Some(body) = store.source_direct_type_annotation(source.alias_declaration) else {
+            return false;
+        };
+        if source.parameters.len() != self.parameters.len()
+            || source
+                .parameters
+                .iter()
+                .zip(&self.parameters)
+                .any(|((_, symbol), type_)| {
+                    cached_ordinary_type_parameter_owner(store, *type_) != Some(*symbol)
+                })
+            || !super::object_aliases::property_object_alias_template_matches(
+                store,
+                self.alias_symbol,
+                body,
+                self.target,
+                &self.parameters,
+            )
+            .is_ok_and(|matches| matches)
+            || store.type_payload(self.target).and_then(TypeRecord::symbol)
+                != Some(self.source_symbol)
+            || store
+                .symbol(self.source_symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                != Some(&[self.declaration])
+            || store.source_declaration_symbol(self.declaration) != Some(self.source_symbol)
+            || store.source_node_kind(self.declaration) != Some(SyntaxKind::TypeLiteral)
+            || !property_object_alias_identity_source_header(store, self.identity_symbol)
+                .is_ok_and(|header| header.parameters.len() == self.identity_arguments.len())
+        {
+            return false;
+        }
+        let Some(record) = store.type_payload(self.result) else {
+            return false;
+        };
+        let TypeData::Object(object) = record.data() else {
+            return false;
+        };
+        let Some(alias) = store.type_alias(self.identity) else {
+            return false;
+        };
+        let Some(global_identity) = store
+            .symbol_store()
+            .assigned_global_symbol_id(self.identity_symbol)
+        else {
+            return false;
+        };
+        self.result != self.target
+            && record.flags() == TypeFlags::OBJECT
+            && record.symbol() == Some(self.source_symbol)
+            && record
+                .object_flags()
+                .contains(ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED)
+            && object.target == Some(self.target)
+            && object.mapper == Some(self.mapper)
+            && object.instantiations == TypeCacheState::Unallocated
+            && record.alias() == Some(self.identity)
+            && alias.symbol() == Some(self.identity_symbol)
+            && alias.type_arguments()
+                == (!self.identity_arguments.is_empty())
+                    .then_some(self.identity_arguments.as_slice())
+            && store.type_mapper_has_exact_endpoints(self.mapper, &self.parameters, &self.arguments)
+                == Some(true)
+            && store.relation_object_instantiation(
+                self.target,
+                type_alias_instantiation_cache_key(
+                    &self.arguments,
+                    Some((global_identity, &self.identity_arguments)),
+                ),
+            ) == Some(self.result)
+    }
+}
+
 /// Checker-query-owned instantiation accounting and recursive mapper cache.
 ///
 /// The per-query count is intentionally not reset by each instantiation call:
@@ -309,6 +462,11 @@ impl InstantiationSession {
     #[allow(dead_code)] // Read by the future source-call diagnostic owner.
     pub(super) const fn limit_event_mark(&self) -> InstantiationLimitEventMark {
         InstantiationLimitEventMark(self.limit_event_generation)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn limit_event_count(&self) -> u64 {
+        self.limit_event_generation
     }
 
     /// Whether a depth or count limit was reached after `mark`.
@@ -461,9 +619,8 @@ fn instantiate_type_with_vector_and_optional_array_targets(
 
 /// Instantiates through a borrowed vector inside an existing checker query.
 ///
-/// The caller owns the [`InstantiationSession::reset_query`] boundary. Alias
-/// instantiation remains private until its owning cache and symbol paths are
-/// dependency-closed.
+/// The caller owns the [`InstantiationSession::reset_query`] boundary.
+/// Existing visible alias arguments are mapped in the same session.
 #[allow(dead_code)] // Installed ahead of the lazy generic-call consumer.
 pub(super) fn instantiate_type_with_vector_and_session(
     store: &mut CanonicalTypeMapperStore,
@@ -884,6 +1041,31 @@ fn could_contain_installed_type_variables_worker(
                 Err(InstantiationError::UnsupportedType(type_))
             }
         }
+        TypeData::Object(_) => match property_object_alias_projection(store, type_)
+            .map_err(|_| InstantiationError::InvalidType(type_))?
+        {
+            Some(projection) => {
+                let identity_arguments = if projection.arguments == projection.identity_arguments {
+                    &[][..]
+                } else {
+                    projection.identity_arguments.as_slice()
+                };
+                projection
+                    .arguments
+                    .iter()
+                    .chain(identity_arguments)
+                    .try_fold(false, |contains, argument| {
+                        Ok(contains
+                            | could_contain_installed_type_variables_worker(
+                                store,
+                                *argument,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            }
+            None => Ok(true),
+        },
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
                 Err(TemplateTypeError::InvalidTemplate(type_).into())
@@ -1191,6 +1373,9 @@ fn supported_instantiable_union_constituent(
                 .is_ok(),
             None => store.validate_cached_union_result(type_, None).is_ok(),
         },
+        Some(TypeData::Object(_)) => {
+            matches!(property_object_alias_projection(store, type_), Ok(Some(_)))
+        }
         _ => false,
     }
 }
@@ -1226,6 +1411,29 @@ fn validate_instantiable_member_type_worker(
             }
         }
         TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
+        TypeData::Object(_) => {
+            let projection = property_object_alias_projection(store, type_)
+                .map_err(|_| InstantiationError::InvalidType(type_))?
+                .ok_or(InstantiationError::UnsupportedType(type_))?;
+            let identity_arguments = if projection.arguments == projection.identity_arguments {
+                &[][..]
+            } else {
+                projection.identity_arguments.as_slice()
+            };
+            projection
+                .arguments
+                .iter()
+                .chain(identity_arguments)
+                .try_for_each(|argument| {
+                    validate_instantiable_member_type_worker(
+                        store,
+                        *argument,
+                        mapper_parameters,
+                        array_targets,
+                        active,
+                    )
+                })
+        }
         TypeData::IndexedAccess(indexed) => {
             if record.flags() != TypeFlags::INDEXED_ACCESS
                 || record.symbol().is_some()
@@ -1416,16 +1624,17 @@ fn instantiated_member_type_matches_worker(
             array_targets,
         )
         .map(|expected| expected == Some(actual)),
-        TypeData::TemplateLiteral(_) | TypeData::StringMapping(_) | TypeData::IndexedAccess(_) => {
-            cached_instantiated_member_type(
-                store,
-                template,
-                mapper,
-                array_targets,
-                &mut HashSet::new(),
-            )
-            .map(|expected| expected == Some(actual))
-        }
+        TypeData::TemplateLiteral(_)
+        | TypeData::StringMapping(_)
+        | TypeData::IndexedAccess(_)
+        | TypeData::Object(_) => cached_instantiated_member_type(
+            store,
+            template,
+            mapper,
+            array_targets,
+            &mut HashSet::new(),
+        )
+        .map(|expected| expected == Some(actual)),
         TypeData::Union(_) => {
             instantiated_member_union_matches(store, template, actual, mapper, array_targets)
         }
@@ -1777,6 +1986,62 @@ fn cached_instantiated_type_worker(
                 Err(InstantiationError::UnsupportedType(template))
             }
         }
+        TypeData::Object(_) => {
+            let projection = property_object_alias_projection(store, template)
+                .map_err(|_| InstantiationError::InvalidType(template))?
+                .ok_or(InstantiationError::UnsupportedType(template))?;
+            if !could_contain_installed_type_variables(store, template, array_targets)? {
+                return Ok(Some(template));
+            }
+            let mut arguments = Vec::with_capacity(projection.arguments.len());
+            for argument in &projection.arguments {
+                let mapped = if projection.mapper.is_none() {
+                    cached_apply_mapping(store, *argument, mapping, array_targets)?
+                } else {
+                    cached_instantiated_type_worker(
+                        store,
+                        *argument,
+                        mapping,
+                        array_targets,
+                        None,
+                        active,
+                    )?
+                };
+                let Some(mapped) = mapped else {
+                    return Ok(None);
+                };
+                arguments.push(mapped);
+            }
+            let (identity_symbol, identity_arguments) =
+                if let Some((symbol, arguments)) = alias_override {
+                    (symbol, arguments.to_vec())
+                } else if projection.arguments == projection.identity_arguments {
+                    (projection.identity_symbol, arguments.clone())
+                } else {
+                    let mut arguments = Vec::with_capacity(projection.identity_arguments.len());
+                    for argument in &projection.identity_arguments {
+                        let Some(mapped) = cached_instantiated_type_worker(
+                            store,
+                            *argument,
+                            mapping,
+                            array_targets,
+                            None,
+                            active,
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        arguments.push(mapped);
+                    }
+                    (projection.identity_symbol, arguments)
+                };
+            cached_property_object_alias_instance(
+                store,
+                &projection,
+                &arguments,
+                (identity_symbol, &identity_arguments),
+            )
+        }
         TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if let Some(targets) = array_targets {
                 store.canonical_array_reference_with_targets(targets, template)?;
@@ -2083,6 +2348,282 @@ fn instantiated_member_union_matches(
     .map(|expected| expected == Some(actual))
 }
 
+fn cached_property_object_alias_instance(
+    store: &CanonicalTypeMapperStore,
+    source: &PropertyObjectAliasProjection,
+    arguments: &[TypeId],
+    identity: (SemanticSymbolId, &[TypeId]),
+) -> Result<Option<TypeId>, InstantiationError> {
+    if arguments.len() != source.parameters.len() {
+        return Err(InstantiationError::InvalidType(source.type_));
+    }
+    validate_property_object_alias_arguments(store, arguments)
+        .map_err(|_| InstantiationError::UnsupportedType(source.type_))?;
+    let identity_source = property_object_alias_identity_source_header(store, identity.0)
+        .map_err(|_| InstantiationError::InvalidType(source.type_))?;
+    if identity_source.parameters.len() != identity.1.len() {
+        return Err(InstantiationError::UnsupportedType(source.type_));
+    }
+    validate_property_object_alias_arguments(store, identity.1)
+        .map_err(|_| InstantiationError::UnsupportedType(source.type_))?;
+    if arguments == source.arguments
+        && identity.0 == source.identity_symbol
+        && identity.1 == source.identity_arguments
+    {
+        return Ok(Some(source.type_));
+    }
+    let Some(alias_id) = store.symbol_store().assigned_global_symbol_id(identity.0) else {
+        return Ok(None);
+    };
+    let key = type_alias_instantiation_cache_key(arguments, Some((alias_id, identity.1)));
+    let Some(cached) = store.relation_object_instantiation(source.target, key) else {
+        return Ok(None);
+    };
+    let actual = property_object_alias_projection(store, cached)
+        .map_err(|_| InstantiationError::InvalidType(cached))?
+        .ok_or(InstantiationError::InvalidType(cached))?;
+    if actual.target != source.target
+        || actual.alias_symbol != source.alias_symbol
+        || actual.parameters != source.parameters
+        || actual.arguments != arguments
+        || actual.identity_symbol != identity.0
+        || actual.identity_arguments != identity.1
+    {
+        return Err(InstantiationError::InvalidType(cached));
+    }
+    Ok(Some(cached))
+}
+
+/// Keeps the original anonymous target and maps its ordered outer parameters.
+/// Property symbols and their value types are resolved by member demand.
+#[allow(clippy::too_many_lines)] // Argument mapping, exact cache identity, and recovery publication are one operation.
+fn instantiate_property_object_alias(
+    store: &mut CanonicalTypeMapperStore,
+    source: &PropertyObjectAliasProjection,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    let error_type = store
+        .intrinsic_bootstrap()
+        .ok_or(InstantiationError::InvalidType(source.type_))?
+        .error_type;
+    let (inherited_physical, inherited_identity) =
+        if let Some(recovery) = store.property_object_alias_recovery(source.type_) {
+            if recovery.result() != source.type_ || !recovery.matches_current_result(store) {
+                return Err(InstantiationError::InvalidType(source.type_));
+            }
+            (
+                (0..source.arguments.len())
+                    .map(|index| recovery.physical_slot_recovered(index))
+                    .collect::<Vec<_>>(),
+                (0..source.identity_arguments.len())
+                    .map(|index| recovery.identity_slot_recovered(index))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                vec![false; source.arguments.len()],
+                vec![false; source.identity_arguments.len()],
+            )
+        };
+    let mut arguments = Vec::with_capacity(source.arguments.len());
+    let mut physical_recovery = Vec::with_capacity(source.arguments.len());
+    for (index, argument) in source.arguments.iter().enumerate() {
+        let mark = session.limit_event_mark();
+        let mapped = if source.mapper.is_none() {
+            apply_mapping(store, *argument, mapping, array_targets, session)?
+        } else {
+            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?
+        };
+        physical_recovery.push(recovered_property_alias_argument(
+            session,
+            mark,
+            error_type,
+            *argument,
+            mapped,
+            inherited_physical[index],
+        )?);
+        arguments.push(mapped);
+    }
+    let mut identity_recovery = Vec::new();
+    let (identity_symbol, identity_arguments) = if let Some((symbol, arguments)) = alias_override {
+        identity_recovery.resize(arguments.len(), false);
+        (symbol, arguments.to_vec())
+    } else {
+        let mut arguments = Vec::with_capacity(source.identity_arguments.len());
+        identity_recovery.reserve(source.identity_arguments.len());
+        for (index, argument) in source.identity_arguments.iter().enumerate() {
+            let mark = session.limit_event_mark();
+            let mapped = instantiate_type_with_alias(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                session,
+            )?;
+            identity_recovery.push(recovered_property_alias_argument(
+                session,
+                mark,
+                error_type,
+                *argument,
+                mapped,
+                inherited_identity[index],
+            )?);
+            arguments.push(mapped);
+        }
+        (source.identity_symbol, arguments)
+    };
+    if let Some(cached) = cached_property_object_alias_instance(
+        store,
+        source,
+        &arguments,
+        (identity_symbol, &identity_arguments),
+    )? {
+        return Ok(cached);
+    }
+
+    let has_recovery = physical_recovery
+        .iter()
+        .chain(&identity_recovery)
+        .any(|marked| *marked);
+    if has_recovery && !store.try_reserve_property_object_alias_recoveries() {
+        return Err(LiteralTypeCacheError::Capacity.into());
+    }
+
+    let global_alias = store
+        .global_symbol_id(identity_symbol)
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    let global_source_alias = store
+        .global_symbol_id(source.alias_symbol)
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    let key =
+        type_alias_instantiation_cache_key(&arguments, Some((global_alias, &identity_arguments)));
+    let identity_key = type_alias_instantiation_cache_key(
+        &source.parameters,
+        Some((global_source_alias, &source.parameters)),
+    );
+    let Some(TypeData::Object(target)) = store.type_payload(source.target).map(TypeRecord::data)
+    else {
+        return Err(InstantiationError::InvalidType(source.target));
+    };
+    let mut new_cache = if matches!(target.instantiations, TypeCacheState::Unallocated) {
+        let mut entries = HashMap::new();
+        entries
+            .try_reserve(2)
+            .map_err(|_| LiteralTypeCacheError::Capacity)?;
+        entries.insert(identity_key, source.target);
+        Some(entries)
+    } else {
+        if !store.try_reserve_object_instantiations(source.target, 1) {
+            return Err(LiteralTypeCacheError::Capacity.into());
+        }
+        None
+    };
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_type_aliases(1)
+        || !store.try_reserve_mappers(1)
+        || !store.try_reserve_type_node_links(1)
+    {
+        return Err(LiteralTypeCacheError::Capacity.into());
+    }
+    let mut links = store
+        .type_node_links(source.declaration)
+        .cloned()
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    let mapper = store
+        .new_type_mapper(source.parameters.clone(), arguments.clone())
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    let propagating_flags = identity_arguments
+        .iter()
+        .fold(ObjectFlags::NONE, |flags, argument| {
+            flags
+                | store
+                    .type_payload(*argument)
+                    .expect("the alias argument proof checked every type")
+                    .object_flags()
+                    & ObjectFlags::PROPAGATING_FLAGS
+        });
+    let alias = store
+        .alloc_type_alias(Some(identity_symbol))
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    if !store.set_type_alias_arguments(
+        alias,
+        (!identity_arguments.is_empty()).then(|| identity_arguments.clone()),
+    ) {
+        return Err(InstantiationError::InvalidAlias(alias));
+    }
+    let instantiated = store
+        .alloc_plain_object_type(
+            ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED | propagating_flags,
+            Some(source.source_symbol),
+        )
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    if !store.set_type_alias(instantiated, Some(alias))
+        || !store.set_object_target_and_mapper(instantiated, Some(source.target), Some(mapper))
+    {
+        return Err(InstantiationError::InvalidType(instantiated));
+    }
+    if let Some(entries) = new_cache.as_mut() {
+        entries.insert(key, instantiated);
+    }
+    if let Some(entries) = new_cache {
+        if !store.set_object_instantiations(source.target, TypeCacheState::Allocated(entries)) {
+            return Err(InstantiationError::InvalidType(source.target));
+        }
+    } else if store.insert_object_instantiation(source.target, key, instantiated)
+        != Some(instantiated)
+    {
+        return Err(InstantiationError::InvalidType(source.target));
+    }
+    if links.outer_type_parameters.is_none() {
+        links.outer_type_parameters = Some(source.parameters.clone());
+        if !store.set_type_node_links(source.declaration, links) {
+            return Err(InstantiationError::InvalidType(source.target));
+        }
+    }
+    if has_recovery
+        && !store.publish_property_object_alias_recovery(PropertyObjectAliasRecovery {
+            result: instantiated,
+            target: source.target,
+            declaration: source.declaration,
+            source_symbol: source.source_symbol,
+            alias_symbol: source.alias_symbol,
+            parameters: source.parameters.clone(),
+            mapper,
+            arguments,
+            identity: alias,
+            identity_symbol,
+            identity_arguments,
+            error_type,
+            physical_recovery,
+            identity_recovery,
+        })
+    {
+        return Err(InstantiationError::InvalidType(instantiated));
+    }
+    Ok(instantiated)
+}
+
+fn recovered_property_alias_argument(
+    session: &InstantiationSession,
+    mark: InstantiationLimitEventMark,
+    error_type: TypeId,
+    source: TypeId,
+    result: TypeId,
+    inherited: bool,
+) -> Result<bool, InstantiationError> {
+    let recovered = session.limit_event_occurred_since(mark);
+    if recovered && session.recovery_error_type() != Some(error_type) {
+        return Err(InstantiationError::InvalidRecoveryType(
+            session.recovery_error_type().unwrap_or(error_type),
+        ));
+    }
+    Ok(result == error_type && (recovered || inherited && source == result))
+}
+
 enum InstantiationWork {
     TypeParameter,
     Identity,
@@ -2097,6 +2638,7 @@ enum InstantiationWork {
     Union,
     Intersection(DeferredIntersectionTypeProjection),
     TypeReference,
+    PropertyObjectAlias(PropertyObjectAliasProjection),
     IndexedAccess {
         object: TypeId,
         index: TypeId,
@@ -2154,6 +2696,12 @@ fn instantiate_type_worker(
                 InstantiationWork::TypeReference
             }
             TypeData::Interface(_) => InstantiationWork::Identity,
+            TypeData::Object(_) => match property_object_alias_projection(store, type_)
+                .map_err(|_| InstantiationError::InvalidType(type_))?
+            {
+                Some(projection) => InstantiationWork::PropertyObjectAlias(projection),
+                None => InstantiationWork::Unsupported,
+            },
             _ => InstantiationWork::Unsupported,
         }
     };
@@ -2269,6 +2817,14 @@ fn instantiate_type_worker(
         InstantiationWork::TypeReference => {
             instantiate_reference(store, type_, mapping, array_targets, session)
         }
+        InstantiationWork::PropertyObjectAlias(projection) => instantiate_property_object_alias(
+            store,
+            &projection,
+            mapping,
+            array_targets,
+            alias,
+            session,
+        ),
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
     }
 }

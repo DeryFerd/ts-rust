@@ -541,8 +541,8 @@ fn origin_type_parameter_object_flags(flags: ObjectFlags) -> bool {
                 | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
 }
 
-pub(super) fn cached_ordinary_type_parameter_owner(
-    store: &SemanticStore<TypeRecord, TypeMapper>,
+pub(super) fn cached_ordinary_type_parameter_owner<M>(
+    store: &SemanticStore<TypeRecord, M>,
     declared_type: TypeId,
 ) -> Option<SemanticSymbolId> {
     let record = store.type_payload(declared_type)?;
