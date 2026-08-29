@@ -215,3 +215,56 @@ fn contextual_conditional_array_literals_keep_literal_types() {
         assert_contextual_conditional_array(name, source, codes, types);
     }
 }
+
+#[test]
+fn contextual_conditional_arrays_check_variable_conditions() {
+    for (name, source, codes, types) in [
+        (
+            "variable-context",
+            "declare const flag: boolean;\nconst values: string[] = [flag ? \"a\" : \"b\"];\n",
+            &[][..],
+            &[
+                ">[flag ? \"a\" : \"b\"] : string[]\r\n",
+                ">flag ? \"a\" : \"b\" : \"a\" | \"b\"\r\n",
+            ][..],
+        ),
+        (
+            "variable-literal-context",
+            "declare const flag: boolean;\nconst values: (\"a\" | \"b\")[] = [flag ? \"a\" : \"b\"];\n",
+            &[][..],
+            &[
+                ">[flag ? \"a\" : \"b\"] : (\"a\" | \"b\")[]\r\n",
+                ">flag ? \"a\" : \"b\" : \"a\" | \"b\"\r\n",
+            ][..],
+        ),
+        (
+            "variable-wrong-branch",
+            "declare const flag: boolean;\nconst values: string[] = [flag ? \"a\" : 1];\n",
+            &[2322][..],
+            &[
+                ">[flag ? \"a\" : 1] : (string | number)[]\r\n",
+                ">flag ? \"a\" : 1 : \"a\" | 1\r\n",
+            ][..],
+        ),
+        (
+            "variable-undefined",
+            "declare const flag: boolean;\nconst values: string[] = [flag ? \"a\" : undefined];\n",
+            &[2322][..],
+            &[
+                ">[flag ? \"a\" : undefined] : (string | undefined)[]\r\n",
+                ">flag ? \"a\" : undefined : \"a\" | undefined\r\n",
+            ][..],
+        ),
+        (
+            "variable-optional",
+            "declare const flag: boolean;\nconst values: (string | undefined)[] = [flag ? \"a\" : undefined];\n",
+            &[][..],
+            &[
+                ">[flag ? \"a\" : undefined] : (string | undefined)[]\r\n",
+                ">flag ? \"a\" : undefined : \"a\" | undefined\r\n",
+            ][..],
+        ),
+    ] {
+        assert_contextual_conditional_array(name, source, codes, types);
+    }
+}

@@ -29267,15 +29267,6 @@ fn check_expression_type_with_class_context(
             ))
         }
         PlannedExpressionKind::Conditional(conditional) => {
-            if contextual_type.is_some()
-                && !conditional.direct_return
-                && !matches!(
-                    conditional.condition.unparenthesized().kind,
-                    PlannedExpressionKind::Boolean(_)
-                )
-            {
-                return Err(SourceCheckError::Conditional(conditional.node));
-            }
             let condition = if conditional.condition_expectation
                 == ConditionalScalarExpectation::Error
                 || conditional.condition_expectation == ConditionalScalarExpectation::Dynamic
@@ -102893,47 +102884,52 @@ class Foo2 {
     fn contextual_conditional_arrays_replay_without_child_links() {
         let library = parsed("interface Array<T> {}");
         let library_file = FileId::new(9_890);
-        let source = parsed("const values: (\"a\" | \"b\")[] = [true ? \"a\" : \"b\"];");
-        let file = FileId::new(9_891);
-        let mut context = context(
-            &[(library_file, &library), (file, &source)],
-            CanonicalCheckerOptions::default(),
-        );
-        let array = variable_initializer(&source, file, "values");
-        let elements = array_elements(&source, file, array);
-        let [conditional] = elements.as_slice() else {
-            panic!("expected one conditional array element")
-        };
-        let NodeData::ConditionalExpression(data) =
-            &source.arena.get(conditional.node).unwrap().data
-        else {
-            unreachable!()
-        };
-        let children = [data.condition, data.when_true, data.when_false]
-            .map(|node| NodeRef::new(source.arena.id(), file, node));
+        for text in [
+            "const values: (\"a\" | \"b\")[] = [true ? \"a\" : \"b\"];",
+            "declare const flag: boolean; const values: (\"a\" | \"b\")[] = [flag ? \"a\" : \"b\"];",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(9_891);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let array = variable_initializer(&source, file, "values");
+            let elements = array_elements(&source, file, array);
+            let [conditional] = elements.as_slice() else {
+                panic!("expected one conditional array element")
+            };
+            let NodeData::ConditionalExpression(data) =
+                &source.arena.get(conditional.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let children = [data.condition, data.when_true, data.when_false]
+                .map(|node| NodeRef::new(source.arena.id(), file, node));
 
-        context.check_source_file(file).unwrap();
-        assert!(context.diagnostics().is_empty());
-        assert_eq!(
-            context
-                .type_to_string(resolved_node_type(&context, array))
-                .unwrap(),
-            "(\"a\" | \"b\")[]",
-        );
-        assert_eq!(
-            context
-                .type_to_string(resolved_node_type(&context, *conditional))
-                .unwrap(),
-            "\"a\" | \"b\"",
-        );
-        for child in children {
-            assert!(context.store().type_node_links(child).is_none());
-        }
-        let warm = observable_state(&context, file);
-        context.recheck_source_file(file).unwrap();
-        assert_eq!(observable_state(&context, file), warm);
-        for child in children {
-            assert!(context.store().type_node_links(child).is_none());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, array))
+                    .unwrap(),
+                "(\"a\" | \"b\")[]",
+            );
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, *conditional))
+                    .unwrap(),
+                "\"a\" | \"b\"",
+            );
+            for child in children {
+                assert!(context.store().type_node_links(child).is_none());
+            }
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            for child in children {
+                assert!(context.store().type_node_links(child).is_none());
+            }
         }
     }
 
