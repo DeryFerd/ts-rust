@@ -305,8 +305,8 @@ use super::{
         plan_source_for_of_statement_syntax, plan_source_function_for_in_statement_syntax,
         plan_source_function_for_of_statement_syntax, plan_source_function_statements_syntax,
         plan_source_joined_function_statements_syntax, plan_source_labeled_for_in_statement_syntax,
-        plan_source_linear_function_statements_syntax, plan_source_loop_function_statements_syntax,
-        plan_source_switch_function_statements_syntax,
+        plan_source_linear_function_statements_syntax, plan_source_linear_logical_statement_syntax,
+        plan_source_loop_function_statements_syntax, plan_source_switch_function_statements_syntax,
         plan_source_typeof_switch_function_statements_syntax,
         plan_source_unused_iteration_statement_syntax,
         plan_source_void_switch_function_statements_syntax, source_control_branch_is_empty,
@@ -771,6 +771,7 @@ pub(super) struct LogicalBinaryPlan {
     operator: SyntaxKind,
     right: PlannedExpression,
     parent: Option<DirectBinaryParent>,
+    required_property_statement: bool,
 }
 
 /// Fully preflighted conditional initializer, object spread, or function return.
@@ -13412,6 +13413,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let mut locals = Vec::with_capacity(local_syntax.len());
         let mut statements = Vec::with_capacity(statement_syntax.len());
+        let mut logical_statements = Vec::new();
         let mut expected_locals = local_syntax.into_iter();
         for statement in statement_syntax {
             match statement {
@@ -13474,7 +13476,52 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         continue;
                     }
                     self.primitive_binary_position_roots.insert(expression);
-                    let expression = self.plan_expression(expression)?;
+                    let mut expression = self.plan_expression(expression)?;
+                    if let PlannedExpressionKind::Logical(binary) = &mut expression.kind {
+                        let syntax = plan_source_linear_logical_statement_syntax(
+                            self.arena,
+                            self.bound,
+                            statement,
+                            callable.declaration,
+                        )
+                        .map_err(|error| Self::function_statements_plan_error(callable, error))?;
+                        let (
+                            PlannedExpressionKind::Property(left),
+                            PlannedExpressionKind::Call(call),
+                        ) = (&binary.left.kind, &binary.right.kind)
+                        else {
+                            return Err(Self::unsupported_function_body(callable));
+                        };
+                        let PlannedExpressionKind::Property(right) = &call.callee.kind else {
+                            return Err(Self::unsupported_function_body(callable));
+                        };
+                        let (
+                            PlannedExpressionKind::Identifier(left_read),
+                            PlannedExpressionKind::Identifier(right_read),
+                        ) = (&left.receiver.kind, &right.receiver.kind)
+                        else {
+                            return Err(Self::unsupported_function_body(callable));
+                        };
+                        if binary.node != syntax.expression
+                            || binary.left.node != syntax.left
+                            || binary.right.node != syntax.right
+                            || call.callee.node != syntax.callee
+                            || left.receiver.node != syntax.left_receiver
+                            || right.receiver.node != syntax.right_receiver
+                            || left_read.kind != PlannedIdentifierReadKind::Variable
+                            || right_read.kind != PlannedIdentifierReadKind::Variable
+                            || left_read.value_symbol != right_read.value_symbol
+                            || !call
+                                .arguments
+                                .iter()
+                                .map(|argument| argument.node)
+                                .eq(syntax.arguments.iter().copied())
+                        {
+                            return Err(Self::unsupported_function_body(callable));
+                        }
+                        binary.required_property_statement = true;
+                        logical_statements.push(syntax);
+                    }
                     statements.push(PlannedLinearFunctionStatement::Expression {
                         statement,
                         expression: Box::new(expression),
@@ -13553,16 +13600,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some((store, _)) = self.semantic else {
             return Err(Self::unsupported_function_body(callable));
         };
-        let flow = SourceFlowPlan::preflight_linear(
-            self.arena,
-            self.bound,
-            store,
-            callable.declaration,
-            points,
-            assignments,
-            parameter_assignments,
-            calls,
-        )
+        let flow = if logical_statements.is_empty() {
+            SourceFlowPlan::preflight_linear(
+                self.arena,
+                self.bound,
+                store,
+                callable.declaration,
+                points,
+                assignments,
+                parameter_assignments,
+                calls,
+            )
+        } else {
+            SourceFlowPlan::preflight_linear_with_logical_statements(
+                self.arena,
+                self.bound,
+                store,
+                callable.declaration,
+                points,
+                assignments,
+                parameter_assignments,
+                calls,
+                logical_statements,
+            )
+        }
         .map_err(|error| Self::source_flow_plan_error(callable, error))?;
 
         Ok(PlannedLinearFunctionStatements {
@@ -13800,6 +13861,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let target = self.reference(binary.left);
         let right = self.reference(binary.right);
         let operator = self.reference(binary.operator_token);
+        if self.node(operator)?.kind == SyntaxKind::AmpersandAmpersandToken {
+            // The statement syntax proof owns this non-assignment form.
+            return Ok(None);
+        }
         let target_record = self.node(target)?;
         let NodeData::Identifier(identifier) = &target_record.data else {
             return Err(Self::unsupported_function_body(callable));
@@ -23806,6 +23871,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 operator: operator_kind,
                 right: right_plan,
                 parent: None,
+                required_property_statement: false,
             }))
         } else {
             PlannedExpressionKind::Binary(Box::new(PrimitiveBinaryPlan {
@@ -30455,6 +30521,15 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
+            let required_property = if binary.required_property_statement {
+                Some(validate_required_property_logical_read(
+                    store,
+                    binary,
+                    left.result,
+                )?)
+            } else {
+                None
+            };
             let narrowed_flow_types = narrow_logical_right_flow_types(
                 store,
                 host,
@@ -30485,6 +30560,9 @@ fn check_expression_type_with_capture_context(
                 class_flow.as_deref_mut(),
                 arrow_capture,
             )?;
+            if let Some(property) = required_property {
+                validate_required_property_logical_call(store, binary, property, left.result)?;
+            }
             emit_logical_grammar_diagnostic(diagnostics, binary)?;
             emit_logical_operand_diagnostics(store, host, diagnostics, binary, left.result)?;
             let resolution = check_logical_binary(
@@ -34647,6 +34725,120 @@ fn validate_conditional_scalar_expectation(
             }
         }
     }
+}
+
+fn required_property_logical_parts(
+    binary: &LogicalBinaryPlan,
+) -> Result<(&SourcePropertyPlan, &SourcePropertyPlan), SourceCheckError> {
+    let invalid = || SourceCheckError::LogicalOperator(binary.node);
+    if !binary.required_property_statement
+        || binary.operator != SyntaxKind::AmpersandAmpersandToken
+        || binary.parent.is_some()
+    {
+        return Err(invalid());
+    }
+    let (PlannedExpressionKind::Property(left), PlannedExpressionKind::Call(call)) =
+        (&binary.left.kind, &binary.right.kind)
+    else {
+        return Err(invalid());
+    };
+    let PlannedExpressionKind::Property(right) = &call.callee.kind else {
+        return Err(invalid());
+    };
+    let (
+        PlannedExpressionKind::Identifier(left_read),
+        PlannedExpressionKind::Identifier(right_read),
+    ) = (&left.receiver.kind, &right.receiver.kind)
+    else {
+        return Err(invalid());
+    };
+    if left_read.kind != PlannedIdentifierReadKind::Variable
+        || right_read.kind != PlannedIdentifierReadKind::Variable
+        || left_read.value_symbol != right_read.value_symbol
+    {
+        return Err(invalid());
+    }
+    Ok((left, right))
+}
+
+/// This statement scope does not yet carry property-reference narrowing facts.
+fn validate_required_property_logical_read(
+    store: &CanonicalTypeMapperStore,
+    binary: &LogicalBinaryPlan,
+    read_type: TypeId,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let unsupported = || {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node: binary.node,
+            kind: SyntaxKind::BinaryExpression,
+            role: SourceSyntaxRole::BinaryExpression,
+        })
+    };
+    let (left, _) = required_property_logical_parts(binary)?;
+    let record = store
+        .type_payload(read_type)
+        .ok_or(SourceCheckError::Property(left.node))?;
+    let flags = record.flags();
+    // Object and symbol reads are already truthy. Broad scalar types cannot
+    // represent their nonzero/nonempty subset and keep their existing type.
+    let unchanged_read = flags
+        .intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE | TypeFlags::ES_SYMBOL_LIKE)
+        || matches!(
+            flags,
+            TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT
+        );
+    if !unchanged_read
+        || flags.intersects(
+            TypeFlags::ANY
+                | TypeFlags::UNKNOWN
+                | TypeFlags::NULLABLE
+                | TypeFlags::VOID
+                | TypeFlags::UNION
+                | TypeFlags::INTERSECTION
+                | TypeFlags::INSTANTIABLE,
+        )
+    {
+        return Err(unsupported());
+    }
+    let symbol = store
+        .symbol_node_links(left.node)
+        .and_then(|links| links.resolved_symbol)
+        .ok_or(SourceCheckError::Property(left.node))?;
+    let member = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Property(left.node))?;
+    if member
+        .flags()
+        .intersects(SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR)
+        || !member
+            .flags()
+            .intersects(SymbolFlags::PROPERTY | SymbolFlags::METHOD)
+    {
+        return Err(unsupported());
+    }
+    Ok(symbol)
+}
+
+fn validate_required_property_logical_call(
+    store: &CanonicalTypeMapperStore,
+    binary: &LogicalBinaryPlan,
+    property: SemanticSymbolId,
+    read_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    let (_, right) = required_property_logical_parts(binary)?;
+    if store
+        .symbol_node_links(right.node)
+        .and_then(|links| links.resolved_symbol)
+        != Some(property)
+        || store.type_node_links(right.node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(read_type),
+                ..TypeNodeLinks::default()
+            })
+    {
+        return Err(SourceCheckError::Property(right.node));
+    }
+    Ok(())
 }
 
 fn narrow_logical_right_flow_types(
@@ -65692,6 +65884,139 @@ mod tests {
             is_type_checked(context, file),
             context.diagnostics().len(),
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both coherent cache poisons and exact restores together.
+    fn linear_required_property_logical_statements_reject_paired_warm_caches() {
+        let source = parsed(concat!(
+            "type Sink = { send: (value: string) => void; other: (value: number) => number }; ",
+            "function emit(sink: Sink, value: string): void { sink.send && sink.send(value); } ",
+            "function alternate(sink: Sink, value: number): void { sink.other && sink.other(value); }",
+        ));
+        let file = FileId::new(45_310);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let mut binaries = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(&record.data, NodeData::BinaryExpression(binary)
+                if source.arena.get(binary.operator_token).unwrap().kind
+                    == SyntaxKind::AmpersandAmpersandToken)
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        binaries.sort_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [first, second] = binaries.as_slice() else {
+            panic!("both controls retain one logical statement")
+        };
+        let call_nodes = |node: NodeRef| {
+            let NodeData::BinaryExpression(binary) = &source.arena.get(node.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let NodeData::CallExpression(call) = &source.arena.get(binary.right).unwrap().data
+            else {
+                unreachable!()
+            };
+            (
+                NodeRef::new(node.arena, node.file, call.expression),
+                NodeRef::new(node.arena, node.file, binary.right),
+            )
+        };
+        let (callee, call) = call_nodes(*first);
+        let (other_callee, other_call) = call_nodes(*second);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let original = observable_state(&context, file);
+        let callee_type = context.store().type_node_links(callee).unwrap().clone();
+        let callee_symbol = context.store().symbol_node_links(callee).unwrap().clone();
+        let call_type = context.store().type_node_links(call).unwrap().clone();
+        let call_signature = context.store().signature_links(call).unwrap().clone();
+        let other_callee_type = context
+            .store()
+            .type_node_links(other_callee)
+            .unwrap()
+            .clone();
+        let other_callee_symbol = context
+            .store()
+            .symbol_node_links(other_callee)
+            .unwrap()
+            .clone();
+        let other_call_type = context.store().type_node_links(other_call).unwrap().clone();
+        let other_signature = context.store().signature_links(other_call).unwrap().clone();
+        assert_ne!(callee_type, other_callee_type);
+        assert_ne!(callee_symbol, other_callee_symbol);
+        assert_ne!(call_type, other_call_type);
+        assert_ne!(call_signature, other_signature);
+
+        for poison_call in [false, true] {
+            mark_source_unchecked(&mut context, file);
+            if poison_call {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(call, other_call_type.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_links(call, other_signature.clone())
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(callee, other_callee_type.clone())
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(callee, other_callee_symbol.clone())
+                );
+            }
+            let before = observable_state(&context, file);
+            let store_before = format!("{:?}", context.store());
+            let expected = if poison_call {
+                SourceCheckError::Call(call)
+            } else {
+                SourceCheckError::Property(callee)
+            };
+            for _ in 0..2 {
+                assert_eq!(context.check_source_file(file), Err(expected.clone()));
+                assert_eq!(observable_state(&context, file), before);
+                assert_eq!(format!("{:?}", context.store()), store_before);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(callee, callee_type.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(callee, callee_symbol.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(call, call_type.clone())
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_links(call, call_signature.clone())
+            );
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), original);
+            assert_eq!(context.store().type_node_links(callee), Some(&callee_type));
+            assert_eq!(
+                context.store().symbol_node_links(callee),
+                Some(&callee_symbol)
+            );
+            assert_eq!(context.store().type_node_links(call), Some(&call_type));
+            assert_eq!(context.store().signature_links(call), Some(&call_signature));
+        }
     }
 
     fn type_reference_nodes(parsed: &ParseResult, file: FileId, expected: &str) -> Vec<NodeRef> {

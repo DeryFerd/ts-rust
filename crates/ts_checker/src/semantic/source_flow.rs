@@ -19,7 +19,8 @@ use std::{
 };
 
 use ts_ast::{
-    FlowFlags, FlowNode, FlowNodePayload, FlowRef, NodeArena, NodeData, NodeRef, SyntaxKind,
+    FlowFlags, FlowNode, FlowNodeArena, FlowNodeId, FlowNodePayload, FlowRef, NodeArena,
+    NodeArenaRevision, NodeData, NodeRef, SyntaxKind,
 };
 use ts_binder::{
     BoundFile, BoundFlowGraph, CanonicalNameResolver, CanonicalResolutionLocation,
@@ -41,6 +42,9 @@ use super::{
     source_properties::{
         ClassAccessContext, SourceClassPropertyWritePlan, SourcePropertyError,
         plan_class_property_write, validate_class_property_write_access,
+    },
+    source_statements::{
+        SourceLinearLogicalStatementSyntax, plan_source_linear_logical_statement_syntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -297,8 +301,30 @@ pub(super) struct SourceFlowPlan {
     assignment_order: Vec<NodeRef>,
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     calls: HashMap<NodeRef, NodeRef>,
+    logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
+}
+
+/// The detached logical join proves both condition edges, but is not an exit.
+#[derive(Clone, Debug)]
+struct SourceLogicalStatementFlow {
+    syntax: SourceLinearLogicalStatementSyntax,
+    revision: NodeArenaRevision,
+    block_scope: NodeRef,
+    entry: FlowRef,
+    rows: SourceLogicalStatementRows,
+    source_points: Vec<(NodeRef, Option<FlowRef>)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceLogicalStatementRows {
+    left_true: FlowRef,
+    left_false: FlowRef,
+    right_true: FlowRef,
+    right_false: FlowRef,
+    pre_right: FlowRef,
+    join: FlowRef,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -396,6 +422,7 @@ pub(super) enum SourceFlowInvariant {
     InvalidParameterAssignment(NodeRef),
     InvalidArrayMutation(NodeRef),
     InvalidCall(NodeRef),
+    InvalidLogicalStatement(NodeRef),
     InvalidDeclarationUse(NodeRef),
     InvalidClassBody(NodeRef),
     InvalidClassProperty(NodeRef),
@@ -502,6 +529,7 @@ struct SourceFlowCoverage {
 struct SourceFlowEffects {
     assignment_declarations: HashMap<NodeRef, NodeRef>,
     calls: HashMap<NodeRef, NodeRef>,
+    logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
     start_container: Option<NodeRef>,
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
@@ -1055,6 +1083,32 @@ impl SourceFlowPlan {
         parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
         calls: impl IntoIterator<Item = NodeRef>,
     ) -> Result<Self, SourceFlowError> {
+        Self::preflight_linear_with_logical_statements(
+            arena,
+            bound,
+            store,
+            container,
+            points,
+            assignments,
+            parameter_assignments,
+            calls,
+            [],
+        )
+    }
+
+    /// Also proves the detached branches of bounded logical expression statements.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_linear_with_logical_statements(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        container: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
+        calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
+    ) -> Result<Self, SourceFlowError> {
         if bound.node_arena_id() != arena.id()
             || bound.node_arena_revision() != arena.revision()
             || !container.is_for(arena.id(), bound.file_id())
@@ -1085,6 +1139,16 @@ impl SourceFlowPlan {
             }
         }
 
+        let mut conditions = Vec::new();
+        for syntax in logical_statements {
+            let proof = preflight_logical_statement(arena, bound, container, syntax)?;
+            conditions.extend([
+                SourceFlowCondition::Unchanged(proof.syntax.left),
+                SourceFlowCondition::Unchanged(proof.syntax.right),
+            ]);
+            effects.logical_statements.push(proof);
+        }
+
         let expected_start_payload = arena
             .get(container.node)
             .is_some_and(|record| {
@@ -1097,7 +1161,7 @@ impl SourceFlowPlan {
             container,
             expected_start_payload,
             points,
-            [],
+            conditions,
             planned_assignments,
             effects,
         )
@@ -1178,6 +1242,21 @@ impl SourceFlowPlan {
                 true,
             )?;
         }
+        for proof in &effects.logical_statements {
+            for &(point, flow) in &proof.source_points {
+                if flow.is_some() {
+                    insert_flow_point(
+                        bound,
+                        graph,
+                        container,
+                        &mut planned_points,
+                        &mut point_order,
+                        point,
+                        false,
+                    )?;
+                }
+            }
+        }
         let end = match effects.class_body.as_ref() {
             Some(body)
                 if matches!(
@@ -1206,6 +1285,7 @@ impl SourceFlowPlan {
             assignment_order,
             assignment_declarations: effects.assignment_declarations,
             calls: effects.calls,
+            logical_statements: effects.logical_statements,
             class_body: effects.class_body,
             property_assignments: effects.property_assignments,
         };
@@ -1251,6 +1331,36 @@ impl SourceFlowPlan {
             {
                 return Err(SourceFlowInvariant::InvalidParameterAssignment(*target).into());
             }
+        }
+        if !self.logical_statements.is_empty() {
+            for proof in &self.logical_statements {
+                validate_logical_statement(bound, self.container, proof)?;
+                for &(point, flow) in &proof.source_points {
+                    if flow.is_some() && self.points.get(&point).copied() != flow {
+                        return Err(SourceFlowInvariant::InvalidLogicalStatement(
+                            proof.syntax.statement,
+                        )
+                        .into());
+                    }
+                }
+                for expression in [proof.syntax.left, proof.syntax.right] {
+                    if self.conditions.get(&expression)
+                        != Some(&SourceFlowCondition::Unchanged(expression))
+                    {
+                        return Err(SourceFlowInvariant::InvalidLogicalStatement(
+                            proof.syntax.statement,
+                        )
+                        .into());
+                    }
+                }
+            }
+            if self.end != graph.container_end(self.container) {
+                return Err(SourceFlowInvariant::InvalidLogicalStatement(
+                    self.logical_statements[0].syntax.statement,
+                )
+                .into());
+            }
+            self.validate_flow_paths(bound)?;
         }
         Ok(SourceFlowFrame {
             plan: self,
@@ -1305,6 +1415,16 @@ impl SourceFlowPlan {
         }
         if let Some(end) = self.end {
             self.validate_flow(bound, end, 0, &mut validated, &mut visiting, &mut coverage)?;
+        }
+        for proof in &self.logical_statements {
+            self.validate_flow(
+                bound,
+                proof.rows.join,
+                0,
+                &mut validated,
+                &mut visiting,
+                &mut coverage,
+            )?;
         }
         for declaration in self.assignments.keys() {
             if !coverage.assignments.contains(declaration) {
@@ -4102,6 +4222,161 @@ fn plan_constructor_property_assignment(
     }))
 }
 
+fn preflight_logical_statement(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    container: NodeRef,
+    syntax: SourceLinearLogicalStatementSyntax,
+) -> Result<SourceLogicalStatementFlow, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidLogicalStatement(syntax.statement);
+    let actual =
+        plan_source_linear_logical_statement_syntax(arena, bound, syntax.statement, container)
+            .map_err(|_| invalid())?;
+    if actual != syntax || syntax.container != container {
+        return Err(invalid().into());
+    }
+    let entry = bound.flow_at(syntax.statement).ok_or_else(invalid)?;
+    let rows = logical_statement_rows(bound.flow_graph().nodes(), &syntax, entry)?;
+    let block_scope = bound
+        .block_scope_container(syntax.statement)
+        .ok_or_else(invalid)?;
+    let mut source_points = vec![
+        (syntax.statement, Some(entry)),
+        (syntax.expression, None),
+        (syntax.left, Some(entry)),
+        (syntax.left_receiver, Some(entry)),
+        (syntax.left_name, Some(entry)),
+        (syntax.operator, None),
+        (syntax.right, None),
+        (syntax.callee, Some(rows.left_true)),
+        (syntax.right_receiver, Some(rows.left_true)),
+        (syntax.right_name, Some(rows.left_true)),
+    ];
+    for &argument in &syntax.arguments {
+        let record = arena.get(argument.node).ok_or_else(invalid)?;
+        source_points.push((
+            argument,
+            (record.kind == SyntaxKind::Identifier).then_some(rows.left_true),
+        ));
+    }
+    let proof = SourceLogicalStatementFlow {
+        syntax,
+        revision: arena.revision(),
+        block_scope,
+        entry,
+        rows,
+        source_points,
+    };
+    validate_logical_statement(bound, container, &proof)?;
+    Ok(proof)
+}
+
+fn validate_logical_statement(
+    bound: &BoundFile,
+    container: NodeRef,
+    proof: &SourceLogicalStatementFlow,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidLogicalStatement(proof.syntax.statement);
+    let graph = bound.flow_graph();
+    if proof.syntax.container != container
+        || bound.node_arena_revision() != proof.revision
+        || !container.is_for(bound.node_arena_id(), bound.file_id())
+        || !bound.contains(container)
+    {
+        return Err(invalid().into());
+    }
+    validate_container(graph, container)?;
+    for &(node, flow) in &proof.source_points {
+        validate_bound_node(bound, graph, node)?;
+        if bound.container(node) != Some(container)
+            || bound.block_scope_container(node) != Some(proof.block_scope)
+            || bound.flow_at(node) != flow
+        {
+            return Err(invalid().into());
+        }
+        if flow.is_some() {
+            validate_node_container(bound, graph, container, node)?;
+        } else if bound.flow_container(node).is_some() {
+            return Err(invalid().into());
+        }
+    }
+    if bound.flow_at(proof.syntax.statement) != Some(proof.entry)
+        || logical_statement_rows(graph.nodes(), &proof.syntax, proof.entry)? != proof.rows
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+/// Recover labels by their complete source-bound edges, never by allocation IDs.
+fn logical_statement_rows(
+    nodes: &FlowNodeArena,
+    syntax: &SourceLinearLogicalStatementSyntax,
+    entry: FlowRef,
+) -> Result<SourceLogicalStatementRows, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidLogicalStatement(syntax.statement);
+    if nodes.get(entry).is_none() || !syntax.statement.is_for(nodes.node_arena(), nodes.file()) {
+        return Err(invalid().into());
+    }
+    let condition_pair = |expression: NodeRef, antecedent: FlowRef| {
+        let mut true_edge = None;
+        let mut false_edge = None;
+        for (index, row) in nodes.iter().enumerate() {
+            if row.payload != Some(FlowNodePayload::Ast(expression)) {
+                continue;
+            }
+            let flow = FlowRef::new(
+                nodes.node_arena(),
+                nodes.file(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            let slot = match source_flow_kind(flow, row.flags)? {
+                SourceFlowKind::TrueCondition => &mut true_edge,
+                SourceFlowKind::FalseCondition => &mut false_edge,
+                _ => return Err(invalid().into()),
+            };
+            if linear_antecedent(flow, row)? != antecedent || slot.replace(flow).is_some() {
+                return Err(invalid().into());
+            }
+        }
+        Ok::<_, SourceFlowError>((
+            true_edge.ok_or_else(invalid)?,
+            false_edge.ok_or_else(invalid)?,
+        ))
+    };
+    let (left_true, left_false) = condition_pair(syntax.left, entry)?;
+    let (right_true, right_false) = condition_pair(syntax.right, left_true)?;
+    let label = |antecedents: &[FlowRef]| -> Result<FlowRef, SourceFlowError> {
+        let mut matched = None;
+        for (index, row) in nodes.iter().enumerate() {
+            if row.antecedents != antecedents {
+                continue;
+            }
+            let flow = FlowRef::new(
+                nodes.node_arena(),
+                nodes.file(),
+                FlowNodeId(u32::try_from(index).map_err(|_| invalid())?),
+            );
+            if source_flow_kind(flow, row.flags)? != SourceFlowKind::BranchLabel
+                || row.payload.is_some()
+                || row.antecedent.is_some()
+                || matched.replace(flow).is_some()
+            {
+                return Err(invalid().into());
+            }
+        }
+        matched.ok_or_else(|| invalid().into())
+    };
+    Ok(SourceLogicalStatementRows {
+        left_true,
+        left_false,
+        right_true,
+        right_false,
+        pre_right: label(&[left_true])?,
+        join: label(&[left_false, right_true, right_false])?,
+    })
+}
+
 fn validate_node_container(
     bound: &BoundFile,
     graph: &BoundFlowGraph,
@@ -4628,6 +4903,7 @@ mod tests {
             assignment_order: Vec::new(),
             assignment_declarations: HashMap::new(),
             calls: HashMap::new(),
+            logical_statements: Vec::new(),
             class_body: None,
             property_assignments: HashMap::new(),
         };
@@ -5680,6 +5956,297 @@ mod tests {
             .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
             .unwrap();
         assert_eq!(repeated, after_loop);
+    }
+
+    #[test]
+    fn logical_statement_flow_keeps_detached_conditions_and_replays_read_points() {
+        for (index, argument) in ["value", "1", "'text'", "true", "null"]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = parse_source_file(&format!(
+                "function emit(observer: {{next: (value: number) => void}}, value: number): void {{\n\
+                   observer.next && observer.next({argument});\n\
+                   value;\n\
+                 }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(2_410 + u32::try_from(index).unwrap());
+            let mut context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let (function, parameter, statements) = linear_function_nodes(&parsed, file, "emit");
+            let [statement, after] = statements.as_slice() else {
+                panic!("expected a logical statement and a following read")
+            };
+            let syntax = plan_source_linear_logical_statement_syntax(
+                &parsed.arena,
+                &bound,
+                *statement,
+                function,
+            )
+            .unwrap();
+            assert!(matches!(
+                SourceFlowPlan::preflight_linear(
+                    &parsed.arena, &bound, context.store(), function,
+                    [*statement, syntax.callee, *after], [], [], [],
+                ),
+                Err(SourceFlowError::Invariant(SourceFlowInvariant::UnknownCondition(node)))
+                    if node == syntax.left
+            ));
+            assert!(matches!(
+                SourceFlowPlan::preflight_linear(
+                    &parsed.arena, &bound, context.store(), function,
+                    [*statement, *after], [], [], [syntax.right],
+                ),
+                Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidCall(node)))
+                    if node == syntax.right
+            ));
+            let plan = SourceFlowPlan::preflight_linear_with_logical_statements(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                function,
+                [*statement, *after],
+                [],
+                [],
+                [],
+                [syntax.clone()],
+            )
+            .unwrap();
+            let proof = &plan.logical_statements[0];
+            assert_eq!(plan.end, Some(plan.start));
+            assert_eq!(proof.entry, plan.start);
+            assert!(plan.calls.is_empty());
+            assert_eq!(bound.flow_at(syntax.right), None);
+            assert_eq!(
+                bound
+                    .flow_graph()
+                    .nodes()
+                    .get(proof.rows.pre_right)
+                    .unwrap()
+                    .antecedents,
+                [proof.rows.left_true],
+            );
+            assert_eq!(
+                bound
+                    .flow_graph()
+                    .nodes()
+                    .get(proof.rows.join)
+                    .unwrap()
+                    .antecedents,
+                [
+                    proof.rows.left_false,
+                    proof.rows.right_true,
+                    proof.rows.right_false
+                ],
+            );
+            for condition in [syntax.left, syntax.right] {
+                assert_eq!(
+                    plan.conditions.get(&condition),
+                    Some(&SourceFlowCondition::Unchanged(condition))
+                );
+            }
+            let symbol = bound.symbol(parameter).unwrap();
+            let input = context.store().intrinsic_bootstrap().unwrap().unknown_type;
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                let mut frame = plan
+                    .frame(&bound, [(symbol, input)].into_iter().collect())
+                    .unwrap();
+                let entry = frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, *statement)
+                    .unwrap();
+                for &(point, flow) in &proof.source_points {
+                    if flow.is_some() {
+                        assert_eq!(
+                            frame
+                                .snapshot_at(context.store_mut_for_test(), &globals, point)
+                                .unwrap(),
+                            entry,
+                        );
+                    }
+                }
+                assert_eq!(
+                    frame
+                        .snapshot_at(context.store_mut_for_test(), &globals, *after)
+                        .unwrap(),
+                    entry
+                );
+                assert_eq!(entry.type_of(symbol), Some(input));
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn logical_statement_flow_rejects_changed_rows_and_retained_proofs_without_writes() {
+        let parsed = parse_source_file(concat!(
+            "function emit(observer: {next: (value: number) => void}, value: number): void {\n",
+            "  observer.next && observer.next(value);\n",
+            "  value;\n",
+            "}\n",
+            "function other(observer: {next: (value: number) => void}, value: number): void {\n",
+            "  observer.next && observer.next(value);\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_415);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let (function, _, statements) = linear_function_nodes(&parsed, file, "emit");
+        let (other, _, _) = linear_function_nodes(&parsed, file, "other");
+        let syntax = plan_source_linear_logical_statement_syntax(
+            &parsed.arena,
+            &bound,
+            statements[0],
+            function,
+        )
+        .unwrap();
+        let plan = SourceFlowPlan::preflight_linear_with_logical_statements(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            function,
+            statements,
+            [],
+            [],
+            [],
+            [syntax.clone()],
+        )
+        .unwrap();
+        let proof = &plan.logical_statements[0];
+        let original_nodes = bound.flow_graph().nodes();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for change in 0..8 {
+            let mut nodes = original_nodes.clone();
+            match change {
+                0 => {
+                    nodes.get_mut(proof.rows.left_false).unwrap().payload =
+                        Some(FlowNodePayload::Ast(syntax.callee))
+                }
+                1 => nodes.get_mut(proof.rows.right_true).unwrap().antecedent = Some(proof.entry),
+                2 => nodes.get_mut(proof.rows.right_false).unwrap().flags = FlowFlags::CALL,
+                3 => {
+                    nodes.get_mut(proof.rows.join).unwrap().antecedents.pop();
+                }
+                4 => nodes
+                    .get_mut(proof.rows.join)
+                    .unwrap()
+                    .antecedents
+                    .swap(0, 1),
+                5 => {
+                    nodes.get_mut(proof.rows.pre_right).unwrap().antecedents =
+                        vec![proof.rows.left_false]
+                }
+                6 => {
+                    nodes
+                        .alloc(nodes.get(proof.rows.left_true).unwrap().clone())
+                        .unwrap();
+                }
+                7 => {
+                    nodes
+                        .alloc(nodes.get(proof.rows.join).unwrap().clone())
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                assert!(
+                    logical_statement_rows(&nodes, &syntax, proof.entry).is_err(),
+                    "change {change}"
+                );
+            }
+            nodes = original_nodes.clone();
+            assert_eq!(
+                logical_statement_rows(&nodes, &syntax, proof.entry),
+                Ok(proof.rows)
+            );
+        }
+        for change in 0..6 {
+            let mut changed = plan.clone();
+            let changed_proof = &mut changed.logical_statements[0];
+            match change {
+                0 => changed_proof.syntax.container = other,
+                1 => changed_proof.rows.join = changed_proof.rows.pre_right,
+                2 => {
+                    let point = changed_proof
+                        .source_points
+                        .iter_mut()
+                        .find(|(node, _)| *node == syntax.right_receiver)
+                        .unwrap();
+                    point.1 = Some(changed_proof.entry);
+                }
+                3 => {
+                    changed.points.insert(syntax.right_receiver, proof.entry);
+                }
+                4 => {
+                    changed.conditions.remove(&syntax.right);
+                }
+                5 => changed.end = Some(proof.rows.join),
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                assert!(
+                    changed.frame(&bound, HashMap::new()).is_err(),
+                    "change {change}"
+                );
+            }
+            changed = plan.clone();
+            assert!(changed.frame(&bound, HashMap::new()).is_ok());
+        }
+        let mut forged = syntax.clone();
+        forged.right_receiver = syntax.left_receiver;
+        assert!(
+            SourceFlowPlan::preflight_linear_with_logical_statements(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                function,
+                [],
+                [],
+                [],
+                [],
+                [forged],
+            )
+            .is_err()
+        );
+        assert!(
+            matches!(SourceFlowPlan::preflight_linear_with_logical_statements(
+            &parsed.arena, &bound, context.store(), function,
+            [], [], [], [], [syntax.clone(), syntax.clone()],
+        ), Err(SourceFlowError::Invariant(SourceFlowInvariant::DuplicateCondition(node))) if node == syntax.left)
+        );
+        let mut missing_root = plan.clone();
+        missing_root.logical_statements.clear();
+        assert!(matches!(missing_root.validate_flow_paths(&bound),
+            Err(SourceFlowError::Invariant(SourceFlowInvariant::MissingConditionEdge {condition, ..}))
+                if condition == syntax.left
+        ));
+        assert!(plan.frame(&bound, HashMap::new()).is_ok());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before,
+        );
     }
 
     #[test]
