@@ -60,7 +60,9 @@ use super::{
         plan_concrete_indexed_access, plan_recursive_indexed_access,
     },
     instantiate::{
-        InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+        InstantiationLimits, InstantiationSession,
+        instantiate_type_with_vector_and_alias_and_session,
+        instantiate_type_with_vector_and_session,
     },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
@@ -9823,6 +9825,33 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 .is_some_and(|instantiation| *instantiation == declared_type)
                         };
                         if is_cached_instantiation {
+                            if let Some(proof) =
+                                self.authenticated_react_detailed_html_props_alias(canonical)
+                            {
+                                let arguments = self
+                                    .type_reference_argument_nodes(reference)?
+                                    .into_iter()
+                                    .map(|argument| {
+                                        self.cached_type_node_identity(root_symbol, argument)
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let identity =
+                                    self.cached_react_alias_override(reference, canonical)?;
+                                self.validate_cached_react_alias_instantiation(
+                                    proof,
+                                    reference,
+                                    &arguments,
+                                    identity
+                                        .as_ref()
+                                        .map(|(owner, arguments)| (*owner, arguments.as_slice())),
+                                    declared_type,
+                                )
+                                .map_err(|_| {
+                                    type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                    )
+                                })?;
+                            }
                             if let Some(non_nullable_alias) =
                                 self.authenticated_default_library_non_nullable_alias(canonical)
                             {
@@ -10319,12 +10348,58 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .map(|nodes| nodes.len())
     }
 
+    #[allow(clippy::too_many_lines)] // Keyword and infer identities can exist without a node cache.
     fn cached_type_node_identity(
         &self,
         root_symbol: SemanticSymbolId,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
+        if (record.kind == SyntaxKind::InferType)
+            != matches!(record.data, NodeData::InferTypeNode(_))
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+            ));
+        }
+        if let NodeData::InferTypeNode(infer) = &record.data {
+            let mut planner = TypeQueryPlanner::new(
+                self.store,
+                self.host,
+                self.array_type,
+                self.array_targets,
+                self.strict_builtin_iterator_return,
+                self.type_reference_alias_targets,
+            );
+            planner.plan_infer_type(node)?;
+            let invalid =
+                || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol));
+            let symbol = planner
+                .plan
+                .infer_parameters
+                .get(&node)
+                .copied()
+                .ok_or_else(&invalid)?;
+            let parameter = NodeRef::new(node.arena, node.file, infer.type_parameter);
+            if !self.host.symbol_matches(self.store, parameter, symbol)
+                || self
+                    .store
+                    .symbol(symbol)
+                    .and_then(|owner| owner.declarations())
+                    .is_none_or(|declarations| !declarations.contains(&parameter))
+            {
+                return Err(invalid());
+            }
+            let type_ = self
+                .store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or_else(&invalid)?;
+            if cached_ordinary_type_parameter_owner(self.store, type_) != Some(symbol) {
+                return Err(invalid());
+            }
+            return Ok(type_);
+        }
         let bootstrap = self
             .store
             .intrinsic_bootstrap()
@@ -12696,6 +12771,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         if arity == PlannedTypeReferenceArity::Valid && flags.contains(SymbolFlags::TYPE_ALIAS) {
             self.preflight_cached_alias_instantiation(
+                node,
                 symbol,
                 effective_alias_owner,
                 &type_arguments,
@@ -12722,8 +12798,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps existing union checks beside the owner-aware React check.
     fn preflight_cached_alias_instantiation(
         &self,
+        reference: NodeRef,
         symbol: SemanticSymbolId,
         owner: Option<SemanticSymbolId>,
         argument_nodes: &[NodeRef],
@@ -12738,10 +12816,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         ) else {
             return Ok(());
         };
+        let react_alias = self.authenticated_react_detailed_html_props_alias(symbol);
         // Alias results can be cached before the source callable is published.
         let union = match self.store.type_payload(declared).map(TypeRecord::data) {
             Some(TypeData::Union(union)) => Some(union),
-            _ if self.source_callable_alias_planning => None,
+            _ if self.source_callable_alias_planning || react_alias.is_some() => None,
             _ => return Ok(()),
         };
         if parameters.len() != argument_nodes.len()
@@ -12804,6 +12883,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(cached) = instantiations.get(&key).copied() else {
             return Ok(());
         };
+        if let Some(proof) = react_alias {
+            return self.validate_cached_react_alias_instantiation(
+                proof,
+                reference,
+                &arguments,
+                identity.map(|(owner, _, arguments)| (owner, arguments)),
+                cached,
+            );
+        }
         let expected = super::instantiate::cached_instantiation_with_vector(
             self.store,
             declared,
@@ -12821,6 +12909,432 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
             ));
+        }
+        Ok(())
+    }
+
+    fn cached_react_alias_override(
+        &self,
+        reference: NodeRef,
+        target: SemanticSymbolId,
+    ) -> Result<Option<(SemanticSymbolId, Vec<TypeId>)>, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                target,
+            ))
+        };
+        let Some(owner) = self.direct_type_alias_owner(reference)? else {
+            return Ok(None);
+        };
+        if self.is_local_type_alias(owner)? && !self.is_local_type_alias(target)? {
+            return Ok(None);
+        }
+        let parameters =
+            cached_alias_parameter_symbols(self.store, self.host, owner)?.ok_or_else(&invalid)?;
+        let arguments = self
+            .store
+            .type_alias_links(owner)
+            .and_then(|links| links.type_parameters.as_deref())
+            .unwrap_or_default();
+        if parameters.len() != arguments.len()
+            || parameters
+                .iter()
+                .zip(arguments)
+                .any(|(parameter, argument)| {
+                    cached_ordinary_type_parameter_owner(self.store, *argument) != Some(*parameter)
+                })
+        {
+            return Err(invalid());
+        }
+        Ok(Some((owner, arguments.to_vec())))
+    }
+
+    /// The source reference, parameter order, and both cache owners must agree.
+    #[allow(clippy::too_many_lines)] // One read-only proof covers source and result identities.
+    fn validate_cached_react_alias_instantiation(
+        &self,
+        proof: ReactDetailedHtmlPropsPlan,
+        reference: NodeRef,
+        arguments: &[TypeId],
+        alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+        instantiated: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                proof.alias,
+            ))
+        };
+        if self.authenticated_react_detailed_html_props_alias(proof.alias) != Some(proof)
+            || self
+                .resolve_uncached_type_reference_symbol(reference)
+                .ok()
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                != Some(proof.alias)
+            || self
+                .store
+                .symbol_node_links(reference)
+                .is_some_and(|links| {
+                    links.resolved_symbol.is_some_and(|symbol| {
+                        self.store.get_merged_symbol(symbol) != Some(proof.alias)
+                    })
+                })
+        {
+            return Err(invalid());
+        }
+        let argument_nodes = self.type_reference_argument_nodes(reference)?;
+        if argument_nodes.len() != arguments.len() {
+            return Err(invalid());
+        }
+        for (node, argument) in argument_nodes.iter().zip(arguments) {
+            self.validate_cached_react_alias_argument(proof.alias, *node, *argument)?;
+        }
+        let expected_override = self.cached_react_alias_override(reference, proof.alias)?;
+        if expected_override
+            .as_ref()
+            .map(|(owner, arguments)| (*owner, arguments.as_slice()))
+            != alias_override
+        {
+            return Err(invalid());
+        }
+
+        let cached = cached_type_alias(
+            self.store,
+            self.host,
+            proof.alias,
+            self.strict_builtin_iterator_return,
+        )?
+        .ok_or_else(&invalid)?;
+        let parameters = self
+            .store
+            .type_alias_links(proof.alias)
+            .and_then(|links| links.type_parameters.as_deref())
+            .ok_or_else(&invalid)?;
+        let [attributes, target] = parameters else {
+            return Err(invalid());
+        };
+        if cached_ordinary_type_parameter_owner(self.store, *attributes)
+            != Some(proof.attributes_parameter)
+            || cached_ordinary_type_parameter_owner(self.store, *target)
+                != Some(proof.target_parameter)
+            || !self
+                .store
+                .source_direct_type_annotation_is_exact(proof.intersection, cached.declared_type)
+        {
+            return Err(invalid());
+        }
+        let source = self
+            .store
+            .validate_deferred_intersection_type(cached.declared_type)
+            .map_err(|_| invalid())?;
+        let [class_attributes, source_attributes] = source.types.as_slice() else {
+            return Err(invalid());
+        };
+        if source.alias_symbol != Some(proof.alias)
+            || source.alias_arguments != parameters
+            || source_attributes != attributes
+            || !self
+                .store
+                .source_direct_type_annotation_is_exact(proof.attributes_reference, *attributes)
+            || !self.store.source_direct_type_annotation_is_exact(
+                proof.class_attributes_reference,
+                *class_attributes,
+            )
+        {
+            return Err(invalid());
+        }
+        self.validate_cached_class_or_interface_reference(
+            proof.alias,
+            proof.class_attributes_reference,
+            proof.class_attributes,
+            *class_attributes,
+        )?;
+        let class_reference = validate_direct_generic_reference(self.store, *class_attributes)
+            .map_err(|_| invalid())?;
+        if class_reference.type_arguments != [*target] {
+            return Err(invalid());
+        }
+        let expected = super::instantiate::cached_instantiation_with_vector(
+            self.store,
+            cached.declared_type,
+            parameters,
+            arguments,
+            self.array_targets,
+            alias_override,
+        )
+        .map_err(|_| invalid())?;
+        if expected != Some(instantiated) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Each admitted argument uses its existing source and result proof.
+    fn validate_cached_react_alias_argument(
+        &self,
+        alias: SemanticSymbolId,
+        node: NodeRef,
+        argument: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                alias,
+            ))
+        };
+        let record = preflight_node(self.store, self.host, node)?;
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+            let inner = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            if record.kind != SyntaxKind::ParenthesizedType
+                || preflight_node(self.store, self.host, inner)?.parent != Some(node.node)
+                || self.store.type_node_links(node).is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && links
+                            != &TypeNodeLinks {
+                                resolved_type: Some(argument),
+                                outer_type_parameters: None,
+                            }
+                })
+                || self
+                    .store
+                    .symbol_node_links(node)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+            {
+                return Err(invalid());
+            }
+            return self.validate_cached_react_alias_argument(alias, inner, argument);
+        }
+        if record.kind == SyntaxKind::InferType || matches!(record.data, NodeData::InferTypeNode(_))
+        {
+            return if self.cached_type_node_identity(alias, node)? == argument {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        if self.cached_type_node_identity(alias, node)? != argument
+            || !self
+                .store
+                .source_direct_type_annotation_is_exact(node, argument)
+        {
+            return Err(invalid());
+        }
+        if matches!(record.data, NodeData::LiteralTypeNode(_)) {
+            if record.kind != SyntaxKind::LiteralType {
+                return Err(invalid());
+            }
+            let mut planner = TypeQueryPlanner::new(
+                self.store,
+                self.host,
+                self.array_type,
+                self.array_targets,
+                self.strict_builtin_iterator_return,
+                self.type_reference_alias_targets,
+            );
+            planner.plan_literal_type(node)?;
+            let expected = planner.plan.cached_annotation_type(
+                self.store,
+                self.host,
+                self.array_targets,
+                node,
+                &mut HashSet::new(),
+            )?;
+            return if expected == Some(argument) {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        if let NodeData::UnionTypeNode(union) = &record.data {
+            if record.kind != SyntaxKind::UnionType {
+                return Err(invalid());
+            }
+            let mut constituents = Vec::with_capacity(union.types.nodes.len());
+            for child in &union.types.nodes {
+                let child = NodeRef::new(node.arena, node.file, *child);
+                if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                    return Err(invalid());
+                }
+                let type_ = self.cached_type_node_identity(alias, child)?;
+                self.validate_cached_react_alias_argument(alias, child, type_)?;
+                constituents.push(type_);
+            }
+            let expected = self
+                .store
+                .cached_literal_union_type_with_alias(&constituents, None, self.array_targets)
+                .map_err(|_| invalid())?;
+            return if expected == Some(argument) {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        if matches!(record.data, NodeData::TypeReferenceNode(_)) {
+            let symbol = self
+                .resolve_uncached_type_reference_symbol(node)
+                .ok()
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                .ok_or_else(&invalid)?;
+            if self
+                .store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                != Some(symbol)
+            {
+                return Err(invalid());
+            }
+            let argument_nodes = self.type_reference_argument_nodes(node)?;
+            let mut provided_arguments = Vec::with_capacity(argument_nodes.len());
+            for child in &argument_nodes {
+                let child_type = self.cached_type_node_identity(alias, *child)?;
+                self.validate_cached_react_alias_argument(alias, *child, child_type)?;
+                provided_arguments.push(child_type);
+            }
+            let flags = self.store.symbol(symbol).ok_or_else(&invalid)?.flags();
+            if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
+                self.validate_cached_class_or_interface_reference(alias, node, symbol, argument)?;
+            } else if flags.contains(SymbolFlags::TYPE_PARAMETER)
+                && cached_ordinary_type_parameter_owner(self.store, argument) != Some(symbol)
+            {
+                return Err(invalid());
+            } else if flags.contains(SymbolFlags::TYPE_ALIAS) {
+                if self
+                    .authenticated_default_library_awaited_alias(symbol)
+                    .is_some()
+                {
+                    let [input] = provided_arguments.as_slice() else {
+                        return Err(invalid());
+                    };
+                    return if self.canonical_awaited_type(node, *input)? == argument {
+                        Ok(())
+                    } else {
+                        Err(invalid())
+                    };
+                }
+                let cached = cached_type_alias(
+                    self.store,
+                    self.host,
+                    symbol,
+                    self.strict_builtin_iterator_return,
+                )?
+                .ok_or_else(&invalid)?;
+                self.validate_cached_type_alias_identity(symbol, cached, false)?;
+                if symbol_is_string_mapping_intrinsic(self.store, symbol)
+                    && self.store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                        cached.declared_type == bootstrap.intrinsic_marker_type
+                    })
+                {
+                    let [input] = provided_arguments.as_slice() else {
+                        return Err(invalid());
+                    };
+                    return if self.cached_string_mapping_result(
+                        symbol,
+                        *input,
+                        argument,
+                        &mut HashSet::new(),
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(invalid())
+                    };
+                }
+                if cached.type_parameter_count == 0 {
+                    if !provided_arguments.is_empty() || cached.declared_type != argument {
+                        return Err(invalid());
+                    }
+                } else {
+                    let mut arguments = provided_arguments;
+                    let key = type_alias_instantiation_cache_key(&arguments, None);
+                    if self
+                        .store
+                        .type_alias_links(symbol)
+                        .and_then(|links| links.instantiations.as_ref())
+                        .and_then(|instantiations| instantiations.get(&key))
+                        != Some(&argument)
+                    {
+                        return Err(invalid());
+                    }
+                    let parameters = self
+                        .store
+                        .type_alias_links(symbol)
+                        .and_then(|links| links.type_parameters.as_deref())
+                        .ok_or_else(&invalid)?;
+                    if arguments.len() > parameters.len() {
+                        return Err(invalid());
+                    }
+                    for parameter in parameters.iter().skip(arguments.len()) {
+                        let owner = cached_ordinary_type_parameter_owner(self.store, *parameter)
+                            .ok_or_else(&invalid)?;
+                        let declaration = self
+                            .store
+                            .symbol(owner)
+                            .and_then(|owner| owner.declarations())
+                            .and_then(|declarations| declarations.first())
+                            .copied()
+                            .ok_or_else(&invalid)?;
+                        let NodeData::TypeParameterDeclaration(data) =
+                            &preflight_node(self.store, self.host, declaration)?.data
+                        else {
+                            return Err(invalid());
+                        };
+                        let default = NodeRef::new(
+                            declaration.arena,
+                            declaration.file,
+                            data.default_type.ok_or_else(&invalid)?,
+                        );
+                        let default_type = self.cached_type_node_identity(alias, default)?;
+                        self.validate_cached_react_alias_argument(alias, default, default_type)?;
+                        let instantiated = super::instantiate::cached_instantiation_with_vector(
+                            self.store,
+                            default_type,
+                            &parameters[..arguments.len()],
+                            &arguments,
+                            self.array_targets,
+                            None,
+                        )
+                        .map_err(|_| invalid())?
+                        .ok_or_else(&invalid)?;
+                        arguments.push(instantiated);
+                    }
+                    if validate_conditional_reference_result(self.store, node, argument)
+                        .map_err(|_| invalid())?
+                    {
+                        // The retained conditional proof owns its mapped result.
+                    } else if matches!(
+                        self.store
+                            .type_payload(cached.declared_type)
+                            .map(TypeRecord::data),
+                        Some(TypeData::Mapped(_))
+                    ) {
+                        validate_supported_mapped_alias_instantiation(
+                            self.store,
+                            symbol,
+                            cached.declared_type,
+                            parameters,
+                            &arguments,
+                            argument,
+                            self.authenticated_mapped_utility_alias(symbol),
+                        )
+                        .map_err(|_| invalid())?;
+                        if !valid_record_mapped_alias_identity(
+                            self.store, symbol, &arguments, argument,
+                        ) {
+                            return Err(invalid());
+                        }
+                    } else if super::instantiate::cached_instantiation_with_vector(
+                        self.store,
+                        cached.declared_type,
+                        parameters,
+                        &arguments,
+                        self.array_targets,
+                        None,
+                    )
+                    .map_err(|_| invalid())?
+                        != Some(argument)
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -28616,6 +29130,34 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 alias_identity.as_ref(),
             );
         }
+        if let Some(proof) = plan.react_detailed_html_props_aliases.get(&symbol).copied()
+            && let Some(cached) = links
+                .instantiations
+                .as_ref()
+                .and_then(|instantiations| instantiations.get(&key))
+                .copied()
+        {
+            let planner = TypeQueryPlanner::new(
+                self.store,
+                self.host,
+                self.array_type,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+                self.options.strict_builtin_iterator_return,
+                &self.type_reference_alias_targets,
+            );
+            planner.validate_cached_react_alias_instantiation(
+                proof,
+                node,
+                &type_arguments,
+                alias_identity
+                    .as_ref()
+                    .map(|(owner, arguments)| (*owner, arguments.as_slice())),
+                cached,
+            )?;
+            return Ok(cached);
+        }
         if matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Union(_))
@@ -28959,6 +29501,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 declared_type,
                 &type_parameters,
                 &type_arguments,
+                alias_identity
+                    .as_ref()
+                    .filter(|_| plan.react_detailed_html_props_aliases.contains_key(&symbol))
+                    .map(|(owner, arguments)| (*owner, arguments.as_slice())),
             )?
         } else {
             self.instantiate_direct_alias_type(
@@ -29553,6 +30099,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     constraint,
                     type_parameters,
                     type_arguments,
+                    None,
                 )?
             } else {
                 self.instantiate_direct_alias_type(
@@ -30085,9 +30632,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 arguments,
             )? {
                 Some(type_) => type_,
-                None => {
-                    self.instantiate_dependent_alias_type(symbol, template, &parameters, arguments)?
-                }
+                None => self.instantiate_dependent_alias_type(
+                    symbol,
+                    template,
+                    &parameters,
+                    arguments,
+                    None,
+                )?,
             }
         };
         let bootstrap = self
@@ -30248,28 +30799,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         type_: TypeId,
         type_parameters: &[TypeId],
         type_arguments: &[TypeId],
+        alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     ) -> Result<TypeId, DeclaredTypeError> {
         let array_targets = self
             .global_types
             .as_ref()
             .map(CanonicalArrayTargets::from_global_types);
         let result = if let Some(session) = self.instantiation_session.as_deref_mut() {
-            instantiate_type_with_vector_and_session(
+            instantiate_type_with_vector_and_alias_and_session(
                 self.store,
                 type_,
                 type_parameters,
                 type_arguments,
                 array_targets,
+                alias_override,
                 session,
             )
         } else {
             let mut session = InstantiationSession::new(InstantiationLimits::default());
-            instantiate_type_with_vector_and_session(
+            instantiate_type_with_vector_and_alias_and_session(
                 self.store,
                 type_,
                 type_parameters,
                 type_arguments,
                 array_targets,
+                alias_override,
                 &mut session,
             )
         };
@@ -30314,6 +30868,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 type_,
                 mapped_parameters,
                 type_arguments,
+                None,
             );
         }
         if self.is_literal_method_callable(type_) {
@@ -30478,6 +31033,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 constituent,
                 parameters,
                 arguments,
+                None,
             )?);
         }
         self.construct_alias_union(&instantiated, Some((alias, arguments)))
@@ -30686,7 +31242,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     arguments,
                 )?
             } else {
-                self.instantiate_dependent_alias_type(alias, constituent, parameters, arguments)?
+                self.instantiate_dependent_alias_type(
+                    alias,
+                    constituent,
+                    parameters,
+                    arguments,
+                    None,
+                )?
             };
             instantiated.push(mapped);
         }
@@ -30848,7 +31410,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let mapped = if self.is_literal_method_callable(type_) {
                 self.instantiate_literal_method_alias_type(symbol, type_, parameters, arguments)?
             } else {
-                self.instantiate_dependent_alias_type(symbol, type_, parameters, arguments)?
+                self.instantiate_dependent_alias_type(symbol, type_, parameters, arguments, None)?
             };
             if self
                 .instantiation_session
@@ -30866,7 +31428,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .into_iter()
                     .map(|argument| {
                         self.instantiate_dependent_alias_type(
-                            symbol, argument, parameters, arguments,
+                            symbol, argument, parameters, arguments, None,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -30931,7 +31493,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let mapped_arguments = previous_arguments
             .iter()
             .map(|argument| {
-                self.instantiate_dependent_alias_type(alias, *argument, parameters, arguments)
+                self.instantiate_dependent_alias_type(alias, *argument, parameters, arguments, None)
             })
             .collect::<Result<Vec<_>, _>>()?;
         if limit_mark.is_some_and(|mark| {
@@ -31450,7 +32012,9 @@ mod tests {
         production::GlobalMergeCompletion,
         signatures::SignatureFlags,
         source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
-        type_records::{LiteralValue, TypeAlias},
+        type_records::{
+            InterfaceTypeData, IntersectionTypeData, LiteralValue, TypeAlias, TypeReferenceData,
+        },
         types::{ObjectFlags, TypeFlags},
     };
 
@@ -46328,6 +46892,842 @@ mod tests {
         ));
         assert_eq!(store_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
+    }
+
+    const REACT_ALIAS_DECLARATIONS: &str = concat!(
+        "declare namespace React { interface DOMAttributes<T> {} ",
+        "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+        "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+        "interface MediaHTMLAttributes<T> extends HTMLAttributes<T> { src?: string; } ",
+        "interface AudioHTMLAttributes<T> extends MediaHTMLAttributes<T> {} ",
+        "interface Attributes { key?: string; } ",
+        "interface ClassAttributes<T> extends Attributes { ref?: T; } ",
+        "type DetailedHTMLProps<E extends HTMLAttributes<T>, T> = ClassAttributes<T> & E; }",
+    );
+    const REACT_ALIAS_SOURCE: &str = concat!(
+        "type Probe = React.DetailedHTMLProps<React.AudioHTMLAttributes<number>, number>; ",
+        "type Second = React.DetailedHTMLProps<React.AudioHTMLAttributes<number>, number>; ",
+        "type Forwarded = Probe; ",
+        "declare let direct: React.DetailedHTMLProps<React.AudioHTMLAttributes<number>, number>;",
+    );
+    const REACT_ALIAS_FILE: FileId = FileId::new(732);
+    const REACT_ALIAS_SOURCE_FILE: FileId = FileId::new(733);
+
+    fn react_alias_context<'a>(
+        react: &'a ParseResult,
+        source: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path, declaration) in [
+            (react, REACT_ALIAS_FILE, "\"/project/react.d.ts\"", true),
+            (
+                source,
+                REACT_ALIAS_SOURCE_FILE,
+                "\"/project/case.ts\"",
+                false,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (REACT_ALIAS_FILE, &react.arena),
+                (REACT_ALIAS_SOURCE_FILE, &source.arena),
+            ],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn react_alias_parts(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> (SemanticSymbolId, NodeRef, NodeRef) {
+        let (id, alias) = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&parsed.arena, alias.name) == Some(expected))
+                    .then_some((id, alias))
+            })
+            .unwrap();
+        let declaration = NodeRef::new(parsed.arena.id(), file, id);
+        let symbol = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(declaration)
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        (
+            symbol,
+            NodeRef::new(parsed.arena.id(), file, alias.name),
+            NodeRef::new(parsed.arena.id(), file, alias.type_),
+        )
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ReactAliasRecord {
+        Intersection(IntersectionTypeData),
+        Reference(TypeReferenceData),
+        Interface(InterfaceTypeData),
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ReactAliasSnapshot {
+        store: StoreState,
+        counts: [usize; 6],
+        records: Vec<(TypeId, ReactAliasRecord)>,
+        diagnostics: CanonicalCheckerDiagnostics,
+    }
+
+    fn react_alias_snapshot(context: &CanonicalCheckerContext<'_>) -> ReactAliasSnapshot {
+        let store = context.store();
+        ReactAliasSnapshot {
+            store: store_state(store),
+            counts: [
+                store.type_alias_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.properties_type_cache_len(),
+            ],
+            records: store
+                .types()
+                .filter_map(|(type_, _)| {
+                    let record = match store.type_payload(type_).unwrap().data() {
+                        TypeData::Intersection(data) => {
+                            ReactAliasRecord::Intersection(data.clone())
+                        }
+                        TypeData::TypeReference(data) => ReactAliasRecord::Reference(data.clone()),
+                        TypeData::Interface(data) => ReactAliasRecord::Interface(data.clone()),
+                        _ => return None,
+                    };
+                    Some((type_, record))
+                })
+                .collect(),
+            diagnostics: context.diagnostics().clone(),
+        }
+    }
+
+    #[test]
+    fn react_intersection_alias_overrides_keep_distinct_owners_on_warm_queries() {
+        let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+        let source = parse_source_file(REACT_ALIAS_SOURCE);
+        let mut context = react_alias_context(&react, &source);
+        let (generic, _, _) =
+            react_alias_parts(&context, &react, REACT_ALIAS_FILE, "DetailedHTMLProps");
+        let mut queries = Vec::new();
+        for name in ["Probe", "Second", "Forwarded"] {
+            let (symbol, name, body) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, name);
+            let type_ = context.get_type_at_location(name).unwrap();
+            assert_eq!(context.get_type_from_type_node(body), Ok(type_));
+            queries.push((symbol, name, body, type_));
+        }
+        let direct = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(source.arena.id(), REACT_ALIAS_SOURCE_FILE, node))
+            })
+            .unwrap();
+        let direct_type = context.get_type_from_type_node(direct).unwrap();
+        let direct_projection = context
+            .store()
+            .validate_deferred_intersection_type(direct_type)
+            .unwrap();
+        assert_eq!(direct_projection.alias_symbol, Some(generic));
+        assert_eq!(direct_projection.alias_arguments.len(), 2);
+        for (symbol, _, _, type_) in &queries[..2] {
+            let projection = context
+                .store()
+                .validate_deferred_intersection_type(*type_)
+                .unwrap();
+            assert_eq!(projection.types, direct_projection.types);
+            assert_eq!(projection.alias_symbol, Some(*symbol));
+            assert!(projection.alias_arguments.is_empty());
+            assert_ne!(*type_, direct_type);
+        }
+        assert_ne!(queries[0].3, queries[1].3);
+        assert_eq!(queries[0].3, queries[2].3);
+        assert!(context.diagnostics().is_empty());
+        let before = react_alias_snapshot(&context);
+        for _ in 0..2 {
+            for (_, name, body, type_) in &queries {
+                assert_eq!(context.get_type_at_location(*name), Ok(*type_));
+                assert_eq!(context.get_type_from_type_node(*body), Ok(*type_));
+            }
+            assert_eq!(context.get_type_from_type_node(direct), Ok(direct_type));
+            assert_eq!(react_alias_snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    fn react_intersection_alias_queries_reject_other_canonical_outer_owners() {
+        for paired_links in [false, true] {
+            let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+            let source = parse_source_file(REACT_ALIAS_SOURCE);
+            let mut context = react_alias_context(&react, &source);
+            let (generic, _, _) =
+                react_alias_parts(&context, &react, REACT_ALIAS_FILE, "DetailedHTMLProps");
+            let (probe, name, body) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Probe");
+            let (_, second_name, _) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Second");
+            let expected = context.get_type_at_location(name).unwrap();
+            let wrong = context.get_type_at_location(second_name).unwrap();
+            assert_ne!(expected, wrong);
+            let source_projection = context
+                .store()
+                .validate_deferred_intersection_type(expected)
+                .unwrap();
+            assert_eq!(
+                source_projection.types,
+                context
+                    .store()
+                    .validate_deferred_intersection_type(wrong)
+                    .unwrap()
+                    .types
+            );
+            let store = context.store_mut_for_test();
+            let mut generic_links = store.type_alias_links(generic).unwrap().clone();
+            let mut changed = 0;
+            for result in generic_links.instantiations.as_mut().unwrap().values_mut() {
+                if *result == expected {
+                    *result = wrong;
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, 1);
+            assert!(store.set_type_alias_links(generic, generic_links));
+            if paired_links {
+                let mut links = store.type_alias_links(probe).unwrap().clone();
+                links.declared_type = Some(wrong);
+                assert!(store.set_type_alias_links(probe, links));
+                assert!(store.set_type_node_links(
+                    body,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        outer_type_parameters: None,
+                    }
+                ));
+            }
+            let before = react_alias_snapshot(&context);
+            assert!(context.get_type_at_location(name).is_err());
+            assert_eq!(react_alias_snapshot(&context), before);
+            assert!(context.get_type_from_type_node(body).is_err());
+            assert_eq!(react_alias_snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    fn react_intersection_alias_warm_queries_keep_written_argument_forms() {
+        for text in [
+            "type Probe = React.DetailedHTMLProps<React.AudioHTMLAttributes<number>, (number)>;",
+            concat!(
+                "type Attrs<Value = number> = React.AudioHTMLAttributes<Value>; ",
+                "type Probe = React.DetailedHTMLProps<Attrs, number>;",
+            ),
+            concat!(
+                "type Uppercase<Input extends string> = intrinsic; ",
+                "type Probe = React.DetailedHTMLProps<",
+                "React.AudioHTMLAttributes<Uppercase<'x'>>, Uppercase<'x'>>;",
+            ),
+            "type Probe<Value> = React.DetailedHTMLProps<React.AudioHTMLAttributes<Value>, Value>;",
+        ] {
+            let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+            let source = parse_source_file(text);
+            let mut context = react_alias_context(&react, &source);
+            let (owner, name, body) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Probe");
+            let type_ = context.get_type_at_location(name).unwrap();
+            let projection = context
+                .store()
+                .validate_deferred_intersection_type(type_)
+                .unwrap();
+            assert_eq!(projection.alias_symbol, Some(owner));
+            assert_eq!(
+                projection.alias_arguments.as_slice(),
+                context
+                    .store()
+                    .type_alias_links(owner)
+                    .unwrap()
+                    .type_parameters
+                    .as_deref()
+                    .unwrap_or_default()
+            );
+            assert!(context.diagnostics().is_empty());
+            let before = react_alias_snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(context.get_type_at_location(name), Ok(type_), "{text}");
+                assert_eq!(context.get_type_from_type_node(body), Ok(type_), "{text}");
+                assert_eq!(react_alias_snapshot(&context), before);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_infer_argument_identity_uses_the_source_parameter_without_node_links() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Value> {} ",
+            "type Result<Input> = Input extends Box<infer Item> ? Item : never;",
+        ));
+        let root = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+        let infer = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                (record.kind == SyntaxKind::InferType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    id,
+                ))
+            })
+            .unwrap();
+        let reference = NodeRef::new(
+            infer.arena,
+            infer.file,
+            fixture
+                .parsed
+                .arena
+                .get(infer.node)
+                .unwrap()
+                .parent
+                .unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let computed = query_node(&mut fixture, infer, &mut diagnostics).unwrap();
+        let boxed = query_node(&mut fixture, reference, &mut diagnostics).unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(&fixture.store, boxed)
+                .unwrap()
+                .type_arguments,
+            [computed]
+        );
+        assert!(
+            fixture
+                .store
+                .type_node_links(infer)
+                .is_none_or(|links| links == &TypeNodeLinks::default())
+        );
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let aliases = HashMap::new();
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.type_alias_len(),
+            fixture.store.symbol_len(),
+        );
+        let planner = TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases);
+        assert_eq!(planner.cached_type_node_identity(root, infer), Ok(computed));
+        assert_eq!(
+            planner.validate_cached_react_alias_argument(root, infer, computed),
+            Ok(())
+        );
+        assert_eq!(
+            planner.validate_cached_react_alias_argument(root, reference, boxed),
+            Ok(())
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.type_alias_len(),
+                fixture.store.symbol_len()
+            ),
+            before
+        );
+        assert!(
+            fixture
+                .store
+                .type_node_links(infer)
+                .is_none_or(|links| links == &TypeNodeLinks::default())
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cached_infer_argument_identity_rejects_owner_and_optional_link_changes() {
+        for damage in 0..3 {
+            let mut fixture = fixture(concat!(
+                "interface Box<Value> {} ",
+                "type Result<Input> = Input extends Box<infer Item> ? Item : never; ",
+                "type Other<OtherValue> = OtherValue;",
+            ));
+            let root = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+            let other = named_symbol(&fixture, SyntaxKind::TypeParameter, "OtherValue");
+            let infer = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    (record.kind == SyntaxKind::InferType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        id,
+                    ))
+                })
+                .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let computed = query_node(&mut fixture, infer, &mut diagnostics).unwrap();
+            let other_type = query_declared(
+                &mut fixture,
+                other,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let owner = cached_ordinary_type_parameter_owner(&fixture.store, computed).unwrap();
+            match damage {
+                0 => {
+                    let mut links = fixture.store.declared_type_links(owner).unwrap().clone();
+                    links.declared_type = Some(other_type);
+                    assert!(fixture.store.set_declared_type_links(owner, links));
+                }
+                1 => {
+                    assert!(fixture.store.set_type_node_links(
+                        infer,
+                        TypeNodeLinks {
+                            resolved_type: Some(other_type),
+                            outer_type_parameters: None,
+                        }
+                    ));
+                }
+                2 => {
+                    let declarations = fixture
+                        .store
+                        .symbol(other)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .to_vec();
+                    assert!(
+                        fixture
+                            .store
+                            .set_symbol_declarations(owner, Some(declarations), None)
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let aliases = HashMap::new();
+            let before = (
+                store_state(&fixture.store),
+                fixture.store.type_alias_len(),
+                fixture.store.symbol_len(),
+            );
+            let node_links = fixture.store.type_node_links(infer).cloned();
+            let planner = TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases);
+            assert!(
+                planner.cached_type_node_identity(root, infer).is_err(),
+                "damage {damage}"
+            );
+            assert!(
+                planner
+                    .validate_cached_react_alias_argument(root, infer, computed)
+                    .is_err(),
+                "damage {damage}"
+            );
+            assert_eq!(
+                (
+                    store_state(&fixture.store),
+                    fixture.store.type_alias_len(),
+                    fixture.store.symbol_len()
+                ),
+                before
+            );
+            assert_eq!(fixture.store.type_node_links(infer), node_links.as_ref());
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn react_intersection_local_alias_keeps_the_nonlocal_target_identity() {
+        use crate::semantic::{
+            SourceCheckError, artifact_queries::CanonicalArtifactQueryError,
+            source::UnsupportedSourceSyntax, source_functions::SourceFunctionUnsupported,
+        };
+
+        let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+        let source = parse_source_file(concat!(
+            "function owner() { ",
+            "type Probe = React.DetailedHTMLProps<React.AudioHTMLAttributes<number>, number>; }",
+        ));
+        let mut context = react_alias_context(&react, &source);
+        let (generic, _, _) =
+            react_alias_parts(&context, &react, REACT_ALIAS_FILE, "DetailedHTMLProps");
+        let (owner, name, body) =
+            react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Probe");
+        let function_body = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                function
+                    .body
+                    .map(|body| NodeRef::new(source.arena.id(), REACT_ALIAS_SOURCE_FILE, body))
+            })
+            .unwrap();
+        // Full source checking does not yet admit a function-local type alias.
+        assert_eq!(
+            context.get_type_at_location(name),
+            Err(CanonicalArtifactQueryError::SourceCheck(
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+                    SourceFunctionUnsupported::FunctionBody(function_body),
+                )),
+            )),
+        );
+        let type_ = context.get_declared_type_of_symbol(owner).unwrap();
+        assert_eq!(context.get_type_from_type_node(body), Ok(type_));
+        let projection = context
+            .store()
+            .validate_deferred_intersection_type(type_)
+            .unwrap();
+        assert_ne!(owner, generic);
+        assert_eq!(projection.alias_symbol, Some(generic));
+        assert_eq!(projection.alias_arguments.len(), 2);
+        let before = react_alias_snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_declared_type_of_symbol(owner), Ok(type_));
+            assert_eq!(context.get_type_from_type_node(body), Ok(type_));
+            assert_eq!(react_alias_snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    fn react_intersection_alias_executor_rechecks_a_canonical_cache_hit() {
+        let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+        let source = parse_source_file(REACT_ALIAS_SOURCE);
+        let mut context = react_alias_context(&react, &source);
+        let (generic, _, _) =
+            react_alias_parts(&context, &react, REACT_ALIAS_FILE, "DetailedHTMLProps");
+        let (owner, name, body) =
+            react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Probe");
+        let (_, second_name, _) =
+            react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Second");
+        let expected = context.get_type_at_location(name).unwrap();
+        let wrong = context.get_type_at_location(second_name).unwrap();
+        let react_bound = context.file(REACT_ALIAS_FILE).unwrap().1.clone();
+        let source_bound = context.file(REACT_ALIAS_SOURCE_FILE).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&react.arena, &react_bound), (&source.arena, &source_bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let aliases = HashMap::new();
+        let mut planner =
+            TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases);
+        planner.replay_cached_annotations = true;
+        planner.plan_type_alias(owner, false).unwrap();
+        planner
+            .plan_type_node_in_context(body, Some(owner), false)
+            .unwrap();
+        let plan = planner.finish();
+        let reference = plan.references.get(&body).unwrap();
+        let source_type = context
+            .store()
+            .type_alias_links(generic)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new(
+            context.store_mut_for_test(),
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let mut prepared = query.prepare_literal_types(&plan).unwrap();
+        assert_eq!(
+            query.execute_generic_alias_instantiation(
+                body,
+                reference,
+                source_type,
+                &plan,
+                &mut prepared,
+            ),
+            Ok(expected)
+        );
+        let mut links = query.store.type_alias_links(generic).unwrap().clone();
+        for result in links.instantiations.as_mut().unwrap().values_mut() {
+            if *result == expected {
+                *result = wrong;
+            }
+        }
+        assert!(query.store.set_type_alias_links(generic, links));
+        let before = (
+            store_state(query.store),
+            query.store.type_alias_len(),
+            query.store.symbol_len(),
+        );
+        assert_eq!(
+            query.execute_generic_alias_instantiation(
+                body,
+                reference,
+                source_type,
+                &plan,
+                &mut prepared,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(generic)
+            ))
+        );
+        assert_eq!(
+            (
+                store_state(query.store),
+                query.store.type_alias_len(),
+                query.store.symbol_len()
+            ),
+            before
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn react_intersection_alias_queries_reject_interner_and_argument_damage() {
+        for damage in 0..4 {
+            let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+            let source = parse_source_file(REACT_ALIAS_SOURCE);
+            let mut context = react_alias_context(&react, &source);
+            let (_, name, body) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Probe");
+            let expected = context.get_type_at_location(name).unwrap();
+            let NodeData::TypeReferenceNode(reference) = &source.arena.get(body.node).unwrap().data
+            else {
+                panic!("Probe must retain its written reference")
+            };
+            let arguments = reference
+                .type_arguments
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|node| NodeRef::new(body.arena, body.file, *node))
+                .collect::<Vec<_>>();
+            let store = context.store_mut_for_test();
+            let key = store
+                .intersection_keys_by_type
+                .get(&expected)
+                .unwrap()
+                .clone();
+            match damage {
+                0 => {
+                    assert_eq!(store.intersection_types.remove(&key), Some(expected));
+                }
+                1 => {
+                    assert_eq!(store.intersection_keys_by_type.remove(&expected), Some(key));
+                }
+                2 => {
+                    let wrong = store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(store.set_type_node_links(
+                        arguments[1],
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            outer_type_parameters: None,
+                        }
+                    ));
+                }
+                3 => {
+                    let generic = context
+                        .store()
+                        .type_alias_links(
+                            react_alias_parts(
+                                &context,
+                                &react,
+                                REACT_ALIAS_FILE,
+                                "DetailedHTMLProps",
+                            )
+                            .0,
+                        )
+                        .unwrap()
+                        .declared_type
+                        .unwrap();
+                    let store = context.store_mut_for_test();
+                    let identity = store.type_payload(generic).unwrap().alias().unwrap();
+                    let mut arguments = store
+                        .type_alias(identity)
+                        .unwrap()
+                        .type_arguments()
+                        .unwrap()
+                        .to_vec();
+                    arguments.reverse();
+                    assert!(store.set_type_alias_arguments(identity, Some(arguments)));
+                }
+                _ => unreachable!(),
+            }
+            let before = react_alias_snapshot(&context);
+            assert!(
+                context.get_type_at_location(name).is_err(),
+                "damage {damage}"
+            );
+            assert_eq!(react_alias_snapshot(&context), before);
+            assert!(
+                context.get_type_from_type_node(body).is_err(),
+                "damage {damage}"
+            );
+            assert_eq!(react_alias_snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Paired cache edits must still agree with written arguments.
+    fn react_intersection_alias_queries_reject_paired_argument_cache_changes() {
+        for (left, right, nested_alias) in [
+            ("1", "2", false),
+            ("Identity<number>", "Identity<string>", true),
+        ] {
+            let react = parse_source_file(REACT_ALIAS_DECLARATIONS);
+            let text = format!(
+                concat!(
+                    "type Identity<Value> = Value; ",
+                    "type Probe = React.DetailedHTMLProps<React.AudioHTMLAttributes<{0}>, {0}>; ",
+                    "type Alternate = React.DetailedHTMLProps<React.AudioHTMLAttributes<{1}>, {1}>;",
+                ),
+                left, right
+            );
+            let source = parse_source_file(&text);
+            let mut context = react_alias_context(&react, &source);
+            let (generic, _, _) =
+                react_alias_parts(&context, &react, REACT_ALIAS_FILE, "DetailedHTMLProps");
+            let (owner, name, body) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Probe");
+            let (_, alternate_name, alternate_body) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Alternate");
+            let (identity, _, _) =
+                react_alias_parts(&context, &source, REACT_ALIAS_SOURCE_FILE, "Identity");
+            let original = context.get_type_at_location(name).unwrap();
+            let alternate = context.get_type_at_location(alternate_name).unwrap();
+            assert_ne!(original, alternate);
+            let argument_nodes = |node: NodeRef| {
+                let NodeData::TypeReferenceNode(reference) =
+                    &source.arena.get(node.node).unwrap().data
+                else {
+                    panic!("expected a written generic reference")
+                };
+                reference
+                    .type_arguments
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .map(|child| NodeRef::new(node.arena, node.file, *child))
+                    .collect::<Vec<_>>()
+            };
+            let original_nodes = argument_nodes(body);
+            let alternate_arguments = argument_nodes(alternate_body)
+                .iter()
+                .map(|node| context.get_type_from_type_node(*node).unwrap())
+                .collect::<Vec<_>>();
+            let original_target = context.get_type_from_type_node(original_nodes[1]).unwrap();
+            let nested_argument = argument_nodes(original_nodes[0])[0];
+            let alternate_projection = context
+                .store()
+                .validate_deferred_intersection_type(alternate)
+                .unwrap();
+            let store = context.store_mut_for_test();
+            let forged = store
+                .canonical_deferred_intersection_type(
+                    &alternate_projection.types,
+                    Some((owner, &[])),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .validate_deferred_intersection_type(forged)
+                    .unwrap()
+                    .alias_symbol,
+                Some(owner)
+            );
+            let global = store
+                .symbol_store()
+                .assigned_global_symbol_id(owner)
+                .unwrap();
+            let key = type_alias_instantiation_cache_key(&alternate_arguments, Some((global, &[])));
+            let mut links = store.type_alias_links(generic).unwrap().clone();
+            assert_eq!(
+                links.instantiations.as_mut().unwrap().insert(key, forged),
+                None
+            );
+            assert!(store.set_type_alias_links(generic, links));
+            let mut owner_links = store.type_alias_links(owner).unwrap().clone();
+            owner_links.declared_type = Some(forged);
+            assert!(store.set_type_alias_links(owner, owner_links));
+            for (node, type_) in [
+                (body, forged),
+                (original_nodes[0], alternate_arguments[0]),
+                (original_nodes[1], alternate_arguments[1]),
+                (nested_argument, alternate_arguments[1]),
+            ] {
+                assert!(store.set_type_node_links(
+                    node,
+                    TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        outer_type_parameters: None,
+                    }
+                ));
+            }
+            if nested_alias {
+                let mut identity_links = store.type_alias_links(identity).unwrap().clone();
+                let key = type_alias_instantiation_cache_key(&[original_target], None);
+                assert_eq!(
+                    identity_links
+                        .instantiations
+                        .as_mut()
+                        .unwrap()
+                        .insert(key, alternate_arguments[1],),
+                    Some(original_target)
+                );
+                assert!(store.set_type_alias_links(identity, identity_links));
+            }
+            let before = react_alias_snapshot(&context);
+            assert!(context.get_type_at_location(name).is_err(), "{left}");
+            assert_eq!(react_alias_snapshot(&context), before);
+            assert!(context.get_type_from_type_node(body).is_err(), "{left}");
+            assert_eq!(react_alias_snapshot(&context), before);
+        }
     }
 
     #[test]

@@ -45,7 +45,8 @@ use super::{
     template_types::{MAX_TEMPLATE_UNION_SIZE, StringMappingKind},
     type_nodes::type_alias_instantiation_cache_key,
     type_records::{
-        CacheHashKey, LiteralValue, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
+        CacheHashKey, ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState,
+        TypeData, TypeRecord,
     },
     types::{AccessFlags, ObjectFlags, TypeFlags},
 };
@@ -246,6 +247,13 @@ pub(super) struct FiniteRecordMappedProperty {
     pub(super) type_: TypeId,
     pub(super) optional: bool,
     pub(super) readonly: bool,
+}
+
+/// The validated alias owner and arguments used without resolving mapped values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MappedAliasDisplayIdentity {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) arguments: Vec<TypeId>,
 }
 
 /// An invalid mapped record, unsupported input, or poisoned lazy cache.
@@ -2362,6 +2370,109 @@ impl CanonicalTypeMapperStore {
         let modifiers = self.declared_mapped_modifiers(type_)?;
         let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
         validate_warm_mapped_members(self, &shape, &properties, &indexes)
+    }
+
+    /// Checks alias and mapper identity without demanding cold mapped members.
+    pub(super) fn mapped_alias_display_identity(
+        &self,
+        type_: TypeId,
+        alias: SemanticSymbolId,
+    ) -> Result<MappedAliasDisplayIdentity, MappedTypeError> {
+        let invalid = || MappedTypeError::InvalidMappedType(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Mapped(mapped) = record.data() else {
+            return Err(invalid());
+        };
+        let declaration = mapped.declaration.ok_or_else(invalid)?;
+        let Some(SourceNodeParent::Parent(alias_declaration)) =
+            self.source_node_parent(declaration)
+        else {
+            return Err(invalid());
+        };
+        if self.source_node_kind(alias_declaration) != Some(SyntaxKind::TypeAliasDeclaration)
+            || self.source_declaration_symbol(alias_declaration) != Some(alias)
+            || !self.source_symbol_declarations_match(alias)
+        {
+            return Err(invalid());
+        }
+        if mapped.object.target.is_some() {
+            validate_mapped_relation_identity(self, type_)?;
+            let template = mapped
+                .template_type
+                .and_then(|template| self.type_payload(template))
+                .ok_or_else(invalid)?;
+            let variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+            if let TypeData::IndexedAccess(indexed) = template.data()
+                && (template.flags() != TypeFlags::INDEXED_ACCESS
+                    || template.object_flags() != ObjectFlags::NONE
+                        && template.object_flags() != variable_flags
+                    || template.symbol().is_some()
+                    || template.alias().is_some()
+                    || indexed.constrained != ConstrainedTypeData::default()
+                    || cached_deferred_indexed_access_type(
+                        self,
+                        indexed.object_type,
+                        indexed.index_type,
+                        indexed.access_flags,
+                    ) != Ok(Some(template.id())))
+            {
+                return Err(invalid());
+            }
+            let identity = record
+                .alias()
+                .and_then(|identity| self.type_alias(identity))
+                .ok_or_else(invalid)?;
+            return Ok(MappedAliasDisplayIdentity {
+                symbol: identity.symbol().ok_or_else(invalid)?,
+                arguments: identity.type_arguments().ok_or_else(invalid)?.to_vec(),
+            });
+        }
+
+        let links = self.type_alias_links(alias).ok_or_else(invalid)?;
+        let parameters = links.type_parameters.as_deref().unwrap_or_default();
+        if links.declared_type != Some(type_)
+            || !parameters.is_empty()
+                && links.instantiations.as_ref().is_none_or(|entries| {
+                    entries.get(&type_list_key(parameters)) != Some(&type_)
+                        || entries
+                            .values()
+                            .any(|type_| self.type_payload(*type_).is_none())
+                })
+        {
+            return Err(invalid());
+        }
+        // Pick declarations retain their source parameter as the modifier type.
+        // Authenticate that shape before allowing the utility modifier rule.
+        let pick = matches!(parameters, [_, _])
+            && matches!(
+                mapped
+                    .template_type
+                    .and_then(|template| self.type_payload(template))
+                    .map(TypeRecord::data),
+                Some(TypeData::IndexedAccess(_))
+            );
+        if pick {
+            validate_pick_mapped_alias_request(self, alias, type_, parameters, parameters)?;
+        }
+        validate_source_mapped_relation_identity(self, type_, pick)?;
+        if record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            let shape = validate_mapped_shape(self, type_)?;
+            let modifiers = self.declared_mapped_modifiers(type_)?;
+            let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
+            if validate_warm_mapped_members(self, &shape, &properties, &indexes)?.is_none() {
+                return Err(invalid());
+            }
+        } else {
+            validate_unresolved_mapped_members(self, type_)?;
+        }
+        Ok(MappedAliasDisplayIdentity {
+            symbol: alias,
+            arguments: parameters.to_vec(),
+        })
     }
 
     fn declared_mapped_modifiers(

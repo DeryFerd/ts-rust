@@ -18,7 +18,10 @@ use super::{
     indexed_access_types::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
-    intersection_types::{DeferredIntersectionTypeProjection, IntersectionTypeError},
+    instantiated_members::validate_generic_interface_members,
+    intersection_types::{
+        DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
+    },
     keyof_types::plan_nongeneric_keyof_type,
     mapped_types::{MappedTypeError, MappedTypeModifiers, escaped_property_name_from_type},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
@@ -189,6 +192,12 @@ enum InstantiationAliasCacheKey {
         symbol: SemanticSymbolId,
         type_arguments: Vec<TypeId>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum InstantiationAliasInput<'a> {
+    Stored(TypeAliasId),
+    Borrowed(SemanticSymbolId, &'a [TypeId]),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,6 +473,28 @@ pub(super) fn instantiate_type_with_vector_and_session(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_vector_and_alias_and_session(
+        store,
+        type_,
+        sources,
+        targets,
+        array_targets,
+        None,
+        session,
+    )
+}
+
+/// Instantiates one root with a borrowed alias identity in the caller's session.
+/// Child substitutions do not inherit the override or remap its arguments.
+pub(super) fn instantiate_type_with_vector_and_alias_and_session(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
     if sources.len() != targets.len() {
         return Err(InstantiationError::InvalidType(type_));
     }
@@ -472,12 +503,13 @@ pub(super) fn instantiate_type_with_vector_and_session(
             return Err(InstantiationError::InvalidType(*endpoint));
         }
     }
-    instantiate_type_with_alias(
+    instantiate_type_with_alias_input(
         store,
         type_,
         InstantiationMapping::Vector { sources, targets },
         array_targets,
-        None,
+        alias_override
+            .map(|(symbol, arguments)| InstantiationAliasInput::Borrowed(symbol, arguments)),
         session,
     )
 }
@@ -529,7 +561,7 @@ pub(super) fn with_mapped_template_frame<E>(
             }
         },
         map_error,
-        work,
+        |store, session, _| work(store, session),
     )
 }
 
@@ -618,6 +650,24 @@ fn instantiate_type_with_alias(
     alias: Option<TypeAliasId>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_alias_input(
+        store,
+        type_,
+        mapping,
+        array_targets,
+        alias.map(InstantiationAliasInput::Stored),
+        session,
+    )
+}
+
+fn instantiate_type_with_alias_input(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias: Option<InstantiationAliasInput<'_>>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
     if matches!(
         store.type_payload(type_).map(TypeRecord::data),
         Some(TypeData::Union(_))
@@ -631,9 +681,19 @@ fn instantiate_type_with_alias(
         store,
         mapping,
         session,
-        |store| instantiation_cache_key(store, type_, alias),
+        |store| instantiation_cache_key_for_input(store, type_, alias),
         std::convert::identity,
-        |store, session| {
+        |store, session, key| {
+            let InstantiationCacheKey::Type { alias, .. } = key else {
+                return Err(InstantiationError::InvalidType(type_));
+            };
+            let alias = match alias {
+                InstantiationAliasCacheKey::None => None,
+                InstantiationAliasCacheKey::Some {
+                    symbol,
+                    type_arguments,
+                } => Some((*symbol, type_arguments.as_slice())),
+            };
             instantiate_type_worker(store, type_, mapping, array_targets, alias, session)
         },
     )
@@ -647,7 +707,11 @@ fn with_instantiation_frame<E>(
         &CanonicalTypeMapperStore,
     ) -> Result<InstantiationCacheKey, InstantiationError>,
     map_error: impl Fn(InstantiationError) -> E,
-    work: impl FnOnce(&mut CanonicalTypeMapperStore, &mut InstantiationSession) -> Result<TypeId, E>,
+    work: impl FnOnce(
+        &mut CanonicalTypeMapperStore,
+        &mut InstantiationSession,
+        &InstantiationCacheKey,
+    ) -> Result<TypeId, E>,
 ) -> Result<TypeId, E> {
     if session.depth == session.limits.max_depth {
         return session
@@ -696,7 +760,7 @@ fn with_instantiation_frame<E>(
     session.total_count += 1;
     session.count += 1;
     session.depth += 1;
-    let result = work(store, session);
+    let result = work(store, session, &key);
     if existing_index.is_none() {
         let popped = session
             .active_mappers
@@ -732,6 +796,47 @@ fn instantiation_cache_key(
         }
     };
     Ok(InstantiationCacheKey::Type { type_, alias })
+}
+
+fn instantiation_cache_key_for_input(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    alias: Option<InstantiationAliasInput<'_>>,
+) -> Result<InstantiationCacheKey, InstantiationError> {
+    let (symbol, arguments) = match alias {
+        None => return instantiation_cache_key(store, type_, None),
+        Some(InstantiationAliasInput::Stored(identity)) => {
+            return instantiation_cache_key(store, type_, Some(identity));
+        }
+        Some(InstantiationAliasInput::Borrowed(symbol, arguments)) => (symbol, arguments),
+    };
+    validate_borrowed_alias_input(store, type_, symbol, arguments)?;
+    Ok(InstantiationCacheKey::Type {
+        type_,
+        alias: InstantiationAliasCacheKey::Some {
+            symbol,
+            type_arguments: arguments.to_vec(),
+        },
+    })
+}
+
+fn validate_borrowed_alias_input(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    symbol: SemanticSymbolId,
+    arguments: &[TypeId],
+) -> Result<(), InstantiationError> {
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || store
+            .symbol(symbol)
+            .is_none_or(|owner| !owner.flags().contains(SymbolFlags::TYPE_ALIAS))
+        || arguments
+            .iter()
+            .any(|argument| store.type_payload(*argument).is_none())
+    {
+        return Err(InstantiationError::InvalidType(type_));
+    }
+    Ok(())
 }
 
 fn could_contain_installed_type_variables(
@@ -1641,6 +1746,14 @@ fn cached_instantiated_type_worker(
                     .map_err(Into::into)
             }
         }
+        TypeData::Intersection(_) => cached_instantiated_intersection_type(
+            store,
+            template,
+            mapping,
+            array_targets,
+            alias_override,
+            active,
+        ),
         TypeData::Interface(data)
             if data
                 .reference
@@ -1704,6 +1817,248 @@ fn cached_instantiated_type_worker(
     result
 }
 
+fn cached_instantiated_intersection_type(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    active: &mut HashSet<TypeId>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let projection = store
+        .validate_deferred_intersection_type(source)
+        .map_err(|error| deferred_intersection_error(source, error))?;
+    if !could_contain_installed_type_variables(store, source, array_targets)? {
+        return Ok(Some(source));
+    }
+    if let Some((symbol, arguments)) = alias_override {
+        validate_borrowed_alias_input(store, source, symbol, arguments)?;
+    }
+    let mut constituents = Vec::with_capacity(projection.types.len());
+    for constituent in &projection.types {
+        let Some(instantiated) = cached_instantiated_type_worker(
+            store,
+            *constituent,
+            mapping,
+            array_targets,
+            None,
+            active,
+        )?
+        else {
+            return Ok(None);
+        };
+        constituents.push(instantiated);
+    }
+    if constituents == projection.types
+        && alias_override.map(|(symbol, _)| symbol) == projection.alias_symbol
+    {
+        return Ok(Some(source));
+    }
+    let mut arguments = Vec::new();
+    let alias = if let Some(alias) = alias_override {
+        Some(alias)
+    } else {
+        for argument in &projection.alias_arguments {
+            let Some(instantiated) = cached_instantiated_type_worker(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                active,
+            )?
+            else {
+                return Ok(None);
+            };
+            arguments.push(instantiated);
+        }
+        projection
+            .alias_symbol
+            .map(|symbol| (symbol, arguments.as_slice()))
+    };
+    let reduction_arguments = if alias_override.is_some() {
+        &constituents[..1]
+    } else {
+        arguments.as_slice()
+    };
+    if let Some(reduced) = reduce_default_library_non_nullable_intersection(
+        store,
+        source,
+        &projection,
+        &constituents,
+        reduction_arguments,
+        array_targets,
+    )? {
+        return Ok(Some(reduced));
+    }
+    cached_deferred_intersection_result(store, source, &constituents, alias)
+}
+
+/// Mirrors the deferred constructor's flattening without publishing a result.
+fn cached_deferred_intersection_result(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    constituents: &[TypeId],
+    alias: Option<(SemanticSymbolId, &[TypeId])>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(source);
+    if let Some((symbol, arguments)) = alias {
+        validate_borrowed_alias_input(store, source, symbol, arguments)?;
+        let Some([declaration]) = store.symbol(symbol).and_then(|owner| owner.declarations())
+        else {
+            return Err(invalid());
+        };
+        if store.source_node_kind(*declaration) != Some(SyntaxKind::TypeAliasDeclaration)
+            || store
+                .type_alias_links(symbol)
+                .and_then(|links| links.type_parameters.as_deref())
+                .is_some_and(|parameters| parameters.len() != arguments.len())
+        {
+            return Err(invalid());
+        }
+    }
+    let mut types = Vec::with_capacity(constituents.len());
+    for constituent in constituents {
+        append_cached_intersection_constituent(store, *constituent, &mut types)?;
+    }
+    match types.as_slice() {
+        [] => {
+            return store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| Some(bootstrap.unknown_type))
+                .ok_or_else(invalid);
+        }
+        [single] => return Ok(Some(*single)),
+        _ => {}
+    }
+    let key = IntersectionTypeCacheKey {
+        types,
+        alias_symbol: alias.map(|(symbol, _)| symbol),
+        alias_arguments: alias.map_or_else(Vec::new, |(_, arguments)| arguments.to_vec()),
+    };
+    let Some(cached) = store.intersection_types.get(&key).copied() else {
+        return if store
+            .intersection_keys_by_type
+            .values()
+            .any(|reverse| reverse == &key)
+        {
+            Err(invalid())
+        } else {
+            Ok(None)
+        };
+    };
+    if store.intersection_keys_by_type.get(&cached) != Some(&key) {
+        return Err(invalid());
+    }
+    let record = store.type_payload(cached).ok_or_else(invalid)?;
+    if record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        store
+            .validate_intersection_type(cached)
+            .map_err(|error| deferred_intersection_error(source, error))?;
+    } else {
+        store
+            .validate_deferred_intersection_type(cached)
+            .map_err(|error| deferred_intersection_error(source, error))?;
+    }
+    Ok(Some(cached))
+}
+
+/// A collapsed intersection still requires the constructor's complete leaf proof.
+fn append_cached_intersection_constituent(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    output: &mut Vec<TypeId>,
+) -> Result<(), InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    match record.data() {
+        TypeData::Intersection(_) => {
+            let constituents = if record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                store
+                    .validate_intersection_type(type_)
+                    .map_err(|error| deferred_intersection_error(type_, error))?
+                    .types
+            } else {
+                store
+                    .validate_deferred_intersection_type(type_)
+                    .map_err(|error| deferred_intersection_error(type_, error))?
+                    .types
+            };
+            for constituent in constituents {
+                append_cached_intersection_constituent(store, constituent, output)?;
+            }
+            return Ok(());
+        }
+        TypeData::TypeParameter(_) => {
+            let owner = cached_ordinary_type_parameter_owner(store, type_).ok_or_else(invalid)?;
+            let Some([declaration]) = store.symbol(owner).and_then(|owner| owner.declarations())
+            else {
+                return Err(invalid());
+            };
+            if store.get_merged_symbol(owner) != Some(owner)
+                || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+            {
+                return Err(invalid());
+            }
+        }
+        TypeData::Mapped(_) => store
+            .validate_deferred_mapped_type(type_)
+            .map_err(|_| invalid())?,
+        TypeData::TypeReference(_) | TypeData::Interface(_)
+            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+        {
+            let reference = validate_direct_generic_reference(store, type_)?;
+            let target = store.type_payload(reference.target).ok_or_else(invalid)?;
+            if !matches!(target.data(), TypeData::Interface(_))
+                || target.symbol().is_none_or(|symbol| {
+                    store.get_merged_symbol(symbol) != Some(symbol)
+                        || store.symbol(symbol).is_none_or(|owner| {
+                            !owner.flags().contains(SymbolFlags::INTERFACE)
+                                || owner
+                                    .flags()
+                                    .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+                                    != SymbolFlags::NONE
+                        })
+                })
+            {
+                return Err(invalid());
+            }
+            if record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                if !matches!(
+                    validate_generic_interface_members(store, type_, None),
+                    Ok(Some(_))
+                ) {
+                    return Err(invalid());
+                }
+            } else if record.data().structured() != Some(&StructuredTypeData::default()) {
+                return Err(invalid());
+            }
+        }
+        TypeData::Interface(_) | TypeData::Object(_) => {
+            if !matches!(
+                validate_resolved_declared_property_object(store, type_),
+                DeclaredPropertyObjectValidation::Valid(_)
+            ) {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(InstantiationError::UnsupportedType(type_)),
+    }
+    if !output.contains(&type_) {
+        output.push(type_);
+    }
+    Ok(())
+}
+
 fn instantiated_member_union_matches(
     store: &CanonicalTypeMapperStore,
     template: TypeId,
@@ -1755,7 +2110,7 @@ fn instantiate_type_worker(
     type_: TypeId,
     mapping: InstantiationMapping<'_>,
     array_targets: Option<CanonicalArrayTargets>,
-    alias: Option<TypeAliasId>,
+    alias: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
     let work = {
@@ -1902,9 +2257,15 @@ fn instantiate_type_worker(
         InstantiationWork::Union => {
             instantiate_union(store, type_, mapping, array_targets, alias, session)
         }
-        InstantiationWork::Intersection(projection) => {
-            instantiate_intersection(store, type_, &projection, mapping, array_targets, session)
-        }
+        InstantiationWork::Intersection(projection) => instantiate_intersection(
+            store,
+            type_,
+            &projection,
+            mapping,
+            array_targets,
+            alias,
+            session,
+        ),
         InstantiationWork::TypeReference => {
             instantiate_reference(store, type_, mapping, array_targets, session)
         }
@@ -2276,6 +2637,7 @@ fn instantiate_intersection(
     projection: &DeferredIntersectionTypeProjection,
     mapping: InstantiationMapping<'_>,
     array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
     let mut constituents = Vec::with_capacity(projection.types.len());
@@ -2293,32 +2655,44 @@ fn instantiate_intersection(
         constituents.push(instantiated);
     }
 
-    let mut alias_arguments = Vec::with_capacity(projection.alias_arguments.len());
-    for argument in &projection.alias_arguments {
-        let instantiated =
-            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?;
-        changed |= instantiated != *argument;
-        alias_arguments.push(instantiated);
-    }
-
-    if !changed {
+    if !changed && alias_override.map(|(symbol, _)| symbol) == projection.alias_symbol {
         return Ok(source);
     }
 
+    let mut alias_arguments = Vec::new();
+    let alias = if let Some(alias) = alias_override {
+        Some(alias)
+    } else {
+        for argument in &projection.alias_arguments {
+            alias_arguments.push(instantiate_type_with_alias(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                session,
+            )?);
+        }
+        projection
+            .alias_symbol
+            .map(|symbol| (symbol, alias_arguments.as_slice()))
+    };
+    let reduction_arguments = if alias_override.is_some() {
+        &constituents[..1]
+    } else {
+        alias_arguments.as_slice()
+    };
     if let Some(reduced) = reduce_default_library_non_nullable_intersection(
         store,
         source,
         projection,
         &constituents,
-        &alias_arguments,
+        reduction_arguments,
         array_targets,
     )? {
         return Ok(reduced);
     }
 
-    let alias = projection
-        .alias_symbol
-        .map(|symbol| (symbol, alias_arguments.as_slice()));
     store
         .canonical_deferred_intersection_type(&constituents, alias)
         .map_err(|error| deferred_intersection_error(source, error))
@@ -2709,26 +3083,29 @@ fn instantiate_union(
     source: TypeId,
     mapping: InstantiationMapping<'_>,
     array_targets: Option<CanonicalArrayTargets>,
-    alias_override: Option<TypeAliasId>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
     let constituents = instantiable_union_source_types(store, source, array_targets)?.to_vec();
     let source_alias = store.type_payload(source).and_then(TypeRecord::alias);
-    let alias = alias_override
-        .or(source_alias)
-        .map(|identity| {
-            let alias = store
-                .type_alias(identity)
-                .ok_or(InstantiationError::InvalidAlias(identity))?;
-            let symbol = alias
-                .symbol()
-                .ok_or(InstantiationError::InvalidAlias(identity))?;
-            Ok::<_, InstantiationError>((
-                symbol,
-                alias.type_arguments().unwrap_or_default().to_vec(),
-            ))
-        })
-        .transpose()?;
+    let alias = if let Some((symbol, arguments)) = alias_override {
+        Some((symbol, arguments.to_vec()))
+    } else {
+        source_alias
+            .map(|identity| {
+                let alias = store
+                    .type_alias(identity)
+                    .ok_or(InstantiationError::InvalidAlias(identity))?;
+                let symbol = alias
+                    .symbol()
+                    .ok_or(InstantiationError::InvalidAlias(identity))?;
+                Ok::<_, InstantiationError>((
+                    symbol,
+                    alias.type_arguments().unwrap_or_default().to_vec(),
+                ))
+            })
+            .transpose()?
+    };
     let mut mapped_types = Vec::with_capacity(constituents.len());
     let mut changed = false;
     let mut contains_type_variable = false;
@@ -2807,9 +3184,10 @@ pub(super) fn canonical_anonymous_union(
 mod tests {
     use super::*;
     use crate::semantic::{
-        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
-        ValueSymbolLinks,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeHost, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
         declared::{get_declared_class_interface_or_type_parameter, type_list_key},
+        links::TypeAliasLinks,
         mapper::TypeMapper,
         signatures::ElementFlags,
         template_types::MAX_TEMPLATE_UNION_SIZE,
@@ -2823,7 +3201,7 @@ mod tests {
         EscapedName, SymbolData, SymbolFlags,
     };
     use ts_core::JsString;
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     struct DeferredGenericIntersectionFixture {
         store: CanonicalTypeMapperStore,
@@ -2834,6 +3212,9 @@ mod tests {
         props: TypeId,
         string: TypeId,
         alias: SemanticSymbolId,
+        outer_aliases: [SemanticSymbolId; 2],
+        argument_alias: SemanticSymbolId,
+        outer_parameters: [TypeId; 2],
     }
 
     #[allow(clippy::too_many_lines)] // The fixture binds one complete generic alias graph.
@@ -2842,6 +3223,8 @@ mod tests {
             "interface ClassAttributes<T> {}\n",
             "interface HTMLAttributes<T> {}\n",
             "type DetailedHTMLProps<E, T> = ClassAttributes<T> & E;\n",
+            "type Probe = unknown; type Other = unknown;\n",
+            "type Forward<Left, Right> = unknown;\n",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(8_551);
@@ -2886,6 +3269,18 @@ mod tests {
             .symbol_table(locals)
             .unwrap()
             .get_source("DetailedHTMLProps")
+            .unwrap();
+        let outer_aliases = ["Probe", "Other"].map(|name| {
+            store
+                .symbol_table(locals)
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        });
+        let argument_alias = store
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("Forward")
             .unwrap();
         let declaration = store.symbol(alias).unwrap().declarations().unwrap()[0];
         let NodeData::TypeAliasDeclaration(alias_declaration) =
@@ -2941,6 +3336,44 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let outer_declaration = store
+            .symbol(argument_alias)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let NodeData::TypeAliasDeclaration(outer) =
+            &parsed.arena.get(outer_declaration.node).unwrap().data
+        else {
+            panic!("Forward retains its bound type parameters")
+        };
+        let outer_parameters = outer
+            .type_parameters
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|node| {
+                let symbol = bound
+                    .symbol(NodeRef::new(parsed.arena.id(), file, *node))
+                    .unwrap();
+                get_declared_class_interface_or_type_parameter(
+                    &mut store,
+                    &host,
+                    symbol,
+                    SymbolFlags::TYPE_PARAMETER,
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let outer_parameters: [TypeId; 2] = outer_parameters.try_into().unwrap();
+        assert!(store.set_type_alias_links(
+            argument_alias,
+            TypeAliasLinks {
+                type_parameters: Some(outer_parameters.to_vec()),
+                ..TypeAliasLinks::default()
+            }
+        ));
         let string = store.intrinsic_bootstrap().unwrap().string_type;
         let class_reference = create_direct_generic_reference(
             &mut store,
@@ -2971,18 +3404,150 @@ mod tests {
             props,
             string,
             alias,
+            outer_aliases,
+            argument_alias,
+            outer_parameters,
+        }
+    }
+
+    struct NonemptyDeferredGenericIntersectionFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        intersection: TypeId,
+        sources: [TypeId; 2],
+        targets: [TypeId; 2],
+        source_alias: SemanticSymbolId,
+        owner: SemanticSymbolId,
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep checked properties and unchecked alias identities in one fixture.
+    fn nonempty_deferred_generic_intersection_fixture<'arena>(
+        parsed: &'arena ParseResult,
+        template: &'arena ParseResult,
+    ) -> NonemptyDeferredGenericIntersectionFixture<'arena> {
+        let file = FileId::new(8_552);
+        let template_file = FileId::new(8_553);
+        let mut binder = CanonicalBinder::new();
+        for (source, file, path) in [
+            (parsed, file, "\"/nonempty-deferred-intersection.ts\""),
+            (
+                template,
+                template_file,
+                "\"/deferred-intersection-template.ts\"",
+            ),
+        ] {
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena), (template_file, &template.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        // Check only the concrete reference source to publish its declared property
+        // types. The generic intersection stays on the kernel construction path.
+        context.check_source_file(file).unwrap();
+        let [source_alias, owner, left, right] = [
+            (template_file, "DetailedHTMLProps"),
+            (template_file, "Probe"),
+            (file, "Left"),
+            (file, "Right"),
+        ]
+        .map(|(file, name)| {
+            let bound = context.file(file).unwrap().1;
+            let locals = bound.locals(bound.source_file()).unwrap();
+            context
+                .store()
+                .symbol_table(locals)
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        });
+        let [class, attributes] = [left, right].map(|symbol| {
+            context
+                .store()
+                .type_alias_links(symbol)
+                .unwrap()
+                .declared_type
+                .unwrap()
+        });
+        let declaration = context
+            .store()
+            .symbol(source_alias)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let NodeData::TypeAliasDeclaration(alias) =
+            &template.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the nonempty fixture must retain its declared intersection alias")
+        };
+        let [props_node, element_node] = alias.type_parameters.as_ref().unwrap().nodes.as_slice()
+        else {
+            panic!("the nonempty fixture must bind E and T")
+        };
+        let parameter_symbols = [props_node, element_node].map(|node| {
+            context
+                .file(template_file)
+                .unwrap()
+                .1
+                .symbol(NodeRef::new(template.arena.id(), template_file, *node))
+                .unwrap()
+        });
+        let [props, element] =
+            parameter_symbols.map(|symbol| context.get_declared_type_of_symbol(symbol).unwrap());
+        let store = context.store_mut_for_test();
+        let class_target = validate_direct_generic_reference(store, class)
+            .unwrap()
+            .target;
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let class_reference =
+            create_direct_generic_reference(store, class_target, &[element], ObjectFlags::NONE)
+                .unwrap();
+        let intersection = store
+            .canonical_deferred_intersection_type(
+                &[class_reference, props],
+                Some((source_alias, &[props, element])),
+            )
+            .unwrap();
+        NonemptyDeferredGenericIntersectionFixture {
+            context,
+            intersection,
+            sources: [props, element],
+            targets: [attributes, string],
+            source_alias,
+            owner,
         }
     }
 
     fn deferred_intersection_store_state(
         store: &CanonicalTypeMapperStore,
-    ) -> (usize, usize, usize, usize, usize, [usize; 26]) {
+    ) -> ([usize; 7], [usize; 26]) {
         (
-            store.type_len(),
-            store.type_alias_len(),
-            store.mapper_len(),
-            store.symbol_len(),
-            store.symbol_store().symbol_table_len(),
+            [
+                store.type_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.signature_len(),
+                store.index_info_len(),
+            ],
             store.checker_link_allocated_lengths(),
         )
     }
@@ -3309,6 +3874,703 @@ mod tests {
             Ok(source),
         );
         assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn deferred_intersection_alias_overrides_keep_distinct_cold_and_warm_owners() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let sources = [fixture.props, fixture.element];
+        let targets = [fixture.attributes_reference, fixture.string];
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let aliases = [
+            None,
+            Some((fixture.outer_aliases[0], &[][..])),
+            Some((fixture.outer_aliases[1], &[][..])),
+        ];
+        let mut results = Vec::new();
+        for alias in aliases {
+            let before = deferred_intersection_store_state(&fixture.store);
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &fixture.store,
+                    source,
+                    &sources,
+                    &targets,
+                    None,
+                    alias,
+                ),
+                Ok(None)
+            );
+            assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+            let aliases_before = fixture.store.type_alias_len();
+            let result = instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                alias,
+                &mut session,
+            )
+            .unwrap();
+            assert_eq!(
+                fixture.store.type_alias_len(),
+                aliases_before + 1,
+                "only the canonical result allocates an alias record"
+            );
+            let projection = fixture
+                .store
+                .validate_deferred_intersection_type(result)
+                .unwrap();
+            assert_eq!(
+                projection.alias_symbol,
+                Some(alias.map_or(fixture.alias, |(owner, _)| owner))
+            );
+            assert_eq!(
+                projection.alias_arguments,
+                alias.map_or_else(|| targets.to_vec(), |(_, arguments)| arguments.to_vec())
+            );
+            assert_eq!(projection.types[1], fixture.attributes_reference);
+            let before = deferred_intersection_store_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &fixture.store,
+                        source,
+                        &sources,
+                        &targets,
+                        None,
+                        alias,
+                    ),
+                    Ok(Some(result))
+                );
+                assert_eq!(
+                    instantiate_type_with_vector_and_alias_and_session(
+                        &mut fixture.store,
+                        source,
+                        &sources,
+                        &targets,
+                        None,
+                        alias,
+                        &mut session,
+                    ),
+                    Ok(result)
+                );
+            }
+            assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+            assert!(!results.contains(&result));
+            results.push(result);
+        }
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+    }
+
+    #[test]
+    fn deferred_intersection_alias_override_keeps_go_identity_mapper_rule() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let arguments = [fixture.props, fixture.element];
+        let alias = Some((fixture.outer_aliases[0], &[][..]));
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &arguments,
+                &arguments,
+                None,
+                alias,
+            ),
+            Ok(None)
+        );
+        let renamed = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &arguments,
+            &arguments,
+            None,
+            alias,
+            &mut session,
+        )
+        .unwrap();
+        assert_ne!(renamed, source);
+        let original = fixture
+            .store
+            .validate_deferred_intersection_type(source)
+            .unwrap();
+        let projection = fixture
+            .store
+            .validate_deferred_intersection_type(renamed)
+            .unwrap();
+        assert_eq!(projection.types, original.types);
+        assert_eq!(projection.alias_symbol, Some(fixture.outer_aliases[0]));
+        assert!(projection.alias_arguments.is_empty());
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &arguments,
+                &arguments,
+                None,
+                alias,
+            ),
+            Ok(Some(renamed))
+        );
+
+        // Pinned Go tests the override symbol before reading its argument slice.
+        let different_arguments = [fixture.string, fixture.attributes_reference];
+        let same_owner = Some((fixture.alias, different_arguments.as_slice()));
+        let before = deferred_intersection_store_state(&fixture.store);
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &arguments,
+                &arguments,
+                None,
+                same_owner,
+                &mut session,
+            ),
+            Ok(source)
+        );
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &arguments,
+                &arguments,
+                None,
+                same_owner,
+            ),
+            Ok(Some(source))
+        );
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn deferred_intersection_alias_override_does_not_remap_borrowed_arguments() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let arguments = fixture.outer_parameters;
+        let sources = [fixture.props, fixture.element, arguments[0], arguments[1]];
+        let targets = [
+            fixture.attributes_reference,
+            fixture.string,
+            fixture.string,
+            fixture.attributes_reference,
+        ];
+        let alias = Some((fixture.argument_alias, arguments.as_slice()));
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 4,
+        });
+        let mark = session.limit_event_mark();
+        let aliases_before = fixture.store.type_alias_len();
+        let mappers_before = fixture.store.mapper_len();
+        let result = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &sources,
+            &targets,
+            None,
+            alias,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(fixture.store.type_alias_len(), aliases_before + 1);
+        assert_eq!(fixture.store.mapper_len(), mappers_before);
+        assert_eq!(
+            session.query_count(),
+            4,
+            "the root, reference, T, and E are the only charged substitutions"
+        );
+        assert!(!session.limit_event_occurred_since(mark));
+        let projection = fixture
+            .store
+            .validate_deferred_intersection_type(result)
+            .unwrap();
+        assert_eq!(projection.alias_symbol, Some(fixture.argument_alias));
+        assert_eq!(projection.alias_arguments, arguments);
+        assert_eq!(projection.types[1], fixture.attributes_reference);
+        assert_eq!(
+            validate_direct_generic_reference(&fixture.store, projection.types[0])
+                .unwrap()
+                .type_arguments,
+            [fixture.string]
+        );
+        let before = deferred_intersection_store_state(&fixture.store);
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                alias,
+            ),
+            Ok(Some(result))
+        );
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation checks the same expected intersection identity.
+    fn cached_deferred_intersection_alias_overrides_reject_interner_and_alias_damage() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let sources = [fixture.props, fixture.element];
+        let targets = [fixture.attributes_reference, fixture.string];
+        let arguments = fixture.outer_parameters;
+        let alias = Some((fixture.argument_alias, arguments.as_slice()));
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let result = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &sources,
+            &targets,
+            None,
+            alias,
+            &mut session,
+        )
+        .unwrap();
+        let other = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &sources,
+            &targets,
+            None,
+            Some((fixture.outer_aliases[0], &[])),
+            &mut session,
+        )
+        .unwrap();
+        let key = fixture
+            .store
+            .intersection_keys_by_type
+            .get(&result)
+            .unwrap()
+            .clone();
+        let other_key = fixture
+            .store
+            .intersection_keys_by_type
+            .get(&other)
+            .unwrap()
+            .clone();
+        let identity = fixture.store.type_payload(result).unwrap().alias().unwrap();
+        let other_identity = fixture.store.type_payload(other).unwrap().alias().unwrap();
+        let flags = fixture.store.type_payload(result).unwrap().object_flags();
+        let assert_rejected = |store: &CanonicalTypeMapperStore| {
+            let before = deferred_intersection_store_state(store);
+            let forward = store.intersection_types.clone();
+            let reverse = store.intersection_keys_by_type.clone();
+            assert!(
+                cached_instantiation_with_vector(store, source, &sources, &targets, None, alias,)
+                    .is_err()
+            );
+            assert_eq!(deferred_intersection_store_state(store), before);
+            assert_eq!(store.intersection_types, forward);
+            assert_eq!(store.intersection_keys_by_type, reverse);
+        };
+
+        assert_eq!(fixture.store.intersection_types.remove(&key), Some(result));
+        assert_rejected(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .intersection_types
+                .insert(key.clone(), result)
+                .is_none()
+        );
+        assert_eq!(
+            fixture.store.intersection_keys_by_type.remove(&result),
+            Some(key.clone())
+        );
+        assert_rejected(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .intersection_keys_by_type
+                .insert(result, key.clone())
+                .is_none()
+        );
+
+        assert_eq!(
+            fixture.store.intersection_types.insert(key.clone(), other),
+            Some(result)
+        );
+        assert_rejected(&fixture.store);
+        assert_eq!(
+            fixture.store.intersection_types.insert(key.clone(), result),
+            Some(other)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .intersection_keys_by_type
+                .insert(result, other_key.clone()),
+            Some(key.clone())
+        );
+        assert_rejected(&fixture.store);
+        assert_eq!(
+            fixture
+                .store
+                .intersection_keys_by_type
+                .insert(result, key.clone()),
+            Some(other_key)
+        );
+
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(vec![arguments[1], arguments[0]]))
+        );
+        assert_rejected(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(arguments.to_vec()))
+        );
+        assert!(fixture.store.set_type_alias(result, Some(other_identity)));
+        assert_rejected(&fixture.store);
+        assert!(fixture.store.set_type_alias(result, Some(identity)));
+
+        assert!(
+            fixture
+                .store
+                .set_type_object_flags(result, flags | ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert_rejected(&fixture.store);
+        assert!(fixture.store.set_type_object_flags(result, flags));
+        assert!(fixture.store.set_union_or_intersection_caches(
+            result,
+            None,
+            None,
+            Some(Vec::new())
+        ));
+        assert_rejected(&fixture.store);
+        assert!(
+            fixture
+                .store
+                .set_union_or_intersection_caches(result, None, None, None)
+        );
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                alias,
+            ),
+            Ok(Some(result))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check flattening, collapse, and the surviving reference cache together.
+    fn cached_deferred_intersections_flatten_and_validate_collapsed_references() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let sources = [fixture.props, fixture.element];
+        let targets = [fixture.attributes_reference, fixture.string];
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let inner = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &sources,
+            &targets,
+            None,
+            Some((fixture.outer_aliases[1], &[])),
+            &mut session,
+        )
+        .unwrap();
+        let inner_projection = fixture
+            .store
+            .validate_deferred_intersection_type(inner)
+            .unwrap();
+        let class = inner_projection.types[0];
+        let alias = Some((fixture.outer_aliases[0], &[][..]));
+        let nested_targets = [inner, fixture.string];
+        let flattened = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &sources,
+            &nested_targets,
+            None,
+            alias,
+            &mut session,
+        )
+        .unwrap();
+        let projection = fixture
+            .store
+            .validate_deferred_intersection_type(flattened)
+            .unwrap();
+        assert_eq!(projection.types, inner_projection.types);
+        assert_eq!(projection.alias_symbol, Some(fixture.outer_aliases[0]));
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &sources,
+                &nested_targets,
+                None,
+                alias,
+            ),
+            Ok(Some(flattened))
+        );
+
+        let collapsed_targets = [class, fixture.string];
+        let before = deferred_intersection_store_state(&fixture.store);
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &sources,
+                &collapsed_targets,
+                None,
+                alias,
+            ),
+            Ok(Some(class))
+        );
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &sources,
+                &collapsed_targets,
+                None,
+                alias,
+                &mut session,
+            ),
+            Ok(class)
+        );
+        assert!(fixture.store.type_payload(class).unwrap().alias().is_none());
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+
+        let flags = fixture.store.type_payload(class).unwrap().object_flags();
+        assert!(fixture.store.set_structured_type_members(
+            class,
+            None,
+            Some(vec![fixture.alias]),
+            None,
+            None,
+            None,
+        ));
+        let damaged = deferred_intersection_store_state(&fixture.store);
+        assert!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &sources,
+                &collapsed_targets,
+                None,
+                alias,
+            )
+            .is_err()
+        );
+        assert_eq!(deferred_intersection_store_state(&fixture.store), damaged);
+        assert!(
+            fixture
+                .store
+                .set_structured_type_members(class, None, None, None, None, None)
+        );
+        assert!(fixture.store.set_type_object_flags(class, flags));
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &fixture.store,
+                source,
+                &sources,
+                &collapsed_targets,
+                None,
+                alias,
+            ),
+            Ok(Some(class))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Validate resolved intersections and their surviving reference cache together.
+    fn cached_deferred_intersections_preserve_resolved_members_and_reject_warm_damage() {
+        let parsed = parse_source_file(concat!(
+            "interface ClassAttributes<T> { ref: T }\n",
+            "interface HTMLAttributes<T> { value: T }\n",
+            "type Left = ClassAttributes<string>;\n",
+            "type Right = HTMLAttributes<string>;\n",
+        ));
+        let template = parse_source_file(concat!(
+            "type DetailedHTMLProps<E, T> = ClassAttributes<T> & E;\n",
+            "type Probe = unknown;\n",
+        ));
+        let mut fixture = nonempty_deferred_generic_intersection_fixture(&parsed, &template);
+        let source = fixture.intersection;
+        let sources = fixture.sources;
+        let targets = fixture.targets;
+        let owner = fixture.owner;
+        let alias = Some((owner, &[][..]));
+        let store = fixture.context.store_mut_for_test();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let result = instantiate_type_with_vector_and_alias_and_session(
+            store,
+            source,
+            &sources,
+            &targets,
+            None,
+            alias,
+            &mut session,
+        )
+        .unwrap();
+        let constituents = store
+            .validate_deferred_intersection_type(result)
+            .unwrap()
+            .types;
+        assert_eq!(constituents.len(), 2);
+        for (reference, name) in constituents.iter().zip(["ref", "value"]) {
+            let property = store
+                .resolve_generic_interface_property(*reference, name, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(property.type_id(), targets[1]);
+        }
+        assert_eq!(
+            store.canonical_intersection_type(&constituents, Some(owner)),
+            Ok(result)
+        );
+        let resolved = store.validate_intersection_type(result).unwrap();
+        assert_eq!(resolved.properties.len(), 2);
+        assert!(store.validate_deferred_intersection_type(result).is_err());
+        let class = constituents[0];
+        let collapsed_targets = [class, targets[1]];
+        let before = deferred_intersection_store_state(store);
+        for (arguments, expected) in [(&targets, result), (&collapsed_targets, class)] {
+            assert_eq!(
+                cached_instantiation_with_vector(store, source, &sources, arguments, None, alias,),
+                Ok(Some(expected))
+            );
+        }
+        assert_eq!(deferred_intersection_store_state(store), before);
+
+        assert!(store.set_union_or_intersection_caches(result, Some(resolved.members), None, None));
+        let damaged = deferred_intersection_store_state(store);
+        assert!(
+            cached_instantiation_with_vector(store, source, &sources, &targets, None, alias,)
+                .is_err()
+        );
+        assert_eq!(deferred_intersection_store_state(store), damaged);
+        assert!(store.set_union_or_intersection_caches(
+            result,
+            Some(resolved.members),
+            None,
+            Some(resolved.properties),
+        ));
+
+        let original = store
+            .type_payload(class)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        assert!(original.signatures.is_none());
+        assert_eq!(original.call_signature_count, 0);
+        assert!(store.set_structured_type_members(
+            class,
+            None,
+            Some(vec![fixture.source_alias]),
+            None,
+            None,
+            None,
+        ));
+        let damaged = deferred_intersection_store_state(store);
+        for arguments in [&targets, &collapsed_targets] {
+            assert!(
+                cached_instantiation_with_vector(store, source, &sources, arguments, None, alias,)
+                    .is_err()
+            );
+        }
+        assert_eq!(deferred_intersection_store_state(store), damaged);
+        assert!(store.set_structured_type_members(
+            class,
+            original.members,
+            original.properties,
+            None,
+            None,
+            original.index_infos,
+        ));
+        for (arguments, expected) in [(&targets, result), (&collapsed_targets, class)] {
+            assert_eq!(
+                cached_instantiation_with_vector(store, source, &sources, arguments, None, alias,),
+                Ok(Some(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn empty_generic_deferred_intersection_materialization_is_unsupported_without_writes() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let owner = fixture.outer_aliases[0];
+        let result = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            fixture.intersection,
+            &[fixture.props, fixture.element],
+            &[fixture.attributes_reference, fixture.string],
+            None,
+            Some((owner, &[])),
+            &mut InstantiationSession::new(InstantiationLimits::default()),
+        )
+        .unwrap();
+        let constituents = fixture
+            .store
+            .validate_deferred_intersection_type(result)
+            .unwrap()
+            .types;
+        for reference in &constituents {
+            let target = validate_direct_generic_reference(&fixture.store, *reference)
+                .unwrap()
+                .target;
+            assert!(fixture.store.publish_interface_no_base_resolution(target));
+            assert!(
+                fixture
+                    .store
+                    .set_interface_declared_members(target, true, None, None, None, None)
+            );
+            let members = fixture
+                .store
+                .resolve_generic_interface_members(*reference, None)
+                .unwrap();
+            assert!(members.properties().is_empty());
+            assert!(members.mapper().is_none());
+        }
+        let before = deferred_intersection_store_state(&fixture.store);
+        let forward = fixture.store.intersection_types.clone();
+        let reverse = fixture.store.intersection_keys_by_type.clone();
+        let record_state = |store: &CanonicalTypeMapperStore| {
+            let record = store.type_payload(result).unwrap();
+            let TypeData::Intersection(data) = record.data() else {
+                panic!("unsupported materialization must retain its intersection record")
+            };
+            (
+                record.flags(),
+                record.object_flags(),
+                record.symbol(),
+                record.alias(),
+                data.clone(),
+            )
+        };
+        let record = record_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .store
+                    .canonical_intersection_type(&constituents, Some(owner)),
+                Err(IntersectionTypeError::UnsupportedConstituent(
+                    constituents[0]
+                ))
+            );
+            assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+            assert_eq!(fixture.store.intersection_types, forward);
+            assert_eq!(fixture.store.intersection_keys_by_type, reverse);
+            assert_eq!(record_state(&fixture.store), record);
+        }
     }
 
     #[test]
@@ -4575,6 +5837,284 @@ mod tests {
             None,
             "a live alias mutation must miss"
         );
+    }
+
+    #[test]
+    fn borrowed_alias_cache_keys_match_stored_owner_and_ordered_arguments() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let arguments = fixture.outer_parameters;
+        let identity = fixture
+            .store
+            .alloc_type_alias(Some(fixture.argument_alias))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(arguments.to_vec()))
+        );
+        let before = deferred_intersection_store_state(&fixture.store);
+        let key = instantiation_cache_key_for_input(
+            &fixture.store,
+            source,
+            Some(InstantiationAliasInput::Borrowed(
+                fixture.argument_alias,
+                &arguments,
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            instantiation_cache_key(&fixture.store, source, Some(identity)),
+            Ok(key.clone())
+        );
+        assert_ne!(
+            instantiation_cache_key_for_input(
+                &fixture.store,
+                source,
+                Some(InstantiationAliasInput::Borrowed(
+                    fixture.argument_alias,
+                    &[arguments[1], arguments[0]]
+                )),
+            )
+            .unwrap(),
+            key
+        );
+        let first = instantiation_cache_key_for_input(
+            &fixture.store,
+            source,
+            Some(InstantiationAliasInput::Borrowed(
+                fixture.outer_aliases[0],
+                &[],
+            )),
+        )
+        .unwrap();
+        let second = instantiation_cache_key_for_input(
+            &fixture.store,
+            source,
+            Some(InstantiationAliasInput::Borrowed(
+                fixture.outer_aliases[1],
+                &[],
+            )),
+        )
+        .unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            first,
+            instantiation_cache_key(&fixture.store, source, None).unwrap()
+        );
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cache hits, both guards, and recovery in one active frame.
+    fn borrowed_alias_overrides_share_session_cache_and_preserve_limit_guards() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let sources = [fixture.props, fixture.element];
+        let targets = [fixture.attributes_reference, fixture.string];
+        let alias = Some((fixture.outer_aliases[0], &[][..]));
+        let mut preparation = InstantiationSession::new(InstantiationLimits::default());
+        let result = instantiate_type_with_vector_and_alias_and_session(
+            &mut fixture.store,
+            source,
+            &sources,
+            &targets,
+            None,
+            alias,
+            &mut preparation,
+        )
+        .unwrap();
+        let key = instantiation_cache_key_for_input(
+            &fixture.store,
+            source,
+            Some(InstantiationAliasInput::Borrowed(
+                fixture.outer_aliases[0],
+                &[],
+            )),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 5,
+        });
+        session.depth = 3;
+        session.count = 4;
+        session.total_count = 9;
+        session.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMapping::Vector {
+                sources: &sources,
+                targets: &targets,
+            }
+            .identity(),
+            cache: HashMap::from([(key.clone(), result)]),
+        });
+        let before = deferred_intersection_store_state(&fixture.store);
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                alias,
+                &mut session,
+            ),
+            Ok(result)
+        );
+        assert_eq!(
+            (session.depth, session.query_count(), session.total_count()),
+            (3, 4, 9)
+        );
+        assert_eq!(session.limit_event_mark(), mark);
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+
+        session.count = 5;
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                alias,
+                &mut session,
+            ),
+            Err(InstantiationError::CountLimit { count: 5, limit: 5 })
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert_eq!(session.active_mappers[0].cache.get(&key), Some(&result));
+        assert_eq!(
+            (session.depth, session.query_count(), session.total_count()),
+            (3, 5, 9)
+        );
+
+        session.count = 4;
+        session.depth = 10;
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                alias,
+                &mut session,
+            ),
+            Err(InstantiationError::DepthLimit {
+                depth: 10,
+                limit: 10
+            })
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert_eq!(
+            (session.depth, session.query_count(), session.total_count()),
+            (10, 4, 9)
+        );
+
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        session.limit_policy = InstantiationLimitPolicy::Recover { error_type };
+        let cache = session.active_mappers[0].cache.clone();
+        for owner in fixture.outer_aliases {
+            let mark = session.limit_event_mark();
+            assert_eq!(
+                instantiate_type_with_vector_and_alias_and_session(
+                    &mut fixture.store,
+                    source,
+                    &sources,
+                    &targets,
+                    None,
+                    Some((owner, &[])),
+                    &mut session,
+                ),
+                Ok(error_type)
+            );
+            assert!(session.limit_event_occurred_since(mark));
+            assert_eq!(session.active_mappers.len(), 1);
+            assert_eq!(
+                session.active_mappers[0].cache, cache,
+                "a guarded cache hit survives, and an absent key stays absent"
+            );
+            assert_eq!(
+                (session.depth, session.query_count(), session.total_count()),
+                (10, 4, 9)
+            );
+            assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn borrowed_alias_validation_stays_after_nonvariable_and_limit_guards() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let foreign = deferred_generic_intersection_fixture();
+        let source = fixture.props;
+        let sources = [source];
+        let targets = [fixture.string];
+        let foreign_argument = [foreign.string];
+        let invalid = [
+            Some((foreign.outer_aliases[0], &[][..])),
+            Some((fixture.outer_aliases[0], foreign_argument.as_slice())),
+        ];
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mark = session.limit_event_mark();
+        let before = deferred_intersection_store_state(&fixture.store);
+        for alias in invalid {
+            assert_eq!(
+                instantiate_type_with_vector_and_alias_and_session(
+                    &mut fixture.store,
+                    source,
+                    &sources,
+                    &targets,
+                    None,
+                    alias,
+                    &mut session,
+                ),
+                Err(InstantiationError::InvalidType(source))
+            );
+        }
+        assert_eq!(
+            (session.depth, session.query_count(), session.total_count()),
+            (0, 0, 0)
+        );
+        assert!(session.active_mappers.is_empty());
+        assert_eq!(session.limit_event_mark(), mark);
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+
+        session.limits.max_depth = 0;
+        session.limits.max_count = 0;
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                fixture.string,
+                &sources,
+                &targets,
+                None,
+                invalid[0],
+                &mut session,
+            ),
+            Ok(fixture.string)
+        );
+        assert_eq!(session.limit_event_mark(), mark);
+        assert_eq!(
+            instantiate_type_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                source,
+                &sources,
+                &targets,
+                None,
+                invalid[0],
+                &mut session,
+            ),
+            Err(InstantiationError::DepthLimit { depth: 0, limit: 0 })
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert_eq!(
+            (session.depth, session.query_count(), session.total_count()),
+            (0, 0, 0)
+        );
+        assert!(session.active_mappers.is_empty());
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
     }
 
     #[test]

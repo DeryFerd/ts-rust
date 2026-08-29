@@ -2351,113 +2351,75 @@ fn display_mapped_type_alias(
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
 
-    if mapped.object.target.is_some() {
-        let instantiation_mapper = mapped
-            .object
-            .mapper
-            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-        let type_parameters = store
-            .type_alias_links(symbol)
-            .and_then(|links| links.type_parameters.as_deref())
-            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-        let type_arguments = [
-            mapped
-                .constraint_type
-                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
-            mapped
-                .template_type
-                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
-        ];
-        if store.mapper_payload(instantiation_mapper).is_none()
-            || store
-                .validate_record_mapped_alias_instantiation(
-                    symbol,
-                    declared_type,
-                    type_parameters,
-                    &type_arguments,
-                    type_id,
-                )
-                .is_err()
-        {
-            return Err(TypeDisplayUnavailable::MalformedType(type_id));
-        }
-
-        let alias = record
-            .alias()
-            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-        let identity = store
-            .type_alias(alias)
-            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
-        let owner = identity
-            .symbol()
-            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let identity = store
+        .mapped_alias_display_identity(type_id, symbol)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    for owner in [symbol, identity.symbol] {
         let owner_record = store
             .symbol(owner)
-            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
         let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
-            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        };
+        let Some(NodeData::TypeAliasDeclaration(owner_data)) =
+            host.node(*owner_declaration).map(|node| &node.data)
+        else {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
         };
         let owner_links = store
             .type_alias_links(owner)
-            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let parameters = owner_links.type_parameters.as_deref().unwrap_or_default();
+        let source_parameters = owner_data
+            .type_parameters
+            .as_ref()
+            .map(|parameters| parameters.nodes.as_slice())
+            .unwrap_or_default();
         if owner_record.flags() != SymbolFlags::TYPE_ALIAS
             || store.get_merged_symbol(owner) != Some(owner)
             || !host.symbol_matches(store, *owner_declaration, owner)
-            || !matches!(
-                host.node(*owner_declaration).map(|node| &node.data),
-                Some(NodeData::TypeAliasDeclaration(_))
-            )
+            || owner_links.type_parameters.is_some() != owner_data.type_parameters.is_some()
+            || parameters.len() != source_parameters.len()
+            || parameters
+                .iter()
+                .zip(source_parameters)
+                .any(|(parameter, node)| {
+                    let declaration =
+                        NodeRef::new(owner_declaration.arena, owner_declaration.file, *node);
+                    cached_ordinary_type_parameter_owner(store, *parameter).is_none_or(|symbol| {
+                        !host.symbol_matches(store, declaration, symbol)
+                            || store
+                                .symbol(symbol)
+                                .and_then(|symbol| symbol.declarations())
+                                != Some(&[declaration][..])
+                    })
+                })
         {
-            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
-
-        if owner == symbol {
-            if owner_record.name().as_utf8() != Some("Record")
-                || owner_links.declared_type != Some(declared_type)
-                || identity.type_arguments() != Some(type_arguments.as_slice())
-            {
-                return Err(TypeDisplayUnavailable::Alias { type_id, alias });
-            }
-            if !visiting.insert(type_id) {
-                return Err(TypeDisplayUnavailable::CyclicType(type_id));
-            }
-            let result = (|| {
-                let mut result = display_alias_name(store, Some(host), type_id, alias, state)?;
-                result.push('<');
-                state.add(2);
-                for (index, argument) in type_arguments.iter().enumerate() {
-                    if index != 0 {
-                        result.push_str(", ");
-                        state.add(2);
-                    }
-                    result.push_str(&display_type_worker(
-                        store,
-                        Some(host),
-                        global_types,
-                        *argument,
-                        flags,
-                        state,
-                        visiting,
-                    )?);
-                }
-                result.push('>');
-                Ok(result)
-            })();
-            visiting.remove(&type_id);
-            return result;
-        }
-
-        if owner_links.declared_type != Some(type_id)
-            || identity.type_arguments()
-                != Some(owner_links.type_parameters.as_deref().unwrap_or_default())
-        {
-            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
-        }
-
-        return display_alias_name(store, Some(host), type_id, alias, state);
     }
-
-    display_symbol_name(store, Some(host), type_id, symbol, state)
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let mut result = if let Some(alias) = record.alias() {
+            display_alias_name(store, Some(host), type_id, alias, state)?
+        } else {
+            display_symbol_name(store, Some(host), type_id, identity.symbol, state)?
+        };
+        result.push_str(&display_type_arguments(
+            store,
+            Some(host),
+            global_types,
+            &identity.arguments,
+            flags,
+            state,
+            visiting,
+        )?);
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
 }
 
 #[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
@@ -6075,21 +6037,47 @@ fn display_intersection_type(
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
-    let projection = store
-        .validate_intersection_type(type_id)
-        .map_err(|_| TypeDisplayUnavailable::InvalidIntersection(type_id))?;
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+    let constituents = if record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        store
+            .validate_intersection_type(type_id)
+            .map_err(|_| TypeDisplayUnavailable::InvalidIntersection(type_id))?
+            .types
+    } else {
+        store
+            .validate_deferred_intersection_type(type_id)
+            .map_err(|_| TypeDisplayUnavailable::InvalidIntersection(type_id))?
+            .types
+    };
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
     }
     let result = (|| {
-        let record = store
-            .type_payload(type_id)
-            .ok_or(TypeDisplayUnavailable::Type(type_id))?;
         if let Some(alias) = record.alias() {
-            return display_alias_name(store, host, type_id, alias, state);
+            let arguments = store
+                .type_alias(alias)
+                .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?
+                .type_arguments()
+                .unwrap_or_default();
+            let mut result = display_alias_name(store, host, type_id, alias, state)?;
+            result.push_str(&display_type_arguments(
+                store,
+                host,
+                global_types,
+                arguments,
+                flags,
+                state,
+                visiting,
+            )?);
+            return Ok(result);
         }
         let mut result = String::new();
-        for (index, constituent) in projection.types.iter().enumerate() {
+        for (index, constituent) in constituents.iter().enumerate() {
             if index != 0 {
                 state.add(3);
                 result.push_str(" & ");
@@ -6108,6 +6096,39 @@ fn display_intersection_type(
     })();
     visiting.remove(&type_id);
     result
+}
+
+fn display_type_arguments(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    arguments: &[TypeId],
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if arguments.is_empty() {
+        return Ok(String::new());
+    }
+    let mut result = String::from("<");
+    state.add(2);
+    for (index, argument) in arguments.iter().enumerate() {
+        if index != 0 {
+            result.push_str(", ");
+            state.add(2);
+        }
+        result.push_str(&display_type_worker(
+            store,
+            host,
+            global_types,
+            *argument,
+            flags,
+            state,
+            visiting,
+        )?);
+    }
+    result.push('>');
+    Ok(result)
 }
 
 fn display_union_type(
@@ -6822,11 +6843,12 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        MappedTypeModifiers, SignatureId,
         bootstrap::UnionReduction,
         production::GlobalMergeCompletion,
         tuple_types::CanonicalTupleTypeRequest,
-        type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink},
+        type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink, StructuredTypeData},
         types::ObjectFlags,
     };
 
@@ -7401,6 +7423,69 @@ mod tests {
                 (name.text == expected).then(|| NodeRef::new(parsed.arena.id(), file, alias.type_))
             })
             .expect("the test source contains the requested type alias")
+    }
+
+    fn alias_display_query(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> (NodeRef, TypeId) {
+        let body = type_alias_body(parsed, file, name);
+        let declaration = NodeRef::new(
+            body.arena,
+            body.file,
+            parsed.arena.get(body.node).unwrap().parent.unwrap(),
+        );
+        let NodeData::TypeAliasDeclaration(alias) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the alias body retains its declaration")
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, alias.name);
+        let type_ = context.get_type_at_location(name).unwrap();
+        assert_eq!(context.get_type_from_type_node(body).unwrap(), type_);
+        (declaration, type_)
+    }
+
+    fn alias_display_cache_counts(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> ([usize; 7], [usize; 26]) {
+        let store = context.store();
+        (
+            [
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+                store.type_alias_len_internal(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    fn assert_invalid_intersection_display_without_writes(
+        context: &CanonicalCheckerContext<'_>,
+        type_: TypeId,
+    ) {
+        let before = alias_display_cache_counts(context);
+        let TypeData::Intersection(data) = context.store().type_payload(type_).unwrap().data()
+        else {
+            panic!("the damaged record remains an intersection")
+        };
+        let data = data.clone();
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::InvalidIntersection(type_))
+        );
+        assert_eq!(alias_display_cache_counts(context), before);
+        let TypeData::Intersection(after) = context.store().type_payload(type_).unwrap().data()
+        else {
+            panic!("display does not replace the intersection")
+        };
+        assert_eq!(*after, data);
     }
 
     fn type_literal_member(
@@ -9160,6 +9245,585 @@ mod tests {
             let type_ = context.get_type_from_type_node(node).unwrap();
             assert_eq!(context.type_to_string(type_).unwrap(), name);
         }
+    }
+
+    const REACT_DISPLAY_DECLARATIONS: &str = concat!(
+        "declare namespace React { interface DOMAttributes<T> {} ",
+        "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+        "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+        "interface MediaHTMLAttributes<T> extends HTMLAttributes<T> { src?: string; } ",
+        "interface AudioHTMLAttributes<T> extends MediaHTMLAttributes<T> {} ",
+        "interface Attributes { key?: string; } ",
+        "interface ClassAttributes<T> extends Attributes { ref?: T; } ",
+        "type DetailedHTMLProps<E extends HTMLAttributes<T>, T> = ClassAttributes<T> & E; }",
+    );
+
+    const PICK_DISPLAY_SOURCE: &str = concat!(
+        "type Subset<Model, Keys extends keyof Model> = { [K in Keys]: Model[K] }; ",
+        "interface Item { value: string; other: number; } ",
+        "type Result = Subset<Item, 'value'>;",
+    );
+
+    fn react_display_context(
+        parsed: &ParseResult,
+        file: FileId,
+        options: impl Into<CanonicalCheckerOptions>,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/react.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
+    }
+
+    #[test]
+    fn deferred_intersection_alias_display_preserves_canonical_query_identity() {
+        let parsed = parse_source_file(REACT_DISPLAY_DECLARATIONS);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(240);
+        let mut context = react_display_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let (declaration, type_) =
+            alias_display_query(&mut context, &parsed, file, "DetailedHTMLProps");
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let projection = context
+            .store()
+            .validate_deferred_intersection_type(type_)
+            .unwrap();
+        assert_eq!(projection.alias_symbol, Some(owner));
+        assert_eq!(
+            projection.alias_arguments,
+            context
+                .store()
+                .type_alias_links(owner)
+                .unwrap()
+                .type_parameters
+                .clone()
+                .unwrap()
+        );
+        assert!(context.store().validate_intersection_type(type_).is_err());
+        let cold_members = projection
+            .types
+            .iter()
+            .map(|type_| {
+                context
+                    .store()
+                    .type_payload(*type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let before = alias_display_cache_counts(&context);
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(type_, declaration, flags)
+                    .unwrap(),
+                "DetailedHTMLProps<E, T>"
+            );
+            assert_eq!(
+                context.type_to_string(type_).unwrap(),
+                "React.DetailedHTMLProps<E, T>"
+            );
+            assert_eq!(
+                alias_display_query(&mut context, &parsed, file, "DetailedHTMLProps").1,
+                type_
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .validate_deferred_intersection_type(type_)
+                    .unwrap(),
+                projection
+            );
+        }
+        assert_eq!(alias_display_cache_counts(&context), before);
+        assert_eq!(
+            projection
+                .types
+                .iter()
+                .map(|type_| context
+                    .store()
+                    .type_payload(*type_)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .cloned())
+                .collect::<Vec<_>>(),
+            cold_members
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation checks one part of the same deferred identity.
+    fn deferred_intersection_alias_display_rejects_alias_and_cache_changes() {
+        let parsed = parse_source_file(REACT_DISPLAY_DECLARATIONS);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(241);
+        let mut context = react_display_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (_, type_) = alias_display_query(&mut context, &parsed, file, "DetailedHTMLProps");
+        let projection = context
+            .store()
+            .validate_deferred_intersection_type(type_)
+            .unwrap();
+        let alias = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .alias()
+            .unwrap();
+        let flags = context.store().type_payload(type_).unwrap().object_flags();
+
+        let mut reversed = projection.alias_arguments.clone();
+        reversed.reverse();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(alias, Some(reversed))
+        );
+        assert_invalid_intersection_display_without_writes(&context, type_);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(alias, Some(projection.alias_arguments.clone()),)
+        );
+
+        let key = context
+            .store_mut_for_test()
+            .intersection_keys_by_type
+            .remove(&type_)
+            .unwrap();
+        assert_invalid_intersection_display_without_writes(&context, type_);
+        assert!(
+            context
+                .store_mut_for_test()
+                .intersection_keys_by_type
+                .insert(type_, key.clone())
+                .is_none()
+        );
+        assert_eq!(
+            context.store_mut_for_test().intersection_types.remove(&key),
+            Some(type_)
+        );
+        assert_invalid_intersection_display_without_writes(&context, type_);
+        assert!(
+            context
+                .store_mut_for_test()
+                .intersection_types
+                .insert(key, type_)
+                .is_none()
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_union_or_intersection_caches(type_, None, None, Some(Vec::new()),)
+        );
+        assert_invalid_intersection_display_without_writes(&context, type_);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_union_or_intersection_caches(type_, None, None, None)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(type_, flags | ObjectFlags::MEMBERS_RESOLVED,)
+        );
+        assert_invalid_intersection_display_without_writes(&context, type_);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(type_, flags)
+        );
+
+        let reference = projection.types[0];
+        let TypeData::TypeReference(original) =
+            context.store().type_payload(reference).unwrap().data()
+        else {
+            panic!("ClassAttributes<T> retains its generic reference")
+        };
+        let original = original.clone();
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            reference,
+            original.node,
+            Some(vec![projection.alias_arguments[0]]),
+        ));
+        assert_invalid_intersection_display_without_writes(&context, type_);
+        assert!(context.store_mut_for_test().set_type_reference_resolution(
+            reference,
+            original.node,
+            original.resolved_type_arguments,
+        ));
+
+        assert_eq!(
+            context
+                .store()
+                .validate_deferred_intersection_type(type_)
+                .unwrap(),
+            projection
+        );
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            "React.DetailedHTMLProps<E, T>"
+        );
+    }
+
+    #[test]
+    fn pick_alias_display_preserves_validated_query_types_before_and_after_member_reads() {
+        let parsed = parse_source_file(PICK_DISPLAY_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(242);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (declaration, declared) = alias_display_query(&mut context, &parsed, file, "Subset");
+        let (result_declaration, result) =
+            alias_display_query(&mut context, &parsed, file, "Result");
+        let alias = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let parameters = context
+            .store()
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .clone()
+            .unwrap();
+        let TypeData::Mapped(mapped) = context.store().type_payload(result).unwrap().data() else {
+            panic!("Result retains the instantiated Pick record")
+        };
+        let arguments = [
+            mapped.modifiers_type.unwrap(),
+            mapped.constraint_type.unwrap(),
+        ];
+        assert_eq!(mapped.object.target, Some(declared));
+        assert_eq!(mapped.object.structured, StructuredTypeData::default());
+        context
+            .store()
+            .validate_pick_mapped_alias_instantiation(
+                alias,
+                declared,
+                &parameters,
+                &parameters,
+                declared,
+            )
+            .unwrap();
+        context
+            .store()
+            .validate_pick_mapped_alias_instantiation(
+                alias,
+                declared,
+                &parameters,
+                &arguments,
+                result,
+            )
+            .unwrap();
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+        for warm in [false, true] {
+            if warm {
+                let property = context
+                    .store_mut_for_test()
+                    .resolve_mapped_type_property(result, "value", MappedTypeModifiers::NONE)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    property.type_id(),
+                    context.store().intrinsic_bootstrap().unwrap().string_type
+                );
+            }
+            let before = alias_display_cache_counts(&context);
+            let identity = context
+                .store()
+                .mapped_alias_display_identity(result, alias)
+                .unwrap();
+            assert_eq!(
+                identity.symbol,
+                context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .symbol(result_declaration)
+                    .unwrap()
+            );
+            assert!(identity.arguments.is_empty());
+            for _ in 0..2 {
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(declared, declaration, flags)
+                        .unwrap(),
+                    "Subset<Model, Keys>"
+                );
+                assert_eq!(
+                    context
+                        .type_to_string_at_location_with_flags(result, result_declaration, flags)
+                        .unwrap(),
+                    "Result"
+                );
+                assert_eq!(
+                    alias_display_query(&mut context, &parsed, file, "Subset").1,
+                    declared
+                );
+                assert_eq!(
+                    alias_display_query(&mut context, &parsed, file, "Result").1,
+                    result
+                );
+            }
+            assert_eq!(alias_display_cache_counts(&context), before);
+            context
+                .store()
+                .validate_pick_mapped_alias_instantiation(
+                    alias,
+                    declared,
+                    &parameters,
+                    &arguments,
+                    result,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn direct_pick_alias_display_uses_validated_substitution_arguments() {
+        let parsed = parse_source_file(&format!(
+            "{PICK_DISPLAY_SOURCE} declare const direct: Subset<Item, 'value'>;"
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(244);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (declaration, declared) = alias_display_query(&mut context, &parsed, file, "Subset");
+        let node = variable_type_node(&parsed, file, "direct");
+        let type_ = context.get_type_from_type_node(node).unwrap();
+        let alias = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let parameters = context
+            .store()
+            .type_alias_links(alias)
+            .unwrap()
+            .type_parameters
+            .as_ref()
+            .unwrap();
+        let identity = context
+            .store()
+            .mapped_alias_display_identity(type_, alias)
+            .unwrap();
+        assert_eq!(identity.symbol, alias);
+        assert_eq!(identity.arguments.len(), 2);
+        context
+            .store()
+            .validate_pick_mapped_alias_instantiation(
+                alias,
+                declared,
+                parameters,
+                &identity.arguments,
+                type_,
+            )
+            .unwrap();
+        let before = alias_display_cache_counts(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.type_to_string(type_).unwrap(),
+                "Subset<Item, \"value\">"
+            );
+            assert_eq!(context.get_type_from_type_node(node).unwrap(), type_);
+        }
+        assert_eq!(alias_display_cache_counts(&context), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source, mapper, template, and alias-cache mutations together.
+    fn pick_alias_display_rejects_mapper_template_and_owner_cache_changes() {
+        let parsed = parse_source_file(PICK_DISPLAY_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(243);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (declaration, declared) = alias_display_query(&mut context, &parsed, file, "Subset");
+        let (_, result) = alias_display_query(&mut context, &parsed, file, "Result");
+        let alias = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let links = context.store().type_alias_links(alias).unwrap().clone();
+        let parameters = links.type_parameters.as_ref().unwrap();
+        let TypeData::Mapped(mapped) = context.store().type_payload(result).unwrap().data() else {
+            panic!("Result retains the instantiated Pick record")
+        };
+        let mapped = mapped.clone();
+        let arguments = [
+            mapped.modifiers_type.unwrap(),
+            mapped.constraint_type.unwrap(),
+        ];
+        context
+            .store()
+            .validate_pick_mapped_alias_instantiation(
+                alias, declared, parameters, &arguments, result,
+            )
+            .unwrap();
+        assert_eq!(context.type_to_string(result).unwrap(), "Result");
+        let other = context
+            .store_mut_for_test()
+            .instantiate_pick_mapped_alias(alias, declared, parameters, &arguments)
+            .unwrap();
+        let TypeData::Mapped(other_data) = context.store().type_payload(other).unwrap().data()
+        else {
+            panic!("the control clone has a distinct parameter and mapper")
+        };
+        let other_mapper = other_data.object.mapper;
+        assert!(context.store_mut_for_test().set_object_target_and_mapper(
+            result,
+            mapped.object.target,
+            other_mapper,
+        ));
+        assert_malformed_display_without_writes(&context, result);
+        assert!(context.store_mut_for_test().set_object_target_and_mapper(
+            result,
+            mapped.object.target,
+            mapped.object.mapper,
+        ));
+
+        let template = mapped.template_type.unwrap();
+        let identity = context
+            .store()
+            .type_payload(result)
+            .unwrap()
+            .alias()
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(template, Some(alias))
+        );
+        assert_malformed_display_without_writes(&context, result);
+        assert!(context.store_mut_for_test().set_type_symbol(template, None));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias(template, Some(identity))
+        );
+        assert_malformed_display_without_writes(&context, result);
+        assert!(context.store_mut_for_test().set_type_alias(template, None));
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_resolved_base_constraint(template, Some(string))
+        );
+        assert_malformed_display_without_writes(&context, result);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_resolved_base_constraint(template, None)
+        );
+        assert!(context.store_mut_for_test().set_type_object_flags(
+            template,
+            ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
+        ));
+        assert_eq!(context.type_to_string(result).unwrap(), "Result");
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(template, ObjectFlags::NONE)
+        );
+        for template in [Some(string), mapped.template_type] {
+            assert!(context.store_mut_for_test().set_mapped_type_resolution(
+                result,
+                mapped.declaration,
+                mapped.type_parameter,
+                mapped.constraint_type,
+                mapped.name_type,
+                template,
+                mapped.modifiers_type,
+                mapped.resolved_apparent_type,
+                mapped.contains_error,
+            ));
+            if template == mapped.template_type {
+                assert_eq!(context.type_to_string(result).unwrap(), "Result");
+            } else {
+                assert_malformed_display_without_writes(&context, result);
+            }
+        }
+
+        let mut damaged_links = links.clone();
+        let key = *damaged_links
+            .instantiations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find_map(|(key, type_)| (*type_ == result).then_some(key))
+            .unwrap();
+        damaged_links
+            .instantiations
+            .as_mut()
+            .unwrap()
+            .insert(key, other);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_links(alias, damaged_links)
+        );
+        assert_malformed_display_without_writes(&context, result);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_links(alias, links.clone())
+        );
+
+        let body = type_alias_body(&parsed, file, "Result");
+        let original_body = context.store().type_node_links(body).unwrap().clone();
+        let mut changed_body = original_body.clone();
+        changed_body.resolved_type = Some(declared);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(body, changed_body)
+        );
+        assert_malformed_display_without_writes(&context, result);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(body, original_body)
+        );
+
+        let mut changed_parameters = links.clone();
+        changed_parameters
+            .type_parameters
+            .as_mut()
+            .unwrap()
+            .reverse();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_links(alias, changed_parameters)
+        );
+        assert_malformed_display_without_writes(&context, declared);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_links(alias, links)
+        );
+        assert_eq!(
+            context.type_to_string(declared).unwrap(),
+            "Subset<Model, Keys>"
+        );
+        assert_eq!(context.type_to_string(result).unwrap(), "Result");
     }
 
     #[test]
