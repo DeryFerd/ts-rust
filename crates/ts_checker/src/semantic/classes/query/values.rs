@@ -8,13 +8,14 @@ use super::{
     SignatureLinks, StaticShellState, Symbol, SymbolFlags, SyntaxKind, TypeId, TypeNodeLinks,
     TypeRecord, ValueSymbolLinks, bound_symbol, class_member_symbol_name_matches,
     class_property_modifiers, class_query_reference_symbol, class_query_shell_state,
-    enclosing_query_class, exact_class_instance_identity, exact_method_value,
+    enclosing_query_context, exact_class_instance_identity, exact_method_value,
     execute_class_query_shells, execute_selected_class_member, invariant,
     lexical_class_query_symbol, plan_class_query, plan_selected_class_member,
     preflight_class_or_interface_reference, preflight_node, primitive_keyword_type,
     publish_class_method_identity, unsupported, validate_query_reference_cache,
 };
 use crate::semantic::{
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     instantiate::InstantiationSession,
     logical_operators::{LogicalBinaryError, LogicalBinaryRequest, check_logical_binary},
     source::{
@@ -463,9 +464,40 @@ impl ClassValueQuery<'_, '_, '_> {
         } else if flags == SymbolFlags::ENUM_MEMBER {
             query.get_declared_type_of_symbol(symbol)?
         } else {
-            query.get_type_of_declared_value(symbol)?
+            let type_ = query.get_type_of_declared_value(symbol)?;
+            self.resolve_declared_value_callable_returns(symbol, type_)?;
+            type_
         };
         self.read_type(symbol, type_)
+    }
+
+    fn resolve_declared_value_callable_returns(
+        &mut self,
+        symbol: SemanticSymbolId,
+        type_: TypeId,
+    ) -> Result<(), ClassError> {
+        let projection = match validate_stored_callable_set(self.store, type_) {
+            StoredCallableSetValidation::Valid { projection, .. } => projection,
+            StoredCallableSetValidation::NotCallable => return Ok(()),
+            StoredCallableSetValidation::Pending { .. }
+            | StoredCallableSetValidation::Malformed { .. } => {
+                return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+            }
+        };
+        for callable in &projection.call_signatures {
+            if callable.return_type.is_none() {
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    self.store,
+                    self.host,
+                    self.global_types,
+                    self.options,
+                    self.session,
+                    self.diagnostics,
+                )?
+                .get_return_type_of_signature(callable.signature)?;
+            }
+        }
+        Ok(())
     }
 
     fn read_type(&mut self, symbol: SemanticSymbolId, type_: TypeId) -> Result<TypeId, ClassError> {
@@ -764,7 +796,7 @@ impl ClassValueQuery<'_, '_, '_> {
         {
             return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
         }
-        let raw = self.expression_type(initializer, &class, declaration, active)?;
+        let raw = self.expression_type(initializer, Some((&class, declaration)), active)?;
         let type_ = widened_fresh_literal_type(self.store, raw)
             .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(initializer)))?;
         if self.store.value_symbol_links(symbol).is_some_and(|links| {
@@ -793,18 +825,16 @@ impl ClassValueQuery<'_, '_, '_> {
     fn expression_type(
         &mut self,
         node: NodeRef,
-        class: &ClassQueryPlan,
-        member: NodeRef,
+        class_member: Option<(&ClassQueryPlan, NodeRef)>,
         active: &mut HashSet<SemanticSymbolId>,
     ) -> Result<TypeId, ClassError> {
-        self.expression_type_at_depth(node, class, member, active, 0)
+        self.expression_type_at_depth(node, class_member, active, 0)
     }
 
     fn expression_type_at_depth(
         &mut self,
         node: NodeRef,
-        class: &ClassQueryPlan,
-        member: NodeRef,
+        class_member: Option<(&ClassQueryPlan, NodeRef)>,
         active: &mut HashSet<SemanticSymbolId>,
         depth: usize,
     ) -> Result<TypeId, ClassError> {
@@ -893,6 +923,7 @@ impl ClassValueQuery<'_, '_, '_> {
             NodeData::KeywordExpression(keyword)
                 if record.kind == SyntaxKind::ThisKeyword && keyword.flow_node.is_none() =>
             {
+                let (class, member) = class_member.ok_or_else(reject)?;
                 let (arena, _) = self.host.source(member).ok_or_else(reject)?;
                 if ts_binder::canonical_has_syntactic_modifier(
                     arena,
@@ -938,15 +969,13 @@ impl ClassValueQuery<'_, '_, '_> {
                 let operator = operator.kind;
                 let left_type = self.expression_type_at_depth(
                     child(binary.left),
-                    class,
-                    member,
+                    class_member,
                     active,
                     depth + 1,
                 )?;
                 let right_type = self.expression_type_at_depth(
                     child(binary.right),
-                    class,
-                    member,
+                    class_member,
                     active,
                     depth + 1,
                 )?;
@@ -974,7 +1003,7 @@ impl ClassValueQuery<'_, '_, '_> {
                 if preflight_node(self.store, self.host, inner)?.parent != Some(node.node) {
                     return Err(reject());
                 }
-                self.expression_type_at_depth(inner, class, member, active, depth + 1)?
+                self.expression_type_at_depth(inner, class_member, active, depth + 1)?
             }
             NodeData::NumericLiteral(literal)
                 if record.kind == SyntaxKind::NumericLiteral && literal.token_flags.0 == 0 =>
@@ -1131,35 +1160,38 @@ impl ClassValueQuery<'_, '_, '_> {
         if record.kind == SyntaxKind::VariableDeclaration {
             return self.class_expression_variable_type(node);
         }
-        let Some((class, member)) = enclosing_query_class(self.store, self.host, node)? else {
+        let Some(context) = enclosing_query_context(self.store, self.host, node)? else {
             return Ok(None);
         };
-        let member_record = preflight_node(self.store, self.host, member)?;
-        let name = match &member_record.data {
-            NodeData::PropertyDeclaration(property) => property.name,
-            NodeData::MethodDeclaration(method) => method.name,
-            _ => return Ok(None),
-        };
-        if node == member || node.node == name {
-            let symbol = bound_symbol(self.store, self.host, member)
-                .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(member)))?;
-            if self.options.intrinsic.strict_null_checks
-                && self.store.symbol(symbol).is_some_and(|symbol| {
-                    symbol
-                        .flags()
-                        .contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
-                })
-            {
-                return Ok(None);
+        let class_member = context.member();
+        if let Some((_, member)) = class_member {
+            let member_record = preflight_node(self.store, self.host, member)?;
+            let name = match &member_record.data {
+                NodeData::PropertyDeclaration(property) => property.name,
+                NodeData::MethodDeclaration(method) => method.name,
+                _ => return Ok(None),
+            };
+            if node == member || node.node == name {
+                let symbol = bound_symbol(self.store, self.host, member)
+                    .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(member)))?;
+                if self.options.intrinsic.strict_null_checks
+                    && self.store.symbol(symbol).is_some_and(|symbol| {
+                        symbol
+                            .flags()
+                            .contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                    })
+                {
+                    return Ok(None);
+                }
+                return self.member_type(symbol).map(Some);
             }
-            return self.member_type(symbol).map(Some);
         }
         if let Some(parent) = parent
             && matches!(&preflight_node(self.store, self.host, parent)?.data,
                 NodeData::PropertyAccessExpression(access) if access.name == node.node)
         {
             return self
-                .expression_type(parent, &class, member, &mut HashSet::new())
+                .expression_type(parent, class_member, &mut HashSet::new())
                 .map(Some);
         }
         match record.kind {
@@ -1172,7 +1204,7 @@ impl ClassValueQuery<'_, '_, '_> {
             | SyntaxKind::ParenthesizedExpression
             | SyntaxKind::NumericLiteral
             | SyntaxKind::StringLiteral => self
-                .expression_type(node, &class, member, &mut HashSet::new())
+                .expression_type(node, class_member, &mut HashSet::new())
                 .map(Some),
             _ => Ok(None),
         }

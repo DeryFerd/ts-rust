@@ -4100,6 +4100,119 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check private allocation counters for both cold query orders.
+    fn decorator_queries_keep_checker_link_allocations_stable() {
+        for (declaration_file, text) in [
+            (false, "class {\n  @x\n  m() {\n    // ...\n  }\n};\n"),
+            (
+                true,
+                "declare const decorate: () => void;\nclass {\n  @decorate\n  m(): void;\n}\n",
+            ),
+            (
+                true,
+                "declare const decorate: () => void;\ndeclare class Named {\n  @decorate\n  m(): void;\n}\n",
+            ),
+            (
+                true,
+                concat!(
+                    "declare class Decorators { static apply(): void; }\n",
+                    "declare class Named { @Decorators.apply m(): void; }\n",
+                ),
+            ),
+        ] {
+            for type_first in [false, true] {
+                let parsed = parse_source_file(text);
+                let file = FileId::new(6_220);
+                let mut context = context_with_source_kind(
+                    &parsed,
+                    file,
+                    CanonicalCheckerOptions::default(),
+                    declaration_file,
+                );
+                let expression = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(_, record)| {
+                        let NodeData::Decorator(decorator) = &record.data else {
+                            return None;
+                        };
+                        Some(NodeRef::new(parsed.arena.id(), file, decorator.expression))
+                    })
+                    .unwrap();
+                let type_nodes = match &parsed.arena.get(expression.node).unwrap().data {
+                    NodeData::PropertyAccessExpression(access) => vec![
+                        NodeRef::new(parsed.arena.id(), file, access.expression),
+                        expression,
+                        NodeRef::new(parsed.arena.id(), file, access.name),
+                    ],
+                    _ => vec![expression],
+                };
+                let mut symbol_nodes = type_nodes.clone();
+                if !declaration_file {
+                    let method_name = parsed
+                        .arena
+                        .iter()
+                        .find_map(|(_, record)| {
+                            let NodeData::MethodDeclaration(method) = &record.data else {
+                                return None;
+                            };
+                            Some(NodeRef::new(parsed.arena.id(), file, method.name))
+                        })
+                        .unwrap();
+                    symbol_nodes.push(method_name);
+                }
+
+                if !type_first {
+                    for node in &symbol_nodes {
+                        context.get_symbol_at_location(*node).unwrap();
+                    }
+                }
+                let types = type_nodes
+                    .iter()
+                    .map(|node| context.get_type_at_location(*node))
+                    .collect::<Vec<_>>();
+                if declaration_file {
+                    for type_ in &types {
+                        context.type_to_string((*type_).unwrap()).unwrap();
+                    }
+                } else {
+                    assert_eq!(
+                        types,
+                        [Err(CanonicalArtifactQueryError::MissingType {
+                            node: expression,
+                            kind: SyntaxKind::Identifier,
+                        })]
+                    );
+                }
+                let symbols = symbol_nodes
+                    .iter()
+                    .map(|node| context.get_symbol_at_location(*node).unwrap())
+                    .collect::<Vec<_>>();
+                for symbol in symbols.iter().flatten() {
+                    context.symbol_to_string(*symbol).unwrap();
+                    context.get_symbol_declarations(*symbol).unwrap();
+                }
+                let warm = context.store().checker_link_allocated_lengths();
+                let diagnostics = context.diagnostics().clone();
+
+                for _ in 0..3 {
+                    if !declaration_file {
+                        context.recheck_source_file(file).unwrap();
+                    }
+                    for (node, expected) in symbol_nodes.iter().zip(&symbols) {
+                        assert_eq!(context.get_symbol_at_location(*node), Ok(*expected));
+                    }
+                    for (node, expected) in type_nodes.iter().zip(&types) {
+                        assert_eq!(context.get_type_at_location(*node), *expected);
+                    }
+                    assert_eq!(context.store().checker_link_allocated_lengths(), warm);
+                    assert_eq!(context.diagnostics(), &diagnostics);
+                }
+            }
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Keep both existing identities and rejected cache changes together.
     fn export_equals_queries_keep_declared_and_value_identities_separate() {
         for (index, text) in [

@@ -21,11 +21,25 @@ use super::{
 mod values;
 pub(in crate::semantic) use values::ClassValueQuery;
 
-fn enclosing_query_class(
+enum ClassQueryContext {
+    Member(ClassQueryPlan, NodeRef),
+    Decorator,
+}
+
+impl ClassQueryContext {
+    fn member(&self) -> Option<(&ClassQueryPlan, NodeRef)> {
+        match self {
+            Self::Member(class, member) => Some((class, *member)),
+            Self::Decorator => None,
+        }
+    }
+}
+
+fn enclosing_query_context(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
-) -> Result<Option<(ClassQueryPlan, NodeRef)>, ClassError> {
+) -> Result<Option<ClassQueryContext>, ClassError> {
     let mut current = node;
     let mut seen = HashSet::new();
     while seen.insert(current) {
@@ -34,7 +48,18 @@ fn enclosing_query_class(
             return Ok(None);
         };
         let parent = NodeRef::new(node.arena, node.file, parent);
-        match preflight_node(store, host, parent)?.kind {
+        let parent_record = preflight_node(store, host, parent)?;
+        match parent_record.kind {
+            SyntaxKind::Decorator => {
+                if !matches!(
+                    &parent_record.data,
+                    NodeData::Decorator(decorator) if decorator.expression == current.node
+                ) {
+                    return Err(invariant(ClassInvariant::InvalidDeclaration(parent)));
+                }
+                // Decorators use lexical values outside the decorated member.
+                return Ok(Some(ClassQueryContext::Decorator));
+            }
             SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression => {
                 let owner = bound_symbol(store, host, parent)
                     .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(parent)))?;
@@ -44,7 +69,7 @@ fn enclosing_query_class(
                         record.kind,
                         SyntaxKind::PropertyDeclaration | SyntaxKind::MethodDeclaration
                     ))
-                .then_some((plan, current)));
+                .then_some(ClassQueryContext::Member(plan, current)));
             }
             SyntaxKind::FunctionDeclaration
             | SyntaxKind::FunctionExpression
@@ -116,13 +141,13 @@ fn validate_query_reference_cache(
     Ok(())
 }
 
-/// Resolves a reference from its class binding without publishing expression caches.
+/// Resolves member and decorator references without publishing expression caches.
 pub(in crate::semantic) fn class_query_reference_symbol(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
 ) -> Result<Option<SemanticSymbolId>, ClassError> {
-    let Some((class, member)) = enclosing_query_class(store, host, node)? else {
+    let Some(context) = enclosing_query_context(store, host, node)? else {
         return Ok(None);
     };
     let record = preflight_node(store, host, node)?;
@@ -177,6 +202,9 @@ pub(in crate::semantic) fn class_query_reference_symbol(
             {
                 return Err(invariant(ClassInvariant::InvalidProperty(receiver)));
             }
+            let Some((class, member)) = context.member() else {
+                return Ok(None);
+            };
             let (arena, _) = host.source(member)
                 .ok_or_else(|| invariant(ClassInvariant::InvalidDeclaration(member)))?;
             let owner = store.symbol(class.symbol)
@@ -239,6 +267,9 @@ pub(in crate::semantic) fn class_query_reference_symbol(
         {
             return Err(invariant(ClassInvariant::InvalidProperty(node)));
         }
+        let Some((class, _)) = context.member() else {
+            return Ok(None);
+        };
         class.symbol
     } else if record.kind == SyntaxKind::Identifier {
         lexical_class_query_symbol(
