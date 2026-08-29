@@ -14924,29 +14924,42 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             template = argument;
         }
         let template_record = preflight_node(self.store, self.host, template).ok()?;
-        let NodeData::IndexedAccessTypeNode(indexed) = &template_record.data else {
-            return None;
-        };
-        let source_reference = NodeRef::new(template.arena, template.file, indexed.object_type);
-        let parameter_reference = NodeRef::new(template.arena, template.file, indexed.index_type);
-        if template_record.kind != SyntaxKind::IndexedAccessType
-            || template_record.flags.0 != 0
-            || template_record.parent != Some(template_parent.node)
-            || !self.react_detailed_html_props_parameter_reference(
-                source_reference,
-                template,
-                source_name,
-                source_parameter.symbol,
-            )
-            || !self.react_detailed_html_props_parameter_reference(
-                parameter_reference,
-                template,
-                mapped_parameter_name,
-                mapped_parameter,
-            )
-        {
+        if template_record.flags.0 != 0 || template_record.parent != Some(template_parent.node) {
             return None;
         }
+        let source_reference = match &template_record.data {
+            NodeData::IndexedAccessTypeNode(indexed) => {
+                let source_reference =
+                    NodeRef::new(template.arena, template.file, indexed.object_type);
+                let parameter_reference =
+                    NodeRef::new(template.arena, template.file, indexed.index_type);
+                if template_record.kind != SyntaxKind::IndexedAccessType
+                    || !self.react_detailed_html_props_parameter_reference(
+                        source_reference,
+                        template,
+                        source_name,
+                        source_parameter.symbol,
+                    )
+                    || !self.react_detailed_html_props_parameter_reference(
+                        parameter_reference,
+                        template,
+                        mapped_parameter_name,
+                        mapped_parameter,
+                    )
+                {
+                    return None;
+                }
+                source_reference
+            }
+            NodeData::KeywordTypeNode(_)
+                if kind == MappedUtilityKind::Homomorphic
+                    && template_parent == mapped
+                    && template_record.kind == SyntaxKind::VoidKeyword =>
+            {
+                mapped_plan.modifiers_source()?
+            }
+            _ => return None,
+        };
 
         let key_parameter = match kind {
             MappedUtilityKind::Homomorphic => {
@@ -29713,7 +29726,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
     }
 
-    /// Shared inherited properties need no type query unless they use `this`.
+    /// Shared inherited properties can skip comparison only with equal arguments.
     /// Overrides must satisfy the constraint when declaration checks are skipped.
     fn inherited_generic_interface_constraint(
         &mut self,
@@ -29726,10 +29739,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let Ok(base) = validate_direct_generic_reference(self.store, constraint) else {
             return Ok(None);
         };
-        if derived.target == base.target || derived.type_arguments != base.type_arguments {
+        if derived.type_arguments.len() != base.type_arguments.len() {
             return Ok(None);
         }
-        let arguments = derived.type_arguments;
+        let source_arguments = derived.type_arguments;
+        let target_arguments = base.type_arguments;
+        let shared_arguments = source_arguments == target_arguments;
         let Some(derived_symbol) = self
             .store
             .type_payload(derived.target)
@@ -29744,7 +29759,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         else {
             return Ok(None);
         };
-        let Some(chain) = self.forwarded_generic_interface_chain(derived_symbol, arguments.len())
+        let Some(chain) =
+            self.forwarded_generic_interface_chain(derived_symbol, source_arguments.len())
         else {
             return Ok(None);
         };
@@ -29783,22 +29799,27 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Ok(None);
         };
         for (name, target, target_parameters) in inherited {
-            let Some((_, source, source_parameters)) = overrides
+            let source = overrides
                 .iter()
-                .find(|(source_name, _, _)| *source_name == name)
-            else {
-                continue;
+                .find(|(source_name, _, _)| *source_name == name);
+            let (source, source_parameters) = match source {
+                Some((_, source, parameters)) => (*source, parameters.as_slice()),
+                None if shared_arguments => continue,
+                None => (target, target_parameters.as_slice()),
             };
             let source_optional = self
                 .store
-                .symbol(*source)
+                .symbol(source)
                 .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::OPTIONAL));
             let target_optional = self
                 .store
                 .symbol(target)
                 .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::OPTIONAL));
-            let target_type =
-                self.generic_constraint_property_type(target, &target_parameters, &arguments)?;
+            let target_type = self.generic_constraint_property_type(
+                target,
+                &target_parameters,
+                &target_arguments,
+            )?;
             if self
                 .store
                 .type_payload(target_type)
@@ -29809,8 +29830,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 continue;
             }
-            let source_type =
-                self.generic_constraint_property_type(*source, source_parameters, &arguments)?;
+            let source_type = self.generic_constraint_property_type(
+                source,
+                source_parameters,
+                &source_arguments,
+            )?;
             let assignable = self
                 .compare_constraint_types(source_type, target_type)
                 .map_err(|_| {
@@ -37877,12 +37901,12 @@ mod tests {
                 &mut diagnostics,
             )
             .unwrap();
-            let (number, string, undefined, any) = {
+            let (number, string, property_sentinel, any) = {
                 let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
                 (
                     bootstrap.number_type,
                     bootstrap.string_type,
-                    bootstrap.undefined_type,
+                    bootstrap.undefined_or_missing_type,
                     bootstrap.any_type,
                 )
             };
@@ -37890,7 +37914,7 @@ mod tests {
                 (
                     "optional",
                     if strict {
-                        vec![number, undefined]
+                        vec![number, property_sentinel]
                     } else {
                         vec![number]
                     },

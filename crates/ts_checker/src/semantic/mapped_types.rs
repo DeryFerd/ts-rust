@@ -2807,6 +2807,44 @@ fn mapped_template_source_is_exact(
     source: TypeId,
     key: TypeId,
 ) -> bool {
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| template == bootstrap.void_type)
+    {
+        let Some(owner) = cached_ordinary_type_parameter_owner(store, key) else {
+            return false;
+        };
+        let Some([parameter]) = store.symbol(owner).and_then(|owner| owner.declarations()) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(declaration)) = store.source_node_parent(*parameter)
+        else {
+            return false;
+        };
+        let Some(operands) = store.source_mapped_type_operands(declaration) else {
+            return false;
+        };
+        let Some(template_node) = operands.template else {
+            return false;
+        };
+        let Some(mapped_type) = store
+            .type_node_links(declaration)
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        let Some(TypeData::Mapped(mapped)) = store.type_payload(mapped_type).map(TypeRecord::data)
+        else {
+            return false;
+        };
+        return store.validate_union_constituent(template).is_ok()
+            && operands.type_parameter == *parameter
+            && store.source_node_kind(template_node) == Some(SyntaxKind::VoidKeyword)
+            && mapped.template_type == Some(template)
+            && mapped.type_parameter == Some(key)
+            && mapped.modifiers_type == Some(source)
+            && validate_source_mapped_relation_identity(store, mapped_type, false).is_ok();
+    }
     let mut current = template;
     let mut seen = HashSet::new();
     while seen.insert(current) {

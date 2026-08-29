@@ -244,6 +244,59 @@ fn ordinary_generic_constraints_keep_fixed_type_arguments() {
 }
 
 #[test]
+fn ordinary_generic_constraints_compare_substituted_properties() {
+    for (member, bound, argument, expected) in [
+        ("value: Value;", "string | number", "string", None),
+        ("value: string;", "number", "string", None),
+        ("value: Value;", "string", "number", Some(2344)),
+    ] {
+        for source_type in ["Base", "Derived"] {
+            let filesystem = MemoryFileSystem::new(true);
+            filesystem
+                .write_file(
+                    "/project/types.d.ts",
+                    &format!(
+                        "interface Base<Value> {{ {member} }} \
+                         interface Derived<Value> extends Base<Value> {{}} \
+                         type Require<Actual extends Base<{bound}>> = Actual;"
+                    ),
+                )
+                .unwrap();
+            filesystem
+                .write_file(
+                    "/project/case.ts",
+                    &format!("type Result = Require<{source_type}<{argument}>>;"),
+                )
+                .unwrap();
+            let (program, replay) = Program::try_new_with_canonical_checker_and_queries(
+                &filesystem,
+                "/project",
+                &["types.d.ts".to_owned(), "case.ts".to_owned()],
+                CompilerOptions {
+                    target: ScriptTarget::Es2015,
+                    lib: Some(vec!["es2015".to_owned()]),
+                    skip_lib_check: true,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+                |_, queries| queries.replay_sources().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(program.diagnostics(), replay.unwrap());
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected.into_iter().map(Some).collect::<Vec<_>>(),
+                "{member} {source_type}<{argument}> -> Base<{bound}>"
+            );
+        }
+    }
+}
+
+#[test]
 fn inherited_generic_constraints_reuse_types_before_and_after_declaration_checks() {
     use ts_ast::{FileId, NodeData, NodeRef};
     use ts_binder::{
