@@ -2235,6 +2235,33 @@ pub(super) fn validate_enum_value_union_constituent(
     validate_declared_type(store, owner, declared_type, &members)
 }
 
+/// Checks enum type identities against their published owner and member caches.
+pub(super) fn validate_enum_type_union_constituent(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<()> {
+    let owner = canonical_enum_type_owner(store, type_)?;
+    let value = store.value_symbol_links(owner)?.resolved_type?;
+    validate_enum_value_union_constituent(store, value)?;
+    let declared = store.declared_type_links(owner)?.declared_type?;
+    if type_ == declared {
+        return Some(());
+    }
+    let symbol = store.type_payload(type_)?.symbol()?;
+    let fresh = if symbol == owner {
+        let TypeData::Literal(literal) = store.type_payload(declared)?.data() else {
+            return None;
+        };
+        literal.fresh_type?
+    } else {
+        store.declared_type_links(symbol)?.declared_type?
+    };
+    let TypeData::Literal(literal) = store.type_payload(fresh)?.data() else {
+        return None;
+    };
+    (type_ == fresh || type_ == literal.regular_type).then_some(())
+}
+
 /// Resolves one published enum value member without forcing object members.
 pub(super) fn enum_value_member_type(
     store: &CanonicalTypeMapperStore,
@@ -3067,6 +3094,65 @@ mod tests {
                 Err(LiteralTypeCacheError::InvalidCachedUnion(value_type)),
             );
         }
+    }
+
+    #[test]
+    fn enum_type_union_constituents_require_published_member_pairs() {
+        let mut fixture = fixture(concat!(
+            "declare function computed(x: number): number; ",
+            "enum E { Computed = computed(0), Literal = 1 }",
+        ));
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "E");
+        let host = host(&fixture.parsed.arena, &fixture.files[&fixture.file]);
+        let published = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .validate_union_constituent(published.declared_type),
+            Ok(())
+        );
+        for member in &published.members {
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_union_constituent(member.regular_type),
+                Ok(())
+            );
+            assert_eq!(
+                fixture.store.validate_union_constituent(member.fresh_type),
+                Ok(())
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .fresh_type_of_literal_type(member.regular_type),
+                Ok(member.fresh_type)
+            );
+        }
+        assert_eq!(
+            published.members[0].value,
+            CanonicalEnumMemberValue::Computed
+        );
+        assert_eq!(
+            published.members[1].value,
+            CanonicalEnumMemberValue::Number(Number::new(1.0))
+        );
+
+        let (regular, fresh) = alloc_literal_pair(
+            &mut fixture.store,
+            published.members[0].symbol,
+            &CanonicalEnumMemberValue::Computed,
+        );
+        for counterfeit in [regular, fresh] {
+            assert_eq!(
+                fixture.store.validate_union_constituent(counterfeit),
+                Err(LiteralTypeCacheError::InvalidCachedLiteral(counterfeit)),
+            );
+        }
+        assert_eq!(
+            fixture.store.fresh_type_of_literal_type(regular),
+            Err(LiteralTypeCacheError::InvalidCachedLiteral(regular)),
+        );
     }
 
     #[test]

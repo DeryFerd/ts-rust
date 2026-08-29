@@ -12056,6 +12056,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if union_constituent
             && global_array_target.is_none()
             && !flags.contains(SymbolFlags::TYPE_ALIAS)
+            && !flags.intersects(SymbolFlags::ENUM | SymbolFlags::ENUM_MEMBER)
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
                 || !self.is_authenticated_generic_alias_union_type_parameter(node, symbol)?
@@ -12231,9 +12232,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     }
                 }
             }
-        } else if flags.intersects(SymbolFlags::ENUM) {
-            enums::preflight_enum(self.store, self.host, symbol)?;
-            if cached_type.is_some() && cached_enum_owner != Some(symbol) {
+        } else if flags.intersects(SymbolFlags::ENUM | SymbolFlags::ENUM_MEMBER) {
+            let owner = if flags == SymbolFlags::ENUM_MEMBER {
+                self.store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::parent)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::UnsupportedReferenceTarget {
+                            node,
+                            symbol,
+                        })
+                    })?
+            } else {
+                symbol
+            };
+            enums::preflight_enum(self.store, self.host, owner)?;
+            if cached_type.is_some() && cached_enum_owner != Some(owner) {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidTypeReference(node),
                 ));
@@ -26897,6 +26911,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     || plan
                         .default_library_non_nullable_aliases
                         .contains_key(&reference.symbol)
+                    || self.store.symbol(reference.symbol).is_some_and(|symbol| {
+                        symbol
+                            .flags()
+                            .intersects(SymbolFlags::ENUM | SymbolFlags::ENUM_MEMBER)
+                    })
                     || is_instantiated_mapped_type(self.store, resolved_type)
             })
         {
@@ -27160,6 +27179,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     self.error_type()?
                 }
             }
+        };
+        let resolved_type = if self
+            .store
+            .type_payload(resolved_type)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::ENUM_LIKE))
+        {
+            enums::validate_enum_type_union_constituent(self.store, resolved_type).ok_or_else(
+                || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)),
+            )?;
+            match self.store.type_payload(resolved_type).map(TypeRecord::data) {
+                Some(TypeData::Literal(literal)) => literal.regular_type,
+                _ => resolved_type,
+            }
+        } else {
+            resolved_type
         };
         if let Some(cached) = cached_resolved_type {
             return if cached == resolved_type {

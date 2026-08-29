@@ -1108,10 +1108,10 @@ pub(super) fn plan_source_class_members(
                 plan.sources
                     .push(source_property_origin(store, symbol, &property));
                 if let Some(initializer) = property.initializer_node
-                    && matches!(
+                    && (matches!(
                         store.source_node_kind(initializer),
                         Some(SyntaxKind::PropertyAccessExpression | SyntaxKind::ArrowFunction)
-                    )
+                    ) || source_enum_member_const_assertion(store, host, initializer)?)
                 {
                     plan.bodies.push(ClassBodyPlan {
                         class_declaration: plan.declaration(),
@@ -10056,6 +10056,86 @@ fn plan_class_index_signature(
     })
 }
 
+fn source_enum_member_const_assertion(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    initializer: NodeRef,
+) -> Result<bool, ClassError> {
+    let record = preflight_node(store, host, initializer)?;
+    let NodeData::AsExpression(assertion) = &record.data else {
+        return Ok(false);
+    };
+    let operand = NodeRef::new(initializer.arena, initializer.file, assertion.expression);
+    let annotation = NodeRef::new(initializer.arena, initializer.file, assertion.type_);
+    let operand_record = preflight_node(store, host, operand)?;
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let (NodeData::PropertyAccessExpression(access), NodeData::TypeReferenceNode(reference)) =
+        (&operand_record.data, &annotation_record.data)
+    else {
+        return Ok(false);
+    };
+    let constant = NodeRef::new(initializer.arena, initializer.file, reference.type_name);
+    let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
+    let name = NodeRef::new(initializer.arena, initializer.file, access.name);
+    let (
+        NodeData::Identifier(constant),
+        NodeData::Identifier(receiver_name),
+        NodeData::Identifier(name),
+    ) = (
+        &preflight_node(store, host, constant)?.data,
+        &preflight_node(store, host, receiver)?.data,
+        &preflight_node(store, host, name)?.data,
+    )
+    else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::AsExpression
+        || operand_record.parent != Some(initializer.node)
+        || annotation_record.parent != Some(initializer.node)
+        || reference.type_arguments.is_some()
+        || constant.text != "const"
+        || access.question_dot_token.is_some()
+    {
+        return Ok(false);
+    }
+    let (arena, bound) = host
+        .source(initializer)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidProperty(initializer)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let symbol = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+        .map_err(|_| invariant(ClassInvariant::InvalidProperty(initializer)))?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(receiver)),
+            &receiver_name.text,
+            SymbolFlags::VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| unsupported(ClassUnsupported::PropertyInitializer(initializer)))?;
+    let Some(owner) = symbol.and_then(|symbol| store.get_merged_symbol(symbol)) else {
+        return Ok(false);
+    };
+    let Some(record) = store.symbol(owner) else {
+        return Err(invariant(ClassInvariant::SymbolNotOwned(owner)));
+    };
+    if !matches!(
+        record.flags(),
+        SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM
+    ) {
+        return Ok(false);
+    }
+    let member = record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&name.text));
+    Ok(member
+        .and_then(|member| store.symbol(member))
+        .is_some_and(|member| {
+            member.flags() == SymbolFlags::ENUM_MEMBER && member.parent() == Some(owner)
+        }))
+}
+
 fn plan_property(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -10191,6 +10271,8 @@ fn plan_property_with_body_mode(
     let (initializer_text, initializer_string, initializer_parameter_name, initializer_assertion) =
         if let Some(initializer_node) = initializer_node {
             let initializer_record = preflight_node(store, host, initializer_node)?;
+            let enum_const_assertion =
+                source_body && source_enum_member_const_assertion(store, host, initializer_node)?;
             if property.postfix_token.is_some()
                 || initializer_record.flags.0 != 0
                 || initializer_record.parent != Some(member.node)
@@ -10204,7 +10286,7 @@ fn plan_property_with_body_mode(
                 NodeData::NumericLiteral(literal) => Some(literal.text.as_str()),
                 NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
                 NodeData::StringLiteral(literal) => Some(literal.text.as_str()),
-                NodeData::AsExpression(_) if private => None,
+                NodeData::AsExpression(_) if private || enum_const_assertion => None,
                 NodeData::PropertyAccessExpression(_) | NodeData::ArrowFunction(_)
                     if source_body && merged_auto_accessor.is_none() =>
                 {
@@ -10286,6 +10368,7 @@ fn plan_property_with_body_mode(
                     }
                     (None, Some(literal.text.clone()), None, None)
                 }
+                NodeData::AsExpression(_) if enum_const_assertion => (None, None, None, None),
                 NodeData::AsExpression(assertion) => {
                     let operand = NodeRef::new(member.arena, member.file, assertion.expression);
                     let annotation = NodeRef::new(member.arena, member.file, assertion.type_);

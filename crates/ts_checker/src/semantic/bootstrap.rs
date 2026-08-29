@@ -43,7 +43,7 @@ use super::{
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     declared::{cached_class_type, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
-    enums::validate_enum_value_union_constituent,
+    enums::{validate_enum_type_union_constituent, validate_enum_value_union_constituent},
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
@@ -1030,6 +1030,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let TypeData::Literal(literal) = record.data() else {
             return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
         };
+        if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+            validate_enum_type_union_constituent(self, regular)
+                .ok_or(LiteralTypeCacheError::InvalidCachedLiteral(regular))?;
+            return (literal.regular_type == regular)
+                .then_some(literal.fresh_type)
+                .flatten()
+                .ok_or(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        }
         if literal.regular_type != regular
             || self.validate_regular_literal_cache_entry(regular, record.flags(), &literal.value)?
                 != 0
@@ -3322,6 +3330,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        if record.flags().intersects(TypeFlags::ENUM_LIKE) {
+            return validate_enum_type_union_constituent(self, type_).ok_or_else(|| {
+                if matches!(record.data(), TypeData::Literal(_)) {
+                    LiteralTypeCacheError::InvalidCachedLiteral(type_)
+                } else {
+                    LiteralTypeCacheError::InvalidCachedUnion(type_)
+                }
+            });
+        }
         self.validate_union_class_declarations(type_, record)?;
         match record.data() {
             TypeData::Intrinsic(data) => {

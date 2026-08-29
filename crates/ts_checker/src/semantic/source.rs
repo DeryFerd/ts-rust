@@ -782,6 +782,7 @@ enum ConditionalScalarExpectation {
         type_: TypeId,
     },
     Literal(ConditionalScalarFamily),
+    EnumMember(SemanticSymbolId),
     Fixed(TypeId),
     Dynamic,
     Object,
@@ -22572,7 +22573,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             conditional_return_operand_plan_is_supported(&when_true)
         } else {
             conditional_scalar_operand_plan_is_supported(&when_true)
-        };
+        } || self.conditional_enum_member(&when_true).is_some();
         if !when_true_supported {
             return Err(self.unsupported(
                 when_true.node,
@@ -22609,7 +22610,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             conditional_return_operand_plan_is_supported(&when_false)
         } else {
             conditional_scalar_operand_plan_is_supported(&when_false)
-        };
+        } || self.conditional_enum_member(&when_false).is_some();
         if !when_false_supported {
             return Err(self.unsupported(
                 when_false.node,
@@ -22680,9 +22681,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             if !dynamic_result || store.type_node_links(expression).is_some() {
                 preflight_source_expression_cache(store, expression, expected_cache)?;
             }
-            preflight_uncached_conditional_operand_links(store, &condition)?;
-            preflight_uncached_conditional_operand_links(store, &when_true)?;
-            preflight_uncached_conditional_operand_links(store, &when_false)?;
+            preflight_uncached_conditional_operand_links(store, &condition, condition_expectation)?;
+            preflight_uncached_conditional_operand_links(store, &when_true, when_true_expectation)?;
+            preflight_uncached_conditional_operand_links(
+                store,
+                &when_false,
+                when_false_expectation,
+            )?;
         }
         Ok(PlannedExpression::new(
             expression,
@@ -22762,11 +22767,52 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && global == Some(receiver.value_symbol)
     }
 
+    fn conditional_enum_member(&self, expression: &PlannedExpression) -> Option<SemanticSymbolId> {
+        let PlannedExpressionKind::Property(property) = &expression.unparenthesized().kind else {
+            return None;
+        };
+        let PlannedExpressionKind::Identifier(receiver) = &property.receiver.unparenthesized().kind
+        else {
+            return None;
+        };
+        let (store, _) = self.semantic?;
+        let owner = store.symbol(receiver.value_symbol)?;
+        if receiver.kind != PlannedIdentifierReadKind::DeclaredValue
+            || !matches!(
+                owner.flags(),
+                SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM
+            )
+        {
+            return None;
+        }
+        let NodeData::PropertyAccessExpression(access) = &self.arena.get(property.node.node)?.data
+        else {
+            return None;
+        };
+        let NodeData::Identifier(name) = &self.arena.get(access.name)?.data else {
+            return None;
+        };
+        if access.question_dot_token.is_some() {
+            return None;
+        }
+        let member = store
+            .symbol_table(owner.exports()?)?
+            .get_source(&name.text)?;
+        let record = store.symbol(member)?;
+        (record.flags() == SymbolFlags::ENUM_MEMBER
+            && record.parent() == Some(receiver.value_symbol)
+            && store.get_merged_symbol(member) == Some(member))
+        .then_some(member)
+    }
+
     fn conditional_scalar_expectation(
         &self,
         expression: &PlannedExpression,
         allow_calls: bool,
     ) -> Result<Option<ConditionalScalarExpectation>, SourceCheckError> {
+        if let Some(member) = self.conditional_enum_member(expression) {
+            return Ok(Some(ConditionalScalarExpectation::EnumMember(member)));
+        }
         if matches!(
             expression.kind,
             PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
@@ -25718,7 +25764,22 @@ fn deferred_inferred_javascript_functions(
 fn preflight_uncached_conditional_operand_links(
     store: &CanonicalTypeMapperStore,
     expression: &PlannedExpression,
+    expectation: ConditionalScalarExpectation,
 ) -> Result<(), SourceCheckError> {
+    if let ConditionalScalarExpectation::EnumMember(member) = expectation {
+        if store.type_node_links(expression.node).is_some() {
+            let expected = store
+                .value_symbol_links(member)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Conditional(expression.node))?;
+            store.validate_union_constituent(expected)?;
+            preflight_source_expression_cache(store, expression.node, expected)?;
+        }
+        if let PlannedExpressionKind::Parenthesized(inner) = &expression.kind {
+            preflight_uncached_conditional_operand_links(store, inner, expectation)?;
+        }
+        return Ok(());
+    }
     if matches!(
         &expression.unparenthesized().kind,
         PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::CommaToken
@@ -25783,7 +25844,7 @@ fn preflight_uncached_conditional_operand_links(
         ));
     }
     if let PlannedExpressionKind::Parenthesized(inner) = &expression.kind {
-        preflight_uncached_conditional_operand_links(store, inner)?;
+        preflight_uncached_conditional_operand_links(store, inner, expectation)?;
     }
     Ok(())
 }
@@ -25798,6 +25859,7 @@ fn preflight_inferred_function_return_dependencies(
     functions: &[PlannedFunction],
     ambient_variables: &[PlannedAmbientVariable],
     cross_file_global_reads: &[PlannedCrossFileGlobalRead],
+    enums: &[&SourceEnumPlan],
 ) -> Result<(), SourceCheckError> {
     fn expression_is_closed(
         expression: &PlannedExpression,
@@ -26017,7 +26079,7 @@ fn preflight_inferred_function_return_dependencies(
         if !function.callable.return_type.is_inferred() {
             continue;
         }
-        // Annotated declared values are resolved before inferred function bodies run.
+        // Annotated values and enum identities are prepared before inferred bodies run.
         let mut locals = ambient_variables
             .iter()
             .filter(|variable| variable.type_node.is_some() && variable.initializer.is_none())
@@ -26027,6 +26089,7 @@ fn preflight_inferred_function_return_dependencies(
                     .iter()
                     .map(|read| read.read.value_symbol),
             )
+            .chain(enums.iter().map(|enumeration| enumeration.owner_symbol))
             .collect::<HashSet<_>>();
         for parameter in &function.callable.parameters {
             if let Some(bindings) = authenticated_function_array_parameter_bindings(
@@ -29042,7 +29105,9 @@ fn check_expression_type_with_class_context(
                 .map_or(current_flow_types, |(truthy, _)| truthy);
             let when_true = if matches!(
                 conditional.when_true_expectation,
-                ConditionalScalarExpectation::Error | ConditionalScalarExpectation::Object
+                ConditionalScalarExpectation::Error
+                    | ConditionalScalarExpectation::Object
+                    | ConditionalScalarExpectation::EnumMember(_)
             ) || conditional.when_true_expectation
                 == ConditionalScalarExpectation::Dynamic
                 && matches!(
@@ -29088,7 +29153,9 @@ fn check_expression_type_with_class_context(
                 .map_or(current_flow_types, |(_, falsy)| falsy);
             let when_false = if matches!(
                 conditional.when_false_expectation,
-                ConditionalScalarExpectation::Error | ConditionalScalarExpectation::Object
+                ConditionalScalarExpectation::Error
+                    | ConditionalScalarExpectation::Object
+                    | ConditionalScalarExpectation::EnumMember(_)
             ) || conditional.when_false_expectation
                 == ConditionalScalarExpectation::Dynamic
                 && matches!(
@@ -31158,7 +31225,16 @@ fn check_planned_class_body(
                     Some(&mut context),
                 )?
                 .result;
-                let type_ = widened_fresh_literal_type(store, type_)?;
+                let ClassBodyKind::PropertyInitializer { symbol, .. } = body.kind else {
+                    return Err(SourceCheckError::Class(body.declaration));
+                };
+                let member = super::classes::class_member_source(store, host, symbol)
+                    .map_err(|error| SourcePlanner::class_plan_error(body.declaration, error))?;
+                let type_ = if member.readonly {
+                    type_
+                } else {
+                    widened_fresh_literal_union_type(store, global_types, type_)?
+                };
                 store.get_widened_type_with_global_types(type_, global_types)?
             };
             Some(type_)
@@ -33418,6 +33494,17 @@ fn validate_conditional_scalar_expectation(
 ) -> Result<(), SourceCheckError> {
     store.validate_union_constituent_with_global_types(global_types, type_)?;
     match expectation {
+        ConditionalScalarExpectation::EnumMember(member) => {
+            if store
+                .value_symbol_links(member)
+                .and_then(|links| links.resolved_type)
+                == Some(type_)
+            {
+                Ok(())
+            } else {
+                Err(SourceCheckError::Conditional(expression.node))
+            }
+        }
         ConditionalScalarExpectation::Exact {
             type_: expected, ..
         }
@@ -54117,12 +54204,23 @@ pub(super) fn check_source_file(
     }
     let deferred_inferred_functions =
         deferred_inferred_javascript_functions(&statements, &functions, javascript_jsdoc.is_some());
+    let enums = statements
+        .iter()
+        .filter_map(|statement| {
+            if let PlannedStatement::Enum(enumeration) = statement {
+                Some(enumeration)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     preflight_inferred_function_return_dependencies(
         store,
         host,
         &functions,
         &ambient_variables,
         &cross_file_global_reads,
+        &enums,
     )?;
 
     let mut reexport_aliases = HashSet::new();
@@ -55015,15 +55113,7 @@ pub(super) fn check_source_file(
     let mut commonjs_export_types = HashMap::<SemanticSymbolId, Vec<TypeId>>::new();
     let mut commonjs_export_order = Vec::new();
 
-    for enumeration in statements.iter().filter_map(|statement| {
-        if let PlannedStatement::Enum(enumeration) = statement
-            && enumeration.is_const
-        {
-            Some(enumeration)
-        } else {
-            None
-        }
-    }) {
+    for enumeration in &enums {
         let materialized = execute_top_level_enum(store, host, enumeration)
             .map_err(|error| SourcePlanner::enum_plan_error(enumeration.declaration, error))?;
         if current_flow_types
@@ -56844,9 +56934,8 @@ pub(super) fn check_source_file(
                     enumeration.owner_symbol,
                     materialized.value_type,
                 )?;
-                if let Some(previous) =
-                    current_flow_types.insert(enumeration.owner_symbol, materialized.value_type)
-                    && (!enumeration.is_const || previous != materialized.value_type)
+                if current_flow_types.insert(enumeration.owner_symbol, materialized.value_type)
+                    != Some(materialized.value_type)
                 {
                     return Err(SourceCheckError::Enum(enumeration.declaration));
                 }
@@ -69505,6 +69594,241 @@ mod tests {
 
         context.recheck_source_file(file).unwrap();
 
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    fn enum_widening_options() -> CanonicalCheckerOptions {
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_bind_call_apply: true,
+            strict_builtin_iterator_return: true,
+            strict_function_types: true,
+            strict_property_initialization: true,
+            use_unknown_in_catch_variables: true,
+            no_implicit_any: true,
+            no_implicit_this: true,
+            name_resolution: CanonicalNameResolverOptions {
+                emit_target: ts_options::ScriptTarget::Es2015,
+                ..CanonicalNameResolverOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        }
+    }
+
+    #[test]
+    fn computed_enum_variables_preserve_annotation_and_union_widening() {
+        let source = parsed(concat!(
+            "declare function computed(x: number): number; ",
+            "enum E { A = computed(0), B = computed(1), C = computed(2), D = computed(3) } ",
+            "function choose(cond: boolean) { ",
+            "const direct = E.B; let mutable = direct; ",
+            "const alias = direct; let mutableAlias = alias; ",
+            "const annotated: E.B = E.B; let preserved = annotated; ",
+            "const annotatedAlias: E.B = direct; let preservedAlias = annotatedAlias; ",
+            "const inferred = cond ? E.A : E.B; ",
+            "const explicit: E.A | E.B = inferred; ",
+            "const mixed = cond ? inferred : explicit; ",
+            "const widened = cond ? mixed : E.C; ",
+            "const extended: E.A | E.B | E.C = widened; ",
+            "let inferredVariable = inferred; let explicitVariable = explicit; ",
+            "let mixedVariable = mixed; let widenedVariable = widened; ",
+            "let extendedVariable = extended; ",
+            "const asserted = E.B as E.B; let mutableAsserted = asserted; ",
+            "const angle = <E.B>E.B; let mutableAngle = angle; ",
+            "const constAsserted = E.B as const; let mutableConstAsserted = constAsserted; ",
+            "}",
+        ));
+        let file = FileId::new(9_417);
+        let mut context = context(&[(file, &source)], enum_widening_options());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics().as_slice()
+        );
+        // Pinned Go computedEnumTypeWidening.types, not the source comments.
+        for (name, expected) in [
+            ("direct", "E.B"),
+            ("alias", "E.B"),
+            ("mutable", "E"),
+            ("mutableAlias", "E"),
+            ("annotated", "E.B"),
+            ("annotatedAlias", "E.B"),
+            ("preserved", "E.B"),
+            ("preservedAlias", "E.B"),
+            ("inferred", "E.A | E.B"),
+            ("explicit", "E.A | E.B"),
+            ("mixed", "E.A | E.B"),
+            ("widened", "E.A | E.B | E.C"),
+            ("extended", "E.A | E.B | E.C"),
+            ("inferredVariable", "E"),
+            ("explicitVariable", "E.A | E.B"),
+            ("mixedVariable", "E.A | E.B"),
+            ("widenedVariable", "E"),
+            ("extendedVariable", "E.A | E.B | E.C"),
+            ("asserted", "E.B"),
+            ("mutableAsserted", "E.B"),
+            ("angle", "E.B"),
+            ("mutableAngle", "E.B"),
+            ("constAsserted", "E.B"),
+            ("mutableConstAsserted", "E.B"),
+        ] {
+            let type_ = variable_value_type(&context, &source, file, name);
+            assert_eq!(context.type_to_string(type_).unwrap(), expected, "{name}");
+        }
+        let owner = global_symbol(&context, "E");
+        let member = context
+            .store()
+            .symbol_table(context.store().symbol(owner).unwrap().exports().unwrap())
+            .unwrap()
+            .get_source("B")
+            .unwrap();
+        let fresh = context
+            .store()
+            .declared_type_links(member)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Literal(literal) = context.store().type_payload(fresh).unwrap().data() else {
+            panic!("E.B must retain its computed enum literal pair")
+        };
+        assert_eq!(literal.value, LiteralValue::ComputedEnum);
+        let regular = literal.regular_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "direct"),
+            fresh
+        );
+        assert_eq!(variable_value_type(&context, &source, file, "alias"), fresh);
+        for name in [
+            "annotated",
+            "annotatedAlias",
+            "asserted",
+            "angle",
+            "constAsserted",
+        ] {
+            assert_eq!(
+                variable_value_type(&context, &source, file, name),
+                regular,
+                "{name}"
+            );
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn enum_field_widening_preserves_readonly_and_const_assertions() {
+        let source = parsed(concat!(
+            "declare function computed(x: number): number; ",
+            "enum E { A = computed(0), B = computed(1) } ",
+            "enum Literal { A, B } declare enum Ambient { A, B } ",
+            "const direct = E.B; const fixed = E.B as const; ",
+            "let wide = E.B; let narrow = E.B as const; ",
+            "let literalValue = Literal.A; literalValue = Literal.B; ",
+            "let ambientValue = Ambient.A; ambientValue = Ambient.B; ",
+            "class C { ",
+            "p1 = E.B; p2 = E.B as const; readonly p3 = E.B; readonly p4 = E.B as const; ",
+            "literalMutable = Literal.A; readonly literalReadonly = Literal.A; ",
+            "ambientMutable = Ambient.A; readonly ambientReadonly = Ambient.A; ",
+            "annotated: E.B = E.B; ",
+            "}",
+        ));
+        let file = FileId::new(9_418);
+        let mut context = context(&[(file, &source)], enum_widening_options());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics().as_slice()
+        );
+        for (name, expected) in [
+            ("direct", "E.B"),
+            ("fixed", "E.B"),
+            ("wide", "E"),
+            ("narrow", "E.B"),
+            ("literalValue", "Literal"),
+            ("ambientValue", "Ambient"),
+        ] {
+            let type_ = variable_value_type(&context, &source, file, name);
+            assert_eq!(context.type_to_string(type_).unwrap(), expected, "{name}");
+        }
+        let class = global_symbol(&context, "C");
+        let members = context
+            .store()
+            .symbol_table(context.store().symbol(class).unwrap().members().unwrap())
+            .unwrap();
+        let enum_member = |owner: &str, name: &str| {
+            let owner = global_symbol(&context, owner);
+            let member = context
+                .store()
+                .symbol_table(context.store().symbol(owner).unwrap().exports().unwrap())
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            let fresh = context
+                .store()
+                .declared_type_links(member)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let TypeData::Literal(literal) = context.store().type_payload(fresh).unwrap().data()
+            else {
+                panic!("the enum member must retain its literal pair")
+            };
+            (
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .unwrap()
+                    .declared_type
+                    .unwrap(),
+                fresh,
+                literal.regular_type,
+            )
+        };
+        let (e, fresh, regular) = enum_member("E", "B");
+        let (literal, literal_fresh, _) = enum_member("Literal", "A");
+        let (ambient, ambient_fresh, _) = enum_member("Ambient", "A");
+        for (name, expected) in [
+            ("p1", e),
+            ("p2", regular),
+            ("p3", fresh),
+            ("p4", regular),
+            ("literalMutable", literal),
+            ("literalReadonly", literal_fresh),
+            ("ambientMutable", ambient),
+            ("ambientReadonly", ambient_fresh),
+            ("annotated", regular),
+        ] {
+            let symbol = members.get_source(name).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert!(
+            matches!(context.store().type_payload(literal_fresh).unwrap().data(),
+            TypeData::Literal(literal) if matches!(literal.value, LiteralValue::Number(_)))
+        );
+        assert!(
+            matches!(context.store().type_payload(ambient_fresh).unwrap().data(),
+            TypeData::Literal(literal) if literal.value == LiteralValue::ComputedEnum)
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
 
