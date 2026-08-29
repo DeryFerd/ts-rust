@@ -20,6 +20,7 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, ValueSymbolLinks,
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
+    store::SourceNodeParent,
     type_records::{TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -37,6 +38,60 @@ const ES2015_LIBRARY_SUGGESTION: &str = "es2015";
 pub struct CanonicalGlobalTypeDiagnostic {
     pub node: Option<NodeRef>,
     pub diagnostic: Diagnostic,
+}
+
+/// A demanded global and the source proof retained with its diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedGlobalType {
+    type_: TypeId,
+    diagnostics: Vec<CanonicalGlobalTypeDiagnostic>,
+    proof: RequiredGlobalTypeProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequiredGlobalTypeProof {
+    globals: SymbolTableId,
+    name: String,
+    arity: usize,
+    symbol: Option<RequiredGlobalSymbolProof>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequiredGlobalSymbolProof {
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+    declarations: Vec<NodeRef>,
+    declared_type: Option<TypeId>,
+}
+
+impl ResolvedGlobalType {
+    pub(super) const fn type_(&self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) fn diagnostics(&self) -> &[CanonicalGlobalTypeDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub(super) fn is_for(&self, name: &str, arity: usize) -> bool {
+        self.proof.name == name && self.proof.arity == arity
+    }
+
+    pub(super) fn validate(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> Result<(), CanonicalGlobalTypeInitializationError> {
+        if store.type_payload(self.type_).is_none()
+            || self.proof
+                != required_global_type_proof(store, host, &self.proof.name, self.proof.arity)?
+        {
+            return Err(CanonicalGlobalTypeInitializationError::InvalidType(
+                self.type_,
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The eager standard-library identities installed by `initializeChecker`.
@@ -613,6 +668,220 @@ pub(super) fn resolve_optional_global_type(
         diagnostics: Vec::new(),
     };
     resolver.resolve(name, arity, false).map(Some)
+}
+
+/// Uses the ordinary global resolver and retains proof for a lazy required demand.
+pub(super) fn resolve_required_global_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: &str,
+    arity: usize,
+) -> Result<ResolvedGlobalType, CanonicalGlobalTypeInitializationError> {
+    let before = required_global_type_proof(store, host, name, arity)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?;
+    let mut resolver = GlobalTypeResolver {
+        globals: bootstrap.globals,
+        empty_object_type: bootstrap.empty_object_type,
+        empty_generic_type: bootstrap.empty_generic_type,
+        store,
+        host,
+        diagnostics: Vec::new(),
+    };
+    let type_ = resolver.resolve(name, arity, true)?;
+    let mut diagnostics = resolver.diagnostics;
+    let proof = required_global_type_proof(store, host, name, arity)?;
+    if before.globals != proof.globals
+        || before.symbol.as_ref().map(|symbol| symbol.symbol)
+            != proof.symbol.as_ref().map(|symbol| symbol.symbol)
+    {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGlobals(
+            proof.globals,
+        ));
+    }
+    for diagnostic in &mut diagnostics {
+        let Some(declaration) = diagnostic.node else {
+            continue;
+        };
+        let symbol = proof
+            .symbol
+            .as_ref()
+            .ok_or(CanonicalGlobalTypeInitializationError::InvalidType(type_))?
+            .symbol;
+        let invalid = || CanonicalGlobalTypeInitializationError::InvalidSymbol(symbol);
+        let record = host.node(declaration).ok_or_else(invalid)?;
+        let name = match &record.data {
+            NodeData::ClassDeclaration(class) => class.name,
+            NodeData::InterfaceDeclaration(interface) => Some(interface.name),
+            NodeData::TypeAliasDeclaration(alias) => Some(alias.name),
+            NodeData::EnumDeclaration(enumeration) => Some(enumeration.name),
+            _ => None,
+        }
+        .ok_or_else(invalid)?;
+        let name = NodeRef::new(declaration.arena, declaration.file, name);
+        if !host.node(name).is_some_and(|name| {
+            name.parent == Some(declaration.node)
+                && matches!(&name.data, NodeData::Identifier(identifier) if identifier.text == proof.name)
+        }) {
+            return Err(invalid());
+        }
+        diagnostic.node = Some(name);
+    }
+    Ok(ResolvedGlobalType {
+        type_,
+        diagnostics,
+        proof,
+    })
+}
+
+fn required_global_type_proof(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    name: &str,
+    arity: usize,
+) -> Result<RequiredGlobalTypeProof, CanonicalGlobalTypeInitializationError> {
+    let globals = store
+        .intrinsic_bootstrap()
+        .ok_or(CanonicalGlobalTypeInitializationError::MissingBootstrap)?
+        .globals;
+    if store.symbol_table(globals).is_none() {
+        return Err(CanonicalGlobalTypeInitializationError::InvalidGlobals(
+            globals,
+        ));
+    }
+    let symbol = {
+        let mut resolver_host = host.name_resolver_host(store)?;
+        resolve_global_name(
+            store.symbol_store(),
+            &mut resolver_host,
+            name,
+            SymbolFlags::TYPE,
+            None,
+            false,
+            false,
+        )?
+    };
+    let symbol = symbol
+        .map(|symbol| {
+            let invalid = || CanonicalGlobalTypeInitializationError::InvalidSymbol(symbol);
+            let record = store.symbol(symbol).ok_or_else(invalid)?;
+            if store.get_merged_symbol(symbol) != Some(symbol)
+                || record.name().as_utf8() != Some(name)
+                || !store.source_merged_symbol_declarations_match(symbol)
+            {
+                return Err(invalid());
+            }
+            let declarations = record
+                .declarations()
+                .filter(|declarations| !declarations.is_empty())
+                .ok_or_else(invalid)?;
+            if declarations.iter().any(|declaration| {
+                host.node(*declaration).is_none()
+                    || !host.symbol_matches(store, *declaration, symbol)
+            }) {
+                return Err(invalid());
+            }
+            for declaration in declarations {
+                validate_required_global_declaration(store, host, *declaration, symbol, name)?;
+            }
+            let declared_type = if record
+                .flags()
+                .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+            {
+                optional_global_type_has_arity(store, host, name, arity)?;
+                let declared = store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type);
+                if let Some(type_) = declared
+                    && store
+                        .type_payload(type_)
+                        .and_then(super::type_records::TypeRecord::symbol)
+                        != Some(symbol)
+                {
+                    return Err(CanonicalGlobalTypeInitializationError::InvalidType(type_));
+                }
+                declared
+            } else {
+                None
+            };
+            Ok(RequiredGlobalSymbolProof {
+                symbol,
+                flags: record.flags(),
+                declarations: declarations.to_vec(),
+                declared_type,
+            })
+        })
+        .transpose()?;
+    Ok(RequiredGlobalTypeProof {
+        globals,
+        name: name.to_owned(),
+        arity,
+        symbol,
+    })
+}
+
+fn validate_required_global_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    expected_name: &str,
+) -> Result<(), CanonicalGlobalTypeInitializationError> {
+    let invalid = || CanonicalGlobalTypeInitializationError::InvalidSymbol(symbol);
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let source_parent = record.parent.map_or(SourceNodeParent::Root, |parent| {
+        SourceNodeParent::Parent(NodeRef::new(declaration.arena, declaration.file, parent))
+    });
+    if store.source_node_kind(declaration) != Some(record.kind)
+        || store.source_node_start(declaration) != Some(record.range.start.get())
+        || store.source_node_parent(declaration) != Some(source_parent)
+        || !record.data.matches_syntax_kind(record.kind)
+    {
+        return Err(invalid());
+    }
+    let name = match &record.data {
+        NodeData::ClassDeclaration(class) => class.name,
+        NodeData::ClassExpression(class) => class.name,
+        NodeData::InterfaceDeclaration(interface) => Some(interface.name),
+        NodeData::TypeAliasDeclaration(alias) => Some(alias.name),
+        NodeData::EnumDeclaration(enumeration) => Some(enumeration.name),
+        NodeData::ModuleDeclaration(module) => Some(module.name),
+        NodeData::FunctionDeclaration(function) => function.name,
+        NodeData::VariableDeclaration(variable) => Some(variable.name),
+        NodeData::BindingElement(binding) => binding.name,
+        _ => None,
+    }
+    .ok_or_else(invalid)?;
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    if store.source_identifier_text(name) != Some(expected_name)
+        || store.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+    {
+        return Err(invalid());
+    }
+    let mut children = Vec::new();
+    record.for_each_child(|child| {
+        children.push(NodeRef::new(declaration.arena, declaration.file, child));
+    });
+    children.sort_unstable();
+    if store.source_direct_children(declaration).as_deref() != Some(children.as_slice()) {
+        return Err(invalid());
+    }
+    for child in children {
+        let child_record = host.node(child).ok_or_else(invalid)?;
+        if store.source_node_kind(child) != Some(child_record.kind)
+            || store.source_node_start(child) != Some(child_record.range.start.get())
+            || child_record.parent != Some(declaration.node)
+            || !child_record.data.matches_syntax_kind(child_record.kind)
+            || store.source_identifier_text(child).is_some_and(|expected| {
+                !matches!(&child_record.data,
+                    NodeData::Identifier(identifier) if identifier.text == expected)
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 /// Proves the pinned no-heritage `Object` fast path without resolving any

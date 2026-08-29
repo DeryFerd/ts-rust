@@ -65,7 +65,6 @@ pub enum ModuleResolutionKind {
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ScriptTarget {
     Es3,
-    #[default]
     Es5,
     Es2015,
     Es2016,
@@ -77,6 +76,7 @@ pub enum ScriptTarget {
     Es2022,
     Es2023,
     Es2024,
+    #[default]
     Es2025,
     EsNext,
 }
@@ -346,7 +346,7 @@ impl Default for CompilerOptions {
             module: ModuleKind::default(),
             module_specified: false,
             module_resolution: ModuleResolutionKind::Node10,
-            target: ScriptTarget::Es5,
+            target: ScriptTarget::default(),
             jsx: JsxEmit::None,
             jsx_factory: None,
             jsx_fragment_factory: None,
@@ -2171,6 +2171,257 @@ mod tests {
     }
 
     #[test]
+    fn default_target_uses_es2025_without_resolver_changes() {
+        assert_eq!(ScriptTarget::default(), ScriptTarget::Es2025);
+        let parsed = parse_compiler_options(&object([]));
+        assert!(parsed.is_ok(), "{:?}", parsed.diagnostics);
+        for options in [CompilerOptions::default(), parsed.options] {
+            assert_eq!(options.target, ScriptTarget::Es2025);
+            assert_eq!(options.printer_settings().target, ScriptTarget::Es2025);
+            assert_eq!(options.module, ModuleKind::None);
+            assert!(!options.module_specified);
+            assert_eq!(
+                options.module.effective_for_target(options.target),
+                ModuleKind::Es2022
+            );
+            assert_eq!(options.module_resolution, ModuleResolutionKind::Node10);
+            assert_eq!(
+                options.module_resolution_options().mode,
+                ResolutionMode::Node10
+            );
+            assert!(!options.resolve_json_module);
+            assert!(!options.resolve_json_module_specified);
+            assert!(!options.module_resolution_options().resolve_json);
+            assert!(options.lib.is_none());
+            assert!(!options.no_check);
+        }
+    }
+
+    #[test]
+    fn target_fallbacks_keep_their_parse_diagnostics() {
+        for (value, expected_codes) in [
+            (object([]), vec![]),
+            (object([("target", JsonValue::Null)]), vec![]),
+            (
+                object([("target", JsonValue::String("future".to_owned()))]),
+                vec![6046],
+            ),
+            (object([("target", JsonValue::Bool(true))]), vec![5024]),
+            (JsonValue::Bool(false), vec![5024]),
+        ] {
+            let parsed = parse_compiler_options(&value);
+            assert_eq!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .map(ts_diagnostics::Diagnostic::code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "{value:?}"
+            );
+            assert_eq!(parsed.options.target, ScriptTarget::Es2025, "{value:?}");
+            assert_eq!(parsed.options.module, ModuleKind::None, "{value:?}");
+            assert!(!parsed.options.module_specified);
+            assert!(!parsed.options.no_check);
+        }
+    }
+
+    #[test]
+    fn project_target_defaults_keep_configured_inputs() {
+        for path in ["/project/tsconfig.json", "/project/jsconfig.json"] {
+            for text in [
+                r#"{"compilerOptions":{}}"#,
+                r#"{"compilerOptions":{"lib":["es5"]}}"#,
+                r#"{"compilerOptions":{"lib":[]}}"#,
+                r#"{"compilerOptions":{"noLib":true}}"#,
+            ] {
+                let parsed_config = parse_config_text(path, text);
+                assert!(parsed_config.diagnostics.is_empty());
+                let config = parsed_config.value.unwrap();
+                let before = config.clone();
+                let parsed = parse_project_options(&config);
+                assert!(parsed.is_ok(), "{path}: {text}: {:?}", parsed.diagnostics);
+                assert_eq!(config, before);
+                assert!(!config.compiler_options.contains_key("target"));
+                assert!(!config.compiler_options.contains_key("module"));
+                assert_eq!(parsed.options.target, ScriptTarget::Es2025);
+                assert_eq!(parsed.options.module, ModuleKind::None);
+                assert!(!parsed.options.module_specified);
+                assert!(!parsed.options.no_check);
+                if let Some(JsonValue::Array(libraries)) = config.compiler_options.get("lib") {
+                    assert_eq!(
+                        parsed.options.lib,
+                        Some(
+                            libraries
+                                .iter()
+                                .map(|library| library.as_str().unwrap().to_owned())
+                                .collect()
+                        )
+                    );
+                }
+                if config.compiler_options.get("noLib") == Some(&JsonValue::Bool(true)) {
+                    assert!(parsed.options.no_lib);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_targets_and_named_target_overrides_are_preserved() {
+        for (name, expected) in [
+            ("es5", ScriptTarget::Es5),
+            ("es6", ScriptTarget::Es2015),
+            ("es2015", ScriptTarget::Es2015),
+            ("es2019", ScriptTarget::Es2019),
+            ("es2020", ScriptTarget::Es2020),
+            ("es2021", ScriptTarget::Es2021),
+            ("es2022", ScriptTarget::Es2022),
+            ("es2025", ScriptTarget::Es2025),
+            ("esnext", ScriptTarget::EsNext),
+        ] {
+            let parsed =
+                parse_compiler_options(&object([("target", JsonValue::String(name.to_owned()))]));
+            assert!(parsed.is_ok(), "{name}: {:?}", parsed.diagnostics);
+            assert_eq!(parsed.options.target, expected, "{name}");
+        }
+
+        let mut options = CompilerOptions {
+            target: ScriptTarget::Es2019,
+            ..CompilerOptions::default()
+        };
+        options.apply_overrides(&CompilerOptions::default(), &BTreeSet::new());
+        assert_eq!(options.target, ScriptTarget::Es2019);
+        assert_eq!(
+            options.module.effective_for_target(options.target),
+            ModuleKind::Es2015
+        );
+
+        let target = parse_compiler_options(&object([(
+            "target",
+            JsonValue::String("es2021".to_owned()),
+        )]));
+        assert!(target.is_ok(), "{:?}", target.diagnostics);
+        options.apply_overrides(&target.options, &BTreeSet::from(["target".to_owned()]));
+        assert_eq!(options.target, ScriptTarget::Es2021);
+        assert_eq!(options.module, ModuleKind::None);
+        assert!(!options.module_specified);
+        assert_eq!(
+            options.module.effective_for_target(options.target),
+            ModuleKind::Es2020
+        );
+
+        let module = parse_compiler_options(&object([(
+            "module",
+            JsonValue::String("nodenext".to_owned()),
+        )]));
+        assert!(module.is_ok(), "{:?}", module.diagnostics);
+        assert_eq!(module.options.target, ScriptTarget::Es2025);
+        options.apply_overrides(&module.options, &BTreeSet::from(["module".to_owned()]));
+        assert_eq!(options.target, ScriptTarget::Es2021);
+        assert_eq!(options.module, ModuleKind::NodeNext);
+        assert!(options.module_specified);
+
+        let target =
+            parse_compiler_options(&object([("target", JsonValue::String("es5".to_owned()))]));
+        assert!(target.is_ok(), "{:?}", target.diagnostics);
+        options.apply_overrides(&target.options, &BTreeSet::from(["target".to_owned()]));
+        assert_eq!(options.target, ScriptTarget::Es5);
+        assert_eq!(
+            options.module.effective_for_target(options.target),
+            ModuleKind::NodeNext
+        );
+        assert!(options.module_specified);
+    }
+
+    #[test]
+    fn effective_module_uses_target_only_for_the_none_sentinel() {
+        for (target, inferred) in [
+            (ScriptTarget::Es3, ModuleKind::CommonJs),
+            (ScriptTarget::Es5, ModuleKind::CommonJs),
+            (ScriptTarget::Es2015, ModuleKind::Es2015),
+            (ScriptTarget::Es2016, ModuleKind::Es2015),
+            (ScriptTarget::Es2017, ModuleKind::Es2015),
+            (ScriptTarget::Es2018, ModuleKind::Es2015),
+            (ScriptTarget::Es2019, ModuleKind::Es2015),
+            (ScriptTarget::Es2020, ModuleKind::Es2020),
+            (ScriptTarget::Es2021, ModuleKind::Es2020),
+            (ScriptTarget::Es2022, ModuleKind::Es2022),
+            (ScriptTarget::Es2023, ModuleKind::Es2022),
+            (ScriptTarget::Es2024, ModuleKind::Es2022),
+            (ScriptTarget::Es2025, ModuleKind::Es2022),
+            (ScriptTarget::EsNext, ModuleKind::EsNext),
+        ] {
+            for module in [
+                ModuleKind::None,
+                ModuleKind::CommonJs,
+                ModuleKind::Amd,
+                ModuleKind::Umd,
+                ModuleKind::System,
+                ModuleKind::Es2015,
+                ModuleKind::Es2020,
+                ModuleKind::Es2022,
+                ModuleKind::EsNext,
+                ModuleKind::Node16,
+                ModuleKind::Node18,
+                ModuleKind::Node20,
+                ModuleKind::NodeNext,
+                ModuleKind::Preserve,
+            ] {
+                for module_specified in [false, true] {
+                    let options = CompilerOptions {
+                        module,
+                        module_specified,
+                        target,
+                        ..CompilerOptions::default()
+                    };
+                    let expected = if module == ModuleKind::None {
+                        inferred
+                    } else {
+                        module
+                    };
+                    assert_eq!(
+                        options.module.effective_for_target(options.target),
+                        expected
+                    );
+                    assert_eq!(options.module, module);
+                    assert_eq!(options.module_specified, module_specified);
+                    assert_eq!(options.target, target);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_defaults_preserve_explicit_legacy_resolution_and_json_false() {
+        for (name, configured, mode) in [
+            (
+                "classic",
+                ModuleResolutionKind::Classic,
+                ResolutionMode::Classic,
+            ),
+            (
+                "node10",
+                ModuleResolutionKind::Node10,
+                ResolutionMode::Node10,
+            ),
+        ] {
+            let parsed = parse_compiler_options(&object([
+                ("moduleResolution", JsonValue::String(name.to_owned())),
+                ("resolveJsonModule", JsonValue::Bool(false)),
+            ]));
+            assert!(parsed.is_ok(), "{name}: {:?}", parsed.diagnostics);
+            assert_eq!(parsed.options.target, ScriptTarget::Es2025);
+            assert_eq!(parsed.options.module, ModuleKind::None);
+            assert!(!parsed.options.module_specified);
+            assert_eq!(parsed.options.module_resolution, configured);
+            assert_eq!(parsed.options.module_resolution_options().mode, mode);
+            assert!(!parsed.options.resolve_json_module);
+            assert!(parsed.options.resolve_json_module_specified);
+            assert!(!parsed.options.module_resolution_options().resolve_json);
+        }
+    }
+
+    #[test]
     fn defaults_to_untransformed_modules_with_node10_resolution() {
         let direct = CompilerOptions::default();
         assert_eq!(ModuleKind::default(), ModuleKind::None);
@@ -3436,7 +3687,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5024, 5023, 6046]
         );
-        assert_eq!(result.options.target, ScriptTarget::Es5);
+        assert_eq!(result.options.target, ScriptTarget::Es2025);
         assert!(!result.options.allow_js);
     }
 

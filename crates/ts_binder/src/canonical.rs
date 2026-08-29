@@ -317,6 +317,7 @@ pub struct CanonicalSourceFileFacts {
     is_default_library: bool,
     always_strict: bool,
     module_state: CanonicalModuleState,
+    implied_node_format: Option<ts_options::ModuleKind>,
 }
 
 /// One wildcard ambient-module entry recorded by declaration binding.
@@ -433,6 +434,7 @@ impl CanonicalSourceFileFacts {
             is_default_library,
             always_strict: false,
             module_state,
+            implied_node_format: None,
         }
     }
 
@@ -441,6 +443,18 @@ impl CanonicalSourceFileFacts {
     pub const fn with_always_strict(mut self, always_strict: bool) -> Self {
         self.always_strict = always_strict;
         self
+    }
+
+    /// Retains the Program's file format from its suffix and package scope.
+    #[must_use]
+    pub const fn with_implied_node_format(mut self, format: ts_options::ModuleKind) -> Self {
+        self.implied_node_format = Some(format);
+        self
+    }
+
+    #[must_use]
+    pub const fn implied_node_format(&self) -> Option<ts_options::ModuleKind> {
+        self.implied_node_format
     }
 
     #[must_use]
@@ -7829,7 +7843,8 @@ mod tests {
             true,
             CanonicalModuleState::External,
         )
-        .with_always_strict(true);
+        .with_always_strict(true)
+        .with_implied_node_format(ts_options::ModuleKind::EsNext);
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(&parsed.arena, parsed.source_file, file, facts.clone())
@@ -7838,6 +7853,10 @@ mod tests {
         assert_eq!(bound.source_facts(), Some(&facts));
         assert!(bound.source_facts().unwrap().is_default_library());
         assert!(bound.source_facts().unwrap().is_always_strict());
+        assert_eq!(
+            bound.source_facts().unwrap().implied_node_format(),
+            Some(ts_options::ModuleKind::EsNext)
+        );
         assert_eq!(bound.phase(), BindingPhase::Traversal);
         assert_eq!(bound.symbol_count(), 0);
 
@@ -7858,6 +7877,7 @@ mod tests {
         );
         assert!(!ordinary.is_default_library());
         assert!(!ordinary.is_always_strict());
+        assert_eq!(ordinary.implied_node_format(), None);
     }
 
     #[test]

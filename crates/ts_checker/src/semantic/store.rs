@@ -29,6 +29,7 @@ use super::{
     },
     declared_values::DeclaredValueProvenance,
     derived_types::DerivedTypeCaches,
+    global_types::ResolvedGlobalType,
     ids::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
@@ -62,9 +63,11 @@ use super::{
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
     },
     source_imports::SourceFileNamespaceIdentity,
+    source_meta::ImportMetaExpressionIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
-        ConstructorAnnotationProof, SourceCallableAliasResolution, SourceCallableTypeQueryEvidence,
+        ConstructorAnnotationProof, SourceCallableAliasResolution,
+        SourceCallableInterfaceReturnProof, SourceCallableTypeQueryEvidence,
         UnionAliasInstantiationProof,
     },
     type_records::{
@@ -616,6 +619,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     class_instance_super_views_by_instance: HashMap<TypeId, TypeId>,
     class_instance_super_members: HashMap<(TypeId, SemanticSymbolId), ClassInstanceSuperMember>,
     source_callable_provenance: HashMap<TypeId, SourceCallableProvenance>,
+    source_callable_interface_return_proofs:
+        HashMap<SignatureId, SourceCallableInterfaceReturnProof>,
     source_callable_alias_annotations: HashMap<
         NodeRef,
         (
@@ -679,6 +684,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     next_relation_observation_token: u64,
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
+    import_meta_global: Option<ResolvedGlobalType>,
+    import_meta_expression: Option<ImportMetaExpressionIdentity>,
     canonical_union_creations: HashMap<TypeId, CanonicalUnionCreationProof>,
     union_alias_instantiations:
         HashMap<SemanticSymbolId, HashMap<CacheHashKey, UnionAliasInstantiationProof>>,
@@ -777,6 +784,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             class_instance_super_views_by_instance: HashMap::new(),
             class_instance_super_members: HashMap::new(),
             source_callable_provenance: HashMap::new(),
+            source_callable_interface_return_proofs: HashMap::new(),
             source_callable_alias_annotations: HashMap::new(),
             source_callable_alias_owners: HashMap::new(),
             source_jsdoc_typedefs: HashMap::new(),
@@ -828,6 +836,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             next_relation_observation_token: 0,
             derived_types: DerivedTypeCaches::default(),
             intrinsic_bootstrap: None,
+            import_meta_global: None,
+            import_meta_expression: None,
             canonical_union_creations: HashMap::new(),
             union_alias_instantiations: HashMap::new(),
             claimed_strict_builtin_iterator_return: None,
@@ -2924,6 +2934,50 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .map(|(proof, _)| proof)
     }
 
+    /// Reads the retained import proof, including an orphan left by a changed return cache.
+    pub(super) fn source_callable_interface_return_proof(
+        &self,
+        signature: SignatureId,
+    ) -> Option<SourceCallableInterfaceReturnProof> {
+        self.observe_relation_signature_read(signature);
+        self.source_callable_interface_return_proofs
+            .get(&signature)
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn source_callable_interface_return_proof_count(&self) -> usize {
+        self.source_callable_interface_return_proofs.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_source_callable_interface_return_proof_for_test(
+        &mut self,
+        signature: SignatureId,
+        replacement: Option<SourceCallableInterfaceReturnProof>,
+    ) -> Option<SourceCallableInterfaceReturnProof> {
+        let previous = self
+            .source_callable_interface_return_proofs
+            .get(&signature)
+            .copied();
+        if previous == replacement {
+            return previous;
+        }
+        match replacement {
+            Some(proof) => {
+                self.source_callable_interface_return_proofs
+                    .insert(signature, proof);
+            }
+            None => {
+                self.source_callable_interface_return_proofs
+                    .remove(&signature);
+            }
+        }
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
     pub(super) fn source_callable_alias_parameter_annotation(
         &self,
         parameter: SemanticSymbolId,
@@ -3229,6 +3283,46 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         alias: SemanticSymbolId,
     ) -> Option<&SourceFileNamespaceWrapper> {
         self.source_file_namespace_wrappers.get(&alias)
+    }
+
+    pub(super) fn import_meta_global(&self) -> Option<&ResolvedGlobalType> {
+        self.import_meta_global.as_ref()
+    }
+
+    pub(super) fn set_import_meta_global(&mut self, value: ResolvedGlobalType) -> bool {
+        if !value.is_for("ImportMeta", 0) || self.type_payload(value.type_()).is_none() {
+            return false;
+        }
+        if let Some(existing) = &self.import_meta_global {
+            return existing == &value;
+        }
+        self.import_meta_global = Some(value);
+        true
+    }
+
+    pub(super) fn import_meta_expression(&self) -> Option<ImportMetaExpressionIdentity> {
+        self.import_meta_expression
+    }
+
+    pub(super) fn set_import_meta_expression(
+        &mut self,
+        value: ImportMetaExpressionIdentity,
+    ) -> bool {
+        if let Some(existing) = self.import_meta_expression {
+            return existing == value;
+        }
+        if self.type_payload(value.type_).is_none()
+            || self.type_payload(value.import_meta_type).is_none()
+            || self.symbol(value.symbol).is_none()
+            || self.symbol(value.meta).is_none()
+            || self.symbol_table(value.members).is_none()
+            || self.import_meta_global().map(ResolvedGlobalType::type_)
+                != Some(value.import_meta_type)
+        {
+            return false;
+        }
+        self.import_meta_expression = Some(value);
+        true
     }
 
     pub(super) fn source_file_namespace_wrapper_for_module(
@@ -9820,6 +9914,158 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         self.direct_class_heritage_provenance
             .try_reserve(additional)
             .is_ok()
+    }
+
+    fn source_callable_interface_return_proof_has_exact_owner(
+        &self,
+        proof: SourceCallableInterfaceReturnProof,
+    ) -> bool {
+        let signature = proof.signature();
+        let declaration = proof.declaration();
+        let owner = proof.owner_symbol();
+        let annotation = proof.annotation();
+        let target = proof.target_symbol();
+        let Some(type_) = self.source_callable_type_for_signature(signature) else {
+            return false;
+        };
+        let Some(provenance) = self.source_callable_provenance(type_) else {
+            return false;
+        };
+        proof.has_direct_reference()
+            && provenance.signature == signature
+            && provenance.declaration == declaration
+            && provenance.owner_symbol == owner
+            && provenance.return_provenance == SourceCallableReturnProvenance::Annotated
+            && provenance.contextual_target.is_none()
+            && provenance.contextual_variable.is_none()
+            && self.source_callable_type_for_owner(owner) == Some(type_)
+            && self.source_callable_type_for_declaration(declaration) == Some(type_)
+            && self.get_merged_symbol(owner) == Some(owner)
+            && self.type_payload(type_).is_some_and(|record| {
+                record.flags() == TypeFlags::OBJECT
+                    && record.symbol() == Some(owner)
+                    && record.alias().is_none()
+                    && matches!(record.data(), TypeData::Object(_))
+            })
+            && self.value_symbol_links(owner)
+                == Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+            && self
+                .source_node_kind(declaration)
+                .is_some_and(|kind| provenance.family.matches_syntax_kind(kind))
+            && self.signature(signature).is_some_and(|record| {
+                record.declaration() == Some(declaration)
+                    && record.flags() == provenance.flags
+                    && record.target().is_none()
+                    && record.mapper().is_none()
+            })
+            && self
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                == Some(signature)
+            && self.function_signature_return_annotation(signature) == Some((annotation, false))
+            && self.source_node_kind(annotation) == Some(SyntaxKind::TypeReference)
+            && self.source_node_parent(annotation) == Some(SourceNodeParent::Parent(declaration))
+            && self.source_return_annotation_belongs_to(declaration, annotation)
+            && self.get_merged_symbol(target) == Some(target)
+            && self.symbol(target).is_some_and(|record| {
+                record.flags().contains(SymbolFlags::INTERFACE)
+                    && !record.flags().contains(SymbolFlags::CLASS)
+            })
+    }
+
+    fn source_callable_interface_return_proof_matches_published_type(
+        &self,
+        proof: SourceCallableInterfaceReturnProof,
+    ) -> bool {
+        let Some(return_type) = self
+            .signature(proof.signature())
+            .and_then(Signature::resolved_return_type)
+        else {
+            return false;
+        };
+        !self.signature_has_circular_return_type(proof.signature())
+            && self.source_direct_type_annotation_is_exact(proof.annotation(), return_type)
+            && self
+                .declared_type_links(proof.target_symbol())
+                .and_then(|links| links.declared_type)
+                == Some(return_type)
+            && self.type_payload(return_type).is_some_and(|record| {
+                record.flags() == TypeFlags::OBJECT
+                    && record.symbol() == Some(proof.target_symbol())
+                    && record.object_flags().contains(ObjectFlags::INTERFACE)
+                    && !record.object_flags().contains(ObjectFlags::CLASS)
+                    && matches!(record.data(), TypeData::Interface(_))
+            })
+    }
+
+    /// Reserves one proof slot without replacing an existing proof or repairing caches.
+    pub(super) fn try_reserve_source_callable_interface_return_proof(
+        &mut self,
+        proof: SourceCallableInterfaceReturnProof,
+    ) -> bool {
+        if !self.source_callable_interface_return_proof_has_exact_owner(proof) {
+            return false;
+        }
+        if let Some(existing) = self.source_callable_interface_return_proof(proof.signature()) {
+            return existing == proof
+                && self.source_callable_interface_return_proof_matches_published_type(proof);
+        }
+        if self
+            .signature(proof.signature())
+            .and_then(Signature::resolved_return_type)
+            .is_some()
+            && !self.source_callable_interface_return_proof_matches_published_type(proof)
+        {
+            return false;
+        }
+        self.source_callable_interface_return_proofs
+            .try_reserve(1)
+            .is_ok()
+    }
+
+    /// Publishes only the proof whose annotation and interface return are already checked.
+    pub(super) fn publish_source_callable_interface_return_proof(
+        &mut self,
+        proof: SourceCallableInterfaceReturnProof,
+    ) -> bool {
+        if !self.source_callable_interface_return_proof_has_exact_owner(proof)
+            || !self.source_callable_interface_return_proof_matches_published_type(proof)
+        {
+            return false;
+        }
+        let signature = proof.signature();
+        if let Some(existing) = self.source_callable_interface_return_proof(signature) {
+            return existing == proof;
+        }
+        if self.source_callable_interface_return_proofs.len()
+            == self.source_callable_interface_return_proofs.capacity()
+        {
+            return false;
+        }
+        let relation_dirty = self.relation_signature_is_observable(signature)
+            || self
+                .relation_observable_nodes
+                .contains(&proof.declaration())
+            || self.relation_observable_nodes.contains(&proof.annotation())
+            || self
+                .relation_observable_symbols
+                .contains(&proof.owner_symbol())
+            || self
+                .relation_observable_symbols
+                .contains(&proof.target_symbol())
+            || self
+                .source_callable_type_for_signature(signature)
+                .is_some_and(|type_| self.relation_type_is_observable(type_));
+        self.source_callable_interface_return_proofs
+            .insert(signature, proof);
+        if relation_dirty {
+            self.mark_relation_inputs_dirty();
+        }
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub(super) fn constructor_annotation_binding(

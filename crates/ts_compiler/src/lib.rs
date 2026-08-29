@@ -3,6 +3,9 @@
 mod project_graph;
 mod top_level_await;
 
+#[cfg(test)]
+mod import_meta_module_tests;
+
 pub use project_graph::{
     ProgramGraphConfig, ProgramGraphMissingEvidence, ProgramGraphPackageScopeDecision,
     ProgramGraphPackageScopeEvent, ProgramGraphPackageScopeObservation,
@@ -538,6 +541,9 @@ fn alias_query_error_is_unsupported(error: CanonicalAliasQueryError) -> bool {
 fn source_check_capability_code(error: &SourceCheckError) -> Option<&'static str> {
     match error {
         SourceCheckError::Unsupported(_) => Some("E00.SOURCE_SYNTAX"),
+        SourceCheckError::MetaProperty(ts_checker::semantic::SourceMetaError::Unsupported(_)) => {
+            Some("E00.SOURCE_SYNTAX")
+        }
         SourceCheckError::DeclaredType(error) if declared_type_error_is_unsupported(error) => {
             Some(match error {
                 DeclaredTypeError::Unavailable(_)
@@ -572,6 +578,7 @@ fn source_check_capability_code(error: &SourceCheckError) -> Option<&'static str
         | SourceCheckError::ObjectLiteral(_)
         | SourceCheckError::ArrayType(_)
         | SourceCheckError::DerivedType(_)
+        | SourceCheckError::MetaProperty(_)
         | SourceCheckError::Assertion(_)
         | SourceCheckError::Assignment(_)
         | SourceCheckError::Arrow(_)
@@ -643,6 +650,7 @@ fn source_check_invariant_code(error: &SourceCheckError) -> &'static str {
         SourceCheckError::ObjectLiteral(_) => "INV.SOURCE.OBJECT_LITERAL",
         SourceCheckError::ArrayType(_) => "INV.SOURCE.ARRAY_TYPE",
         SourceCheckError::DerivedType(_) => "INV.SOURCE.DERIVED_TYPE",
+        SourceCheckError::MetaProperty(_) => "INV.SOURCE.META_PROPERTY",
         SourceCheckError::Assertion(_) => "INV.SOURCE.ASSERTION",
         SourceCheckError::Assignment(_) => "INV.SOURCE.ASSIGNMENT",
         SourceCheckError::Arrow(_) => "INV.SOURCE.ARROW",
@@ -5255,6 +5263,7 @@ impl Program {
                 CanonicalJsxRuntime::Preserve
             },
             emit_common_js: self.options.module == ModuleKind::CommonJs,
+            module_kind: self.options.module,
             import_call_mode: match self
                 .options
                 .module
@@ -5319,7 +5328,7 @@ impl Program {
 
         // Program.GetGlobalDiagnostics skips checker diagnostics without source files.
         if !self.source_files.is_empty() {
-            for diagnostic in context.global_types().diagnostics() {
+            for diagnostic in context.global_type_diagnostics() {
                 diagnostics.push(self.canonical_program_diagnostic(
                     diagnostic.node,
                     None,
@@ -6954,7 +6963,8 @@ impl Program {
                     &self.options,
                 ),
             )
-            .with_always_strict(self.options.always_strict);
+            .with_always_strict(self.options.always_strict)
+            .with_implied_node_format(implied_node_format);
             bind_source_file_in_file_with_facts(&parse.arena, parse.source_file, file_id, facts)
         } else {
             bind_source_file_in_file(&parse.arena, parse.source_file, file_id)
@@ -7251,14 +7261,6 @@ fn canonical_source_file_facts(
     };
 
     let is_declaration_file = ts_path::is_declaration_file(&source.file_name);
-    if source_contains_import_meta(&source.parse) {
-        return Err(
-            CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported {
-                file_name: source.file_name.clone(),
-            },
-        );
-    }
-
     let module_state = source_file_module_state(
         &source.file_name,
         &source.parse,
@@ -7274,7 +7276,8 @@ fn canonical_source_file_facts(
         source.is_default_library,
         module_state,
     )
-    .with_always_strict(options.always_strict))
+    .with_always_strict(options.always_strict)
+    .with_implied_node_format(source.implied_node_format))
 }
 
 fn source_file_module_state(
@@ -7306,12 +7309,14 @@ fn source_file_module_state(
             NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
         )
     });
-    let is_external_module = source_file_is_external_module(parse)
+    let has_syntactic_module_indicator = source_file_is_external_module(parse);
+    let is_external_module = has_syntactic_module_indicator
         || (!is_declaration_file
             && (options.module_detection == ModuleDetectionKind::Force
                 || (options.module_detection == ModuleDetectionKind::Auto
                     && (fixed_module_file || node_esm_file || jsx_module))));
     let is_common_js_module = language == CanonicalSourceLanguage::JavaScript
+        && !has_syntactic_module_indicator
         && source_file_has_commonjs_indicator(parse);
     match (is_external_module, is_common_js_module) {
         (true, true) => CanonicalModuleState::ExternalAndCommonJs,
@@ -11110,13 +11115,7 @@ fn source_contains_jsx(parse: &ParseResult) -> bool {
 }
 
 fn source_contains_import_meta(parse: &ParseResult) -> bool {
-    parse.arena.iter().any(|(_, node)| {
-        matches!(
-            &node.data,
-            NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword
-                && matches!(parse.arena.get(meta.name).map(|node| &node.data), Some(NodeData::Identifier(name)) if name.text == "meta")
-        )
-    })
+    ts_ast::source_file_contains_import_meta(&parse.arena, parse.source_file)
 }
 
 fn amd_generated_dependency_bases(source: &SourceFile) -> Vec<String> {
@@ -15863,26 +15862,54 @@ mod tests {
     }
 
     #[test]
-    fn canonical_program_rejects_import_meta_before_binding() {
+    fn canonical_program_checks_import_meta_after_binding() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file("/project/main.ts", "const url = import.meta.url;")
+        fs.write_file("/project/main.ts", "const value = import.meta;")
             .unwrap();
 
-        let error = Program::try_new_with_canonical_checker(
+        let (program, checked) = Program::try_new_with_canonical_checker_and_queries(
             &fs,
             "/project",
             &["main.ts".to_owned()],
             CompilerOptions {
                 lib: Some(vec!["es5".to_owned()]),
+                target: ScriptTarget::Es2022,
+                module: ModuleKind::EsNext,
+                module_specified: true,
+                no_emit: true,
                 ..CompilerOptions::default()
             },
+            |program, queries| {
+                let source = program.source_file("/project/main.ts").unwrap();
+                let (_, bound) = queries.context.file(source.id).unwrap();
+                assert!(bound.declarations_complete());
+                assert!(bound.source_facts().unwrap().is_external_module());
+                assert_eq!(
+                    bound.source_facts().unwrap().implied_node_format(),
+                    Some(source.implied_node_format)
+                );
+                assert!(bound.symbol(bound.source_file()).is_some());
+                let meta = source
+                    .parse
+                    .arena
+                    .iter()
+                    .find_map(|(id, node)| (node.kind == SyntaxKind::MetaProperty).then_some(id))
+                    .unwrap();
+                let meta = source.node_ref(meta).unwrap();
+                let type_ = queries.get_type_at_location(meta).unwrap();
+                assert_eq!(queries.type_to_string(type_).unwrap(), "ImportMeta");
+                assert!(queries.get_symbol_at_location(meta).unwrap().is_some());
+                assert!(queries.cold_diagnostic_snapshot().is_empty());
+                assert!(queries.replay_sources().unwrap().is_empty());
+            },
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            CanonicalProgramCheckError::ImportMetaModuleIndicatorUnsupported { file_name }
-                if file_name == "/project/main.ts"
-        ));
+        .unwrap();
+        assert_eq!(checked, Some(()));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
     }
 
     #[test]
@@ -18992,81 +19019,82 @@ mod tests {
 
     #[test]
     fn follows_triple_slash_path_type_and_lib_references() {
-        let fs = MemoryFileSystem::new(true);
-        fs.write_file(
-            "/project/main.ts",
-            concat!(
-                "/// <reference path='./globals.d.ts' />\n",
-                "/// <reference path='./extensionless' />\n",
-                "/// <reference types=\"pkg\" />\n",
-                "/// <reference lib='es2015.promise' />\n",
-                "GLOBAL; NESTED; EXTENSIONLESS; PACKAGE_GLOBAL; Promise;\n",
-            ),
-        )
-        .unwrap();
-        fs.write_file(
-            "/project/globals.d.ts",
-            "/// <reference path='./nested.d.ts' />\ndeclare const GLOBAL: string;",
-        )
-        .unwrap();
-        fs.write_file("/project/nested.d.ts", "declare const NESTED: number;")
-            .unwrap();
-        fs.write_file(
-            "/project/extensionless.ts",
-            "declare const EXTENSIONLESS: symbol;",
-        )
-        .unwrap();
-        fs.write_file(
-            "/project/node_modules/@types/pkg/index.d.ts",
-            "declare const PACKAGE_GLOBAL: boolean;",
-        )
-        .unwrap();
-        let program = Program::new_with_options(
-            &fs,
-            "/project",
-            &["main.ts".to_owned()],
-            CompilerOptions {
-                lib: Some(Vec::new()),
-                ..CompilerOptions::default()
-            },
-        );
-        assert!(
-            program.diagnostics().is_empty(),
-            "{:?}",
-            program.diagnostics()
-        );
-        for file in [
-            "/project/globals.d.ts",
-            "/project/nested.d.ts",
-            "/project/extensionless.ts",
-            "/project/node_modules/@types/pkg/index.d.ts",
-            "/__typescript/lib/lib.es2015.promise.d.ts",
+        for (target, default_library) in [
+            (None, "/__typescript/lib/lib.es2025.full.d.ts"),
+            (Some(ScriptTarget::Es5), "/__typescript/lib/lib.d.ts"),
         ] {
-            assert!(program.source_file(file).is_some(), "missing {file}");
-        }
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file(
+                "/project/main.ts",
+                concat!(
+                    "/// <reference path='./globals.d.ts' />\n",
+                    "/// <reference path='./extensionless' />\n",
+                    "/// <reference types=\"pkg\" />\n",
+                    "/// <reference lib='es2015.promise' />\n",
+                    "GLOBAL; NESTED; EXTENSIONLESS; PACKAGE_GLOBAL; Promise;\n",
+                ),
+            )
+            .unwrap();
+            fs.write_file(
+                "/project/globals.d.ts",
+                "/// <reference path='./nested.d.ts' />\ndeclare const GLOBAL: string;",
+            )
+            .unwrap();
+            fs.write_file("/project/nested.d.ts", "declare const NESTED: number;")
+                .unwrap();
+            fs.write_file(
+                "/project/extensionless.ts",
+                "declare const EXTENSIONLESS: symbol;",
+            )
+            .unwrap();
+            fs.write_file(
+                "/project/node_modules/@types/pkg/index.d.ts",
+                "declare const PACKAGE_GLOBAL: boolean;",
+            )
+            .unwrap();
+            let mut options = CompilerOptions::default();
+            if let Some(target) = target {
+                options.target = target;
+            }
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(Vec::new()),
+                    ..options.clone()
+                },
+            );
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+            for file in [
+                "/project/globals.d.ts",
+                "/project/nested.d.ts",
+                "/project/extensionless.ts",
+                "/project/node_modules/@types/pkg/index.d.ts",
+                "/__typescript/lib/lib.es2015.promise.d.ts",
+            ] {
+                assert!(program.source_file(file).is_some(), "missing {file}");
+            }
 
-        fs.write_file(
-            "/project/no-default.ts",
-            "/// <reference no-default-lib='true' />\nArray;",
-        )
-        .unwrap();
-        let no_default = Program::new_with_options(
-            &fs,
-            "/project",
-            &["no-default.ts".to_owned()],
-            CompilerOptions::default(),
-        );
-        assert!(!no_default.options().no_lib);
-        assert!(
-            no_default
-                .source_file("/__typescript/lib/lib.d.ts")
-                .is_some()
-        );
-        assert!(
-            no_default.diagnostics().is_empty(),
-            "{:?}",
-            no_default.diagnostics()
-        );
+            fs.write_file(
+                "/project/no-default.ts",
+                "/// <reference no-default-lib='true' />\nArray;",
+            )
+            .unwrap();
+            let no_default =
+                Program::new_with_options(&fs, "/project", &["no-default.ts".to_owned()], options);
+            assert!(!no_default.options().no_lib);
+            assert!(no_default.source_file(default_library).is_some());
+            assert!(
+                no_default.diagnostics().is_empty(),
+                "{:?}",
+                no_default.diagnostics()
+            );
+        }
     }
 
     #[test]
@@ -20667,14 +20695,30 @@ export function create() { return new M.Value(); }"#,
             "interface Point { x: number } const point: Point = { x: 1 };",
         )
         .unwrap();
-        let program = Program::new(&fs, "/project", &["main.ts".to_owned()]);
-        let emitted = program.emit();
-        assert!(emitted.diagnostics.is_empty());
-        assert_eq!(emitted.files[0].file_name, "/project/main.js");
-        assert_eq!(
-            emitted.files[0].text,
-            "\"use strict\";\nvar point = { x: 1 };\n"
-        );
+        for (target, expected) in [
+            (None, "\"use strict\";\nconst point = { x: 1 };\n"),
+            (
+                Some(ScriptTarget::Es5),
+                "\"use strict\";\nvar point = { x: 1 };\n",
+            ),
+        ] {
+            let program = match target {
+                None => Program::new(&fs, "/project", &["main.ts".to_owned()]),
+                Some(target) => Program::new_with_options(
+                    &fs,
+                    "/project",
+                    &["main.ts".to_owned()],
+                    CompilerOptions {
+                        target,
+                        ..CompilerOptions::default()
+                    },
+                ),
+            };
+            let emitted = program.emit();
+            assert!(emitted.diagnostics.is_empty());
+            assert_eq!(emitted.files[0].file_name, "/project/main.js");
+            assert_eq!(emitted.files[0].text, expected);
+        }
     }
 
     #[test]
@@ -20746,28 +20790,36 @@ export function create() { return new M.Value(); }"#,
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/view.tsx", "const view = <Box label=\"ok\" />;")
             .unwrap();
-        let program = Program::new_with_options(
-            &fs,
-            "/project",
-            &["view.tsx".to_owned()],
-            CompilerOptions {
+        for (target, expected) in [
+            (
+                None,
+                "\"use strict\";\nconst view = <Box label=\"ok\" />;\n",
+            ),
+            (
+                Some(ScriptTarget::Es5),
+                "\"use strict\";\nvar view = <Box label=\"ok\" />;\n",
+            ),
+        ] {
+            let mut options = CompilerOptions {
                 no_lib: true,
                 ..CompilerOptions::default()
-            },
-        );
-        assert!(
-            program.diagnostics().is_empty(),
-            "{:?}",
-            program.diagnostics()
-        );
-        let emitted = program.emit();
-        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert_eq!(emitted.files.len(), 1);
-        assert_eq!(emitted.files[0].file_name, "/project/view.js");
-        assert_eq!(
-            emitted.files[0].text,
-            "\"use strict\";\nvar view = <Box label=\"ok\" />;\n"
-        );
+            };
+            if let Some(target) = target {
+                options.target = target;
+            }
+            let program =
+                Program::new_with_options(&fs, "/project", &["view.tsx".to_owned()], options);
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+            let emitted = program.emit();
+            assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+            assert_eq!(emitted.files.len(), 1);
+            assert_eq!(emitted.files[0].file_name, "/project/view.js");
+            assert_eq!(emitted.files[0].text, expected);
+        }
     }
 
     #[test]
@@ -24867,65 +24919,71 @@ export function create() { return new M.Value(); }"#,
             .unwrap();
         fs.write_file("/project/global.ts", "const globalValue = 2;")
             .unwrap();
-        let program = Program::new_with_options(
-            &fs,
-            "/project",
-            &["main.ts".to_owned()],
-            CompilerOptions {
-                module: ModuleKind::EsNext,
-                out_file: Some("/project/bundle.js".into()),
-                no_lib: true,
-                ..CompilerOptions::default()
-            },
-        );
-        assert!(program.emit().files.is_empty());
+        for (target, expected) in [
+            (None, "\"use strict\";\nconst globalValue = 2;\n"),
+            (
+                Some(ScriptTarget::Es5),
+                "\"use strict\";\nvar globalValue = 2;\n",
+            ),
+        ] {
+            let mut options = CompilerOptions::default();
+            if let Some(target) = target {
+                options.target = target;
+            }
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    module: ModuleKind::EsNext,
+                    out_file: Some("/project/bundle.js".into()),
+                    no_lib: true,
+                    ..options.clone()
+                },
+            );
+            assert!(program.emit().files.is_empty());
 
-        let unspecified_module = Program::new_with_options(
-            &fs,
-            "/project",
-            &["main.ts".to_owned()],
-            CompilerOptions {
-                out_file: Some("/project/bundle.js".into()),
-                no_lib: true,
-                ..CompilerOptions::default()
-            },
-        );
-        assert!(unspecified_module.emit().files.is_empty());
+            let unspecified_module = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    out_file: Some("/project/bundle.js".into()),
+                    no_lib: true,
+                    ..options.clone()
+                },
+            );
+            assert!(unspecified_module.emit().files.is_empty());
 
-        let mixed_unspecified_module = Program::new_with_options(
-            &fs,
-            "/project",
-            &["main.ts".to_owned(), "global.ts".to_owned()],
-            CompilerOptions {
-                out_file: Some("/project/bundle.js".into()),
-                no_lib: true,
-                ..CompilerOptions::default()
-            },
-        );
-        let emitted = mixed_unspecified_module.emit();
-        assert_eq!(emitted.files.len(), 1);
-        assert_eq!(
-            emitted.files[0].text,
-            "\"use strict\";\nvar globalValue = 2;\n"
-        );
+            let mixed_unspecified_module = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned(), "global.ts".to_owned()],
+                CompilerOptions {
+                    out_file: Some("/project/bundle.js".into()),
+                    no_lib: true,
+                    ..options.clone()
+                },
+            );
+            let emitted = mixed_unspecified_module.emit();
+            assert_eq!(emitted.files.len(), 1);
+            assert_eq!(emitted.files[0].text, expected);
 
-        let commonjs_scripts = Program::new_with_options(
-            &fs,
-            "/project",
-            &["global.ts".to_owned()],
-            CompilerOptions {
-                module: ModuleKind::CommonJs,
-                out_file: Some("/project/bundle.js".into()),
-                no_lib: true,
-                ..CompilerOptions::default()
-            },
-        );
-        let emitted = commonjs_scripts.emit();
-        assert_eq!(emitted.files.len(), 1);
-        assert_eq!(
-            emitted.files[0].text,
-            "\"use strict\";\nvar globalValue = 2;\n"
-        );
+            let commonjs_scripts = Program::new_with_options(
+                &fs,
+                "/project",
+                &["global.ts".to_owned()],
+                CompilerOptions {
+                    module: ModuleKind::CommonJs,
+                    out_file: Some("/project/bundle.js".into()),
+                    no_lib: true,
+                    ..options
+                },
+            );
+            let emitted = commonjs_scripts.emit();
+            assert_eq!(emitted.files.len(), 1);
+            assert_eq!(emitted.files[0].text, expected);
+        }
     }
 
     #[test]

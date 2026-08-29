@@ -1101,6 +1101,62 @@ mod tests {
             options.compiler_options.module_resolution,
             ts_options::ModuleResolutionKind::Node10
         );
+        assert_eq!(
+            options.compiler_options.target,
+            ts_options::ScriptTarget::Es2025
+        );
+        assert_eq!(
+            options
+                .compiler_options
+                .module
+                .effective_for_target(options.compiler_options.target),
+            ts_options::ModuleKind::Es2022
+        );
+        assert!(!options.compiler_options.module_specified);
+        assert!(options.specified_options.is_empty());
+    }
+
+    #[test]
+    fn target_default_preserves_explicit_legacy_command_line_options() {
+        for (resolution, expected) in [
+            ("classic", ts_options::ModuleResolutionKind::Classic),
+            ("node10", ts_options::ModuleResolutionKind::Node10),
+        ] {
+            let Command::Compile(options) = parse(&[
+                "--target",
+                "es5",
+                "--module",
+                "commonjs",
+                "--moduleResolution",
+                resolution,
+                "--resolveJsonModule",
+                "false",
+                "main.ts",
+            ])
+            .unwrap() else {
+                panic!("expected compile command");
+            };
+            assert_eq!(
+                options.compiler_options.target,
+                ts_options::ScriptTarget::Es5
+            );
+            assert_eq!(
+                options.compiler_options.module,
+                ts_options::ModuleKind::CommonJs
+            );
+            assert!(options.compiler_options.module_specified);
+            assert_eq!(options.compiler_options.module_resolution, expected);
+            assert!(!options.compiler_options.resolve_json_module);
+            assert!(options.compiler_options.resolve_json_module_specified);
+            assert_eq!(
+                options
+                    .specified_options
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["module", "moduleresolution", "resolvejsonmodule", "target"]
+            );
+        }
     }
 
     #[test]

@@ -1731,7 +1731,7 @@ pub(super) fn check_direct_source_property_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<CheckedSourceProperty, SourcePropertyQueryError> {
-    if !plan.is_read() {
+    if matches!(plan.position, SourcePropertyPosition::WriteTarget(_)) {
         return check_direct_source_property_with_session(
             store,
             Some(global_types),
@@ -1767,7 +1767,7 @@ pub(super) fn check_direct_source_property_with_source(
                         if !interface.declared_members_resolved
                             && !record.object_flags().contains(ObjectFlags::CLASS))
                 });
-            if !cold_interface {
+            if !cold_interface && !is_cold_direct_nongeneric_interface(store, receiver) {
                 return resolve_direct_source_own_property(
                     store,
                     Some(global_types),
@@ -1905,6 +1905,62 @@ fn cold_inherited_interface_owner(
         }
     }
     Ok(Some(owner))
+}
+
+pub(super) fn is_cold_direct_nongeneric_interface(
+    store: &CanonicalTypeMapperStore,
+    receiver: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(receiver) else {
+        return false;
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return false;
+    };
+    if record
+        .object_flags()
+        .intersects(ObjectFlags::CLASS | ObjectFlags::MEMBERS_RESOLVED)
+        || interface.declared_members_resolved
+        || interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.is_empty())
+        || interface.outer_type_parameter_count != 0
+        || interface.resolved_base_types.is_some()
+        || interface.resolved_base_constructor_type.is_some()
+        || store
+            .direct_interface_heritage_provenance(receiver)
+            .is_some()
+    {
+        return false;
+    }
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    let Some(symbol) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(declarations) = symbol.declarations() else {
+        return false;
+    };
+    symbol.flags().contains(SymbolFlags::INTERFACE)
+        && !symbol.flags().contains(SymbolFlags::CLASS)
+        && store.source_computed_member_count(owner) == Some(0)
+        && declarations.iter().any(|declaration| {
+            store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+        })
+        && declarations
+            .iter()
+            .all(|declaration| match store.source_node_kind(*declaration) {
+                Some(SyntaxKind::InterfaceDeclaration) => store
+                    .source_child_with_kind(*declaration, SyntaxKind::HeritageClause)
+                    .is_none(),
+                Some(SyntaxKind::VariableDeclaration) => symbol
+                    .flags()
+                    .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE),
+                _ => false,
+            })
 }
 
 fn resolve_direct_source_own_property(
@@ -5612,10 +5668,11 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, DeclaredTypeError,
-        DeclaredTypeUnavailable, IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks,
+        IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks,
         signatures::{ElementFlags, SignatureFlags},
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         tuple_types::CanonicalTupleTypeRequest,
+        type_nodes::TypeNodeUnavailable,
         types::ObjectFlags,
     };
 
@@ -5922,9 +5979,9 @@ mod tests {
             assert_eq!(
                 context.recheck_source_file(consumer_file),
                 Err(SourceCheckError::DeclaredType(
-                    DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(
-                        selected
-                    ))
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidCachedUnionType(receiver)
+                    )
                 ))
             );
             assert_eq!(state(&context), before);

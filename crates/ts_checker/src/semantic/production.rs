@@ -160,6 +160,7 @@ pub struct CanonicalCheckerOptions {
     pub isolated_modules: bool,
     pub jsx_runtime: CanonicalJsxRuntime,
     pub emit_common_js: bool,
+    pub module_kind: ts_options::ModuleKind,
     pub import_call_mode: CanonicalImportCallMode,
     pub no_emit: bool,
     pub uses_wildcard_types: bool,
@@ -187,6 +188,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             isolated_modules: false,
             jsx_runtime: CanonicalJsxRuntime::Preserve,
             emit_common_js: false,
+            module_kind: ts_options::ModuleKind::None,
             import_call_mode: CanonicalImportCallMode::Dynamic,
             no_emit: false,
             uses_wildcard_types: false,
@@ -198,6 +200,12 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
 }
 
 impl CanonicalCheckerOptions {
+    /// Uses the shared module rule with the checker's effective target.
+    pub(super) fn effective_module_kind(self) -> ts_options::ModuleKind {
+        self.module_kind
+            .effective_for_target(self.name_resolution.emit_target)
+    }
+
     pub(super) const fn should_preserve_const_enums(self) -> bool {
         self.preserve_const_enums
             || self.isolated_modules
@@ -1031,6 +1039,82 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn global_types(&self) -> &CanonicalGlobalTypes {
         &self.global_types
+    }
+
+    /// Returns eager and lazy global diagnostics independently of source replay.
+    pub fn global_type_diagnostics(
+        &self,
+    ) -> impl Iterator<Item = &super::CanonicalGlobalTypeDiagnostic> {
+        self.global_types.diagnostics().iter().chain(
+            self.store
+                .import_meta_global()
+                .into_iter()
+                .flat_map(super::global_types::ResolvedGlobalType::diagnostics),
+        )
+    }
+
+    pub(super) fn import_meta_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, super::SourceMetaError> {
+        let (arena, _) = self
+            .files
+            .snapshot(node.file)
+            .ok_or(super::SourceMetaError::InvalidNode(node))?;
+        if !super::source_meta::is_import_meta_artifact_node(arena, node) {
+            return Ok(None);
+        }
+        let Self {
+            store,
+            files,
+            options,
+            module_resolutions,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
+        super::source_meta::import_meta_type_at_location(store, &host, node, *options)
+    }
+
+    pub(super) fn import_meta_artifact_symbol(
+        &mut self,
+        node: NodeRef,
+        query: super::source_meta::ImportMetaSymbolQuery,
+    ) -> Result<super::source_meta::ImportMetaSymbolResult, super::SourceMetaError> {
+        let (arena, _) = self
+            .files
+            .snapshot(node.file)
+            .ok_or(super::SourceMetaError::InvalidNode(node))?;
+        if !super::source_meta::is_import_meta_artifact_node(arena, node) {
+            return Ok(super::source_meta::ImportMetaSymbolResult::Unrelated);
+        }
+        let is_expression = matches!(
+            arena.get(node.node).map(|record| &record.data),
+            Some(NodeData::MetaProperty(_))
+        );
+        if is_expression != (query == super::source_meta::ImportMetaSymbolQuery::Expression) {
+            return Ok(super::source_meta::ImportMetaSymbolResult::Unrelated);
+        }
+        let Self {
+            store,
+            files,
+            options,
+            module_resolutions,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(module_resolutions);
+        super::source_meta::import_meta_symbol_at_location(store, &host, node, *options)
     }
 
     pub(super) fn artifact_union_type(

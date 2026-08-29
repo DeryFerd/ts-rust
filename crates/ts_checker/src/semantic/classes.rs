@@ -55,8 +55,9 @@
 //! authenticated private tagged-template console call.
 //! One authenticated class/interface merge can retain a string auto-accessor
 //! and its shared binder-owned property symbol in either declaration order.
-//! An instance field may also reference its own constructor parameter and
+//! A transformed instance field may reference its own constructor parameter and
 //! retain the upstream error-recovery `any` type for the source diagnostic.
+//! Standard fields check identifier initializers in their ordinary lexical scope.
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
 //! Ambient script classes also admit empty namespaces from other source files.
@@ -84,12 +85,13 @@ pub(super) use query::{
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
-    CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, EscapedName,
-    InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    CanonicalNameResolver, CanonicalNameResolverHost, CanonicalResolutionLocation, CheckFlags,
+    EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol},
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::Number;
+use ts_options::ScriptTarget;
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
@@ -1110,7 +1112,11 @@ pub(super) fn plan_source_class_members(
                 if let Some(initializer) = property.initializer_node
                     && (matches!(
                         store.source_node_kind(initializer),
-                        Some(SyntaxKind::PropertyAccessExpression | SyntaxKind::ArrowFunction)
+                        Some(
+                            SyntaxKind::PropertyAccessExpression
+                                | SyntaxKind::ArrowFunction
+                                | SyntaxKind::Identifier
+                        )
                     ) || source_enum_member_const_assertion(store, host, initializer)?)
                 {
                     plan.bodies.push(ClassBodyPlan {
@@ -3591,6 +3597,57 @@ pub(super) fn pending_source_class_property_type(
         declaration: body.declaration,
         body: body.body,
     }))
+}
+
+/// Reuses a checked field only after its class's source bodies have completed.
+fn completed_source_class_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    initializer: NodeRef,
+) -> Result<Option<TypeId>, ClassError> {
+    let Some(provenance) = store.source_class_provenance_for_symbol(owner) else {
+        return Ok(None);
+    };
+    validate_source_class_header(store, host, provenance)?;
+    let plan = &provenance.prepared.plan;
+    let Some(index) = plan
+        .initialized_properties
+        .iter()
+        .position(|property| property.symbol == symbol)
+    else {
+        return Ok(None);
+    };
+    let property = &plan.initialized_properties[index];
+    if property.declaration != declaration || property.initializer_node != Some(initializer) {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            declaration,
+        )));
+    }
+    let body = plan
+        .bodies
+        .iter()
+        .position(|body| {
+            body.declaration == declaration
+                && body.body == initializer
+                && body.kind
+                    == (ClassBodyKind::PropertyInitializer {
+                        symbol,
+                        side: property.side,
+                    })
+        })
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPlan(declaration)))?;
+    if !provenance.complete {
+        return Ok(None);
+    }
+    if !provenance.completed_bodies[body] {
+        return Err(invariant(ClassInvariant::InvalidPlan(declaration)));
+    }
+    provenance.property_types[index]
+        .map(Some)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertyValueCache(symbol)))
 }
 
 pub(super) fn complete_source_class_body(
@@ -10257,6 +10314,15 @@ fn plan_property(
     )
 }
 
+fn emit_standard_class_fields(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+) -> Result<bool, ClassError> {
+    let options = host.name_resolver_host(store)?.compiler_options();
+    Ok(options.use_define_for_class_fields != Some(false)
+        && options.emit_target >= ScriptTarget::Es2022)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_property_with_body_mode(
     store: &CanonicalTypeMapperStore,
@@ -10453,7 +10519,14 @@ fn plan_property_with_body_mode(
                     {
                         return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
                     }
-                    (None, None, Some(identifier.text.clone()), None)
+                    if emit_standard_class_fields(store, host)? {
+                        if !source_body {
+                            return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+                        }
+                        (None, None, None, None)
+                    } else {
+                        (None, None, Some(identifier.text.clone()), None)
+                    }
                 }
                 NodeData::StringLiteral(literal) => {
                     if initializer_record.kind != SyntaxKind::StringLiteral
@@ -29396,6 +29469,292 @@ mod query_tests {
         (declaration, symbol)
     }
 
+    fn standard_field_query_nodes(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (
+        SemanticSymbolId,
+        SemanticSymbolId,
+        NodeRef,
+        NodeRef,
+        SemanticSymbolId,
+    ) {
+        let (_, owner) = class(context, parsed, file, "Model");
+        let field = context
+            .store()
+            .symbol_table(context.store().symbol(owner).unwrap().members().unwrap())
+            .unwrap()
+            .get_source("property")
+            .unwrap();
+        let declaration = context
+            .store()
+            .symbol(field)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::PropertyDeclaration(property) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let initializer = NodeRef::new(parsed.arena.id(), file, property.initializer.unwrap());
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::ParameterDeclaration(_)).then(|| {
+                    context
+                        .file(file)
+                        .unwrap()
+                        .1
+                        .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                        .unwrap()
+                })
+            })
+            .unwrap();
+        (owner, field, declaration, initializer, parameter)
+    }
+
+    fn standard_field_query_counts(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> ([usize; 4], [usize; 26]) {
+        (
+            [
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+            ],
+            context.store().checker_link_allocated_lengths(),
+        )
+    }
+
+    const STANDARD_FIELD_QUERY_SOURCE: &str = concat!(
+        "const value = 1;\n",
+        "class Model {\n",
+        "  property = value;\n",
+        "  constructor(value: string) {}\n",
+        "}\n",
+    );
+
+    #[test]
+    fn standard_identifier_field_queries_require_completed_source_bodies() {
+        let parsed = parse_source_file(STANDARD_FIELD_QUERY_SOURCE);
+        let file = FileId::new(14_409);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (owner, field, declaration, initializer, parameter) =
+            standard_field_query_nodes(&context, &parsed, file);
+        let source = context.source_file(file).unwrap();
+        let source_links = context.store().source_file_links(source).cloned();
+        let cold = standard_field_query_counts(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_class_query_member_type(field),
+                Err(ClassError::Unsupported(
+                    ClassUnsupported::PropertyInitializer(declaration)
+                ))
+            );
+            assert_eq!(standard_field_query_counts(&context), cold);
+            assert_eq!(
+                context.store().source_file_links(source),
+                source_links.as_ref()
+            );
+            assert!(context.store().declared_type_links(owner).is_none());
+            for symbol in [owner, field, parameter] {
+                assert!(context.store().value_symbol_links(symbol).is_none());
+            }
+            assert!(context.store().type_node_links(initializer).is_none());
+            assert!(context.store().symbol_node_links(initializer).is_none());
+            assert!(
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .is_none()
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+        context.check_source_file(file).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let instance = context
+            .store()
+            .declared_type_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .source_class_provenance(instance)
+                .unwrap()
+                .complete
+        );
+        let warm = standard_field_query_counts(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_class_query_member_type(field), Ok(number));
+            assert_eq!(standard_field_query_counts(&context), warm);
+        }
+        context
+            .store_mut_for_test()
+            .source_class_provenance_mut(instance)
+            .unwrap()
+            .complete = false;
+        {
+            let host = context.declared_type_host().unwrap();
+            assert_eq!(
+                completed_source_class_property_type(
+                    context.store(),
+                    &host,
+                    owner,
+                    field,
+                    declaration,
+                    initializer,
+                ),
+                Ok(None)
+            );
+        }
+        assert_eq!(standard_field_query_counts(&context), warm);
+        assert_eq!(
+            context.get_class_query_member_type(field),
+            Err(ClassError::Invariant(ClassInvariant::InvalidValueCache(
+                owner
+            )))
+        );
+        assert!(
+            !context
+                .store()
+                .source_class_provenance(instance)
+                .unwrap()
+                .complete
+        );
+        assert_eq!(standard_field_query_counts(&context), warm);
+        context
+            .store_mut_for_test()
+            .source_class_provenance_mut(instance)
+            .unwrap()
+            .complete = true;
+        assert_eq!(context.get_class_query_member_type(field), Ok(number));
+        assert_eq!(standard_field_query_counts(&context), warm);
+    }
+
+    #[test]
+    fn checked_standard_fields_reject_changed_initializer_and_property_caches() {
+        let parsed = parse_source_file(STANDARD_FIELD_QUERY_SOURCE);
+        let file = FileId::new(14_410);
+        for poison in ["initializer", "property", "symbol"] {
+            let mut context = context(&parsed, file, CanonicalModuleState::Script);
+            let (_, field, _, initializer, parameter) =
+                standard_field_query_nodes(&context, &parsed, file);
+            context.check_source_file(file).unwrap();
+            let type_links = context
+                .store()
+                .type_node_links(initializer)
+                .unwrap()
+                .clone();
+            let value_links = context.store().value_symbol_links(field).unwrap().clone();
+            let symbol_links = context
+                .store()
+                .symbol_node_links(initializer)
+                .unwrap()
+                .clone();
+            let expected = context.get_class_query_member_type(field).unwrap();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+            match poison {
+                "initializer" => assert!(context.store_mut_for_test().set_type_node_links(
+                    initializer,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                "property" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    field,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                "symbol" => assert!(context.store_mut_for_test().set_symbol_node_links(
+                    initializer,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(parameter)
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    standard_field_query_counts(context),
+                    context.store().type_node_links(initializer).cloned(),
+                    context.store().value_symbol_links(field).cloned(),
+                    context.store().symbol_node_links(initializer).cloned(),
+                )
+            };
+            let changed = snapshot(&context);
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.get_class_query_member_type(field),
+                    Err(ClassError::Invariant(_))
+                ));
+                assert_eq!(snapshot(&context), changed);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(initializer, type_links)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(field, value_links)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(initializer, symbol_links)
+            );
+            assert_eq!(context.get_class_query_member_type(field), Ok(expected));
+            assert_eq!(standard_field_query_counts(&context), changed.0);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn standard_field_queries_keep_cold_declared_values() {
+        let parsed = parse_source_file(
+            "declare const value: number; class Model { static property = value; }",
+        );
+        let file = FileId::new(14_411);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (_, owner) = class(&context, &parsed, file, "Model");
+        let field = context
+            .store()
+            .symbol_table(context.store().symbol(owner).unwrap().exports().unwrap())
+            .unwrap()
+            .get_source("property")
+            .unwrap();
+        let source = context.source_file(file).unwrap();
+        let source_links = context.store().source_file_links(source).cloned();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(context.get_class_query_member_type(field), Ok(number));
+        let warm = standard_field_query_counts(&context);
+        for _ in 0..2 {
+            assert_eq!(context.get_class_query_member_type(field), Ok(number));
+            assert_eq!(standard_field_query_counts(&context), warm);
+            assert_eq!(
+                context.store().source_file_links(source),
+                source_links.as_ref()
+            );
+            assert!(
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .is_none()
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
     #[test]
     fn class_query_shells_keep_exported_and_expression_identities_cold_and_warm() {
         for (source, module, name) in [
@@ -40432,7 +40791,14 @@ mod tests {
             fixture("const x = 1; class Model { value = x; constructor(x: string) {} }");
         let owner = class_symbol(&fixture, "Model");
         let bound = &fixture.files[&fixture.file];
-        let host = host(&fixture.parsed.arena, bound);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions {
+                emit_target: ScriptTarget::Es5,
+                ..CanonicalNameResolverOptions::default()
+            }),
+        )
+        .unwrap();
         let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
         let ClassMemberQueryPlan::Direct(class) = &plan else {
             panic!("a captured constructor parameter belongs to one direct class")

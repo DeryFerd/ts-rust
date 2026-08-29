@@ -4,7 +4,8 @@ use ts_options::{
     ScriptTarget,
 };
 
-/// Keep every typed option. New compiler fields must be added to this report.
+/// Keep every typed option and report the effective module separately.
+/// New compiler fields must be added to this report.
 #[allow(clippy::too_many_lines)]
 pub(super) fn normalized_options(options: &CompilerOptions) -> Value {
     let CompilerOptions {
@@ -242,6 +243,10 @@ pub(super) fn normalized_options(options: &CompilerOptions) -> Value {
         Value::String(module_name(*module).to_owned()),
     );
     result.insert(
+        "effective_module".to_owned(),
+        Value::String(module_name(module.effective_for_target(*target)).to_owned()),
+    );
+    result.insert(
         "module_resolution".to_owned(),
         Value::String(
             match module_resolution {
@@ -330,5 +335,77 @@ pub(super) const fn module_name(module: ModuleKind) -> &'static str {
         ModuleKind::Node20 => "node20",
         ModuleKind::NodeNext => "nodenext",
         ModuleKind::Preserve => "preserve",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind, ScriptTarget};
+
+    use super::normalized_options;
+
+    #[test]
+    fn report_separates_the_unset_module_from_its_effective_default() {
+        let options = CompilerOptions::default();
+        let report = normalized_options(&options);
+        assert_eq!(report["target"], json!("es2025"));
+        assert_eq!(report["module"], json!("none"));
+        assert_eq!(report["module_specified"], json!(false));
+        assert_eq!(report["effective_module"], json!("es2022"));
+        assert_eq!(report["module_resolution"], json!("node10"));
+        assert_eq!(report["resolve_json_module"], json!(false));
+        assert_eq!(report["resolve_json_module_specified"], json!(false));
+        assert_eq!(options.module, ModuleKind::None);
+        assert!(!options.module_specified);
+    }
+
+    #[test]
+    fn report_preserves_explicit_legacy_target_resolution_and_json_false() {
+        for (resolution, name) in [
+            (ModuleResolutionKind::Classic, "classic"),
+            (ModuleResolutionKind::Node10, "node10"),
+        ] {
+            let options = CompilerOptions {
+                target: ScriptTarget::Es5,
+                module_resolution: resolution,
+                resolve_json_module: false,
+                resolve_json_module_specified: true,
+                ..CompilerOptions::default()
+            };
+            let report = normalized_options(&options);
+            assert_eq!(report["target"], json!("es5"));
+            assert_eq!(report["module"], json!("none"));
+            assert_eq!(report["module_specified"], json!(false));
+            assert_eq!(report["effective_module"], json!("commonjs"));
+            assert_eq!(report["module_resolution"], json!(name));
+            assert_eq!(report["resolve_json_module"], json!(false));
+            assert_eq!(report["resolve_json_module_specified"], json!(true));
+            assert_eq!(options.target, ScriptTarget::Es5);
+            assert_eq!(options.module_resolution, resolution);
+        }
+    }
+
+    #[test]
+    fn report_preserves_explicit_module_provenance() {
+        for (module, raw, effective) in [
+            (ModuleKind::None, "none", "es2022"),
+            (ModuleKind::CommonJs, "commonjs", "commonjs"),
+            (ModuleKind::System, "system", "system"),
+            (ModuleKind::NodeNext, "nodenext", "nodenext"),
+        ] {
+            let options = CompilerOptions {
+                module,
+                module_specified: true,
+                ..CompilerOptions::default()
+            };
+            let report = normalized_options(&options);
+            assert_eq!(report["target"], json!("es2025"));
+            assert_eq!(report["module"], json!(raw));
+            assert_eq!(report["module_specified"], json!(true));
+            assert_eq!(report["effective_module"], json!(effective));
+            assert_eq!(options.module, module);
+            assert!(options.module_specified);
+        }
     }
 }

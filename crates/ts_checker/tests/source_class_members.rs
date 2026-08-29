@@ -1,15 +1,16 @@
 use ts_ast::{FileId, NodeData, NodeRef};
 use ts_binder::{
-    CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
+    CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions, CanonicalSourceFileFacts,
+    CanonicalSourceLanguage, CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, ClassMembers, IntrinsicBootstrapOptions,
-    SourceCheckError, TypeData, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    SourceCheckError, TypeData, TypeId, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
     signatures::SignatureFlags,
-    type_records::TypeCacheState,
+    type_records::{LiteralValue, TypeCacheState},
     types::{ObjectFlags, TypeFlags},
 };
+use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
 
 const SOURCE: &str = concat!(
@@ -718,22 +719,213 @@ fn annotated_numeric_class_fields_preserve_annotation_and_literal_caches() {
     );
 }
 
-#[test]
-fn class_field_initializers_cannot_capture_constructor_parameters() {
-    let source = concat!(
-        "const value = 1;\n",
-        "class Model {\n",
-        "  property = value;\n",
-        "  constructor(value: string) {}\n",
-        "}\n",
+const CONSTRUCTOR_FIELD_SOURCE: &str = concat!(
+    "const value = 1;\n",
+    "class Model {\n",
+    "  property = value;\n",
+    "  constructor(value: string) {}\n",
+    "}\n",
+);
+
+struct ConstructorFieldFacts {
+    class: SemanticSymbolId,
+    outer: SemanticSymbolId,
+    property: SemanticSymbolId,
+    parameter: SemanticSymbolId,
+    outer_initializer: NodeRef,
+    initializer: NodeRef,
+}
+
+fn constructor_field_facts(
+    parsed: &ParseResult,
+    file: FileId,
+    context: &CanonicalCheckerContext<'_>,
+) -> ConstructorFieldFacts {
+    let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+    let symbol = |declaration| {
+        let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        context.store().get_merged_symbol(raw).unwrap()
+    };
+    let outer = variable_declaration(parsed, file, "value");
+    let NodeData::VariableDeclaration(variable) = &parsed.arena.get(outer.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let (property, initializer) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| match &record.data {
+            NodeData::PropertyDeclaration(property) => {
+                Some((reference(node), reference(property.initializer.unwrap())))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let parameter = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::ParameterDeclaration(_)).then_some(reference(node))
+        })
+        .unwrap();
+    let facts = ConstructorFieldFacts {
+        class: class_symbol(parsed, file, context, "Model"),
+        outer: symbol(outer),
+        property: symbol(property),
+        parameter: symbol(parameter),
+        outer_initializer: reference(variable.initializer.unwrap()),
+        initializer,
+    };
+    assert_ne!(facts.outer, facts.parameter);
+    assert_ne!(facts.property, facts.parameter);
+    assert_ne!(facts.outer, facts.property);
+    facts
+}
+
+fn field_query_counts(context: &CanonicalCheckerContext<'_>) -> [usize; 5] {
+    [
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.store().mapper_len(),
+        context.store().index_info_len(),
+    ]
+}
+
+fn assert_standard_field_types(
+    context: &mut CanonicalCheckerContext<'_>,
+    facts: &ConstructorFieldFacts,
+) -> [TypeId; 6] {
+    let initializer = context.get_type_at_location(facts.initializer).unwrap();
+    let outer = context
+        .store()
+        .value_symbol_links(facts.outer)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    assert_eq!(initializer, outer);
+    assert_eq!(
+        context
+            .get_type_at_location(facts.outer_initializer)
+            .unwrap(),
+        initializer
     );
-    let parsed = parse_source_file(source);
+    assert_eq!(
+        context.get_symbol_at_location(facts.initializer).unwrap(),
+        Some(facts.outer)
+    );
+    assert!(matches!(
+        context.store().type_payload(initializer).unwrap().data(),
+        TypeData::Literal(literal)
+            if literal.value == LiteralValue::Number(ts_jsnum::from_string("1"))
+    ));
+    assert_eq!(context.type_to_string(initializer).unwrap(), "1");
+    let property = context.get_class_query_member_type(facts.property).unwrap();
+    let parameter = context
+        .store()
+        .value_symbol_links(facts.parameter)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(property, bootstrap.number_type);
+    assert_eq!(parameter, bootstrap.string_type);
+    assert_ne!(initializer, property);
+    assert_ne!(initializer, bootstrap.any_type);
+    assert_eq!(
+        context.store().type_node_links(facts.initializer),
+        Some(&TypeNodeLinks {
+            resolved_type: Some(initializer),
+            ..TypeNodeLinks::default()
+        })
+    );
+    assert_eq!(
+        context.store().value_symbol_links(facts.property),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(property),
+            ..ValueSymbolLinks::default()
+        })
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(facts.property)
+            .unwrap()
+            .check_flags(),
+        CheckFlags::NONE
+    );
+    let instance = context
+        .store()
+        .declared_type_links(facts.class)
+        .unwrap()
+        .declared_type
+        .unwrap();
+    let value = context
+        .store()
+        .value_symbol_links(facts.class)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    [outer, initializer, property, parameter, instance, value]
+}
+
+#[test]
+fn standard_class_field_initializers_resolve_outer_values_and_replay() {
+    let parsed = parse_source_file(CONSTRUCTOR_FIELD_SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let file = FileId::new(100);
-    let mut context = checker_context(&parsed, file);
+    for first in ["source", "type", "symbol"] {
+        let file = FileId::new(100);
+        let mut context = checker_context(&parsed, file);
+        let facts = constructor_field_facts(&parsed, file, &context);
+        assert_eq!(
+            context.options().name_resolution.emit_target,
+            ScriptTarget::Es2025
+        );
+        assert_eq!(
+            context
+                .options()
+                .name_resolution
+                .use_define_for_class_fields,
+            None
+        );
+        assert!(!is_type_checked(&context, file));
+        assert!(context.store().value_symbol_links(facts.property).is_none());
+        match first {
+            "source" => context.check_source_file(file).unwrap(),
+            "type" => {
+                context.get_type_at_location(facts.initializer).unwrap();
+            }
+            "symbol" => assert_eq!(
+                context.get_symbol_at_location(facts.initializer).unwrap(),
+                Some(facts.outer)
+            ),
+            _ => unreachable!(),
+        }
+        assert!(is_type_checked(&context, file));
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let identities = assert_standard_field_types(&mut context, &facts);
+        let warm = field_query_counts(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                assert_standard_field_types(&mut context, &facts),
+                identities
+            );
+            assert_eq!(field_query_counts(&context), warm);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+}
 
-    context.check_source_file(file).unwrap();
-
+fn assert_constructor_field_diagnostic(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    initializer: NodeRef,
+) {
     let [diagnostic] = context.diagnostics().as_slice() else {
         panic!("constructor-parameter capture must report one TS2301 diagnostic")
     };
@@ -742,30 +934,90 @@ fn class_field_initializers_cannot_capture_constructor_parameters() {
         diagnostic.diagnostic.render().unwrap(),
         "Initializer of instance member variable 'property' cannot reference identifier 'value' declared in the constructor."
     );
+    assert_eq!(diagnostic.node, Some(initializer));
+    assert_eq!(diagnostic.range_override, None);
     let range = parsed
         .arena
         .get(diagnostic.node.unwrap().node)
         .unwrap()
         .range;
     assert_eq!(
-        &source[range.start.get() as usize..range.end.get() as usize],
-        "value",
+        &CONSTRUCTOR_FIELD_SOURCE[range.start.get() as usize..range.end.get() as usize],
+        "value"
     );
+}
 
-    let warm = (
-        context.store().type_len(),
-        context.store().signature_len(),
-        context.diagnostics().clone(),
-    );
-    context.recheck_source_file(file).unwrap();
-    assert_eq!(
-        (
-            context.store().type_len(),
-            context.store().signature_len(),
-            context.diagnostics().clone(),
-        ),
-        warm,
-    );
+#[test]
+fn class_field_initializers_cannot_capture_constructor_parameters() {
+    let source = CONSTRUCTOR_FIELD_SOURCE;
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for name_resolution in [
+        CanonicalNameResolverOptions {
+            emit_target: ScriptTarget::Es5,
+            ..CanonicalNameResolverOptions::default()
+        },
+        CanonicalNameResolverOptions {
+            use_define_for_class_fields: Some(false),
+            ..CanonicalNameResolverOptions::default()
+        },
+    ] {
+        let file = FileId::new(100);
+        let mut context = checker_context_with_options(
+            &parsed,
+            file,
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions {
+                name_resolution,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let facts = constructor_field_facts(&parsed, file, &context);
+        context.check_source_file(file).unwrap();
+        assert_constructor_field_diagnostic(&context, &parsed, facts.initializer);
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            context.get_type_at_location(facts.initializer).unwrap(),
+            any
+        );
+        assert_eq!(
+            context.get_class_query_member_type(facts.property).unwrap(),
+            any
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(facts.parameter)
+                .unwrap()
+                .resolved_type,
+            Some(string)
+        );
+        let warm = (field_query_counts(&context), context.diagnostics().clone());
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                context.get_type_at_location(facts.initializer).unwrap(),
+                any
+            );
+            assert_eq!(
+                context.get_class_query_member_type(facts.property).unwrap(),
+                any
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(facts.parameter)
+                    .unwrap()
+                    .resolved_type,
+                Some(string)
+            );
+            assert_eq!(
+                (field_query_counts(&context), context.diagnostics().clone()),
+                warm
+            );
+        }
+    }
 }
 
 #[test]

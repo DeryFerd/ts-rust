@@ -102,6 +102,7 @@ pub(super) struct SourceCallPlan {
 pub(super) enum SourceCallCalleeForm {
     /// An identifier or nested call planned through the ordinary expression path.
     Identifier,
+    MetaProperty,
     RequiredOwnProperty,
     /// One authenticated zero-argument parenthesized async arrow.
     ParenthesizedAsyncArrow,
@@ -3489,6 +3490,17 @@ pub(super) fn plan_direct_source_call_syntax(
                 SourceCallCalleeForm::Identifier,
                 actual_callee,
             ),
+            (SyntaxKind::MetaProperty, NodeData::MetaProperty(meta))
+                if meta.keyword_token == SyntaxKind::ImportKeyword
+                    && matches!(arena.get(meta.name).map(|record| &record.data),
+                        Some(NodeData::Identifier(name)) if name.text != "defer") =>
+            {
+                (
+                    actual_callee,
+                    SourceCallCalleeForm::MetaProperty,
+                    actual_callee,
+                )
+            }
             (SyntaxKind::CallExpression, NodeData::CallExpression(_)) => {
                 plan_direct_source_call_syntax(arena, store, actual_callee)?;
                 (
@@ -4055,6 +4067,9 @@ pub(super) fn finish_direct_source_call_plan(
     arguments: Vec<PlannedExpression>,
 ) -> Result<SourceCallPlan, SourceCheckError> {
     let exact_callee = match (&callee.kind, syntax.callee_form) {
+        (PlannedExpressionKind::ImportMeta(_), SourceCallCalleeForm::MetaProperty) => {
+            syntax.callee_diagnostic_node == syntax.callee
+        }
         (PlannedExpressionKind::Identifier(_), SourceCallCalleeForm::Identifier) => true,
         (PlannedExpressionKind::Call(call), SourceCallCalleeForm::Identifier) => {
             call.node == callee.node && syntax.callee_diagnostic_node == syntax.callee
@@ -4204,6 +4219,8 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         | SyntaxKind::NoSubstitutionTemplateLiteral
         | SyntaxKind::NumericLiteral
         | SyntaxKind::BigIntLiteral => true,
+        SyntaxKind::MetaProperty => matches!(&record.data,
+            NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword),
         SyntaxKind::ParenthesizedExpression => {
             let NodeData::ParenthesizedExpression(parenthesized) = &record.data else {
                 return false;
@@ -4258,6 +4275,10 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
                         SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword
                     )
                         if keyword.flow_node.is_none()
+                ) || matches!(
+                    (&receiver.data, receiver.kind),
+                    (NodeData::MetaProperty(meta), SyntaxKind::MetaProperty)
+                        if meta.keyword_token == SyntaxKind::ImportKeyword
                 ))
                 && name.parent == Some(node.node)
                 && name.flags.0 == 0
@@ -4894,6 +4915,7 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
         | PlannedExpressionKind::RegularExpression(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -4984,6 +5006,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::SuperCall(_)
         | PlannedExpressionKind::Assertion { .. }
@@ -7367,8 +7390,11 @@ fn resolve_source_class_call(
                 }
                 retry_source_generic_member_failure(
                     store,
+                    host,
                     globals,
+                    options,
                     session,
+                    diagnostics,
                     error,
                     &relation_candidates,
                     &mut retried_members,
@@ -7716,8 +7742,11 @@ pub(super) fn check_direct_source_call(
                 }
                 retry_source_generic_member_failure(
                     store,
+                    host,
                     global_types,
+                    options,
                     session,
+                    diagnostics,
                     error,
                     &relation_candidates,
                     &mut retried_members,

@@ -7279,14 +7279,15 @@ impl<'store> RelaterSession<'store> {
                     .or_insert(reference);
             }
             let property_record = self.property_symbol(*property, origin)?;
+            let property_name = property_record.name().to_owned();
             if property_origin.is_declared()
-                && property_record.parent() != record_symbol
+                && self.store.get_parent_of_symbol(*property) != record_symbol
                 && heritage_members != InterfaceHeritageMembersValidation::Valid
                 && class_members != ClassHeritageMembersValidation::Valid
             {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
-            property_names.insert(*property, property_record.name().to_owned());
+            property_names.insert(*property, property_name);
         }
         if let ObjectPropertyOrigin::FreshObjectLiteral(owner) = property_origin {
             self.store
@@ -20966,6 +20967,110 @@ mod tests {
         assert_eq!(store.relation_state_snapshot(), unowned_poison);
         assert!(store.set_symbol_relationships(unowned_property, None, None, None, None));
         assert_eq!(store.is_type_assignable_to(unowned, target), Ok(true));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep canonical-parent acceptance and both cache poison paths together.
+    fn merged_property_parents_invalidate_warm_relations_when_redirects_or_parents_change() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let raw_owner = alloc_symbol(&mut store, SymbolFlags::INTERFACE, "Merged");
+        let owner = store.alloc_transient_symbol(
+            SymbolFlags::INTERFACE,
+            EscapedName::source("Merged"),
+            CheckFlags::NONE,
+        );
+        let unrelated = alloc_symbol(&mut store, SymbolFlags::INTERFACE, "Unrelated");
+        assert_eq!(store.record_merged_symbol(owner, raw_owner), Ok(None));
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(owner))
+            .unwrap();
+        let property = alloc_typed_property(&mut store, "value", string, false);
+        assert!(store.set_symbol_relationships(property, None, None, Some(raw_owner), None));
+        set_object_properties(&mut store, target, vec![property]);
+        let source_property = alloc_typed_property(&mut store, "value", string, false);
+        let source = alloc_property_object(&mut store, vec![source_property]);
+        let state = |store: &TestStore| {
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        let root_key = store
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        for poison_redirect in [true, false] {
+            assert_eq!(store.symbol(property).unwrap().parent(), Some(raw_owner));
+            assert_ne!(raw_owner, owner);
+            assert_eq!(store.get_parent_of_symbol(property), Some(owner));
+            assert!(
+                store
+                    .relation_cache_get(RelationKind::Assignable, root_key)
+                    .contains(RelationComparisonResult::SUCCEEDED),
+            );
+            let warm = state(&store);
+            for _ in 0..2 {
+                assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+                assert_eq!(state(&store), warm);
+            }
+            if poison_redirect {
+                assert_eq!(
+                    store.record_merged_symbol(unrelated, raw_owner),
+                    Ok(Some(owner)),
+                );
+                assert_eq!(store.symbol(property).unwrap().parent(), Some(raw_owner));
+            } else {
+                assert!(store.set_symbol_relationships(
+                    property,
+                    None,
+                    None,
+                    Some(unrelated),
+                    None,
+                ));
+                assert_eq!(store.get_merged_symbol(raw_owner), Some(owner));
+            }
+            assert_eq!(store.get_parent_of_symbol(property), Some(unrelated));
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, root_key),
+                RelationComparisonResult::NONE,
+            );
+            let damaged = state(&store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.is_type_assignable_to(source, target),
+                    Err(RelationUnavailable::InvalidStructuredMembers(target)),
+                );
+                assert_eq!(state(&store), damaged);
+            }
+            if poison_redirect {
+                assert_eq!(
+                    store.record_merged_symbol(owner, raw_owner),
+                    Ok(Some(unrelated)),
+                );
+            } else {
+                assert!(store.set_symbol_relationships(
+                    property,
+                    None,
+                    None,
+                    Some(raw_owner),
+                    None,
+                ));
+            }
+            assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+            assert_eq!(store.symbol(property).unwrap().parent(), Some(raw_owner));
+            assert_eq!(store.get_parent_of_symbol(property), Some(owner));
+            assert_eq!(state(&store), warm);
+        }
     }
 
     #[test]

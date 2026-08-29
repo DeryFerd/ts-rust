@@ -223,6 +223,13 @@ impl CanonicalCheckerContext<'_> {
         let catch_rest = self.catch_rest_artifact_type(node)?;
         let declaration = self.prepare_artifact_type_location(node)?;
 
+        if let Some(type_) = self
+            .import_meta_artifact_type(node)
+            .map_err(|error| CanonicalArtifactQueryError::SourceCheck(error.into()))?
+        {
+            return self.validate_artifact_type(node, type_);
+        }
+
         if let Some(type_) = catch_rest {
             return self.validate_artifact_type(node, type_);
         }
@@ -367,10 +374,29 @@ impl CanonicalCheckerContext<'_> {
         &mut self,
         node: NodeRef,
     ) -> Result<Option<SemanticSymbolId>, CanonicalArtifactQueryError> {
+        self.validated_artifact_node(node)?;
+        match self
+            .import_meta_artifact_symbol(node, super::source_meta::ImportMetaSymbolQuery::Name)
+            .map_err(|error| CanonicalArtifactQueryError::SourceCheck(error.into()))?
+        {
+            super::source_meta::ImportMetaSymbolResult::Resolved(symbol) => return Ok(symbol),
+            super::source_meta::ImportMetaSymbolResult::Unrelated => {}
+        }
         if let Some(symbol) = self.type_name_artifact_symbol(node)? {
             return Ok(symbol);
         }
         self.prepare_artifact_location(node)?;
+
+        match self
+            .import_meta_artifact_symbol(
+                node,
+                super::source_meta::ImportMetaSymbolQuery::Expression,
+            )
+            .map_err(|error| CanonicalArtifactQueryError::SourceCheck(error.into()))?
+        {
+            super::source_meta::ImportMetaSymbolResult::Resolved(symbol) => return Ok(symbol),
+            super::source_meta::ImportMetaSymbolResult::Unrelated => {}
+        }
 
         if matches!(
             &self.validated_artifact_node(node)?.2.data,

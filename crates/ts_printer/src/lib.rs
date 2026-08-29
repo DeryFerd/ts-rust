@@ -736,13 +736,7 @@ pub fn emit_source_file_with_context(
             .get(*statement)
             .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
     });
-    let has_import_meta = arena.iter().any(|(_, node)| {
-        matches!(
-            &node.data,
-            NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword
-                && matches!(arena.get(meta.name).map(|node| &node.data), Some(NodeData::Identifier(name)) if name.text == "meta")
-        )
-    });
+    let has_import_meta = ts_ast::source_file_contains_import_meta(arena, source_file);
     let is_external_module = has_explicit_module_indicator
         || has_import_meta
         || source_name_implies_external_module(source_name)
@@ -86701,6 +86695,79 @@ class Board {
         assert!(module.code.starts_with("\"use strict\";\n"));
         let script = emit_with("const value = 1;", ScriptTarget::Es5, ModuleKind::CommonJs);
         assert_eq!(script.code, "var value = 1;\n");
+    }
+
+    #[test]
+    fn import_meta_module_detection_uses_only_source_syntax() {
+        for (source, javascript, external) in [
+            ("const value = 1;", false, false),
+            ("const value = import.meta;", false, true),
+            ("function value() { return import.meta; }", false, true),
+            ("type Shape = { [import.meta]: number };", false, true),
+            ("function value() { return new.target; }", false, false),
+            ("const value = import.defer;", false, false),
+            ("const value = import.other;", false, false),
+            ("const value = 'import.meta'; // import.meta", false, false),
+            (
+                "/** @typedef {{ [import.meta]: number }} Shape */\nconst value = 0;",
+                true,
+                false,
+            ),
+            (
+                "/** @template T @param {T} x @returns {{ [import.meta]: number }} */\nconst f = x => x;",
+                true,
+                false,
+            ),
+            (
+                "/** @template T @param {{ [import.meta]: number }} x @returns {T} */\nconst f = x => x;",
+                true,
+                false,
+            ),
+            (
+                "/** @template T @param {{ [import.meta]: number }} x @returns {T broken} */\nconst f = x => x;",
+                true,
+                false,
+            ),
+            (
+                "/** @template T @param {T} x @returns {T} */\nconst f = x => import.meta;",
+                true,
+                true,
+            ),
+        ] {
+            let parsed = if javascript {
+                parse_javascript_source_file(source)
+            } else {
+                parse_source_file(source)
+            };
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let mut settings = ts_options::CompilerOptions::default().printer_settings();
+            settings.always_strict = false;
+            settings.target = ScriptTarget::Es2022;
+            settings.module = ModuleKind::CommonJs;
+            let output = emit_source_file_with_settings(
+                &parsed.arena,
+                parsed.source_file,
+                if javascript { "input.js" } else { "input.ts" },
+                source,
+                settings,
+            )
+            .unwrap()
+            .code;
+            assert_eq!(
+                output.contains("Object.defineProperty(exports, \"__esModule\", { value: true });"),
+                external,
+                "{source}: {output}"
+            );
+            assert_eq!(
+                output.contains("\"use strict\";"),
+                external,
+                "{source}: {output}"
+            );
+        }
     }
 
     #[test]

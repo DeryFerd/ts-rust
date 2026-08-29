@@ -430,6 +430,15 @@ enum UnionArrayValidation<'globals> {
     Targets(super::array_types::CanonicalArrayTargets),
 }
 
+type SourceInterfaceEdges<'source> =
+    dyn Fn(TypeId) -> Result<Option<Vec<TypeId>>, LiteralTypeCacheError> + 'source;
+
+#[derive(Default)]
+struct CachedArrayWalk<'source> {
+    visited: HashSet<TypeId>,
+    source_interfaces: Option<&'source SourceInterfaceEdges<'source>>,
+}
+
 impl<'globals> UnionArrayValidation<'globals> {
     const fn from_global_types(global_types: Option<&'globals CanonicalGlobalTypes>) -> Self {
         match global_types {
@@ -1176,7 +1185,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 &key,
                 union,
                 array_validation,
-                &mut HashSet::new(),
+                &mut CachedArrayWalk::default(),
                 &allowed_pending,
             )?;
         }
@@ -1196,7 +1205,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         key: &UnionTypeCacheKey,
         union: TypeId,
         array_validation: UnionArrayValidation<'_>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_cache_entry_metadata(key, union)?;
@@ -1289,7 +1298,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 candidate,
                 array_validation,
                 &mut HashSet::new(),
-                &mut HashSet::new(),
+                &mut CachedArrayWalk::default(),
                 allowed_pending,
             )?;
         }
@@ -1327,7 +1336,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     &expected_key,
                     expected,
                     array_validation,
-                    &mut HashSet::new(),
+                    &mut CachedArrayWalk::default(),
                     allowed_pending,
                 )?;
                 expected
@@ -1735,7 +1744,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::None,
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )
     }
@@ -1749,7 +1758,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::GlobalTypes(global_types),
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )
     }
@@ -1763,7 +1772,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::Targets(targets),
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )
     }
@@ -1866,14 +1875,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             base,
             array_validation,
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )?;
         self.validate_union_constituent_worker(
             undefined,
             array_validation,
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )?;
         self.validate_cached_union_result_worker(resolved, None, array_validation, &HashSet::new())
@@ -1890,7 +1899,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_cached_array_capability_worker(
             type_,
             UnionArrayValidation::None,
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )
     }
@@ -1908,7 +1917,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_cached_array_capability_worker(
             type_,
             UnionArrayValidation::Targets(targets),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &HashSet::new(),
         )
     }
@@ -1924,7 +1933,36 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_cached_array_capability_worker(
             type_,
             targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
+            &pending_function_types,
+        )
+    }
+
+    /// Keeps a read-only source proof on every nested cache edge in this walk.
+    /// `None` leaves the existing type rules in control. Proof errors stay errors.
+    pub(super) fn validate_cached_array_capability_with_source_interfaces(
+        &self,
+        targets: Option<CanonicalArrayTargets>,
+        type_: TypeId,
+        pending_function_types: &[PendingFunctionTypeProof],
+        source_interfaces: Option<&SourceInterfaceEdges<'_>>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let Some(source_interfaces) = source_interfaces else {
+            return self.validate_cached_array_capability_with_pending_functions(
+                targets,
+                type_,
+                pending_function_types,
+            );
+        };
+        let pending_function_types =
+            self.proven_pending_function_types(targets, pending_function_types)?;
+        self.validate_cached_array_capability_worker(
+            type_,
+            targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            &mut CachedArrayWalk {
+                visited: HashSet::new(),
+                source_interfaces: Some(source_interfaces),
+            },
             &pending_function_types,
         )
     }
@@ -1942,7 +1980,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_cached_array_capability_worker(
             type_,
             targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &prepared.pending_function_types,
         )
     }
@@ -1977,7 +2015,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             array_validation,
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             allowed_pending,
         )?;
         if let Some(expected_alias) = expected_alias
@@ -2163,7 +2201,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         record: &TypeRecord,
         data: &super::type_records::UnionTypeData,
         array_validation: UnionArrayValidation<'_>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let key = self.validated_union_cache_key(union, record, data)?;
@@ -2225,7 +2263,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         object: &ObjectTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         if !visiting.insert(type_) {
@@ -2411,7 +2449,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         object: &ObjectTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<bool, LiteralTypeCacheError> {
         let derived = match array_validation {
@@ -2486,15 +2524,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
-        visited: &mut HashSet<TypeId>,
+        visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
-        if !visited.insert(type_) {
+        if !visited.visited.insert(type_) {
             return Ok(());
         }
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        if let Some(source_interfaces) = visited.source_interfaces
+            && let Some(edges) = source_interfaces(type_)?
+        {
+            for edge in edges {
+                self.validate_cached_array_capability_worker(
+                    edge,
+                    array_validation,
+                    visited,
+                    allowed_pending,
+                )?;
+            }
+            return Ok(());
+        }
         match record.data() {
             TypeData::Tuple(_) => self.validate_supported_canonical_tuple(
                 type_,
@@ -2755,7 +2806,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         record: &TypeRecord,
         reference: &super::type_records::TypeReferenceData,
         array_validation: UnionArrayValidation<'_>,
-        visited: &mut HashSet<TypeId>,
+        visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let targets = match array_validation {
@@ -2848,7 +2899,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let reference = match array_validation {
@@ -2887,7 +2938,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let reference = super::reference_types::validate_direct_generic_reference(self, type_)
@@ -2952,12 +3003,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && record.alias().is_none()
             && object_members::valid_thisless_interface_identity(interface)
             && cached_interface_type(self, symbol).ok().flatten() == Some(type_)
-            && !self.declared_type_initialization_in_progress(symbol)
-            && !matches!(
+            && !self.declared_type_initialization_in_progress(symbol);
+        if !thisless {
+            return None;
+        }
+        let cold_properties =
+            cold && self.cold_default_library_property_members_are_exact(symbol)?;
+        if !cold_properties
+            && matches!(
                 object_members::validate_resolved_declared_property_type_graph(self, type_),
                 object_members::DeclaredPropertyTypeGraphValidation::Malformed
-            );
-        if !thisless {
+            )
+        {
             return None;
         }
         self.lazy_default_library_interface_member_edges(
@@ -2965,6 +3022,98 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             array_targets,
             resolved.then_some(structured),
         )
+    }
+
+    /// Cold ordinary properties and empty interfaces do not have a resolved graph.
+    /// Returns false for other source shapes and None for malformed ordinary properties.
+    fn cold_default_library_property_members_are_exact(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<bool> {
+        let owner = self.symbol(symbol)?;
+        let declarations = owner.declarations()?;
+        if declarations.is_empty() {
+            return None;
+        }
+        let mut properties = Vec::new();
+        for &declaration in declarations {
+            if self.source_node_kind(declaration)? != SyntaxKind::InterfaceDeclaration {
+                return Some(false);
+            }
+            for node in self.source_direct_children(declaration)? {
+                match self.source_node_kind(node)? {
+                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => {}
+                    SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature => {
+                        properties.push(node);
+                    }
+                    _ => return Some(false),
+                }
+            }
+        }
+        if owner.value_declaration().is_some() {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        for declaration in properties {
+            let member = self.source_declaration_symbol(declaration)?;
+            if !seen.insert(member) {
+                continue;
+            }
+            let record = self.symbol(member)?;
+            let allowed_flags =
+                SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+            if !record.flags().contains(SymbolFlags::PROPERTY)
+                || record.flags().without(allowed_flags) != SymbolFlags::NONE
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.export_symbol().is_some()
+            {
+                return None;
+            }
+            let mut expected_value: Option<(NodeRef, SyntaxKind)> = None;
+            let mut readonly = None;
+            for &declaration in record.declarations()? {
+                let kind = self.source_node_kind(declaration)?;
+                if !matches!(
+                    kind,
+                    SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+                ) {
+                    return None;
+                }
+                // The binder and canonical merge use this same value-declaration rule.
+                if expected_value.is_none_or(|(_, current)| {
+                    ts_binder::should_replace_value_declaration(current, kind)
+                }) {
+                    expected_value = Some((declaration, kind));
+                }
+                let declared_readonly = self
+                    .source_child_with_kind(declaration, SyntaxKind::ReadonlyKeyword)
+                    .is_some();
+                if readonly.is_some_and(|expected| expected != declared_readonly) {
+                    return None;
+                }
+                readonly = Some(declared_readonly);
+            }
+            let readonly = readonly?;
+            let published = self
+                .value_symbol_links(member)
+                .and_then(|links| links.resolved_type)
+                .is_some();
+            if record.value_declaration() != Some(expected_value?.0)
+                || record.check_flags() != CheckFlags::NONE
+                    && (record.check_flags() != CheckFlags::READONLY || !readonly)
+                || readonly && published && record.check_flags() != CheckFlags::READONLY
+                || self
+                    .declared_value_provenance(member)
+                    .is_some_and(|provenance| {
+                        provenance.readonly != Some(readonly)
+                            || !provenance.is_current(self, member)
+                    })
+            {
+                return None;
+            }
+        }
+        Some(true)
     }
 
     /// Unqueried members add no type edges. Published members retain their source
@@ -3519,7 +3668,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         indexed: &IndexedAccessTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
@@ -3579,7 +3728,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let tuple = self
@@ -3591,7 +3740,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         // Declared members can refer back to this tuple. Direct containment
         // cycles still fail through the separate structural visiting set.
-        array_visited.insert(type_);
+        array_visited.visited.insert(type_);
         let result = tuple.element_types().iter().try_for_each(|element| {
             self.validate_union_constituent_worker(
                 *element,
@@ -3908,7 +4057,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         mapped: &super::type_records::MappedTypeData,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
@@ -4029,7 +4178,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         let Some(record) = self.type_payload(type_) else {
@@ -4552,7 +4701,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         normalized: &[TypeId],
         array_validation: UnionArrayValidation<'_>,
         visiting: &mut HashSet<TypeId>,
-        array_visited: &mut HashSet<TypeId>,
+        array_visited: &mut CachedArrayWalk<'_>,
         allowed_pending: &HashSet<TypeId>,
     ) -> Result<(), LiteralTypeCacheError> {
         self.validate_union_origin_structure(union, origin)?;
@@ -5322,7 +5471,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             type_,
             UnionArrayValidation::from_global_types(globals),
             &mut HashSet::new(),
-            &mut HashSet::new(),
+            &mut CachedArrayWalk::default(),
             &prepared.pending_function_types,
         )
     }
@@ -5423,7 +5572,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         if let Some(validation) = validation {
             if let Some(alias) = alias.as_ref() {
-                let mut visited = HashSet::new();
+                let mut visited = CachedArrayWalk::default();
                 for argument in &alias.type_arguments {
                     self.validate_cached_array_capability_worker(
                         *argument,
@@ -5438,7 +5587,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     *type_,
                     validation,
                     &mut HashSet::new(),
-                    &mut HashSet::new(),
+                    &mut CachedArrayWalk::default(),
                     &HashSet::new(),
                 )?;
             }
@@ -5491,7 +5640,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             &key,
                             cached,
                             validation,
-                            &mut HashSet::new(),
+                            &mut CachedArrayWalk::default(),
                             &HashSet::new(),
                         )?;
                     } else {
@@ -5529,7 +5678,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *type_,
                 UnionArrayValidation::None,
                 &mut HashSet::new(),
-                &mut HashSet::new(),
+                &mut CachedArrayWalk::default(),
                 &prepared.pending_function_types,
             )?;
         }
@@ -5580,7 +5729,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 *type_,
                 array_validation,
                 &mut HashSet::new(),
-                &mut HashSet::new(),
+                &mut CachedArrayWalk::default(),
                 &prepared.pending_function_types,
             )?;
         }
@@ -5590,7 +5739,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }));
         }
         if let Some(alias) = alias.as_ref() {
-            let mut visited = HashSet::new();
+            let mut visited = CachedArrayWalk::default();
             for argument in &alias.type_arguments {
                 self.validate_cached_array_capability_worker(
                     *argument,
@@ -5920,7 +6069,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 &key,
                 cached,
                 array_validation,
-                &mut HashSet::new(),
+                &mut CachedArrayWalk::default(),
                 allowed_pending,
             )?;
             return Ok(cached);
@@ -6902,6 +7051,556 @@ mod tests {
             .type_node_links(expression)
             .and_then(|links| links.resolved_type)
             .expect("the expression was checked")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the cold shell, annotation poison, and exact union replay together.
+    fn cold_library_property_unions_reject_poisoned_annotation_caches() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface ColdProperty { value: string }",
+        ));
+        assert!(library.diagnostics.is_empty());
+        let file = FileId::new(9_963);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &library.arena,
+                library.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/cold-library.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&library.arena, file)
+            .unwrap();
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context =
+            CanonicalCheckerContext::new(binder.finish(), vec![(file, &library.arena)], options)
+                .unwrap();
+        let owner = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("ColdProperty"))
+            .and_then(|owner| context.store().get_merged_symbol(owner))
+            .unwrap();
+        let property = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let annotation = context
+            .store()
+            .symbol(property)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
+            .unwrap();
+        let type_ = {
+            let bound = context.file(file).unwrap().1.clone();
+            let host = crate::semantic::DeclaredTypeHost::new_after_global_merge(
+                [(&library.arena, &bound)],
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    options.name_resolution,
+                ),
+            )
+            .unwrap();
+            context
+                .store_mut_for_test()
+                .get_declared_type_of_symbol(&host, owner)
+                .unwrap()
+        };
+        let original_interface = match context.store().type_payload(type_).unwrap().data() {
+            TypeData::Interface(interface) => interface.clone(),
+            _ => panic!("the library declaration must retain its interface identity"),
+        };
+        assert!(!original_interface.declared_members_resolved);
+        assert_eq!(
+            original_interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        let original_member = context.store().value_symbol_links(property).cloned();
+        assert!(
+            original_member
+                .as_ref()
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(string));
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let store = context.store_mut_for_test();
+        let original_annotation = store.type_node_links(annotation).cloned();
+        assert!(
+            original_annotation
+                .as_ref()
+                .is_none_or(|links| links == &TypeNodeLinks::default())
+        );
+        let assert_cold = |store: &TestStore| {
+            let record = store.type_payload(type_).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("the library declaration must retain its interface identity");
+            };
+            assert_eq!(record.object_flags(), ObjectFlags::INTERFACE);
+            assert_eq!(record.symbol(), Some(owner));
+            assert!(record.alias().is_none());
+            assert_eq!(interface, &original_interface);
+            assert_eq!(store.value_symbol_links(property), original_member.as_ref());
+        };
+        assert_cold(store);
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let constituents = [type_, undefined];
+        assert_eq!(
+            store.cached_literal_union_type_with_alias(&constituents, None, targets),
+            Ok(None)
+        );
+        let union = store
+            .literal_union_type_with_alias_and_array_targets(&constituents, None, targets)
+            .unwrap();
+        let mut sorted = constituents;
+        sorted.sort_unstable();
+        assert_eq!(
+            store.validate_canonical_union_metadata(union, &sorted),
+            Ok(())
+        );
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                checker_state(store),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+            )
+        };
+        let warm = snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                Ok(Some(union))
+            );
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+                Ok(union)
+            );
+            assert_cold(store);
+            assert_eq!(snapshot(store), warm);
+        }
+        let member_record = store.symbol(property).unwrap();
+        let declarations = member_record.declarations().unwrap().to_vec();
+        let value_declaration = member_record.value_declaration();
+        let relationships = (
+            member_record.members(),
+            member_record.exports(),
+            member_record.parent(),
+            member_record.export_symbol(),
+        );
+        assert_eq!(member_record.check_flags(), CheckFlags::NONE);
+        let member_table = store.symbol(owner).unwrap().members().unwrap();
+        let member_snapshot = |store: &TestStore| {
+            let record = store.symbol(property).unwrap();
+            (
+                record.flags(),
+                record.check_flags(),
+                record.declarations().map(<[NodeRef]>::to_vec),
+                record.value_declaration(),
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            )
+        };
+        let original_metadata = member_snapshot(store);
+        let owner_snapshot = |store: &TestStore| {
+            let record = store.symbol(owner).unwrap();
+            (
+                record.declarations().unwrap().to_vec(),
+                record.value_declaration(),
+            )
+        };
+        let original_owner = owner_snapshot(store);
+        assert!(original_owner.1.is_none());
+        for poison in 0..6 {
+            match poison {
+                0 => assert!(store.set_source_property_readonly(property, true)),
+                1 => assert!(store.set_symbol_declarations(
+                    property,
+                    Some(declarations.clone()),
+                    None
+                )),
+                2 => assert!(store.set_symbol_relationships(
+                    property,
+                    Some(member_table),
+                    relationships.1,
+                    relationships.2,
+                    relationships.3,
+                )),
+                3 => assert!(store.set_symbol_relationships(
+                    property,
+                    relationships.0,
+                    Some(member_table),
+                    relationships.2,
+                    relationships.3,
+                )),
+                4 => assert!(store.set_symbol_relationships(
+                    property,
+                    relationships.0,
+                    relationships.1,
+                    relationships.2,
+                    Some(owner),
+                )),
+                5 => assert!(store.set_symbol_declarations(
+                    owner,
+                    Some(original_owner.0.clone()),
+                    Some(original_owner.0[0]),
+                )),
+                _ => unreachable!(),
+            }
+            let poisoned_metadata = member_snapshot(store);
+            let poisoned_owner = owner_snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(type_)),
+                    "member poison {poison}"
+                );
+                assert_eq!(
+                    store.literal_union_type_with_alias_and_array_targets(
+                        &constituents,
+                        None,
+                        targets
+                    ),
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(type_)),
+                    "member poison {poison}"
+                );
+                assert_cold(store);
+                assert_eq!(member_snapshot(store), poisoned_metadata);
+                assert_eq!(owner_snapshot(store), poisoned_owner);
+                assert_eq!(snapshot(store), warm);
+            }
+            assert!(store.set_source_property_readonly(property, false));
+            assert!(store.set_symbol_declarations(
+                property,
+                Some(declarations.clone()),
+                value_declaration
+            ));
+            assert!(store.set_symbol_relationships(
+                property,
+                relationships.0,
+                relationships.1,
+                relationships.2,
+                relationships.3,
+            ));
+            assert!(store.set_symbol_declarations(
+                owner,
+                Some(original_owner.0.clone()),
+                original_owner.1,
+            ));
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                Ok(Some(union))
+            );
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+                Ok(union)
+            );
+            assert_cold(store);
+            assert_eq!(member_snapshot(store), original_metadata);
+            assert_eq!(owner_snapshot(store), original_owner);
+            assert_eq!(snapshot(store), warm);
+        }
+        let poisoned_annotation = TypeNodeLinks {
+            resolved_type: Some(number),
+            ..TypeNodeLinks::default()
+        };
+        assert!(store.set_type_node_links(annotation, poisoned_annotation.clone()));
+        let mut poisoned = warm.clone();
+        poisoned.0.links.type_node += usize::from(original_annotation.is_none());
+        assert_eq!(snapshot(store), poisoned);
+        for _ in 0..2 {
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+            );
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+            );
+            assert_eq!(
+                store.type_node_links(annotation),
+                Some(&poisoned_annotation)
+            );
+            assert_cold(store);
+            assert_eq!(snapshot(store), poisoned);
+        }
+        let restored_annotation = original_annotation.unwrap_or_default();
+        assert!(store.set_type_node_links(annotation, restored_annotation.clone()));
+        assert_eq!(
+            store.cached_literal_union_type_with_alias(&constituents, None, targets),
+            Ok(Some(union))
+        );
+        assert_eq!(
+            store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+            Ok(union)
+        );
+        assert_cold(store);
+        assert_eq!(
+            store.type_node_links(annotation),
+            Some(&restored_annotation)
+        );
+        assert_eq!(snapshot(store), poisoned);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Verify one selected value without resolving its interface members.
+    fn cold_library_readonly_unions_keep_selected_value_state() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics, DeclaredTypeHost,
+            instantiate::{InstantiationLimits, InstantiationSession},
+            production::GlobalMergeCompletion,
+        };
+
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface ColdReadonly { readonly value: string }",
+        ));
+        assert!(library.diagnostics.is_empty());
+        let file = FileId::new(9_964);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &library.arena,
+                library.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/cold-readonly-library.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&library.arena, file)
+            .unwrap();
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context =
+            CanonicalCheckerContext::new(binder.finish(), vec![(file, &library.arena)], options)
+                .unwrap();
+        let owner = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("ColdReadonly"))
+            .and_then(|owner| context.store().get_merged_symbol(owner))
+            .unwrap();
+        let property = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let annotation = context
+            .store()
+            .symbol(property)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let store = context.store_mut_for_test();
+        let type_ = store.get_declared_type_of_symbol(&host, owner).unwrap();
+        let original_interface = match store.type_payload(type_).unwrap().data() {
+            TypeData::Interface(interface) => interface.clone(),
+            _ => panic!("the library declaration must retain its interface identity"),
+        };
+        assert!(!original_interface.declared_members_resolved);
+        assert_eq!(
+            original_interface.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        let assert_cold = |store: &TestStore| {
+            let record = store.type_payload(type_).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("the library declaration must retain its interface identity");
+            };
+            assert_eq!(record.object_flags(), ObjectFlags::INTERFACE);
+            assert_eq!(record.symbol(), Some(owner));
+            assert!(record.alias().is_none());
+            assert_eq!(interface, &original_interface);
+        };
+        assert_eq!(
+            store.symbol(property).unwrap().check_flags(),
+            CheckFlags::NONE
+        );
+        assert!(
+            store
+                .value_symbol_links(property)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        );
+        assert!(store.declared_value_provenance(property).is_none());
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let constituents = [type_, undefined];
+        assert_eq!(
+            store.cached_literal_union_type_with_alias(&constituents, None, targets),
+            Ok(None)
+        );
+        let union = store
+            .literal_union_type_with_alias_and_array_targets(&constituents, None, targets)
+            .unwrap();
+        let snapshot = |store: &TestStore| {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                checker_state(store),
+                bootstrap.union_types.clone(),
+                bootstrap.union_of_union_types.clone(),
+                store.value_symbol_links(property).cloned(),
+                store.declared_value_provenance(property),
+                store.symbol(property).unwrap().check_flags(),
+                store.type_node_links(annotation).cloned(),
+            )
+        };
+        let unread = snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                Ok(Some(union))
+            );
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+                Ok(union)
+            );
+            assert_cold(store);
+            assert_eq!(snapshot(store), unread);
+        }
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut read_selected = |store: &mut TestStore| {
+            object_members::resolve_object_property_by_key_with_source(
+                store,
+                &host,
+                &globals,
+                options,
+                type_,
+                ts_binder::EscapedNameRef::source("value"),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let selected = read_selected(store);
+        assert_eq!(selected.symbol, property);
+        assert_eq!(selected.type_, string);
+        assert!(!selected.optional);
+        assert!(selected.readonly);
+        assert_cold(store);
+        let published_value = ValueSymbolLinks {
+            resolved_type: Some(string),
+            ..ValueSymbolLinks::default()
+        };
+        assert_eq!(store.value_symbol_links(property), Some(&published_value));
+        assert_eq!(
+            store.symbol(property).unwrap().check_flags(),
+            CheckFlags::READONLY
+        );
+        let provenance = store.declared_value_provenance(property).unwrap();
+        assert_eq!(provenance.annotation, annotation);
+        assert_eq!(provenance.type_, string);
+        assert_eq!(provenance.readonly, Some(true));
+        assert!(provenance.is_current(store, property));
+        let warm = snapshot(store);
+        let repeated = read_selected(store);
+        assert_eq!(repeated.symbol, property);
+        assert_eq!(repeated.type_, string);
+        assert!(!repeated.optional);
+        assert!(repeated.readonly);
+        assert_eq!(
+            store.cached_literal_union_type_with_alias(&constituents, None, targets),
+            Ok(Some(union))
+        );
+        assert_eq!(
+            store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+            Ok(union)
+        );
+        assert_cold(store);
+        assert_eq!(snapshot(store), warm);
+        for poison in 0..2 {
+            let mut poisoned = warm.clone();
+            match poison {
+                0 => {
+                    assert!(store.set_source_property_readonly(property, false));
+                    poisoned.5 = CheckFlags::NONE;
+                }
+                1 => {
+                    assert!(store.set_value_symbol_links(property, ValueSymbolLinks::default()));
+                    poisoned.3 = Some(ValueSymbolLinks::default());
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(snapshot(store), poisoned);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(type_)),
+                    "published value poison {poison}"
+                );
+                assert_eq!(
+                    store.literal_union_type_with_alias_and_array_targets(
+                        &constituents,
+                        None,
+                        targets
+                    ),
+                    Err(LiteralTypeCacheError::InvalidCachedUnion(type_)),
+                    "published value poison {poison}"
+                );
+                assert_cold(store);
+                assert_eq!(snapshot(store), poisoned);
+            }
+            assert!(store.set_source_property_readonly(property, true));
+            assert!(store.set_value_symbol_links(property, published_value.clone()));
+            assert_eq!(
+                store.cached_literal_union_type_with_alias(&constituents, None, targets),
+                Ok(Some(union))
+            );
+            assert_eq!(
+                store.literal_union_type_with_alias_and_array_targets(&constituents, None, targets),
+                Ok(union)
+            );
+            assert_cold(store);
+            assert_eq!(snapshot(store), warm);
+        }
+        assert!(diagnostics.is_empty());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

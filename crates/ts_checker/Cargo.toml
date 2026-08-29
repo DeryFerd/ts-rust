@@ -11,13 +11,11 @@ ts_core = { path = "../ts_core" }
 ts_diagnostics = { path = "../ts_diagnostics" }
 ts_evaluator = { path = "../ts_evaluator" }
 ts_jsnum = { path = "../ts_jsnum" }
+ts_options = { path = "../ts_options" }
 ts_parser = { path = "../ts_parser" }
 ts_path = { path = "../ts_path" }
 ts_scanner = { path = "../ts_scanner" }
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
-
-[dev-dependencies]
-ts_options = { path = "../ts_options" }
 
 [lints]
 workspace = true

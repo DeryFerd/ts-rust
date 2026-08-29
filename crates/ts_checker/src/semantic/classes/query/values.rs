@@ -1,5 +1,6 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
+use super::super::{completed_source_class_property_type, emit_standard_class_fields};
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, CanonicalTypeQuery, CheckFlags, ClassError, ClassInvariant,
@@ -795,6 +796,41 @@ impl ClassValueQuery<'_, '_, '_> {
             .is_none_or(|symbol| symbol.check_flags() != CheckFlags::NONE)
         {
             return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+        if initializer_record.kind == SyntaxKind::Identifier
+            && emit_standard_class_fields(self.store, self.host)?
+        {
+            let reference = lexical_class_query_symbol(
+                self.store,
+                self.host,
+                initializer,
+                SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE | SymbolFlags::ALIAS,
+            )?;
+            validate_query_reference_cache(self.store, initializer, reference)?;
+            if let Some(type_) = completed_source_class_property_type(
+                self.store,
+                self.host,
+                class.symbol,
+                symbol,
+                declaration,
+                initializer,
+            )? {
+                return Ok(type_);
+            }
+            if self
+                .store
+                .symbol(reference)
+                .filter(|symbol| symbol.flags().intersects(SymbolFlags::VARIABLE))
+                .and_then(Symbol::value_declaration)
+                .and_then(|declaration| self.host.node(declaration))
+                .is_some_and(|record| {
+                    matches!(&record.data, NodeData::VariableDeclaration(variable)
+                        if variable.initializer.is_some())
+                })
+            {
+                // Ordinary variable initializers require the source body checker.
+                return Err(reject());
+            }
         }
         let raw = self.expression_type(initializer, Some((&class, declaration)), active)?;
         let type_ = widened_fresh_literal_type(self.store, raw)

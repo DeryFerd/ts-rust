@@ -8,6 +8,7 @@
 //! literals, authenticated enum members and numeric reverse indices, primitive
 //! string indexing, resolved anonymous string/number index signatures, finite
 //! unions of valid literal keys, optional properties, and optional chains.
+//! Ordinary literal reads can demand one cold interface member.
 //! Array bindings also read authenticated own numeric interface indexes.
 //! Authenticated evolving-array element assignments reuse the same index
 //! validation. Named global Object and Function properties retain their declared
@@ -31,14 +32,17 @@ use super::{
     formatter::{
         type_to_string_with_host_and_flags, type_to_string_with_host_global_types_and_flags,
     },
+    instantiate::InstantiationSession,
     interface_indexes::{InterfaceIndexError, resolve_own_numeric_interface_index},
     member_resolution::UnionPropertyError,
     object_members::{self, PropertyObjectState},
+    relater::ResolvedOwnProperty,
     signatures::ElementFlags,
-    source::PlannedExpression,
+    source::{PlannedExpression, SourceCheckError},
     source_callables::{
         StoredSourceCallableValidation, cached_annotation_identity, validate_stored_source_callable,
     },
+    source_properties::is_cold_direct_nongeneric_interface,
     store::SourceNodeParent,
     type_nodes::CanonicalTypeQuery,
     type_records::{LiteralValue, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
@@ -342,6 +346,65 @@ pub(super) fn check_direct_source_element(
         receiver_type,
         index_type,
         false,
+        resolve_stored_source_element_property,
+    )
+}
+
+/// Demands only the selected cold direct interface member for a source read.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_direct_source_element_with_source<E>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+    index_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<CheckedSourceElement, E>
+where
+    E: From<SourceElementError> + From<SourceCheckError>,
+{
+    if !plan.optional && !is_cold_direct_nongeneric_interface(store, receiver_type) {
+        return check_direct_source_element(
+            store,
+            host,
+            global_types,
+            options,
+            plan,
+            receiver_type,
+            index_type,
+        )
+        .map_err(E::from);
+    }
+    check_direct_source_element_worker(
+        store,
+        host,
+        Some(global_types),
+        CanonicalArrayTargets::from_global_types(global_types),
+        options,
+        plan,
+        receiver_type,
+        index_type,
+        false,
+        |store, receiver, name| {
+            if is_cold_direct_nongeneric_interface(store, receiver) {
+                object_members::resolve_object_property_by_key_with_source(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    receiver,
+                    ts_binder::EscapedNameRef::source(name),
+                    session,
+                    diagnostics,
+                )
+                .map_err(E::from)
+            } else {
+                resolve_stored_source_element_property(store, receiver, name).map_err(E::from)
+            }
+        },
     )
 }
 
@@ -367,6 +430,7 @@ pub(super) fn check_direct_source_element_write(
         receiver_type,
         index_type,
         true,
+        resolve_stored_source_element_property,
     )
 }
 
@@ -1519,11 +1583,23 @@ fn check_direct_source_element_with_array_targets(
         receiver_type,
         index_type,
         false,
+        resolve_stored_source_element_property,
     )
 }
 
+fn resolve_stored_source_element_property(
+    store: &mut CanonicalTypeMapperStore,
+    receiver_type: TypeId,
+    name: &str,
+) -> Result<Option<ResolvedOwnProperty>, SourceElementError> {
+    match store.resolved_own_property(receiver_type, name) {
+        Err(RelationUnavailable::StructuredIndexInfos(_)) => Ok(None),
+        result => result.map_err(Into::into),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn check_direct_source_element_worker(
+fn check_direct_source_element_worker<E, F>(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -1533,14 +1609,20 @@ fn check_direct_source_element_worker(
     receiver_type: TypeId,
     index_type: TypeId,
     write: bool,
-) -> Result<CheckedSourceElement, SourceElementError> {
+    mut resolve_ordinary_property: F,
+) -> Result<CheckedSourceElement, E>
+where
+    E: From<SourceElementError>,
+    F: FnMut(&mut CanonicalTypeMapperStore, TypeId, &str) -> Result<Option<ResolvedOwnProperty>, E>,
+{
     if store.type_payload(receiver_type).is_none() {
-        return Err(SourceElementError::InvalidType(receiver_type));
+        return Err(SourceElementError::InvalidType(receiver_type).into());
     }
     let indices = classify_indices(store, index_type)?;
     let bootstrap = store
         .intrinsic_bootstrap()
-        .ok_or(RelationUnavailable::MissingBootstrap)?;
+        .ok_or(RelationUnavailable::MissingBootstrap)
+        .map_err(SourceElementError::from)?;
     let any = bootstrap.any_type;
     let error = bootstrap.error_type;
     let string = bootstrap.string_type;
@@ -1551,68 +1633,76 @@ fn check_direct_source_element_worker(
         (receiver_type, false)
     };
 
-    let resolution = if invalid_const_enum_index(store, plan, receiver_type)? {
-        ElementResolution::diagnostic(error, ElementDiagnostic::InvalidConstEnumIndex)
-    } else {
-        let mut resolutions = Vec::with_capacity(indices.len());
-        for index in &indices {
-            let resolution = resolve_element_index(
-                store,
-                host,
-                global_types,
-                array_targets,
-                plan,
-                receiver_type,
-                index,
-                any,
-                error,
-                string,
-                undefined,
-            )?;
-            if indices.len() != 1 && resolution.diagnostic.is_some() {
-                return Err(SourceElementError::Unsupported(
-                    SourceElementUnsupported::IndexType(index_type),
-                ));
-            }
-            resolutions.push(resolution);
-        }
-        if let [resolution] = resolutions.as_slice() {
-            *resolution
+    let resolution =
+        if invalid_const_enum_index(store, plan, receiver_type)? {
+            ElementResolution::diagnostic(error, ElementDiagnostic::InvalidConstEnumIndex)
         } else {
-            let values = resolutions
-                .iter()
-                .map(|resolution| resolution.type_)
-                .collect::<Vec<_>>();
-            let type_ = if values.iter().all(|value| *value == values[0]) {
-                values[0]
-            } else if let Some(global_types) = global_types {
-                store.expression_union_type_with_global_types(
+            let mut resolutions = Vec::with_capacity(indices.len());
+            for index in &indices {
+                let resolution = resolve_element_index(
+                    store,
+                    host,
                     global_types,
-                    &values,
-                    UnionReduction::Literal,
-                )?
-            } else {
-                #[cfg(test)]
-                {
-                    store.expression_union_type(&values, UnionReduction::Literal)?
-                }
-                #[cfg(not(test))]
-                {
+                    array_targets,
+                    plan,
+                    receiver_type,
+                    index,
+                    any,
+                    error,
+                    string,
+                    undefined,
+                    &mut resolve_ordinary_property,
+                )?;
+                if indices.len() != 1 && resolution.diagnostic.is_some() {
                     return Err(SourceElementError::Unsupported(
                         SourceElementUnsupported::IndexType(index_type),
-                    ));
+                    )
+                    .into());
                 }
-            };
-            if resolutions
-                .iter()
-                .any(|resolution| resolution.from_index_signature)
-            {
-                ElementResolution::index_signature(type_)
-            } else {
-                ElementResolution::success(type_, None)
+                resolutions.push(resolution);
             }
-        }
-    };
+            if let [resolution] = resolutions.as_slice() {
+                *resolution
+            } else {
+                let values = resolutions
+                    .iter()
+                    .map(|resolution| resolution.type_)
+                    .collect::<Vec<_>>();
+                let type_ = if values.iter().all(|value| *value == values[0]) {
+                    values[0]
+                } else if let Some(global_types) = global_types {
+                    store
+                        .expression_union_type_with_global_types(
+                            global_types,
+                            &values,
+                            UnionReduction::Literal,
+                        )
+                        .map_err(SourceElementError::from)?
+                } else {
+                    #[cfg(test)]
+                    {
+                        store
+                            .expression_union_type(&values, UnionReduction::Literal)
+                            .map_err(SourceElementError::from)?
+                    }
+                    #[cfg(not(test))]
+                    {
+                        return Err(SourceElementError::Unsupported(
+                            SourceElementUnsupported::IndexType(index_type),
+                        )
+                        .into());
+                    }
+                };
+                if resolutions
+                    .iter()
+                    .any(|resolution| resolution.from_index_signature)
+                {
+                    ElementResolution::index_signature(type_)
+                } else {
+                    ElementResolution::success(type_, None)
+                }
+            }
+        };
 
     let type_ = if resolution.from_index_signature && !write {
         unchecked_index_read_type(store, global_types, options, plan.node, resolution.type_)?
@@ -1719,7 +1809,7 @@ fn optional_element_receiver(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_element_index(
+fn resolve_element_index<E, F>(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -1731,7 +1821,12 @@ fn resolve_element_index(
     error: TypeId,
     string: TypeId,
     undefined: TypeId,
-) -> Result<ElementResolution, SourceElementError> {
+    resolve_ordinary_property: &mut F,
+) -> Result<ElementResolution, E>
+where
+    E: From<SourceElementError>,
+    F: FnMut(&mut CanonicalTypeMapperStore, TypeId, &str) -> Result<Option<ResolvedOwnProperty>, E>,
+{
     Ok(if receiver_type == error {
         ElementResolution::success(error, None)
     } else if let Some(enumeration) =
@@ -1742,8 +1837,9 @@ fn resolve_element_index(
         ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
     } else if receiver_type == any {
         ElementResolution::success(any, None)
-    } else if let Some(array) =
-        store.canonical_array_reference_with_targets(array_targets, receiver_type)?
+    } else if let Some(array) = store
+        .canonical_array_reference_with_targets(array_targets, receiver_type)
+        .map_err(SourceElementError::from)?
     {
         if index.is_number_applicable() {
             ElementResolution::index_signature(array.element_type)
@@ -1774,6 +1870,7 @@ fn resolve_element_index(
             index,
             any,
             error,
+            resolve_ordinary_property,
         )?
     })
 }
@@ -2077,7 +2174,7 @@ fn resolve_tuple_element(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_object_element(
+fn resolve_object_element<E, F>(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -2086,7 +2183,12 @@ fn resolve_object_element(
     index: &ClassifiedIndex,
     any_type: TypeId,
     error_type: TypeId,
-) -> Result<ElementResolution, SourceElementError> {
+    resolve_ordinary_property: &mut F,
+) -> Result<ElementResolution, E>
+where
+    E: From<SourceElementError>,
+    F: FnMut(&mut CanonicalTypeMapperStore, TypeId, &str) -> Result<Option<ResolvedOwnProperty>, E>,
+{
     if matches!(index.shape, IndexShape::Invalid) {
         return Ok(ElementResolution::diagnostic(
             error_type,
@@ -2121,24 +2223,20 @@ fn resolve_object_element(
             });
         }
         let own = if callable {
-            Ok(None)
+            None
         } else {
-            store.resolved_own_property(receiver_type, name)
+            resolve_ordinary_property(store, receiver_type, name)?
         };
-        match own {
-            Ok(Some(property)) => {
-                let type_ = optional_element_read_type(
-                    store,
-                    global_types,
-                    plan.node,
-                    property.symbol,
-                    property.type_,
-                    property.optional,
-                )?;
-                return Ok(ElementResolution::success(type_, Some(property.symbol)));
-            }
-            Ok(None) | Err(RelationUnavailable::StructuredIndexInfos(_)) => {}
-            Err(error) => return Err(error.into()),
+        if let Some(property) = own {
+            let type_ = optional_element_read_type(
+                store,
+                global_types,
+                plan.node,
+                property.symbol,
+                property.type_,
+                property.optional,
+            )?;
+            return Ok(ElementResolution::success(type_, Some(property.symbol)));
         }
         if let Some(global_types) = global_types {
             for target in callable
@@ -2196,18 +2294,23 @@ fn resolve_object_element(
         };
         if let Some(union_members) = union_members {
             if union_members.is_empty() {
-                return Err(SourceElementError::InvalidType(receiver_type));
+                return Err(SourceElementError::InvalidType(receiver_type).into());
             }
             for member in union_members {
                 if resolved_index_signature_surface(store, member)?.is_some() {
                     return Err(SourceElementError::Unsupported(
                         SourceElementUnsupported::IndexSignatureSurface(receiver_type),
-                    ));
+                    )
+                    .into());
                 }
-                store.resolved_own_property(member, "")?;
+                store
+                    .resolved_own_property(member, "")
+                    .map_err(SourceElementError::from)?;
             }
         } else {
-            store.resolved_own_property(receiver_type, "")?;
+            store
+                .resolved_own_property(receiver_type, "")
+                .map_err(SourceElementError::from)?;
         }
     }
     Ok(ElementResolution::diagnostic(
@@ -6194,6 +6297,7 @@ mod tests {
                                 tuple,
                                 index,
                                 write,
+                                resolve_stored_source_element_property,
                             ),
                             Ok(CheckedSourceElement {
                                 type_: expected,

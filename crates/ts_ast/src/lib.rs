@@ -33,6 +33,70 @@ pub fn is_import_call(arena: &NodeArena, node: &Node) -> bool {
     }
 }
 
+/// Finds real `import.meta` syntax in a source tree, excluding `JSDoc` annotations.
+#[must_use]
+pub fn source_file_contains_import_meta(arena: &NodeArena, source_file: NodeId) -> bool {
+    if !matches!(
+        arena.get(source_file),
+        Some(Node {
+            kind: SyntaxKind::SourceFile,
+            data: NodeData::SourceFile(_),
+            ..
+        })
+    ) {
+        return false;
+    }
+    let mut pending = vec![source_file];
+    while let Some(id) = pending.pop() {
+        let Some(node) = arena.get(id) else {
+            continue;
+        };
+        if matches!(
+            node.kind,
+            SyntaxKind::JsTypeAliasDeclaration | SyntaxKind::JsImportDeclaration
+        ) || matches!(node.data, NodeData::JsDoc(_))
+        {
+            continue;
+        }
+        if matches!(
+            &node.data,
+            NodeData::MetaProperty(meta)
+                if node.kind == SyntaxKind::MetaProperty
+                    && meta.keyword_token == SyntaxKind::ImportKeyword
+                    && matches!(
+                        arena.get(meta.name),
+                        Some(Node { kind: SyntaxKind::Identifier, data: NodeData::Identifier(name), .. })
+                            if name.text == "meta"
+                    )
+        ) {
+            return true;
+        }
+        node.for_each_child(|child| {
+            let reparsed = arena
+                .get(child)
+                .is_some_and(|node| node.flags.0 & NodeFlags::REPARSED.0 != 0);
+            // Only these type edges contain attached JSDoc reparses. Other
+            // reparsed nodes and real TypeScript type expressions still count.
+            let jsdoc_annotation = reparsed
+                && match &node.data {
+                    NodeData::ArrowFunction(function) => {
+                        function.type_ == Some(child)
+                            || function
+                                .type_parameters
+                                .as_ref()
+                                .is_some_and(|parameters| parameters.nodes.contains(&child))
+                    }
+                    NodeData::ParameterDeclaration(parameter) => parameter.type_ == Some(child),
+                    _ => false,
+                };
+            if !jsdoc_annotation {
+                pending.push(child);
+            }
+        });
+    }
+    false
+}
+
 impl NodeData {
     /// Whether this generated node payload is structurally compatible with a
     /// syntax kind. Most schema names match directly; shared payloads and the

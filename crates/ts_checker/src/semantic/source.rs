@@ -212,10 +212,10 @@ use super::{
     },
     source_elements::{
         CheckedSourceElement, SourceElementError, SourceElementPlan, SourceElementUnsupported,
-        check_array_binding_element, check_computed_binding_element, check_direct_source_element,
-        check_direct_source_element_write, finish_direct_source_element_plan, is_array_like_type,
-        numeric_index_type, plan_direct_source_element_syntax,
-        plan_direct_source_element_write_syntax,
+        check_array_binding_element, check_computed_binding_element,
+        check_direct_source_element_with_source, check_direct_source_element_write,
+        finish_direct_source_element_plan, is_array_like_type, numeric_index_type,
+        plan_direct_source_element_syntax, plan_direct_source_element_write_syntax,
     },
     source_enums::{
         SourceEnumError, SourceEnumPlan, execute_local_const_enum, execute_local_enum,
@@ -529,6 +529,7 @@ pub enum SourceCheckError {
     Call(NodeRef),
     Enum(NodeRef),
     Import(NodeRef),
+    MetaProperty(super::SourceMetaError),
     Class(NodeRef),
     Property(NodeRef),
     Element(NodeRef),
@@ -560,6 +561,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::Call(node) => write!(formatter, "call checking failed at {node:?}"),
             Self::Enum(node) => write!(formatter, "enum checking failed at {node:?}"),
             Self::Import(node) => write!(formatter, "import checking failed at {node:?}"),
+            Self::MetaProperty(error) => write!(formatter, "{error}"),
             Self::Class(node) => write!(formatter, "class checking failed at {node:?}"),
             Self::Property(node) => write!(formatter, "property checking failed at {node:?}"),
             Self::Element(node) => write!(formatter, "element checking failed at {node:?}"),
@@ -591,6 +593,7 @@ impl std::error::Error for SourceCheckError {
             Self::LiteralCache(SourceLiteralCacheError::ArrayType(error))
             | Self::ArrayType(error) => Some(error),
             Self::DerivedType(error) => Some(error),
+            Self::MetaProperty(error) => Some(error),
             Self::Provenance(_)
             | Self::Unsupported(_)
             | Self::LiteralCache(_)
@@ -647,6 +650,18 @@ impl From<DerivedTypeError> for SourceCheckError {
 impl From<ArrayTypeError> for SourceCheckError {
     fn from(error: ArrayTypeError) -> Self {
         Self::ArrayType(error)
+    }
+}
+
+impl From<super::SourceMetaError> for SourceCheckError {
+    fn from(error: super::SourceMetaError) -> Self {
+        match error {
+            super::SourceMetaError::Declared(error)
+            | super::SourceMetaError::Global(
+                super::CanonicalGlobalTypeInitializationError::DeclaredType(error),
+            ) => Self::DeclaredType(error),
+            error => Self::MetaProperty(error),
+        }
     }
 }
 
@@ -864,6 +879,7 @@ pub(super) enum PlannedExpressionKind {
     Identifier(PlannedIdentifierRead),
     ClassReceiver(ClassAccessContext),
     TypeImportValueUse(PlannedSourceTypeImportValueUse),
+    ImportMeta(super::source_meta::PlannedImportMetaProperty),
     Parenthesized(Box<PlannedExpression>),
     Assertion {
         type_node: NodeRef,
@@ -2310,6 +2326,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
         &'semantic DeclaredTypeHost<'sources>,
     )>,
     array_targets: Option<CanonicalArrayTargets>,
+    meta_options: Option<CanonicalCheckerOptions>,
     class_type_context: Option<ClassTypeQueryContext>,
     hoisted_functions: HashSet<SemanticSymbolId>,
     prior_variables: HashSet<SemanticSymbolId>,
@@ -2362,6 +2379,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ambient_namespace_reads: Vec::new(),
             semantic: None,
             array_targets: None,
+            meta_options: None,
             class_type_context: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
@@ -2418,6 +2436,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ambient_namespace_reads: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
+            meta_options: None,
             class_type_context: None,
             hoisted_functions: HashSet::new(),
             prior_variables: HashSet::new(),
@@ -2450,6 +2469,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Self {
         let mut planner = Self::new_semantic(arena, bound, source, store, host);
         planner.array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+        planner.meta_options = Some(options);
         planner.class_type_context = Some(ClassTypeQueryContext::new(global_types, options));
         planner.allow_implicit_ambient_any = !options.no_implicit_any;
         planner.no_implicit_any = options.no_implicit_any;
@@ -4187,6 +4207,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SyntaxKind::Identifier
                             | SyntaxKind::StringLiteral
                             | SyntaxKind::RegularExpressionLiteral
+                            | SyntaxKind::MetaProperty
                             | SyntaxKind::PropertyAccessExpression
                             | SyntaxKind::NewExpression
                             | SyntaxKind::ParenthesizedExpression
@@ -7200,6 +7221,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             true
         } else {
             match &callee_node.data {
+                NodeData::MetaProperty(meta) => {
+                    callee_node.kind == SyntaxKind::MetaProperty
+                        && meta.keyword_token == SyntaxKind::ImportKeyword
+                        && matches!(self.arena.get(meta.name).map(|node| &node.data),
+                            Some(NodeData::Identifier(name)) if name.text != "defer")
+                }
                 NodeData::Identifier(identifier) => {
                     callee_node.kind == SyntaxKind::Identifier
                         && !identifier.text.is_empty()
@@ -21715,6 +21742,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::RegularExpression(type_),
                 ))
             }
+            SyntaxKind::MetaProperty
+                if matches!(&self.node(expression)?.data, NodeData::MetaProperty(meta)
+                    if meta.keyword_token == SyntaxKind::ImportKeyword) =>
+            {
+                let (store, host) = self
+                    .semantic
+                    .ok_or(super::SourceMetaError::MissingOptions(expression))?;
+                let options = self
+                    .meta_options
+                    .ok_or(super::SourceMetaError::MissingOptions(expression))?;
+                let plan = super::source_meta::plan_import_meta_property(
+                    store, host, expression, options,
+                )?;
+                Ok(PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::ImportMeta(plan),
+                ))
+            }
             SyntaxKind::NoSubstitutionTemplateLiteral => {
                 let value = {
                     let node = self.node(expression)?;
@@ -21953,6 +21998,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .extend(argument_nodes.iter().copied());
                 let callee = match syntax.callee_form() {
                     SourceCallCalleeForm::Identifier
+                    | SourceCallCalleeForm::MetaProperty
                     | SourceCallCalleeForm::ParenthesizedAsyncArrow => {
                         self.plan_expression(callee_node)?
                     }
@@ -25466,6 +25512,7 @@ fn class_expression_nodes(
             | PlannedExpressionKind::Null
             | PlannedExpressionKind::String(_)
             | PlannedExpressionKind::RegularExpression(_)
+            | PlannedExpressionKind::ImportMeta(_)
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
             | PlannedExpressionKind::Boolean(_)
@@ -25736,6 +25783,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
                 && primitive_binary_operand_plan_is_supported(&logical.right)
         }
         PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::SuperCall(_)
         | PlannedExpressionKind::RegularExpression(_)
@@ -25768,6 +25816,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
             conditional_scalar_operand_plan_is_supported(&binary.right)
         }
         PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::ClassReceiver(_)
         | PlannedExpressionKind::SuperCall(_)
         | PlannedExpressionKind::Template(_)
@@ -25826,6 +25875,7 @@ fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
         | PlannedExpressionKind::RegularExpression(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -26104,6 +26154,7 @@ fn preflight_inferred_function_return_dependencies(
             PlannedExpressionKind::Null
             | PlannedExpressionKind::String(_)
             | PlannedExpressionKind::RegularExpression(_)
+            | PlannedExpressionKind::ImportMeta(_)
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
             | PlannedExpressionKind::Boolean(_)
@@ -27057,7 +27108,8 @@ fn prepare_const_object_property(
         | (
             PlannedExpressionKind::Null
             | PlannedExpressionKind::GlobalUndefined
-            | PlannedExpressionKind::RegularExpression(_),
+            | PlannedExpressionKind::RegularExpression(_)
+            | PlannedExpressionKind::ImportMeta(_),
             PreparedExpression::Literal(_),
         ) => Ok(prepared.clone()),
         (
@@ -27093,6 +27145,10 @@ where
     ) -> Result<CheckedExpressionTypes, SourceCheckError>,
 {
     let types = match (&expression.kind, prepared) {
+        (
+            PlannedExpressionKind::ImportMeta(_),
+            PreparedExpression::Literal(LiteralTreatment::Identity),
+        ) => check_nested_expression(store, session, expression, None),
         (PlannedExpressionKind::ClassReceiver(_), PreparedExpression::ClassReceiver) => {
             check_nested_expression(store, session, expression, None)
         }
@@ -27515,9 +27571,7 @@ where
             PlannedExpressionKind::Property(property),
             PreparedExpression::Property(prepared_receiver),
         ) => {
-            if property.class_access_context().is_some()
-                || (global_types.is_some() && property.is_read())
-            {
+            if property.class_access_context().is_some() || global_types.is_some() {
                 return check_nested_expression(store, session, expression, None);
             }
             let receiver = execute_expression_types(
@@ -28693,6 +28747,7 @@ fn emit_uninitialized_variable_read_diagnostics(
         PlannedExpressionKind::Null
         | PlannedExpressionKind::String(_)
         | PlannedExpressionKind::RegularExpression(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -28749,7 +28804,7 @@ fn source_is_global_object_factory_method(host: &DeclaredTypeHost<'_>, node: Nod
     )
 }
 
-/// Whole-value reads still require the complete annotation before source execution.
+/// Constructor values keep full preparation when used outside Object factory calls.
 fn cross_file_global_uses_only_object_factory_calls(
     host: &DeclaredTypeHost<'_>,
     identifier_reads: &[(NodeRef, SemanticSymbolId)],
@@ -28789,6 +28844,57 @@ fn cross_file_global_uses_only_object_factory_calls(
         }
     }
     saw_read
+}
+
+/// Admits only interface members supported by the lazy ordinary-property path.
+fn cross_file_global_interface_supports_lazy_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    if store.source_computed_member_count(symbol) != Some(0) {
+        return false;
+    }
+    let mut saw_interface = false;
+    for declaration in declarations {
+        let Some(record) = host.node(*declaration) else {
+            return false;
+        };
+        match &record.data {
+            NodeData::InterfaceDeclaration(interface)
+                if record.kind == SyntaxKind::InterfaceDeclaration =>
+            {
+                saw_interface = true;
+                if interface.heritage_clauses.is_some()
+                    || interface.members.nodes.iter().any(|member| {
+                        host.node(NodeRef::new(declaration.arena, declaration.file, *member))
+                            .is_none_or(|member| {
+                                !matches!(
+                                    member.kind,
+                                    SyntaxKind::PropertyDeclaration
+                                        | SyntaxKind::PropertySignature
+                                        | SyntaxKind::MethodSignature
+                                )
+                            })
+                    })
+                {
+                    return false;
+                }
+            }
+            NodeData::VariableDeclaration(_)
+                if owner
+                    .flags()
+                    .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE) => {}
+            _ => return false,
+        }
+    }
+    saw_interface
 }
 
 fn emit_enum_use_before_declaration_diagnostics(
@@ -29057,6 +29163,24 @@ fn check_source_selected_method_property(
     }))
 }
 
+// Keep element recovery errors distinct from source dependency errors.
+enum SourceElementReadError {
+    Element(SourceElementError),
+    Source(SourceCheckError),
+}
+
+impl From<SourceElementError> for SourceElementReadError {
+    fn from(error: SourceElementError) -> Self {
+        Self::Element(error)
+    }
+}
+
+impl From<SourceCheckError> for SourceElementReadError {
+    fn from(error: SourceCheckError) -> Self {
+        Self::Source(error)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_expression_type(
     store: &mut CanonicalTypeMapperStore,
@@ -29227,6 +29351,18 @@ fn check_expression_type_with_class_context(
         return Ok(CheckedExpressionTypes::leaf(type_, type_));
     }
     match &expression.kind {
+        PlannedExpressionKind::ImportMeta(plan) => {
+            let type_ = super::source_meta::check_import_meta_property(
+                store,
+                host,
+                plan,
+                options,
+                diagnostics,
+            )?;
+            preflight_source_expression_cache(store, expression.node, type_)?;
+            publish_expression_type(store, expression.node, type_)?;
+            Ok(CheckedExpressionTypes::leaf(type_, type_))
+        }
         PlannedExpressionKind::Identifier(read)
             if read.kind == PlannedIdentifierReadKind::Function
                 && !current_flow_types.contains_key(&read.value_symbol) =>
@@ -29828,6 +29964,28 @@ fn check_expression_type_with_class_context(
                 receiver.result,
             )? {
                 checked
+            } else if property.class_access_context().is_none()
+                && super::source_properties::is_cold_direct_nongeneric_interface(
+                    store,
+                    receiver.result,
+                )
+            {
+                check_direct_source_property_with_source(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    property,
+                    receiver.result,
+                    session,
+                    diagnostics,
+                )
+                .map_err(|error| match error {
+                    SourcePropertyQueryError::Property(error) => {
+                        SourcePlanner::property_plan_error(expression.node, error)
+                    }
+                    SourcePropertyQueryError::Source(error) => error,
+                })?
             } else {
                 let mut demanded = HashSet::new();
                 loop {
@@ -29903,7 +30061,7 @@ fn check_expression_type_with_class_context(
             publish_expression_type(store, expression.node, checked.type_)?;
             Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
         }
-        PlannedExpressionKind::Property(property) if property.is_read() => {
+        PlannedExpressionKind::Property(property) => {
             let receiver = check_expression_type_with_class_context(
                 store,
                 host,
@@ -29983,7 +30141,7 @@ fn check_expression_type_with_class_context(
             )?;
             let mut demanded = HashSet::new();
             let checked = loop {
-                match check_direct_source_element(
+                match check_direct_source_element_with_source::<SourceElementReadError>(
                     store,
                     host,
                     global_types,
@@ -29991,11 +30149,13 @@ fn check_expression_type_with_class_context(
                     element,
                     receiver.result,
                     index.result,
+                    session,
+                    diagnostics,
                 ) {
                     Ok(checked) => break checked,
-                    Err(SourceElementError::Relation(
+                    Err(SourceElementReadError::Element(SourceElementError::Relation(
                         RelationUnavailable::UnresolvedPropertyType(symbol),
-                    )) if store
+                    ))) if store
                         .get_parent_of_symbol(symbol)
                         .and_then(|owner| store.declared_type_links(owner))
                         .and_then(|links| links.declared_type)
@@ -30014,11 +30174,11 @@ fn check_expression_type_with_class_context(
                             symbol,
                         )?;
                     }
-                    Err(
+                    Err(SourceElementReadError::Element(
                         error @ SourceElementError::Unsupported(
                             SourceElementUnsupported::IndexSignatureSurface(_),
                         ),
-                    ) => {
+                    )) => {
                         if let Some(checked) = recover_non_iterable_union_element(
                             store,
                             host,
@@ -30033,9 +30193,10 @@ fn check_expression_type_with_class_context(
                         }
                         return Err(SourcePlanner::element_plan_error(element.node, error));
                     }
-                    Err(error) => {
+                    Err(SourceElementReadError::Element(error)) => {
                         return Err(SourcePlanner::element_plan_error(element.node, error));
                     }
+                    Err(SourceElementReadError::Source(error)) => return Err(error),
                 }
             };
             if let Some(diagnostic) = checked.diagnostic {
@@ -31224,6 +31385,19 @@ fn check_expression_type_with_class_context(
             rendered_property_diagnostics
                 .try_reserve_exact(property_diagnostics.capacity())
                 .map_err(|_| SourceCheckError::Property(expression.node))?;
+            if let Some(contextual_type) = contextual_type
+                && matches!(&expression.kind, PlannedExpressionKind::Object { .. })
+            {
+                prepare_source_nongeneric_interface_members(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    contextual_type,
+                )?;
+            }
             let (prepared, tuple_contexts) = if let Some(contextual_type) = contextual_type {
                 if matches!(
                     &expression.kind,
@@ -31305,8 +31479,11 @@ fn check_expression_type_with_class_context(
                         let candidates = current_flow_types.values().copied().collect::<Vec<_>>();
                         retry_source_generic_member_failure(
                             store,
+                            host,
                             global_types,
+                            options,
                             session,
+                            diagnostics,
                             error,
                             &candidates,
                             &mut resolved_members,
@@ -34523,6 +34700,7 @@ fn syntactic_truthiness(
         | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
@@ -34569,6 +34747,7 @@ fn syntactic_nullishness(
         }
         PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::ImportMeta(_)
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
@@ -36129,8 +36308,11 @@ fn source_type_is_assignable_to(
             ) => {
                 retry_source_generic_member_failure(
                     store,
+                    host,
                     global_types,
+                    options,
                     session,
+                    diagnostics,
                     error,
                     &[source, target],
                     &mut resolved_members,
@@ -36152,10 +36334,81 @@ fn source_type_is_assignable_to(
     }
 }
 
+/// Resolves members only after a source operation needs a nongeneric interface.
+#[allow(clippy::too_many_arguments)] // Member demand retains the caller's complete query state.
+fn prepare_source_nongeneric_interface_members(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Ok(false);
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return Ok(false);
+    };
+    if record
+        .object_flags()
+        .intersects(ObjectFlags::CLASS | ObjectFlags::MEMBERS_RESOLVED)
+        || interface.declared_members_resolved
+        || interface.outer_type_parameter_count != 0
+        || interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.is_empty())
+    {
+        return Ok(false);
+    }
+    let owner = record
+        .symbol()
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_))?;
+    let flags = store
+        .symbol(owner)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_))?
+        .flags();
+    if !flags.contains(SymbolFlags::INTERFACE)
+        || flags.contains(SymbolFlags::CLASS)
+        || preflight_class_or_interface_reference(store, host, owner, flags)? != 0
+    {
+        return Ok(false);
+    }
+    if store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        != Some(type_)
+    {
+        return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+    }
+    let mut member_diagnostics = CanonicalCheckerDiagnostics::default();
+    let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut member_diagnostics,
+    )?
+    .get_declared_interface_for_source_check(owner);
+    merge_retry_diagnostics(diagnostics, member_diagnostics);
+    if resolved? != type_ {
+        return Err(RelationUnavailable::InvalidStructuredMembers(type_).into());
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)] // Lazy annotations retain the caller's complete query state.
 pub(super) fn retry_source_generic_member_failure(
     store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     error: RelationUnavailable,
     candidates: &[TypeId],
     resolved_members: &mut HashSet<TypeId>,
@@ -36164,14 +36417,27 @@ pub(super) fn retry_source_generic_member_failure(
     let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
     match error {
         RelationUnavailable::UnresolvedStructuredMembers(type_) => {
-            if !resolved_members.insert(type_)
-                || super::instantiated_members::resolve_members_with_array_targets_and_session(
-                    store,
-                    type_,
-                    array_targets,
-                    session,
-                )
-                .is_err()
+            if !resolved_members.insert(type_) {
+                return Err(error.into());
+            }
+            if prepare_source_nongeneric_interface_members(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                type_,
+            )? {
+                return Ok(());
+            }
+            if super::instantiated_members::resolve_members_with_array_targets_and_session(
+                store,
+                type_,
+                array_targets,
+                session,
+            )
+            .is_err()
             {
                 return Err(error.into());
             }
@@ -42551,8 +42817,11 @@ fn source_array_binding_is_array_like(
                 | RelationUnavailable::UnresolvedPropertyType(_)),
             )) => retry_source_generic_member_failure(
                 store,
+                host,
                 global_types,
+                options,
                 session,
+                diagnostics,
                 error,
                 &[receiver, global_types.any_readonly_array_type],
                 &mut members,
@@ -55540,6 +55809,22 @@ pub(super) fn check_source_file(
             lazy_cross_file_globals.insert(read.read.value_symbol);
         }
         session.reset_query();
+        if !lazy_cross_file_globals.contains(&read.read.value_symbol) {
+            let interface = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut type_import_preflight_diagnostics,
+            )?
+            .preflight_nongeneric_interface_reference_identity(read.type_node)?;
+            if interface.is_some_and(|symbol| {
+                cross_file_global_interface_supports_lazy_members(store, host, symbol)
+            }) {
+                lazy_cross_file_globals.insert(read.read.value_symbol);
+            }
+        }
         let query = CanonicalTypeQuery::new_with_global_types_and_session(
             store,
             host,
@@ -58157,7 +58442,31 @@ pub(super) fn check_source_file(
                                 None,
                             )?;
                         } else {
-                            check_planned_assignment(
+                            let signature = materialized_functions
+                                .get(index)
+                                .ok_or(SourceCheckError::Function(
+                                    SourceFunctionInvariant::InvalidStatementIndex(index),
+                                ))?
+                                .signature;
+                            let mut return_diagnostics = CanonicalCheckerDiagnostics::default();
+                            let expected = CanonicalTypeQuery::new_with_global_types_and_session(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                &mut return_diagnostics,
+                            )?
+                            .with_type_reference_alias_targets(
+                                type_import_capabilities
+                                    .get(&return_type)
+                                    .into_iter()
+                                    .flatten()
+                                    .copied(),
+                            )?
+                            .get_return_type_of_signature(signature);
+                            merge_retry_diagnostics(diagnostics, return_diagnostics);
+                            check_assignment_to_type(
                                 store,
                                 host,
                                 global_types,
@@ -58168,8 +58477,8 @@ pub(super) fn check_source_file(
                                 &body_flow_types,
                                 &preflighted_type_import_value_uses,
                                 &mut deferred,
-                                return_type,
-                                &[],
+                                expected?,
+                                None,
                                 expression,
                                 *statement,
                                 None,
@@ -74218,71 +74527,76 @@ mod tests {
             "const negative = -255n;",
         ));
         let file = FileId::new(9_834);
-        let mut context = context(
-            &[(file, &source)],
-            CanonicalCheckerOptions {
+        for target in [None, Some(ts_options::ScriptTarget::Es5)] {
+            let mut options = CanonicalCheckerOptions {
                 check_bigint_target: true,
                 ..CanonicalCheckerOptions::default()
-            },
-        );
+            };
+            if let Some(target) = target {
+                options.name_resolution.emit_target = target;
+            }
+            let mut context = context(&[(file, &source)], options);
 
-        context.check_source_file(file).unwrap();
+            context.check_source_file(file).unwrap();
 
-        let diagnostics = context.diagnostics().as_slice();
-        assert_eq!(diagnostics.len(), 4);
-        for (diagnostic, spelling) in diagnostics.iter().zip(["255n", "0xffn", "2_5_5n", "255n"]) {
-            assert_eq!(diagnostic.diagnostic.code(), 2737);
-            assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
-            assert_eq!(
-                diagnostic.diagnostic.render().unwrap(),
-                "BigInt literals are not available when targeting lower than ES2020.",
-            );
-        }
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), if target.is_some() { 4 } else { 0 });
+            for (diagnostic, spelling) in
+                diagnostics.iter().zip(["255n", "0xffn", "2_5_5n", "255n"])
+            {
+                assert_eq!(diagnostic.diagnostic.code(), 2737);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "BigInt literals are not available when targeting lower than ES2020.",
+                );
+            }
 
-        let positive = context
-            .store()
-            .intrinsic_bootstrap()
-            .and_then(|bootstrap| {
-                bootstrap.cached_bigint_literal_type(&PseudoBigInt::parse_valid("255n"))
-            })
-            .unwrap();
-        let negative = context
-            .store()
-            .intrinsic_bootstrap()
-            .and_then(|bootstrap| {
-                bootstrap.cached_bigint_literal_type(&PseudoBigInt::parse_valid("-255n"))
-            })
-            .unwrap();
-        let positive_fresh = context
-            .store()
-            .fresh_type_of_literal_type(positive)
-            .unwrap();
-        let negative_fresh = context
-            .store()
-            .fresh_type_of_literal_type(negative)
-            .unwrap();
-        for name in ["decimal", "hex", "separated"] {
-            assert_eq!(
-                variable_value_type(&context, &source, file, name),
-                positive_fresh,
-            );
-        }
-        assert_eq!(
-            variable_value_type(&context, &source, file, "negative"),
-            negative_fresh,
-        );
-        let alias = global_symbol(&context, "TypeOnly");
-        assert_eq!(
-            context
+            let positive = context
                 .store()
-                .type_alias_links(alias)
-                .and_then(|links| links.declared_type),
-            Some(positive),
-        );
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| {
+                    bootstrap.cached_bigint_literal_type(&PseudoBigInt::parse_valid("255n"))
+                })
+                .unwrap();
+            let negative = context
+                .store()
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| {
+                    bootstrap.cached_bigint_literal_type(&PseudoBigInt::parse_valid("-255n"))
+                })
+                .unwrap();
+            let positive_fresh = context
+                .store()
+                .fresh_type_of_literal_type(positive)
+                .unwrap();
+            let negative_fresh = context
+                .store()
+                .fresh_type_of_literal_type(negative)
+                .unwrap();
+            for name in ["decimal", "hex", "separated"] {
+                assert_eq!(
+                    variable_value_type(&context, &source, file, name),
+                    positive_fresh,
+                );
+            }
+            assert_eq!(
+                variable_value_type(&context, &source, file, "negative"),
+                negative_fresh,
+            );
+            let alias = global_symbol(&context, "TypeOnly");
+            assert_eq!(
+                context
+                    .store()
+                    .type_alias_links(alias)
+                    .and_then(|links| links.declared_type),
+                Some(positive),
+            );
 
-        let warm = observable_state(&context, file);
-        context.recheck_source_file(file).unwrap();
-        assert_eq!(observable_state(&context, file), warm);
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]
@@ -83951,6 +84265,129 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check public return queries before and after source checking.
+    fn imported_default_interface_returns_preserve_public_query_orders() {
+        let consumer = parsed(concat!(
+            "import { styled } from './factory'; ",
+            "export const value = styled();",
+        ));
+        let factory = parsed(concat!(
+            "import Color from './color'; ",
+            "export declare function styled(): Color;",
+        ));
+        let color = parsed("interface Color { c: string; } export default Color;");
+        let consumer_file = FileId::new(8_340);
+        let factory_file = FileId::new(8_341);
+        let color_file = FileId::new(8_342);
+        let files = [
+            (consumer_file, &consumer),
+            (factory_file, &factory),
+            (color_file, &color),
+        ];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 2,
+                },
+            ],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+        assert!(!is_type_checked(&context, factory_file));
+        assert!(!is_type_checked(&context, color_file));
+        let owner = function_symbol(&context, &factory, factory_file, "styled");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let expected = variable_value_type(&context, &consumer, consumer_file, "value");
+        let interface = color
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    color.arena.id(),
+                    color_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, color_bound) = context.file(color_file).unwrap();
+        let interface_symbol = color_bound.symbol(interface).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(interface_symbol)
+                .and_then(|links| links.declared_type),
+            Some(expected),
+        );
+
+        let check_return =
+            |context: &mut CanonicalCheckerContext<'_>, factory_checked, color_checked| {
+                assert_eq!(
+                    context.get_return_type_of_signature(signature),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    context.store().source_callable_type_for_owner(owner),
+                    Some(callable),
+                );
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(interface_symbol)
+                        .is_none()
+                );
+                assert_eq!(is_type_checked(context, factory_file), factory_checked);
+                assert_eq!(is_type_checked(context, color_file), color_checked);
+                assert!(context.diagnostics().is_empty());
+            };
+        let check_replays =
+            |context: &mut CanonicalCheckerContext<'_>, factory_checked, color_checked| {
+                let warm = observable_state(context, consumer_file);
+                for (before, after) in [(true, false), (false, true), (true, true)] {
+                    if before {
+                        check_return(context, factory_checked, color_checked);
+                    }
+                    context.recheck_source_file(consumer_file).unwrap();
+                    if after {
+                        check_return(context, factory_checked, color_checked);
+                    }
+                    assert_eq!(observable_state(context, consumer_file), warm);
+                    assert_eq!(is_type_checked(context, factory_file), factory_checked);
+                    assert_eq!(is_type_checked(context, color_file), color_checked);
+                    assert!(
+                        context
+                            .store()
+                            .value_symbol_links(interface_symbol)
+                            .is_none()
+                    );
+                    assert!(context.diagnostics().is_empty());
+                }
+            };
+
+        check_replays(&mut context, false, false);
+        context.check_source_file(factory_file).unwrap();
+        check_return(&mut context, true, false);
+        context.check_source_file(color_file).unwrap();
+        check_return(&mut context, true, true);
+        check_replays(&mut context, true, true);
+    }
+
+    #[test]
     fn default_exported_import_aliases_preserve_their_const_enum_identity() {
         let consumer = parsed(concat!(
             "import selected from './selected'; ",
@@ -90972,6 +91409,167 @@ class Foo2 {
         assert!(bivariant.diagnostics().is_empty());
         assert!(is_type_checked(&strict, relation_file));
         assert!(is_type_checked(&bivariant, relation_file));
+    }
+
+    #[test]
+    fn source_interface_returns_keep_unread_members_cold_on_replay() {
+        let declarations = parsed(concat!(
+            "interface Plain { read(): string; unread: number; } ",
+            "declare const current: Plain;",
+        ));
+        let source = parsed(concat!(
+            "function getValue(): Plain { return current; } ",
+            "const output = getValue().read();",
+        ));
+        let declaration_file = FileId::new(19_801);
+        let file = FileId::new(19_802);
+        let mut context = context_with_cross_file_global(
+            declaration_file,
+            &declarations,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            false,
+        );
+        let plain = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("Plain")
+            .unwrap();
+        let members = context.store().symbol(plain).unwrap().members().unwrap();
+        let table = context.store().symbol_table(members).unwrap();
+        let read = table.get_source("read").unwrap();
+        let unread = table.get_source("unread").unwrap();
+        for property in [read, unread] {
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type)
+                    .is_none(),
+            );
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, declaration_file));
+        let owner = function_symbol(&context, &source, file, "getValue");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let expected = context
+            .store()
+            .declared_type_links(plain)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(expected)
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "output"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        let warm = observable_state(&context, file);
+        for _ in 0..3 {
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(read)
+                    .and_then(|links| links.resolved_type)
+                    .is_some(),
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(unread)
+                    .and_then(|links| links.resolved_type)
+                    .is_none(),
+            );
+            mark_source_unchecked(&mut context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(expected)
+            );
+            assert_eq!(observable_state(&context, file), warm);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, declaration_file));
+        }
+    }
+
+    #[test]
+    fn source_interface_returns_check_scalar_and_object_values_on_replay() {
+        let declarations = parsed("interface Box { value: number; }");
+        let declaration_file = FileId::new(19_803);
+        let file = FileId::new(19_804);
+        for (text, expected_message, expected_node) in [
+            (
+                "function getValue(): Box { return 'bad'; }",
+                Some("Type 'string' is not assignable to type 'Box'."),
+                Some("return 'bad';"),
+            ),
+            (
+                "function getValue(): Box { return { value: 'bad' }; }",
+                Some("Type 'string' is not assignable to type 'number'."),
+                Some("value"),
+            ),
+            (
+                "function getValue(): Box { return { value: 1 }; }",
+                None,
+                None,
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context_with_cross_file_global(
+                declaration_file,
+                &declarations,
+                file,
+                &source,
+                CanonicalModuleState::Script,
+                CanonicalModuleState::Script,
+                false,
+            );
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            let warm = observable_state(&context, file);
+            for _ in 0..3 {
+                if let Some(expected_message) = expected_message {
+                    let [diagnostic] = context.diagnostics().as_slice() else {
+                        panic!("{text}: expected one return diagnostic");
+                    };
+                    assert_eq!(diagnostic.diagnostic.code(), 2322, "{text}");
+                    assert_eq!(
+                        diagnostic.diagnostic.render().unwrap(),
+                        expected_message,
+                        "{text}"
+                    );
+                    assert_eq!(
+                        Some(node_text(&source, diagnostic.node.unwrap())),
+                        expected_node,
+                        "{text}"
+                    );
+                } else {
+                    assert!(context.diagnostics().is_empty(), "{text}");
+                }
+                assert!(is_type_checked(&context, file), "{text}");
+                assert!(!is_type_checked(&context, declaration_file), "{text}");
+                mark_source_unchecked(&mut context, file);
+                context
+                    .check_source_file(file)
+                    .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+                assert_eq!(observable_state(&context, file), warm, "{text}");
+            }
+        }
     }
 
     #[test]
@@ -102248,55 +102846,64 @@ class Foo2 {
 
     #[test]
     fn configured_bigint_exponentiation_reports_target_diagnostics_and_publishes_bigint() {
-        for (index, (text, root, expected_literals)) in [
-            ("const value = 1n ** 2n;", "1n ** 2n", ["1n", "2n"]),
-            (
-                "let value = 1n; value **= 2n;",
-                "value **= 2n",
-                ["1n", "2n"],
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let source = parsed(text);
-            let file = FileId::new(9_835 + u32::try_from(index).unwrap());
-            let mut context = context(
-                &[(file, &source)],
-                CanonicalCheckerOptions {
+        for target in [None, Some(ts_options::ScriptTarget::Es5)] {
+            for (index, (text, root, expected_literals)) in [
+                ("const value = 1n ** 2n;", "1n ** 2n", ["1n", "2n"]),
+                (
+                    "let value = 1n; value **= 2n;",
+                    "value **= 2n",
+                    ["1n", "2n"],
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let source = parsed(text);
+                let file = FileId::new(9_835 + u32::try_from(index).unwrap());
+                let mut options = CanonicalCheckerOptions {
                     check_bigint_target: true,
                     ..CanonicalCheckerOptions::default()
-                },
-            );
+                };
+                if let Some(target) = target {
+                    options.name_resolution.emit_target = target;
+                }
+                let mut context = context(&[(file, &source)], options);
 
-            context.check_source_file(file).unwrap();
+                context.check_source_file(file).unwrap();
 
-            let diagnostics = context.diagnostics().as_slice();
-            assert_eq!(diagnostics.len(), 3, "{text}");
-            for (diagnostic, spelling) in diagnostics[..2].iter().zip(expected_literals) {
-                assert_eq!(diagnostic.diagnostic.code(), 2737, "{text}");
-                assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
+                let diagnostics = context.diagnostics().as_slice();
+                assert_eq!(
+                    diagnostics.len(),
+                    if target.is_some() { 3 } else { 0 },
+                    "{text}"
+                );
+                if target.is_some() {
+                    for (diagnostic, spelling) in diagnostics[..2].iter().zip(expected_literals) {
+                        assert_eq!(diagnostic.diagnostic.code(), 2737, "{text}");
+                        assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
+                    }
+                    assert_eq!(diagnostics[2].diagnostic.code(), 2791, "{text}");
+                    assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), root);
+                }
+
+                let expression = source
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        let node = NodeRef::new(source.arena.id(), file, node);
+                        (record.kind == SyntaxKind::BinaryExpression
+                            && node_text(&source, node) == root)
+                            .then_some(node)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    resolved_node_type(&context, expression),
+                    context.store().intrinsic_bootstrap().unwrap().bigint_type,
+                );
+                let warm = observable_state(&context, file);
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm);
             }
-            assert_eq!(diagnostics[2].diagnostic.code(), 2791, "{text}");
-            assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), root);
-
-            let expression = source
-                .arena
-                .iter()
-                .find_map(|(node, record)| {
-                    let node = NodeRef::new(source.arena.id(), file, node);
-                    (record.kind == SyntaxKind::BinaryExpression
-                        && node_text(&source, node) == root)
-                        .then_some(node)
-                })
-                .unwrap();
-            assert_eq!(
-                resolved_node_type(&context, expression),
-                context.store().intrinsic_bootstrap().unwrap().bigint_type,
-            );
-            let warm = observable_state(&context, file);
-            context.recheck_source_file(file).unwrap();
-            assert_eq!(observable_state(&context, file), warm);
         }
     }
 

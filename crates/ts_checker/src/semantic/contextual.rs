@@ -446,7 +446,8 @@ fn prepare_expression(
         PlannedExpressionKind::ClassReceiver(_) => PreparedExpression::ClassReceiver,
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
-        | PlannedExpressionKind::RegularExpression(_) => {
+        | PlannedExpressionKind::RegularExpression(_)
+        | PlannedExpressionKind::ImportMeta(_) => {
             PreparedExpression::Literal(LiteralTreatment::Identity)
         }
         PlannedExpressionKind::Identifier(read)

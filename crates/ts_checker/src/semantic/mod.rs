@@ -74,6 +74,9 @@ mod source_flow;
 mod source_functions;
 mod source_import_calls;
 mod source_imports;
+mod source_meta;
+#[cfg(test)]
+mod source_meta_invariants_wave152;
 mod source_namespaces;
 mod source_new;
 mod source_overloads;
@@ -182,6 +185,7 @@ pub use source::{
     SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
 };
 pub use source_functions::{SourceFunctionInvariant, SourceFunctionUnsupported};
+pub use source_meta::SourceMetaError;
 pub use store::SemanticStore;
 pub use symbol_display::SymbolDisplayError;
 pub use tuple_types::EmptyTupleTypeError;
