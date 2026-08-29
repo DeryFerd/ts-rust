@@ -7774,7 +7774,7 @@ mod tests {
                     property_recovery_store_counts(store),
                     store.instantiated_property_alias_callable_len(),
                     record.symbol(),
-                    record.data().clone(),
+                    format!("{:?}", record.data()),
                     (
                         signature.target(),
                         signature.mapper(),
