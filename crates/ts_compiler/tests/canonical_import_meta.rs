@@ -440,7 +440,8 @@ fn import_meta_config_defaults_keep_explicit_modules_and_raw_inputs() {
         (None, ModuleKind::None, None),
         (Some("commonjs"), ModuleKind::CommonJs, Some(1343)),
         (Some("es2015"), ModuleKind::Es2015, Some(1343)),
-        (Some("system"), ModuleKind::System, None),
+        // System permits import.meta, but its Bundler default reports 5095.
+        (Some("system"), ModuleKind::System, Some(5095)),
         (Some("esnext"), ModuleKind::EsNext, None),
     ] {
         let fs = MemoryFileSystem::new(true);
@@ -454,6 +455,7 @@ fn import_meta_config_defaults_keep_explicit_modules_and_raw_inputs() {
             config["compilerOptions"]["module"] = serde_json::json!(module);
         }
         assert!(config["compilerOptions"].get("target").is_none());
+        assert!(config["compilerOptions"].get("moduleResolution").is_none());
         assert_eq!(
             config["compilerOptions"].get("module").is_some(),
             configured.is_some()
@@ -468,6 +470,12 @@ fn import_meta_config_defaults_keep_explicit_modules_and_raw_inputs() {
                 assert_eq!(program.options().target, ScriptTarget::Es2025);
                 assert_eq!(program.options().module, module);
                 assert_eq!(program.options().module_specified, configured.is_some());
+                assert_eq!(
+                    program.options().module_resolution,
+                    ModuleResolutionKind::Bundler
+                );
+                assert_eq!(program.options().module_resolution_configured, None);
+                assert!(program.options().resolve_json_module);
                 assert!(!program.options().no_check);
                 let (expression, name) = meta_nodes(program, "/project/main.ts")[0];
                 let type_ = queries.get_type_at_location(expression).unwrap();
