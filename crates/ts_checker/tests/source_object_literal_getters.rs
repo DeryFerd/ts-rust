@@ -118,7 +118,7 @@ fn only_node(parsed: &ParseResult, kind: SyntaxKind) -> NodeRef {
     node
 }
 
-fn name<'a>(parsed: &'a ParseResult, node: NodeRef) -> &'a str {
+fn name(parsed: &ParseResult, node: NodeRef) -> &str {
     let NodeData::Identifier(identifier) = &parsed.arena.get(node.node).unwrap().data else {
         panic!("the control uses an ordinary identifier");
     };

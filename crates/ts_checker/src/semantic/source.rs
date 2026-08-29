@@ -13698,6 +13698,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some((store, host)) = self.semantic else {
             return Err(Self::unsupported_function_body(callable));
         };
+        let mut conditions = Vec::new();
+        for local in &locals {
+            if let PlannedVariableInitializer::Expression(expression) = &local.initializer {
+                collect_eager_logical_truthiness_conditions(expression, &mut conditions);
+            }
+        }
+        for statement in &statements {
+            match statement {
+                PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
+                    collect_eager_logical_truthiness_conditions(&assignment.right, &mut conditions);
+                }
+                PlannedLinearFunctionStatement::CapturedAssignment(assignment) => {
+                    collect_eager_logical_truthiness_conditions(&assignment.right, &mut conditions);
+                }
+                PlannedLinearFunctionStatement::Expression { expression, .. }
+                | PlannedLinearFunctionStatement::Throw { expression, .. } => {
+                    collect_eager_logical_truthiness_conditions(expression, &mut conditions);
+                }
+                PlannedLinearFunctionStatement::Local(_)
+                | PlannedLinearFunctionStatement::Function(_)
+                | PlannedLinearFunctionStatement::Enum(_) => {}
+            }
+        }
+        if let Some(expression) = &return_expression {
+            collect_eager_logical_truthiness_conditions(expression, &mut conditions);
+        }
         let capture_assignments = collect_callable_capture_assignments(
             store,
             host,
@@ -13736,13 +13762,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             )
         });
         let flow = if has_captured_assignment || !captured_array_mutations.is_empty() {
-            SourceFlowPlan::preflight_linear_with_captured_effects(
+            SourceFlowPlan::preflight_linear_with_conditions_and_captured_effects(
                 self.arena,
                 self.bound,
                 store,
                 host,
                 callable.declaration,
                 points,
+                conditions,
                 assignments,
                 parameter_assignments,
                 calls,
@@ -13756,12 +13783,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 captured_array_mutations.iter().copied(),
             )
         } else if logical_statements.is_empty() {
-            SourceFlowPlan::preflight_linear(
+            SourceFlowPlan::preflight_linear_with_conditions(
                 self.arena,
                 self.bound,
                 store,
                 callable.declaration,
                 points,
+                conditions,
                 assignments,
                 parameter_assignments,
                 calls,
@@ -26768,6 +26796,91 @@ fn planned_expression_reads_symbol(
             planned_expression_reads_symbol(inner, symbol)
         }
         _ => false,
+    }
+}
+
+/// Logical operands use their planned binding. Deferred bodies own separate flow graphs.
+fn collect_eager_logical_truthiness_conditions(
+    expression: &PlannedExpression,
+    conditions: &mut Vec<SourceTruthinessCondition>,
+) {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match &expression.kind {
+            PlannedExpressionKind::Logical(binary) => {
+                if matches!(
+                    binary.operator,
+                    SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken
+                ) {
+                    for operand in [&binary.left, &binary.right] {
+                        let reference = operand.unparenthesized();
+                        if !reference.non_null_assertion
+                            && !reference.awaited
+                            && reference.promise_call.is_none()
+                            && reference.jsdoc_type.is_none()
+                            && let PlannedExpressionKind::Identifier(read) = &reference.kind
+                            && read.kind == PlannedIdentifierReadKind::Variable
+                        {
+                            conditions.push(SourceTruthinessCondition {
+                                expression: operand.node,
+                                symbol: read.value_symbol,
+                                negated: false,
+                            });
+                        }
+                    }
+                }
+                pending.push(&binary.right);
+                pending.push(&binary.left);
+            }
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
+            PlannedExpressionKind::Array(elements) => pending.extend(elements),
+            PlannedExpressionKind::Object { properties, .. } => {
+                pending.extend(
+                    properties
+                        .iter()
+                        .filter_map(PlannedObjectMember::eager_expression),
+                );
+                pending.extend(&expression.object_spreads);
+                pending.extend(&expression.object_computed_keys);
+            }
+            PlannedExpressionKind::Property(property) => pending.push(&property.receiver),
+            PlannedExpressionKind::Element(element) => {
+                pending.push(&element.index);
+                pending.push(&element.receiver);
+            }
+            PlannedExpressionKind::Call(call) => {
+                pending.extend(&call.arguments);
+                pending.push(&call.callee);
+            }
+            PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments()),
+            PlannedExpressionKind::ImportCall(call) => pending.push(&call.specifier),
+            PlannedExpressionKind::Binary(binary) => {
+                pending.extend(binary.prefix.iter().map(|step| &step.right));
+                pending.extend(binary.shorthand_assignment_initializer());
+                pending.push(&binary.right);
+                pending.push(&binary.left);
+            }
+            PlannedExpressionKind::Conditional(conditional) => {
+                pending.push(&conditional.when_false);
+                pending.push(&conditional.when_true);
+                pending.push(&conditional.condition);
+            }
+            PlannedExpressionKind::Template(template) => pending.extend(&template.substitutions),
+            PlannedExpressionKind::Null
+            | PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::RegularExpression(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::GlobalUndefined
+            | PlannedExpressionKind::Identifier(_)
+            | PlannedExpressionKind::ClassReceiver(_)
+            | PlannedExpressionKind::TypeImportValueUse(_)
+            | PlannedExpressionKind::ImportMeta(_)
+            | PlannedExpressionKind::Arrow(_)
+            | PlannedExpressionKind::New(_) => {}
+        }
     }
 }
 
@@ -68530,6 +68643,86 @@ mod tests {
             );
             assert_eq!(context.store().type_node_links(call), Some(&call_type));
             assert_eq!(context.store().signature_links(call), Some(&call_signature));
+        }
+    }
+
+    #[test]
+    fn source_object_literal_getters_keep_logical_joins_out_of_deferred_bodies() {
+        for (index, (right, has_getter)) in [
+            ("{ now: value }", false),
+            ("{ now: value, get read() { return value; } }", true),
+            (
+                "{ now: value, get read() { return value && value; } }",
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "var value: number | false = 1; \
+                 export default <T>(seed: T): T => {{ \
+                 const result = (value) && {right}; const later = value; return seed; }};",
+            ));
+            let file = FileId::new(202_310 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let declared = variable_value_type(&context, &source, file, "value");
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let eager = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::PropertyAssignment(property) => {
+                        Some(NodeRef::new(source.arena.id(), file, property.initializer))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let later = variable_initializer(&source, file, "later");
+            assert_eq!(resolved_node_type(&context, eager), number);
+            assert_eq!(resolved_node_type(&context, later), declared);
+            let getter = source.arena.iter().find_map(|(node, record)| {
+                (record.kind == SyntaxKind::GetAccessor).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            });
+            assert_eq!(getter.is_some(), has_getter);
+            if let Some(getter) = getter {
+                let symbol = context.file(file).unwrap().1.symbol(getter).unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(declared),
+                );
+            }
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm);
+                assert_eq!(resolved_node_type(&context, eager), number);
+                assert_eq!(resolved_node_type(&context, later), declared);
+            }
         }
     }
 

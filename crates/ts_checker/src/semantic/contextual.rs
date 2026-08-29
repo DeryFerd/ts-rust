@@ -21,6 +21,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     callables::{StoredSingleCallableValidation, validate_stored_single_callable},
     declared::cached_ordinary_type_parameter_owner,
+    instantiated_members::{GenericInterfaceMemberError, validated_generic_interface_type_edges},
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
@@ -409,6 +410,29 @@ fn preflight_contextual_type_graph(
                 }
                 return Ok(());
             }
+            if matches!(
+                store.type_payload(contextual_type).map(TypeRecord::data),
+                Some(TypeData::TypeReference(_))
+            ) {
+                validate_contextual_union(store, global_types, contextual_type)?;
+                let edges = validated_generic_interface_type_edges(
+                    store,
+                    contextual_type,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                )
+                .map_err(|error| contextual_generic_reference_error(contextual_type, error))?;
+                for edge in edges {
+                    preflight_contextual_type_graph(
+                        store,
+                        host,
+                        global_types,
+                        edge,
+                        validated,
+                        visiting,
+                    )?;
+                }
+                return Ok(());
+            }
             let contextual =
                 resolve_contextual_property_object(store, host, global_types, contextual_type)?
                     .ok_or(RelationUnavailable::UnsupportedStructuredType(
@@ -441,6 +465,32 @@ fn preflight_contextual_type_graph(
         validated.insert(contextual_type);
     }
     result
+}
+
+fn contextual_generic_reference_error(
+    reference: TypeId,
+    error: GenericInterfaceMemberError,
+) -> SourceCheckError {
+    let error = match error {
+        GenericInterfaceMemberError::UnsupportedTarget(type_)
+        | GenericInterfaceMemberError::UnsupportedPropertyType(type_) => {
+            RelationUnavailable::UnsupportedStructuredType(type_)
+        }
+        GenericInterfaceMemberError::UnsupportedMember(symbol) => {
+            RelationUnavailable::UnsupportedProperty(symbol)
+        }
+        GenericInterfaceMemberError::Capacity(type_) => {
+            RelationUnavailable::UnionValidationCapacity(type_)
+        }
+        GenericInterfaceMemberError::Reference(_)
+        | GenericInterfaceMemberError::InvalidTarget(_)
+        | GenericInterfaceMemberError::InvalidMember(_)
+        | GenericInterfaceMemberError::InvalidCachedMembers(_)
+        | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+            RelationUnavailable::InvalidStructuredMembers(reference)
+        }
+    };
+    error.into()
 }
 
 fn prepare_expression(
@@ -1810,6 +1860,600 @@ mod tests {
                     .map(|type_| (node, type_))
             })
             .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the same unexecuted getter against cold, warm, and damaged target graphs.
+    fn nested_generic_context_keeps_hidden_arrays_and_rejects_changed_caches() {
+        use crate::semantic::{
+            ValueSymbolLinks,
+            instantiate::{InstantiationLimits, InstantiationSession},
+            instantiated_members::{
+                demand_instantiated_property_type, resolve_members_with_array_targets_and_session,
+                validate_generic_interface_members,
+            },
+            reference_types::validate_direct_generic_reference,
+        };
+
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Observer<T> { value: T; fixed: number[] } ",
+            "declare const other: Observer<number>;",
+        ));
+        let source = parse_source_file(concat!(
+            "const value: { observer: Observer<string> } = ",
+            "{ get observer() { return 1; } };",
+        ));
+        let declaration_file = FileId::new(202_321);
+        let file = FileId::new(202_322);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file) in [(&declarations, declaration_file), (&source, file)] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/contextual-generic-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [
+                (declaration_file, &declarations.arena),
+                (file, &source.arena),
+            ]
+            .into_iter()
+            .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(declaration_file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let (annotation, object) = mapped_record_nodes(&source, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let reference = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Object(object) => context
+                .store()
+                .value_symbol_links(object.structured.properties.as_deref().unwrap()[0])
+                .unwrap()
+                .resolved_type
+                .unwrap(),
+            _ => panic!("the written return shape must be a type literal"),
+        };
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let direct = validate_direct_generic_reference(context.store(), reference).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(direct.type_arguments, [string]);
+        assert_eq!(
+            validate_generic_interface_members(context.store(), reference, targets),
+            Ok(None)
+        );
+        let other_annotation = declarations
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    variable.type_?,
+                ))
+            })
+            .unwrap();
+        let other = context.get_type_from_type_node(other_annotation).unwrap();
+        let declaration_bound = context.file(declaration_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([
+            (&declarations.arena, &declaration_bound),
+            (&source.arena, &bound),
+        ])
+        .unwrap();
+        let plan =
+            super::super::object_members::plan_object_literal(context.store(), &host, object)
+                .unwrap();
+        let [getter] = plan.object_literal_getters.as_slice() else {
+            panic!("one source getter must retain its cold body")
+        };
+        let getter = getter.clone();
+        let expression = PlannedExpression::new(
+            object,
+            PlannedExpressionKind::Object {
+                properties: vec![PlannedObjectMember::Getter {
+                    getter: getter.clone(),
+                    expression: PlannedExpression::new(
+                        getter.return_expression,
+                        PlannedExpressionKind::Number {
+                            value: ts_jsnum::Number::new(1.0),
+                            unary_operand: None,
+                        },
+                    ),
+                }],
+                plan,
+            },
+        );
+        let expected = PreparedExpression::Object(vec![PreparedObjectMember::Getter]);
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                [
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.type_resolution_len(),
+            )
+        };
+        let unpublished = |store: &CanonicalTypeMapperStore| {
+            assert!(store.type_node_links(object).is_none());
+            assert!(store.type_node_links(getter.return_expression).is_none());
+            assert!(store.signature_links(getter.declaration).is_none());
+            assert!(store.value_symbol_links(getter.symbol).is_none());
+        };
+        let store = context.store_mut_for_test();
+        let cold = snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Ok(expected.clone())
+            );
+            assert_eq!(snapshot(store), cold);
+            unpublished(store);
+        }
+        assert_eq!(
+            resolve_contextual_property_object(store, &host, None, reference),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnsupportedStructuredType(reference)
+            ))
+        );
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                reference,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnsupportedStructuredType(reference)
+            ))
+        );
+        assert_eq!(snapshot(store), cold);
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let members =
+            resolve_members_with_array_targets_and_session(store, reference, targets, &mut session)
+                .unwrap();
+        let proxy = store
+            .symbol_table(members.members().unwrap())
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        let fixed = store
+            .symbol_table(members.members().unwrap())
+            .unwrap()
+            .get_source("fixed")
+            .unwrap();
+        let fixed_type = store
+            .value_symbol_links(fixed)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            demand_instantiated_property_type(store, reference, proxy, targets, &mut session),
+            Ok(string)
+        );
+        let other_members =
+            resolve_members_with_array_targets_and_session(store, other, targets, &mut session)
+                .unwrap();
+        let wrong_mapper = other_members.mapper().unwrap();
+        let original = store.value_symbol_links(proxy).unwrap().clone();
+        assert_ne!(original.mapper, Some(wrong_mapper));
+        let caller_state = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        assert!(session.total_count() > 0);
+        let warm = snapshot(store);
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Ok(expected.clone())
+        );
+        assert_eq!(snapshot(store), warm);
+        unpublished(store);
+
+        let mut wrong_globals = globals.clone();
+        wrong_globals.array_type = globals.readonly_array_type;
+        for (global_types, expected_error) in [
+            (
+                None,
+                RelationUnavailable::UnsupportedUnionConstituent(fixed_type),
+            ),
+            (
+                Some(&wrong_globals),
+                RelationUnavailable::UnsupportedStructuredType(fixed_type),
+            ),
+        ] {
+            assert_eq!(
+                prepare_expression_context_worker(
+                    store,
+                    &host,
+                    global_types,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Err(SourceCheckError::RelationUnavailable(expected_error))
+            );
+            assert_eq!(snapshot(store), warm);
+            unpublished(store);
+        }
+        for poisoned in [
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                target: Some(fixed),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                mapper: Some(wrong_mapper),
+                ..original.clone()
+            },
+        ] {
+            assert!(store.set_value_symbol_links(proxy, poisoned));
+            let poisoned = snapshot(store);
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::InvalidStructuredMembers(reference)
+                ))
+            );
+            assert_eq!(snapshot(store), poisoned);
+            unpublished(store);
+            assert!(store.set_value_symbol_links(proxy, original.clone()));
+        }
+        let template = original.target.unwrap();
+        let original_template = store.value_symbol_links(template).unwrap().clone();
+        assert!(store.set_value_symbol_links(
+            template,
+            ValueSymbolLinks {
+                resolved_type: None,
+                ..original_template.clone()
+            }
+        ));
+        let poisoned = snapshot(store);
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(reference)
+            ))
+        );
+        assert_eq!(snapshot(store), poisoned);
+        unpublished(store);
+        assert!(store.set_value_symbol_links(template, original_template));
+        for _ in 0..2 {
+            let before = snapshot(store);
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Ok(expected.clone())
+            );
+            assert_eq!(snapshot(store), before);
+            unpublished(store);
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark()
+            ),
+            caller_state
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A fixed method return must not hide its array behind a callable edge.
+    fn nested_generic_context_preserves_method_return_array_capabilities() {
+        use crate::semantic::callable_sets::{
+            StoredCallableSetValidation, validate_stored_callable_set,
+        };
+
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Observer<T> { value: T; read(): number[] }",
+        ));
+        let source = parse_source_file(concat!(
+            "const value: { observer: Observer<string> } = ",
+            "{ get observer() { return 1; } };",
+        ));
+        let declaration_file = FileId::new(202_323);
+        let file = FileId::new(202_324);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file) in [(&declarations, declaration_file), (&source, file)] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/contextual-method-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [
+                (declaration_file, &declarations.arena),
+                (file, &source.arena),
+            ]
+            .into_iter()
+            .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(declaration_file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let (annotation, object) = mapped_record_nodes(&source, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let reference = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Object(object) => context
+                .store()
+                .value_symbol_links(object.structured.properties.as_deref().unwrap()[0])
+                .unwrap()
+                .resolved_type
+                .unwrap(),
+            _ => panic!("the written context must be a type literal"),
+        };
+        let declaration_bound = context.file(declaration_file).unwrap().1.clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let method = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let method_symbol = declaration_bound.symbol(method).unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(method_symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let StoredCallableSetValidation::Valid {
+            projection, edges, ..
+        } = validate_stored_callable_set(context.store(), callable)
+        else {
+            panic!("source checking must publish the actual declared method provider")
+        };
+        let [method] = projection.call_signatures.as_ref() else {
+            panic!("read has one declared signature")
+        };
+        let signature = method.signature;
+        let array = method.return_type.unwrap();
+        assert!(edges.contains(&array));
+        let globals = context.global_types().clone();
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(&globals, array)
+                .unwrap(),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+        );
+        let host = DeclaredTypeHost::new([
+            (&declarations.arena, &declaration_bound),
+            (&source.arena, &bound),
+        ])
+        .unwrap();
+        let plan =
+            super::super::object_members::plan_object_literal(context.store(), &host, object)
+                .unwrap();
+        let [getter] = plan.object_literal_getters.as_slice() else {
+            panic!("one source getter must stay unexecuted")
+        };
+        let getter = getter.clone();
+        let expression = PlannedExpression::new(
+            object,
+            PlannedExpressionKind::Object {
+                properties: vec![PlannedObjectMember::Getter {
+                    getter: getter.clone(),
+                    expression: PlannedExpression::new(
+                        getter.return_expression,
+                        PlannedExpressionKind::Number {
+                            value: ts_jsnum::Number::new(1.0),
+                            unary_operand: None,
+                        },
+                    ),
+                }],
+                plan,
+            },
+        );
+        let expected = PreparedExpression::Object(vec![PreparedObjectMember::Getter]);
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                [
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.type_resolution_len(),
+            )
+        };
+        let unpublished = |store: &CanonicalTypeMapperStore| {
+            assert!(store.type_node_links(object).is_none());
+            assert!(store.type_node_links(getter.return_expression).is_none());
+            assert!(store.signature_links(getter.declaration).is_none());
+            assert!(store.value_symbol_links(getter.symbol).is_none());
+        };
+        let store = context.store_mut_for_test();
+        let before = snapshot(store);
+        let generic_edges = validated_generic_interface_type_edges(
+            store,
+            reference,
+            Some(CanonicalArrayTargets::from_global_types(&globals)),
+        )
+        .unwrap();
+        assert!(generic_edges.contains(&callable));
+        assert!(generic_edges.contains(&array));
+        assert_eq!(snapshot(store), before);
+        for _ in 0..2 {
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Ok(expected.clone())
+            );
+            assert_eq!(snapshot(store), before);
+            unpublished(store);
+        }
+        let mut wrong_globals = globals.clone();
+        wrong_globals.array_type = globals.readonly_array_type;
+        for (global_types, expected_error) in [
+            (
+                None,
+                RelationUnavailable::UnsupportedUnionConstituent(array),
+            ),
+            (
+                Some(&wrong_globals),
+                RelationUnavailable::UnsupportedStructuredType(array),
+            ),
+        ] {
+            assert_eq!(
+                prepare_expression_context_worker(
+                    store,
+                    &host,
+                    global_types,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Err(SourceCheckError::RelationUnavailable(expected_error))
+            );
+            assert_eq!(snapshot(store), before);
+            unpublished(store);
+        }
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(store.set_signature_resolved_return_type(signature, Some(string)));
+        assert!(matches!(
+            validate_stored_callable_set(store, callable),
+            StoredCallableSetValidation::Malformed { .. }
+        ));
+        let poisoned = snapshot(store);
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(reference)
+            ))
+        );
+        assert_eq!(snapshot(store), poisoned);
+        unpublished(store);
+        assert!(store.set_signature_resolved_return_type(signature, Some(array)));
+        let restored = snapshot(store);
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Ok(expected)
+        );
+        assert_eq!(snapshot(store), restored);
+        unpublished(store);
     }
 
     #[test]

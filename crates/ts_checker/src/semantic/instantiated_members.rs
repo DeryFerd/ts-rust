@@ -27,7 +27,7 @@ use super::{
     array_types::{CanonicalArrayReference, CanonicalArrayTargets},
     callable_sets::{
         CallableSetProjection, StoredCallableSetValidation, instantiated_method_type_matches,
-        validated_instantiated_method_mapper,
+        validate_stored_callable_set, validated_instantiated_method_mapper,
     },
     callables::{
         CallableFamily, ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay,
@@ -2809,6 +2809,106 @@ pub(super) fn validate_generic_interface_members(
 ) -> Result<Option<InstantiatedInterfaceMembers>, GenericInterfaceMemberError> {
     let shape = validate_shape(store, reference, array_targets)?;
     validate_warm_members(store, &shape, array_targets)
+}
+
+/// Returns argument and member type edges without resolving cold tables or values.
+pub(super) fn validated_generic_interface_type_edges(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<TypeId>, GenericInterfaceMemberError> {
+    let shape = validate_shape(store, reference, array_targets)?;
+    let mut edges = Vec::new();
+    append_validated_generic_interface_type_edges(store, &shape, array_targets, &mut edges)?;
+    if shape.target != reference {
+        let target = validate_shape(store, shape.target, array_targets)?;
+        append_validated_generic_interface_type_edges(store, &target, array_targets, &mut edges)?;
+    }
+    append_validated_generic_callable_type_edges(store, reference, &mut edges)?;
+    Ok(edges)
+}
+
+fn append_validated_generic_callable_type_edges(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+    edges: &mut Vec<TypeId>,
+) -> Result<(), GenericInterfaceMemberError> {
+    let mut visited = HashSet::new();
+    let mut next = 0;
+    while let Some(&type_) = edges.get(next) {
+        next += 1;
+        if !visited.insert(type_) {
+            continue;
+        }
+        match validate_stored_callable_set(store, type_) {
+            StoredCallableSetValidation::Valid {
+                edges: dependencies,
+                ..
+            } => edges.extend(dependencies),
+            // A pending callable still needs its source owner to resolve it.
+            StoredCallableSetValidation::Pending { .. } => {
+                return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+            }
+            StoredCallableSetValidation::Malformed { .. } => {
+                return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
+            }
+            StoredCallableSetValidation::NotCallable => {
+                let record = store
+                    .type_payload(type_)
+                    .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(reference))?;
+                if record.data().structured().is_some_and(|structured| {
+                    structured.signatures.is_some() || structured.call_signature_count != 0
+                }) {
+                    return Err(GenericInterfaceMemberError::UnsupportedPropertyType(type_));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_validated_generic_interface_type_edges(
+    store: &CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+    edges: &mut Vec<TypeId>,
+) -> Result<(), GenericInterfaceMemberError> {
+    let warm = validate_warm_members(store, shape, array_targets)?;
+    edges.extend_from_slice(&shape.target_arguments);
+    edges.extend_from_slice(&shape.base_types);
+    edges.extend(shape.properties.iter().map(|property| property.type_));
+    for &symbol in shape
+        .inherited_properties
+        .iter()
+        .chain(warm.iter().flat_map(|members| members.properties()))
+    {
+        let links = store
+            .value_symbol_links(symbol)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(symbol))?;
+        // Only an exact unresolved proxy may have no value after the shared proof.
+        edges.extend(links.resolved_type);
+    }
+    let structured = store
+        .type_payload(shape.reference)
+        .and_then(|record| record.data().structured())
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+            shape.reference,
+        ))?;
+    for &index in shape
+        .index_infos
+        .iter()
+        .chain(&shape.inherited_index_infos)
+        .chain(structured.index_infos.as_deref().unwrap_or_default())
+    {
+        let info =
+            store
+                .index_info(index)
+                .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                    shape.reference,
+                ))?;
+        edges.extend([info.key_type(), info.value_type()]);
+    }
+    Ok(())
 }
 
 pub(super) fn resolve_property_with_array_targets(
@@ -8617,6 +8717,166 @@ mod tests {
             .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
             .unwrap();
         context.get_type_from_type_node(annotation).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare cold templates with the same reference's published values.
+    fn generic_interface_type_edges_preserve_cold_templates_and_warm_values() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { inherited: T } ",
+            "interface Observer<T> extends Base<T> { value: T; fixed: number[] } ",
+            "interface Indexed<T> { readonly [key: string]: T[] } ",
+            "interface Phantom<T> { fixed: number[] } ",
+            "declare const observer: Observer<string>; declare const indexed: Indexed<string>;",
+            "declare const phantom: Phantom<boolean>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_320);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let boolean = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        for (name, argument) in [
+            ("observer", string),
+            ("indexed", string),
+            ("phantom", boolean),
+        ] {
+            let reference = property_object_alias_variable_type(&parsed, file, &mut context, name);
+            let shape = validate_shape(context.store(), reference, targets).unwrap();
+            assert_eq!(shape.target_arguments, [argument]);
+            assert_eq!(
+                validate_generic_interface_members(context.store(), reference, targets),
+                Ok(None)
+            );
+            let before = (
+                property_recovery_store_counts(context.store()),
+                context.store().relation_state_snapshot(),
+                context.store().type_resolution_len(),
+            );
+            let cold = validated_generic_interface_type_edges(context.store(), reference, targets)
+                .unwrap();
+            assert!(cold.contains(&argument));
+            assert!(cold.contains(&shape.source_parameters[0]));
+            for property in &shape.properties {
+                assert!(cold.contains(&property.type_));
+            }
+            for base in &shape.base_types {
+                assert!(cold.contains(base));
+            }
+            for index in &shape.index_infos {
+                let info = context.store().index_info(*index).unwrap();
+                assert!(cold.contains(&info.key_type()));
+                assert!(cold.contains(&info.value_type()));
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    validated_generic_interface_type_edges(context.store(), reference, targets),
+                    Ok(cold.clone()),
+                );
+                assert_eq!(
+                    (
+                        property_recovery_store_counts(context.store()),
+                        context.store().relation_state_snapshot(),
+                        context.store().type_resolution_len(),
+                    ),
+                    before,
+                );
+            }
+
+            let members = resolve_members_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                targets,
+                &mut session,
+            )
+            .unwrap();
+            let lazy = validated_generic_interface_type_edges(context.store(), reference, targets)
+                .unwrap();
+            assert!(cold.iter().all(|edge| lazy.contains(edge)));
+            let values = members
+                .properties()
+                .iter()
+                .map(|property| {
+                    demand_instantiated_property_type(
+                        context.store_mut_for_test(),
+                        reference,
+                        *property,
+                        targets,
+                        &mut session,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let target_members = resolve_members_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                shape.target,
+                targets,
+                &mut session,
+            )
+            .unwrap();
+            for property in target_members.properties() {
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    shape.target,
+                    *property,
+                    targets,
+                    &mut session,
+                )
+                .unwrap();
+            }
+            let warm = validated_generic_interface_type_edges(context.store(), reference, targets)
+                .unwrap();
+            assert!(values.iter().all(|value| warm.contains(value)));
+            let indexes = context
+                .store()
+                .type_payload(reference)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .index_infos
+                .as_deref()
+                .unwrap_or_default();
+            for index in indexes {
+                let info = context.store().index_info(*index).unwrap();
+                assert!(warm.contains(&info.key_type()));
+                assert!(warm.contains(&info.value_type()));
+            }
+            let before = (
+                property_recovery_store_counts(context.store()),
+                context.store().relation_state_snapshot(),
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    validated_generic_interface_type_edges(context.store(), reference, targets),
+                    Ok(warm.clone()),
+                );
+                assert_eq!(
+                    (
+                        property_recovery_store_counts(context.store()),
+                        context.store().relation_state_snapshot(),
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_mark(),
+                    ),
+                    before,
+                );
+            }
+        }
+        assert!(session.total_count() > 0);
     }
 
     struct PropertyFunctionFixture<'arena> {
