@@ -64749,13 +64749,89 @@ mod tests {
     }
 
     #[test]
+    fn property_constructor_type_literal_keeps_the_original_label_case() {
+        let mut fixture =
+            fixture("type Callable = { new(value: string): number; label: boolean; };");
+        let owner =
+            canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Callable");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(callable).unwrap().data() else {
+            panic!("the constructor and label keep the source type literal");
+        };
+        assert_eq!(object.structured.call_signature_count, 0);
+        let [constructor] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the type literal has one constructor");
+        };
+        let constructor = *constructor;
+        let [label] = object.structured.properties.as_deref().unwrap() else {
+            panic!("the type literal has one label property");
+        };
+        let label = *label;
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (number, string, boolean) = (
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.boolean_type,
+        );
+        let signature = fixture.store.signature(constructor).unwrap();
+        assert_eq!(signature.flags(), SignatureFlags::CONSTRUCT);
+        assert_eq!(signature.min_argument_count(), 1);
+        assert_eq!(signature.resolved_return_type(), Some(number));
+        assert!(signature.declaration().is_some_and(|node| {
+            fixture.parsed.arena.get(node.node).is_some_and(|record| {
+                node.arena == fixture.parsed.arena.id()
+                    && node.file == fixture.file
+                    && record.kind == SyntaxKind::ConstructSignature
+            })
+        }));
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(constructor),
+            Some([string].as_slice()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(label)
+                .unwrap()
+                .resolved_type,
+            Some(boolean),
+        );
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("the source constructor must pass its stored member proof");
+        };
+        assert_eq!(projection.owner, callable);
+        assert!(projection.call_signatures.is_empty());
+        assert_eq!(projection.construct_signatures.as_ref(), [constructor]);
+        let warm = format!("{:?}", fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    owner,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(callable),
+            );
+            assert_eq!(format!("{:?}", fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn callable_type_literal_properties_keep_other_member_boundaries_atomic() {
         for (source, owner_kind, rejected_kind) in [
-            (
-                "type Callable = { new(value: string): number; label: boolean; };",
-                SyntaxKind::TypeAliasDeclaration,
-                SyntaxKind::ConstructSignature,
-            ),
             (
                 "type Callable = { (value: string): number; [key: string]: boolean; };",
                 SyntaxKind::TypeAliasDeclaration,

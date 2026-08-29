@@ -3183,7 +3183,9 @@ pub(super) fn validate_stored_declared_call_set(
             && (inherited_base.is_some()
                 || match store.source_node_kind(owner_declaration) {
                     Some(SyntaxKind::InterfaceDeclaration) => false,
-                    Some(SyntaxKind::TypeLiteral) => call_signature_count != signatures.len(),
+                    Some(SyntaxKind::TypeLiteral) => {
+                        call_signature_count != 0 && call_signature_count != signatures.len()
+                    }
                     _ => true,
                 })
     {
@@ -10841,9 +10843,7 @@ fn plan_members(
                             || !additional_members.is_empty()
                             || !methods.is_empty()
                             || !accessors.is_empty()
-                            || call_signatures
-                                .iter()
-                                .any(PlannedCallSignature::is_construct)
+                            || reserved_call_count > 1
                     }
                     PropertyObjectKind::ObjectLiteral => true,
                 })
@@ -18050,10 +18050,7 @@ fn valid_planned_call_signature_set(
                 && plan.methods.is_empty()
                 && plan.accessors.is_empty()
                 && plan.indexes.is_empty()
-                && !plan
-                    .call_signatures
-                    .iter()
-                    .any(PlannedCallSignature::is_construct))
+                && family_count == 1)
         && plan.properties.iter().all(|property| {
             planned_declared_property_key(store, property)
                 .is_some_and(|key| members.get(key) == Some(property.symbol))
@@ -26780,6 +26777,388 @@ mod generic_publication_tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep real constructor ownership, replay, and cache repair in one control.
+    fn property_constructor_type_literal_keeps_source_identity_and_rejects_bad_caches() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface SecondBase { other: string; } ",
+                "declare var SecondBase: { prototype: SecondBase; new(): SecondBase; };",
+            ),
+            147_230,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let (value_declaration, literal) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        variable.type_.unwrap(),
+                    ),
+                ))
+            })
+            .unwrap();
+        let instance_owner = fixture.symbol;
+        assert_eq!(
+            fixture.bound.symbol(value_declaration),
+            Some(instance_owner)
+        );
+        assert!(
+            fixture
+                .store
+                .symbol(instance_owner)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        );
+        assert!(fixture.store.declared_type_links(instance_owner).is_none());
+        assert!(fixture.store.type_node_links(literal).is_none());
+        let value_links = fixture.store.value_symbol_links(instance_owner).cloned();
+        assert!(
+            value_links
+                .as_ref()
+                .is_none_or(|links| links.resolved_type.is_none())
+        );
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let plan = plan_type_literal(&fixture.store, &host, literal, None).unwrap();
+        let [property] = plan.properties.as_slice() else {
+            panic!("the constructor has one original prototype property");
+        };
+        let [planned] = plan.call_signatures.as_slice() else {
+            panic!("the constructor has one original construct signature");
+        };
+        assert_eq!(plan.kind, PropertyObjectKind::TypeLiteral);
+        assert_eq!(plan.declarations, [literal]);
+        assert_eq!(plan.alias_symbol, None);
+        assert_ne!(plan.symbol, instance_owner);
+        assert_eq!(fixture.bound.symbol(literal), Some(plan.symbol));
+        assert_eq!(property.name.as_utf8(), Some("prototype"));
+        assert_eq!(
+            fixture.bound.symbol(property.declaration),
+            Some(property.symbol)
+        );
+        assert_eq!(
+            fixture.store.get_parent_of_symbol(property.symbol),
+            Some(plan.symbol)
+        );
+        assert!(!property.optional && !property.readonly);
+        assert!(planned.is_construct());
+        assert!(planned.parameters.is_empty());
+        assert!(planned.type_parameters.is_empty());
+        assert_eq!(planned.min_argument_count(), 0);
+        assert_eq!(
+            fixture.bound.symbol(planned.declaration),
+            Some(planned.symbol)
+        );
+        assert_eq!(
+            fixture.store.get_parent_of_symbol(planned.symbol),
+            Some(plan.symbol)
+        );
+        assert_eq!(
+            fixture.store.symbol(planned.symbol).unwrap().name(),
+            InternalSymbolName::New.as_ref()
+        );
+        assert_ne!(property.type_node, planned.return_type);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let constructor = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(literal)
+        .unwrap();
+        let instance = fixture
+            .store
+            .declared_type_links(instance_owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_ne!(constructor, instance);
+        assert!(matches!(
+            fixture.store.type_payload(instance).unwrap().data(),
+            TypeData::Interface(_)
+        ));
+        assert_eq!(
+            fixture.store.type_payload(instance).unwrap().symbol(),
+            Some(instance_owner)
+        );
+        let TypeData::Object(object) = fixture.store.type_payload(constructor).unwrap().data()
+        else {
+            panic!("the value annotation must retain its anonymous constructor object");
+        };
+        assert_eq!(
+            fixture.store.type_payload(constructor).unwrap().symbol(),
+            Some(plan.symbol)
+        );
+        assert_eq!(object.structured.members, plan.members);
+        assert_eq!(
+            object.structured.properties.as_deref(),
+            Some([property.symbol].as_slice())
+        );
+        assert_eq!(object.structured.call_signature_count, 0);
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the object must publish exactly one construct signature");
+        };
+        let signature = *signature;
+        let record = fixture.store.signature(signature).unwrap();
+        assert_eq!(record.flags(), SignatureFlags::CONSTRUCT);
+        assert_eq!(record.declaration(), Some(planned.declaration));
+        assert_eq!(record.resolved_return_type(), Some(instance));
+        assert_eq!(record.min_argument_count(), 0);
+        assert!(record.parameters().is_empty());
+        assert!(record.type_parameters().is_empty());
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([].as_slice())
+        );
+        assert_eq!(
+            fixture
+                .store
+                .function_signature_return_annotation(signature),
+            Some((planned.return_identity_node, false))
+        );
+        assert_eq!(
+            fixture
+                .store
+                .declared_call_set_type_for_signature(signature),
+            Some(constructor)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature_links(planned.declaration)
+                .unwrap()
+                .resolved_signature
+                .signature(),
+            Some(signature)
+        );
+        for annotation in [property.type_node, planned.return_type] {
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(annotation)
+                    .unwrap()
+                    .resolved_type,
+                Some(instance)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(annotation)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(instance_owner)
+            );
+        }
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(literal)
+                .unwrap()
+                .resolved_type,
+            Some(constructor)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(property.symbol)
+                .unwrap()
+                .resolved_type,
+            Some(instance)
+        );
+        assert_eq!(
+            fixture.store.value_symbol_links(instance_owner).cloned(),
+            value_links
+        );
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, constructor),
+            StoredDeclaredCallSetValidation::Valid(vec![instance, instance]),
+        );
+        let crate::semantic::callable_sets::StoredCallableSetValidation::Valid {
+            projection, ..
+        } = crate::semantic::callable_sets::validate_stored_callable_set(
+            &fixture.store,
+            constructor,
+        )
+        else {
+            panic!("the original construct signature must retain its callable provider");
+        };
+        assert!(projection.call_signatures.is_empty());
+        assert_eq!(
+            projection.construct_signatures.as_ref(),
+            [signature].as_slice()
+        );
+        let original_property_links = fixture
+            .store
+            .value_symbol_links(property.symbol)
+            .cloned()
+            .unwrap();
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            let TypeData::Object(object) = store.type_payload(constructor).unwrap().data() else {
+                unreachable!();
+            };
+            (
+                [
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                ],
+                store.checker_link_allocated_lengths().to_vec(),
+                object.clone(),
+                store.signature(signature).unwrap().resolved_return_type(),
+                store.signature_links(planned.declaration).cloned(),
+                store.value_symbol_links(property.symbol).cloned(),
+                store.value_symbol_links(instance_owner).cloned(),
+                store.declared_type_links(instance_owner).cloned(),
+                [literal, property.type_node, planned.return_type].map(|node| {
+                    (
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                    )
+                }),
+            )
+        };
+        let warm = snapshot(&fixture.store);
+        for _ in 0..3 {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(literal),
+                Ok(constructor),
+            );
+            assert_eq!(
+                type_literal_state(&fixture.store, &plan),
+                Ok(Some(PropertyObjectState::Resolved(constructor)))
+            );
+            assert_eq!(snapshot(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        for corruption in 0..3 {
+            match corruption {
+                0 => assert!(fixture.store.set_value_symbol_links(
+                    property.symbol,
+                    ValueSymbolLinks {
+                        write_type: Some(number),
+                        ..original_property_links.clone()
+                    },
+                )),
+                1 => assert!(fixture.store.set_structured_type_members(
+                    constructor,
+                    plan.members,
+                    Some(vec![property.symbol]),
+                    Some(vec![signature]),
+                    None,
+                    None,
+                )),
+                2 => assert!(
+                    fixture
+                        .store
+                        .set_signature_resolved_return_type(signature, Some(number))
+                ),
+                _ => unreachable!(),
+            }
+            let damaged = snapshot(&fixture.store);
+            assert_eq!(
+                validate_stored_declared_call_set(&fixture.store, constructor),
+                StoredDeclaredCallSetValidation::Malformed
+            );
+            assert_eq!(
+                type_literal_state(&fixture.store, &plan),
+                Err(PropertyObjectError::InvalidCachedTypeLiteral {
+                    node: literal,
+                    type_: constructor
+                })
+            );
+            for _ in 0..2 {
+                assert!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalCheckerOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_type_from_type_node(literal)
+                    .is_err(),
+                );
+                assert_eq!(snapshot(&fixture.store), damaged);
+                assert!(diagnostics.is_empty());
+            }
+            match corruption {
+                0 => assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(property.symbol, original_property_links.clone())
+                ),
+                1 => assert!(fixture.store.set_structured_type_members(
+                    constructor,
+                    plan.members,
+                    Some(vec![property.symbol]),
+                    None,
+                    Some(vec![signature]),
+                    None,
+                )),
+                2 => assert!(
+                    fixture
+                        .store
+                        .set_signature_resolved_return_type(signature, Some(instance))
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_stored_declared_call_set(&fixture.store, constructor),
+                StoredDeclaredCallSetValidation::Valid(vec![instance, instance])
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(literal),
+                Ok(constructor),
+            );
+            assert_eq!(snapshot(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
