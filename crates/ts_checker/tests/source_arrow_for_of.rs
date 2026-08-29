@@ -17,7 +17,7 @@ use ts_parser::{ParseResult, parse_source_file};
 const LIBRARY: FileId = FileId::new(8_240);
 const IMPORTER: FileId = FileId::new(8_241);
 const PROVIDER: FileId = FileId::new(8_242);
-const ARRAY_LIBRARY: &str = "interface Array<T> {} interface ReadonlyArray<T> {}";
+const ARRAY_LIBRARY: &str = "interface Array<T> { [n: number]: T; } interface ReadonlyArray<T> { readonly [n: number]: T; }";
 const CALL_SOURCE: &str = concat!(
     "function consume(value: number): void {}\n",
     "export default (values: number[], wrong: string): void => {\n",
@@ -660,7 +660,7 @@ fn nested_for_of_observer_call_keeps_the_outer_type_parameter() {
     };
     assert_eq!(*seed_type, t);
     assert_eq!(outer_state.signature.returned, t);
-    let observer_type = array_element(&checker, *observers_type);
+    let element_type = array_element(&checker, *observers_type);
     let next = declaration(&provider, PROVIDER, "next");
     let NodeData::VariableDeclaration(next_data) = &provider.arena.get(next.node).unwrap().data
     else {
@@ -702,7 +702,7 @@ fn nested_for_of_observer_call_keeps_the_outer_type_parameter() {
         Some(t_symbol)
     );
     let iteration = iteration(&provider);
-    let observer = assert_iteration_owner(&checker, &iteration, child, observer_type);
+    let observer = assert_iteration_owner(&checker, &iteration, child, element_type);
     assert_ne!(observer, *observers);
     assert_ne!(observer, *value);
     assert_eq!(cached_type(&checker, iteration.iterable), *observers_type);
@@ -714,7 +714,7 @@ fn nested_for_of_observer_call_keeps_the_outer_type_parameter() {
         panic!("expected the alias's separate T")
     };
     assert_ne!(*alias_t, t);
-    let instance = object(&checker, observer_type);
+    let instance = object(&checker, element_type);
     assert_eq!(instance.target, Some(template));
     let mapper = instance.mapper.unwrap();
     let property = checker
@@ -821,7 +821,7 @@ fn nested_for_of_observer_call_keeps_the_outer_type_parameter() {
         ),
         (node_ref(parameter.name), t, Some(*value)),
         (annotation, t, Some(t_symbol)),
-        (iteration.name, observer_type, Some(observer)),
+        (iteration.name, element_type, Some(observer)),
         (iteration.iterable, *observers_type, Some(*observers)),
         (argument, t, Some(*value)),
         (call, void, None),
@@ -842,11 +842,11 @@ fn nested_for_of_observer_call_keeps_the_outer_type_parameter() {
             Some(property)
         );
         let receiver = node_ref(property_data.expression);
-        assert_eq!(cached_type(&checker, receiver), observer_type);
+        assert_eq!(cached_type(&checker, receiver), element_type);
         artifacts.extend([
             (access, callable, Some(property)),
             (node_ref(property_data.name), callable, Some(property)),
-            (receiver, observer_type, Some(observer)),
+            (receiver, element_type, Some(observer)),
         ]);
     }
     let returned = only_node(&provider, PROVIDER, SyntaxKind::ReturnStatement);
