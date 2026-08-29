@@ -142,8 +142,12 @@ fn object<'a>(context: &'a CanonicalCheckerContext<'_>, type_: TypeId) -> &'a Ob
 }
 
 fn array_element(context: &CanonicalCheckerContext<'_>, type_: TypeId) -> TypeId {
-    let TypeData::TypeReference(array) = context.store().type_payload(type_).unwrap().data() else {
-        panic!("expected a canonical Array reference")
+    let array = match context.store().type_payload(type_).unwrap().data() {
+        TypeData::TypeReference(array) => array,
+        TypeData::Interface(interface) if type_ == context.global_types().array_type => {
+            &interface.reference
+        }
+        _ => panic!("expected a canonical Array reference"),
     };
     assert_eq!(array.object.target, Some(context.global_types().array_type));
     let [element] = array.resolved_type_arguments.as_deref().unwrap() else {

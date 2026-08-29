@@ -489,7 +489,7 @@ pub(super) fn plan_source_captured_local(
     let mut resolver =
         CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
             .map_err(|_| invalid())?;
-    let resolved = resolver
+    let found_symbol = resolver
         .resolve(
             Some(CanonicalResolutionLocation::Bound(target)),
             &identifier.text,
@@ -499,7 +499,7 @@ pub(super) fn plan_source_captured_local(
             false,
         )
         .map_err(|_| invalid())?;
-    if resolved != Some(symbol) {
+    if found_symbol != Some(symbol) {
         return Err(invalid().into());
     }
     Ok(Some(SourceCapturedLocal {

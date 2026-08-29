@@ -752,6 +752,12 @@ pub(super) struct PrimitiveBinaryPlan {
     shorthand_assignment: Option<Box<PlannedObjectAssignmentExpression>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImmediateClosureAssignment {
+    writer: NodeRef,
+    call: NodeRef,
+}
+
 #[derive(Clone, Debug)]
 struct PrimitiveBinaryChainStep {
     node: NodeRef,
@@ -20737,7 +20743,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let mut argument = declaration;
         let mut default_export = None;
-        let mut local_arrow_in_arrow = false;
+        let mut local_arrow_in_sync_callable = false;
         loop {
             let parent = self
                 .node(argument)?
@@ -20934,6 +20940,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     } else {
                         false
                     };
+                    let enclosing_function = if arrow.parameters.nodes.is_empty()
+                        && self.node(container)?.kind == SyntaxKind::FunctionDeclaration
+                    {
+                        let owner =
+                            self.bound
+                                .symbol(container)
+                                .ok_or(SourceCheckError::Function(
+                                    SourceFunctionInvariant::Callable(container),
+                                ))?;
+                        let enclosing =
+                            plan_source_callable(store, host, container, owner, self.array_targets)
+                                .map_err(Self::callable_plan_error)?;
+                        enclosing.declaration == container
+                            && enclosing.family == SourceCallableFamily::FunctionDeclaration
+                            && enclosing.body_mode == SourceCallableBodyMode::Present
+                            && !enclosing.is_async
+                    } else {
+                        false
+                    };
                     if container == self.bound.source_file() {
                         let name = self.reference(variable.name);
                         let NodeData::Identifier(identifier) = &self.node(name)?.data else {
@@ -20951,6 +20976,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .map_err(Self::variable_plan_error)?;
                     } else if !class_local
                         && !enclosing_arrow
+                        && !enclosing_function
                         && (self.node(container)?.kind != SyntaxKind::FunctionDeclaration
                             || arrow.parameters.nodes.is_empty())
                         || !arrow.parameters.nodes.iter().all(|parameter| {
@@ -20967,7 +20993,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             UnsupportedSourceSyntax::Arrow(declaration),
                         ));
                     }
-                    local_arrow_in_arrow = enclosing_arrow;
+                    local_arrow_in_sync_callable = enclosing_arrow || enclosing_function;
                     break;
                 }
                 NodeData::PropertyDeclaration(property)
@@ -21018,7 +21044,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             None => plan_source_arrow_value(store, host, declaration, self.array_targets)
                 .map_err(Self::arrow_plan_error)?,
         };
-        if local_arrow_in_arrow && callable.is_async {
+        if local_arrow_in_sync_callable && callable.is_async {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Arrow(declaration),
             ));
@@ -23956,8 +23982,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::PrimitiveOperator(operator));
         }
         let operator_kind = operator_record.kind;
-        let assignment = operator_kind == SyntaxKind::EqualsToken
-            && self.is_immediately_invoked_closure_assignment(expression)?;
+        let immediate_assignment = if operator_kind == SyntaxKind::EqualsToken {
+            self.plan_immediately_invoked_closure_assignment(expression)?
+        } else {
+            None
+        };
+        let assignment = immediate_assignment.is_some();
         if operator_kind == SyntaxKind::EqualsToken && !assignment {
             if !self.source_spelling_matches(operator, "=") {
                 return Err(SourceCheckError::PrimitiveOperator(operator));
@@ -24033,7 +24063,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
         }
-        if assignment && !self.captured_closure_assignment_target_is_mutable(&left_plan) {
+        if let Some(immediate) = immediate_assignment
+            && !self.captured_closure_assignment_target_is_mutable(&left_plan)
+            && !self
+                .parameter_initializer_iife_target_is_mutable(expression, immediate, &left_plan)?
+        {
             return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
         }
         if assignment {
@@ -24117,15 +24151,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     }
 
     /// Proves that an assignment is the concise body of an exact closure IIFE.
-    fn is_immediately_invoked_closure_assignment(
+    fn plan_immediately_invoked_closure_assignment(
         &self,
         expression: NodeRef,
-    ) -> Result<bool, SourceCheckError> {
+    ) -> Result<Option<ImmediateClosureAssignment>, SourceCheckError> {
         let mut current = expression;
-        loop {
+        let mut visited = HashSet::from([expression]);
+        let writer = loop {
             let Some(parent) = self.node(current)?.parent.map(|node| self.reference(node)) else {
-                return Ok(false);
+                return Ok(None);
             };
+            if !visited.insert(parent) {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::RepeatedNode(parent),
+                ));
+            }
             let record = self.node(parent)?;
             match &record.data {
                 NodeData::ParenthesizedExpression(parenthesized)
@@ -24139,17 +24179,22 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && arrow.body == current.node
                         && arrow.parameters.nodes.is_empty() =>
                 {
-                    current = parent;
-                    break;
+                    break parent;
                 }
-                _ => return Ok(false),
+                _ => return Ok(None),
             }
-        }
+        };
 
+        current = writer;
         loop {
             let Some(parent) = self.node(current)?.parent.map(|node| self.reference(node)) else {
-                return Ok(false);
+                return Ok(None);
             };
+            if !visited.insert(parent) {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::RepeatedNode(parent),
+                ));
+            }
             let record = self.node(parent)?;
             match &record.data {
                 NodeData::ParenthesizedExpression(parenthesized)
@@ -24162,10 +24207,361 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if record.kind == SyntaxKind::CallExpression
                         && call.expression == current.node =>
                 {
-                    return Ok(is_immediately_invoked_source_callable(self.arena, parent));
+                    return Ok(is_immediately_invoked_source_callable(self.arena, parent)
+                        .then_some(ImmediateClosureAssignment {
+                            writer,
+                            call: parent,
+                        }));
                 }
-                _ => return Ok(false),
+                _ => return Ok(None),
             }
+        }
+    }
+
+    /// Proves the stored child's parameter default without changing a planner scope.
+    #[allow(clippy::too_many_lines)] // The inner writer, parameter, child, and captured let share one proof.
+    fn parameter_initializer_iife_target_is_mutable(
+        &self,
+        expression: NodeRef,
+        immediate: ImmediateClosureAssignment,
+        left: &PlannedExpression,
+    ) -> Result<bool, SourceCheckError> {
+        let PlannedExpressionKind::Identifier(read) = &left.kind else {
+            return Ok(false);
+        };
+        if read.kind != PlannedIdentifierReadKind::Variable {
+            return Ok(false);
+        }
+        let invalid = || SourceCheckError::PrimitiveOperator(expression);
+        if self.plan_immediately_invoked_closure_assignment(expression)? != Some(immediate) {
+            return Err(invalid());
+        }
+        let initializer = self.source_outer_parentheses(immediate.call)?;
+        let Some(parameter) = self
+            .node(initializer)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let parameter_record = self.node(parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Ok(false);
+        };
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_data.initializer != Some(initializer.node)
+            || parameter_data.type_.is_none()
+        {
+            return Ok(false);
+        }
+        let child = parameter_record
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or_else(invalid)?;
+        if self.node(child)?.kind != SyntaxKind::ArrowFunction {
+            return Ok(false);
+        }
+        let Some((store, host)) = self.semantic else {
+            return Ok(false);
+        };
+        if self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+            || host.source(expression).is_none_or(|(arena, bound)| {
+                arena.id() != self.arena.id()
+                    || arena.revision() != self.arena.revision()
+                    || bound.file_id() != self.bound.file_id()
+                    || bound.node_arena_revision() != arena.revision()
+            })
+        {
+            return Err(invalid());
+        }
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+        {
+            return Ok(false);
+        }
+        let (writer, _) =
+            plan_source_arrow_value(store, host, immediate.writer, self.array_targets)
+                .map_err(Self::arrow_plan_error)?;
+        let (stored_child, _) = plan_source_arrow_value(store, host, child, self.array_targets)
+            .map_err(Self::arrow_plan_error)?;
+        if writer.body_mode != SourceCallableBodyMode::Present
+            || writer.is_async
+            || !writer.parameters.is_empty()
+            || stored_child.body_mode != SourceCallableBodyMode::Present
+            || stored_child.is_async
+        {
+            return Ok(false);
+        }
+        if writer.declaration != immediate.writer
+            || stored_child.declaration != child
+            || immediate.writer == child
+            || self.bound.container(left.node) != Some(immediate.writer)
+            || self.bound.flow_container(left.node) != Some(immediate.writer)
+            || self.bound.container(parameter) != Some(child)
+            || self.bound.flow_container(initializer) != Some(child)
+            || stored_child
+                .parameters
+                .iter()
+                .filter(|candidate| {
+                    candidate.declaration == parameter
+                        && candidate.initializer == Some(initializer)
+                        && candidate.explicit_type_node().map(|node| node.node)
+                            == parameter_data.type_
+                })
+                .count()
+                != 1
+        {
+            return Err(invalid());
+        }
+        let child_initializer = self.source_outer_parentheses(child)?;
+        let Some(child_binding) = self
+            .node(child_initializer)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let Some(child_binding) = self.plan_iife_capture_variable(child_binding)? else {
+            return Ok(false);
+        };
+        if child_binding.initializer != Some(child_initializer)
+            || child_binding.symbol == stored_child.owner_symbol
+        {
+            return Err(invalid());
+        }
+        let NodeData::BinaryExpression(binary) = &self.node(expression)?.data else {
+            return Err(invalid());
+        };
+        let left_record = self.node(left.node)?;
+        let NodeData::Identifier(identifier) = &left_record.data else {
+            return Err(invalid());
+        };
+        if binary.left != left.node.node
+            || left_record.parent != Some(expression.node)
+            || left_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+        {
+            return Err(invalid());
+        }
+        let actual_read = plan_identifier_read(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_variables,
+            &self.readable_variables,
+            left.node,
+            &identifier.text,
+        )
+        .map(PlannedIdentifierRead::variable)
+        .map_err(Self::variable_plan_error)?;
+        if actual_read != *read {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(read.value_symbol),
+            ));
+        }
+        let declaration = store
+            .symbol(read.value_symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .ok_or_else(invalid)?;
+        let Some(captured) = self.plan_iife_capture_variable(declaration)? else {
+            return Ok(false);
+        };
+        if captured.binding != VariableBindingKind::Let || captured.type_node.is_none() {
+            return Ok(false);
+        }
+        let declaring = self.bound.container(declaration).ok_or_else(invalid)?;
+        if !matches!(
+            self.node(declaring)?.kind,
+            SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration
+        ) {
+            return Ok(false);
+        }
+        let owner = self.bound.symbol(declaring).ok_or_else(invalid)?;
+        let declaring_callable =
+            plan_source_callable(store, host, declaring, owner, self.array_targets)
+                .map_err(Self::callable_plan_error)?;
+        if declaring_callable.body_mode != SourceCallableBodyMode::Present
+            || self.node(declaring_callable.body)?.kind != SyntaxKind::Block
+        {
+            return Ok(false);
+        }
+        if captured.symbol != read.value_symbol
+            || declaring == child
+            || declaring == immediate.writer
+            || self.node(declaration)?.range.end > self.node(child)?.range.start
+            || self.node(declaring_callable.body)?.parent != Some(declaring.node)
+            || !self.source_node_is_within(captured.statement, declaring_callable.body)?
+            || !self.source_node_is_within(child_binding.statement, declaring_callable.body)?
+        {
+            return Err(invalid());
+        }
+        Ok(true)
+    }
+
+    fn source_outer_parentheses(&self, node: NodeRef) -> Result<NodeRef, SourceCheckError> {
+        let mut current = node;
+        let mut visited = HashSet::from([node]);
+        while let Some(parent) = self.node(current)?.parent.map(|node| self.reference(node)) {
+            let record = self.node(parent)?;
+            let NodeData::ParenthesizedExpression(parenthesized) = &record.data else {
+                return Ok(current);
+            };
+            if !visited.insert(parent) {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::RepeatedNode(parent),
+                ));
+            }
+            if record.kind != SyntaxKind::ParenthesizedExpression
+                || record.flags.0 != 0
+                || parenthesized.expression != current.node
+            {
+                return Err(SourceCheckError::PrimitiveOperator(parent));
+            }
+            current = parent;
+        }
+        Ok(current)
+    }
+
+    /// Reads a local variable's syntax and owner without making it readable or mutable.
+    #[allow(clippy::too_many_lines)] // The declaration, list, statement, and symbol must agree.
+    fn plan_iife_capture_variable(
+        &self,
+        declaration: NodeRef,
+    ) -> Result<Option<SourceLocalDeclarationSyntax>, SourceCheckError> {
+        let record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Ok(None);
+        };
+        let invalid = || SourceCheckError::PrimitiveOperator(declaration);
+        let list = record
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or_else(invalid)?;
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+            return Err(invalid());
+        };
+        let binding = match list_record.flags.0 {
+            0 => VariableBindingKind::Var,
+            NODE_FLAG_LET => VariableBindingKind::Let,
+            NODE_FLAG_CONST => VariableBindingKind::Const,
+            _ => return Ok(None),
+        };
+        let statement = list_record
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or_else(invalid)?;
+        let statement_record = self.node(statement)?;
+        let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+            return Ok(None);
+        };
+        if statement_data.modifiers.is_some() {
+            return Ok(None);
+        }
+        let name = self.reference(variable.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::VariableDeclaration
+            || record.flags.0 != 0
+            || variable.exclamation_token.is_some()
+            || variable.symbol.is_some()
+            || variable.local_symbol.is_some()
+            || variable.facts != 0
+            || list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_data.facts != 0
+            || list_data
+                .declarations
+                .nodes
+                .iter()
+                .filter(|node| **node == declaration.node)
+                .count()
+                != 1
+            || statement_record.kind != SyntaxKind::VariableStatement
+            || statement_record.flags.0 != 0
+            || statement_data.declaration_list != list.node
+            || statement_data.flow_node.is_some()
+            || statement_data.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(declaration.node)
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(invalid());
+        }
+        let type_node = variable.type_.map(|node| self.reference(node));
+        let initializer = variable.initializer.map(|node| self.reference(node));
+        for child in type_node.into_iter().chain(initializer) {
+            if self.node(child)?.parent != Some(declaration.node) {
+                return Err(invalid());
+            }
+        }
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        for (node, parent) in [(declaration, list), (name, declaration), (list, statement)] {
+            if store.source_node_kind(node) != Some(self.node(node)?.kind)
+                || store.source_node_parent(node)
+                    != Some(super::store::SourceNodeParent::Parent(parent))
+            {
+                return Err(invalid());
+            }
+        }
+        let symbol = plan_top_level_variable(
+            self.bound,
+            store,
+            declaration,
+            name,
+            &identifier.text,
+            binding,
+            false,
+        )
+        .map_err(Self::variable_plan_error)?;
+        Ok(Some(SourceLocalDeclarationSyntax {
+            statement,
+            list,
+            declaration,
+            name,
+            symbol,
+            binding,
+            type_node,
+            initializer,
+        }))
+    }
+
+    fn source_node_is_within(
+        &self,
+        node: NodeRef,
+        ancestor: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let mut current = node;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::RepeatedNode(current),
+                ));
+            }
+            let record = self.node(current)?;
+            if current == ancestor {
+                return Ok(true);
+            }
+            let Some(parent) = record.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            if self.semantic.is_none_or(|(store, _)| {
+                store.source_node_parent(current)
+                    != Some(super::store::SourceNodeParent::Parent(parent))
+            }) {
+                return Err(SourceCheckError::PrimitiveOperator(current));
+            }
+            current = parent;
         }
     }
 
@@ -108790,6 +109186,334 @@ class Foo2 {
         .unwrap();
         assert_eq!(plan.arrows.len(), 1);
         plan.arrows.pop().unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the actual writer, parameter, child, let, and declaring owner.
+    fn captured_arrow_parameter_initializer_iife_rechecks_real_owners() {
+        let file = FileId::new(202_330);
+        let source = parsed(concat!(
+            "const factory = (): void => { ",
+            "let value: number | false = 1; let other: number | false = 1; ",
+            "const write = (prefix: number = 0, item: number = (() => (value = 2))()): void => {}; ",
+            "const alternate = (item: number = (() => 3)()): void => {}; };",
+        ));
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let target = identifier_expressions(&source, file, "value")[0];
+        let expression = NodeRef::new(
+            source.arena.id(),
+            file,
+            source.arena.get(target.node).unwrap().parent.unwrap(),
+        );
+        let value = variable_symbol(&context, &source, file, "value");
+        let other = variable_symbol(&context, &source, file, "other");
+        let factory = variable_initializer(&source, file, "factory");
+        let child = variable_initializer(&source, file, "write");
+        let alternate = variable_initializer(&source, file, "alternate");
+        let NodeData::ArrowFunction(child_data) = &source.arena.get(child.node).unwrap().data
+        else {
+            panic!("expected the stored child")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, child_data.parameters.nodes[1]);
+        let prefix = NodeRef::new(source.arena.id(), file, child_data.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &source.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("expected the actual default parameter")
+        };
+        let call = NodeRef::new(source.arena.id(), file, parameter_data.initializer.unwrap());
+        let writer = context.file(file).unwrap().1.container(target).unwrap();
+        let actual = ImmediateClosureAssignment { writer, call };
+        let inspect = |context: &CanonicalCheckerContext<'_>,
+                       immediate: ImmediateClosureAssignment| {
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let mut planner = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            );
+            planner.prior_variables.insert(value);
+            planner.readable_variables.insert(value);
+            let left = PlannedExpression::new(
+                target,
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    resolved_symbol: value,
+                    value_symbol: value,
+                    kind: PlannedIdentifierReadKind::Variable,
+                }),
+            );
+            let scopes = [
+                planner.prior_variables.clone(),
+                planner.readable_variables.clone(),
+                planner.assignable_mutable_variables.clone(),
+                planner.hoisted_functions.clone(),
+                planner.prior_enums.clone(),
+            ];
+            let result =
+                planner.parameter_initializer_iife_target_is_mutable(expression, immediate, &left);
+            assert_eq!(
+                [
+                    planner.prior_variables.clone(),
+                    planner.readable_variables.clone(),
+                    planner.assignable_mutable_variables.clone(),
+                    planner.hoisted_functions.clone(),
+                    planner.prior_enums.clone(),
+                ],
+                scopes
+            );
+            assert_eq!(planner.nested_arrow_depth, 0);
+            assert!(planner.identifier_reads.is_empty());
+            assert!(planner.nested_arrow_callables.is_empty());
+            result
+        };
+        let before = format!("{:#?}", context.store());
+        assert_eq!(inspect(&context, actual), Ok(true));
+        for wrong in [
+            ImmediateClosureAssignment {
+                writer: child,
+                ..actual
+            },
+            ImmediateClosureAssignment {
+                call: alternate,
+                ..actual
+            },
+        ] {
+            assert_eq!(
+                inspect(&context, wrong),
+                Err(SourceCheckError::PrimitiveOperator(expression))
+            );
+            assert_eq!(format!("{:#?}", context.store()), before);
+        }
+        for (declaration, wrong_value, expected) in [
+            (writer, child, SourceCheckError::Arrow(writer)),
+            (child, alternate, SourceCheckError::Arrow(child)),
+            (parameter, prefix, SourceCheckError::Arrow(parameter)),
+            (
+                factory,
+                child,
+                SourceCheckError::Function(SourceFunctionInvariant::Callable(factory)),
+            ),
+        ] {
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let record = context.store().symbol(owner).unwrap();
+            let declarations = record.declarations().unwrap().to_vec();
+            let original = record.value_declaration();
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                owner,
+                Some(declarations.clone()),
+                Some(wrong_value),
+            ));
+            let poisoned = format!("{:#?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(inspect(&context, actual), Err(expected));
+                assert_eq!(format!("{:#?}", context.store()), poisoned);
+            }
+            assert!(context.store_mut_for_test().set_symbol_declarations(
+                owner,
+                Some(declarations),
+                original,
+            ));
+            assert_eq!(inspect(&context, actual), Ok(true));
+        }
+        let declaration = variable_declaration(&source, file, "value");
+        let other_declaration = variable_declaration(&source, file, "other");
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            value,
+            Some(vec![declaration]),
+            Some(other_declaration),
+        ));
+        let poisoned = format!("{:#?}", context.store());
+        assert_eq!(
+            inspect(&context, actual),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::ValueDeclarationMismatch {
+                    symbol: value,
+                    declaration,
+                    value_declaration: Some(other_declaration),
+                },
+            ))
+        );
+        assert_eq!(format!("{:#?}", context.store()), poisoned);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            value,
+            Some(vec![declaration]),
+            Some(declaration),
+        ));
+        assert_eq!(inspect(&context, actual), Ok(true));
+        assert_eq!(format!("{:#?}", context.store()), before);
+
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(value)
+            },
+        ));
+        let warm = format!("{:#?}", context.store());
+        assert_eq!(inspect(&context, actual), Ok(true));
+        assert_eq!(format!("{:#?}", context.store()), warm);
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other)
+            },
+        ));
+        let poisoned = format!("{:#?}", context.store());
+        assert_eq!(
+            inspect(&context, actual),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node: target,
+                    cached: Some(other),
+                    expected: value,
+                },
+            ))
+        );
+        assert_eq!(format!("{:#?}", context.store()), poisoned);
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            target,
+            SymbolNodeLinks {
+                resolved_symbol: Some(value)
+            },
+        ));
+        assert_eq!(inspect(&context, actual), Ok(true));
+        assert_eq!(format!("{:#?}", context.store()), warm);
+    }
+
+    #[test]
+    fn captured_arrow_parameter_initializer_restores_only_its_parameter_scope() {
+        for (index, binding) in ["let", "const"].into_iter().enumerate() {
+            let file = FileId::new(202_331 + u32::try_from(index).unwrap());
+            let source = parsed(&format!(
+                "const factory = (): void => {{ {binding} value: number | false = 1; const write = (prefix: number = 0, item: number = (() => (value = 2))()): void => {{}}; }};"
+            ));
+            let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let child = variable_initializer(&source, file, "write");
+            let target = identifier_expressions(&source, file, "value")[0];
+            let value = variable_symbol(&context, &source, file, "value");
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let mut planner = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            );
+            planner.prior_variables.insert(value);
+            planner.readable_variables.insert(value);
+            let callable =
+                plan_source_arrow_value(context.store(), &host, child, planner.array_targets)
+                    .unwrap()
+                    .0;
+            let before = format!("{:#?}", context.store());
+            let initializers = planner.plan_parameter_initializers_and_enter_scope(&callable);
+            if binding == "let" {
+                assert_eq!(initializers.unwrap().len(), 2);
+                for parameter in &callable.parameters {
+                    assert!(planner.prior_variables.contains(&parameter.symbol));
+                    assert!(planner.readable_variables.contains(&parameter.symbol));
+                }
+                planner.leave_callable_parameter_scope(&callable).unwrap();
+            } else {
+                assert!(matches!(initializers, Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node,
+                        kind: SyntaxKind::Identifier,
+                        role: SourceSyntaxRole::BinaryOperand,
+                    },
+                )) if node == target));
+            }
+            assert_eq!(planner.prior_variables, HashSet::from([value]));
+            assert_eq!(planner.readable_variables, HashSet::from([value]));
+            assert!(planner.assignable_mutable_variables.is_empty());
+            assert!(planner.hoisted_functions.is_empty());
+            assert!(planner.prior_enums.is_empty());
+            assert_eq!(planner.nested_arrow_depth, 0);
+            assert_eq!(planner.identifier_reads.as_slice(), [(target, value)]);
+            assert_eq!(format!("{:#?}", context.store()), before);
+        }
+    }
+
+    #[test]
+    fn captured_arrow_zero_parameter_function_owner_is_exact() {
+        let file = FileId::new(202_333);
+        let source = parsed(
+            "function factory(): void { function nested() { const read = (): void => {}; } }",
+        );
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let enclosing = function_declaration(&source, file, "nested");
+        let child = variable_initializer(&source, file, "read");
+        let owner = context.file(file).unwrap().1.symbol(enclosing).unwrap();
+        let inspect = |context: &CanonicalCheckerContext<'_>| {
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let mut planner = SourcePlanner::new_semantic_with_global_types(
+                &source.arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            );
+            let result = planner.plan_nested_arrow_argument(child);
+            assert!(planner.hoisted_functions.is_empty());
+            assert!(planner.prior_variables.is_empty());
+            assert!(planner.readable_variables.is_empty());
+            assert!(planner.assignable_mutable_variables.is_empty());
+            assert_eq!(planner.nested_arrow_depth, 0);
+            result
+        };
+        let before = format!("{:#?}", context.store());
+        let valid = inspect(&context).unwrap();
+        let PlannedExpressionKind::Arrow(valid) = valid.kind else {
+            panic!("expected the actual zero-parameter child")
+        };
+        assert_eq!(valid.callable.declaration, child);
+        assert!(valid.callable.parameters.is_empty());
+        assert_eq!(format!("{:#?}", context.store()), before);
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(vec![enclosing]),
+            Some(child),
+        ));
+        let poisoned = format!("{:#?}", context.store());
+        for _ in 0..2 {
+            assert!(matches!(inspect(&context), Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(node),
+            )) if node == enclosing));
+            assert_eq!(format!("{:#?}", context.store()), poisoned);
+        }
+        assert!(context.store_mut_for_test().set_symbol_declarations(
+            owner,
+            Some(vec![enclosing]),
+            Some(enclosing),
+        ));
+        let restored = inspect(&context).unwrap();
+        let PlannedExpressionKind::Arrow(restored) = restored.kind else {
+            panic!("expected the same child after owner restoration")
+        };
+        assert_eq!(restored.callable, valid.callable);
+        assert_eq!(format!("{:#?}", context.store()), before);
     }
 
     #[test]
