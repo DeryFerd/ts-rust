@@ -13782,30 +13782,55 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }),
                 captured_array_mutations.iter().copied(),
             )
-        } else if logical_statements.is_empty() {
-            SourceFlowPlan::preflight_linear_with_conditions(
-                self.arena,
-                self.bound,
-                store,
-                callable.declaration,
-                points,
-                conditions,
-                assignments,
-                parameter_assignments,
-                calls,
-            )
         } else {
-            SourceFlowPlan::preflight_linear_with_logical_statements(
-                self.arena,
-                self.bound,
-                store,
-                callable.declaration,
-                points,
-                assignments,
-                parameter_assignments,
-                calls,
-                logical_statements,
-            )
+            match (conditions.is_empty(), logical_statements.is_empty()) {
+                (true, true) => SourceFlowPlan::preflight_linear(
+                    self.arena,
+                    self.bound,
+                    store,
+                    callable.declaration,
+                    points,
+                    assignments,
+                    parameter_assignments,
+                    calls,
+                ),
+                (false, true) => SourceFlowPlan::preflight_linear_with_conditions(
+                    self.arena,
+                    self.bound,
+                    store,
+                    callable.declaration,
+                    points,
+                    conditions,
+                    assignments,
+                    parameter_assignments,
+                    calls,
+                ),
+                (true, false) => SourceFlowPlan::preflight_linear_with_logical_statements(
+                    self.arena,
+                    self.bound,
+                    store,
+                    callable.declaration,
+                    points,
+                    assignments,
+                    parameter_assignments,
+                    calls,
+                    logical_statements,
+                ),
+                (false, false) => {
+                    SourceFlowPlan::preflight_linear_with_conditions_and_logical_statements(
+                        self.arena,
+                        self.bound,
+                        store,
+                        callable.declaration,
+                        points,
+                        conditions,
+                        assignments,
+                        parameter_assignments,
+                        calls,
+                        logical_statements,
+                    )
+                }
+            }
         }
         .map_err(|error| Self::source_flow_plan_error(callable, error))?;
 

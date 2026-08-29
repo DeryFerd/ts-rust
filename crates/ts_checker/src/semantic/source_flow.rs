@@ -1894,23 +1894,7 @@ impl SourceFlowPlan {
         parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
         calls: impl IntoIterator<Item = NodeRef>,
     ) -> Result<Self, SourceFlowError> {
-        let conditions = conditions.into_iter().collect::<Vec<_>>();
-        if conditions.is_empty() {
-            return Self::preflight_linear(
-                arena,
-                bound,
-                store,
-                container,
-                points,
-                assignments,
-                parameter_assignments,
-                calls,
-            );
-        }
-        let points = points.into_iter().collect::<Vec<_>>();
-        let conditions =
-            retained_linear_truthiness_conditions(arena, bound, container, &points, conditions)?;
-        Self::preflight_linear_with_condition_facts(
+        Self::preflight_linear_with_conditions_and_logical_statements(
             arena,
             bound,
             store,
@@ -1920,6 +1904,7 @@ impl SourceFlowPlan {
             assignments,
             parameter_assignments,
             calls,
+            [],
         )
     }
 
@@ -1957,9 +1942,6 @@ impl SourceFlowPlan {
                 captured_array_mutations,
             );
         }
-        let points = points.into_iter().collect::<Vec<_>>();
-        let conditions =
-            retained_linear_truthiness_conditions(arena, bound, container, &points, conditions)?;
         Self::preflight_linear_effects(
             arena,
             bound,
@@ -1977,17 +1959,19 @@ impl SourceFlowPlan {
         )
     }
 
+    /// Combines retained eager conditions with exact detached statement branches.
     #[allow(clippy::too_many_arguments)]
-    fn preflight_linear_with_condition_facts(
+    pub(super) fn preflight_linear_with_conditions_and_logical_statements(
         arena: &NodeArena,
         bound: &BoundFile,
         store: &CanonicalTypeMapperStore,
         container: NodeRef,
         points: impl IntoIterator<Item = NodeRef>,
-        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
         assignments: impl IntoIterator<Item = SourceFlowAssignment>,
         parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
         calls: impl IntoIterator<Item = NodeRef>,
+        logical_statements: impl IntoIterator<Item = SourceLinearLogicalStatementSyntax>,
     ) -> Result<Self, SourceFlowError> {
         Self::preflight_linear_effects(
             arena,
@@ -2000,7 +1984,7 @@ impl SourceFlowPlan {
             assignments,
             parameter_assignments,
             calls,
-            [],
+            logical_statements,
             [],
             [],
         )
@@ -2014,7 +1998,7 @@ impl SourceFlowPlan {
         host: Option<&DeclaredTypeHost<'_>>,
         container: NodeRef,
         points: impl IntoIterator<Item = NodeRef>,
-        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        conditions: impl IntoIterator<Item = SourceTruthinessCondition>,
         assignments: impl IntoIterator<Item = SourceFlowAssignment>,
         parameter_assignments: impl IntoIterator<Item = SourceFlowParameterAssignment>,
         calls: impl IntoIterator<Item = NodeRef>,
@@ -2089,14 +2073,68 @@ impl SourceFlowPlan {
             }
         }
 
-        let mut conditions = conditions.into_iter().collect::<Vec<_>>();
+        let candidates = conditions.into_iter().collect::<Vec<_>>();
+        let mut condition_nodes = HashSet::new();
+        for condition in &candidates {
+            if !condition_nodes.insert(condition.expression) {
+                return Err(SourceFlowInvariant::DuplicateCondition(condition.expression).into());
+            }
+        }
+        let mut conditions = Vec::new();
         for syntax in logical_statements {
             let proof = preflight_logical_statement(arena, bound, container, syntax)?;
+            for expression in [proof.syntax.left, proof.syntax.right] {
+                if !condition_nodes.insert(expression) {
+                    return Err(SourceFlowInvariant::DuplicateCondition(expression).into());
+                }
+            }
             conditions.extend([
                 SourceFlowCondition::Unchanged(proof.syntax.left),
                 SourceFlowCondition::Unchanged(proof.syntax.right),
             ]);
             effects.logical_statements.push(proof);
+        }
+
+        let points = points.into_iter().collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            let graph = bound.flow_graph();
+            let mut point_flows = HashMap::new();
+            let mut effective_points = Vec::new();
+            for &point in &points {
+                insert_flow_point(
+                    bound,
+                    graph,
+                    container,
+                    &mut point_flows,
+                    &mut effective_points,
+                    point,
+                    true,
+                )?;
+            }
+            for proof in &effects.logical_statements {
+                for &(point, flow) in &proof.source_points {
+                    if flow.is_some() {
+                        insert_flow_point(
+                            bound,
+                            graph,
+                            container,
+                            &mut point_flows,
+                            &mut effective_points,
+                            point,
+                            false,
+                        )?;
+                    }
+                }
+            }
+            let mut retained = retained_linear_truthiness_conditions(
+                arena,
+                bound,
+                container,
+                &effective_points,
+                candidates,
+            )?;
+            retained.extend(conditions);
+            conditions = retained;
         }
 
         let expected_start_payload = arena
@@ -8563,6 +8601,199 @@ mod tests {
                 context.store().type_len(),
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths()
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the mixed graph, rejected joins, and replay together.
+    fn mixed_linear_conditions_keep_eager_facts_from_automatic_logical_points() {
+        let parsed = parse_source_file(concat!(
+            "function choose(value: number | false, observer: {next: (value: number | false) => void}): void { ",
+            "const result = (value) && { now: value, get read() { return value && 1; } }; ",
+            "observer.next && observer.next(value); return; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_451);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (function, parameter, statements) = linear_function_nodes(&parsed, file, "choose");
+        let [_, logical_statement, _] = statements.as_slice() else {
+            panic!("one initializer precedes the logical statement and return");
+        };
+        let (declaration, local) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::VariableDeclaration(local) => Some((reference(node), local)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::BinaryExpression(initializer) =
+            &parsed.arena.get(local.initializer.unwrap()).unwrap().data
+        else {
+            panic!("the initializer keeps its eager logical condition");
+        };
+        let fact = SourceTruthinessCondition {
+            expression: reference(initializer.left),
+            symbol: bound.symbol(parameter).unwrap(),
+            negated: false,
+        };
+        let assignment = SourceFlowAssignment {
+            declaration,
+            symbol: bound.symbol(declaration).unwrap(),
+        };
+        let syntax = plan_source_linear_logical_statement_syntax(
+            &parsed.arena,
+            bound,
+            *logical_statement,
+            function,
+        )
+        .unwrap();
+        let getter = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::GetAccessor).then_some(reference(node))
+            })
+            .unwrap();
+        let deferred_condition = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                let left = reference(binary.left);
+                (bound.flow_container(left) == Some(getter)).then_some(left)
+            })
+            .unwrap();
+        let prepare = |points: Vec<NodeRef>,
+                       facts: Vec<SourceTruthinessCondition>,
+                       logical: Vec<SourceLinearLogicalStatementSyntax>| {
+            SourceFlowPlan::preflight_linear_with_conditions_and_logical_statements(
+                &parsed.arena,
+                bound,
+                context.store(),
+                function,
+                points,
+                facts,
+                [assignment],
+                [],
+                [],
+                logical,
+            )
+        };
+        assert_eq!(bound.flow_graph().container_end(function), None);
+        assert!(
+            retained_linear_truthiness_conditions(&parsed.arena, bound, function, &[], vec![fact],)
+                .unwrap()
+                .is_empty()
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            let plan = prepare(Vec::new(), vec![fact], vec![syntax.clone()]).unwrap();
+            assert_eq!(plan.end, None);
+            assert_eq!(plan.logical_statements.len(), 1);
+            assert!(plan.calls.is_empty());
+            assert_eq!(plan.conditions.len(), 3);
+            assert_eq!(
+                plan.conditions.get(&fact.expression),
+                Some(&SourceFlowCondition::Truthiness(fact))
+            );
+            assert!(!plan.conditions.contains_key(&deferred_condition));
+            for condition in [syntax.left, syntax.right] {
+                assert_eq!(
+                    plan.conditions.get(&condition),
+                    Some(&SourceFlowCondition::Unchanged(condition))
+                );
+            }
+            let proof = &plan.logical_statements[0];
+            assert_eq!(plan.points.get(logical_statement), Some(&proof.entry));
+            assert_eq!(
+                plan.points.get(&syntax.right_receiver),
+                Some(&proof.rows.left_true)
+            );
+            plan.validate_flow_paths(bound).unwrap();
+            assert!(plan.frame(bound, HashMap::new()).is_ok());
+            let mut damaged = plan.clone();
+            damaged.conditions.remove(&fact.expression);
+            assert_eq!(
+                damaged.frame(bound, HashMap::new()).err(),
+                Some(SourceFlowInvariant::UnknownCondition(fact.expression).into())
+            );
+            damaged = plan.clone();
+            damaged.logical_statements[0].rows.join = proof.rows.pre_right;
+            assert!(damaged.frame(bound, HashMap::new()).is_err());
+            damaged = plan.clone();
+            assert!(damaged.frame(bound, HashMap::new()).is_ok());
+        }
+        assert_eq!(
+            prepare(Vec::new(), Vec::new(), vec![syntax.clone()]).unwrap_err(),
+            SourceFlowInvariant::UnknownCondition(fact.expression).into()
+        );
+        assert_eq!(
+            prepare(Vec::new(), vec![fact, fact], vec![syntax.clone()]).unwrap_err(),
+            SourceFlowInvariant::DuplicateCondition(fact.expression).into()
+        );
+        assert_eq!(
+            prepare(Vec::new(), vec![fact], vec![syntax.clone(), syntax.clone()]).unwrap_err(),
+            SourceFlowInvariant::DuplicateCondition(syntax.left).into()
+        );
+        assert_eq!(
+            prepare(
+                Vec::new(),
+                vec![
+                    fact,
+                    SourceTruthinessCondition {
+                        expression: syntax.left,
+                        ..fact
+                    }
+                ],
+                vec![syntax.clone()]
+            )
+            .unwrap_err(),
+            SourceFlowInvariant::DuplicateCondition(syntax.left).into()
+        );
+        assert_eq!(
+            prepare(
+                vec![*logical_statement, *logical_statement],
+                vec![fact],
+                vec![syntax.clone()]
+            )
+            .unwrap_err(),
+            SourceFlowInvariant::DuplicatePoint(*logical_statement).into()
+        );
+        let foreign = SourceTruthinessCondition {
+            expression: NodeRef::new(
+                fact.expression.arena,
+                FileId::new(2_499),
+                fact.expression.node,
+            ),
+            ..fact
+        };
+        assert_eq!(
+            prepare(Vec::new(), vec![foreign], vec![syntax.clone()]).unwrap_err(),
+            SourceFlowInvariant::ForeignNode(foreign.expression).into()
+        );
+        assert!(prepare(vec![*logical_statement], vec![fact], vec![syntax]).is_ok());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot()
             ),
             before,
         );
