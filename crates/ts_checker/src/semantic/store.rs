@@ -9973,7 +9973,11 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         && record.symbol() == Some(base_symbol)
                         && record.alias().is_none()
                         && self.symbol(base_symbol).is_some_and(|symbol| {
-                            symbol.flags() == SymbolFlags::INTERFACE
+                            (symbol.flags() == SymbolFlags::INTERFACE
+                                || super::object_members::authenticated_nongeneric_global_interface_owner(
+                                    self,
+                                    base_symbol,
+                                ))
                                 && symbol.members() == interface.declared_members
                         })
                         && interface.all_type_parameters.is_none()
@@ -17014,6 +17018,122 @@ mod tests {
         let restored = snapshot(store);
         assert!(!store.publish_direct_interface_heritage_provenance(derived, original.clone()));
         assert_eq!(snapshot(store), restored);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep real global ownership, failed publication, and exact retry together.
+    fn secondary_global_base_publication_requires_the_original_owner_proof() {
+        let parsed = parse_source_file(concat!(
+            "interface First { first: number }\n",
+            "interface Second { second: string }\n",
+            "declare var Second: unknown;\n",
+            "interface Derived extends First, Second {}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_014);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/secondary-global-base.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let [owner, first, second] = ["Derived", "First", "Second"].map(|name| {
+            context
+                .store()
+                .symbol_table(context.globals())
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap()
+        });
+        let store = context.store_mut_for_test();
+        let [derived, first_type, second_type] = [owner, first, second].map(|symbol| {
+            store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap()
+        });
+        let flags = store.symbol(second).unwrap().flags();
+        assert!(flags.contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE));
+        assert_ne!(flags, SymbolFlags::INTERFACE);
+        assert!(
+            crate::semantic::object_members::authenticated_nongeneric_global_interface_owner(
+                store, second,
+            )
+        );
+        let value = store.value_symbol_links(second).cloned().unwrap();
+        assert_eq!(
+            value.resolved_type,
+            Some(store.intrinsic_bootstrap().unwrap().unknown_type),
+        );
+        assert_ne!(value.resolved_type, Some(second_type));
+        let original = store
+            .direct_interface_heritage_provenance(derived)
+            .cloned()
+            .unwrap();
+        assert_eq!(original.owner_symbol, owner);
+        assert_eq!(original.bases, [(first, first_type), (second, second_type)]);
+        assert_eq!(
+            store.direct_interface_heritage_provenance.remove(&derived),
+            Some(original.clone()),
+        );
+        assert!(store.try_reserve_direct_interface_heritage_provenance(1));
+
+        let globals = store.source_global_bindings.take().unwrap();
+        let missing_proof = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(
+                !store.publish_direct_interface_heritage_provenance(derived, original.clone(),)
+            );
+            assert_eq!(format!("{store:?}"), missing_proof);
+        }
+        store.source_global_bindings = Some(globals);
+        assert!(
+            crate::semantic::object_members::authenticated_nongeneric_global_interface_owner(
+                store, second,
+            )
+        );
+
+        assert!(store.set_symbol_flags(second, flags | SymbolFlags::CLASS, CheckFlags::NONE));
+        let damaged_owner = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(
+                !store.publish_direct_interface_heritage_provenance(derived, original.clone(),)
+            );
+            assert_eq!(format!("{store:?}"), damaged_owner);
+        }
+        assert!(store.set_symbol_flags(second, flags, CheckFlags::NONE));
+        assert!(store.publish_direct_interface_heritage_provenance(derived, original.clone()));
+        assert_eq!(
+            store.direct_interface_heritage_provenance(derived),
+            Some(&original),
+        );
+        assert_eq!(store.value_symbol_links(second), Some(&value));
+        let restored = format!("{store:?}");
+        for _ in 0..2 {
+            assert!(
+                !store.publish_direct_interface_heritage_provenance(derived, original.clone(),)
+            );
+            assert_eq!(format!("{store:?}"), restored);
+        }
     }
 
     #[test]

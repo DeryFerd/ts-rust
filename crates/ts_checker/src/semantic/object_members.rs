@@ -5832,6 +5832,7 @@ pub(super) fn plan_interface(
                     .ok_or(PropertyObjectError::InvalidInterfaceSymbol(base.symbol))?
                     .flags()
                     != SymbolFlags::INTERFACE
+                && !authenticated_nongeneric_global_interface_owner(store, base.symbol)
             {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: base.node,

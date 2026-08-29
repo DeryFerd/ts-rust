@@ -279,9 +279,10 @@ fn distinct_second_interface_base_is_supported(
         && record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
         && record.symbol() == Some(symbol)
         && record.alias().is_none()
-        && store.symbol(symbol).is_some_and(|symbol| {
-            symbol.flags() == SymbolFlags::INTERFACE
-                && symbol.members() == interface.declared_members
+        && store.symbol(symbol).is_some_and(|owner| {
+            (owner.flags() == SymbolFlags::INTERFACE
+                || authenticated_nongeneric_global_interface_owner(store, symbol))
+                && owner.members() == interface.declared_members
         })
         && interface.all_type_parameters.is_none()
         && interface.outer_type_parameter_count == 0
@@ -6768,7 +6769,7 @@ mod tests {
             assert!(context.store().type_node_links(value_annotation).is_none());
             assert!(context.diagnostics().is_empty());
 
-            // The direct publisher also checks the retained second-base boundary.
+            // A secondary global base keeps its instance type and cold value annotation.
             let leaf_record = context.store().symbol(leaf).unwrap();
             let [leaf_node] = leaf_record.declarations().unwrap() else {
                 panic!("the leaf has one source interface declaration");
@@ -6794,29 +6795,16 @@ mod tests {
             assert_eq!(leaf_heritage.bases[0].symbol, base);
             assert_eq!(leaf_heritage.bases[1].symbol, owner);
             let second_node = leaf_heritage.bases[1].node;
+            let leaf_plan = object_members::plan_interface(context.store(), &host, leaf).unwrap();
+            assert_eq!(leaf_plan.heritage.as_ref(), Some(&leaf_heritage));
+            assert_eq!(leaf_plan.node, leaf_node);
+            assert_eq!(leaf_plan.symbol, leaf);
+            assert_eq!(leaf_plan.declarations, [leaf_node]);
+            assert!(leaf_plan.properties.is_empty());
             assert_eq!(
-                object_members::plan_interface(context.store(), &host, leaf),
-                Err(PropertyObjectError::UnsupportedMember {
-                    node: second_node,
-                    kind: SyntaxKind::ExpressionWithTypeArguments,
-                }),
+                leaf_plan.heritage.as_ref().unwrap().bases[1].node,
+                second_node
             );
-            let leaf_plan = PropertyObjectPlan {
-                kind: PropertyObjectKind::Interface,
-                node: leaf_node,
-                const_context: false,
-                declarations: vec![leaf_node],
-                symbol: leaf,
-                members: None,
-                properties: Vec::new(),
-                methods: Vec::new(),
-                accessors: Vec::new(),
-                spreads: Vec::new(),
-                indexes: Vec::new(),
-                call_signatures: Vec::new(),
-                alias_symbol: None,
-                heritage: Some(leaf_heritage),
-            };
             let leaf_type = get_declared_class_interface_or_type_parameter(
                 context.store_mut_for_test(),
                 &host,
@@ -6842,7 +6830,52 @@ mod tests {
                     snapshot(context),
                 )
             };
-            let unpublished = leaf_state(&context);
+            assert_eq!(
+                resolve_direct_interface_members(
+                    context.store_mut_for_test(),
+                    &leaf_plan,
+                    leaf_type,
+                    &[],
+                    &[base_type, type_],
+                ),
+                Ok(leaf_type),
+            );
+            let expected_provenance = DirectInterfaceHeritageProvenance {
+                owner_symbol: leaf,
+                bases: vec![(base, base_type), (owner, type_)],
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .direct_interface_heritage_provenance(leaf_type),
+                Some(&expected_provenance),
+            );
+            let first = base_plan.properties[0].symbol;
+            let leaf_record = context.store().type_payload(leaf_type).unwrap();
+            let TypeData::Interface(leaf_data) = leaf_record.data() else {
+                panic!("the leaf must retain its declared interface type");
+            };
+            assert_eq!(
+                leaf_data.resolved_base_types.as_deref(),
+                Some(&[base_type, type_][..])
+            );
+            assert_eq!(leaf_data.declared_members, None);
+            assert_eq!(
+                leaf_data.reference.object.structured.properties.as_deref(),
+                Some(&[first, own][..]),
+            );
+            let members = context
+                .store()
+                .symbol_table(leaf_data.reference.object.structured.members.unwrap())
+                .unwrap();
+            assert_eq!(members.len(), 2);
+            assert_eq!(members.get_source("first"), Some(first));
+            assert_eq!(members.get_source("own"), Some(own));
+            assert_eq!(context.store().get_parent_of_symbol(first), Some(base));
+            assert_eq!(context.store().get_parent_of_symbol(own), Some(owner));
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().type_node_links(value_annotation).is_none());
+            let published_leaf = leaf_state(&context);
             for _ in 0..2 {
                 assert_eq!(
                     resolve_direct_interface_members(
@@ -6852,19 +6885,36 @@ mod tests {
                         &[],
                         &[base_type, type_],
                     ),
-                    Err(PropertyObjectError::UnsupportedMember {
-                        node: second_node,
-                        kind: SyntaxKind::ExpressionWithTypeArguments,
-                    }),
+                    Ok(leaf_type),
                 );
-                assert_eq!(leaf_state(&context), unpublished);
+                assert!(validate_planned_interface_heritage_members(
+                    context.store(),
+                    &leaf_plan,
+                    leaf_type,
+                ));
+                assert_eq!(
+                    validate_interface_heritage_members(context.store(), leaf_type),
+                    InterfaceHeritageMembersValidation::Valid,
+                );
+                for (name, symbol) in [("first", first), ("own", own)] {
+                    let property = validated_interface_property_by_key(
+                        context.store(),
+                        leaf_type,
+                        EscapedNameRef::source(name),
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(property.symbol, symbol);
+                    assert_eq!(property.type_, number);
+                    assert!(!property.optional);
+                    assert!(!property.readonly);
+                }
+                assert_eq!(leaf_state(&context), published_leaf);
             }
-            assert!(
-                context
-                    .store()
-                    .direct_interface_heritage_provenance(leaf_type)
-                    .is_none()
-            );
+            assert_eq!(context.store().value_symbol_links(owner), None);
+            assert_eq!(context.store().type_node_links(value_annotation), None);
+            assert!(context.diagnostics().is_empty());
         }
     }
 

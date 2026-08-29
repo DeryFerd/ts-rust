@@ -5,8 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
-    SourceCheckError, SourceSyntaxRole, TypeData, TypeId, UnsupportedSourceSyntax,
-    type_records::InterfaceTypeData,
+    TypeData, TypeId, type_records::InterfaceTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -1033,8 +1032,8 @@ fn neutral_merged_interface_heritage_preserves_base_order_and_separate_values() 
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // Compare all source caches before and after the exact unsupported request.
-fn distinct_second_base_with_a_value_stays_unsupported_without_publication() {
+#[allow(clippy::too_many_lines)] // Keep the original sources, intentional error, and separate value demand together.
+fn distinct_secondary_global_base_keeps_value_and_instance_types_separate() {
     let library = parse_source_file(NEUTRAL_LIBRARY);
     let added = parse_source_file(
         "interface RootPacket extends SecondBase { added: boolean; } interface TargetRecord {}",
@@ -1068,6 +1067,60 @@ fn distinct_second_base_with_a_value_stays_unsupported_without_publication() {
             .map(move |(node, _)| NodeRef::new(parsed.arena.id(), file, node))
     })
     .collect::<Vec<_>>();
+    let root_declaration = interface(&library, LIBRARY_FILE, "RootPacket");
+    let first_declaration = interface(&library, LIBRARY_FILE, "FirstBase");
+    let second_declaration = interface(&library, LIBRARY_FILE, "SecondBase");
+    let target_declaration = interface(&library, LIBRARY_FILE, "TargetRecord");
+    let added_root = interface(&added, ADDED_FILE, "RootPacket");
+    let (value_declaration, value_name, value_annotation) = library
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &library.arena.get(variable.name)?.data else {
+                return None;
+            };
+            (name.text == "SecondBase").then(|| {
+                (
+                    NodeRef::new(library.arena.id(), LIBRARY_FILE, node),
+                    NodeRef::new(library.arena.id(), LIBRARY_FILE, variable.name),
+                    NodeRef::new(library.arena.id(), LIBRARY_FILE, variable.type_.unwrap()),
+                )
+            })
+        })
+        .unwrap();
+    let property_reads = consumer
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            let NodeData::PropertyAccessExpression(access) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &consumer.arena.get(access.name)?.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(consumer.arena.id(), CONSUMER_FILE, node),
+                name.text.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(property_reads.len(), 5);
+    let wrong_range = consumer
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &consumer.arena.get(variable.name)?.data else {
+                return None;
+            };
+            (name.text == "wrong").then_some(record.range)
+        })
+        .unwrap();
     for (strict, exact) in MODES {
         let mut checker = context(
             &[
@@ -1121,24 +1174,476 @@ fn distinct_second_base_with_a_value_stays_unsupported_without_publication() {
         };
         let cold = snapshot(&checker);
         let source = checker.source_file(ADDED_FILE).unwrap();
-        for _ in 0..3 {
-            assert!(checker.store().source_file_links(source).is_none());
-            let result = checker.check_source_file(ADDED_FILE);
-            assert_eq!(
-                result,
-                Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Syntax {
-                        node: second_node,
-                        kind: SyntaxKind::ExpressionWithTypeArguments,
-                        role: SourceSyntaxRole::InterfaceDeclaration,
-                    },
-                )),
+        assert!(checker.store().source_file_links(source).is_none());
+        for name in ["RootPacket", "FirstBase", "SecondBase", "TargetRecord"] {
+            assert_value_annotation_cold(&checker, &library, LIBRARY_FILE, name);
+        }
+        assert_eq!(snapshot(&checker), cold);
+        checker.check_source_file(ADDED_FILE).unwrap();
+        checker.check_source_file(CONSUMER_FILE).unwrap();
+        assert!(
+            checker
+                .store()
+                .source_file_links(source)
+                .unwrap()
+                .type_checked
+        );
+        let [diagnostic] = checker.diagnostics().as_slice() else {
+            panic!("only the original wrong inherited-property assignment must fail");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+        let diagnostic_node = diagnostic.node.unwrap();
+        assert_eq!(diagnostic_node.file, CONSUMER_FILE);
+        let diagnostic_range = consumer.arena.get(diagnostic_node.node).unwrap().range;
+        assert!(diagnostic_range.start >= wrong_range.start);
+        assert!(diagnostic_range.end <= wrong_range.end);
+        let declarations = [
+            root_declaration,
+            first_declaration,
+            second_declaration,
+            target_declaration,
+        ];
+        let interface_owners = declarations.map(|declaration| symbol(&checker, declaration));
+        let [root, first, second, _] = interface_owners;
+        assert_eq!(symbol(&checker, added_root), root);
+        assert_eq!(symbol(&checker, value_declaration), second);
+        let types =
+            interface_owners.map(|owner| checker.get_declared_type_of_symbol(owner).unwrap());
+        let [root_type, first_type, second_type, _] = types;
+        assert_eq!(
+            interface_data(&checker, root_type)
+                .resolved_base_types
+                .as_deref(),
+            Some([first_type, second_type].as_slice()),
+        );
+        assert_eq!(
+            checker.get_symbol_at_location(second_name),
+            Ok(Some(second))
+        );
+        assert_eq!(checker.get_type_at_location(second_name), Ok(second_type));
+        let query = |checker: &mut CanonicalCheckerContext<'_>| {
+            let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+            let (string, number, boolean) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
             );
-            assert!(checker.store().source_file_links(source).is_none());
-            for name in ["RootPacket", "FirstBase", "SecondBase", "TargetRecord"] {
-                assert_value_annotation_cold(&checker, &library, LIBRARY_FILE, name);
+            let mut values = Vec::new();
+            for &(access, name) in &property_reads {
+                let (parsed, declaration, owner, expected_type) = match name {
+                    "own" => (&library, root_declaration, root, string),
+                    "added" => (&added, added_root, root, boolean),
+                    "inherited" => (&library, first_declaration, first, number),
+                    "other" => (&library, second_declaration, second, string),
+                    _ => panic!("the unchanged consumer has only its original property reads"),
+                };
+                let expected = symbol(checker, member(parsed, declaration, name).0);
+                assert_eq!(checker.store().get_parent_of_symbol(expected), Some(owner));
+                assert_eq!(resolved_member(checker, root_type, name), expected);
+                assert_eq!(checker.get_symbol_at_location(access), Ok(Some(expected)));
+                assert_eq!(checker.get_type_at_location(access), Ok(expected_type));
+                values.push(expected_type);
             }
-            assert_eq!(snapshot(&checker), cold, "strict={strict}, exact={exact}");
+            values
+        };
+        let values = query(&mut checker);
+        let mut expected_members = vec![
+            symbol(&checker, member(&library, root_declaration, "own").0),
+            symbol(&checker, member(&added, added_root, "added").0),
+        ];
+        expected_members.extend(
+            ["inherited", "target", "path", "init"]
+                .map(|name| symbol(&checker, member(&library, first_declaration, name).0)),
+        );
+        expected_members.push(symbol(
+            &checker,
+            member(&library, second_declaration, "other").0,
+        ));
+        assert_eq!(
+            interface_data(&checker, root_type)
+                .reference
+                .object
+                .structured
+                .properties
+                .as_deref(),
+            Some(expected_members.as_slice()),
+        );
+        for name in ["RootPacket", "FirstBase", "SecondBase", "TargetRecord"] {
+            assert_value_annotation_cold(&checker, &library, LIBRARY_FILE, name);
+        }
+        let value_links = checker.store().value_symbol_links(second).cloned();
+        let constructor = checker.get_type_at_location(value_name).unwrap();
+        assert_ne!(constructor, second_type);
+        assert!(matches!(
+            checker.store().type_payload(constructor).unwrap().data(),
+            TypeData::Object(_)
+        ));
+        assert_eq!(checker.get_symbol_at_location(value_name), Ok(Some(second)));
+        // This artifact query resolves the annotation without publishing the variable's value cache.
+        assert_eq!(
+            checker.store().value_symbol_links(second).cloned(),
+            value_links,
+        );
+        assert_eq!(
+            checker
+                .store()
+                .type_node_links(value_annotation)
+                .unwrap()
+                .resolved_type,
+            Some(constructor),
+        );
+        assert_eq!(
+            checker.get_type_at_location(second_declaration),
+            Ok(second_type)
+        );
+        let interface_state = types.map(|type_| interface_data(&checker, type_).clone());
+        let warm = snapshot(&checker);
+        for _ in 0..3 {
+            checker.recheck_source_file(ADDED_FILE).unwrap();
+            checker.recheck_source_file(CONSUMER_FILE).unwrap();
+            assert_eq!(query(&mut checker), values);
+            assert_eq!(checker.get_type_at_location(value_name), Ok(constructor));
+            assert_eq!(
+                checker.store().value_symbol_links(second).cloned(),
+                value_links,
+            );
+            assert_eq!(checker.get_type_at_location(second_name), Ok(second_type));
+            for ((owner, declaration), type_) in
+                interface_owners.into_iter().zip(declarations).zip(types)
+            {
+                assert_eq!(checker.get_declared_type_of_symbol(owner), Ok(type_));
+                assert_eq!(checker.get_type_at_location(declaration), Ok(type_));
+            }
+            assert_eq!(
+                types.map(|type_| interface_data(&checker, type_).clone()),
+                interface_state,
+            );
+            assert_eq!(snapshot(&checker), warm, "strict={strict}, exact={exact}");
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep real DOM owners, ordered bases, cold values, and both query orders together.
+fn bundled_composition_event_keeps_secondary_global_bases_and_member_owners() {
+    use std::collections::HashSet;
+
+    let es5 = parse_source_file(include_str!("../../ts_bundled/libs/lib.es5.d.ts"));
+    let dom = parse_source_file(include_str!("../../ts_bundled/libs/lib.dom.d.ts"));
+    let augmentation = concat!(
+        "interface Event {} ",
+        "interface UIEvent extends Event {} ",
+        "interface CompositionEvent extends Event {}",
+    );
+    let first = parse_source_file(augmentation);
+    let second = parse_source_file(augmentation);
+    let second_file = FileId::new(99_015);
+    let contributions = [
+        (&dom, LIBRARY_FILE),
+        (&first, ADDED_FILE),
+        (&second, second_file),
+    ];
+    let declarations = ["Event", "UIEvent", "CompositionEvent"]
+        .map(|name| contributions.map(|(parsed, file)| interface(parsed, file, name)));
+    let [event_declaration, ui_declaration, composition_declaration] =
+        declarations.map(|declarations| declarations[0]);
+    let target_declaration = interface(&dom, LIBRARY_FILE, "EventTarget");
+    let ui_bases = contributions
+        .into_iter()
+        .zip(declarations[1])
+        .map(|((parsed, _), declaration)| heritage_identifier(parsed, declaration))
+        .collect::<Vec<_>>();
+    let composition_bases = contributions
+        .into_iter()
+        .zip(declarations[2])
+        .map(|((parsed, _), declaration)| heritage_identifier(parsed, declaration))
+        .collect::<Vec<_>>();
+    for nodes in [&ui_bases, &composition_bases] {
+        assert_eq!(nodes.len(), 3);
+        for (index, node) in nodes.iter().enumerate() {
+            assert_eq!(node.file, contributions[index].1);
+            assert!(nodes[..index].iter().all(|previous| previous != node));
+        }
+    }
+
+    for query_first in [false, true] {
+        let mut checker = context(
+            &[
+                (ES5_FILE, &es5, "\"/lib/lib.es5.d.ts\"", true, true),
+                (LIBRARY_FILE, &dom, "\"/lib/lib.dom.d.ts\"", true, true),
+                (
+                    ADDED_FILE,
+                    &first,
+                    "\"/project/react-first-global.d.ts\"",
+                    true,
+                    false,
+                ),
+                (
+                    second_file,
+                    &second,
+                    "\"/project/react-second-global.d.ts\"",
+                    true,
+                    false,
+                ),
+            ],
+            true,
+            false,
+        );
+        assert_eq!(
+            checker.file_order(),
+            [ES5_FILE, LIBRARY_FILE, ADDED_FILE, second_file],
+        );
+        let owners = declarations.map(|declarations| symbol(&checker, declarations[0]));
+        let [event, ui, composition] = owners;
+        assert_eq!(owners.into_iter().collect::<HashSet<_>>().len(), 3);
+        for (owner, declarations) in owners.into_iter().zip(declarations) {
+            let record = checker.store().symbol(owner).unwrap();
+            assert!(record.flags().contains(
+                ts_binder::SymbolFlags::INTERFACE
+                    | ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | ts_binder::SymbolFlags::TRANSIENT,
+            ));
+            assert_eq!(checker.store().get_merged_symbol(owner), Some(owner));
+            let original_interfaces = record
+                .declarations()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|node| {
+                    checker
+                        .file(node.file)
+                        .unwrap()
+                        .0
+                        .get(node.node)
+                        .unwrap()
+                        .kind
+                        == SyntaxKind::InterfaceDeclaration
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(original_interfaces, declarations);
+            for declaration in declarations {
+                assert_eq!(symbol(&checker, declaration), owner);
+            }
+            assert!(checker.store().declared_type_links(owner).is_none());
+        }
+        let early = query_first.then(|| {
+            owners.map(|owner| {
+                let type_ = checker.get_declared_type_of_symbol(owner).unwrap();
+                let interface = interface_data(&checker, type_);
+                assert!(!interface.base_types_resolved);
+                assert!(!interface.declared_members_resolved);
+                assert!(interface.resolved_base_types.is_none());
+                assert!(interface.reference.object.structured.properties.is_none());
+                type_
+            })
+        });
+        for name in ["Event", "UIEvent", "CompositionEvent", "EventTarget"] {
+            assert_value_annotation_cold(&checker, &dom, LIBRARY_FILE, name);
+        }
+        for file in [ADDED_FILE, second_file] {
+            assert!(
+                checker
+                    .store()
+                    .source_file_links(checker.source_file(file).unwrap())
+                    .is_none_or(|links| !links.type_checked)
+            );
+            checker.check_source_file(file).unwrap();
+            assert!(
+                checker
+                    .store()
+                    .source_file_links(checker.source_file(file).unwrap())
+                    .unwrap()
+                    .type_checked
+            );
+        }
+        assert!(
+            checker.diagnostics().is_empty(),
+            "{:?}",
+            checker.diagnostics()
+        );
+        let types = owners.map(|owner| checker.get_declared_type_of_symbol(owner).unwrap());
+        let [event_type, ui_type, composition_type] = types;
+        if let Some(early) = early {
+            assert_eq!(early, types);
+        }
+        let target = symbol(&checker, target_declaration);
+        let target_type = checker
+            .store()
+            .declared_type_links(target)
+            .unwrap()
+            .declared_type
+            .unwrap();
+
+        let query = |checker: &mut CanonicalCheckerContext<'_>| {
+            for ((owner, declarations), type_) in owners.into_iter().zip(declarations).zip(types) {
+                assert_eq!(
+                    checker.store().type_payload(type_).unwrap().symbol(),
+                    Some(owner)
+                );
+                for declaration in declarations {
+                    assert_eq!(checker.get_type_at_location(declaration), Ok(type_));
+                    assert_eq!(checker.get_symbol_at_location(declaration), Ok(Some(owner)));
+                }
+            }
+            assert_eq!(
+                interface_data(checker, composition_type)
+                    .resolved_base_types
+                    .as_deref(),
+                Some([ui_type, event_type, event_type].as_slice()),
+            );
+            assert_eq!(
+                interface_data(checker, ui_type)
+                    .resolved_base_types
+                    .as_deref(),
+                Some([event_type, event_type, event_type].as_slice()),
+            );
+            for (nodes, expected) in [
+                (&ui_bases, [(event, event_type); 3]),
+                (
+                    &composition_bases,
+                    [(ui, ui_type), (event, event_type), (event, event_type)],
+                ),
+            ] {
+                for (&node, (owner, type_)) in nodes.iter().zip(expected) {
+                    assert_eq!(checker.get_symbol_at_location(node), Ok(Some(owner)));
+                    assert_eq!(checker.get_type_at_location(node), Ok(type_));
+                }
+            }
+            for (declaration, derived, base) in [
+                (ui_declaration, ui_type, event_type),
+                (composition_declaration, composition_type, ui_type),
+            ] {
+                let NodeData::InterfaceDeclaration(interface) =
+                    &dom.arena.get(declaration.node).unwrap().data
+                else {
+                    unreachable!();
+                };
+                let mut expected = interface
+                    .members
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        symbol(
+                            checker,
+                            NodeRef::new(declaration.arena, declaration.file, *node),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                expected.extend_from_slice(
+                    interface_data(checker, base)
+                        .reference
+                        .object
+                        .structured
+                        .properties
+                        .as_deref()
+                        .unwrap(),
+                );
+                let structured = &interface_data(checker, derived).reference.object.structured;
+                assert_eq!(structured.properties.as_deref(), Some(expected.as_slice()));
+                assert_eq!(
+                    expected.iter().copied().collect::<HashSet<_>>().len(),
+                    expected.len()
+                );
+                let table = checker
+                    .store()
+                    .symbol_table(structured.members.unwrap())
+                    .unwrap();
+                assert_eq!(table.len(), expected.len());
+                for property in expected {
+                    assert_eq!(
+                        table.get(checker.store().symbol(property).unwrap().name()),
+                        Some(property)
+                    );
+                }
+            }
+            let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+            let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+            let mut member_types = Vec::new();
+            for (declaration, owner, name, expected_type) in [
+                (composition_declaration, composition, "data", string),
+                (ui_declaration, ui, "detail", number),
+                (event_declaration, event, "type", string),
+            ] {
+                let (member, name_node) = member(&dom, declaration, name);
+                let property = symbol(checker, member);
+                let original_owner = checker
+                    .file(LIBRARY_FILE)
+                    .unwrap()
+                    .1
+                    .symbol(declaration)
+                    .unwrap();
+                let record = checker.store().symbol(property).unwrap();
+                assert_eq!(record.parent(), Some(original_owner));
+                assert_eq!(record.declarations(), Some([member].as_slice()));
+                assert_eq!(checker.store().get_parent_of_symbol(property), Some(owner));
+                assert_eq!(resolved_member(checker, composition_type, name), property);
+                assert_eq!(
+                    checker.get_symbol_at_location(name_node),
+                    Ok(Some(property))
+                );
+                assert_eq!(checker.get_type_at_location(name_node), Ok(expected_type));
+                assert_eq!(
+                    checker
+                        .store()
+                        .value_symbol_links(property)
+                        .unwrap()
+                        .resolved_type,
+                    Some(expected_type)
+                );
+                member_types.push(expected_type);
+            }
+            assert_target_members_cold(checker, &dom, target_declaration, target_type);
+            for name in ["Event", "UIEvent", "CompositionEvent", "EventTarget"] {
+                assert_value_annotation_cold(checker, &dom, LIBRARY_FILE, name);
+            }
+            for file in [ES5_FILE, LIBRARY_FILE] {
+                assert!(
+                    checker
+                        .store()
+                        .source_file_links(checker.source_file(file).unwrap())
+                        .is_none_or(|links| !links.type_checked)
+                );
+            }
+            member_types
+        };
+        let member_types = query(&mut checker);
+        let snapshot = |checker: &CanonicalCheckerContext<'_>| {
+            (
+                counts(checker),
+                [event_type, ui_type, composition_type, target_type]
+                    .map(|type_| interface_data(checker, type_).clone()),
+                interface_data(checker, composition_type)
+                    .reference
+                    .object
+                    .structured
+                    .properties
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|property| checker.store().value_symbol_links(*property).cloned())
+                    .collect::<Vec<_>>(),
+                ui_bases
+                    .iter()
+                    .chain(&composition_bases)
+                    .map(|node| {
+                        (
+                            checker.store().type_node_links(*node).cloned(),
+                            checker.store().symbol_node_links(*node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                checker.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&checker);
+        for _ in 0..2 {
+            for file in [ADDED_FILE, second_file] {
+                checker.recheck_source_file(file).unwrap();
+            }
+            assert_eq!(query(&mut checker), member_types);
+            assert!(checker.diagnostics().is_empty());
+            assert_eq!(snapshot(&checker), warm, "query_first={query_first}");
         }
     }
 }
