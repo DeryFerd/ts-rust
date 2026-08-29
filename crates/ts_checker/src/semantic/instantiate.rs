@@ -171,9 +171,15 @@ impl From<TemplateTypeError> for InstantiationError {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct InstantiationCacheKey {
-    type_: TypeId,
-    alias: InstantiationAliasCacheKey,
+enum InstantiationCacheKey {
+    Type {
+        type_: TypeId,
+        alias: InstantiationAliasCacheKey,
+    },
+    MappedOptional {
+        template: TypeId,
+        sentinel: TypeId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -476,6 +482,111 @@ pub(super) fn instantiate_type_with_vector_and_session(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MappedTemplateFrame {
+    Optional { template: TypeId, sentinel: TypeId },
+    Indexed(TypeId),
+}
+
+impl MappedTemplateFrame {
+    const fn template(self) -> TypeId {
+        match self {
+            Self::Optional { template, .. } | Self::Indexed(template) => template,
+        }
+    }
+}
+
+/// Runs a caller-proved mapped template through the normal instantiation frame.
+/// The caller keeps the same vector slices alive through all nested work.
+pub(super) fn with_mapped_template_frame<E>(
+    store: &mut CanonicalTypeMapperStore,
+    frame: MappedTemplateFrame,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    session: &mut InstantiationSession,
+    map_error: impl Fn(InstantiationError) -> E,
+    work: impl FnOnce(&mut CanonicalTypeMapperStore, &mut InstantiationSession) -> Result<TypeId, E>,
+) -> Result<TypeId, E> {
+    if sources.len() != targets.len() {
+        return Err(map_error(InstantiationError::InvalidType(frame.template())));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(map_error(InstantiationError::InvalidType(*endpoint)));
+        }
+    }
+    validate_mapped_template_frame(store, frame).map_err(&map_error)?;
+    with_instantiation_frame(
+        store,
+        InstantiationMapping::Vector { sources, targets },
+        session,
+        |store| match frame {
+            MappedTemplateFrame::Optional { template, sentinel } => {
+                Ok(InstantiationCacheKey::MappedOptional { template, sentinel })
+            }
+            MappedTemplateFrame::Indexed(template) => {
+                instantiation_cache_key(store, template, None)
+            }
+        },
+        map_error,
+        work,
+    )
+}
+
+fn validate_mapped_template_frame(
+    store: &CanonicalTypeMapperStore,
+    frame: MappedTemplateFrame,
+) -> Result<(), InstantiationError> {
+    let template = frame.template();
+    let record = store
+        .type_payload(template)
+        .ok_or(InstantiationError::InvalidType(template))?;
+    let TypeData::IndexedAccess(indexed) = record.data() else {
+        return Err(InstantiationError::InvalidType(template));
+    };
+    let computed_variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+    if record.flags() != TypeFlags::INDEXED_ACCESS
+        || (record.object_flags() != ObjectFlags::NONE
+            && record.object_flags() != computed_variable_flags)
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || indexed.access_flags != AccessFlags::NONE
+        || indexed.constrained.resolved_base_constraint.is_some()
+    {
+        return Err(InstantiationError::InvalidType(template));
+    }
+    if cached_deferred_indexed_access_type(
+        store,
+        indexed.object_type,
+        indexed.index_type,
+        indexed.access_flags,
+    )
+    .map_err(InstantiationError::InvalidType)?
+        != Some(template)
+    {
+        return Err(InstantiationError::InvalidType(template));
+    }
+    if let MappedTemplateFrame::Optional { sentinel, .. } = frame {
+        let record = store
+            .type_payload(sentinel)
+            .ok_or(InstantiationError::InvalidType(sentinel))?;
+        if store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| sentinel != bootstrap.undefined_or_missing_type)
+            || record.flags() != TypeFlags::UNDEFINED
+            || record.object_flags() != ObjectFlags::NONE
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || !matches!(record.data(), TypeData::Intrinsic(intrinsic)
+                if intrinsic.intrinsic_name == "undefined")
+        {
+            return Err(InstantiationError::InvalidType(sentinel));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum InstantiationMapping<'a> {
     Stored(TypeMapperId),
@@ -516,28 +627,54 @@ fn instantiate_type_with_alias(
     if !could_contain_installed_type_variables(store, type_, array_targets)? {
         return Ok(type_);
     }
+    with_instantiation_frame(
+        store,
+        mapping,
+        session,
+        |store| instantiation_cache_key(store, type_, alias),
+        std::convert::identity,
+        |store, session| {
+            instantiate_type_worker(store, type_, mapping, array_targets, alias, session)
+        },
+    )
+}
+
+fn with_instantiation_frame<E>(
+    store: &mut CanonicalTypeMapperStore,
+    mapping: InstantiationMapping<'_>,
+    session: &mut InstantiationSession,
+    cache_key: impl FnOnce(
+        &CanonicalTypeMapperStore,
+    ) -> Result<InstantiationCacheKey, InstantiationError>,
+    map_error: impl Fn(InstantiationError) -> E,
+    work: impl FnOnce(&mut CanonicalTypeMapperStore, &mut InstantiationSession) -> Result<TypeId, E>,
+) -> Result<TypeId, E> {
     if session.depth == session.limits.max_depth {
-        return session.handle_limit(
-            store,
-            InstantiationError::DepthLimit {
-                depth: session.depth,
-                limit: session.limits.max_depth,
-            },
-        );
+        return session
+            .handle_limit(
+                store,
+                InstantiationError::DepthLimit {
+                    depth: session.depth,
+                    limit: session.limits.max_depth,
+                },
+            )
+            .map_err(map_error);
     }
     if session.count >= session.limits.max_count {
-        return session.handle_limit(
-            store,
-            InstantiationError::CountLimit {
-                count: session.count,
-                limit: session.limits.max_count,
-            },
-        );
+        return session
+            .handle_limit(
+                store,
+                InstantiationError::CountLimit {
+                    count: session.count,
+                    limit: session.limits.max_count,
+                },
+            )
+            .map_err(map_error);
     }
 
     // Rust IDs can carry foreign provenance, unlike the upstream pointers.
     // Validate the complete cache identity before mutating the dynamic stack.
-    let key = instantiation_cache_key(store, type_, alias)?;
+    let key = cache_key(store).map_err(map_error)?;
     let mapping_identity = mapping.identity();
     let existing_index = session
         .active_mappers
@@ -559,7 +696,7 @@ fn instantiate_type_with_alias(
     session.total_count += 1;
     session.count += 1;
     session.depth += 1;
-    let result = instantiate_type_worker(store, type_, mapping, array_targets, alias, session);
+    let result = work(store, session);
     if existing_index.is_none() {
         let popped = session
             .active_mappers
@@ -594,7 +731,7 @@ fn instantiation_cache_key(
             }
         }
     };
-    Ok(InstantiationCacheKey { type_, alias })
+    Ok(InstantiationCacheKey::Type { type_, alias })
 }
 
 fn could_contain_installed_type_variables(
@@ -2858,6 +2995,27 @@ mod tests {
         store
     }
 
+    fn mapped_frame_fixture() -> (CanonicalTypeMapperStore, TypeId, TypeId, TypeId, TypeId) {
+        let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            })
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (object, number, sentinel) = (
+            bootstrap.empty_type_literal_type,
+            bootstrap.number_type,
+            bootstrap.undefined_or_missing_type,
+        );
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let template = store
+            .alloc_indexed_access_type(object, parameter, AccessFlags::NONE)
+            .unwrap();
+        (store, template, parameter, number, sentinel)
+    }
+
     fn canonical_array_target(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
         let symbol = store
             .alloc_symbol(SymbolData::new(
@@ -3801,12 +3959,311 @@ mod tests {
     }
 
     #[test]
+    fn mapped_template_frames_share_the_vector_cache_with_distinct_optional_keys() {
+        let (mut store, template, parameter, number, sentinel) = mapped_frame_fixture();
+        let sources = [parameter];
+        let targets = [number];
+        let optional = store
+            .literal_union_type_with_alias_and_array_targets(&[number, sentinel], None, None)
+            .unwrap();
+        assert_ne!(optional, number);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        session.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMapping::Vector {
+                sources: &sources,
+                targets: &targets,
+            }
+            .identity(),
+            cache: HashMap::new(),
+        });
+        let result = with_mapped_template_frame(
+            &mut store,
+            MappedTemplateFrame::Optional { template, sentinel },
+            &sources,
+            &targets,
+            &mut session,
+            std::convert::identity,
+            |store, session| {
+                let indexed = with_mapped_template_frame(
+                    store,
+                    MappedTemplateFrame::Indexed(template),
+                    &sources,
+                    &targets,
+                    session,
+                    std::convert::identity,
+                    |store, session| {
+                        instantiate_type_with_vector_and_session(
+                            store, parameter, &sources, &targets, None, session,
+                        )
+                    },
+                )?;
+                assert_eq!(indexed, number);
+                store
+                    .literal_union_type_with_alias_and_array_targets(
+                        &[indexed, sentinel],
+                        None,
+                        None,
+                    )
+                    .map_err(InstantiationError::from)
+            },
+        );
+        assert_eq!(result, Ok(optional));
+        assert_eq!(session.query_count(), 3);
+        assert_eq!(session.total_count(), 3);
+        assert_eq!(session.depth, 0);
+        assert_eq!(session.active_mappers.len(), 1);
+        assert_eq!(session.active_mappers[0].cache.len(), 3);
+
+        for (frame, expected) in [
+            (
+                MappedTemplateFrame::Optional { template, sentinel },
+                optional,
+            ),
+            (MappedTemplateFrame::Indexed(template), number),
+        ] {
+            assert_eq!(
+                with_mapped_template_frame(
+                    &mut store,
+                    frame,
+                    &sources,
+                    &targets,
+                    &mut session,
+                    std::convert::identity,
+                    |_, _| -> Result<TypeId, InstantiationError> {
+                        panic!("the existing frame must return its cached result")
+                    },
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                parameter,
+                &sources,
+                &targets,
+                None,
+                &mut session,
+            ),
+            Ok(number),
+        );
+        assert_eq!(session.query_count(), 3);
+        assert_eq!(session.total_count(), 3);
+        assert_eq!(session.depth, 0);
+    }
+
+    #[test]
+    fn mapped_template_frame_limits_precede_cache_hits_and_keep_recovery_uncached() {
+        let (mut store, template, parameter, number, sentinel) = mapped_frame_fixture();
+        let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+        let sources = [parameter];
+        let targets = [number];
+        for frame in [
+            MappedTemplateFrame::Optional { template, sentinel },
+            MappedTemplateFrame::Indexed(template),
+        ] {
+            let key = match frame {
+                MappedTemplateFrame::Optional { template, sentinel } => {
+                    InstantiationCacheKey::MappedOptional { template, sentinel }
+                }
+                MappedTemplateFrame::Indexed(template) => {
+                    instantiation_cache_key(&store, template, None).unwrap()
+                }
+            };
+            for recovering in [false, true] {
+                for (limits, error) in [
+                    (
+                        InstantiationLimits {
+                            max_depth: 0,
+                            max_count: 10,
+                        },
+                        InstantiationError::DepthLimit { depth: 0, limit: 0 },
+                    ),
+                    (
+                        InstantiationLimits {
+                            max_depth: 10,
+                            max_count: 0,
+                        },
+                        InstantiationError::CountLimit { count: 0, limit: 0 },
+                    ),
+                ] {
+                    let mut session = if recovering {
+                        InstantiationSession::new_recovering(&store, limits, error_type).unwrap()
+                    } else {
+                        InstantiationSession::new(limits)
+                    };
+                    session.active_mappers.push(ActiveMapperFrame {
+                        mapping: InstantiationMapping::Vector {
+                            sources: &sources,
+                            targets: &targets,
+                        }
+                        .identity(),
+                        cache: HashMap::from([(key.clone(), number)]),
+                    });
+                    let mark = session.limit_event_mark();
+                    let result = with_mapped_template_frame(
+                        &mut store,
+                        frame,
+                        &sources,
+                        &targets,
+                        &mut session,
+                        std::convert::identity,
+                        |_, _| panic!("a guarded frame must not execute work"),
+                    );
+                    assert_eq!(
+                        result,
+                        if recovering {
+                            Ok(error_type)
+                        } else {
+                            Err(error)
+                        }
+                    );
+                    assert!(session.limit_event_occurred_since(mark));
+                    assert_eq!(session.query_count(), 0);
+                    assert_eq!(session.total_count(), 0);
+                    assert_eq!(session.depth, 0);
+                    assert_eq!(session.active_mappers.len(), 1);
+                    assert_eq!(session.active_mappers[0].cache.get(&key), Some(&number));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_template_frames_validate_inputs_without_work() {
+        let (mut store, template, parameter, number, _) = mapped_frame_fixture();
+        let foreign_store = initialized_store();
+        let foreign = foreign_store.intrinsic_bootstrap().unwrap().number_type;
+        let sources = [parameter];
+        let targets = [number];
+        let foreign_endpoints = [foreign];
+        let frame = MappedTemplateFrame::Indexed(template);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let before = (store.type_len(), store.mapper_len());
+        let mark = session.limit_event_mark();
+        for (frame, sources, targets, invalid) in [
+            (frame, sources.as_slice(), &[][..], template),
+            (
+                frame,
+                foreign_endpoints.as_slice(),
+                targets.as_slice(),
+                foreign,
+            ),
+            (
+                frame,
+                sources.as_slice(),
+                foreign_endpoints.as_slice(),
+                foreign,
+            ),
+            (
+                MappedTemplateFrame::Indexed(foreign),
+                sources.as_slice(),
+                targets.as_slice(),
+                foreign,
+            ),
+            (
+                MappedTemplateFrame::Indexed(number),
+                sources.as_slice(),
+                targets.as_slice(),
+                number,
+            ),
+            (
+                MappedTemplateFrame::Optional {
+                    template,
+                    sentinel: number,
+                },
+                sources.as_slice(),
+                targets.as_slice(),
+                number,
+            ),
+            (
+                MappedTemplateFrame::Optional {
+                    template,
+                    sentinel: foreign,
+                },
+                sources.as_slice(),
+                targets.as_slice(),
+                foreign,
+            ),
+        ] {
+            assert_eq!(
+                with_mapped_template_frame(
+                    &mut store,
+                    frame,
+                    sources,
+                    targets,
+                    &mut session,
+                    std::convert::identity,
+                    |_, _| panic!("invalid frame inputs must not execute work"),
+                ),
+                Err(InstantiationError::InvalidType(invalid)),
+            );
+        }
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(session.total_count(), 0);
+        assert!(!session.limit_event_occurred_since(mark));
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+        assert_eq!((store.type_len(), store.mapper_len()), before);
+    }
+
+    #[test]
+    fn mapped_template_frames_unwind_work_errors_without_caching() {
+        #[derive(Debug, PartialEq)]
+        enum WorkError {
+            Instantiation(InstantiationError),
+            Work,
+        }
+
+        let (mut store, template, parameter, number, sentinel) = mapped_frame_fixture();
+        let sources = [parameter];
+        let targets = [number];
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let before = (store.type_len(), store.mapper_len());
+        for retained_frame in [false, true] {
+            if retained_frame {
+                session.active_mappers.push(ActiveMapperFrame {
+                    mapping: InstantiationMapping::Vector {
+                        sources: &sources,
+                        targets: &targets,
+                    }
+                    .identity(),
+                    cache: HashMap::new(),
+                });
+            }
+            assert_eq!(
+                with_mapped_template_frame(
+                    &mut store,
+                    MappedTemplateFrame::Optional { template, sentinel },
+                    &sources,
+                    &targets,
+                    &mut session,
+                    WorkError::Instantiation,
+                    |_, _| Err(WorkError::Work),
+                ),
+                Err(WorkError::Work),
+            );
+            assert_eq!(session.depth, 0);
+            assert_eq!(session.active_mappers.len(), usize::from(retained_frame));
+            assert!(
+                session
+                    .active_mappers
+                    .iter()
+                    .all(|frame| frame.cache.is_empty())
+            );
+        }
+        assert_eq!(session.query_count(), 2);
+        assert_eq!(session.total_count(), 2);
+        assert_eq!((store.type_len(), store.mapper_len()), before);
+    }
+
+    #[test]
     fn limit_guard_precedes_an_active_mapper_cache_hit() {
         let mut store = initialized_store();
         let number = store.intrinsic_bootstrap().unwrap().number_type;
         let parameter = store.alloc_type_parameter(None).unwrap();
         let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
-        let key = InstantiationCacheKey {
+        let key = InstantiationCacheKey::Type {
             type_: parameter,
             alias: InstantiationAliasCacheKey::None,
         };
@@ -3927,7 +4384,7 @@ mod tests {
         let number = store.intrinsic_bootstrap().unwrap().number_type;
         let parameter = store.alloc_type_parameter(None).unwrap();
         let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
-        let key = InstantiationCacheKey {
+        let key = InstantiationCacheKey::Type {
             type_: parameter,
             alias: InstantiationAliasCacheKey::None,
         };

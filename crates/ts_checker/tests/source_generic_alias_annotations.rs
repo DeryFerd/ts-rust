@@ -1,11 +1,11 @@
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName,
+    EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
-    TypeData,
+    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
+    SourceCheckError, TypeData, TypeId,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -398,6 +398,288 @@ fn unsupported_alias_instantiation_does_not_publish_a_callable_or_grow_on_retry(
 }
 
 #[test]
+fn nested_generic_alias_parameters_keep_canonical_identities_in_either_query_order() {
+    let source = "type Alias<T> = T; interface Box<T> { value: T } declare function f<T>(value: Box<Alias<T>>): T;";
+    for annotation_first in [false, true] {
+        let parsed = parse_source_file(source);
+        let nodes = NestedAliasNodes::new(&parsed);
+        let mut context = context(&parsed);
+        let early = annotation_first.then(|| {
+            context
+                .get_type_from_type_node(nodes.outer_annotation)
+                .unwrap()
+        });
+        context.check_source_file(FILE).unwrap();
+        let identities = nested_alias_identities(&mut context, &nodes);
+        if let Some(early) = early {
+            assert_eq!(early, identities.parameter_type);
+        }
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+
+        let before = counts(&context);
+        for _ in 0..2 {
+            context.recheck_source_file(FILE).unwrap();
+            assert_eq!(nested_alias_identities(&mut context, &nodes), identities);
+            assert_eq!(counts(&context), before);
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+        }
+    }
+}
+
+struct NestedAliasNodes {
+    declarations: [NodeRef; 3],
+    type_parameters: [NodeRef; 3],
+    parameter: NodeRef,
+    outer_annotation: NodeRef,
+    inner_annotation: NodeRef,
+    return_annotation: NodeRef,
+    alias_body: NodeRef,
+}
+
+impl NestedAliasNodes {
+    fn new(parsed: &ParseResult) -> Self {
+        let node = |id| NodeRef::new(parsed.arena.id(), FILE, id);
+        let declarations = [
+            SyntaxKind::FunctionDeclaration,
+            SyntaxKind::TypeAliasDeclaration,
+            SyntaxKind::InterfaceDeclaration,
+        ]
+        .map(|kind| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| (record.kind == kind).then_some(node(id)))
+                .unwrap()
+        });
+        let [function, alias, interface] = declarations;
+        let NodeData::FunctionDeclaration(function) =
+            &parsed.arena.get(function.node).unwrap().data
+        else {
+            panic!("expected the function declaration")
+        };
+        let NodeData::TypeAliasDeclaration(alias) = &parsed.arena.get(alias.node).unwrap().data
+        else {
+            panic!("expected the alias declaration")
+        };
+        let NodeData::InterfaceDeclaration(interface) =
+            &parsed.arena.get(interface.node).unwrap().data
+        else {
+            panic!("expected the interface declaration")
+        };
+        let type_parameters = [
+            function.type_parameters.as_ref().unwrap(),
+            alias.type_parameters.as_ref().unwrap(),
+            interface.type_parameters.as_ref().unwrap(),
+        ]
+        .map(|parameters| {
+            assert_eq!(parameters.nodes.len(), 1);
+            node(parameters.nodes[0])
+        });
+        assert_eq!(function.parameters.nodes.len(), 1);
+        let parameter = node(function.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &parsed.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("expected the function parameter")
+        };
+        let outer_annotation = node(parameter_data.type_.unwrap());
+        let NodeData::TypeReferenceNode(reference) =
+            &parsed.arena.get(outer_annotation.node).unwrap().data
+        else {
+            panic!("expected the Box type reference")
+        };
+        let arguments = reference.type_arguments.as_ref().unwrap();
+        assert_eq!(arguments.nodes.len(), 1);
+        Self {
+            declarations,
+            type_parameters,
+            parameter,
+            outer_annotation,
+            inner_annotation: node(arguments.nodes[0]),
+            return_annotation: node(function.type_.unwrap()),
+            alias_body: node(alias.type_),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NestedAliasIdentities {
+    callable: TypeId,
+    signature: SignatureId,
+    parameter: SemanticSymbolId,
+    parameter_type: TypeId,
+    type_parameters: [TypeId; 3],
+    box_target: TypeId,
+    box_this: TypeId,
+}
+
+fn nested_alias_type_parameters(
+    context: &CanonicalCheckerContext<'_>,
+    nodes: &NestedAliasNodes,
+) -> [TypeId; 3] {
+    let bound = context.file(FILE).unwrap().1;
+    let symbols = nodes
+        .type_parameters
+        .map(|node| bound.symbol(node).unwrap());
+    assert_ne!(symbols[0], symbols[1]);
+    assert_ne!(symbols[0], symbols[2]);
+    assert_ne!(symbols[1], symbols[2]);
+    let types = symbols.map(|symbol| {
+        let type_ = context
+            .store()
+            .declared_type_links(symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let record = context.store().type_payload(type_).unwrap();
+        assert!(matches!(record.data(), TypeData::TypeParameter(_)));
+        assert_eq!(record.symbol(), Some(symbol));
+        type_
+    });
+    assert_ne!(types[0], types[1]);
+    assert_ne!(types[0], types[2]);
+    assert_ne!(types[1], types[2]);
+    for (symbol, node) in symbols.into_iter().zip(nodes.type_parameters) {
+        assert_eq!(
+            context.store().symbol(symbol).unwrap().declarations(),
+            Some(&[node][..])
+        );
+    }
+    let alias_symbol = bound.symbol(nodes.declarations[1]).unwrap();
+    let alias = context.store().type_alias_links(alias_symbol).unwrap();
+    assert_eq!(alias.type_parameters.as_deref(), Some(&[types[1]][..]));
+    assert_eq!(alias.declared_type, Some(types[1]));
+    types
+}
+
+#[allow(clippy::too_many_lines)] // One snapshot checks each owner and its parameter identities.
+fn nested_alias_identities(
+    context: &mut CanonicalCheckerContext<'_>,
+    nodes: &NestedAliasNodes,
+) -> NestedAliasIdentities {
+    let [function_symbol, _, box_symbol] = nodes
+        .declarations
+        .map(|node| context.file(FILE).unwrap().1.symbol(node).unwrap());
+    let parameter = context
+        .file(FILE)
+        .unwrap()
+        .1
+        .symbol(nodes.parameter)
+        .unwrap();
+    let parameter_type = context
+        .get_type_from_type_node(nodes.outer_annotation)
+        .unwrap();
+    let type_parameters = nested_alias_type_parameters(context, nodes);
+    let [function_parameter, alias_parameter, box_parameter] = type_parameters;
+    assert_eq!(
+        context
+            .get_type_from_type_node(nodes.inner_annotation)
+            .unwrap(),
+        function_parameter
+    );
+    assert_eq!(
+        context
+            .get_type_from_type_node(nodes.return_annotation)
+            .unwrap(),
+        function_parameter
+    );
+    assert_eq!(
+        context.get_type_from_type_node(nodes.alias_body).unwrap(),
+        alias_parameter
+    );
+    let callable = context
+        .store()
+        .value_symbol_links(function_symbol)
+        .unwrap()
+        .resolved_type
+        .unwrap();
+    let callable_record = context.store().type_payload(callable).unwrap();
+    assert_eq!(callable_record.symbol(), Some(function_symbol));
+    let TypeData::Object(object) = callable_record.data() else {
+        panic!("the function must retain a callable object")
+    };
+    let signatures = object.structured.signatures.as_ref().unwrap();
+    assert_eq!(signatures.len(), 1);
+    let signature = signatures[0];
+    let record = context.store().signature(signature).unwrap();
+    assert_eq!(record.declaration(), Some(nodes.declarations[0]));
+    assert_eq!(record.type_parameters(), &[function_parameter]);
+    assert_eq!(record.parameters(), &[parameter]);
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(
+        context.get_return_type_of_signature(signature).unwrap(),
+        function_parameter
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(parameter)
+            .unwrap()
+            .resolved_type,
+        Some(parameter_type)
+    );
+    let box_target = context
+        .store()
+        .declared_type_links(box_symbol)
+        .unwrap()
+        .declared_type
+        .unwrap();
+    let target = context.store().type_payload(box_target).unwrap();
+    assert_eq!(target.symbol(), Some(box_symbol));
+    let TypeData::Interface(interface) = target.data() else {
+        panic!("Box must retain its declared interface target")
+    };
+    let box_this = interface.this_type.expect("Box must retain its this type");
+    assert_eq!(interface.outer_type_parameter_count, 0);
+    assert_eq!(
+        interface.all_type_parameters.as_deref(),
+        Some(&[box_parameter, box_this][..])
+    );
+    assert_eq!(
+        interface.reference.resolved_type_arguments.as_deref(),
+        Some(&[box_parameter][..])
+    );
+    assert_eq!(interface.reference.object.target, Some(box_target));
+    let this_record = context.store().type_payload(box_this).unwrap();
+    assert_eq!(this_record.symbol(), Some(box_symbol));
+    let TypeData::TypeParameter(this_data) = this_record.data() else {
+        panic!("Box's this type must be a type parameter")
+    };
+    assert!(this_data.is_this_type);
+    assert_eq!(this_data.constraint, Some(box_target));
+    assert!(this_data.target.is_none());
+    assert!(this_data.mapper.is_none());
+    assert!(!type_parameters.contains(&box_this));
+    let TypeData::TypeReference(reference) =
+        context.store().type_payload(parameter_type).unwrap().data()
+    else {
+        panic!("the parameter must be a reference to Box")
+    };
+    assert_eq!(reference.object.target, Some(box_target));
+    assert_eq!(
+        reference.resolved_type_arguments.as_deref(),
+        Some(&[function_parameter][..])
+    );
+    NestedAliasIdentities {
+        callable,
+        signature,
+        parameter,
+        parameter_type,
+        type_parameters,
+        box_target,
+        box_this,
+    }
+}
+
+#[test]
 fn generic_alias_source_boundary_keeps_recursive_and_const_forms_unsupported() {
     for source in [
         "interface Array<T> {} interface ReadonlyArray<T> {} type Alias<T> = T[]; declare function f<T>(value: Alias<T>): void;",
@@ -405,7 +687,6 @@ fn generic_alias_source_boundary_keeps_recursive_and_const_forms_unsupported() {
         "type First<T> = Second<T>; type Second<T> = First<T>[]; declare function f<T>(value: First<T>): void;",
         "type Alias<T> = T; declare function f<const T>(value: Alias<T>): void;",
         "type Alias<T> = T; const f = <T>(value: Alias<T>): Alias<T> => value;",
-        "type Alias<T> = T; interface Box<T> { value: T } declare function f<T>(value: Box<Alias<T>>): T;",
         "type Alias<T> = typeof f; declare function f<T>(value: Alias<T>): void;",
         "namespace N { export type Again<T> = Alias<T>; } type Alias<T> = N.Again<T>; declare function f<T>(value: Alias<T>): void;",
     ] {
