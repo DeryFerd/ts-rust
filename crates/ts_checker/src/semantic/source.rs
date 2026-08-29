@@ -1353,6 +1353,7 @@ struct PlannedContextualArrow {
 #[allow(clippy::large_enum_variant)] // Keeps ordinary arrow return expressions inline.
 enum PlannedArrowBody {
     Empty,
+    ForOf(Box<PlannedLexicalIteration>),
     Return {
         diagnostic_node: NodeRef,
         expression: PlannedExpression,
@@ -2041,6 +2042,7 @@ struct PlannedLexicalIteration {
     locals: Vec<PlannedVariable>,
     body: Vec<PlannedLoopFunctionStatement>,
     trailing: Vec<PlannedExpression>,
+    capture_assignments: Vec<SourceFlowAssignment>,
 }
 
 #[derive(Clone, Debug)]
@@ -5493,6 +5495,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         syntax: SourceForInStatementSyntax,
     ) -> Result<PlannedLexicalIteration, SourceCheckError> {
+        let reads_start = self.identifier_reads.len();
         let statement = syntax.control.statement;
         let iterable = self.plan_expression(syntax.control.iterable.ok_or(
             SourceCheckError::Function(SourceFunctionInvariant::Callable(statement)),
@@ -5591,6 +5594,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.readable_variables = readable_variables;
         self.assignable_mutable_variables = mutable_variables;
         let (locals, body, trailing) = result?;
+        let Some((store, host)) = self.semantic else {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(statement),
+            ));
+        };
+        let capture_assignments = collect_source_capture_assignments(
+            store,
+            host,
+            &[],
+            &self.identifier_reads[reads_start..],
+        )?;
 
         Ok(PlannedLexicalIteration {
             syntax,
@@ -5598,6 +5612,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             locals,
             body,
             trailing,
+            capture_assignments,
         })
     }
 
@@ -13267,6 +13282,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 if callable.family == SourceCallableFamily::ArrowFunction
                     && self.node(callable.declaration)?.kind == SyntaxKind::ArrowFunction =>
             {
+                match plan_source_function_for_of_statement_syntax(
+                    self.arena, self.bound, store, callable,
+                ) {
+                    Ok(syntax) => {
+                        if !self.function_empty_body_return_supported(callable.return_type)? {
+                            return Err(Self::unsupported_function_body(callable));
+                        }
+                        let planned = self.finish_for_in_statement(syntax)?;
+                        return Ok(PlannedFunctionBody::ForOf(Box::new(planned)));
+                    }
+                    Err(SourceFunctionStatementsError::Unsupported(_)) => {}
+                    Err(error) => {
+                        return Err(Self::function_statements_plan_error(callable, error));
+                    }
+                }
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Arrow(callable.body),
                 ));
@@ -15352,23 +15382,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         source: SourceArrowPlan,
     ) -> Result<PlannedArrow, SourceCheckError> {
         self.plan_callable_type_import_annotation_roots(&source.callable)?;
-        if let SourceArrowBodyPlan::LinearBlock { block } = source.body {
-            let (parameter_initializers, object_parameter_bindings, body) =
+        if let SourceArrowBodyPlan::LinearBlock { block }
+        | SourceArrowBodyPlan::ForOfBlock { block } = source.body
+        {
+            let (parameter_initializers, object_parameter_bindings, statements) =
                 self.plan_function_body(&source.callable)?;
             if !object_parameter_bindings.is_empty() {
                 return Err(SourceCheckError::Arrow(source.callable.declaration));
             }
-            let PlannedFunctionBody::Linear(linear_body) = body else {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::Arrow(block),
-                ));
+            let (linear_body, body) = match (source.body, statements) {
+                (SourceArrowBodyPlan::LinearBlock { .. }, PlannedFunctionBody::Linear(linear)) => {
+                    (Some(linear), PlannedArrowBody::Empty)
+                }
+                (SourceArrowBodyPlan::ForOfBlock { .. }, PlannedFunctionBody::ForOf(iteration)) => {
+                    (None, PlannedArrowBody::ForOf(iteration))
+                }
+                _ => {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Arrow(block),
+                    ));
+                }
             };
             return Ok(PlannedArrow {
                 source,
                 parameter_initializers,
                 expression_statement: None,
-                linear_body: Some(linear_body),
-                body: PlannedArrowBody::Empty,
+                linear_body,
+                body,
             });
         }
         let parameter_initializers =
@@ -15406,7 +15446,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceArrowBodyPlan::ConciseExpression { expression } => {
                 self.plan_arrow_return_expression(expression, expression)
             }
-            SourceArrowBodyPlan::LinearBlock { .. } => {
+            SourceArrowBodyPlan::LinearBlock { .. } | SourceArrowBodyPlan::ForOfBlock { .. } => {
                 unreachable!("statement bodies were planned above")
             }
         };
@@ -20870,28 +20910,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         self.nested_arrow_depth += 1;
         let result = (|| {
-            if let SourceArrowBodyPlan::LinearBlock { block } = body {
+            if let SourceArrowBodyPlan::LinearBlock { block }
+            | SourceArrowBodyPlan::ForOfBlock { block } = body
+            {
                 if expression_statement.is_some() {
                     return Err(SourceCheckError::Arrow(declaration));
                 }
-                let (parameter_initializers, object_parameter_bindings, body) =
+                let (parameter_initializers, object_parameter_bindings, statements) =
                     self.plan_function_body(&callable)?;
                 if !object_parameter_bindings.is_empty() {
                     return Err(SourceCheckError::Arrow(declaration));
                 }
-                let PlannedFunctionBody::Linear(linear_body) = body else {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Arrow(block),
-                    ));
+                let (linear_body, body) = match (body, statements) {
+                    (
+                        SourceArrowBodyPlan::LinearBlock { .. },
+                        PlannedFunctionBody::Linear(linear),
+                    ) => (Some(linear), PlannedArrowBody::Empty),
+                    (
+                        SourceArrowBodyPlan::ForOfBlock { .. },
+                        PlannedFunctionBody::ForOf(iteration),
+                    ) => (None, PlannedArrowBody::ForOf(iteration)),
+                    _ => {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(block),
+                        ));
+                    }
                 };
                 return Ok(PlannedArrowExpression {
                     callable,
                     parameter_initializers,
                     expression_statement: None,
-                    linear_body: Some(linear_body),
+                    linear_body,
                     loop_body: None,
                     prototype_this: None,
-                    body: PlannedArrowBody::Empty,
+                    body,
                 });
             }
             let parameter_initializers =
@@ -20927,8 +20979,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceArrowBodyPlan::ConciseExpression { expression } => {
                     self.plan_arrow_return_expression(expression, expression)
                 }
-                SourceArrowBodyPlan::LinearBlock { .. } => {
-                    unreachable!("linear arrow bodies were planned above")
+                SourceArrowBodyPlan::LinearBlock { .. }
+                | SourceArrowBodyPlan::ForOfBlock { .. } => {
+                    unreachable!("statement arrow bodies were planned above")
                 }
             };
             self.prior_variables = body_prior_variables;
@@ -26783,7 +26836,9 @@ fn preflight_inferred_function_return_dependencies(
                                 &HashSet::new(),
                                 functions,
                             ),
-                            PlannedArrowBody::ReturnJsx { .. } => false,
+                            PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => {
+                                false
+                            }
                         }
                     }
                     _ => false,
@@ -33424,6 +33479,28 @@ fn check_planned_arrow_argument(
     {
         return Err(SourceCheckError::Arrow(expression));
     }
+    if matches!(arrow.body, PlannedArrowBody::ForOf(_))
+        && (arrow.callable.is_async
+            || arrow.expression_statement.is_some()
+            || arrow.linear_body.is_some()
+            || arrow.loop_body.is_some()
+            || arrow.prototype_this.is_some()
+            || arrow
+                .callable
+                .parameters
+                .iter()
+                .any(|parameter| parameter.is_implicit_any())
+            || host.node(expression).is_none_or(|record| {
+                record.kind != SyntaxKind::ArrowFunction
+                    || !matches!(record.data, NodeData::ArrowFunction(_))
+            })
+            || host
+                .bound_file(expression)
+                .and_then(BoundFile::source_facts)
+                .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file))
+    {
+        return Err(SourceCheckError::Arrow(expression));
+    }
     if outer_capture.is_some()
         && host.node(expression).is_none_or(|record| {
             !(matches!(
@@ -33465,6 +33542,7 @@ fn check_planned_arrow_argument(
         if !arrow.parameter_initializers.is_empty()
             || arrow.expression_statement.is_some()
             || arrow.linear_body.is_some()
+            || matches!(arrow.body, PlannedArrowBody::ForOf(_))
             || !arrow.callable.parameters.is_empty()
         {
             return Err(SourceCheckError::Arrow(expression));
@@ -33564,6 +33642,7 @@ fn check_planned_arrow_argument(
             let body = match &arrow.body {
                 PlannedArrowBody::Empty => None,
                 PlannedArrowBody::Return { expression, .. } => Some(expression),
+                PlannedArrowBody::ForOf(_) => return Err(SourceCheckError::Arrow(expression)),
                 PlannedArrowBody::ReturnJsx { .. } => unreachable!("JSX returns were handled"),
             };
             publish_checked_source_callable_return_with_capture_context(
@@ -33703,7 +33782,10 @@ fn check_planned_arrow_argument(
                 .linear_body
                 .as_ref()
                 .map(|statements| &statements.flow),
-            assignments: &[],
+            assignments: match &arrow.body {
+                PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
+                _ => &[],
+            },
             value_exports: &[],
         });
     let flow_types = check_callable_parameter_initializers_with_capture_context(
@@ -33777,9 +33859,31 @@ fn check_planned_arrow_argument(
                 .linear_body
                 .as_ref()
                 .map(|statements| &statements.flow),
-            assignments: &[],
+            assignments: match &arrow.body {
+                PlannedArrowBody::ForOf(iteration) => &iteration.capture_assignments,
+                _ => &[],
+            },
             value_exports: &[],
         });
+    if let PlannedArrowBody::ForOf(iteration) = &arrow.body {
+        check_planned_lexical_iteration_with_capture_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &flow_types,
+            type_import_execution,
+            type_import_execution.annotation_capabilities,
+            deferred,
+            iteration,
+            &mut linear_values,
+            &mut linear_value_order,
+            arrow_capture,
+        )?;
+    }
     if let Some(statement) = &arrow.expression_statement {
         let checked = check_expression_type_with_capture_context(
             store,
@@ -33842,6 +33946,7 @@ fn check_planned_arrow_argument(
                     .as_ref()
                     .and_then(|statements| statements.return_expression.as_ref()),
                 PlannedArrowBody::Return { expression, .. } => Some(expression),
+                PlannedArrowBody::ForOf(_) => None,
                 PlannedArrowBody::ReturnJsx { .. } => {
                     return Err(SourceCheckError::Arrow(expression));
                 }
@@ -33871,7 +33976,7 @@ fn check_planned_arrow_argument(
             .type_node()
             .ok_or(SourceCheckError::Arrow(expression))?;
         match &arrow.body {
-            PlannedArrowBody::Empty => {}
+            PlannedArrowBody::Empty | PlannedArrowBody::ForOf(_) => {}
             PlannedArrowBody::Return {
                 diagnostic_node,
                 expression: body,
@@ -33944,7 +34049,7 @@ fn check_planned_arrow_argument(
         }
     }
 
-    if arrow.linear_body.is_some() {
+    if arrow.linear_body.is_some() || matches!(arrow.body, PlannedArrowBody::ForOf(_)) {
         publish_staged_variable_state(
             store,
             source.node_ref(),
@@ -34301,7 +34406,9 @@ fn check_contextual_direct_call_arrow(
             let widened = widened_fresh_literal_type(store, checked.result)?;
             store.get_widened_type_with_global_types(widened, global_types)?
         }
-        PlannedArrowBody::ReturnJsx { .. } => return Err(unsupported()),
+        PlannedArrowBody::ForOf(_) | PlannedArrowBody::ReturnJsx { .. } => {
+            return Err(unsupported());
+        }
     };
     if let Some(predicate) = filter_predicate {
         let narrowed = predicate.narrowed_type.ok_or_else(unsupported)?;
@@ -39784,7 +39891,44 @@ fn check_planned_lexical_iteration(
     staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
     value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
-    let iterable = check_expression_type(
+    check_planned_lexical_iteration_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        type_import_capabilities,
+        deferred,
+        iteration,
+        staged_value_types,
+        value_order,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // The loop keeps eager flow separate from deferred capture entries.
+fn check_planned_lexical_iteration_with_capture_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    iteration: &PlannedLexicalIteration,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let iterable = check_expression_type_with_capture_context(
         store,
         host,
         global_types,
@@ -39797,6 +39941,8 @@ fn check_planned_lexical_iteration(
         &iteration.iterable,
         None,
         deferred,
+        None,
+        outer_capture,
     )?;
     let bootstrap = store
         .intrinsic_bootstrap()
@@ -39890,6 +40036,7 @@ fn check_planned_lexical_iteration(
         iteration_type
     };
     let mut loop_flow_types = flow_types.clone();
+    let mut loop_declared_types = HashMap::new();
     let mut binding_types = Vec::with_capacity(iteration.syntax.bindings.len());
     for binding in &iteration.syntax.bindings {
         let type_ = if destructured {
@@ -39917,12 +40064,25 @@ fn check_planned_lexical_iteration(
                 VariableInvariant::DuplicateCurrentFlowType(binding.symbol),
             ));
         }
+        if outer_capture.is_some() && !iteration.syntax.binding.is_const() {
+            loop_declared_types.insert(binding.symbol, type_);
+        }
         binding_types.push((binding.symbol, type_));
     }
     for (symbol, type_) in binding_types {
         stage_value_type(store, staged_value_types, value_order, symbol, type_)?;
     }
     for statement in &iteration.body {
+        let arrow_capture = outer_capture
+            .is_some()
+            .then_some(SourceArrowCaptureContext {
+                declared_types: &loop_declared_types,
+                mutable_symbols: None,
+                outer: outer_capture.as_ref(),
+                flow: None,
+                assignments: &iteration.capture_assignments,
+                value_exports: &[],
+            });
         match statement {
             PlannedLoopFunctionStatement::Local(index) => {
                 let local = iteration
@@ -39931,7 +40091,7 @@ fn check_planned_lexical_iteration(
                     .ok_or(SourceCheckError::Function(
                         SourceFunctionInvariant::Callable(iteration.syntax.control.statement),
                     ))?;
-                check_planned_loop_local(
+                check_planned_loop_local_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -39946,10 +40106,19 @@ fn check_planned_lexical_iteration(
                     local,
                     staged_value_types,
                     value_order,
+                    arrow_capture,
                 )?;
+                if outer_capture.is_some() && !local.binding.is_const() {
+                    let declared = staged_value_types.get(&local.symbol).copied().ok_or(
+                        SourceCheckError::Variable(VariableInvariant::MissingStagedValueType(
+                            local.symbol,
+                        )),
+                    )?;
+                    loop_declared_types.insert(local.symbol, declared);
+                }
             }
             PlannedLoopFunctionStatement::Expression(expression) => {
-                check_expression_type(
+                check_expression_type_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -39962,6 +40131,8 @@ fn check_planned_lexical_iteration(
                     expression,
                     None,
                     deferred,
+                    None,
+                    arrow_capture,
                 )?;
             }
             PlannedLoopFunctionStatement::Loop(nested) => {
@@ -40001,8 +40172,18 @@ fn check_planned_lexical_iteration(
             ));
         }
     }
+    let arrow_capture = outer_capture
+        .is_some()
+        .then_some(SourceArrowCaptureContext {
+            declared_types: &loop_declared_types,
+            mutable_symbols: None,
+            outer: outer_capture.as_ref(),
+            flow: None,
+            assignments: &iteration.capture_assignments,
+            value_exports: &[],
+        });
     for expression in &iteration.trailing {
-        check_expression_type(
+        check_expression_type_with_capture_context(
             store,
             host,
             global_types,
@@ -40015,6 +40196,8 @@ fn check_planned_lexical_iteration(
             expression,
             None,
             deferred,
+            None,
+            arrow_capture,
         )?;
     }
     Ok(())
@@ -47511,6 +47694,9 @@ fn source_arrow_capture_can_keep_narrowing(
         }
         return Ok(true);
     }
+    if record.kind == SyntaxKind::BindingElement {
+        return source_for_of_let_capture_is_exact(store, host, symbol, declaration);
+    }
     if record.kind != SyntaxKind::VariableDeclaration
         || !matches!(record.data, NodeData::VariableDeclaration(_))
     {
@@ -47525,14 +47711,21 @@ fn source_arrow_capture_can_keep_narrowing(
     {
         return Err(invalid());
     }
-    if list.flags.0 & NODE_FLAG_LET == 0 || bound.local_symbol(declaration).is_some() {
-        return Ok(false);
-    }
     let statement = list
         .parent
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
         .ok_or_else(invalid)?;
     let statement_record = host.node(statement).ok_or_else(invalid)?;
+    if statement_record.kind == SyntaxKind::ForOfStatement
+        || bound
+            .block_scope_container(declaration)
+            .is_some_and(|scope| store.source_node_kind(scope) == Some(SyntaxKind::ForOfStatement))
+    {
+        return source_for_of_let_capture_is_exact(store, host, symbol, declaration);
+    }
+    if list.flags.0 & NODE_FLAG_LET == 0 || bound.local_symbol(declaration).is_some() {
+        return Ok(false);
+    }
     let NodeData::VariableStatement(statement_data) = &statement_record.data else {
         return Ok(false);
     };
@@ -47556,6 +47749,215 @@ fn source_arrow_capture_can_keep_narrowing(
         || bound
             .source_facts()
             .is_some_and(ts_binder::CanonicalSourceFileFacts::is_external_or_common_js_module))
+}
+
+/// Keeps the original binding symbol while proving its mutable for-of owner.
+#[allow(clippy::too_many_lines)] // The scalar and array bindings share one checked loop owner.
+fn source_for_of_let_capture_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let invalid = || SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(symbol));
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let reference = |node| NodeRef::new(declaration.arena, declaration.file, node);
+    let parent = |node| {
+        host.node(node)
+            .and_then(|record| record.parent)
+            .map(reference)
+    };
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let root = if record.kind == SyntaxKind::BindingElement {
+        parent(declaration).and_then(parent)
+    } else {
+        Some(declaration)
+    };
+    let list = root.and_then(parent);
+    let statement = list.and_then(parent);
+    let source_for_of = statement
+        .is_some_and(|node| store.source_node_kind(node) == Some(SyntaxKind::ForOfStatement));
+    let bound_for_of = bound
+        .block_scope_container(declaration)
+        .is_some_and(|node| store.source_node_kind(node) == Some(SyntaxKind::ForOfStatement));
+    if !source_for_of && !bound_for_of {
+        return Ok(false);
+    }
+    if !declaration.is_for(arena.id(), bound.file_id())
+        || bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+    {
+        return Err(invalid());
+    }
+    let root = root.ok_or_else(invalid)?;
+    let list = list.ok_or_else(invalid)?;
+    let statement = statement.ok_or_else(invalid)?;
+    let root_record = host.node(root).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &root_record.data else {
+        return Err(invalid());
+    };
+    let list_record = host.node(list).ok_or_else(invalid)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return Err(invalid());
+    };
+    if root_record.kind != SyntaxKind::VariableDeclaration
+        || root_record.flags.0 != 0
+        || variable.initializer.is_some()
+        || variable.type_.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_LET
+        || declarations.declarations.nodes.as_slice() != [root.node]
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+    {
+        return Err(invalid());
+    }
+    let mut bindings = vec![root, list];
+    let name = if root == declaration {
+        reference(variable.name)
+    } else {
+        let pattern = parent(declaration).ok_or_else(invalid)?;
+        let pattern_record = host.node(pattern).ok_or_else(invalid)?;
+        let NodeData::BindingPattern(elements) = &pattern_record.data else {
+            return Err(invalid());
+        };
+        if record.kind != SyntaxKind::BindingElement
+            || pattern_record.kind != SyntaxKind::ArrayBindingPattern
+            || pattern_record.flags.0 != 0
+            || variable.name != pattern.node
+            || elements.elements.nodes.is_empty()
+            || elements.elements.has_trailing_comma
+            || elements.elements.range != pattern_record.range
+            || elements.facts != 0
+            || elements
+                .elements
+                .nodes
+                .iter()
+                .filter(|&&node| node == declaration.node)
+                .count()
+                != 1
+            || bound.symbol(root).is_some()
+        {
+            return Err(invalid());
+        }
+        bindings.push(pattern);
+        let mut selected_name = None;
+        for &element in &elements.elements.nodes {
+            let element = reference(element);
+            let element_record = host.node(element).ok_or_else(invalid)?;
+            let NodeData::BindingElement(binding) = &element_record.data else {
+                return Err(invalid());
+            };
+            if element_record.kind != SyntaxKind::BindingElement
+                || element_record.flags.0 != 0
+                || element_record.parent != Some(pattern.node)
+                || binding.dot_dot_dot_token.is_some()
+                || binding.flow_node.is_some()
+                || binding.initializer.is_some()
+                || binding.local_symbol.is_some()
+                || binding.property_name.is_some()
+                || binding.symbol.is_some()
+                || binding.facts != 0
+            {
+                return Err(invalid());
+            }
+            let name = reference(binding.name.ok_or_else(invalid)?);
+            let name_record = host.node(name).ok_or_else(invalid)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(invalid());
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(element.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(invalid());
+            }
+            bindings.extend([element, name]);
+            if element == declaration {
+                selected_name = Some(name);
+            }
+        }
+        selected_name.ok_or_else(invalid)?
+    };
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(invalid());
+    }
+    bindings.push(name);
+    let body = parent(statement).ok_or_else(invalid)?;
+    let callable = parent(body).ok_or_else(invalid)?;
+    let body_record = host.node(body).ok_or_else(invalid)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invalid());
+    };
+    let callable_record = host.node(callable).ok_or_else(invalid)?;
+    let NodeData::ArrowFunction(arrow) = &callable_record.data else {
+        return Err(invalid());
+    };
+    let owner = bound
+        .symbol(callable)
+        .and_then(|owner| store.symbol(owner))
+        .ok_or_else(invalid)?;
+    if body_record.kind != SyntaxKind::Block
+        || block.statements.nodes.first() != Some(&statement.node)
+        || callable_record.kind != SyntaxKind::ArrowFunction
+        || arrow.body != body.node
+        || arrow.modifiers.is_some()
+        || owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(&[callable])
+        || owner.value_declaration() != Some(callable)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || bound.container(statement) != Some(callable)
+        || bound.flow_container(statement) != Some(callable)
+        || bound.block_scope_container(statement) != Some(callable)
+        || bindings.iter().any(|&node| {
+            bound.container(node) != Some(callable)
+                || bound.block_scope_container(node) != Some(statement)
+        })
+    {
+        return Err(invalid());
+    }
+    let control =
+        plan_source_control_loop_syntax(arena, bound, statement, body).map_err(|_| invalid())?;
+    if control.kind != SourceControlLoopKind::ForOf
+        || control.initializer != Some(list)
+        || plan_top_level_variable(
+            bound,
+            store,
+            declaration,
+            name,
+            &identifier.text,
+            VariableBindingKind::Let,
+            false,
+        )
+        .map_err(|_| invalid())?
+            != symbol
+        || bound
+            .locals(statement)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 fn source_arrow_parameter_entry_types(
@@ -60463,35 +60865,53 @@ pub(super) fn check_source_file(
                     )?;
                 }
                 if callback.is_none() && callable.return_type.is_inferred() {
-                    let captured_flow_types = SourceArrowCaptureContext {
+                    let source_capture = SourceArrowCaptureContext {
                         declared_types: &top_level_declared_types,
                         mutable_symbols: Some(&mutable_variables),
                         outer: None,
                         flow: None,
                         assignments: &capture_assignments,
                         value_exports: &local_named_exports,
-                    }
-                    .flow_types(
+                    };
+                    let captured_flow_types = source_capture.flow_types(
                         store,
                         host,
                         callable.declaration,
                         &current_flow_types,
                     )?;
-                    let body_flow_types = check_callable_parameter_initializers(
-                        store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        session,
-                        diagnostics,
-                        &captured_flow_types,
-                        &type_import_execution,
-                        &mut deferred,
-                        &callable,
-                        &arrow.parameter_initializers,
-                        &[],
-                    )?;
+                    let for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
+                        .then(|| source_arrow_parameter_entry_types(store, &callable))
+                        .transpose()?;
+                    let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
+                        (PlannedArrowBody::ForOf(iteration), Some(entries)) => {
+                            Some(SourceArrowCaptureContext {
+                                declared_types: entries,
+                                mutable_symbols: None,
+                                outer: Some(&source_capture),
+                                flow: None,
+                                assignments: &iteration.capture_assignments,
+                                value_exports: &[],
+                            })
+                        }
+                        _ => None,
+                    };
+                    let body_flow_types =
+                        check_callable_parameter_initializers_with_capture_context(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &captured_flow_types,
+                            &type_import_execution,
+                            &mut deferred,
+                            &callable,
+                            &arrow.parameter_initializers,
+                            &[],
+                            for_of_capture,
+                        )?;
                     let body_flow_types = if let Some(statements) = &arrow.linear_body {
                         check_planned_linear_function_statements(
                             bound,
@@ -60515,6 +60935,25 @@ pub(super) fn check_source_file(
                     } else {
                         body_flow_types
                     };
+                    if let PlannedArrowBody::ForOf(iteration) = &arrow.body {
+                        check_planned_lexical_iteration_with_capture_context(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &body_flow_types,
+                            &type_import_execution,
+                            &type_import_capabilities,
+                            &mut deferred,
+                            iteration,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            for_of_capture,
+                        )?;
+                    }
                     if let Some(statement) = &arrow.expression_statement {
                         let checked = check_expression_type(
                             store,
@@ -60600,6 +61039,7 @@ pub(super) fn check_source_file(
                                     expression,
                                     diagnostic_node,
                                 } => (Some(expression), *diagnostic_node),
+                                PlannedArrowBody::ForOf(_) => (None, callable.declaration),
                                 PlannedArrowBody::ReturnJsx { .. } => {
                                     unreachable!("JSX arrow returns are checked above")
                                 }
@@ -64334,21 +64774,37 @@ pub(super) fn check_source_file(
         let Some(return_type) = arrow.source.callable.return_type.type_node() else {
             return Err(SourceCheckError::Arrow(arrow.source.callable.declaration));
         };
-        let captured_flow_types = SourceArrowCaptureContext {
+        let source_capture = SourceArrowCaptureContext {
             declared_types: &top_level_declared_types,
             mutable_symbols: Some(&mutable_variables),
             outer: None,
             flow: None,
             assignments: &capture_assignments,
             value_exports: &local_named_exports,
-        }
-        .flow_types(
+        };
+        let captured_flow_types = source_capture.flow_types(
             store,
             host,
             arrow.source.callable.declaration,
             &current_flow_types,
         )?;
-        let body_flow_types = check_callable_parameter_initializers(
+        let for_of_entries = matches!(arrow.body, PlannedArrowBody::ForOf(_))
+            .then(|| source_arrow_parameter_entry_types(store, &arrow.source.callable))
+            .transpose()?;
+        let for_of_capture = match (&arrow.body, for_of_entries.as_ref()) {
+            (PlannedArrowBody::ForOf(iteration), Some(entries)) => {
+                Some(SourceArrowCaptureContext {
+                    declared_types: entries,
+                    mutable_symbols: None,
+                    outer: Some(&source_capture),
+                    flow: None,
+                    assignments: &iteration.capture_assignments,
+                    value_exports: &[],
+                })
+            }
+            _ => None,
+        };
+        let body_flow_types = check_callable_parameter_initializers_with_capture_context(
             store,
             host,
             global_types,
@@ -64362,6 +64818,7 @@ pub(super) fn check_source_file(
             &arrow.source.callable,
             &arrow.parameter_initializers,
             &[],
+            for_of_capture,
         )?;
         if let Some(statements) = &arrow.linear_body {
             check_planned_linear_function_statements(
@@ -64387,6 +64844,25 @@ pub(super) fn check_source_file(
         }
         match &arrow.body {
             PlannedArrowBody::Empty => {}
+            PlannedArrowBody::ForOf(iteration) => {
+                check_planned_lexical_iteration_with_capture_context(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &body_flow_types,
+                    &type_import_execution,
+                    &type_import_capabilities,
+                    &mut deferred,
+                    iteration,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    for_of_capture,
+                )?;
+            }
             PlannedArrowBody::Return {
                 diagnostic_node,
                 expression,
@@ -107472,6 +107948,456 @@ class Foo2 {
         };
         assert_eq!(restored.callable, valid.callable);
         assert_eq!(observable_state(&context, file), before);
+    }
+
+    fn arrow_for_of_test_plan(
+        context: &CanonicalCheckerContext<'_>,
+        library: &ParseResult,
+        library_file: FileId,
+        source: &ParseResult,
+        file: FileId,
+    ) -> PlannedArrow {
+        let (_, library_bound) = context.file(library_file).unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, library_bound), (&source.arena, bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let mut plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            context.global_types(),
+            context.options(),
+        )
+        .finish()
+        .unwrap();
+        assert_eq!(plan.arrows.len(), 1);
+        plan.arrows.pop().unwrap()
+    }
+
+    #[test]
+    fn arrow_for_of_loop_locals_keep_declared_var_and_safe_let_captures() {
+        for (file, fragment, expected_error) in [
+            (
+                FileId::new(202_200),
+                concat!(
+                    "(values: number[]): void => {\n",
+                    "  for (const item of values) {\n",
+                    "    var local: number | false = 1;\n",
+                    "    const result = { nested: (): number => local };\n",
+                    "  }\n",
+                    "}",
+                ),
+                true,
+            ),
+            (
+                FileId::new(202_201),
+                concat!(
+                    "(values: number[]): void => {\n",
+                    "  for (const item of values) {\n",
+                    "    let local: number | false = 1;\n",
+                    "    const result = { nested: (): number => local };\n",
+                    "  }\n",
+                    "}",
+                ),
+                false,
+            ),
+        ] {
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let library_file = FileId::new(202_199);
+            let source = parsed(&format!("const iterate = {fragment};"));
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+            let local = variable_symbol(&context, &source, file, "local");
+            let declared = variable_value_type(&context, &source, file, "local");
+            assert!(matches!(
+                context.store().type_payload(declared).unwrap().data(),
+                TypeData::Union(_)
+            ));
+            let reads = identifier_expressions(&source, file, "local");
+            let [read] = reads.as_slice() else {
+                panic!("expected the unchanged captured return: {fragment}")
+            };
+            let expected = if expected_error { declared } else { number };
+            assert_eq!(resolved_node_type(&context, *read), expected, "{fragment}");
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(*read)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(local)
+            );
+            let nested = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(read.node).unwrap().parent.unwrap(),
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let nested_owner = bound.symbol(nested).unwrap();
+            let outer = variable_initializer(&source, file, "iterate");
+            let outer_owner = bound.symbol(outer).unwrap();
+            assert_ne!(local, nested_owner);
+            assert_ne!(nested_owner, outer_owner);
+            assert_ne!(local, variable_symbol(&context, &source, file, "item"));
+            for (owner, expected_return) in [(outer_owner, void), (nested_owner, number)] {
+                let callable = context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .unwrap();
+                let signature = context
+                    .store()
+                    .source_callable_provenance(callable)
+                    .unwrap()
+                    .signature;
+                assert_eq!(
+                    context
+                        .store()
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(expected_return)
+                );
+            }
+            if expected_error {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the captured var union must report TS2322: {fragment}")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.node, Some(*read));
+                assert_eq!(diagnostic.diagnostic.arguments[1], "number");
+            } else {
+                assert!(context.diagnostics().is_empty(), "{fragment}");
+            }
+            let plan = arrow_for_of_test_plan(&context, &library, library_file, &source, file);
+            let PlannedArrowBody::ForOf(iteration) = &plan.body else {
+                panic!("the actual arrow must retain its loop")
+            };
+            assert!(iteration.capture_assignments.is_empty());
+            assert!(plan.linear_body.is_none());
+            let diagnostics = context.diagnostics().clone();
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_at_location(*read).unwrap(), expected);
+                assert_eq!(observable_state(&context, file), warm);
+                assert_eq!(context.diagnostics(), &diagnostics);
+            }
+        }
+    }
+
+    #[test]
+    fn arrow_for_of_loop_entries_separate_eager_reads_from_nested_write_captures() {
+        for (file, binding, write) in [
+            (FileId::new(202_202), "var", ""),
+            (
+                FileId::new(202_203),
+                "let",
+                "const assigned = (() => (local = 2))();",
+            ),
+        ] {
+            let text = format!(
+                "const iterate = (values: number[]): void => {{ for (const item of values) {{ {binding} local: number | false = 1; {write} const result = {{ now: local, nested: (): number => local }}; }} }};"
+            );
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let library_file = FileId::new(202_199);
+            let source = parsed(&text);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let local = variable_symbol(&context, &source, file, "local");
+            let declared = variable_value_type(&context, &source, file, "local");
+            let mut reads = identifier_expressions(&source, file, "local");
+            reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+            let captured = *reads.last().unwrap();
+            let eager = reads[reads.len() - 2];
+            assert_eq!(resolved_node_type(&context, eager), number);
+            assert_eq!(resolved_node_type(&context, captured), declared);
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected the real stored return mismatch: {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.node, Some(captured));
+            let plan = arrow_for_of_test_plan(&context, &library, library_file, &source, file);
+            let PlannedArrowBody::ForOf(iteration) = &plan.body else {
+                panic!("expected the retained for-of body")
+            };
+            if write.is_empty() {
+                assert!(iteration.capture_assignments.is_empty());
+            } else {
+                assert_eq!(
+                    iteration.capture_assignments.as_slice(),
+                    [SourceFlowAssignment {
+                        declaration: reads[0],
+                        symbol: local,
+                    }]
+                );
+                assert_eq!(resolved_node_type(&context, reads[0]), number);
+            }
+            let diagnostics = context.diagnostics().clone();
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_at_location(eager).unwrap(), number);
+                assert_eq!(context.get_type_at_location(captured).unwrap(), declared);
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(observable_state(&context, file), warm);
+            }
+        }
+    }
+
+    #[test]
+    fn arrow_for_of_let_bindings_keep_safe_narrowing_and_nested_write_veto() {
+        for (index, (binding, values)) in [
+            ("item", "(number | false)[]"),
+            ("[item]", "(number | false)[][]"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for with_write in [false, true] {
+                let file = FileId::new(
+                    202_204 + u32::try_from(index).unwrap() * 2 + u32::from(with_write),
+                );
+                let write = if with_write {
+                    "const assigned = (() => (item = 2))();"
+                } else {
+                    ""
+                };
+                let text = format!(
+                    "const iterate = (values: {values}): void => {{ for (let {binding} of values) {{ {write} const result = item && {{ now: item, nested: (): number => item }}; }} }};"
+                );
+                let library = parsed("interface Array<T> { [index: number]: T; }");
+                let library_file = FileId::new(202_199);
+                let source = parsed(&text);
+                let mut context = context(
+                    &[(library_file, &library), (file, &source)],
+                    CanonicalCheckerOptions::default(),
+                );
+                context
+                    .check_source_file(file)
+                    .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+                let plan = arrow_for_of_test_plan(&context, &library, library_file, &source, file);
+                let PlannedArrowBody::ForOf(iteration) = &plan.body else {
+                    panic!("expected the actual for-of plan")
+                };
+                let [item] = iteration.syntax.bindings.as_slice() else {
+                    panic!("expected one actual iteration binding")
+                };
+                let declared = context
+                    .store()
+                    .value_symbol_links(item.symbol)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(matches!(
+                    context.store().type_payload(declared).unwrap().data(),
+                    TypeData::Union(_)
+                ));
+                assert_eq!(item.declaration != iteration.syntax.declaration, index == 1);
+                let mut reads = identifier_expressions(&source, file, "item");
+                reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+                let captured = *reads.last().unwrap();
+                let eager = reads[reads.len() - 2];
+                let expected = if with_write { declared } else { number };
+                assert_eq!(resolved_node_type(&context, eager), number, "{text}");
+                assert_eq!(resolved_node_type(&context, captured), expected, "{text}");
+                for read in &reads {
+                    assert_eq!(
+                        context
+                            .store()
+                            .symbol_node_links(*read)
+                            .unwrap()
+                            .resolved_symbol,
+                        Some(item.symbol)
+                    );
+                }
+                if with_write {
+                    assert_eq!(
+                        iteration.capture_assignments.as_slice(),
+                        [SourceFlowAssignment {
+                            declaration: reads[0],
+                            symbol: item.symbol,
+                        }]
+                    );
+                    let [diagnostic] = context.diagnostics().as_slice() else {
+                        panic!("expected the nested-write return mismatch: {text}")
+                    };
+                    assert_eq!(diagnostic.diagnostic.code(), 2322);
+                    assert_eq!(diagnostic.node, Some(captured));
+                } else {
+                    assert!(iteration.capture_assignments.is_empty());
+                    assert!(context.diagnostics().is_empty(), "{text}");
+                }
+                let diagnostics = context.diagnostics().clone();
+                let warm = observable_state(&context, file);
+                for _ in 0..2 {
+                    context.recheck_source_file(file).unwrap();
+                    assert_eq!(context.get_type_at_location(captured).unwrap(), expected);
+                    assert_eq!(context.get_type_at_location(eager).unwrap(), number);
+                    assert_eq!(context.diagnostics(), &diagnostics);
+                    assert_eq!(observable_state(&context, file), warm);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn arrow_for_of_let_capture_rejects_changed_owner_and_loop_table_cold_and_warm() {
+        for (index, (binding, values)) in [("item", "number[]"), ("[item]", "number[][]")]
+            .into_iter()
+            .enumerate()
+        {
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let library_file = FileId::new(202_199);
+            let file = FileId::new(202_208 + u32::try_from(index).unwrap());
+            let source = parsed(&format!(
+                "const iterate = (values: {values}): void => {{ for (let {binding} of values) {{ const result = {{ nested: (): number => item }}; }} }};"
+            ));
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&library.arena, &library_bound), (&source.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let plan = arrow_for_of_test_plan(&context, &library, library_file, &source, file);
+            let PlannedArrowBody::ForOf(iteration) = &plan.body else {
+                panic!("expected the actual for-of plan")
+            };
+            let item = iteration.syntax.bindings[0];
+            let owner = plan.source.callable.owner_symbol;
+            let table = bound.locals(iteration.syntax.control.statement).unwrap();
+            let expected = Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(item.symbol),
+            ));
+            for warm in [false, true] {
+                if warm {
+                    context.check_source_file(file).unwrap();
+                    assert!(context.diagnostics().is_empty());
+                }
+                let before = observable_state(&context, file);
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(
+                        context.store(),
+                        &host,
+                        item.symbol,
+                        &[]
+                    ),
+                    Ok(true)
+                );
+                assert_eq!(observable_state(&context, file), before);
+                let record = context.store().symbol(owner).unwrap();
+                let relationships = (
+                    record.members(),
+                    record.exports(),
+                    record.parent(),
+                    record.export_symbol(),
+                );
+                assert!(context.store_mut_for_test().set_symbol_relationships(
+                    owner,
+                    relationships.0,
+                    relationships.1,
+                    Some(item.symbol),
+                    relationships.3
+                ));
+                let poisoned = observable_state(&context, file);
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(
+                        context.store(),
+                        &host,
+                        item.symbol,
+                        &[]
+                    ),
+                    expected
+                );
+                assert_eq!(observable_state(&context, file), poisoned);
+                assert!(context.store_mut_for_test().set_symbol_relationships(
+                    owner,
+                    relationships.0,
+                    relationships.1,
+                    relationships.2,
+                    relationships.3
+                ));
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(
+                        context.store(),
+                        &host,
+                        item.symbol,
+                        &[]
+                    ),
+                    Ok(true)
+                );
+                assert_eq!(
+                    context.store_mut_for_test().insert_symbol(
+                        table,
+                        EscapedName::source("item"),
+                        owner
+                    ),
+                    Some(Some(item.symbol))
+                );
+                let poisoned = observable_state(&context, file);
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(
+                        context.store(),
+                        &host,
+                        item.symbol,
+                        &[]
+                    ),
+                    expected
+                );
+                assert_eq!(observable_state(&context, file), poisoned);
+                assert_eq!(
+                    context.store_mut_for_test().insert_symbol(
+                        table,
+                        EscapedName::source("item"),
+                        item.symbol
+                    ),
+                    Some(Some(owner))
+                );
+                assert_eq!(
+                    source_arrow_capture_can_keep_narrowing(
+                        context.store(),
+                        &host,
+                        item.symbol,
+                        &[]
+                    ),
+                    Ok(true)
+                );
+            }
+            let read = identifier_expressions(&source, file, "item")[0];
+            let expected_type = context
+                .store()
+                .value_symbol_links(item.symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.get_type_at_location(read).unwrap(), expected_type);
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

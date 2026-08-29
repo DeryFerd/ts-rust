@@ -184,6 +184,9 @@ pub(super) enum SourceArrowBodyPlan {
     LinearBlock {
         block: NodeRef,
     },
+    ForOfBlock {
+        block: NodeRef,
+    },
     ReturnExpression {
         block: NodeRef,
         statement: NodeRef,
@@ -2225,11 +2228,36 @@ fn plan_body(
     {
         return Err(invariant(SourceArrowInvariant::InvalidBody(body)));
     }
-    if !callable.is_async
+    let synchronous_typescript = !callable.is_async
         && host
             .bound_file(callable.declaration)
             .and_then(ts_binder::BoundFile::source_facts)
-            .is_some_and(|facts| !facts.is_javascript_file())
+            .is_some_and(|facts| !facts.is_javascript_file());
+    if synchronous_typescript
+        && callable
+            .parameters
+            .iter()
+            .all(|parameter| !parameter.is_implicit_any())
+        && host.node(callable.declaration).is_some_and(|record| {
+            record.kind == SyntaxKind::ArrowFunction
+                && matches!(record.data, NodeData::ArrowFunction(_))
+        })
+        && block.statements.nodes.first().is_some_and(|statement| {
+            store.source_node_kind(NodeRef::new(body.arena, body.file, *statement))
+                == Some(SyntaxKind::ForOfStatement)
+        })
+    {
+        for statement in &block.statements.nodes {
+            let statement = NodeRef::new(body.arena, body.file, *statement);
+            let record = preflight_node(store, host, statement)?;
+            if record.parent != Some(body.node) || !range_contains(body_record.range, record.range)
+            {
+                return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
+            }
+        }
+        return Ok(SourceArrowBodyPlan::ForOfBlock { block: body });
+    }
+    if synchronous_typescript
         && block.statements.nodes.first().is_some_and(|statement| {
             store.source_node_kind(NodeRef::new(body.arena, body.file, *statement))
                 == Some(SyntaxKind::VariableStatement)
