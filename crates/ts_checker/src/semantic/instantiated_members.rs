@@ -11699,7 +11699,7 @@ mod tests {
                 .store()
                 .source_direct_children(declaration)
                 .unwrap()
-                .to_vec();
+                .clone();
             let key_parameter = children
                 .iter()
                 .copied()
