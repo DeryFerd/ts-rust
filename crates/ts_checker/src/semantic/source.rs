@@ -245,10 +245,11 @@ use super::{
         SourceImportPlan, SourceImportUnsupported, SourceNamedReexportBindingPlan,
         SourceNamedReexportPlan, plan_source_import_default_arrow_export,
         plan_source_import_identifier_read, plan_source_jsdoc_typedef_import,
-        plan_source_type_import_reference, plan_top_level_import_equals,
-        plan_top_level_javascript_require, plan_top_level_named_reexport,
-        plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
-        plan_top_level_named_value_import, preflight_prepared_source_import_publications_with_host,
+        plan_source_property_type_import, plan_source_type_import_reference,
+        plan_top_level_import_equals, plan_top_level_javascript_require,
+        plan_top_level_named_reexport, plan_top_level_named_specifier_type_import,
+        plan_top_level_named_type_import, plan_top_level_named_value_import,
+        preflight_prepared_source_import_publications_with_host,
         preflight_source_default_arrow_export_value,
         prepare_source_import_value_with_type_import_capabilities,
         reject_source_type_import_value_use, resolve_source_import_binding,
@@ -7193,11 +7194,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(())
     }
 
-    fn validate_type_import_reference_boundaries(&self) -> Result<(), SourceCheckError> {
+    fn validate_type_import_reference_boundaries(&mut self) -> Result<(), SourceCheckError> {
         if self.type_import_bindings.is_empty() {
             return Ok(());
         }
-        let planned = self
+        let mut planned = self
             .type_import_references
             .iter()
             .map(|reference| reference.node)
@@ -7207,15 +7208,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 continue;
             }
             let reference = self.reference(node);
-            if self
-                .type_import_alias_for_type_reference(reference)?
-                .is_some()
-                && !planned.contains(&reference)
-            {
+            let Some(alias_symbol) = self.type_import_alias_for_type_reference(reference)? else {
+                continue;
+            };
+            if planned.contains(&reference) {
+                continue;
+            }
+            let Some((store, host)) = self.semantic else {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Import(reference),
                 ));
+            };
+            let Some(property) = plan_source_property_type_import(store, host, reference)
+                .map_err(|error| Self::import_plan_error(reference, &error))?
+            else {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(reference),
+                ));
+            };
+            if property.annotation() != reference || property.alias_symbol() != alias_symbol {
+                return Err(SourceCheckError::Import(reference));
             }
+            self.type_import_references
+                .push(PlannedSourceTypeImportReference {
+                    root: reference,
+                    node: reference,
+                    alias_symbol,
+                });
+            planned.insert(reference);
         }
         Ok(())
     }
@@ -9438,6 +9458,39 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
             }
             SourceImportError::DeclaredType(error) => SourceCheckError::DeclaredType(*error),
+            SourceImportError::ModuleExport { alias, error } => match error.as_ref() {
+                super::module_exports::CanonicalModuleExportQueryError::Source(error) => *error,
+                super::module_exports::CanonicalModuleExportQueryError::Target(reason) => {
+                    let error = super::alias::CanonicalAliasResolutionError::TargetUnavailable {
+                        alias: *alias,
+                        reason: *reason,
+                    };
+                    if import_alias_error_is_unsupported(error) {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node))
+                    } else {
+                        SourceCheckError::Import(node)
+                    }
+                }
+                super::module_exports::CanonicalModuleExportQueryError::TargetHost(error) => {
+                    SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::NamespaceAliasHost {
+                            node,
+                            error: *error,
+                        },
+                    ))
+                }
+                super::module_exports::CanonicalModuleExportQueryError::DeclaredHost(error) => {
+                    SourceCheckError::DeclaredType((*error).into())
+                }
+                super::module_exports::CanonicalModuleExportQueryError::InvalidModule(_)
+                | super::module_exports::CanonicalModuleExportQueryError::InvalidExportCache(_) => {
+                    SourceCheckError::Import(node)
+                }
+                super::module_exports::CanonicalModuleExportQueryError::UnsupportedModule(_)
+                | super::module_exports::CanonicalModuleExportQueryError::UnsupportedExportCache(
+                    _,
+                ) => SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node)),
+            },
             SourceImportError::Variable(error) => match *error {
                 VariablePlanError::Unsupported(_) => {
                     SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node))

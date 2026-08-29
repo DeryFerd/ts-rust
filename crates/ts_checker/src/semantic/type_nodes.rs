@@ -93,6 +93,7 @@ use super::{
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableError,
         SourceCallableFamily, SourceCallablePlan,
     },
+    source_imports::{self, SourceImportError, SourcePropertyTypeImportPlan},
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::{
@@ -826,17 +827,33 @@ impl TypeQueryPlan {
             .and_then(|links| links.resolved_type);
         let mut needs_node_cache = true;
         let expected = if let Some(reference) = self.references.get(&node) {
+            let cold_property_import = if let Some(property) = &reference.property_import {
+                if property.annotation() != node
+                    || Some(property.alias_symbol()) != reference.import_alias
+                    || property.target_symbol() != reference.symbol
+                    || !reference.type_arguments.is_empty()
+                {
+                    return Err(invalid());
+                }
+                !property
+                    .validate_current(store)
+                    .map_err(|error| property_type_import_error(node, error))?
+            } else {
+                false
+            };
             let symbol = store
                 .symbol_node_links(node)
                 .and_then(|links| links.resolved_symbol);
             if symbol.is_some() != cached.is_some()
                 || symbol.is_some_and(|symbol| symbol != reference.symbol)
                 || store.get_merged_symbol(reference.symbol) != Some(reference.symbol)
-                || reference.import_alias.is_some_and(|alias| {
-                    store.alias_symbol_links(alias).is_none_or(|links| {
-                        links.alias_target != super::AliasTargetState::Resolved(reference.symbol)
+                || !cold_property_import
+                    && reference.import_alias.is_some_and(|alias| {
+                        store.alias_symbol_links(alias).is_none_or(|links| {
+                            links.alias_target
+                                != super::AliasTargetState::Resolved(reference.symbol)
+                        })
                     })
-                })
             {
                 return Err(invalid());
             }
@@ -2702,6 +2719,7 @@ pub(super) fn cached_property_object_alias_request_matches(
 struct PlannedTypeReference {
     symbol: SemanticSymbolId,
     import_alias: Option<SemanticSymbolId>,
+    property_import: Option<SourcePropertyTypeImportPlan>,
     type_arguments: Vec<NodeRef>,
     alias_owner: Option<SemanticSymbolId>,
     arity: PlannedTypeReferenceArity,
@@ -2911,6 +2929,12 @@ impl SourceCallableTypeQueryEvidence {
             || self.type_parameters.len() != self.base_constraints.len()
             || self.type_parameters.is_empty()
             || self.callable.type_parameter_syntax.declaration() != self.callable.declaration
+            || self.plan.references.values().any(|reference| {
+                reference
+                    .property_import
+                    .as_ref()
+                    .is_some_and(|property| property.validate_retained(store).is_err())
+            })
         {
             return false;
         }
@@ -3304,6 +3328,101 @@ enum CachedTypeAliasRhs {
 
 fn type_node_unavailable(reason: TypeNodeUnavailable) -> DeclaredTypeError {
     DeclaredTypeError::TypeNodeUnavailable(reason)
+}
+
+fn property_type_import_error(node: NodeRef, error: SourceImportError) -> DeclaredTypeError {
+    use super::variables::VariablePlanError;
+
+    match error {
+        SourceImportError::DeclaredType(error)
+        | SourceImportError::Variable(VariablePlanError::DeclaredType(error))
+        | SourceImportError::Callable(SourceCallableError::DeclaredType(error)) => error,
+        SourceImportError::Unsupported(_)
+        | SourceImportError::CircularAlias { .. }
+        | SourceImportError::Variable(VariablePlanError::Unsupported(_))
+        | SourceImportError::Callable(SourceCallableError::Unsupported(_)) => {
+            type_node_unavailable(TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node))
+        }
+        SourceImportError::Invariant(_)
+        | SourceImportError::Variable(VariablePlanError::Invariant(_))
+        | SourceImportError::Callable(SourceCallableError::Invariant(_)) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+        }
+        SourceImportError::Alias(error) => {
+            type_node_unavailable(TypeNodeUnavailable::NamespaceAlias { node, error })
+        }
+        SourceImportError::Callable(SourceCallableError::LiteralCache(error)) => {
+            type_construction_error(error)
+        }
+        SourceImportError::ModuleExport { alias, error } => {
+            property_module_export_error(node, alias, *error)
+        }
+    }
+}
+
+fn property_module_export_error(
+    node: NodeRef,
+    alias: SemanticSymbolId,
+    error: super::module_exports::CanonicalModuleExportQueryError,
+) -> DeclaredTypeError {
+    use super::{module_exports::CanonicalModuleExportQueryError, source::SourceCheckError};
+
+    match error {
+        CanonicalModuleExportQueryError::TargetHost(error) => {
+            type_node_unavailable(TypeNodeUnavailable::NamespaceAliasHost { node, error })
+        }
+        CanonicalModuleExportQueryError::DeclaredHost(error) => error.into(),
+        CanonicalModuleExportQueryError::Target(reason) => {
+            type_node_unavailable(TypeNodeUnavailable::NamespaceAlias {
+                node,
+                error: super::alias::CanonicalAliasResolutionError::TargetUnavailable {
+                    alias,
+                    reason,
+                },
+            })
+        }
+        CanonicalModuleExportQueryError::InvalidModule(symbol)
+        | CanonicalModuleExportQueryError::InvalidExportCache(symbol) => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidCachedSymbol { node, symbol })
+        }
+        CanonicalModuleExportQueryError::UnsupportedModule(_)
+        | CanonicalModuleExportQueryError::UnsupportedExportCache(_) => {
+            type_node_unavailable(TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node))
+        }
+        CanonicalModuleExportQueryError::Source(error) => match error {
+            SourceCheckError::DeclaredType(error) => error,
+            SourceCheckError::Unsupported(_) => {
+                type_node_unavailable(TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node))
+            }
+            // Export lookup checks source metadata and never executes statements.
+            // A source invariant or execution error cannot authorize a type read.
+            SourceCheckError::Provenance(_)
+            | SourceCheckError::RelationUnavailable(_)
+            | SourceCheckError::TypeDisplayUnavailable(_)
+            | SourceCheckError::LiteralCache(_)
+            | SourceCheckError::ObjectLiteral(_)
+            | SourceCheckError::ArrayType(_)
+            | SourceCheckError::DerivedType(_)
+            | SourceCheckError::Assertion(_)
+            | SourceCheckError::Assignment(_)
+            | SourceCheckError::Arrow(_)
+            | SourceCheckError::Function(_)
+            | SourceCheckError::Variable(_)
+            | SourceCheckError::Call(_)
+            | SourceCheckError::Enum(_)
+            | SourceCheckError::Import(_)
+            | SourceCheckError::MetaProperty(_)
+            | SourceCheckError::Class(_)
+            | SourceCheckError::Property(_)
+            | SourceCheckError::Element(_)
+            | SourceCheckError::PrimitiveOperator(_)
+            | SourceCheckError::LogicalOperator(_)
+            | SourceCheckError::Conditional(_)
+            | SourceCheckError::MissingDiagnostic(_) => {
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+            }
+        },
+    }
 }
 
 fn property_object_error(error: PropertyObjectError) -> DeclaredTypeError {
@@ -14467,6 +14586,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let cached_syntax_contains_builtin_array = cached_type.is_some()
             && self.type_node_contains_builtin_array_reference(node, &mut HashSet::new())?;
         let exact_import = self.type_reference_alias_targets.get(&node).copied();
+        let property_import = if qualified || record_heritage {
+            None
+        } else {
+            source_imports::plan_source_property_type_import(self.store, self.host, node)
+                .map_err(|error| property_type_import_error(node, error))?
+        };
         let cached_symbol = self
             .store
             .symbol_node_links(node)
@@ -14490,6 +14615,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if !qualified
             && exact_import.is_none()
+            && property_import.is_none()
             && (cached_type.is_some() || cached_symbol.is_some())
         {
             self.reject_cached_import_alias_without_capability(node, name, name_text)?;
@@ -14501,6 +14627,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !self.source_callable_alias_planning
             && self.intersection_planning_depth == 0
             && exact_import.is_none()
+            && property_import.is_none()
             && let Some(cached) = cached_type
             && !cached_array_capability_missing
             && !cached_pending_function
@@ -14537,7 +14664,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let possible_global_array_name = !qualified
             && self.array_targets.is_some()
             && matches!(name_text, "Array" | "ReadonlyArray");
-        let symbol = if let Some(capability) = exact_import {
+        let symbol = if let Some(property) = &property_import {
+            if property.annotation() != node
+                || exact_import.is_some_and(|capability| !property.matches_capability(&capability))
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidImportAliasTarget {
+                        node,
+                        alias: property.alias_symbol(),
+                        target: property.target_symbol(),
+                    },
+                ));
+            }
+            property.target_symbol()
+        } else if let Some(capability) = exact_import {
             self.resolve_type_reference_alias_target(
                 node,
                 name,
@@ -15170,7 +15310,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let planned = PlannedTypeReference {
             symbol,
-            import_alias: exact_import.map(|capability| capability.alias),
+            import_alias: property_import
+                .as_ref()
+                .map(SourcePropertyTypeImportPlan::alias_symbol)
+                .or_else(|| exact_import.map(|capability| capability.alias)),
+            property_import,
             type_arguments,
             alias_owner: effective_alias_owner,
             arity,
@@ -27194,6 +27338,39 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         additional_union_operations: usize,
         additional_source_types: usize,
     ) -> Result<PreparedTypeQueryTypes, DeclaredTypeError> {
+        // Check every property route before publishing any cold import links.
+        for (&node, reference) in &plan.references {
+            let Some(property) = &reference.property_import else {
+                continue;
+            };
+            let current =
+                source_imports::plan_source_property_type_import(self.store, self.host, node)
+                    .map_err(|error| property_type_import_error(node, error))?;
+            if property.annotation() != node
+                || Some(property.alias_symbol()) != reference.import_alias
+                || property.target_symbol() != reference.symbol
+                || !reference.type_arguments.is_empty()
+                || current.as_ref() != Some(property)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
+        for (&node, reference) in &plan.references {
+            let Some(property) = &reference.property_import else {
+                continue;
+            };
+            let capability = source_imports::prepare_source_property_type_import(
+                self.store, self.host, property,
+            )
+            .map_err(|error| property_type_import_error(node, error))?;
+            if !property.matches_capability(&capability) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
         let mut strings = Vec::new();
         let mut numbers = Vec::new();
         let mut bigints = Vec::new();
@@ -27747,6 +27924,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let reference = PlannedTypeReference {
                 symbol: base.symbol,
                 import_alias: None,
+                property_import: None,
                 type_arguments: supplied.to_vec(),
                 alias_owner: None,
                 arity: PlannedTypeReferenceArity::Valid,
@@ -37562,6 +37740,781 @@ mod tests {
         )
         .unwrap();
         (context, source_file, target_file)
+    }
+
+    const PROPERTY_IMPORT_FILES: [FileId; 3] = [
+        FileId::new(98_330),
+        FileId::new(98_331),
+        FileId::new(98_332),
+    ];
+
+    fn property_type_import_test_context<'arena>(
+        sources: [&'arena ParseResult; 3],
+    ) -> (
+        CanonicalCheckerContext<'arena>,
+        [BoundFile; 3],
+        super::super::module_resolution::CanonicalModuleResolutionManifest,
+    ) {
+        use super::super::module_resolution::{
+            CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
+            CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
+            validate_module_resolution_manifest,
+        };
+
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file) in sources.into_iter().zip(PROPERTY_IMPORT_FILES) {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/property-import-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let input = || {
+            CanonicalModuleResolutionManifestInput::new([0, 1].map(|index| {
+                let parsed = sources[index];
+                let specifier = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(_, record)| match &record.data {
+                        NodeData::ImportDeclaration(import) => Some(import.module_specifier),
+                        NodeData::ExportDeclaration(export) => export.module_specifier,
+                        _ => None,
+                    })
+                    .unwrap();
+                CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(parsed.arena.id(), PROPERTY_IMPORT_FILES[index], specifier),
+                    CanonicalResolvedModuleInput::new(
+                        PROPERTY_IMPORT_FILES[index + 1],
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                )
+            }))
+        };
+        let context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            sources
+                .into_iter()
+                .zip(PROPERTY_IMPORT_FILES)
+                .map(|(parsed, file)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+            input(),
+        )
+        .unwrap();
+        let bounds = PROPERTY_IMPORT_FILES.map(|file| context.file(file).unwrap().1.clone());
+        let manifest = validate_module_resolution_manifest(
+            input(),
+            context.store().symbol_store(),
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (bound.file_id(), &parsed.arena, bound)),
+        )
+        .unwrap();
+        assert_eq!(&manifest, context.module_resolutions());
+        (context, bounds, manifest)
+    }
+
+    fn property_type_import_named_node(
+        parsed: &ParseResult,
+        file: FileId,
+        kind: SyntaxKind,
+        text: &str,
+    ) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                if record.kind != kind {
+                    return None;
+                }
+                let name = match &record.data {
+                    NodeData::TypeAliasDeclaration(alias) => alias.name,
+                    NodeData::ImportSpecifier(import) => import.name,
+                    NodeData::FunctionDeclaration(function) => function.name?,
+                    NodeData::PropertyDeclaration(property) => property.name,
+                    NodeData::PropertySignatureDeclaration(property) => property.name,
+                    _ => return None,
+                };
+                (identifier_text(&parsed.arena, name) == Some(text)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap_or_else(|| panic!("missing {kind:?} named {text}"))
+    }
+
+    fn property_type_import_annotation(parsed: &ParseResult, property: NodeRef) -> NodeRef {
+        let annotation = match &parsed.arena.get(property.node).unwrap().data {
+            NodeData::PropertyDeclaration(property) => property.type_.unwrap(),
+            NodeData::PropertySignatureDeclaration(property) => property.type_,
+            _ => panic!("expected a property declaration"),
+        };
+        NodeRef::new(property.arena, property.file, annotation)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Checks the whole import batch before the first alias publication.
+    fn property_type_import_queries_validate_all_plans_before_publication() {
+        let source = parse_source_file(concat!(
+            "import type { Noop, Other } from '../types'; ",
+            "export type Pair = { left: Noop; right: Other; };",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider =
+            parse_source_file("export type Noop = () => void; export type Other = () => number;");
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let property = |name| {
+            property_type_import_named_node(
+                &source,
+                PROPERTY_IMPORT_FILES[0],
+                SyntaxKind::PropertyDeclaration,
+                name,
+            )
+        };
+        let left = property_type_import_annotation(&source, property("left"));
+        let right = property_type_import_annotation(&source, property("right"));
+        let pair = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::TypeAliasDeclaration,
+            "Pair",
+        );
+        let NodeData::TypeAliasDeclaration(pair_data) = &source.arena.get(pair.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body = NodeRef::new(pair.arena, pair.file, pair_data.type_);
+        let store = context.store_mut_for_test();
+        let before = function_store_state(store);
+        let aliases = HashMap::new();
+        let mut planner = TypeQueryPlanner::new(
+            store,
+            &host,
+            Some(globals.array_type),
+            Some(CanonicalArrayTargets::from_global_types(&globals)),
+            options.strict_builtin_iterator_return,
+            &aliases,
+        );
+        planner.plan_type_node(body).unwrap();
+        let plan = planner.finish();
+        assert_eq!(function_store_state(store), before);
+        let left_plan = plan.references[&left].property_import.as_ref().unwrap();
+        let right_plan = plan.references[&right].property_import.as_ref().unwrap();
+        assert_ne!(left_plan.alias_symbol(), right_plan.alias_symbol());
+        assert_ne!(left_plan.target_symbol(), right_plan.target_symbol());
+        assert!(store.alias_symbol_links(left_plan.alias_symbol()).is_none());
+        assert!(
+            store
+                .alias_symbol_links(right_plan.alias_symbol())
+                .is_none()
+        );
+        let cold_aliases = store.checkpoint_alias_symbol_links();
+        let poisoned = super::super::AliasSymbolLinks {
+            immediate_target: Some(left_plan.target_symbol()),
+            alias_target: super::super::AliasTargetState::Resolved(left_plan.target_symbol()),
+            type_only_declaration: Some(right_plan.binding_declaration()),
+            ..super::super::AliasSymbolLinks::default()
+        };
+        assert!(store.set_alias_symbol_links(right_plan.alias_symbol(), poisoned.clone()));
+        let poisoned_state = function_store_state(store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(matches!(
+            query.prepare_literal_types(&plan),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node)
+            )) if node == right
+        ));
+        assert_eq!(function_store_state(query.store), poisoned_state);
+        assert!(
+            query
+                .store
+                .alias_symbol_links(left_plan.alias_symbol())
+                .is_none()
+        );
+        assert_eq!(
+            query.store.alias_symbol_links(right_plan.alias_symbol()),
+            Some(&poisoned)
+        );
+        assert!(query.store.type_node_links(body).is_none());
+        assert!(query.store.type_node_links(left).is_none());
+        assert!(query.store.type_node_links(right).is_none());
+        assert!(query.diagnostics.is_empty());
+        assert!(query.store.restore_alias_symbol_links(cold_aliases));
+        assert_eq!(function_store_state(query.store), before);
+        let result = query.get_type_from_type_node(body).unwrap();
+        assert_eq!(
+            query.store.type_node_links(body).unwrap().resolved_type,
+            Some(result)
+        );
+        assert_ne!(
+            query.store.type_node_links(left).unwrap().resolved_type,
+            query.store.type_node_links(right).unwrap().resolved_type,
+        );
+        let warm = function_store_state(query.store);
+        for _ in 0..2 {
+            assert_eq!(query.get_type_from_type_node(body), Ok(result));
+            assert_eq!(function_store_state(query.store), warm);
+        }
+        assert!(
+            query
+                .store
+                .value_symbol_links(left_plan.alias_symbol())
+                .is_none()
+        );
+        assert!(
+            query
+                .store
+                .value_symbol_links(right_plan.alias_symbol())
+                .is_none()
+        );
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both written property roots and the unrelated factory root stay distinct.
+    fn property_type_import_queries_keep_external_root_checks() {
+        let source = parse_source_file(concat!(
+            "import type { Noop } from '../types'; ",
+            "export type Subscription = { unsubscribe: Noop; }; ",
+            "export type Subject<T> = { stop: Noop; untouched: T; }; ",
+            "export declare function subject<T>(): Subject<T>;",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider = parse_source_file("export type Noop = () => void;");
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let annotation = |name| {
+            property_type_import_annotation(
+                &source,
+                property_type_import_named_node(
+                    &source,
+                    PROPERTY_IMPORT_FILES[0],
+                    SyntaxKind::PropertyDeclaration,
+                    name,
+                ),
+            )
+        };
+        let first = annotation("unsubscribe");
+        let second = annotation("stop");
+        let function = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::FunctionDeclaration,
+            "subject",
+        );
+        let NodeData::FunctionDeclaration(function_data) =
+            &source.arena.get(function.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let factory_root =
+            NodeRef::new(function.arena, function.file, function_data.type_.unwrap());
+        let store = context.store_mut_for_test();
+        let first_plan = source_imports::plan_source_property_type_import(store, &host, first)
+            .unwrap()
+            .unwrap();
+        let second_plan = source_imports::plan_source_property_type_import(store, &host, second)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first_plan.property_symbol(), second_plan.property_symbol());
+        assert_eq!(first_plan.alias_symbol(), second_plan.alias_symbol());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let expected = query.get_type_from_type_node(first).unwrap();
+        let capability = |root, reference| {
+            CanonicalTypeReferenceAliasTarget::new(
+                root,
+                reference,
+                first_plan.binding_declaration(),
+                first_plan.alias_symbol(),
+                first_plan.immediate_target(),
+                first_plan.target_symbol(),
+            )
+        };
+        for wrong in [capability(first, first), capability(factory_root, second)] {
+            query.add_type_reference_alias_targets([wrong]).unwrap();
+            let before = function_store_state(query.store);
+            assert!(matches!(
+                query.get_type_from_type_node(second),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node)
+                )) if node == wrong.reference
+            ));
+            assert_eq!(function_store_state(query.store), before);
+            assert!(query.store.type_node_links(second).is_none());
+            assert!(query.store.type_node_links(factory_root).is_none());
+            assert_eq!(
+                query.type_reference_alias_targets.remove(&wrong.reference),
+                Some(wrong)
+            );
+        }
+        let correct = capability(second, second);
+        query.add_type_reference_alias_targets([correct]).unwrap();
+        assert_eq!(query.get_type_from_type_node(second), Ok(expected));
+        assert_eq!(
+            query.type_reference_alias_targets.remove(&second),
+            Some(correct)
+        );
+        let warm = function_store_state(query.store);
+        for annotation in [first, second, first, second] {
+            assert_eq!(query.get_type_from_type_node(annotation), Ok(expected));
+            assert_eq!(function_store_state(query.store), warm);
+        }
+        assert!(
+            query
+                .store
+                .value_symbol_links(first_plan.alias_symbol())
+                .is_none()
+        );
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Original selected demand uses the caller session and keeps its sibling cold.
+    fn property_type_import_selected_demand_revalidates_the_original_annotation() {
+        let source = parse_source_file(concat!(
+            "import type { Noop } from '../types'; ",
+            "export type Subscription<T> = { unsubscribe: Noop; untouched: T; };",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider = parse_source_file("export type Noop = () => void;");
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let declaration = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::TypeAliasDeclaration,
+            "Subscription",
+        );
+        let owner = context
+            .store()
+            .get_merged_symbol(bounds[0].symbol(declaration).unwrap())
+            .unwrap();
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let property = |name| {
+            property_type_import_named_node(
+                &source,
+                PROPERTY_IMPORT_FILES[0],
+                SyntaxKind::PropertyDeclaration,
+                name,
+            )
+        };
+        let selected = property("unsubscribe");
+        let untouched = property("untouched");
+        let annotation = property_type_import_annotation(&source, selected);
+        let untouched_annotation = property_type_import_annotation(&source, untouched);
+        let selected_symbol = bounds[0].symbol(selected).unwrap();
+        let untouched_symbol = bounds[0].symbol(untouched).unwrap();
+        let store = context.store_mut_for_test();
+        let projection =
+            super::super::object_aliases::property_object_alias_projection(store, target)
+                .unwrap()
+                .unwrap();
+        assert_eq!(projection.type_, projection.target);
+        assert_eq!(projection.alias_symbol, owner);
+        assert!(store.type_node_links(annotation).is_none());
+        assert!(store.type_node_links(untouched_annotation).is_none());
+        assert!(store.value_symbol_links(selected_symbol).is_none());
+        assert!(store.value_symbol_links(untouched_symbol).is_none());
+        let plan = source_imports::plan_source_property_type_import(store, &host, annotation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.property_symbol(), selected_symbol);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let session_before = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        let expected = super::super::instantiated_members::demand_property_object_alias_property(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            target,
+            selected_symbol,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .value_symbol_links(selected_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(expected)
+        );
+        assert_eq!(
+            store.type_node_links(annotation).unwrap().resolved_type,
+            Some(expected)
+        );
+        assert_eq!(
+            store
+                .type_alias_links(plan.target_symbol())
+                .unwrap()
+                .declared_type,
+            Some(expected)
+        );
+        assert!(store.type_has_function_type_provenance(expected));
+        assert!(store.type_node_links(untouched_annotation).is_none());
+        assert!(store.value_symbol_links(untouched_symbol).is_none());
+        assert!(store.value_symbol_links(plan.alias_symbol()).is_none());
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark()
+            ),
+            session_before
+        );
+        let original = store
+            .alias_symbol_links(plan.alias_symbol())
+            .cloned()
+            .unwrap();
+        let mut poisoned = original.clone();
+        poisoned.immediate_target = None;
+        assert!(store.set_alias_symbol_links(plan.alias_symbol(), poisoned.clone()));
+        let before = function_store_state(store);
+        assert_eq!(
+            super::super::instantiated_members::demand_property_object_alias_property(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                target,
+                selected_symbol,
+            ),
+            Err(super::super::source::SourceCheckError::DeclaredType(
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(annotation),)
+            )),
+        );
+        assert_eq!(function_store_state(store), before);
+        assert_eq!(
+            store.alias_symbol_links(plan.alias_symbol()),
+            Some(&poisoned)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(selected_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(expected)
+        );
+        assert!(store.set_alias_symbol_links(plan.alias_symbol(), original));
+        let warm = function_store_state(store);
+        for _ in 0..2 {
+            assert_eq!(
+                super::super::instantiated_members::demand_property_object_alias_property(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    target,
+                    selected_symbol,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(function_store_state(store), warm);
+        }
+        assert!(store.type_node_links(untouched_annotation).is_none());
+        assert!(store.value_symbol_links(untouched_symbol).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A real generic signature keeps the return dependency cold but its import ready.
+    fn property_type_import_callable_evidence_requires_prepared_imports() {
+        let source = parse_source_file(concat!(
+            "import type { Noop } from '../types'; ",
+            "export type Subscription = { unsubscribe: Noop; }; ",
+            "export declare function subscribe<T>(value: T): Subscription;",
+        ));
+        let barrel = parse_source_file("export * from './utils';");
+        let provider = parse_source_file("export type Noop = () => void;");
+        let sources = [&source, &barrel, &provider];
+        let (mut context, bounds, manifest) = property_type_import_test_context(sources);
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources
+                .into_iter()
+                .zip(&bounds)
+                .map(|(parsed, bound)| (&parsed.arena, bound)),
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap()
+        .with_module_resolutions(&manifest);
+        let declaration = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::FunctionDeclaration,
+            "subscribe",
+        );
+        let property = property_type_import_named_node(
+            &source,
+            PROPERTY_IMPORT_FILES[0],
+            SyntaxKind::PropertyDeclaration,
+            "unsubscribe",
+        );
+        let annotation = property_type_import_annotation(&source, property);
+        let owner = bounds[0].symbol(declaration).unwrap();
+        let store = context.store_mut_for_test();
+        let callable = source_callables::plan_source_callable(
+            store,
+            &host,
+            declaration,
+            owner,
+            Some(CanonicalArrayTargets::from_global_types(&globals)),
+        )
+        .unwrap();
+        assert!(callable.requires_type_query_evidence());
+        let return_root = callable.return_type.type_node().unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let before = function_store_state(query.store);
+        let cold = query.plan_source_callable_type_inputs(&callable).unwrap();
+        let property_plan = cold.references[&annotation]
+            .property_import
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(property_plan.validate_current(query.store), Ok(false));
+        assert_eq!(
+            property_plan.validate_retained(query.store),
+            Err(SourceImportError::Invariant(
+                source_imports::SourceImportInvariant::InvalidAliasLinks(
+                    property_plan.alias_symbol()
+                ),
+            )),
+        );
+        assert_eq!(
+            cold.cached_source_callable_type(query.store, &callable, &[], annotation),
+            Ok(None),
+        );
+        assert_eq!(function_store_state(query.store), before);
+        let callable_type = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        let evidence = query.store.source_callable_type_query(signature).unwrap();
+        assert!(evidence.matches_plan(&callable));
+        assert!(evidence.is_exact(query.store));
+        assert_eq!(evidence.annotation_type(return_root), None);
+        assert_eq!(
+            evidence.plan.references[&annotation]
+                .property_import
+                .as_ref(),
+            Some(&property_plan),
+        );
+        assert_eq!(property_plan.validate_current(query.store), Ok(true));
+        assert_eq!(property_plan.validate_retained(query.store), Ok(()));
+        assert!(
+            query
+                .store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        assert!(
+            query
+                .store
+                .value_symbol_links(property_plan.property_symbol())
+                .is_none()
+        );
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        let original = query
+            .store
+            .alias_symbol_links(property_plan.alias_symbol())
+            .cloned()
+            .unwrap();
+        for field in 0..3 {
+            let mut changed = original.clone();
+            match field {
+                0 => changed.immediate_target = None,
+                1 => changed.alias_target = super::super::AliasTargetState::Unresolved,
+                2 => changed.type_only_declaration = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                query
+                    .store
+                    .set_alias_symbol_links(property_plan.alias_symbol(), changed.clone())
+            );
+            let damaged = function_store_state(query.store);
+            assert!(
+                !query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(query.store)
+            );
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(declaration)
+                )),
+            );
+            assert_eq!(function_store_state(query.store), damaged);
+            assert_eq!(
+                query.store.alias_symbol_links(property_plan.alias_symbol()),
+                Some(&changed)
+            );
+            assert!(
+                query
+                    .store
+                    .value_symbol_links(property_plan.property_symbol())
+                    .is_none()
+            );
+            assert!(
+                query
+                    .store
+                    .set_alias_symbol_links(property_plan.alias_symbol(), original.clone())
+            );
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(callable_type)
+            );
+            assert_eq!(function_store_state(query.store), damaged);
+        }
+        let subscription = query.get_return_type_of_signature(signature).unwrap();
+        assert_eq!(
+            query
+                .store
+                .type_node_links(return_root)
+                .unwrap()
+                .resolved_type,
+            Some(subscription)
+        );
+        let noop = query
+            .store
+            .type_node_links(annotation)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            query
+                .store
+                .type_alias_links(property_plan.target_symbol())
+                .unwrap()
+                .declared_type,
+            Some(noop)
+        );
+        assert!(query.store.type_has_function_type_provenance(noop));
+        let warm = function_store_state(query.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(callable_type)
+            );
+            assert_eq!(
+                query.get_return_type_of_signature(signature),
+                Ok(subscription)
+            );
+            assert!(
+                query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(query.store)
+            );
+            assert_eq!(function_store_state(query.store), warm);
+        }
+        assert!(
+            query
+                .store
+                .value_symbol_links(property_plan.alias_symbol())
+                .is_none()
+        );
+        assert!(query.diagnostics.is_empty());
     }
 
     #[allow(clippy::too_many_lines)] // One fixture binds independent DOM, React, and source files.
