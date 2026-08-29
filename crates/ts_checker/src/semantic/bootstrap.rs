@@ -3108,19 +3108,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             if record.flags().contains(SymbolFlags::METHOD) {
                 let (callable, expected) =
                     object_members::declared_method_value_types(self, member)?;
-                return (expected == value
-                    && record.declarations()?.iter().all(|declaration| {
+                if expected != value
+                    || !record.declarations()?.iter().all(|declaration| {
                         self.lazy_default_library_annotation_children_are_exact(
                             *declaration,
                             array_targets,
                             &mut HashSet::new(),
                         )
                     })
-                    && matches!(
-                        validate_stored_declared_method_callable_set(self, callable),
-                        Some(StoredCallableSetValidation::Valid { .. })
-                    ))
-                .then_some(vec![value]);
+                {
+                    return None;
+                }
+                let Some(StoredCallableSetValidation::Valid { edges, .. }) =
+                    validate_stored_declared_method_callable_set(self, callable)
+                else {
+                    return None;
+                };
+                // Keep the dependencies from the provider that proved this publication.
+                return Some(edges);
             }
             if record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::PROPERTY
                 || self.value_symbol_links(member)

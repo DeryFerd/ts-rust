@@ -29217,6 +29217,117 @@ mod generic_publication_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check both callable edge kinds and a corrupt signature.
+    fn date_unions_keep_declared_method_provider_edges() {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+
+        let library = parse_source_file(&format!(
+            "{DATE_UNION_LIBRARY} interface Array<T> {{}} interface ReadonlyArray<T> {{}}",
+        ));
+        for (method_source, parameter_array) in [
+            ("toFixed(values: string[]): number;", true),
+            ("toFixed(value: number): string[];", false),
+        ] {
+            let augmentation = parse_source_file(&format!(
+                "{DATE_UNION_AUGMENTATION} interface Date {{ {method_source} }}",
+            ));
+            let mut fixture = date_union_fixture(&library, &augmentation, true);
+            let globals = fixture.context.global_types().clone();
+            let union = assert_date_union_identity(&mut fixture, Some(&globals));
+            let store = fixture.context.store();
+            let method = store
+                .symbol(fixture.date)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("toFixed"))
+                .unwrap();
+            let callable = fixture
+                .context
+                .artifact_interface_method_type(method)
+                .unwrap();
+            let store = fixture.context.store();
+            let [signature] = store
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_deref())
+                .unwrap()
+            else {
+                panic!("toFixed must keep its source signature")
+            };
+            let signature = *signature;
+            let signature_record = store.signature(signature).unwrap();
+            let return_type = signature_record.resolved_return_type().unwrap();
+            let array_type = if parameter_array {
+                let [parameter] = signature_record.parameters() else {
+                    panic!("toFixed must keep its source parameter")
+                };
+                store
+                    .value_symbol_links(*parameter)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap()
+            } else {
+                return_type
+            };
+            assert_eq!(
+                store
+                    .canonical_array_reference(&globals, array_type)
+                    .unwrap()
+                    .unwrap()
+                    .element_type,
+                store.intrinsic_bootstrap().unwrap().string_type,
+            );
+            assert_eq!(
+                assert_date_union_identity(&mut fixture, Some(&globals)),
+                union,
+            );
+            let store = fixture.context.store_mut_for_test();
+            let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let before = snapshot(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.expression_union_type(
+                        &[fixture.type_, undefined],
+                        UnionReduction::Literal,
+                    ),
+                    Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                        array_type
+                    )),
+                );
+                assert_eq!(snapshot(store), before);
+            }
+            let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+            assert!(store.set_signature_resolved_return_type(signature, Some(boolean)));
+            let invalid = LiteralTypeCacheError::InvalidCachedUnion(fixture.type_);
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &[fixture.type_, undefined],
+                    UnionReduction::Literal,
+                ),
+                Err(invalid),
+            );
+            assert_eq!(snapshot(store), before);
+            assert!(store.set_signature_resolved_return_type(signature, Some(return_type)));
+            assert_eq!(
+                assert_date_union_identity(&mut fixture, Some(&globals)),
+                union,
+            );
+            assert!(fixture.context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // A nested cache error must not hide the reachable array.
     fn date_unions_reject_nested_member_list_poison_without_hiding_array_capability() {
         use crate::semantic::bootstrap::LiteralTypeCacheError;
