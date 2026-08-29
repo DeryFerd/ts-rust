@@ -14028,6 +14028,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             target,
             &name,
         )
+        .map(PlannedIdentifierRead::variable)
         .map_err(Self::variable_plan_error)?;
         if read.kind != PlannedIdentifierReadKind::Variable {
             return Err(Self::unsupported_function_body(callable));
