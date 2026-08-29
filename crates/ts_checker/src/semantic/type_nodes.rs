@@ -91,7 +91,7 @@ use super::{
     source_callables::{
         self, CallableTypePredicatePlan, PendingSourceCallableParameterTypes,
         SourceCallableAliasAnnotation, SourceCallableAliasSnapshot, SourceCallableError,
-        SourceCallableFamily, SourceCallablePlan,
+        SourceCallableFamily, SourceCallablePlan, SourceCallableTypeParameterPlan,
     },
     source_namespaces::authenticated_merged_namespace_interface,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
@@ -2870,6 +2870,13 @@ struct TypeQueryPlan {
     pending_function_proofs: Vec<PendingFunctionTypeProof>,
 }
 
+/// The source header rows needed by one annotation's constrained arguments.
+/// This plan does not authorize callable or signature publication.
+struct SourceCallableHeaderPlan {
+    callable: SourceCallablePlan,
+    parameter_indices: Vec<usize>,
+}
+
 /// The normal query's source-owned inputs for one generic signature.
 /// Only the query producer can create this evidence. Stored consumers replay
 /// its binding and provider checks before using an annotation result.
@@ -4392,6 +4399,82 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         self.replay_cached_annotations = replay_cached_annotations;
         Ok(())
+    }
+
+    fn plan_required_source_callable_header(
+        &mut self,
+    ) -> Result<Option<SourceCallableHeaderPlan>, DeclaredTypeError> {
+        let Some(callable) = self.source_callable_scope.as_deref().cloned() else {
+            return Ok(None);
+        };
+        let mut roots = HashSet::new();
+        for reference in self.plan.references.values() {
+            if reference.arity != PlannedTypeReferenceArity::Valid {
+                continue;
+            }
+            let Some(alias) = self.plan.aliases.get(&reference.symbol) else {
+                continue;
+            };
+            for (parameter, argument) in alias.type_parameters.iter().zip(&reference.type_arguments)
+            {
+                if parameter.constraint.is_some() {
+                    roots.insert(*argument);
+                }
+            }
+        }
+        let mut selected = BTreeSet::new();
+        loop {
+            let mut pending = BTreeSet::new();
+            for (node, reference) in &self.plan.references {
+                let Some(index) = callable
+                    .type_parameters
+                    .iter()
+                    .position(|parameter| parameter.symbol == reference.symbol)
+                else {
+                    continue;
+                };
+                if selected.contains(&index)
+                    || !self
+                        .source_callable_owns_type_parameter_reference(*node, reference.symbol)?
+                {
+                    continue;
+                }
+                let mut current = *node;
+                let mut visited = HashSet::new();
+                while visited.insert(current) {
+                    if roots.contains(&current) {
+                        pending.insert(index);
+                        break;
+                    }
+                    if current == callable.declaration {
+                        break;
+                    }
+                    let Some(parent) = preflight_node(self.store, self.host, current)?.parent
+                    else {
+                        break;
+                    };
+                    current = NodeRef::new(current.arena, current.file, parent);
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            for index in pending {
+                selected.insert(index);
+                let parameter = callable.type_parameters[index];
+                for annotation in [parameter.constraint, parameter.default_type]
+                    .into_iter()
+                    .flatten()
+                {
+                    self.plan_type_node(annotation)?;
+                    roots.insert(annotation);
+                }
+            }
+        }
+        Ok((!selected.is_empty()).then(|| SourceCallableHeaderPlan {
+            callable,
+            parameter_indices: selected.into_iter().collect(),
+        }))
     }
 
     fn validate_replayed_annotation_cache(&self, node: NodeRef) -> Result<(), DeclaredTypeError> {
@@ -24274,8 +24357,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map_err(property_object_error)?;
         planner.plan_interface_method_dependencies(&methods, node)?;
         planner.plan_type_node(node)?;
+        let header = planner.plan_required_source_callable_header()?;
         let plan = planner.finish();
-        let mut prepared = self.prepare_literal_types(&plan)?;
+        let cold_header_types = match &header {
+            Some(header) => self.preflight_source_callable_header(header, &plan)?,
+            None => 0,
+        };
+        let mut prepared =
+            self.prepare_literal_types_with_additional(&plan, 0, cold_header_types)?;
         if let Err(error) = self.seed_pending_function_parameters(&plan, &mut prepared) {
             self.pending_function_parameters.clear();
             prepared.clear_pending_function_types();
@@ -24296,6 +24385,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             _ => None,
         };
         let result = (|| {
+            if let Some(header) = &header {
+                self.resolve_source_callable_header(header, &plan, &mut prepared)?;
+            }
             self.execute_interface_method_type_parameters(&methods, &[], &plan, &mut prepared)?;
             for method in &methods {
                 for parameter in &method.parameters {
@@ -24799,6 +24891,338 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
+    /// Rechecks every selected row before a cold row can publish any state.
+    fn preflight_source_callable_header(
+        &self,
+        header: &SourceCallableHeaderPlan,
+        plan: &TypeQueryPlan,
+    ) -> Result<usize, DeclaredTypeError> {
+        let callable = &header.callable;
+        let invalid = |node| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        for node in &plan.nodes {
+            plan.cached_source_callable_type(self.store, callable, &[], *node)?;
+        }
+        plan.preflight_source_callable_alias_cycles(self.store, callable)?;
+        let evidence = match source_callables::source_callable_state(self.store, callable, true)
+            .map_err(|error| source_callable_error(error, callable.family))?
+        {
+            source_callables::SourceCallableState::Cold => None,
+            source_callables::SourceCallableState::Resolved { signature, .. } => {
+                let evidence = self
+                    .store
+                    .source_callable_type_query(signature)
+                    .ok_or_else(|| invalid(callable.declaration))?;
+                if !evidence.matches_plan(callable) || !evidence.is_exact(self.store) {
+                    return Err(invalid(callable.declaration));
+                }
+                Some(evidence)
+            }
+            _ => return Err(invalid(callable.declaration)),
+        };
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let mut cold = 0;
+        for &index in &header.parameter_indices {
+            let parameter = callable.type_parameters[index];
+            if self.store.source_node_parent(parameter.declaration)
+                != Some(SourceNodeParent::Parent(callable.declaration))
+                || self.store.source_declaration_symbol(parameter.declaration)
+                    != Some(parameter.symbol)
+                || !self
+                    .store
+                    .source_symbol_declarations_match(parameter.symbol)
+            {
+                return Err(invalid(parameter.declaration));
+            }
+            let expected_constraint =
+                self.cached_source_header_constraint(callable, parameter, plan)?;
+            let expected_default = match parameter.default_type {
+                Some(node) => plan.cached_source_callable_type(self.store, callable, &[], node)?,
+                None => Some(bootstrap.no_constraint_type),
+            };
+            let Some(type_) = self
+                .store
+                .declared_type_links(parameter.symbol)
+                .and_then(|links| links.declared_type)
+            else {
+                cold += 1;
+                continue;
+            };
+            if cached_ordinary_type_parameter_owner(self.store, type_) != Some(parameter.symbol) {
+                return Err(invalid(parameter.declaration));
+            }
+            let Some(TypeData::TypeParameter(data)) =
+                self.store.type_payload(type_).map(TypeRecord::data)
+            else {
+                return Err(invalid(parameter.declaration));
+            };
+            if data.target.is_some()
+                || data.mapper.is_some()
+                || data
+                    .constraint
+                    .is_some_and(|actual| Some(actual) != expected_constraint)
+                || data
+                    .resolved_default_type
+                    .is_some_and(|actual| Some(actual) != expected_default)
+            {
+                return Err(invalid(parameter.declaration));
+            }
+            if let Some(actual) = data.constrained.resolved_base_constraint {
+                let expected = if let Some(evidence) = evidence {
+                    evidence.base_constraints().get(index).copied()
+                } else if let Some(constraint) = expected_constraint {
+                    self.cached_source_header_base_constraint(
+                        header,
+                        plan,
+                        constraint,
+                        &mut HashSet::new(),
+                    )?
+                } else {
+                    return Err(invalid(parameter.declaration));
+                };
+                let Some(expected) = expected else {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericReferenceUnsupported {
+                            node: parameter.constraint.unwrap_or(parameter.declaration),
+                            symbol: parameter.symbol,
+                        },
+                    ));
+                };
+                if actual != expected {
+                    return Err(invalid(parameter.declaration));
+                }
+            }
+        }
+        Ok(cold)
+    }
+
+    fn cached_source_header_constraint(
+        &self,
+        callable: &SourceCallablePlan,
+        parameter: SourceCallableTypeParameterPlan,
+        plan: &TypeQueryPlan,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let Some(node) = parameter.constraint else {
+            return Ok(Some(bootstrap.no_constraint_type));
+        };
+        Ok(plan
+            .cached_source_callable_type(self.store, callable, &[], node)?
+            .map(|raw| {
+                if raw == bootstrap.any_type {
+                    bootstrap.unknown_type
+                } else {
+                    raw
+                }
+            }))
+    }
+
+    /// Reads the base implied by source-checked direct constraints, never the
+    /// parameter's cached base. Cold bases remain lazy in annotation queries.
+    fn cached_source_header_base_constraint(
+        &self,
+        header: &SourceCallableHeaderPlan,
+        plan: &TypeQueryPlan,
+        constraint: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<Option<TypeId>, DeclaredTypeError> {
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        if constraint == bootstrap.no_constraint_type {
+            return Ok(Some(constraint));
+        }
+        if !active.insert(constraint) {
+            return Ok(None);
+        }
+        let result = match self.store.type_payload(constraint).map(TypeRecord::data) {
+            Some(
+                TypeData::Intrinsic(_)
+                | TypeData::Literal(_)
+                | TypeData::UniqueEsSymbol(_)
+                | TypeData::Interface(_)
+                | TypeData::Tuple(_)
+                | TypeData::TypeReference(_),
+            ) => Some(constraint),
+            Some(TypeData::Object(_))
+                if matches!(
+                    object_members::validate_resolved_declared_property_object(
+                        self.store, constraint
+                    ),
+                    object_members::DeclaredPropertyObjectValidation::Valid(_)
+                ) =>
+            {
+                Some(constraint)
+            }
+            Some(TypeData::Index(_)) => {
+                super::keyof_types::validate_generic_keyof_index_type(self.store, constraint)
+                    .map_err(|error| keyof_type_error(error, header.callable.declaration))?;
+                Some(bootstrap.string_number_symbol_type)
+            }
+            Some(TypeData::TypeParameter(_)) => {
+                let owner = cached_ordinary_type_parameter_owner(self.store, constraint);
+                let parameter = header.parameter_indices.iter().find_map(|index| {
+                    let parameter = header.callable.type_parameters[*index];
+                    (Some(parameter.symbol) == owner).then_some(parameter)
+                });
+                match parameter {
+                    Some(parameter) => match self.cached_source_header_constraint(
+                        &header.callable,
+                        parameter,
+                        plan,
+                    )? {
+                        Some(direct) => {
+                            self.cached_source_header_base_constraint(header, plan, direct, active)?
+                        }
+                        None => None,
+                    },
+                    None => None,
+                }
+            }
+            Some(TypeData::Union(union)) => {
+                let mut bases = Vec::with_capacity(union.union.types.len());
+                for &member in &union.union.types {
+                    let Some(base) =
+                        self.cached_source_header_base_constraint(header, plan, member, active)?
+                    else {
+                        active.remove(&constraint);
+                        return Ok(None);
+                    };
+                    if base == bootstrap.no_constraint_type {
+                        active.remove(&constraint);
+                        return Ok(Some(base));
+                    }
+                    bases.push(base);
+                }
+                if bases == union.union.types {
+                    Some(constraint)
+                } else {
+                    self.store
+                        .cached_literal_union_type_with_alias(
+                            &bases,
+                            None,
+                            self.global_types
+                                .as_ref()
+                                .map(CanonicalArrayTargets::from_global_types),
+                        )
+                        .map_err(type_construction_error)?
+                }
+            }
+            _ => None,
+        };
+        active.remove(&constraint);
+        Ok(result)
+    }
+
+    fn resolve_source_callable_header(
+        &mut self,
+        header: &SourceCallableHeaderPlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        let parameters = header
+            .parameter_indices
+            .iter()
+            .map(|index| {
+                execute_type_parameter(self.store, header.callable.type_parameters[*index].symbol)
+            })
+            .collect::<Vec<_>>();
+        let mut annotation_results = BTreeMap::new();
+        for (&index, type_parameter) in header.parameter_indices.iter().zip(parameters) {
+            self.resolve_source_callable_type_parameter_row(
+                header.callable.type_parameters[index],
+                type_parameter,
+                plan,
+                prepared,
+                &mut annotation_results,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn resolve_source_callable_type_parameter_row(
+        &mut self,
+        parameter: SourceCallableTypeParameterPlan,
+        type_parameter: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+        annotation_results: &mut BTreeMap<NodeRef, TypeId>,
+    ) -> Result<ResolvedSourceCallableTypeParameter, DeclaredTypeError> {
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let no_constraint = bootstrap.no_constraint_type;
+        let any_type = bootstrap.any_type;
+        let unknown_type = bootstrap.unknown_type;
+        let constraint = if let Some(node) = parameter.constraint {
+            let raw = self.execute_type_node(node, plan, prepared)?;
+            annotation_results.insert(node, raw);
+            if raw == any_type { unknown_type } else { raw }
+        } else {
+            no_constraint
+        };
+        let default_type = if let Some(node) = parameter.default_type {
+            let raw = self.execute_type_node(node, plan, prepared)?;
+            annotation_results.insert(node, raw);
+            raw
+        } else {
+            no_constraint
+        };
+        let Some(TypeData::TypeParameter(data)) = self
+            .store
+            .type_payload(type_parameter)
+            .map(TypeRecord::data)
+        else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+            ));
+        };
+        if data.target.is_some()
+            || data.mapper.is_some()
+            || data.constraint.is_some_and(|cached| cached != constraint)
+            || data
+                .resolved_default_type
+                .is_some_and(|cached| cached != default_type)
+            || !self.store.set_type_parameter_resolution(
+                type_parameter,
+                Some(constraint),
+                None,
+                None,
+                Some(default_type),
+            )
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
+            ));
+        }
+        Ok(ResolvedSourceCallableTypeParameter {
+            provenance: SourceCallableTypeParameterProvenance {
+                declaration: parameter.declaration,
+                symbol: parameter.symbol,
+                type_parameter,
+                constraint: parameter.constraint,
+                default_type: parameter.default_type,
+            },
+            constraint,
+            default_type,
+        })
+    }
+
     fn plan_source_callable_type_inputs(
         &self,
         callable: &SourceCallablePlan,
@@ -24862,15 +25286,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .collect::<Vec<_>>();
         let result = (|| {
             self.seed_pending_function_parameters(&plan, &mut prepared)?;
-            let bootstrap =
-                self.store
-                    .intrinsic_bootstrap()
-                    .ok_or(DeclaredTypeError::Unavailable(
-                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-                    ))?;
-            let no_constraint = bootstrap.no_constraint_type;
-            let any_type = bootstrap.any_type;
-            let unknown_type = bootstrap.unknown_type;
             let mut annotation_results = BTreeMap::new();
             let mut resolved = Vec::with_capacity(parameters.len());
             for (parameter, type_parameter) in callable
@@ -24878,58 +25293,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .iter()
                 .zip(parameters.iter().copied())
             {
-                let constraint = if let Some(node) = parameter.constraint {
-                    let raw = self.execute_type_node(node, &plan, &mut prepared)?;
-                    annotation_results.insert(node, raw);
-                    if raw == any_type { unknown_type } else { raw }
-                } else {
-                    no_constraint
-                };
-                let default_type = if let Some(node) = parameter.default_type {
-                    let raw = self.execute_type_node(node, &plan, &mut prepared)?;
-                    annotation_results.insert(node, raw);
-                    raw
-                } else {
-                    no_constraint
-                };
-                let Some(TypeData::TypeParameter(data)) = self
-                    .store
-                    .type_payload(type_parameter)
-                    .map(TypeRecord::data)
-                else {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
-                    ));
-                };
-                if data.target.is_some()
-                    || data.mapper.is_some()
-                    || data.constraint.is_some_and(|cached| cached != constraint)
-                    || data
-                        .resolved_default_type
-                        .is_some_and(|cached| cached != default_type)
-                    || !self.store.set_type_parameter_resolution(
-                        type_parameter,
-                        Some(constraint),
-                        None,
-                        None,
-                        Some(default_type),
-                    )
-                {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidTypeReference(parameter.declaration),
-                    ));
-                }
-                resolved.push(ResolvedSourceCallableTypeParameter {
-                    provenance: SourceCallableTypeParameterProvenance {
-                        declaration: parameter.declaration,
-                        symbol: parameter.symbol,
-                        type_parameter,
-                        constraint: parameter.constraint,
-                        default_type: parameter.default_type,
-                    },
-                    constraint,
-                    default_type,
-                });
+                resolved.push(self.resolve_source_callable_type_parameter_row(
+                    *parameter,
+                    type_parameter,
+                    &plan,
+                    &mut prepared,
+                    &mut annotation_results,
+                )?);
             }
             let mut base_constraints = Vec::with_capacity(parameters.len());
             let mut default_seen = false;
@@ -79633,6 +80003,573 @@ mod tests {
             }
             assert!(query.diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn source_callable_header_query_keeps_unused_rows_and_callable_state_cold() {
+        let mut fixture = fixture(concat!(
+            "type SelectedFields<S, K extends keyof S> = { [P in K]: S[P] }; ",
+            "interface Neighbor { value: string; } ",
+            "function select<O, K extends keyof O, Unused extends Neighbor = Neighbor>",
+            "(value: O, unread: Unused): SelectedFields<O, K> { return value; }",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "select");
+        let owner = node_symbol(&fixture, declaration);
+        let neighbor = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Neighbor");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let return_node = callable.return_type.type_node().unwrap();
+        let [object_parameter, key_parameter, unused_parameter] =
+            callable.type_parameters.as_slice()
+        else {
+            panic!("select has three real source parameters");
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let signature_count = query.store.signature_len();
+        let returned = query.get_type_from_type_node(return_node).unwrap();
+        let object = query
+            .store
+            .declared_type_links(object_parameter.symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let key = query
+            .store
+            .declared_type_links(key_parameter.symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let no_constraint = query
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .no_constraint_type;
+        let index = query
+            .store
+            .type_node_links(key_parameter.constraint.unwrap())
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            super::super::keyof_types::validate_generic_keyof_index_type(query.store, index),
+            Ok(object)
+        );
+        for (type_, parameter, constraint) in [
+            (object, object_parameter, no_constraint),
+            (key, key_parameter, index),
+        ] {
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(query.store, type_),
+                Some(parameter.symbol)
+            );
+            let TypeData::TypeParameter(data) = query.store.type_payload(type_).unwrap().data()
+            else {
+                panic!("source header identities stay ordinary parameters");
+            };
+            assert_eq!(data.constraint, Some(constraint));
+            assert_eq!(data.resolved_default_type, Some(no_constraint));
+            assert_eq!(data.constrained.resolved_base_constraint, None);
+        }
+        let TypeData::Mapped(mapped) = query.store.type_payload(returned).unwrap().data() else {
+            panic!("the return keeps the real mapped alias");
+        };
+        assert_eq!(mapped.modifiers_type, Some(object));
+        assert_eq!(mapped.constraint_type, Some(key));
+        assert!(mapped.object.structured.members.is_none());
+        assert!(
+            query
+                .store
+                .declared_type_links(unused_parameter.symbol)
+                .is_none()
+        );
+        assert!(query.store.declared_type_links(neighbor).is_none());
+        for node in [
+            unused_parameter.constraint.unwrap(),
+            unused_parameter.default_type.unwrap(),
+        ] {
+            assert!(query.store.type_node_links(node).is_none());
+        }
+        assert_eq!(query.store.signature_len(), signature_count);
+        assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        assert!(query.store.signature_links(declaration).is_none());
+        assert!(query.store.type_node_links(callable.body).is_none());
+        for parameter in &callable.parameters {
+            assert!(query.store.value_symbol_links(parameter.symbol).is_none());
+            assert!(
+                query
+                    .store
+                    .type_node_links(parameter.explicit_type_node().unwrap())
+                    .is_none()
+            );
+        }
+        let cold = format!("{:?}", query.store);
+        assert_eq!(query.get_type_from_type_node(return_node), Ok(returned));
+        assert_eq!(format!("{:?}", query.store), cold);
+
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = query
+            .store
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        let parameters = query
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        assert_eq!(&parameters[..2], &[object, key]);
+        let evidence = query.store.source_callable_type_query(signature).unwrap();
+        assert!(evidence.matches_plan(&callable));
+        assert!(evidence.is_exact(query.store));
+        assert_eq!(evidence.annotation_type(return_node), None);
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+        let warm = format!("{:?}", query.store);
+        let counts = {
+            let session = query.instantiation_session.as_deref().unwrap();
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark(),
+            )
+        };
+        for _ in 0..2 {
+            assert_eq!(query.get_type_from_type_node(return_node), Ok(returned));
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(type_)
+            );
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            assert_eq!(format!("{:?}", query.store), warm);
+            let session = query.instantiation_session.as_deref().unwrap();
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark()
+                ),
+                counts
+            );
+        }
+        assert!(query.store.type_node_links(callable.body).is_none());
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_header_query_rejects_later_row_and_base_cache_damage_before_writes() {
+        let mut fixture = fixture(concat!(
+            "type SelectedFields<S, K extends keyof S> = { [P in K]: S[P] }; ",
+            "declare function select<O, K extends keyof O>(value: O): SelectedFields<O, K>;",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "select");
+        let owner = node_symbol(&fixture, declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let return_node = callable.return_type.type_node().unwrap();
+        let [object_parameter, key_parameter] = callable.type_parameters.as_slice() else {
+            panic!("select has two real source parameters");
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let index = query
+            .get_type_from_type_node(key_parameter.constraint.unwrap())
+            .unwrap();
+        let object = query
+            .store
+            .declared_type_links(object_parameter.symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let key = execute_type_parameter(query.store, key_parameter.symbol);
+        let string = query.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(
+            query
+                .store
+                .set_type_parameter_resolution(key, Some(string), None, None, None)
+        );
+        let damaged = format!("{:?}", query.store);
+        let counts = {
+            let session = query.instantiation_session.as_deref().unwrap();
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark(),
+            )
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_from_type_node(return_node),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(key_parameter.declaration),
+                ))
+            );
+            assert_eq!(format!("{:?}", query.store), damaged);
+            let TypeData::TypeParameter(data) = query.store.type_payload(object).unwrap().data()
+            else {
+                panic!("O stays a source type parameter");
+            };
+            assert_eq!(data.constraint, None, "a later bad row must not complete O");
+            assert_eq!(data.resolved_default_type, None);
+            let session = query.instantiation_session.as_deref().unwrap();
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark()
+                ),
+                counts
+            );
+        }
+        assert!(
+            query
+                .store
+                .set_type_parameter_resolution(key, None, None, None, None)
+        );
+        let returned = query.get_type_from_type_node(return_node).unwrap();
+        assert_eq!(
+            query
+                .store
+                .type_node_links(key_parameter.constraint.unwrap())
+                .unwrap()
+                .resolved_type,
+            Some(index)
+        );
+        for (type_, declaration) in [
+            (object, object_parameter.declaration),
+            (key, key_parameter.declaration),
+        ] {
+            assert!(
+                query
+                    .store
+                    .set_resolved_base_constraint(type_, Some(string))
+            );
+            let damaged = format!("{:?}", query.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    query.get_type_from_type_node(return_node),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(declaration),
+                    ))
+                );
+                assert_eq!(format!("{:?}", query.store), damaged);
+                let session = query.instantiation_session.as_deref().unwrap();
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_mark()
+                    ),
+                    counts
+                );
+            }
+            assert!(query.store.set_resolved_base_constraint(type_, None));
+            let restored = format!("{:?}", query.store);
+            assert_eq!(query.get_type_from_type_node(return_node), Ok(returned));
+            assert_eq!(format!("{:?}", query.store), restored);
+        }
+        assert_eq!(get_base_constraint_of_type(query.store, object), Ok(None));
+        let keys = query
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_number_symbol_type;
+        assert_eq!(
+            get_base_constraint_of_type(query.store, key),
+            Ok(Some(keys))
+        );
+        let valid_growth = format!("{:?}", query.store);
+        for _ in 0..2 {
+            assert_eq!(query.get_type_from_type_node(return_node), Ok(returned));
+            assert_eq!(format!("{:?}", query.store), valid_growth);
+        }
+        assert!(query.store.signature_links(callable.declaration).is_none());
+        assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_header_query_follows_required_default_dependencies() {
+        let mut fixture = fixture(concat!(
+            "type RequiredText<T extends string> = T; ",
+            "declare function select<A extends string, B extends string = A, Unused extends number = number>",
+            "(unread: Unused): RequiredText<B>; ",
+            "type RequiredUnknown<T extends unknown> = T; ",
+            "declare function normalize<T extends any>(): RequiredUnknown<T>;",
+            "interface Neighbor { value: string; } ",
+            "type Carry<K extends string, Value> = Value; ",
+            "declare function carry<Unneeded extends Neighbor = Neighbor>(): Carry<'key', Unneeded>;",
+        ));
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "select");
+        let owner = node_symbol(&fixture, declaration);
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let normalize_declaration =
+            named_node(&fixture, SyntaxKind::FunctionDeclaration, "normalize");
+        let normalize_owner = node_symbol(&fixture, normalize_declaration);
+        let normalize = source_callables::plan_source_callable(
+            &fixture.store,
+            &host,
+            normalize_declaration,
+            normalize_owner,
+            None,
+        )
+        .unwrap();
+        let carry_declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "carry");
+        let carry_owner = node_symbol(&fixture, carry_declaration);
+        let carry = source_callables::plan_source_callable(
+            &fixture.store,
+            &host,
+            carry_declaration,
+            carry_owner,
+            None,
+        )
+        .unwrap();
+        let neighbor = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Neighbor");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let returned = query
+            .get_type_from_type_node(callable.return_type.type_node().unwrap())
+            .unwrap();
+        let [first, second, unused] = callable.type_parameters.as_slice() else {
+            panic!("select has three source parameters");
+        };
+        let first_type = query
+            .store
+            .declared_type_links(first.symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let second_type = query
+            .store
+            .declared_type_links(second.symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(returned, second_type);
+        let string = query.store.intrinsic_bootstrap().unwrap().string_type;
+        for type_ in [first_type, second_type] {
+            let TypeData::TypeParameter(data) = query.store.type_payload(type_).unwrap().data()
+            else {
+                panic!("the header retains its ordinary parameter identity");
+            };
+            assert_eq!(data.constraint, Some(string));
+            assert_eq!(data.constrained.resolved_base_constraint, None);
+        }
+        let TypeData::TypeParameter(second_data) =
+            query.store.type_payload(second_type).unwrap().data()
+        else {
+            panic!("B stays a source parameter");
+        };
+        assert_eq!(second_data.resolved_default_type, Some(first_type));
+        assert!(query.store.declared_type_links(unused.symbol).is_none());
+        assert!(
+            query
+                .store
+                .value_symbol_links(callable.parameters[0].symbol)
+                .is_none()
+        );
+        assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        let normalized = query
+            .get_type_from_type_node(normalize.return_type.type_node().unwrap())
+            .unwrap();
+        let TypeData::TypeParameter(normalized_data) =
+            query.store.type_payload(normalized).unwrap().data()
+        else {
+            panic!("normalize keeps its real source parameter");
+        };
+        assert_eq!(
+            normalized_data.constraint,
+            Some(query.store.intrinsic_bootstrap().unwrap().unknown_type)
+        );
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(query.store, normalized),
+            Some(normalize.type_parameters[0].symbol)
+        );
+        let carried = query
+            .get_type_from_type_node(carry.return_type.type_node().unwrap())
+            .unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(query.store, carried),
+            Some(carry.type_parameters[0].symbol)
+        );
+        let TypeData::TypeParameter(carried_data) =
+            query.store.type_payload(carried).unwrap().data()
+        else {
+            panic!("Carry retains its unconstrained value argument");
+        };
+        assert_eq!(carried_data.constraint, None);
+        assert_eq!(carried_data.resolved_default_type, None);
+        assert_eq!(carried_data.constrained.resolved_base_constraint, None);
+        assert!(query.store.declared_type_links(neighbor).is_none());
+        assert!(
+            query
+                .store
+                .type_node_links(carry.type_parameters[0].constraint.unwrap())
+                .is_none()
+        );
+        assert!(
+            query
+                .store
+                .type_node_links(carry.type_parameters[0].default_type.unwrap())
+                .is_none()
+        );
+        let warm = format!("{:?}", query.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_from_type_node(callable.return_type.type_node().unwrap()),
+                Ok(returned)
+            );
+            assert_eq!(
+                query.get_type_from_type_node(normalize.return_type.type_node().unwrap()),
+                Ok(normalized)
+            );
+            assert_eq!(
+                query.get_type_from_type_node(carry.return_type.type_node().unwrap()),
+                Ok(carried)
+            );
+            assert_eq!(format!("{:?}", query.store), warm);
+        }
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn source_callable_header_query_preserves_the_callers_used_budget() {
+        let mut fixture = fixture(concat!(
+            "type SelectedFields<S, K extends keyof S> = { [P in K]: S[P] }; ",
+            "declare function select<O, K extends keyof O>(value: O): SelectedFields<O, K>;",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "select");
+        let owner = node_symbol(&fixture, declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (error, number, string) = (
+            bootstrap.error_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        query
+            .get_type_from_type_node(callable.type_parameters[1].constraint.unwrap())
+            .unwrap();
+        let object = query
+            .store
+            .declared_type_links(callable.type_parameters[0].symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                query.store,
+                object,
+                &[object],
+                &[number],
+                None,
+                query.instantiation_session.as_deref_mut().unwrap()
+            ),
+            Ok(number)
+        );
+        let before = {
+            let session = query.instantiation_session.as_deref().unwrap();
+            assert_eq!((session.query_count(), session.total_count()), (1, 1));
+            session.limit_event_mark()
+        };
+        let returned = query
+            .get_type_from_type_node(callable.return_type.type_node().unwrap())
+            .unwrap();
+        assert_ne!(returned, error);
+        assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(session.limit_event_mark(), before);
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                query.store,
+                object,
+                &[object],
+                &[string],
+                None,
+                query.instantiation_session.as_deref_mut().unwrap()
+            ),
+            Ok(error)
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert!(session.limit_event_occurred_since(before));
+        assert!(query.pending_function_parameters.is_empty());
+        assert!(query.diagnostics.is_empty());
     }
 
     #[test]
