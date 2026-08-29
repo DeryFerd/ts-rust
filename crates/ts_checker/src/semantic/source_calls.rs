@@ -4951,9 +4951,11 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
             call.node == expression.node
                 && call.arguments.iter().all(is_supported_call_argument_plan)
         }
-        PlannedExpressionKind::Object { properties, .. } => {
-            properties.iter().all(is_supported_call_argument_plan)
-        }
+        PlannedExpressionKind::Object { properties, .. } => properties.iter().all(|property| {
+            property
+                .eager_expression()
+                .is_some_and(is_supported_call_argument_plan)
+        }),
         PlannedExpressionKind::Array(elements) => {
             elements.iter().all(is_supported_call_argument_plan)
         }

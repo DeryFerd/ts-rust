@@ -1978,6 +1978,10 @@ fn resolve_direct_source_own_property(
     if store
         .direct_interface_heritage_provenance(receiver)
         .is_some()
+        || store
+            .object_literal_getter_origin_for_type(receiver)
+            .is_some()
+        || store.derived_object_literal_has_getter_origin(receiver)
     {
         super::object_members::resolve_object_property_by_key(
             store,
@@ -5816,6 +5820,176 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check the same getter through its original and derived receivers.
+    fn object_literal_getter_reads_keep_caller_array_targets_and_session() {
+        use crate::semantic::instantiate::{
+            InstantiationLimits, instantiate_type_with_vector_and_session,
+        };
+
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "declare const captured: number[]; ",
+            "const box = { get value() { return captured; }, eager: 1 }; ",
+            "const selected = box.value;",
+        ));
+        let file = FileId::new(202_210);
+        let files = [(FileId::new(202_209), &library), (file, &source)];
+        let mut context = source_property_context(&files, 1);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let object = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let getter = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::GetAccessor).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let raw = context.file(file).unwrap().1.symbol(getter).unwrap();
+        let original = context
+            .store()
+            .type_node_links(object)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let globals = context.global_types().clone();
+        let read_type = context
+            .store()
+            .value_symbol_links(raw)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let selected = property_access(&source, file);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(selected)
+                .unwrap()
+                .resolved_symbol,
+            Some(raw)
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(selected)
+                .unwrap()
+                .resolved_type,
+            Some(read_type)
+        );
+        let regular = context
+            .store_mut_for_test()
+            .get_regular_type_of_object_literal(original)
+            .unwrap();
+        let widened = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(original, &globals)
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let TypeData::Interface(array) = context
+            .store()
+            .type_payload(globals.array_type)
+            .unwrap()
+            .data()
+        else {
+            unreachable!();
+        };
+        let parameter = array.reference.resolved_type_arguments.as_ref().unwrap()[0];
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            },
+            error,
+        )
+        .unwrap();
+        for expected in [number, error] {
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    &mut session,
+                ),
+                Ok(expected)
+            );
+        }
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.limit_event_count(), 1);
+        let session_before = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_mark(),
+        );
+        let before = class_property_cache_state(&context, &source, file);
+        let mut wrong_globals = globals.clone();
+        wrong_globals.array_type = globals.readonly_array_type;
+        for receiver in [original, regular, widened] {
+            assert_eq!(
+                resolve_direct_source_own_property(
+                    context.store_mut_for_test(),
+                    Some(&globals),
+                    receiver,
+                    "value",
+                    &mut session,
+                ),
+                Ok(Some(ResolvedOwnProperty {
+                    symbol: raw,
+                    type_: read_type,
+                    readonly: true,
+                    optional: false,
+                }))
+            );
+            assert!(
+                resolve_direct_source_own_property(
+                    context.store_mut_for_test(),
+                    None,
+                    receiver,
+                    "value",
+                    &mut session,
+                )
+                .is_err()
+            );
+            assert!(
+                resolve_direct_source_own_property(
+                    context.store_mut_for_test(),
+                    Some(&wrong_globals),
+                    receiver,
+                    "value",
+                    &mut session,
+                )
+                .is_err()
+            );
+            assert_eq!(class_property_cache_state(&context, &source, file), before);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark()
+                ),
+                session_before
+            );
+        }
     }
 
     #[test]

@@ -11356,6 +11356,24 @@ fn object_literal_getter_annotation_is_exact(
         })
 }
 
+/// Replans the retained object against the live source before reading its getter proof.
+pub(super) fn object_literal_getter_projection_with_host(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<ObjectLiteralGetterProjection, RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidSymbolMembers(symbol);
+    let origin = store
+        .object_literal_getter_origin(symbol)
+        .ok_or_else(invalid)?;
+    if plan_object_literal(store, host, origin.object()).map_err(|_| invalid())?
+        != *origin.object_plan
+    {
+        return Err(invalid());
+    }
+    object_literal_getter_projection(store, symbol)
+}
+
 /// Reads a getter without checking its body or creating a replacement property.
 #[allow(clippy::too_many_lines)] // The source, object tables, and getter caches share one proof.
 pub(super) fn object_literal_getter_projection(
@@ -26599,6 +26617,121 @@ mod generic_publication_tests {
         let widened =
             super::super::source::widened_fresh_literal_type(store, expression_type).unwrap();
         (expression_type, store.get_widened_type(widened).unwrap())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold and warm projections share the same retained source.
+    fn object_literal_getter_host_projection_rechecks_source_without_publication() {
+        let (mut fixture, object) =
+            object_fixture("const result = { get current() { return 2; }, value: 1 };");
+        let plan = plan_object_literal(
+            &fixture.store,
+            &host(&fixture.parsed, &fixture.bound),
+            object,
+        )
+        .unwrap();
+        let getter = &plan.object_literal_getters[0];
+        let invalid = RelationUnavailable::InvalidSymbolMembers(getter.symbol);
+        let before = getter_allocations(&fixture.store);
+        assert_eq!(
+            object_literal_getter_projection_with_host(
+                &fixture.store,
+                &host(&fixture.parsed, &fixture.bound),
+                getter.symbol,
+            ),
+            Err(invalid),
+        );
+        assert_eq!(getter_allocations(&fixture.store), before);
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let type_ = publish_object_literal_with_getters(
+            &mut fixture.store,
+            &host(&fixture.parsed, &fixture.bound),
+            &plan,
+            &[number],
+        )
+        .unwrap();
+        let cold = getter_allocations(&fixture.store);
+        let projection = object_literal_getter_projection_with_host(
+            &fixture.store,
+            &host(&fixture.parsed, &fixture.bound),
+            getter.symbol,
+        )
+        .unwrap();
+        assert_eq!(projection.object_type, type_);
+        assert_eq!(projection.signature, None);
+        assert_eq!(
+            projection.require_type(),
+            Err(RelationUnavailable::UnresolvedPropertyType(getter.symbol)),
+        );
+        assert_eq!(getter_allocations(&fixture.store), cold);
+
+        let (expression_type, read_type) =
+            checked_numeric_getter_return(&mut fixture.store, &fixture.parsed, getter);
+        let signature = publish_object_literal_getter_return(
+            &mut fixture.store,
+            &host(&fixture.parsed, &fixture.bound),
+            getter,
+            expression_type,
+            read_type,
+        )
+        .unwrap();
+        let expected = object_literal_getter_projection(&fixture.store, getter.symbol).unwrap();
+        assert_eq!(expected.signature, Some(signature));
+        let warm = getter_allocations(&fixture.store);
+        let empty_host = DeclaredTypeHost::new(std::iter::empty::<(
+            &ts_ast::NodeArena,
+            &ts_binder::BoundFile,
+        )>())
+        .unwrap();
+        assert_eq!(
+            object_literal_getter_projection_with_host(&fixture.store, &empty_host, getter.symbol),
+            Err(invalid),
+        );
+
+        let saved = fixture
+            .parsed
+            .arena
+            .get(getter.declaration.node)
+            .unwrap()
+            .clone();
+        let NodeData::GetAccessorDeclaration(declaration) = &mut fixture
+            .parsed
+            .arena
+            .get_mut(getter.declaration.node)
+            .unwrap()
+            .data
+        else {
+            unreachable!();
+        };
+        declaration.facts = 1;
+        assert_eq!(
+            object_literal_getter_projection(&fixture.store, getter.symbol),
+            Ok(expected),
+        );
+        assert_eq!(
+            object_literal_getter_projection_with_host(
+                &fixture.store,
+                &host(&fixture.parsed, &fixture.bound),
+                getter.symbol,
+            ),
+            Err(invalid),
+        );
+        assert_eq!(getter_allocations(&fixture.store), warm);
+        *fixture
+            .parsed
+            .arena
+            .get_mut(getter.declaration.node)
+            .unwrap() = saved;
+        assert_eq!(
+            object_literal_getter_projection_with_host(
+                &fixture.store,
+                &host(&fixture.parsed, &fixture.bound),
+                getter.symbol,
+            ),
+            Ok(expected),
+        );
+        assert_eq!(getter_allocations(&fixture.store), warm);
     }
 
     #[test]

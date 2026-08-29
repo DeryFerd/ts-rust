@@ -1,4 +1,4 @@
-//! Contextual typing for the property-only object-literal source slice.
+//! Contextual typing for eager object-literal properties.
 //!
 //! The pinned checker obtains an object's contextual type once, looks up each
 //! source property by name, and checks ordinary property initializers as
@@ -25,8 +25,8 @@ use super::{
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
     source::{
-        PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
-        SourceSyntaxRole, UnsupportedSourceSyntax,
+        PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, PlannedObjectMember,
+        SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -62,7 +62,7 @@ pub(super) enum PreparedExpression {
     Template(Option<TypeId>),
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
-    Object(Vec<PreparedExpression>),
+    Object(Vec<PreparedObjectMember>),
     Property(Box<PreparedExpression>),
     Arrow(Option<TypeId>),
     Assertion(Option<TypeId>),
@@ -70,6 +70,13 @@ pub(super) enum PreparedExpression {
         contextual_type: Option<TypeId>,
         mutable_result: bool,
     },
+}
+
+/// Getter bodies are prepared only when source checking enters their own scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PreparedObjectMember {
+    Eager(PreparedExpression),
+    Getter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -637,7 +644,11 @@ fn prepare_expression(
                 state.current_flow_types,
             )?;
             let mut prepared = Vec::with_capacity(properties.len());
-            for (property, expression) in plan.properties.iter().zip(properties) {
+            for (property, member) in plan.properties.iter().zip(properties) {
+                let Some(expression) = member.eager_expression() else {
+                    prepared.push(PreparedObjectMember::Getter);
+                    continue;
+                };
                 let name = property
                     .name
                     .as_utf8()
@@ -649,7 +660,7 @@ fn prepare_expression(
                     expression,
                     state.current_flow_types,
                 )?;
-                prepared.push(prepare_expression(
+                prepared.push(PreparedObjectMember::Eager(prepare_expression(
                     store,
                     host,
                     global_types,
@@ -661,7 +672,7 @@ fn prepare_expression(
                     } else {
                         ExpressionLocation::Mutable
                     },
-                )?);
+                )?));
             }
             PreparedExpression::Object(prepared)
         }
@@ -714,7 +725,7 @@ fn contextual_objects(
     global_types: Option<&CanonicalGlobalTypes>,
     contextual_type: Option<TypeId>,
     source_properties: &[PlannedProperty],
-    expressions: &[PlannedExpression],
+    expressions: &[PlannedObjectMember],
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
 ) -> Result<Vec<ContextualPropertyObject>, SourceCheckError> {
     let Some(contextual_type) = contextual_type else {
@@ -749,7 +760,10 @@ fn contextual_objects(
                 return Err(RelationUnavailable::UnsupportedStructuredType(constituent).into());
             }
         }
-        for (property, expression) in source_properties.iter().zip(expressions) {
+        for (property, member) in source_properties.iter().zip(expressions) {
+            let Some(expression) = member.eager_expression() else {
+                continue;
+            };
             let name = property
                 .name
                 .as_utf8()
@@ -1740,10 +1754,10 @@ mod tests {
                 else {
                     panic!("mapped object fixture properties have string initializers")
                 };
-                PlannedExpression::new(
+                PlannedObjectMember::Eager(PlannedExpression::new(
                     property.type_node,
                     PlannedExpressionKind::String(value.text.clone()),
-                )
+                ))
             })
             .collect();
         PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties })
@@ -1771,7 +1785,7 @@ mod tests {
                     },
                     _ => panic!("intersection fixtures use string or numeric properties"),
                 };
-                PlannedExpression::new(property.type_node, kind)
+                PlannedObjectMember::Eager(PlannedExpression::new(property.type_node, kind))
             })
             .collect();
         PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties })
@@ -1799,6 +1813,107 @@ mod tests {
     }
 
     #[test]
+    fn object_getters_keep_contextual_slots_without_checking_bodies_or_discriminants() {
+        let parsed = parse_source_file(concat!(
+            "type Left = { first: 'first'; current: 'left'; last: number }; ",
+            "type Right = { first: 'first'; current: 'right'; last: 'last' }; ",
+            "const value: Left | Right = { ",
+            "first: 'first', get current() { return 'left'; }, last: 'last' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_074);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let plan =
+            super::super::object_members::plan_object_literal(context.store(), &host, object)
+                .unwrap();
+        let [getter] = plan.object_literal_getters.as_slice() else {
+            panic!("the object has one getter between its eager properties")
+        };
+        let getter = getter.clone();
+        assert_eq!(getter.property_index, 1);
+        let string_expression = |node: NodeRef| {
+            let NodeData::StringLiteral(literal) = &parsed.arena.get(node.node).unwrap().data
+            else {
+                panic!("each fixture value is a string literal")
+            };
+            PlannedExpression::new(node, PlannedExpressionKind::String(literal.text.clone()))
+        };
+        let properties = plan
+            .properties
+            .iter()
+            .enumerate()
+            .map(|(index, property)| {
+                if index == getter.property_index {
+                    PlannedObjectMember::Getter {
+                        getter: getter.clone(),
+                        expression: string_expression(getter.return_expression),
+                    }
+                } else {
+                    PlannedObjectMember::Eager(string_expression(property.type_node))
+                }
+            })
+            .collect::<Vec<_>>();
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            contextual_objects(
+                store,
+                &host,
+                None,
+                Some(target),
+                &plan.properties,
+                &properties,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .len(),
+            2,
+        );
+        let expression =
+            PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties });
+        let expected = PreparedExpression::Object(vec![
+            PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
+            PreparedObjectMember::Getter,
+            PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
+        ]);
+        assert_eq!(
+            prepare_expression_context(store, &host, &expression, target),
+            Ok(expected.clone()),
+        );
+        assert!(store.type_node_links(object).is_none());
+        assert!(store.type_node_links(getter.return_expression).is_none());
+        assert!(store.signature_links(getter.declaration).is_none());
+        assert!(
+            store
+                .value_symbol_links(getter.symbol)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            prepare_expression_context(store, &host, &expression, target),
+            Ok(expected),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn synthetic_jsdoc_objects_provide_context_and_reject_forged_properties() {
         let parsed = parse_source_file("const value: { age: number } = { age: 1 };");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -1816,13 +1931,13 @@ mod tests {
         let expression = PlannedExpression::new(
             object,
             PlannedExpressionKind::Object {
-                properties: vec![PlannedExpression::new(
+                properties: vec![PlannedObjectMember::Eager(PlannedExpression::new(
                     age.type_node,
                     PlannedExpressionKind::Number {
                         value: ts_jsnum::Number::new(1.0),
                         unary_operand: None,
                     },
-                )],
+                ))],
                 plan,
             },
         );
@@ -1881,7 +1996,9 @@ mod tests {
                 target,
             ),
             Ok(PreparedExpression::Object(vec![
-                PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(
+                    LiteralTreatment::WidenedPrimitive,
+                )),
             ])),
         );
         assert_eq!(
@@ -2035,7 +2152,9 @@ mod tests {
                         target,
                     ),
                     Ok(PreparedExpression::Object(vec![
-                        PreparedExpression::Literal(LiteralTreatment::Regular),
+                        PreparedObjectMember::Eager(PreparedExpression::Literal(
+                            LiteralTreatment::Regular,
+                        )),
                     ])),
                 );
                 assert_eq!(
@@ -2419,7 +2538,7 @@ mod tests {
                 target,
             ),
             Ok(PreparedExpression::Object(vec![
-                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
             ])),
         );
     }
@@ -2998,8 +3117,8 @@ mod tests {
         assert_eq!(
             prepared,
             PreparedExpression::Object(vec![
-                PreparedExpression::Literal(LiteralTreatment::Regular),
-                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
             ]),
         );
 
@@ -3134,8 +3253,8 @@ mod tests {
         assert_eq!(
             prepared,
             PreparedExpression::Object(vec![
-                PreparedExpression::Literal(LiteralTreatment::Regular),
-                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
             ]),
         );
         let contextual = resolve_contextual_property_object(store, &host, None, target)
@@ -3202,8 +3321,12 @@ mod tests {
         assert_eq!(
             prepared,
             PreparedExpression::Object(vec![
-                PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
-                PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(
+                    LiteralTreatment::WidenedPrimitive,
+                )),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(
+                    LiteralTreatment::WidenedPrimitive,
+                )),
             ]),
         );
         let projection = broad_record_mapped_projection(store, target).unwrap();
@@ -3270,8 +3393,8 @@ mod tests {
         assert_eq!(
             prepare_expression_context(store, &host, &expression, target),
             Ok(PreparedExpression::Object(vec![
-                PreparedExpression::Literal(LiteralTreatment::Regular),
-                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
+                PreparedObjectMember::Eager(PreparedExpression::Literal(LiteralTreatment::Regular)),
             ])),
         );
         let projection = broad_record_mapped_projection(store, target).unwrap();

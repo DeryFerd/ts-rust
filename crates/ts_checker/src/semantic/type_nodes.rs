@@ -25309,7 +25309,49 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
-        self.get_type_from_type_node_worker(node, false)
+        self.get_type_from_type_node_worker(node, false, false)
+    }
+
+    /// Replays a written getter annotation before or after its body is checked.
+    pub(super) fn get_type_from_object_literal_getter_annotation(
+        &mut self,
+        getter: &object_members::PlannedObjectLiteralGetter,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid =
+            || property_object_error(PropertyObjectError::InvalidObjectLiteral(getter.object));
+        let projection = object_members::object_literal_getter_projection_with_host(
+            self.store,
+            self.host,
+            getter.symbol,
+        )
+        .map_err(|_| invalid())?;
+        let plan = object_members::plan_object_literal(self.store, self.host, getter.object)
+            .map_err(|_| invalid())?;
+        if plan.object_literal_getter(getter.symbol) != Some(getter)
+            || projection.symbol != getter.symbol
+            || projection.owner != getter.owner
+            || projection.declaration != getter.declaration
+        {
+            return Err(invalid());
+        }
+        let annotation = getter.return_annotation.ok_or_else(invalid)?;
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        for edge in projection.type_edges() {
+            self.store
+                .validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])
+                .map_err(type_construction_error)?;
+        }
+        let result = self.get_type_from_type_node_worker(annotation, false, true)?;
+        if projection
+            .type_
+            .is_some_and(|read_type| read_type != result)
+        {
+            return Err(invalid());
+        }
+        Ok(result)
     }
 
     /// Resolves a reference identity without demanding interface member types.
@@ -25322,13 +25364,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
-        self.get_type_from_type_node_worker(node, true)
+        self.get_type_from_type_node_worker(node, true, false)
     }
 
     fn get_type_from_type_node_worker(
         &mut self,
         node: NodeRef,
         lazy_interface_values: bool,
+        replay_cached_annotations: bool,
     ) -> Result<TypeId, DeclaredTypeError> {
         self.require_type_reference_alias_root_capability(node)?;
         if !self.pending_function_parameters.is_empty() {
@@ -25349,6 +25392,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         .with_jsdoc_import_type_target(self.jsdoc_import_type_target)
         .with_enclosing_source_callable_scope(node)?;
         planner.lazy_interface_values = lazy_interface_values;
+        planner.replay_cached_annotations |= replay_cached_annotations;
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
@@ -26716,7 +26760,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         enums::get_enum_semantics(self.store, self.host, symbol).map_err(Into::into)
     }
 
-    /// Resolves an exact function, source callable, declared call, method, or
+    /// Resolves an exact function, source callable, getter, declared call, method, or
     /// constructor signature return type. Function-type returns remain lazy;
     /// constructor returns are published with their construct signature.
     pub(super) fn get_return_type_of_signature(
@@ -26917,6 +26961,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
+            }
+            SyntaxKind::GetAccessor => {
+                return self
+                    .get_return_type_of_object_literal_getter_signature(signature, declaration);
             }
             kind @ (SyntaxKind::CallSignature | SyntaxKind::ConstructSignature) => {
                 self.reject_type_reference_alias_capabilities()?;
@@ -27193,6 +27241,55 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             );
             Ok(return_type)
         }
+    }
+
+    fn get_return_type_of_object_literal_getter_signature(
+        &mut self,
+        signature: SignatureId,
+        declaration: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+        let record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::GetAccessorDeclaration(getter) = &record.data else {
+            return Err(invalid());
+        };
+        let annotation = getter
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node));
+        let symbol = self
+            .host
+            .bound_file(declaration)
+            .and_then(|bound| bound.symbol(declaration))
+            .filter(|symbol| self.store.get_merged_symbol(*symbol) == Some(*symbol))
+            .ok_or_else(invalid)?;
+        let projection = object_members::object_literal_getter_projection_with_host(
+            self.store, self.host, symbol,
+        )
+        .map_err(|_| invalid())?;
+        if projection.declaration != declaration || projection.signature != Some(signature) {
+            return Err(invalid());
+        }
+        let return_type = projection.require_type().map_err(|_| invalid())?;
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        for edge in projection.type_edges() {
+            self.store
+                .validate_cached_array_capability_with_pending_functions(array_targets, edge, &[])
+                .map_err(type_construction_error)?;
+        }
+        if let Some(annotation) = annotation {
+            // Replay source names even when a scalar alias has a cached type.
+            // Imported annotations still require this query's exact capability.
+            if self.get_type_from_type_node_worker(annotation, false, true)? != return_type {
+                return Err(invalid());
+            }
+        } else {
+            self.reject_type_reference_alias_capabilities()?;
+        }
+        Ok(return_type)
     }
 
     fn get_return_type_of_declared_method_signature(
@@ -27993,7 +28090,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         property: &object_members::PlannedProperty,
     ) -> Result<TypeId, DeclaredTypeError> {
-        let type_ = self.get_type_from_type_node_worker(property.type_node, true)?;
+        let type_ = self.get_type_from_type_node_worker(property.type_node, true, false)?;
         let bootstrap = self
             .store
             .intrinsic_bootstrap()
@@ -78170,6 +78267,510 @@ mod tests {
             Ok(callable),
         );
         assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cold_getter_annotations_reject_prewarmed_alias_symbol_changes() {
+        let mut fixture = fixture(concat!(
+            "type Result = number; type Other = number; ",
+            "const box = { get value(): Result { return 1; } };",
+        ));
+        let object = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let plan = object_members::plan_object_literal(&fixture.store, &host, object).unwrap();
+        let getter = &plan.object_literal_getters[0];
+        let annotation = getter.return_annotation.unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(query.get_type_from_type_node(annotation), Ok(number));
+        object_members::publish_object_literal_with_getters(query.store, &host, &plan, &[])
+            .unwrap();
+        let cold = format!("{:?}", query.store);
+        assert_eq!(
+            query.get_type_from_object_literal_getter_annotation(getter),
+            Ok(number)
+        );
+        assert_eq!(format!("{:?}", query.store), cold);
+        let original = query.store.symbol_node_links(annotation).unwrap().clone();
+        assert!(query.store.set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other),
+            }
+        ));
+        let poisoned = format!("{:?}", query.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_from_object_literal_getter_annotation(getter),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedSymbol {
+                        node: annotation,
+                        symbol: other,
+                    },
+                )),
+            );
+            assert_eq!(format!("{:?}", query.store), poisoned);
+        }
+        assert!(query.store.set_symbol_node_links(annotation, original));
+        assert_eq!(
+            query.get_type_from_object_literal_getter_annotation(getter),
+            Ok(number)
+        );
+        assert_eq!(format!("{:?}", query.store), cold);
+        assert!(query.store.signature_links(getter.declaration).is_none());
+        assert!(query.store.value_symbol_links(getter.symbol).is_none());
+        assert!(
+            query
+                .store
+                .type_node_links(getter.return_expression)
+                .is_none()
+        );
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One getter retains its source and signature through cache damage.
+    fn object_literal_getter_signature_queries_replay_source_and_reject_changed_caches() {
+        let mut fixture = fixture(concat!(
+            "type Result = number; type Other = number; ",
+            "const box = { get value(): Result { return 1; } };",
+        ));
+        let object = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let plan = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let plan = object_members::plan_object_literal(&fixture.store, &host, object).unwrap();
+            object_members::publish_object_literal_with_getters(
+                &mut fixture.store,
+                &host,
+                &plan,
+                &[],
+            )
+            .unwrap();
+            plan
+        };
+        let getter = &plan.object_literal_getters[0];
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let forged = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(getter.declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(number),
+                None,
+                0,
+            )
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            ),
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let cold = format!("{:?}", fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, forged, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(forged),
+            )),
+        );
+        assert_eq!(format!("{:?}", fixture.store), cold);
+        assert!(fixture.store.signature_links(getter.declaration).is_none());
+        assert!(
+            fixture
+                .store
+                .type_node_links(getter.return_expression)
+                .is_none()
+        );
+
+        let annotation = getter.return_annotation.unwrap();
+        assert_eq!(
+            query_node(&mut fixture, annotation, &mut diagnostics),
+            Ok(number)
+        );
+        let literal = fixture
+            .store
+            .regular_number_literal_type(Number::new(1.0))
+            .unwrap();
+        let expression_type = fixture.store.fresh_type_of_literal_type(literal).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            getter.return_expression,
+            TypeNodeLinks {
+                resolved_type: Some(expression_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let signature = object_members::publish_object_literal_getter_return(
+            &mut fixture.store,
+            &post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            ),
+            getter,
+            expression_type,
+            number,
+        )
+        .unwrap();
+        assert_ne!(signature, forged);
+        let warm = format!("{:?}", fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(number)
+            );
+            assert_eq!(
+                query_signature_return(&mut fixture, forged, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(forged),
+                )),
+            );
+            assert_eq!(format!("{:?}", fixture.store), warm);
+        }
+
+        let annotation_links = fixture.store.type_node_links(annotation).unwrap().clone();
+        let value_links = fixture
+            .store
+            .value_symbol_links(getter.symbol)
+            .unwrap()
+            .clone();
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            getter.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(string))
+        );
+        let poisoned = format!("{:?}", fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature),
+            )),
+        );
+        assert_eq!(format!("{:?}", fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(annotation, annotation_links)
+        );
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(getter.symbol, value_links)
+        );
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(number))
+        );
+
+        let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+        let original_symbol = fixture.store.symbol_node_links(annotation).unwrap().clone();
+        assert!(fixture.store.set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other),
+            }
+        ));
+        let poisoned = format!("{:?}", fixture.store);
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedSymbol {
+                    node: annotation,
+                    symbol: other,
+                },
+            )),
+        );
+        assert_eq!(format!("{:?}", fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_symbol_node_links(annotation, original_symbol)
+        );
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(number)
+        );
+        assert_eq!(format!("{:?}", fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The declared read type must not hide the checked array edge.
+    fn object_literal_getter_signature_queries_require_both_array_edges() {
+        let mut fixture = global_array_fixture(concat!(
+            "declare const captured: number[]; ",
+            "const inferred = { get value() { return captured; } }; ",
+            "const annotated = { get value(): number { return captured; } };",
+        ));
+        let globals = initialize_fixture_global_types(&mut fixture);
+        let captured = named_symbol(&fixture, SyntaxKind::VariableDeclaration, "captured");
+        let objects = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(objects.len(), 2);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let array = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut fixture.store,
+            &host,
+            &globals,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_declared_value(captured)
+        .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let TypeData::Interface(array_target) = fixture
+            .store
+            .type_payload(globals.array_type)
+            .unwrap()
+            .data()
+        else {
+            unreachable!();
+        };
+        let parameter = array_target
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 1,
+            },
+            error,
+        )
+        .unwrap();
+        for expected in [number, error] {
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    &mut fixture.store,
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    &mut session,
+                ),
+                Ok(expected)
+            );
+        }
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.limit_event_count(), 1);
+        let mut wrong_globals = globals.clone();
+        wrong_globals.array_type = globals.readonly_array_type;
+        for object in objects {
+            let plan = object_members::plan_object_literal(&fixture.store, &host, object).unwrap();
+            let getter = &plan.object_literal_getters[0];
+            object_members::publish_object_literal_with_getters(
+                &mut fixture.store,
+                &host,
+                &plan,
+                &[],
+            )
+            .unwrap();
+            let read = super::super::variables::plan_identifier_read(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+                &fixture.store,
+                &host,
+                &HashSet::from([captured]),
+                &HashSet::from([captured]),
+                getter.return_expression,
+                "captured",
+            )
+            .unwrap();
+            assert_eq!(read.value_symbol, captured);
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(read.value_symbol)
+                    .unwrap()
+                    .resolved_type,
+                Some(array)
+            );
+            assert!(fixture.store.set_symbol_node_links(
+                getter.return_expression,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(read.resolved_symbol),
+                }
+            ));
+            assert!(fixture.store.set_type_node_links(
+                getter.return_expression,
+                TypeNodeLinks {
+                    resolved_type: Some(array),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let read_type = if let Some(annotation) = getter.return_annotation {
+                let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                    &mut fixture.store,
+                    &host,
+                    &globals,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(annotation)
+                .unwrap();
+                assert_eq!(type_, number);
+                type_
+            } else {
+                array
+            };
+            let signature = object_members::publish_object_literal_getter_return(
+                &mut fixture.store,
+                &host,
+                getter,
+                array,
+                read_type,
+            )
+            .unwrap();
+            let before = format!("{:?}", fixture.store);
+            let session_before = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_mark(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        &mut fixture.store,
+                        &host,
+                        &globals,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut session,
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_return_type_of_signature(signature),
+                    Ok(read_type)
+                );
+                assert_eq!(format!("{:?}", fixture.store), before);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_mark()
+                    ),
+                    session_before
+                );
+            }
+            assert_eq!(
+                CanonicalTypeQuery::new_with_session_for_test(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Err(type_construction_error(
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(array),
+                ))
+            );
+            assert!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    &mut fixture.store,
+                    &host,
+                    &wrong_globals,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature)
+                .is_err()
+            );
+            assert_eq!(format!("{:?}", fixture.store), before);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_mark()
+                ),
+                session_before
+            );
+        }
         assert!(diagnostics.is_empty());
     }
 

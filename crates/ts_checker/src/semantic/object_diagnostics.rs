@@ -1,6 +1,6 @@
 //! Object-literal assignability diagnostic elaboration.
 //!
-//! This is the property-only prefix of the pinned
+//! This is the object-literal prefix of the pinned
 //! `checkTypeAssignableToAndOptionallyElaborate` / `elaborateObjectLiteral` /
 //! `elaborateElement` path at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Relations remain silent: this
@@ -44,13 +44,14 @@ use super::{
     instantiate::InstantiationSession,
     object_members::{
         DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
+        object_literal_getter_projection_with_host, plan_object_literal,
         validate_resolved_declared_property_type_graph,
     },
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
     signatures::ElementFlags,
     source::{
-        CheckedExpressionShape, CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
-        SourceCheckError, SourceCheckProvenanceError,
+        CheckedExpressionShape, CheckedExpressionTypes, CheckedObjectMember, PlannedExpression,
+        PlannedExpressionKind, PlannedObjectMember, SourceCheckError, SourceCheckProvenanceError,
     },
     spelling::get_spelling_suggestion,
     type_nodes::CanonicalTypeQuery,
@@ -152,7 +153,7 @@ fn diagnostics_for_failed_assignment_once(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
-    validate_checked_expression_shape(expression, checked)?;
+    validate_checked_expression_shape(store, host, global_types, expression, checked)?;
     let flags = display_flags(options);
     if options.intrinsic.exact_optional_property_types
         && matches!(
@@ -251,6 +252,9 @@ fn exact_function_type_signature(
 /// Validates the complete retained execution tree before recursive diagnostic
 /// elaboration can run relation queries for any sibling.
 fn validate_checked_expression_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     expression: &PlannedExpression,
     checked: &CheckedExpressionTypes,
 ) -> Result<(), SourceCheckError> {
@@ -260,13 +264,51 @@ fn validate_checked_expression_shape(
             PlannedExpressionKind::Object { plan, properties },
             CheckedExpressionShape::Object(checked_properties),
         ) => {
-            if plan.properties.len() != properties.len()
-                || properties.len() != checked_properties.len()
-            {
+            validate_planned_object_members(store, host, plan, properties, checked.result)?;
+            if expression.node != plan.node || properties.len() != checked_properties.len() {
                 return Err(invalid_structure(checked.result));
             }
-            for (property, checked_property) in properties.iter().zip(checked_properties) {
-                validate_checked_expression_shape(property, checked_property)?;
+            for (member, checked_member) in properties.iter().zip(checked_properties) {
+                match (member, checked_member) {
+                    (PlannedObjectMember::Eager(_), CheckedObjectMember::Eager(_)) => {}
+                    (
+                        PlannedObjectMember::Getter { getter, .. },
+                        CheckedObjectMember::Getter { symbol, read_type },
+                    ) => {
+                        if *symbol != getter.symbol {
+                            return Err(invalid_structure(checked.result));
+                        }
+                        let projection =
+                            object_literal_getter_projection_with_host(store, host, *symbol)?;
+                        if projection.object_type != checked.result
+                            || projection.owner != plan.symbol
+                            || projection.declaration != getter.declaration
+                            || projection.require_type()? != *read_type
+                        {
+                            return Err(invalid_structure(checked.result));
+                        }
+                        for edge in projection.type_edges() {
+                            store.validate_cached_array_capability_with_array_targets(
+                                CanonicalArrayTargets::from_global_types(global_types),
+                                edge,
+                            )?;
+                        }
+                    }
+                    _ => return Err(invalid_structure(checked.result)),
+                }
+            }
+            for (member, checked_member) in properties.iter().zip(checked_properties) {
+                if let (PlannedObjectMember::Eager(property), CheckedObjectMember::Eager(checked)) =
+                    (member, checked_member)
+                {
+                    validate_checked_expression_shape(
+                        store,
+                        host,
+                        global_types,
+                        property,
+                        checked,
+                    )?;
+                }
             }
             Ok(())
         }
@@ -278,7 +320,13 @@ fn validate_checked_expression_shape(
                 return Err(invalid_structure(checked.result));
             }
             for (element, checked_element) in elements.iter().zip(checked_elements) {
-                validate_checked_expression_shape(element, checked_element)?;
+                validate_checked_expression_shape(
+                    store,
+                    host,
+                    global_types,
+                    element,
+                    checked_element,
+                )?;
             }
             Ok(())
         }
@@ -291,6 +339,49 @@ fn validate_checked_expression_shape(
         }
         _ => Ok(()),
     }
+}
+
+fn validate_planned_object_members(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &PropertyObjectPlan,
+    members: &[PlannedObjectMember],
+    source_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    if plan.properties.len() != members.len() {
+        return Err(invalid_structure(source_type));
+    }
+    if !plan.object_literal_getters.is_empty()
+        && plan_object_literal(store, host, plan.node)
+            .map_err(|_| invalid_structure(source_type))?
+            != *plan
+    {
+        return Err(invalid_structure(source_type));
+    }
+    let mut getters = plan.object_literal_getters.iter().peekable();
+    for (index, (property, member)) in plan.properties.iter().zip(members).enumerate() {
+        let valid = match member {
+            PlannedObjectMember::Eager(expression) => {
+                expression.node == property.type_node
+                    && getters
+                        .peek()
+                        .is_none_or(|getter| getter.property_index != index)
+                    && store.source_node_kind(property.declaration) != Some(SyntaxKind::GetAccessor)
+            }
+            PlannedObjectMember::Getter { getter, expression } => {
+                getters.next() == Some(getter)
+                    && getter.property_index == index
+                    && expression.node == getter.return_expression
+            }
+        };
+        if !valid {
+            return Err(invalid_structure(source_type));
+        }
+    }
+    if getters.next().is_some() {
+        return Err(invalid_structure(source_type));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors the pinned recursive elaboration boundary.
@@ -382,7 +473,8 @@ fn elaborate_known_properties(
     else {
         return Ok(Vec::new());
     };
-    let source_types = resolved_source_property_types(store, plan, checked.result)?;
+    let source_types =
+        resolved_source_property_types(store, host, global_types, plan, checked.result)?;
     if properties.len() != plan.properties.len()
         || source_types.len() != plan.properties.len()
         || checked_properties.len() != plan.properties.len()
@@ -401,6 +493,7 @@ fn elaborate_known_properties(
             properties,
             checked_properties,
             &source_types,
+            checked.result,
             index,
             flags,
             options,
@@ -409,17 +502,19 @@ fn elaborate_known_properties(
     }
 
     let mut diagnostics = Vec::new();
-    for (index, ((source_property, source_expression), source_property_type)) in plan
+    for (index, ((source_property, source_member), source_property_type)) in plan
         .properties
         .iter()
         .zip(properties)
         .zip(source_types)
         .enumerate()
     {
-        let checked_property = &checked_properties[index];
-        if checked_property.result != source_property_type {
-            return Err(invalid_structure(checked.result));
-        }
+        let initializer = checked_object_member_initializer(
+            source_member,
+            &checked_properties[index],
+            source_property_type,
+            checked.result,
+        )?;
         let Some(target_property) = target.get(source_property.name.as_ref()) else {
             if let Some(indexed_target) = indexed_target {
                 let name = source_property.name.as_utf8().ok_or(
@@ -429,8 +524,7 @@ fn elaborate_known_properties(
                     store,
                     host,
                     global_types,
-                    source_expression,
-                    checked_property,
+                    initializer,
                     name,
                     source_property.name_node,
                     source_property_type,
@@ -442,20 +536,83 @@ fn elaborate_known_properties(
             }
             continue;
         };
-        if store.is_type_assignable_to_with_global_types(
-            source_property_type,
-            target_property.type_,
-            global_types,
-        )? {
+        let assignable = if initializer.is_none() {
+            store.is_type_assignable_to_with_session(
+                source_property_type,
+                target_property.type_,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            )?
+        } else {
+            store.is_type_assignable_to_with_global_types(
+                source_property_type,
+                target_property.type_,
+                global_types,
+            )?
+        };
+        if assignable {
             continue;
         }
 
-        if options.intrinsic.exact_optional_property_types
-            && matches!(
-                source_expression.unparenthesized().kind,
-                PlannedExpressionKind::Object { .. }
-            )
-            && let Some(mut diagnostic) = exact_optional_assignment_diagnostic(
+        let mut diagnostic = if let Some((source_expression, checked_property)) = initializer {
+            if options.intrinsic.exact_optional_property_types
+                && matches!(
+                    source_expression.unparenthesized().kind,
+                    PlannedExpressionKind::Object { .. }
+                )
+                && let Some(mut diagnostic) = exact_optional_assignment_diagnostic(
+                    store,
+                    host,
+                    global_types,
+                    source_property_type,
+                    target_property.type_,
+                    source_property.name_node,
+                    flags,
+                )?
+            {
+                append_expected_property_related(
+                    &mut diagnostic,
+                    store,
+                    host,
+                    global_types,
+                    target_type,
+                    target_property,
+                    flags,
+                )?;
+                diagnostics.push(diagnostic);
+                continue;
+            }
+
+            let nested = elaborate_expression(
+                store,
+                host,
+                global_types,
+                source_expression,
+                checked_property,
+                target_property.type_,
+                flags,
+                options,
+                session,
+            )?;
+            if !nested.is_empty() {
+                diagnostics.extend(nested);
+                continue;
+            }
+
+            shape_or_generic_diagnostic(
+                store,
+                host,
+                global_types,
+                source_expression,
+                source_property_type,
+                target_property.type_,
+                source_property.name_node,
+                flags,
+                options,
+            )?
+        } else {
+            generic_assignability_diagnostic(
                 store,
                 host,
                 global_types,
@@ -463,48 +620,9 @@ fn elaborate_known_properties(
                 target_property.type_,
                 source_property.name_node,
                 flags,
+                options,
             )?
-        {
-            append_expected_property_related(
-                &mut diagnostic,
-                store,
-                host,
-                global_types,
-                target_type,
-                target_property,
-                flags,
-            )?;
-            diagnostics.push(diagnostic);
-            continue;
-        }
-
-        let nested = elaborate_expression(
-            store,
-            host,
-            global_types,
-            source_expression,
-            checked_property,
-            target_property.type_,
-            flags,
-            options,
-            session,
-        )?;
-        if !nested.is_empty() {
-            diagnostics.extend(nested);
-            continue;
-        }
-
-        let mut diagnostic = shape_or_generic_diagnostic(
-            store,
-            host,
-            global_types,
-            source_expression,
-            source_property_type,
-            target_property.type_,
-            source_property.name_node,
-            flags,
-            options,
-        )?;
+        };
         append_expected_property_related(
             &mut diagnostic,
             store,
@@ -517,6 +635,27 @@ fn elaborate_known_properties(
         diagnostics.push(diagnostic);
     }
     Ok(diagnostics)
+}
+
+/// A getter has no initializer to elaborate at the object-member boundary.
+fn checked_object_member_initializer<'a>(
+    member: &'a PlannedObjectMember,
+    checked: &'a CheckedObjectMember,
+    property_type: TypeId,
+    object_type: TypeId,
+) -> Result<Option<(&'a PlannedExpression, &'a CheckedExpressionTypes)>, SourceCheckError> {
+    match (member, checked) {
+        (PlannedObjectMember::Eager(expression), CheckedObjectMember::Eager(checked))
+            if checked.result == property_type =>
+        {
+            Ok(Some((expression, checked)))
+        }
+        (
+            PlannedObjectMember::Getter { getter, .. },
+            CheckedObjectMember::Getter { symbol, read_type },
+        ) if *symbol == getter.symbol && *read_type == property_type => Ok(None),
+        _ => Err(invalid_structure(object_type)),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -595,16 +734,17 @@ fn elaborate_indexed_properties(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     plan: &PropertyObjectPlan,
-    expressions: &[PlannedExpression],
-    checked: &[CheckedExpressionTypes],
+    expressions: &[PlannedObjectMember],
+    checked: &[CheckedObjectMember],
     source_types: &[TypeId],
+    object_type: TypeId,
     target: DeclaredIndexTarget,
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     let mut diagnostics = Vec::new();
-    for (index, ((property, expression), source_type)) in plan
+    for (index, ((property, member), source_type)) in plan
         .properties
         .iter()
         .zip(expressions)
@@ -615,12 +755,13 @@ fn elaborate_indexed_properties(
             .name
             .as_utf8()
             .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))?;
+        let initializer =
+            checked_object_member_initializer(member, &checked[index], *source_type, object_type)?;
         diagnostics.extend(elaborate_indexed_property(
             store,
             host,
             global_types,
-            expression,
-            &checked[index],
+            initializer,
             name,
             property.name_node,
             *source_type,
@@ -638,8 +779,7 @@ fn elaborate_indexed_property(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
-    expression: &PlannedExpression,
-    checked: &CheckedExpressionTypes,
+    initializer: Option<(&PlannedExpression, &CheckedExpressionTypes)>,
     name: &str,
     name_node: NodeRef,
     source_type: TypeId,
@@ -648,28 +788,42 @@ fn elaborate_indexed_property(
     options: CanonicalCheckerOptions,
     session: &mut InstantiationSession,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
-    if !declared_index_accepts_name(store, target, name)?
-        || store.is_type_assignable_to_with_global_types(
+    if !declared_index_accepts_name(store, target, name)? {
+        return Ok(Vec::new());
+    }
+    let assignable = if initializer.is_none() {
+        store.is_type_assignable_to_with_session(
+            source_type,
+            target.value_type,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
+        )?
+    } else {
+        store.is_type_assignable_to_with_global_types(
             source_type,
             target.value_type,
             global_types,
         )?
-    {
+    };
+    if assignable {
         return Ok(Vec::new());
     }
-    let nested = elaborate_expression(
-        store,
-        host,
-        global_types,
-        expression,
-        checked,
-        target.value_type,
-        flags,
-        options,
-        session,
-    )?;
-    if !nested.is_empty() {
-        return Ok(nested);
+    if let Some((expression, checked)) = initializer {
+        let nested = elaborate_expression(
+            store,
+            host,
+            global_types,
+            expression,
+            checked,
+            target.value_type,
+            flags,
+            options,
+            session,
+        )?;
+        if !nested.is_empty() {
+            return Ok(nested);
+        }
     }
 
     let mut diagnostic = generic_assignability_diagnostic(
@@ -933,7 +1087,7 @@ fn discriminated_union_excess_property_diagnostic(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     plan: &PropertyObjectPlan,
-    properties: &[PlannedExpression],
+    properties: &[PlannedObjectMember],
     target_type: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
@@ -968,7 +1122,10 @@ fn discriminated_union_excess_property_diagnostic(
     }
 
     let mut included = vec![true; targets.len()];
-    for (source_property, expression) in plan.properties.iter().zip(properties) {
+    for (source_property, member) in plan.properties.iter().zip(properties) {
+        let Some(expression) = member.eager_expression() else {
+            continue;
+        };
         let Some(source_type) = literal_discriminant_type(store, expression) else {
             continue;
         };
@@ -1149,21 +1306,18 @@ pub(super) fn excess_object_argument_diagnostic(
     let PlannedExpressionKind::Object { plan, properties } = &argument.kind else {
         return Ok(None);
     };
-    if argument.node != plan.node
-        || !plan.spreads.is_empty()
-        || properties.len() != plan.properties.len()
-        || properties
-            .iter()
-            .zip(&plan.properties)
-            .any(|(expression, property)| expression.node != property.type_node)
-    {
+    if argument.node != plan.node || !plan.spreads.is_empty() {
         return Err(invalid_structure(source_type));
     }
+    validate_planned_object_members(store, host, plan, properties, source_type)?;
     let state = super::object_members::object_literal_state(store, plan)
         .map_err(|_| invalid_structure(source_type))?
         .ok_or_else(|| invalid_structure(source_type))?;
     if state.type_id() != source_type || !state.is_resolved() {
         return Err(invalid_structure(source_type));
+    }
+    if !plan.object_literal_getters.is_empty() {
+        resolved_source_property_types(store, host, global_types, plan, source_type)?;
     }
     let Some(target) = store.resolved_declared_property_object_with_global_types(
         host,
@@ -2512,6 +2666,8 @@ fn declared_property_name_node(
 
 fn resolved_source_property_types(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     plan: &PropertyObjectPlan,
     source_type: TypeId,
 ) -> Result<Vec<TypeId>, SourceCheckError> {
@@ -2543,9 +2699,34 @@ fn resolved_source_property_types(
         .and_then(|members| store.symbol_table(members))
         .ok_or_else(|| invalid_structure(source_type))?;
     let mut property_types = Vec::with_capacity(property_symbols.len());
-    for (planned, symbol) in plan.properties.iter().zip(property_symbols) {
+    for (index, (planned, symbol)) in plan.properties.iter().zip(property_symbols).enumerate() {
         if table.get(planned.name.as_ref()) != Some(symbol) {
             return Err(invalid_structure(source_type));
+        }
+        if let Some(getter) = plan
+            .object_literal_getters
+            .iter()
+            .find(|getter| getter.property_index == index)
+        {
+            if symbol != getter.symbol || symbol != planned.symbol {
+                return Err(invalid_structure(source_type));
+            }
+            let projection = object_literal_getter_projection_with_host(store, host, symbol)?;
+            if projection.object_type != source_type
+                || projection.owner != plan.symbol
+                || projection.declaration != planned.declaration
+            {
+                return Err(invalid_structure(source_type));
+            }
+            let read_type = projection.require_type()?;
+            for edge in projection.type_edges() {
+                store.validate_cached_array_capability_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(global_types),
+                    edge,
+                )?;
+            }
+            property_types.push(read_type);
+            continue;
         }
         let links = store
             .value_symbol_links(symbol)
@@ -2577,7 +2758,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, IntrinsicBootstrapOptions, MappedTypeModifiers,
+        ArrayTypeError, CanonicalCheckerContext, IntrinsicBootstrapOptions, MappedTypeModifiers,
+        source::{PlannedIdentifierRead, PlannedIdentifierReadKind, SourceLiteralCacheError},
     };
 
     fn diagnostic_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -2954,6 +3136,181 @@ mod tests {
     }
 
     #[test]
+    fn excess_diagnostics_validate_hidden_getter_array_before_excess_errors() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "declare const entries: number[]; ",
+            "const value = { extra: 1, get current(): number { return entries; }, tail: 2 }; ",
+            "declare let target: { current: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(220);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let [body_error] = context.diagnostics().as_slice() else {
+            panic!("source checking reports the getter's array return mismatch")
+        };
+        let body_error = body_error.clone();
+        assert_eq!(body_error.diagnostic.code(), 2322);
+        assert_eq!(body_error.diagnostic.arguments, ["number[]", "number"]);
+        let published_diagnostics = context.diagnostics().clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let globals = context.global_types().clone();
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let target_node = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == "target").then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    variable.type_?,
+                ))
+            })
+            .unwrap();
+        let target_type = context.get_type_from_type_node(target_node).unwrap();
+        let store = context.store_mut_for_test();
+        let plan = plan_object_literal(store, &host, object).unwrap();
+        let [getter] = plan.object_literal_getters.as_slice() else {
+            panic!("the source object has one getter")
+        };
+        let getter = getter.clone();
+        assert_eq!(getter.property_index, 1);
+        assert_eq!(body_error.node, Some(getter.return_statement));
+        let projection =
+            object_literal_getter_projection_with_host(store, &host, getter.symbol).unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(projection.require_type(), Ok(number));
+        let body_array = projection.checked_return.unwrap();
+        assert_ne!(body_array, number);
+        assert_eq!(
+            store.canonical_array_element_type(&globals, body_array),
+            Ok(Some(number)),
+        );
+        let source_type = projection.object_type;
+        let captured = store
+            .symbol_node_links(getter.return_expression)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let excess_name = plan.properties[0].name_node;
+        let properties = plan
+            .properties
+            .iter()
+            .enumerate()
+            .map(|(index, property)| {
+                if index == getter.property_index {
+                    PlannedObjectMember::Getter {
+                        getter: getter.clone(),
+                        expression: PlannedExpression::new(
+                            getter.return_expression,
+                            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                                resolved_symbol: captured,
+                                value_symbol: captured,
+                                kind: PlannedIdentifierReadKind::DeclaredValue,
+                            }),
+                        ),
+                    }
+                } else {
+                    let NodeData::NumericLiteral(literal) =
+                        &parsed.arena.get(property.type_node.node).unwrap().data
+                    else {
+                        panic!("the eager properties have numeric initializers")
+                    };
+                    PlannedObjectMember::Eager(PlannedExpression::new(
+                        property.type_node,
+                        PlannedExpressionKind::Number {
+                            value: ts_jsnum::Number::new(literal.text.parse().unwrap()),
+                            unary_operand: None,
+                        },
+                    ))
+                }
+            })
+            .collect();
+        let argument =
+            PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties });
+        let flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        let diagnostic = excess_object_argument_diagnostic(
+            store,
+            &host,
+            &globals,
+            &argument,
+            source_type,
+            target_type,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(diagnostic.diagnostic.code(), 2353);
+        assert_eq!(diagnostic.node, Some(excess_name));
+
+        let mut wrong_globals = globals.clone();
+        wrong_globals.array_type = globals.readonly_array_type;
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            excess_object_argument_diagnostic(
+                store,
+                &host,
+                &wrong_globals,
+                &argument,
+                source_type,
+                target_type,
+                flags,
+            ),
+            Err(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::ArrayType(ArrayTypeError::InvalidReference(body_array)),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert_eq!(
+            excess_object_argument_diagnostic(
+                store,
+                &host,
+                &globals,
+                &argument,
+                source_type,
+                target_type,
+                flags,
+            ),
+            Ok(Some(diagnostic)),
+        );
+        assert_eq!(context.diagnostics(), &published_diagnostics);
+    }
+
+    #[test]
     fn excess_object_call_argument_retains_its_source_property_location() {
         let parsed = parse_source_file(concat!(
             "const value = { b: 5 }; ",
@@ -3014,13 +3371,13 @@ mod tests {
             object,
             PlannedExpressionKind::Object {
                 plan,
-                properties: vec![PlannedExpression::new(
+                properties: vec![PlannedObjectMember::Eager(PlannedExpression::new(
                     value_node,
                     PlannedExpressionKind::Number {
                         value: ts_jsnum::Number::new(5.0),
                         unary_operand: None,
                     },
-                )],
+                ))],
             },
         );
 

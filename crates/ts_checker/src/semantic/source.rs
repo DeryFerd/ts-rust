@@ -121,7 +121,7 @@ use super::{
         prepare_source_class_members, validate_class_heritage_members,
     },
     contextual::{
-        LiteralTreatment, PreparedExpression, mutable_literal_treatment,
+        LiteralTreatment, PreparedExpression, PreparedObjectMember, mutable_literal_treatment,
         prepare_expression_context_and_tuple_contexts_with_global_types,
         prepare_expression_context_with_global_types,
         prepare_expression_without_context_with_global_types,
@@ -903,7 +903,7 @@ pub(super) enum PlannedExpressionKind {
     Array(Vec<PlannedExpression>),
     Object {
         plan: super::object_members::PropertyObjectPlan,
-        properties: Vec<PlannedExpression>,
+        properties: Vec<PlannedObjectMember>,
     },
     Property(Box<SourcePropertyPlan>),
     Element(Box<SourceElementPlan>),
@@ -915,6 +915,25 @@ pub(super) enum PlannedExpressionKind {
     Binary(Box<PrimitiveBinaryPlan>),
     Logical(Box<LogicalBinaryPlan>),
     Conditional(Box<ConditionalExpressionPlan>),
+}
+
+/// Each source member keeps its eager value or deferred getter body in its original slot.
+#[derive(Clone, Debug)]
+pub(super) enum PlannedObjectMember {
+    Eager(PlannedExpression),
+    Getter {
+        getter: super::object_members::PlannedObjectLiteralGetter,
+        expression: PlannedExpression,
+    },
+}
+
+impl PlannedObjectMember {
+    pub(super) const fn eager_expression(&self) -> Option<&PlannedExpression> {
+        match self {
+            Self::Eager(expression) => Some(expression),
+            Self::Getter { .. } => None,
+        }
+    }
 }
 
 /// Authenticated cooked text segments and source-owned template substitutions.
@@ -24094,7 +24113,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let [property] = plan.properties.as_slice() else {
                 return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
             };
-            let [initializer] = properties.as_slice() else {
+            let [PlannedObjectMember::Eager(initializer)] = properties.as_slice() else {
                 return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
             };
             if plan.kind != super::object_members::PropertyObjectKind::ObjectLiteral
@@ -24580,15 +24599,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Parenthesized(inner) => {
                 self.captured_closure_assignment_target_is_mutable(inner)
             }
-            PlannedExpressionKind::Array(targets)
-            | PlannedExpressionKind::Object {
-                properties: targets,
-                ..
-            } => {
+            PlannedExpressionKind::Array(targets) => {
                 !targets.is_empty()
                     && targets
                         .iter()
                         .all(|target| self.captured_closure_assignment_target_is_mutable(target))
+            }
+            PlannedExpressionKind::Object { properties, .. } => {
+                !properties.is_empty()
+                    && properties.iter().all(|property| {
+                        property.eager_expression().is_some_and(|target| {
+                            self.captured_closure_assignment_target_is_mutable(target)
+                        })
+                    })
             }
             _ => false,
         }
@@ -25145,7 +25168,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let key = self.reference(computed.expression);
                 computed_keys.push(self.plan_expression(key)?);
             }
-            properties.push(self.plan_expression(initializer)?);
+            if let Some(getter) = plan.object_literal_getter(plan.properties[index].symbol) {
+                if let Some(annotation) = getter.return_annotation {
+                    self.plan_type_import_annotation_root(annotation)?;
+                }
+                properties.push(PlannedObjectMember::Getter {
+                    getter: getter.clone(),
+                    expression: self.plan_expression(getter.return_expression)?,
+                });
+            } else {
+                properties.push(PlannedObjectMember::Eager(
+                    self.plan_expression(initializer)?,
+                ));
+            }
         }
         while let Some(spread) = plan.spreads.get(spread_index) {
             if spread.property_index != plan.properties.len() {
@@ -26365,7 +26400,12 @@ fn class_expression_nodes(
             PlannedExpressionKind::SuperCall(call) => pending.extend(call.arguments().iter().rev()),
             PlannedExpressionKind::Array(elements) => pending.extend(elements.iter().rev()),
             PlannedExpressionKind::Object { properties, .. } => {
-                pending.extend(properties.iter().rev());
+                pending.extend(
+                    properties
+                        .iter()
+                        .rev()
+                        .filter_map(PlannedObjectMember::eager_expression),
+                );
                 pending.extend(expression.object_spreads.iter().rev());
                 pending.extend(expression.object_computed_keys.iter().rev());
             }
@@ -26731,6 +26771,91 @@ fn planned_expression_reads_symbol(
     }
 }
 
+fn expression_has_object_literal_getters(expression: &PlannedExpression) -> bool {
+    match &expression.kind {
+        PlannedExpressionKind::Object { plan, properties } => {
+            !plan.object_literal_getters.is_empty()
+                || properties
+                    .iter()
+                    .filter_map(PlannedObjectMember::eager_expression)
+                    .any(expression_has_object_literal_getters)
+                || expression
+                    .object_spreads
+                    .iter()
+                    .any(expression_has_object_literal_getters)
+        }
+        PlannedExpressionKind::Array(elements) => {
+            elements.iter().any(expression_has_object_literal_getters)
+        }
+        PlannedExpressionKind::Parenthesized(inner)
+        | PlannedExpressionKind::Assertion { operand: inner, .. } => {
+            expression_has_object_literal_getters(inner)
+        }
+        PlannedExpressionKind::Property(property) => {
+            expression_has_object_literal_getters(&property.receiver)
+        }
+        PlannedExpressionKind::Element(element) => {
+            expression_has_object_literal_getters(&element.receiver)
+                || expression_has_object_literal_getters(&element.index)
+        }
+        PlannedExpressionKind::Call(call) => {
+            expression_has_object_literal_getters(&call.callee)
+                || call
+                    .arguments
+                    .iter()
+                    .any(expression_has_object_literal_getters)
+        }
+        PlannedExpressionKind::Binary(binary) => {
+            expression_has_object_literal_getters(&binary.left)
+                || expression_has_object_literal_getters(&binary.right)
+                || binary
+                    .prefix
+                    .iter()
+                    .any(|step| expression_has_object_literal_getters(&step.right))
+        }
+        PlannedExpressionKind::Logical(binary) => {
+            expression_has_object_literal_getters(&binary.left)
+                || expression_has_object_literal_getters(&binary.right)
+        }
+        PlannedExpressionKind::Conditional(conditional) => {
+            expression_has_object_literal_getters(&conditional.condition)
+                || expression_has_object_literal_getters(&conditional.when_true)
+                || expression_has_object_literal_getters(&conditional.when_false)
+        }
+        PlannedExpressionKind::Template(template) => template
+            .substitutions
+            .iter()
+            .any(expression_has_object_literal_getters),
+        _ => false,
+    }
+}
+
+fn arrow_has_object_literal_getters(arrow: &PlannedArrow) -> bool {
+    matches!(&arrow.body, PlannedArrowBody::Return { expression, .. }
+        if expression_has_object_literal_getters(expression))
+        || arrow
+            .expression_statement
+            .as_ref()
+            .is_some_and(|statement| expression_has_object_literal_getters(&statement.expression))
+        || arrow.linear_body.as_ref().is_some_and(|body| {
+            body.return_expression
+                .as_ref()
+                .is_some_and(expression_has_object_literal_getters)
+                || body.locals.iter().any(|local| {
+                    matches!(&local.initializer,
+                    PlannedVariableInitializer::Expression(expression)
+                        if expression_has_object_literal_getters(expression))
+                })
+                || body.statements.iter().any(|statement| match statement {
+                    PlannedLinearFunctionStatement::Expression { expression, .. }
+                    | PlannedLinearFunctionStatement::Throw { expression, .. } => {
+                        expression_has_object_literal_getters(expression)
+                    }
+                    _ => false,
+                })
+        })
+}
+
 fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
     let expression = expression.unparenthesized();
     if expression.non_null_assertion {
@@ -26810,12 +26935,16 @@ fn deferred_inferred_javascript_functions(
                     else {
                         continue;
                     };
-                    if properties.iter().any(|property| {
-                        matches!(
-                            &property.unparenthesized().kind,
-                            PlannedExpressionKind::Arrow(_)
-                        )
-                    }) {
+                    if properties
+                        .iter()
+                        .filter_map(PlannedObjectMember::eager_expression)
+                        .any(|property| {
+                            matches!(
+                                &property.unparenthesized().kind,
+                                PlannedExpressionKind::Arrow(_)
+                            )
+                        })
+                    {
                         prior_object_variables.insert(variable.symbol);
                     }
                 }
@@ -26881,6 +27010,7 @@ fn deferred_inferred_javascript_functions(
                 };
                 if properties
                     .iter()
+                    .filter_map(PlannedObjectMember::eager_expression)
                     .any(|property| planned_expression_reads_symbol(property, parameter.symbol))
                 {
                     deferred_functions.insert(*index);
@@ -27173,7 +27303,12 @@ fn preflight_inferred_function_return_dependencies(
                 .all(|element| expression_is_closed(element, parameters, locals, functions)),
             PlannedExpressionKind::Object { properties, .. } => properties
                 .iter()
-                .all(|property| expression_is_closed(property, parameters, locals, functions)),
+                .all(|property| match property {
+                    PlannedObjectMember::Eager(expression)
+                    | PlannedObjectMember::Getter { expression, .. } => {
+                        expression_is_closed(expression, parameters, locals, functions)
+                    }
+                }),
             PlannedExpressionKind::Property(property) => {
                 expression_is_closed(&property.receiver, parameters, locals, functions)
             }
@@ -27877,7 +28012,7 @@ fn expression_type(
         expression,
         prepared,
         &mut property_diagnostics,
-        &mut |_, _, nested, _| {
+        &mut |_, _, nested, _, _| {
             Err(SourceCheckError::Unsupported(
                 if matches!(&nested.kind, PlannedExpressionKind::Arrow(_)) {
                     UnsupportedSourceSyntax::Arrow(nested.node)
@@ -27894,7 +28029,16 @@ fn expression_type(
 pub(super) enum CheckedExpressionShape {
     Leaf,
     Array(Vec<CheckedExpressionTypes>),
-    Object(Vec<CheckedExpressionTypes>),
+    Object(Vec<CheckedObjectMember>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckedObjectMember {
+    Eager(CheckedExpressionTypes),
+    Getter {
+        symbol: SemanticSymbolId,
+        read_type: TypeId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27936,11 +28080,12 @@ fn prepare_source_property_diagnostic_sink(
                     count.checked_add(capacity(element)?)
                 })
             }
-            PlannedExpressionKind::Object { properties, .. } => {
-                properties.iter().try_fold(0usize, |count, property| {
+            PlannedExpressionKind::Object { properties, .. } => properties
+                .iter()
+                .filter_map(PlannedObjectMember::eager_expression)
+                .try_fold(0usize, |count, property| {
                     count.checked_add(capacity(property)?)
-                })
-            }
+                }),
             PlannedExpressionKind::Property(_) => Some(1),
             _ => Some(0),
         }
@@ -28012,15 +28157,16 @@ where
         &mut InstantiationSession,
         &PlannedExpression,
         Option<TypeId>,
+        Option<&PreparedExpression>,
     ) -> Result<CheckedExpressionTypes, SourceCheckError>,
 {
     let types = match (&expression.kind, prepared) {
         (
             PlannedExpressionKind::ImportMeta(_),
             PreparedExpression::Literal(LiteralTreatment::Identity),
-        ) => check_nested_expression(store, session, expression, None),
+        ) => check_nested_expression(store, session, expression, None, None),
         (PlannedExpressionKind::ClassReceiver(_), PreparedExpression::ClassReceiver) => {
-            check_nested_expression(store, session, expression, None)
+            check_nested_expression(store, session, expression, None, None)
         }
         (PlannedExpressionKind::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => {
             store
@@ -28096,7 +28242,7 @@ where
                 || read.kind == PlannedIdentifierReadKind::Function
                     && !current_flow_types.contains_key(&read.value_symbol) =>
         {
-            check_nested_expression(store, session, expression, None)
+            check_nested_expression(store, session, expression, None, None)
         }
         (PlannedExpressionKind::Identifier(read), PreparedExpression::Identifier(treatment)) => {
             let raw = *current_flow_types
@@ -28195,7 +28341,7 @@ where
             }
         }
         (PlannedExpressionKind::Template(_), PreparedExpression::Template(contextual_type)) => {
-            check_nested_expression(store, session, expression, *contextual_type)
+            check_nested_expression(store, session, expression, *contextual_type, None)
         }
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
@@ -28323,11 +28469,14 @@ where
         ) => {
             debug_assert_eq!(expression.node, plan.node);
             debug_assert_eq!(properties.len(), prepared_properties.len());
+            if !plan.object_literal_getters.is_empty() {
+                return check_nested_expression(store, session, expression, None, Some(prepared));
+            }
             super::object_members::object_literal_state(store, plan)
                 .map_err(source_object_execution_error)?;
             // Check every computed key before values or spreads, without a value context.
             for key in &expression.object_computed_keys {
-                let checked_key = check_nested_expression(store, session, key, None)?;
+                let checked_key = check_nested_expression(store, session, key, None, None)?;
                 preflight_source_expression_cache(store, key.node, checked_key.raw)?;
             }
             let mut checked_properties = Vec::with_capacity(properties.len());
@@ -28340,6 +28489,16 @@ where
                 .zip(&plan.properties)
                 .enumerate()
             {
+                let (PlannedObjectMember::Eager(property), PreparedObjectMember::Eager(prepared)) =
+                    (property, prepared)
+                else {
+                    return Err(SourceCheckError::ObjectLiteral(
+                        SourceObjectLiteralError::InvalidCache {
+                            node: expression.node,
+                            type_: None,
+                        },
+                    ));
+                };
                 while plan
                     .spreads
                     .get(spread_index)
@@ -28352,7 +28511,7 @@ where
                         }),
                     )?;
                     spread_types
-                        .push(check_nested_expression(store, session, spread, None)?.result);
+                        .push(check_nested_expression(store, session, spread, None, None)?.result);
                     spread_index += 1;
                 }
                 let const_preparation = property_plan
@@ -28377,7 +28536,7 @@ where
                     checked.result = literal.regular_type;
                 }
                 property_types.push(checked.result);
-                checked_properties.push(checked);
+                checked_properties.push(CheckedObjectMember::Eager(checked));
             }
             while let Some(spread) = plan.spreads.get(spread_index) {
                 if spread.property_index != properties.len() {
@@ -28396,7 +28555,7 @@ where
                     }),
                 )?;
                 spread_types
-                    .push(check_nested_expression(store, session, expression, None)?.result);
+                    .push(check_nested_expression(store, session, expression, None, None)?.result);
                 spread_index += 1;
             }
             if spread_index != expression.object_spreads.len() {
@@ -28442,7 +28601,7 @@ where
             PreparedExpression::Property(prepared_receiver),
         ) => {
             if property.class_access_context().is_some() || global_types.is_some() {
-                return check_nested_expression(store, session, expression, None);
+                return check_nested_expression(store, session, expression, None, None);
             }
             let receiver = execute_expression_types(
                 store,
@@ -28473,7 +28632,7 @@ where
         | (
             PlannedExpressionKind::Assertion { .. },
             PreparedExpression::Assertion(contextual_type),
-        ) => check_nested_expression(store, session, expression, *contextual_type),
+        ) => check_nested_expression(store, session, expression, *contextual_type, None),
         (
             PlannedExpressionKind::Conditional(_),
             PreparedExpression::Conditional {
@@ -28482,7 +28641,7 @@ where
             },
         ) => {
             let mut checked =
-                check_nested_expression(store, session, expression, *contextual_type)?;
+                check_nested_expression(store, session, expression, *contextual_type, None)?;
             if *mutable_result {
                 let global_types =
                     global_types.ok_or(SourceCheckError::Conditional(expression.node))?;
@@ -29492,11 +29651,7 @@ fn emit_uninitialized_variable_read_diagnostics(
                 inner,
             )?;
         }
-        PlannedExpressionKind::Array(elements)
-        | PlannedExpressionKind::Object {
-            properties: elements,
-            ..
-        } => {
+        PlannedExpressionKind::Array(elements) => {
             for element in elements {
                 emit_uninitialized_variable_read_diagnostics(
                     store,
@@ -29504,6 +29659,20 @@ fn emit_uninitialized_variable_read_diagnostics(
                     current_flow_types,
                     diagnostics,
                     element,
+                )?;
+            }
+        }
+        PlannedExpressionKind::Object { properties, .. } => {
+            for value in properties
+                .iter()
+                .filter_map(PlannedObjectMember::eager_expression)
+            {
+                emit_uninitialized_variable_read_diagnostics(
+                    store,
+                    host,
+                    current_flow_types,
+                    diagnostics,
+                    value,
                 )?;
             }
         }
@@ -29798,11 +29967,7 @@ fn emit_enum_use_before_declaration_diagnostics(
                 }
             }
         }
-        PlannedExpressionKind::Array(expressions)
-        | PlannedExpressionKind::Object {
-            properties: expressions,
-            ..
-        } => {
+        PlannedExpressionKind::Array(expressions) => {
             for expression in expressions {
                 emit_enum_use_before_declaration_diagnostics(
                     store,
@@ -29810,6 +29975,20 @@ fn emit_enum_use_before_declaration_diagnostics(
                     options,
                     diagnostics,
                     expression,
+                )?;
+            }
+        }
+        PlannedExpressionKind::Object { properties, .. } => {
+            for value in properties
+                .iter()
+                .filter_map(PlannedObjectMember::eager_expression)
+            {
+                emit_enum_use_before_declaration_diagnostics(
+                    store,
+                    host,
+                    options,
+                    diagnostics,
+                    value,
                 )?;
             }
         }
@@ -30050,6 +30229,373 @@ impl From<SourceCheckError> for SourceElementReadError {
     fn from(error: SourceCheckError) -> Self {
         Self::Source(error)
     }
+}
+
+/// Checks eager members first, then checks each getter under its deferred capture boundary.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn check_source_object_literal_getters(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    expression: &PlannedExpression,
+    prepared: &PreparedExpression,
+    tuple_contexts: &HashMap<NodeRef, TypeId>,
+    deferred: &mut Vec<DeferredAssertion>,
+    mut class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
+    capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let invalid = || {
+        SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+            node: expression.node,
+            type_: None,
+        })
+    };
+    let (
+        PlannedExpressionKind::Object { plan, properties },
+        PreparedExpression::Object(prepared_properties),
+    ) = (&expression.kind, prepared)
+    else {
+        return Err(invalid());
+    };
+    if plan.object_literal_getters.is_empty()
+        || !plan.spreads.is_empty()
+        || !expression.object_spreads.is_empty()
+        || plan.properties.len() != properties.len()
+        || properties.len() != prepared_properties.len()
+        || super::object_members::plan_object_literal(store, host, expression.node)
+            .map_err(source_object_execution_error)?
+            != *plan
+    {
+        return Err(invalid());
+    }
+    for (index, ((member, prepared), property)) in properties
+        .iter()
+        .zip(prepared_properties)
+        .zip(&plan.properties)
+        .enumerate()
+    {
+        match (
+            member,
+            prepared,
+            plan.object_literal_getter(property.symbol),
+        ) {
+            (PlannedObjectMember::Eager(value), PreparedObjectMember::Eager(_), None)
+                if value.node == property.type_node => {}
+            (
+                PlannedObjectMember::Getter {
+                    getter,
+                    expression: returned,
+                },
+                PreparedObjectMember::Getter,
+                Some(expected),
+            ) if getter == expected
+                && getter.property_index == index
+                && returned.node == getter.return_expression => {}
+            _ => return Err(invalid()),
+        }
+    }
+    super::object_members::object_literal_state(store, plan)
+        .map_err(source_object_execution_error)?;
+    for getter in &plan.object_literal_getters {
+        if store.object_literal_getter_origin(getter.symbol).is_some() {
+            super::object_members::object_literal_getter_projection_with_host(
+                store,
+                host,
+                getter.symbol,
+            )?;
+        }
+    }
+    for key in &expression.object_computed_keys {
+        check_expression_type_with_capture_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            type_import_execution,
+            key,
+            None,
+            deferred,
+            class_flow.as_deref_mut(),
+            capture,
+        )?;
+    }
+    let mut eager_types = Vec::new();
+    let mut checked_members = Vec::with_capacity(properties.len());
+    for ((member, prepared), property) in properties
+        .iter()
+        .zip(prepared_properties)
+        .zip(&plan.properties)
+    {
+        let (PlannedObjectMember::Eager(value), PreparedObjectMember::Eager(prepared)) =
+            (member, prepared)
+        else {
+            checked_members.push(None);
+            continue;
+        };
+        let const_preparation = property
+            .readonly
+            .then(|| prepare_const_object_property(value, prepared))
+            .transpose()?;
+        let mut property_diagnostics = prepare_source_property_diagnostic_sink(value)?;
+        let mut checked = {
+            let mut check_nested =
+                |store: &mut CanonicalTypeMapperStore,
+                 session: &mut InstantiationSession,
+                 nested: &PlannedExpression,
+                 contextual_type: Option<TypeId>,
+                 prepared_object: Option<&PreparedExpression>| {
+                    if let Some(prepared_object) = prepared_object {
+                        check_source_object_literal_getters(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            current_flow_types,
+                            type_import_execution,
+                            nested,
+                            prepared_object,
+                            tuple_contexts,
+                            deferred,
+                            class_flow.as_deref_mut(),
+                            capture,
+                        )
+                    } else {
+                        check_expression_type_with_capture_context(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            current_flow_types,
+                            type_import_execution,
+                            nested,
+                            contextual_type,
+                            deferred,
+                            class_flow.as_deref_mut(),
+                            capture,
+                        )
+                    }
+                };
+            execute_expression_types(
+                store,
+                Some(global_types),
+                session,
+                current_flow_types,
+                tuple_contexts,
+                value,
+                const_preparation.as_ref().unwrap_or(prepared),
+                &mut property_diagnostics,
+                &mut check_nested,
+            )?
+        };
+        for diagnostic in property_diagnostics {
+            publish_or_defer_class_property_diagnostic(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+                value.node,
+                diagnostic,
+                class_flow.as_deref_mut(),
+            )?;
+        }
+        if property.readonly
+            && let Some(TypeData::Literal(literal)) =
+                store.type_payload(checked.result).map(TypeRecord::data)
+        {
+            checked.result = literal.regular_type;
+        }
+        eager_types.push(checked.result);
+        checked_members.push(Some(CheckedObjectMember::Eager(checked)));
+    }
+    let type_ =
+        super::object_members::publish_object_literal_with_getters(store, host, plan, &eager_types)
+            .map_err(source_object_execution_error)?;
+    for (index, member) in properties.iter().enumerate() {
+        let PlannedObjectMember::Getter {
+            getter,
+            expression: returned,
+        } = member
+        else {
+            continue;
+        };
+        checked_members[index] = Some(check_source_object_literal_getter_return(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            type_import_execution,
+            getter,
+            returned,
+            deferred,
+            class_flow.as_deref_mut(),
+            capture,
+        )?);
+    }
+    let checked_members = checked_members
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(invalid)?;
+    publish_expression_type(store, expression.node, type_)?;
+    Ok(CheckedExpressionTypes {
+        raw: type_,
+        result: type_,
+        shape: CheckedExpressionShape::Object(checked_members),
+        primitive_binary_recovery: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep the checked body and declared read type in one transaction.
+fn check_source_object_literal_getter_return(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    getter: &super::object_members::PlannedObjectLiteralGetter,
+    expression: &PlannedExpression,
+    deferred: &mut Vec<DeferredAssertion>,
+    mut class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
+    capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<CheckedObjectMember, SourceCheckError> {
+    let invalid = || {
+        SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+            node: getter.object,
+            type_: None,
+        })
+    };
+    if expression.node != getter.return_expression {
+        return Err(invalid());
+    }
+    let projection = super::object_members::object_literal_getter_projection_with_host(
+        store,
+        host,
+        getter.symbol,
+    )?;
+    validate_getter_capture_entries(store, host, getter, expression, capture)?;
+    match projection.require_type() {
+        Ok(_) => {}
+        Err(RelationUnavailable::UnresolvedPropertyType(symbol)) if symbol == getter.symbol => {}
+        Err(error) => return Err(error.into()),
+    }
+    let captured_flow = capture
+        .map(|capture| capture.flow_types(store, host, getter.declaration, current_flow_types))
+        .transpose()?;
+    let flow_types = captured_flow.as_ref().unwrap_or(current_flow_types);
+    if !store
+        .push_type_resolution(
+            TypeResolutionTarget::Symbol(getter.symbol),
+            TypeSystemPropertyName::Type,
+        )
+        .map_err(DeclaredTypeError::from)?
+    {
+        return Err(invalid());
+    }
+    let result = (|| {
+        if let Some(annotation) = getter.return_annotation {
+            let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut annotation_diagnostics,
+            )?
+            .with_type_reference_alias_targets(
+                type_import_execution
+                    .annotation_capabilities
+                    .get(&annotation)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )?;
+            let read_type = query.get_type_from_object_literal_getter_annotation(getter);
+            merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+            let read_type = read_type?;
+            let (_, checked) = check_assignment_with_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                type_import_execution,
+                deferred,
+                read_type,
+                None,
+                expression,
+                getter.return_statement,
+                None,
+                class_flow.as_deref_mut(),
+                capture,
+            )?;
+            Ok::<_, SourceCheckError>((checked.raw, read_type))
+        } else {
+            let checked = check_expression_type_with_capture_context(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                type_import_execution,
+                expression,
+                None,
+                deferred,
+                class_flow.as_deref_mut(),
+                capture,
+            )?;
+            let widened = widened_fresh_literal_type(store, checked.result)?;
+            let read_type = store.get_widened_type_with_global_types(widened, global_types)?;
+            Ok((checked.raw, read_type))
+        }
+    })();
+    let cycle_free = store.pop_type_resolution().ok_or_else(invalid)?;
+    let (checked_raw, read_type) = result?;
+    if !cycle_free {
+        return Err(invalid());
+    }
+    super::object_members::publish_object_literal_getter_return(
+        store,
+        host,
+        getter,
+        checked_raw,
+        read_type,
+    )
+    .map_err(source_object_execution_error)?;
+    Ok(CheckedObjectMember::Getter {
+        symbol: getter.symbol,
+        read_type,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30701,14 +31247,18 @@ fn check_expression_type_with_capture_context(
         }
         PlannedExpressionKind::Object { plan, properties }
             if plan.spreads.is_empty()
+                && plan.object_literal_getters.is_empty()
                 && expression.object_spreads.is_empty()
                 && expression.object_computed_keys.is_empty()
-                && properties.iter().any(|property| {
-                    matches!(
-                        &property.unparenthesized().kind,
-                        PlannedExpressionKind::Call(_)
-                    )
-                })
+                && properties
+                    .iter()
+                    .filter_map(PlannedObjectMember::eager_expression)
+                    .any(|property| {
+                        matches!(
+                            &property.unparenthesized().kind,
+                            PlannedExpressionKind::Call(_)
+                        )
+                    })
                 && contextual_type.is_none_or(|type_| {
                     store
                         .type_payload(type_)
@@ -30728,6 +31278,14 @@ fn check_expression_type_with_capture_context(
             let mut property_types = Vec::with_capacity(properties.len());
             let mut checked_properties = Vec::with_capacity(properties.len());
             for (property, property_plan) in properties.iter().zip(&plan.properties) {
+                let PlannedObjectMember::Eager(property) = property else {
+                    return Err(SourceCheckError::ObjectLiteral(
+                        SourceObjectLiteralError::InvalidCache {
+                            node: expression.node,
+                            type_: None,
+                        },
+                    ));
+                };
                 let mut checked = check_expression_type_with_capture_context(
                     store,
                     host,
@@ -30758,7 +31316,7 @@ fn check_expression_type_with_capture_context(
                     )?
                 };
                 property_types.push(checked.result);
-                checked_properties.push(checked);
+                checked_properties.push(CheckedObjectMember::Eager(checked));
             }
             let object =
                 super::object_members::publish_object_literal(store, plan, &property_types)
@@ -31319,7 +31877,11 @@ fn check_expression_type_with_capture_context(
             )?;
             let destructuring = match (&binary.left.kind, &binary.right.kind) {
                 (PlannedExpressionKind::Array(targets), PlannedExpressionKind::Array(values)) => {
-                    Some((targets.as_slice(), values.as_slice(), None))
+                    Some((
+                        targets.iter().collect::<Vec<_>>(),
+                        values.iter().collect::<Vec<_>>(),
+                        None,
+                    ))
                 }
                 (
                     PlannedExpressionKind::Object {
@@ -31331,13 +31893,25 @@ fn check_expression_type_with_capture_context(
                         properties: values,
                     },
                 ) if target_plan.properties.len() == value_plan.properties.len()
+                    && target_plan.object_literal_getters.is_empty()
+                    && value_plan.object_literal_getters.is_empty()
                     && target_plan
                         .properties
                         .iter()
                         .zip(&value_plan.properties)
                         .all(|(target, value)| target.name == value.name) =>
                 {
-                    Some((targets.as_slice(), values.as_slice(), Some(value_plan)))
+                    let targets = targets
+                        .iter()
+                        .map(PlannedObjectMember::eager_expression)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(SourceCheckError::PrimitiveOperator(binary.node))?;
+                    let values = values
+                        .iter()
+                        .map(PlannedObjectMember::eager_expression)
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(SourceCheckError::PrimitiveOperator(binary.node))?;
+                    Some((targets, values, Some(value_plan)))
                 }
                 _ => None,
             };
@@ -32479,7 +33053,27 @@ fn check_expression_type_with_capture_context(
                         |store: &mut CanonicalTypeMapperStore,
                          session: &mut InstantiationSession,
                          nested: &PlannedExpression,
-                         nested_context: Option<TypeId>| {
+                         nested_context: Option<TypeId>,
+                         prepared_object: Option<&PreparedExpression>| {
+                            if let Some(prepared_object) = prepared_object {
+                                return check_source_object_literal_getters(
+                                    store,
+                                    host,
+                                    global_types,
+                                    source,
+                                    options,
+                                    session,
+                                    diagnostics,
+                                    current_flow_types,
+                                    type_import_execution,
+                                    nested,
+                                    prepared_object,
+                                    &tuple_contexts,
+                                    deferred,
+                                    class_flow.as_deref_mut(),
+                                    arrow_capture,
+                                );
+                            }
                             check_expression_type_with_capture_context(
                                 store,
                                 host,
@@ -35763,13 +36357,18 @@ fn issue_invalid_const_enum_value_diagnostic(
     expression: &PlannedExpression,
 ) -> Result<(), SourceCheckError> {
     let read = match &expression.kind {
-        PlannedExpressionKind::Array(elements)
-        | PlannedExpressionKind::Object {
-            properties: elements,
-            ..
-        } => {
+        PlannedExpressionKind::Array(elements) => {
             for element in elements {
                 issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, element)?;
+            }
+            return Ok(());
+        }
+        PlannedExpressionKind::Object { properties, .. } => {
+            for value in properties
+                .iter()
+                .filter_map(PlannedObjectMember::eager_expression)
+            {
+                issue_invalid_const_enum_value_diagnostic(store, host, diagnostics, value)?;
             }
             return Ok(());
         }
@@ -36964,6 +37563,49 @@ fn check_assignment_to_type_with_capture_context(
     class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
     arrow_capture: Option<SourceArrowCaptureContext<'_>>,
 ) -> Result<CheckedAssignment, SourceCheckError> {
+    check_assignment_with_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        type_import_execution,
+        deferred,
+        target,
+        target_display_name,
+        expression,
+        fallback_node,
+        assignment_expression,
+        class_flow,
+        arrow_capture,
+    )
+    .map(|(assignment, _)| assignment)
+}
+
+/// Retains the checked raw expression for consumers whose public read type is annotated.
+#[allow(clippy::too_many_arguments)]
+fn check_assignment_with_expression_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    target: TypeId,
+    target_display_name: Option<&str>,
+    expression: &PlannedExpression,
+    fallback_node: NodeRef,
+    assignment_expression: Option<NodeRef>,
+    class_flow: Option<&mut ClassBodyExecutionContext<'_, '_, '_>>,
+    arrow_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(CheckedAssignment, CheckedExpressionTypes), SourceCheckError> {
     let class_assignment = class_flow.is_some();
     if assignment_expression.is_some() {
         publish_expression_type(store, fallback_node, target)?;
@@ -37002,10 +37644,13 @@ fn check_assignment_to_type_with_capture_context(
             conditional,
             target,
         )?;
-        return Ok(CheckedAssignment {
-            declared_type: target,
-            assigned_type: source_type,
-        });
+        return Ok((
+            CheckedAssignment {
+                declared_type: target,
+                assigned_type: source_type,
+            },
+            source_types,
+        ));
     }
     let limit_mark = session.limit_event_mark();
     let assignable = source_type_is_assignable_to(
@@ -37100,10 +37745,13 @@ fn check_assignment_to_type_with_capture_context(
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
     }
-    Ok(CheckedAssignment {
-        declared_type: target,
-        assigned_type: source_type,
-    })
+    Ok((
+        CheckedAssignment {
+            declared_type: target,
+            assigned_type: source_type,
+        },
+        source_types,
+    ))
 }
 
 fn class_assignment_error_target(
@@ -41944,6 +42592,77 @@ fn check_planned_async_captured_loop(
     Ok(())
 }
 
+/// Keeps checked local entry types alive through an inferred getter-bearing return.
+#[allow(clippy::too_many_arguments)]
+fn check_inferred_linear_getter_return(
+    bound: &BoundFile,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    base_flow_types: HashMap<SemanticSymbolId, TypeId>,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    signature: SignatureId,
+    statements: &PlannedLinearFunctionStatements,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+    outer_capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<TypeId, SourceCheckError> {
+    let mut entry_types = source_arrow_parameter_entry_types(store, callable)?;
+    let flow_types = check_planned_linear_function_statements_with_capture_entries(
+        bound,
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        base_flow_types,
+        type_import_execution,
+        type_import_capabilities,
+        deferred,
+        callable,
+        None,
+        statements,
+        staged_value_types,
+        value_order,
+        &mut entry_types,
+        outer_capture,
+    )?;
+    let capture = SourceArrowCaptureContext {
+        declared_types: &entry_types,
+        mutable_symbols: None,
+        outer: outer_capture.as_ref(),
+        flow: Some(&statements.flow),
+        assignments: &statements.capture_assignments,
+        value_exports: &[],
+    };
+    publish_checked_source_callable_return_with_capture_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        type_import_execution,
+        deferred,
+        callable,
+        signature,
+        statements.return_expression.as_ref(),
+        None,
+        Some(capture),
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // Reuses the existing source flow and publication transaction.
 fn check_planned_linear_function_statements(
     bound: &BoundFile,
@@ -42179,6 +42898,34 @@ fn check_planned_linear_function_statements_with_capture_entries(
                     &function.object_parameter_bindings,
                     arrow_capture,
                 )?;
+                if let PlannedFunctionBody::Linear(nested) = &function.body
+                    && nested
+                        .return_expression
+                        .as_ref()
+                        .is_some_and(expression_has_object_literal_getters)
+                {
+                    check_inferred_linear_getter_return(
+                        bound,
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        flow_types,
+                        type_import_execution,
+                        type_import_capabilities,
+                        deferred,
+                        &function.callable,
+                        materialized.signature,
+                        nested,
+                        staged_value_types,
+                        value_order,
+                        arrow_capture,
+                    )?;
+                    continue;
+                }
                 let mut nested_capture_entries =
                     source_arrow_parameter_entry_types(store, &function.callable)?;
                 let (expression, return_flow_types) = match &function.body {
@@ -45955,6 +46702,7 @@ fn check_object_binding_literal_context(
             .nested
             .iter()
             .find(|(candidate, _)| candidate == name)
+            && let Some(initializer) = initializer.eager_expression()
         {
             check_object_binding_literal_context(
                 store,
@@ -47844,6 +48592,25 @@ fn publish_checked_source_callable_return_with_capture_context(
         store, callable, signature,
     )
     .map_err(SourcePlanner::callable_plan_error)?;
+    let parameter_entries = if arrow_capture.is_none()
+        && expression.is_some_and(expression_has_object_literal_getters)
+    {
+        Some(source_arrow_parameter_entry_types(store, callable)?)
+    } else {
+        None
+    };
+    let arrow_capture = arrow_capture.or_else(|| {
+        parameter_entries
+            .as_ref()
+            .map(|declared_types| SourceArrowCaptureContext {
+                declared_types,
+                mutable_symbols: None,
+                outer: None,
+                flow: None,
+                assignments: &[],
+                value_exports: &[],
+            })
+    });
     if !store
         .push_type_resolution(
             TypeResolutionTarget::Signature(signature),
@@ -48427,6 +49194,16 @@ impl SourceArrowCaptureContext<'_> {
         ))
     }
 
+    fn contains_declared_entry(self, symbol: SemanticSymbolId) -> bool {
+        self.declared_types.contains_key(&symbol)
+            && self
+                .mutable_symbols
+                .is_none_or(|symbols| symbols.contains(&symbol))
+            || self
+                .outer
+                .is_some_and(|outer| outer.contains_declared_entry(symbol))
+    }
+
     fn flow_types(
         self,
         store: &CanonicalTypeMapperStore,
@@ -48501,6 +49278,134 @@ impl SourceArrowCaptureContext<'_> {
         }
         captured_callable_flow_types(current, self.declared_types, &unsafe_captures)
     }
+}
+
+#[allow(clippy::too_many_lines)] // Each admitted expression child must retain its capture checks.
+fn validate_getter_capture_entries(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    getter: &super::object_members::PlannedObjectLiteralGetter,
+    expression: &PlannedExpression,
+    capture: Option<SourceArrowCaptureContext<'_>>,
+) -> Result<(), SourceCheckError> {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match &expression.kind {
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable =>
+            {
+                if capture.is_some_and(|capture| capture.contains_declared_entry(read.value_symbol))
+                {
+                    continue;
+                }
+                let invalid = || {
+                    SourceCheckError::Variable(VariableInvariant::InvalidSymbolShape(
+                        read.value_symbol,
+                    ))
+                };
+                let declaration = store
+                    .symbol(read.value_symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .ok_or_else(invalid)?;
+                if !store.source_declaration_belongs_to_symbol(declaration, read.value_symbol) {
+                    return Err(invalid());
+                }
+                let mut node = declaration;
+                let mut visited = HashSet::new();
+                let constant = loop {
+                    if !visited.insert(node) {
+                        return Err(invalid());
+                    }
+                    let record = host.node(node).ok_or_else(invalid)?;
+                    if record.kind == SyntaxKind::VariableDeclarationList {
+                        break record.flags.0 & NODE_FLAG_CONST != 0;
+                    }
+                    if matches!(record.kind, SyntaxKind::Parameter | SyntaxKind::SourceFile) {
+                        break false;
+                    }
+                    let parent = record.parent.ok_or_else(invalid)?;
+                    node = NodeRef::new(node.arena, node.file, parent);
+                };
+                if !constant {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            node: getter.declaration,
+                            kind: SyntaxKind::GetAccessor,
+                            role: SourceSyntaxRole::ObjectProperty,
+                        },
+                    ));
+                }
+            }
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::Assertion { operand: inner, .. } => pending.push(inner),
+            PlannedExpressionKind::Array(elements) => pending.extend(elements),
+            PlannedExpressionKind::Object { properties, .. } => {
+                pending.extend(
+                    properties
+                        .iter()
+                        .filter_map(PlannedObjectMember::eager_expression),
+                );
+                pending.extend(&expression.object_spreads);
+                pending.extend(&expression.object_computed_keys);
+            }
+            PlannedExpressionKind::Property(property) => pending.push(&property.receiver),
+            PlannedExpressionKind::Element(element) => {
+                pending.push(&element.receiver);
+                pending.push(&element.index);
+            }
+            PlannedExpressionKind::Call(call) => {
+                pending.push(&call.callee);
+                pending.extend(&call.arguments);
+            }
+            PlannedExpressionKind::Binary(binary) => {
+                pending.push(&binary.left);
+                pending.push(&binary.right);
+                pending.extend(binary.prefix.iter().map(|step| &step.right));
+                pending.extend(binary.shorthand_assignment_initializer());
+            }
+            PlannedExpressionKind::Logical(binary) => {
+                pending.push(&binary.left);
+                pending.push(&binary.right);
+            }
+            PlannedExpressionKind::Conditional(conditional) => {
+                pending.extend([
+                    &conditional.condition,
+                    &conditional.when_true,
+                    &conditional.when_false,
+                ]);
+            }
+            PlannedExpressionKind::Template(template) => pending.extend(&template.substitutions),
+            PlannedExpressionKind::New(construction) => {
+                pending.extend(construction.promise_executor());
+            }
+            PlannedExpressionKind::ImportCall(import) => {
+                pending.extend(import.specifier.as_ref());
+            }
+            PlannedExpressionKind::Arrow(_) => {
+                // Nested callable bodies need their own complete capture-entry proof.
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: getter.declaration,
+                        kind: SyntaxKind::GetAccessor,
+                        role: SourceSyntaxRole::ObjectProperty,
+                    },
+                ));
+            }
+            PlannedExpressionKind::Null
+            | PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::RegularExpression(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::GlobalUndefined
+            | PlannedExpressionKind::Identifier(_)
+            | PlannedExpressionKind::ClassReceiver(_)
+            | PlannedExpressionKind::TypeImportValueUse(_)
+            | PlannedExpressionKind::ImportMeta(_)
+            | PlannedExpressionKind::SuperCall(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn source_arrow_capture_can_keep_narrowing(
@@ -59802,6 +60707,34 @@ pub(super) fn check_source_file(
                 continue;
             }
             PlannedFunctionBody::Linear(statements) => {
+                if statements
+                    .return_expression
+                    .as_ref()
+                    .is_some_and(expression_has_object_literal_getters)
+                {
+                    check_inferred_linear_getter_return(
+                        bound,
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        &mut function_diagnostics,
+                        body_flow_types,
+                        &type_import_execution,
+                        &type_import_capabilities,
+                        &mut deferred,
+                        &function.callable,
+                        materialized.signature,
+                        statements,
+                        &mut staged_value_types,
+                        &mut value_order,
+                        None,
+                    )?;
+                    inferred_function_diagnostics[index] = Some(function_diagnostics);
+                    continue;
+                }
                 let flow_types = check_planned_linear_function_statements(
                     bound,
                     store,
@@ -60990,7 +61923,17 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::DefaultObject(export)
             | PlannedStatement::DefaultAssertion(export) => {
-                let checked = check_expression_type(
+                let capture = expression_has_object_literal_getters(&export.expression).then_some(
+                    SourceArrowCaptureContext {
+                        declared_types: &top_level_declared_types,
+                        mutable_symbols: Some(&mutable_variables),
+                        outer: None,
+                        flow: None,
+                        assignments: &capture_assignments,
+                        value_exports: &local_named_exports,
+                    },
+                );
+                let checked = check_expression_type_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -61003,6 +61946,8 @@ pub(super) fn check_source_file(
                     &export.expression,
                     None,
                     &mut deferred,
+                    None,
+                    capture,
                 )?;
                 if store
                     .type_node_links(export.expression.node)
@@ -61734,7 +62679,51 @@ pub(super) fn check_source_file(
                         javascript_jsdoc.as_ref(),
                     )?;
                 }
-                if callback.is_none() && callable.return_type.is_inferred() {
+                if callback.is_none() && arrow_has_object_literal_getters(arrow) {
+                    let expression = PlannedArrowExpression {
+                        callable: callable.clone(),
+                        parameter_initializers: arrow.parameter_initializers.clone(),
+                        expression_statement: arrow.expression_statement.clone(),
+                        linear_body: arrow.linear_body.clone(),
+                        loop_body: None,
+                        prototype_this: None,
+                        body: arrow.body.clone(),
+                    };
+                    let capture = SourceArrowCaptureContext {
+                        declared_types: &top_level_declared_types,
+                        mutable_symbols: Some(&mutable_variables),
+                        outer: None,
+                        flow: None,
+                        assignments: &capture_assignments,
+                        value_exports: &local_named_exports,
+                    };
+                    let captured_flow_types = capture.flow_types(
+                        store,
+                        host,
+                        callable.declaration,
+                        &current_flow_types,
+                    )?;
+                    let checked = check_planned_arrow_argument(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &captured_flow_types,
+                        &type_import_execution,
+                        &mut deferred,
+                        callable.declaration,
+                        &expression,
+                        None,
+                        None,
+                        Some(capture),
+                    )?;
+                    if checked.result != materialized.type_ {
+                        return Err(SourceCheckError::Arrow(callable.declaration));
+                    }
+                } else if callback.is_none() && callable.return_type.is_inferred() {
                     let source_capture = SourceArrowCaptureContext {
                         declared_types: &top_level_declared_types,
                         mutable_symbols: Some(&mutable_variables),
@@ -62540,12 +63529,27 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
+                    let capture = match &variable.initializer {
+                        PlannedVariableInitializer::Expression(expression)
+                            if expression_has_object_literal_getters(expression) =>
+                        {
+                            Some(SourceArrowCaptureContext {
+                                declared_types: &top_level_declared_types,
+                                mutable_symbols: Some(&mutable_variables),
+                                outer: None,
+                                flow: None,
+                                assignments: &capture_assignments,
+                                value_exports: &local_named_exports,
+                            })
+                        }
+                        _ => None,
+                    };
                     let (declared_type, current_flow_type) = match (
                         &variable.initializer,
                         variable.type_node,
                     ) {
                         (PlannedVariableInitializer::Expression(initializer), Some(type_node)) => {
-                            let assignment = check_planned_assignment(
+                            let assignment = check_planned_assignment_with_capture_context(
                                 store,
                                 host,
                                 global_types,
@@ -62563,6 +63567,7 @@ pub(super) fn check_source_file(
                                 initializer,
                                 variable.name,
                                 None,
+                                capture,
                             )?;
                             (
                                 assignment.declared_type,
@@ -62659,7 +63664,7 @@ pub(super) fn check_source_file(
                                     }
                                 }
                             };
-                            let initializer = check_expression_type(
+                            let initializer = check_expression_type_with_capture_context(
                                 store,
                                 host,
                                 global_types,
@@ -62672,6 +63677,8 @@ pub(super) fn check_source_file(
                                 initializer,
                                 None,
                                 &mut deferred,
+                                None,
+                                capture,
                             )?;
                             let declared_type = if variable.evolving_array {
                                 global_types.auto_array_type
@@ -65634,7 +66641,17 @@ pub(super) fn check_source_file(
                 )?;
             }
             PlannedStatement::ExpressionValue(expression) => {
-                check_expression_type(
+                let capture = expression_has_object_literal_getters(&expression).then_some(
+                    SourceArrowCaptureContext {
+                        declared_types: &top_level_declared_types,
+                        mutable_symbols: Some(&mutable_variables),
+                        outer: None,
+                        flow: None,
+                        assignments: &capture_assignments,
+                        value_exports: &local_named_exports,
+                    },
+                );
+                check_expression_type_with_capture_context(
                     store,
                     host,
                     global_types,
@@ -65647,6 +66664,8 @@ pub(super) fn check_source_file(
                     &expression,
                     None,
                     &mut deferred,
+                    None,
+                    capture,
                 )?;
             }
             PlannedStatement::ExpressionCall(expression)
@@ -65678,7 +66697,9 @@ pub(super) fn check_source_file(
     }
 
     for arrow in &arrows {
-        if arrow.source.callable.return_type.is_inferred() {
+        if arrow.source.callable.return_type.is_inferred()
+            || arrow_has_object_literal_getters(arrow)
+        {
             continue;
         }
         session.reset_query();
@@ -67470,6 +68491,449 @@ mod tests {
             assert_eq!(context.store().type_node_links(call), Some(&call_type));
             assert_eq!(context.store().signature_links(call), Some(&call_signature));
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare eager and deferred reads across the actual enclosing bodies.
+    fn source_object_literal_getters_keep_capture_entries_on_inferred_returns() {
+        for (index, (text, eager_is_union, getter_is_union)) in [
+            (
+                concat!(
+                    "var value: number | string = 1; ",
+                    "const make = () => ({ eager: value, get current() { return value; } }); ",
+                    "value = 'later';",
+                ),
+                true,
+                true,
+            ),
+            (
+                concat!(
+                    "function make() { var value: number | string = 1; ",
+                    "return { eager: value, get current() { return value; } }; }",
+                ),
+                false,
+                true,
+            ),
+            (
+                concat!(
+                    "function make() { let value: number | string = 1; ",
+                    "return { eager: value, get current() { return value; } }; }",
+                ),
+                false,
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(202_300 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, &bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let getter = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::GetAccessor).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let symbol = bound.symbol(getter).unwrap();
+            let projection =
+                super::super::object_members::object_literal_getter_projection_with_host(
+                    context.store(),
+                    &host,
+                    symbol,
+                )
+                .unwrap();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let declared = variable_value_type(&context, &source, file, "value");
+            assert!(matches!(
+                context.store().type_payload(declared).unwrap().data(),
+                TypeData::Union(_)
+            ));
+            let getter_type = if getter_is_union { declared } else { number };
+            let eager_type = if eager_is_union { declared } else { number };
+            assert_eq!(projection.require_type(), Ok(getter_type));
+            assert_eq!(projection.checked_return, Some(getter_type));
+            let eager = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::PropertyAssignment(property) = &record.data else {
+                        return None;
+                    };
+                    Some(NodeRef::new(source.arena.id(), file, property.initializer))
+                })
+                .unwrap();
+            assert_eq!(resolved_node_type(&context, eager), eager_type);
+            let captured = variable_symbol(&context, &source, file, "value");
+            let returned = context
+                .store()
+                .object_literal_getter_origin(symbol)
+                .unwrap()
+                .return_expression();
+            for node in [eager, returned] {
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(node)
+                        .and_then(|links| links.resolved_symbol),
+                    Some(captured),
+                );
+            }
+            let signature = projection.signature.unwrap();
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(getter_type)
+            );
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(
+                    context.get_return_type_of_signature(signature),
+                    Ok(getter_type)
+                );
+                assert_eq!(observable_state(&context, file), warm);
+                assert_eq!(
+                    super::super::object_members::object_literal_getter_projection_with_host(
+                        context.store(),
+                        &host,
+                        symbol,
+                    ),
+                    Ok(projection),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Real source checking establishes every cache before each corruption.
+    fn source_object_literal_getters_reject_changed_caches_and_keep_caller_state() {
+        use crate::semantic::instantiate::instantiate_type_with_vector_and_session;
+
+        let source = parsed(concat!(
+            "type Result = number; type Other = number; ",
+            "function keep<T>(value: T): T { return value; } ",
+            "const captured = 1; const peer = 'other'; ",
+            "const object = { get current(): Result { return captured; } };",
+        ));
+        let file = FileId::new(202_303);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let source_file = context.source_file(file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            source_file,
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let (getter, expression) = plan
+            .statements
+            .iter()
+            .find_map(|statement| {
+                let PlannedStatement::Variables(variables) = statement else {
+                    return None;
+                };
+                variables.iter().find_map(|variable| {
+                    let PlannedVariableInitializer::Expression(expression) = &variable.initializer
+                    else {
+                        return None;
+                    };
+                    let PlannedExpressionKind::Object { properties, .. } = &expression.kind else {
+                        return None;
+                    };
+                    let [PlannedObjectMember::Getter { getter, expression }] =
+                        properties.as_slice()
+                    else {
+                        return None;
+                    };
+                    Some((getter.clone(), expression.clone()))
+                })
+            })
+            .unwrap();
+        let captured = variable_symbol(&context, &source, file, "captured");
+        let peer = variable_symbol(&context, &source, file, "peer");
+        let other = global_symbol(&context, "Other");
+        let flow = HashMap::from([(
+            captured,
+            variable_value_type(&context, &source, file, "captured"),
+        )]);
+        let projection = super::super::object_members::object_literal_getter_projection_with_host(
+            context.store(),
+            &host,
+            getter.symbol,
+        )
+        .unwrap();
+        let signature = projection.signature.unwrap();
+        let annotation = getter.return_annotation.unwrap();
+        let read_type = projection.require_type().unwrap();
+        let expression_links = context
+            .store()
+            .type_node_links(getter.return_expression)
+            .unwrap()
+            .clone();
+        let expression_symbol = context
+            .store()
+            .symbol_node_links(getter.return_expression)
+            .unwrap()
+            .clone();
+        let annotation_links = context.store().type_node_links(annotation).unwrap().clone();
+        let annotation_symbol = context
+            .store()
+            .symbol_node_links(annotation)
+            .unwrap()
+            .clone();
+        let value_links = context
+            .store()
+            .value_symbol_links(getter.symbol)
+            .unwrap()
+            .clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(read_type, number);
+        let keep_owner = function_symbol(&context, &source, file, "keep");
+        let keep_type = context
+            .store()
+            .source_callable_type_for_owner(keep_owner)
+            .unwrap();
+        let keep_signature = context
+            .store()
+            .source_callable_provenance(keep_type)
+            .unwrap()
+            .signature;
+        let parameter = context
+            .store()
+            .signature(keep_signature)
+            .unwrap()
+            .type_parameters()[0];
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        for expected in [number, error_type] {
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    parameter,
+                    &[parameter],
+                    &[number],
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    &mut session,
+                ),
+                Ok(expected),
+            );
+        }
+        let spent = (
+            session.total_count(),
+            session.limit_event_mark(),
+            session.recovery_error_type(),
+        );
+        assert_eq!(session.total_count(), 1);
+        assert_eq!(session.limit_event_count(), 1);
+        let capabilities = HashMap::new();
+        let imports = SourceTypeImportExecution {
+            value_uses: HashMap::new(),
+            annotation_capabilities: &capabilities,
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut check = |context: &mut CanonicalCheckerContext<'_>,
+                         session: &mut InstantiationSession,
+                         flow: &HashMap<SemanticSymbolId, TypeId>| {
+            check_source_object_literal_getter_return(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                source_file,
+                options,
+                session,
+                &mut diagnostics,
+                flow,
+                &imports,
+                &getter,
+                &expression,
+                &mut Vec::new(),
+                None,
+                None,
+            )
+        };
+        for change in 0..4 {
+            let store = context.store_mut_for_test();
+            match change {
+                0 => {
+                    let mut changed = expression_links.clone();
+                    changed.resolved_type = Some(string);
+                    assert!(store.set_type_node_links(getter.return_expression, changed));
+                }
+                1 => assert!(store.set_symbol_node_links(
+                    getter.return_expression,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(peer)
+                    },
+                )),
+                2 => {
+                    let mut changed_annotation = annotation_links.clone();
+                    changed_annotation.resolved_type = Some(string);
+                    assert!(store.set_type_node_links(annotation, changed_annotation));
+                    let mut changed_value = value_links.clone();
+                    changed_value.resolved_type = Some(string);
+                    assert!(store.set_value_symbol_links(getter.symbol, changed_value));
+                    assert!(store.set_signature_resolved_return_type(signature, Some(string)));
+                }
+                3 => assert!(store.set_symbol_node_links(
+                    annotation,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(other)
+                    },
+                )),
+                _ => unreachable!(),
+            }
+            let expected = if change == 3 {
+                SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidCachedSymbol {
+                        node: annotation,
+                        symbol: other,
+                    },
+                ))
+            } else {
+                SourceCheckError::RelationUnavailable(RelationUnavailable::InvalidSymbolMembers(
+                    getter.symbol,
+                ))
+            };
+            for _ in 0..2 {
+                let before = observable_state(&context, file);
+                assert_eq!(check(&mut context, &mut session, &flow), Err(expected));
+                assert_eq!(observable_state(&context, file), before);
+                assert_eq!(
+                    (
+                        session.total_count(),
+                        session.limit_event_mark(),
+                        session.recovery_error_type()
+                    ),
+                    spent
+                );
+            }
+            let store = context.store_mut_for_test();
+            assert!(store.set_type_node_links(getter.return_expression, expression_links.clone()));
+            assert!(
+                store.set_symbol_node_links(getter.return_expression, expression_symbol.clone())
+            );
+            assert!(store.set_type_node_links(annotation, annotation_links.clone()));
+            assert!(store.set_symbol_node_links(annotation, annotation_symbol.clone()));
+            assert!(store.set_value_symbol_links(getter.symbol, value_links.clone()));
+            assert!(store.set_signature_resolved_return_type(signature, Some(read_type)));
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .push_type_resolution(
+                    TypeResolutionTarget::Symbol(captured),
+                    TypeSystemPropertyName::Type,
+                )
+                .unwrap()
+        );
+        let before_error = observable_state(&context, file);
+        assert_eq!(
+            check(&mut context, &mut session, &HashMap::new()),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(captured)
+            )),
+        );
+        assert_eq!(observable_state(&context, file), before_error);
+        assert_eq!(
+            context.store_mut_for_test().pop_type_resolution(),
+            Some(true)
+        );
+        let warm = observable_state(&context, file);
+        assert_eq!(
+            check(&mut context, &mut session, &flow),
+            Ok(CheckedObjectMember::Getter {
+                symbol: getter.symbol,
+                read_type,
+            })
+        );
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            (
+                session.total_count(),
+                session.limit_event_mark(),
+                session.recovery_error_type()
+            ),
+            spent
+        );
+        assert!(diagnostics.is_empty());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn source_object_literal_getters_do_not_skip_nested_callable_captures() {
+        let source = parsed(concat!(
+            "var captured: number | string = 1; ",
+            "const object = { get callback() { return { run: () => captured }; } }; ",
+            "captured = 'later';",
+        ));
+        let file = FileId::new(202_304);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let getter = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::GetAccessor).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let raw = context.file(file).unwrap().1.symbol(getter).unwrap();
+        let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node: getter,
+            kind: SyntaxKind::GetAccessor,
+            role: SourceSyntaxRole::ObjectProperty,
+        });
+        assert_eq!(context.check_source_file(file), Err(expected));
+        assert!(context.store().signature_links(getter).is_none());
+        assert!(
+            context
+                .store()
+                .value_symbol_links(raw)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        );
+        assert!(!is_type_checked(&context, file));
+        let stopped = observable_state(&context, file);
+        assert_eq!(context.check_source_file(file), Err(expected));
+        assert_eq!(observable_state(&context, file), stopped);
     }
 
     fn type_reference_nodes(parsed: &ParseResult, file: FileId, expected: &str) -> Vec<NodeRef> {
@@ -82384,8 +83848,8 @@ mod tests {
             raw: number,
             result: number,
             shape: CheckedExpressionShape::Object(vec![
-                CheckedExpressionTypes::leaf(number, number),
-                CheckedExpressionTypes::leaf(number, number),
+                CheckedObjectMember::Eager(CheckedExpressionTypes::leaf(number, number)),
+                CheckedObjectMember::Eager(CheckedExpressionTypes::leaf(number, number)),
             ]),
             primitive_binary_recovery: None,
         };
