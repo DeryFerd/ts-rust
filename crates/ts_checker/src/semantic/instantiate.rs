@@ -5915,7 +5915,10 @@ mod tests {
             let targets = [fixture.argument];
             let store = fixture.context.store_mut_for_test();
             let empty = store.intrinsic_bootstrap().unwrap().empty_type_literal_type;
-            let conditional = store.type_payload(fixture.argument).unwrap().data().clone();
+            let conditional = match store.type_payload(fixture.argument).unwrap().data() {
+                TypeData::Conditional(data) => TypeData::Conditional(data.clone()),
+                _ => panic!("expected the source-produced conditional argument"),
+            };
             let conditional_alias = store.type_payload(fixture.argument).unwrap().alias();
             let production_lengths = store.conditional_production_lengths();
             let before = deferred_intersection_store_state(store);
