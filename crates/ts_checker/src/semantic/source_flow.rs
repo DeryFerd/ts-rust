@@ -6138,7 +6138,7 @@ mod tests {
             match change {
                 0 => {
                     nodes.get_mut(proof.rows.left_false).unwrap().payload =
-                        Some(FlowNodePayload::Ast(syntax.callee))
+                        Some(FlowNodePayload::Ast(syntax.callee));
                 }
                 1 => nodes.get_mut(proof.rows.right_true).unwrap().antecedent = Some(proof.entry),
                 2 => nodes.get_mut(proof.rows.right_false).unwrap().flags = FlowFlags::CALL,
@@ -6152,7 +6152,7 @@ mod tests {
                     .swap(0, 1),
                 5 => {
                     nodes.get_mut(proof.rows.pre_right).unwrap().antecedents =
-                        vec![proof.rows.left_false]
+                        vec![proof.rows.left_false];
                 }
                 6 => {
                     nodes

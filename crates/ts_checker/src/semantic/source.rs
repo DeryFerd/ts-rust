@@ -65889,6 +65889,15 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Keep both coherent cache poisons and exact restores together.
     fn linear_required_property_logical_statements_reject_paired_warm_caches() {
+        fn split_observation_counter(snapshot: &str) -> (&str, u64, &str) {
+            const FIELD: &str = ", next_relation_observation_token: ";
+            let (prefix, remaining) = snapshot.split_once(FIELD).unwrap();
+            assert!(!remaining.contains(FIELD));
+            let (counter, suffix) = remaining.split_once(',').unwrap();
+            assert!(!counter.is_empty() && counter.bytes().all(|byte| byte.is_ascii_digit()));
+            (prefix, counter.parse().unwrap(), suffix)
+        }
+
         let source = parsed(concat!(
             "type Sink = { send: (value: string) => void; other: (value: number) => number }; ",
             "function emit(sink: Sink, value: string): void { sink.send && sink.send(value); } ",
@@ -65977,15 +65986,25 @@ mod tests {
             }
             let before = observable_state(&context, file);
             let store_before = format!("{:?}", context.store());
+            let (before_prefix, mut observation_counter, before_suffix) =
+                split_observation_counter(&store_before);
+            assert!(!context.store().relation_read_observation_is_active());
             let expected = if poison_call {
                 SourceCheckError::Call(call)
             } else {
                 SourceCheckError::Property(callee)
             };
             for _ in 0..2 {
-                assert_eq!(context.check_source_file(file), Err(expected.clone()));
+                assert_eq!(context.check_source_file(file), Err(expected));
                 assert_eq!(observable_state(&context, file), before);
-                assert_eq!(format!("{:?}", context.store()), store_before);
+                assert!(!context.store().relation_read_observation_is_active());
+                let store_after = format!("{:?}", context.store());
+                let (after_prefix, after_counter, after_suffix) =
+                    split_observation_counter(&store_after);
+                // Both property reads finish an observation before the cache error.
+                assert_eq!(after_counter, observation_counter.checked_add(2).unwrap());
+                assert_eq!((after_prefix, after_suffix), (before_prefix, before_suffix));
+                observation_counter = after_counter;
             }
             assert!(
                 context
