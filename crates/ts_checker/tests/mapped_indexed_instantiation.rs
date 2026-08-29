@@ -6,7 +6,7 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore, DeclaredTypeLinks,
     GenericInterfaceArrayTarget, GenericInterfaceMemberError, IntrinsicBootstrapOptions, TypeData,
-    TypeId, TypeNodeLinks, ValueSymbolLinks,
+    TypeId, TypeNodeLinks, TypeRecord, ValueSymbolLinks,
     type_records::CacheHashKey,
     types::{AccessFlags, ObjectFlags},
 };
@@ -112,6 +112,7 @@ fn interface_target(
     (target, parameters)
 }
 
+#[allow(clippy::too_many_lines)] // Keep one dictionary's source, property, and index setup together.
 fn dictionary_interface(
     store: &mut CanonicalTypeMapperStore,
     parsed: &ParseResult,
@@ -138,7 +139,7 @@ fn dictionary_interface(
                     panic!("the dictionary fixture uses string literal values")
                 };
                 store
-                    .get_template_literal_type(&[literal.text.clone()], &[])
+                    .get_template_literal_type(std::slice::from_ref(&literal.text), &[])
                     .unwrap()
             }
             _ => panic!("unexpected dictionary annotation"),
@@ -520,7 +521,7 @@ fn index_signature_values_use_the_same_nested_indexed_instantiation() {
         .store
         .alloc_index_info(string, fixture.template, true, None, Vec::new())
         .unwrap();
-    let mapped = fixture
+    let instantiated_index = fixture
         .store
         .instantiate_generic_interface_index_info(
             reference,
@@ -529,7 +530,7 @@ fn index_signature_values_use_the_same_nested_indexed_instantiation() {
             Some(GenericInterfaceArrayTarget::new(fixture.array)),
         )
         .unwrap();
-    let info = fixture.store.index_info(mapped).unwrap();
+    let info = fixture.store.index_info(instantiated_index).unwrap();
     assert_eq!(info.key_type(), string);
     assert!(info.is_readonly());
     let element = fixture.array_element(info.value_type());
@@ -798,6 +799,7 @@ fn optional_property_relations_distribute_stored_unions_by_relation_kind() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Compare both optional alias forms and their warm identities.
 fn nested_optional_reads_preserve_aliases_and_mapped_void_values() {
     let parsed = parse_source_file(concat!(
         "type DeclaredValue = number | undefined; ",
@@ -878,7 +880,7 @@ fn nested_optional_reads_preserve_aliases_and_mapped_void_values() {
                 .iter()
                 .find(|type_| {
                     matches!(
-                        store.type_payload(**type_).map(|record| record.data()),
+                        store.type_payload(**type_).map(TypeRecord::data),
                         Some(TypeData::TypeReference(_))
                     )
                 })
@@ -939,6 +941,7 @@ fn nested_optional_reads_preserve_aliases_and_mapped_void_values() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Check the same nested optional value before and after replay.
 fn nested_mapped_property_instantiation_keeps_the_optional_sentinel() {
     let parsed = parse_source_file(concat!(
         "interface Wrapper<Value> { value: Value } ",
@@ -1006,7 +1009,7 @@ fn nested_mapped_property_instantiation_keeps_the_optional_sentinel() {
                 .iter()
                 .find(|type_| {
                     matches!(
-                        store.type_payload(**type_).map(|record| record.data()),
+                        store.type_payload(**type_).map(TypeRecord::data),
                         Some(TypeData::TypeReference(_))
                     )
                 })
