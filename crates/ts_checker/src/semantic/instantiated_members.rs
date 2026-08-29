@@ -4775,7 +4775,12 @@ pub(super) fn instantiated_function_member_signature_return(
                     owner,
                     mapper,
                     array_targets,
-                )
+                ) && match array_targets {
+                    Some(targets) => store
+                        .validate_cached_array_capability_with_array_targets(targets, owner)
+                        .is_ok(),
+                    None => store.validate_cached_array_capability(owner).is_ok(),
+                }
             }
         };
         if !matches_caller {
@@ -7608,12 +7613,12 @@ mod tests {
         store: &CanonicalTypeMapperStore,
         signature: SignatureId,
         targets: Option<CanonicalArrayTargets>,
-        expected: Option<Result<TypeId, GenericInterfaceMemberError>>,
+        expected: Option<&Result<TypeId, GenericInterfaceMemberError>>,
     ) {
         let before = property_recovery_store_counts(store);
         for _ in 0..2 {
             assert_eq!(
-                instantiated_function_member_signature_return(store, signature, targets),
+                instantiated_function_member_signature_return(store, signature, targets).as_ref(),
                 expected,
             );
             assert_eq!(property_recovery_store_counts(store), before);
@@ -7671,7 +7676,7 @@ mod tests {
                 store,
                 callable.signature,
                 Some(targets),
-                Some(Ok(expected)),
+                Some(&Ok(expected)),
             );
         }
         assert_ne!(signatures[0], signatures[1]);
@@ -7720,7 +7725,7 @@ mod tests {
             let other_mapper = store
                 .new_simple_type_mapper(fixture.parameter, number)
                 .unwrap();
-            assert_mapped_member_return_read_only(store, signature, Some(targets), Some(Ok(void)));
+            assert_mapped_member_return_read_only(store, signature, Some(targets), Some(&Ok(void)));
             match mutation {
                 "callable_target" => assert!(store.set_object_target_and_mapper(
                     value,
@@ -7733,7 +7738,7 @@ mod tests {
                     Some(other_mapper)
                 )),
                 "callable_symbol" => {
-                    assert!(store.set_type_symbol(value, Some(fixture.source_property)))
+                    assert!(store.set_type_symbol(value, Some(fixture.source_property)));
                 }
                 "signature_target" => assert!(store.set_signature_target_and_mapper(
                     signature,
@@ -7753,13 +7758,13 @@ mod tests {
                     }
                 )),
                 "return" => {
-                    assert!(store.set_signature_resolved_return_type(signature, Some(number)))
+                    assert!(store.set_signature_resolved_return_type(signature, Some(number)));
                 }
                 "missing_return" => {
-                    assert!(store.set_signature_resolved_return_type(signature, None))
+                    assert!(store.set_signature_resolved_return_type(signature, None));
                 }
                 "owner_members" => {
-                    assert!(store.set_structured_type_members(value, None, None, None, None, None))
+                    assert!(store.set_structured_type_members(value, None, None, None, None, None));
                 }
                 "origin" => assert_eq!(
                     store.replace_instantiated_property_alias_callable_for_test(value, None),
@@ -7804,7 +7809,7 @@ mod tests {
                         value,
                         Some(fixture.source),
                         Some(fixture.mapper)
-                    ))
+                    ));
                 }
                 "callable_symbol" => assert!(store.set_type_symbol(value, owner)),
                 "signature_target" | "signature_mapper" => {
@@ -7812,11 +7817,11 @@ mod tests {
                         signature,
                         Some(fixture.signature),
                         Some(fixture.mapper)
-                    ))
+                    ));
                 }
                 "parameter" => assert!(store.set_value_symbol_links(parameter, parameter_links)),
                 "return" | "missing_return" => {
-                    assert!(store.set_signature_resolved_return_type(signature, Some(void)))
+                    assert!(store.set_signature_resolved_return_type(signature, Some(void)));
                 }
                 "owner_members" => assert!(store.set_structured_type_members(
                     value,
@@ -7837,7 +7842,7 @@ mod tests {
                 store.instantiated_property_alias_callable(value),
                 Some(origin)
             );
-            assert_mapped_member_return_read_only(store, signature, Some(targets), Some(Ok(void)));
+            assert_mapped_member_return_read_only(store, signature, Some(targets), Some(&Ok(void)));
             assert_eq!(property_function_callable(store, value, string), signature);
         }
     }
@@ -7885,12 +7890,12 @@ mod tests {
                 store,
                 signature,
                 Some(targets),
-                Some(Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                Some(&Err(GenericInterfaceMemberError::InvalidCachedMembers(
                     first,
                 ))),
             );
             assert!(store.set_structured_type_members(malformed, None, None, None, None, None));
-            assert_mapped_member_return_read_only(store, signature, Some(targets), Some(Ok(void)));
+            assert_mapped_member_return_read_only(store, signature, Some(targets), Some(&Ok(void)));
         }
     }
 
@@ -7936,7 +7941,7 @@ mod tests {
                 store,
                 callable.signature,
                 unavailable,
-                Some(Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                Some(&Err(GenericInterfaceMemberError::InvalidCachedMembers(
                     value,
                 ))),
             );
@@ -7945,7 +7950,7 @@ mod tests {
             store,
             callable.signature,
             Some(targets),
-            Some(Ok(returned)),
+            Some(&Ok(returned)),
         );
     }
 
@@ -8028,7 +8033,7 @@ mod tests {
                 store,
                 callable.signature,
                 Some(targets),
-                Some(Ok(returned)),
+                Some(&Ok(returned)),
             );
             if arrays {
                 let mut foreign = CanonicalTypeMapperStore::new();
@@ -8043,7 +8048,7 @@ mod tests {
                         store,
                         callable.signature,
                         unavailable,
-                        Some(Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                        Some(&Err(GenericInterfaceMemberError::InvalidCachedMembers(
                             value,
                         ))),
                     );
@@ -8052,7 +8057,7 @@ mod tests {
                     store,
                     callable.signature,
                     Some(targets),
-                    Some(Ok(returned)),
+                    Some(&Ok(returned)),
                 );
             }
             assert_eq!(
