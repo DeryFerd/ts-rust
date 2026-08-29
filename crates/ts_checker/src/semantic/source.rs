@@ -30859,6 +30859,7 @@ fn check_expression_type_with_capture_context(
                     host,
                     global_types,
                     options,
+                    session,
                     diagnostics,
                     receiver.result,
                     &name,

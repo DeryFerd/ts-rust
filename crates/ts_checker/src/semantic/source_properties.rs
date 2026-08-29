@@ -4050,11 +4050,12 @@ fn resolve_published_canonical_array_property(
         );
         Some(requires.and_then(|requires| {
             if requires {
-                super::instantiated_members::instantiate_published_generic_interface_method(
+                super::instantiated_members::instantiate_published_generic_interface_method_with_session(
                     store,
                     global_types,
                     receiver_type,
                     symbol,
+                    session,
                 )
             } else {
                 Ok(type_)
@@ -5674,6 +5675,7 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, DeclaredTypeError,
         IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks,
+        instantiate::{InstantiationLimits, instantiate_type_with_session},
         signatures::{ElementFlags, SignatureFlags},
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         tuple_types::CanonicalTupleTypeRequest,
@@ -8114,6 +8116,723 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn array_filter_library() -> ParseResult {
+        parsed(concat!(
+            "interface Array<T> { ",
+            "filter<S extends T>(predicate: ",
+            "(value: T, index: number, array: T[]) => value is S, thisArg?: any): S[]; ",
+            "filter(predicate: ",
+            "(value: T, index: number, array: T[]) => unknown, thisArg?: any): T[]; ",
+            "} interface ReadonlyArray<T> { ",
+            "filter<S extends T>(predicate: ",
+            "(value: T, index: number, array: readonly T[]) => value is S, ",
+            "thisArg?: any): S[]; ",
+            "filter(predicate: ",
+            "(value: T, index: number, array: readonly T[]) => unknown, ",
+            "thisArg?: any): T[]; }",
+        ))
+    }
+
+    struct ArrayFilterPropertyFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        plan: SourcePropertyPlan,
+        receiver: TypeId,
+        element: TypeId,
+        source_element: TypeId,
+        method: SemanticSymbolId,
+        template: TypeId,
+    }
+
+    #[allow(clippy::too_many_lines)] // Real library declarations publish the source method, but not its receiver copy.
+    fn array_filter_property_fixture<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+    ) -> ArrayFilterPropertyFixture<'arena> {
+        let library_file = FileId::new(45_320);
+        let source_file = FileId::new(45_321);
+        let files = [(library_file, library), (source_file, source)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            let is_library = file == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            options,
+        )
+        .unwrap();
+        let bounds = files.map(|(file, _)| context.file(file).unwrap().1.clone());
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files
+                .iter()
+                .zip(&bounds)
+                .map(|((_, parsed), bound)| (&parsed.arena, bound)),
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let access = property_access(source, source_file);
+        let syntax =
+            plan_direct_source_property_syntax(&source.arena, context.store(), access).unwrap();
+        let variable =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(&record.data, NodeData::VariableDeclaration(_))
+                        .then_some(NodeRef::new(source.arena.id(), source_file, node))
+                })
+                .unwrap();
+        let variable = context
+            .store()
+            .get_merged_symbol(bounds[1].symbol(variable).unwrap())
+            .unwrap();
+        let globals = context.global_types().clone();
+        let mut setup = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let receiver =
+            crate::semantic::type_nodes::CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut setup,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_declared_value(variable)
+            .unwrap();
+        let array = context
+            .store()
+            .canonical_array_reference(&globals, receiver)
+            .unwrap()
+            .unwrap();
+        let target = if array.readonly {
+            globals.readonly_array_type
+        } else {
+            globals.array_type
+        };
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the receiver must retain the real Array target")
+        };
+        let [source_element] = interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the Array target must retain its declared element parameter")
+        };
+        let source_element = *source_element;
+        let template = crate::semantic::source_calls::materialize_global_array_callback_method(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut setup,
+            &mut diagnostics,
+            receiver,
+            "filter",
+            access,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(setup.limit_event_count(), 0);
+        let method = context
+            .store()
+            .type_payload(template)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        assert!(!context.store().types().any(|(_, record)| {
+            matches!(record.data(), TypeData::Object(object) if object.target == Some(template))
+        }));
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, variable))
+                .unwrap();
+        ArrayFilterPropertyFixture {
+            context,
+            plan,
+            receiver,
+            element: array.element_type,
+            source_element,
+            method,
+            template,
+        }
+    }
+
+    fn array_filter_property_counts(store: &CanonicalTypeMapperStore) -> ([usize; 8], [usize; 26]) {
+        (
+            [
+                store.type_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.type_alias_len(),
+                store.type_predicate_len(),
+                store.symbol_store().symbol_table_len(),
+                store.type_resolution_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // Check source declarations, method mappers, and both callback copies.
+    fn assert_array_filter_property_mapping(
+        fixture: &ArrayFilterPropertyFixture<'_>,
+        value: TypeId,
+    ) {
+        let store = fixture.context.store();
+        let globals = fixture.context.global_types();
+        let receiver = store
+            .canonical_array_reference(globals, fixture.receiver)
+            .unwrap()
+            .unwrap();
+        let TypeData::Object(object) = store.type_payload(value).unwrap().data() else {
+            panic!("filter must retain its copied method object")
+        };
+        assert_eq!(object.target, Some(fixture.template));
+        assert_eq!(
+            store.type_payload(value).unwrap().symbol(),
+            Some(fixture.method)
+        );
+        let target = if receiver.readonly {
+            globals.readonly_array_type
+        } else {
+            globals.array_type
+        };
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            unreachable!()
+        };
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(
+                object.mapper.unwrap(),
+                &[fixture.source_element, interface.this_type.unwrap()],
+                &[fixture.element, fixture.receiver],
+            ),
+            Some(true)
+        );
+        let StoredCallableSetValidation::Valid {
+            projection: source, ..
+        } = validate_stored_callable_set(store, fixture.template)
+        else {
+            panic!("the source filter overloads must remain valid")
+        };
+        let StoredCallableSetValidation::Valid {
+            projection: mapped, ..
+        } = validate_stored_callable_set(store, value)
+        else {
+            panic!("the mapped filter overloads must remain valid")
+        };
+        assert_eq!(source.call_signatures.len(), 2);
+        assert_eq!(mapped.call_signatures.len(), 2);
+        for (source, mapped) in source.call_signatures.iter().zip(&mapped.call_signatures) {
+            let original = store.signature(source.signature).unwrap();
+            let copied = store.signature(mapped.signature).unwrap();
+            assert_eq!(copied.target(), Some(source.signature));
+            assert_eq!(copied.declaration(), original.declaration());
+            let StoredCallableSetValidation::Valid {
+                projection: source_callback,
+                ..
+            } = validate_stored_callable_set(store, source.parameters[0])
+            else {
+                panic!("the source callback must keep its FunctionType declaration")
+            };
+            let StoredCallableSetValidation::Valid {
+                projection: mapped_callback,
+                ..
+            } = validate_stored_callable_set(store, mapped.parameters[0])
+            else {
+                panic!("the mapped callback must retain the Array method owner")
+            };
+            let source_callback = &source_callback.call_signatures[0];
+            let mapped_callback = &mapped_callback.call_signatures[0];
+            assert_eq!(source_callback.parameters[0], fixture.source_element);
+            assert_eq!(mapped_callback.parameters[0], fixture.element);
+            assert_eq!(mapped_callback.parameters[1], source_callback.parameters[1]);
+            let callback_array = store
+                .canonical_array_reference(globals, mapped_callback.parameters[2])
+                .unwrap()
+                .unwrap();
+            assert_eq!(callback_array.element_type, fixture.element);
+            assert_eq!(callback_array.readonly, receiver.readonly);
+            let callback_signature = store.signature(mapped_callback.signature).unwrap();
+            assert_eq!(callback_signature.target(), Some(source_callback.signature));
+            assert_eq!(callback_signature.mapper(), copied.mapper());
+            assert_eq!(
+                callback_signature.declaration(),
+                store
+                    .signature(source_callback.signature)
+                    .unwrap()
+                    .declaration()
+            );
+            let TypeData::Object(callback) =
+                store.type_payload(mapped.parameters[0]).unwrap().data()
+            else {
+                unreachable!()
+            };
+            assert_eq!(callback.target, Some(source.parameters[0]));
+            assert_eq!(callback.mapper, copied.mapper());
+        }
+        let ordinary = &mapped.call_signatures[1];
+        let returned = store
+            .canonical_array_reference(globals, ordinary.return_type.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned.element_type, fixture.element);
+        assert!(!returned.readonly);
+        assert_eq!(
+            store
+                .value_symbol_links(fixture.method)
+                .unwrap()
+                .resolved_type,
+            Some(fixture.template)
+        );
+    }
+
+    #[test]
+    fn canonical_array_filter_properties_use_the_caller_session_cold_and_warm() {
+        let library = array_filter_library();
+        for (readonly, recovering) in [(false, false), (false, true), (true, false), (true, true)] {
+            let source = parsed(&format!(
+                "declare const values: {}number[]; values.filter(value => value);",
+                if readonly { "readonly " } else { "" },
+            ));
+            let mut fixture = array_filter_property_fixture(&library, &source);
+            let globals = fixture.context.global_types().clone();
+            let mut session = if recovering {
+                InstantiationSession::new_recovering(
+                    fixture.context.store(),
+                    InstantiationLimits::default(),
+                    fixture
+                        .context
+                        .store()
+                        .intrinsic_bootstrap()
+                        .unwrap()
+                        .error_type,
+                )
+                .unwrap()
+            } else {
+                InstantiationSession::new(InstantiationLimits::default())
+            };
+            let checked = check_direct_source_property_with_session(
+                fixture.context.store_mut_for_test(),
+                Some(&globals),
+                &fixture.plan,
+                fixture.receiver,
+                &mut session,
+            )
+            .unwrap();
+            assert!(checked.diagnostics.is_empty());
+            assert!(session.query_count() > 0);
+            assert_eq!(session.query_count(), session.total_count());
+            assert_eq!(session.limit_event_count(), 0);
+            assert_array_filter_property_mapping(&fixture, checked.type_);
+            let counts = array_filter_property_counts(fixture.context.store());
+            let budget = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    check_direct_source_property_with_session(
+                        fixture.context.store_mut_for_test(),
+                        Some(&globals),
+                        &fixture.plan,
+                        fixture.receiver,
+                        &mut session,
+                    ),
+                    Ok(checked.clone())
+                );
+                assert_eq!(
+                    array_filter_property_counts(fixture.context.store()),
+                    counts
+                );
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    budget
+                );
+            }
+            let mut exhausted = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            assert_eq!(
+                check_direct_source_property_with_session(
+                    fixture.context.store_mut_for_test(),
+                    Some(&globals),
+                    &fixture.plan,
+                    fixture.receiver,
+                    &mut exhausted,
+                ),
+                Ok(checked)
+            );
+            assert_eq!(
+                (
+                    exhausted.query_count(),
+                    exhausted.total_count(),
+                    exhausted.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(
+                array_filter_property_counts(fixture.context.store()),
+                counts
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_array_filter_properties_keep_spent_count_and_depth_limits() {
+        let library = array_filter_library();
+        let source = parsed("declare const values: number[]; values.filter(value => value);");
+        for count_limit in [true, false] {
+            let mut fixture = array_filter_property_fixture(&library, &source);
+            let globals = fixture.context.global_types().clone();
+            let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+            let mapper = fixture
+                .context
+                .store_mut_for_test()
+                .new_simple_type_mapper(fixture.source_element, fixture.element)
+                .unwrap();
+            let limits = if count_limit {
+                InstantiationLimits {
+                    max_count: 1,
+                    ..InstantiationLimits::default()
+                }
+            } else {
+                InstantiationLimits {
+                    max_depth: 1,
+                    ..InstantiationLimits::default()
+                }
+            };
+            let mut session = InstantiationSession::new(limits);
+            if count_limit {
+                assert_eq!(
+                    instantiate_type_with_session(
+                        fixture.context.store_mut_for_test(),
+                        fixture.source_element,
+                        mapper,
+                        targets,
+                        &mut session
+                    ),
+                    Ok(fixture.element)
+                );
+                assert_eq!(session.query_count(), 1);
+            }
+            assert_eq!(
+                check_direct_source_property_with_session(
+                    fixture.context.store_mut_for_test(),
+                    Some(&globals),
+                    &fixture.plan,
+                    fixture.receiver,
+                    &mut session,
+                ),
+                Err(SourcePropertyError::Capacity(fixture.plan.node))
+            );
+            assert_eq!(session.limit_event_count(), 1);
+            assert_eq!(session.query_count(), session.total_count());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(fixture.plan.node)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .symbol_node_links(fixture.plan.node)
+                    .is_none()
+            );
+            let total = session.total_count();
+            if count_limit {
+                assert_eq!(session.query_count(), 1);
+                session.reset_query();
+            }
+            assert_eq!(
+                instantiate_type_with_session(
+                    fixture.context.store_mut_for_test(),
+                    fixture.source_element,
+                    mapper,
+                    targets,
+                    &mut session
+                ),
+                Ok(fixture.element)
+            );
+            assert_eq!(session.total_count(), total + 1);
+            assert_eq!(session.limit_event_count(), 1);
+            let mut retry = InstantiationSession::new(InstantiationLimits::default());
+            let checked = check_direct_source_property_with_session(
+                fixture.context.store_mut_for_test(),
+                Some(&globals),
+                &fixture.plan,
+                fixture.receiver,
+                &mut retry,
+            )
+            .unwrap();
+            assert_array_filter_property_mapping(&fixture, checked.type_);
+            assert!(retry.query_count() > 0);
+            assert_eq!(retry.limit_event_count(), 0);
+        }
+    }
+
+    #[test]
+    fn canonical_array_filter_properties_reject_warm_callback_damage_without_budget_use() {
+        let library = array_filter_library();
+        let source = parsed("declare const values: number[]; values.filter(value => value);");
+        let mut fixture = array_filter_property_fixture(&library, &source);
+        let globals = fixture.context.global_types().clone();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let checked = check_direct_source_property_with_session(
+            fixture.context.store_mut_for_test(),
+            Some(&globals),
+            &fixture.plan,
+            fixture.receiver,
+            &mut session,
+        )
+        .unwrap();
+        assert_array_filter_property_mapping(&fixture, checked.type_);
+        let store = fixture.context.store_mut_for_test();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, checked.type_)
+        else {
+            unreachable!()
+        };
+        let callback = projection.call_signatures[1].parameters[0];
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, callback)
+        else {
+            unreachable!()
+        };
+        let parameter = store
+            .signature(projection.call_signatures[0].signature)
+            .unwrap()
+            .parameters()[0];
+        let original = store.value_symbol_links(parameter).unwrap().clone();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..original.clone()
+            }
+        ));
+        let counts = array_filter_property_counts(store);
+        let mut exhausted = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property_with_session(
+                    fixture.context.store_mut_for_test(),
+                    Some(&globals),
+                    &fixture.plan,
+                    fixture.receiver,
+                    &mut exhausted
+                ),
+                Err(SourcePropertyError::InvalidCache(fixture.plan.node))
+            );
+            assert_eq!(
+                array_filter_property_counts(fixture.context.store()),
+                counts
+            );
+            assert_eq!(
+                (
+                    exhausted.query_count(),
+                    exhausted.total_count(),
+                    exhausted.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, original)
+        );
+        assert_eq!(
+            check_direct_source_property_with_session(
+                fixture.context.store_mut_for_test(),
+                Some(&globals),
+                &fixture.plan,
+                fixture.receiver,
+                &mut exhausted
+            ),
+            Ok(checked)
+        );
+        assert_eq!(
+            array_filter_property_counts(fixture.context.store()),
+            counts
+        );
+        assert_eq!(exhausted.limit_event_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the limit event, later caller use, and cache checks in one control.
+    fn canonical_array_filter_zero_count_recovery_cannot_publish_an_invalid_method() {
+        let library = array_filter_library();
+        let source = parsed("declare const values: number[]; values.filter(value => value);");
+        let mut fixture = array_filter_property_fixture(&library, &source);
+        let globals = fixture.context.global_types().clone();
+        let error = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .error_type;
+        let mapper = fixture
+            .context
+            .store_mut_for_test()
+            .new_simple_type_mapper(fixture.source_element, fixture.element)
+            .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            fixture.context.store(),
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let checked = check_direct_source_property_with_session(
+            fixture.context.store_mut_for_test(),
+            Some(&globals),
+            &fixture.plan,
+            fixture.receiver,
+            &mut session,
+        );
+        assert!(session.limit_event_count() > 0);
+        assert_eq!((session.query_count(), session.total_count()), (0, 0));
+        assert_eq!(session.recovery_error_type(), Some(error));
+        let events = session.limit_event_count();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        assert_eq!(
+            instantiate_type_with_session(
+                fixture.context.store_mut_for_test(),
+                fixture.source_element,
+                mapper,
+                targets,
+                &mut session
+            ),
+            Ok(error)
+        );
+        assert_eq!(session.limit_event_count(), events + 1);
+        assert_eq!(
+            instantiate_type_with_session(
+                fixture.context.store_mut_for_test(),
+                fixture.element,
+                mapper,
+                targets,
+                &mut session
+            ),
+            Ok(fixture.element)
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, events + 1)
+        );
+        let store = fixture.context.store();
+        for (type_, record) in store.types() {
+            if matches!(record.data(), TypeData::Object(object) if object.target == Some(fixture.template))
+            {
+                assert!(
+                    matches!(
+                        validate_stored_callable_set(store, type_),
+                        StoredCallableSetValidation::Valid { .. }
+                    ),
+                    "limit recovery must not leave an invalid filter method cache"
+                );
+            }
+        }
+        match checked {
+            Ok(checked) => {
+                assert!(matches!(
+                    validate_stored_callable_set(store, checked.type_),
+                    StoredCallableSetValidation::Valid { .. }
+                ));
+                let counts = array_filter_property_counts(store);
+                let events = session.limit_event_count();
+                assert_eq!(
+                    check_direct_source_property_with_session(
+                        fixture.context.store_mut_for_test(),
+                        Some(&globals),
+                        &fixture.plan,
+                        fixture.receiver,
+                        &mut session
+                    ),
+                    Ok(checked)
+                );
+                assert_eq!(
+                    array_filter_property_counts(fixture.context.store()),
+                    counts
+                );
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    (0, 0, events)
+                );
+            }
+            Err(_) => {
+                assert!(
+                    store
+                        .type_node_links(fixture.plan.node)
+                        .is_none_or(|links| links == &TypeNodeLinks::default())
+                );
+                assert!(
+                    store
+                        .symbol_node_links(fixture.plan.node)
+                        .is_none_or(|links| links == &SymbolNodeLinks::default())
+                );
+            }
+        }
     }
 
     fn published_array_concat(

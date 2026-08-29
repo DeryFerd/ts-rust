@@ -1230,6 +1230,7 @@ pub(super) fn materialize_global_array_callback_method(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     receiver: TypeId,
     name: &str,
@@ -1330,6 +1331,7 @@ pub(super) fn materialize_global_array_callback_method(
         host,
         global_types,
         options,
+        session,
         &mut annotation_diagnostics,
         &plan,
         site,
@@ -1435,6 +1437,7 @@ fn resolve_global_array_callback_overloads(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &GlobalArrayCallbackMethod,
     site: NodeRef,
@@ -1474,11 +1477,12 @@ fn resolve_global_array_callback_overloads(
             let constraint = parameter
                 .constraint
                 .map(|constraint| {
-                    CanonicalTypeQuery::new_with_global_types(
+                    CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
                         host,
                         global_types,
                         options,
+                        session,
                         diagnostics,
                     )?
                     .get_type_from_type_node(constraint)
@@ -1510,11 +1514,12 @@ fn resolve_global_array_callback_overloads(
 
         let mut parameter_types = Vec::with_capacity(overload.parameters.len());
         for parameter in &overload.parameters {
-            let type_ = CanonicalTypeQuery::new_with_global_types(
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
                 global_types,
                 options,
+                session,
                 diagnostics,
             )?
             .get_type_from_type_node(parameter.annotation)?;
@@ -1525,6 +1530,7 @@ fn resolve_global_array_callback_overloads(
             host,
             global_types,
             options,
+            session,
             diagnostics,
             overload.return_annotation,
             site,
@@ -1537,8 +1543,15 @@ fn resolve_global_array_callback_overloads(
         else {
             return Err(SourceCheckError::Call(site));
         };
-        CanonicalTypeQuery::new_with_global_types(store, host, global_types, options, diagnostics)?
-            .get_return_type_of_signature(callback_signature.signature)?;
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_return_type_of_signature(callback_signature.signature)?;
         let StoredSingleCallableValidation::Valid {
             callable: callback_signature,
             ..
@@ -1581,6 +1594,7 @@ fn resolve_global_array_callback_return_annotation(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     annotation: NodeRef,
     site: NodeRef,
@@ -1592,11 +1606,12 @@ fn resolve_global_array_callback_return_annotation(
             if store.source_node_parent(element) != Some(SourceNodeParent::Parent(annotation)) {
                 return Err(SourceCheckError::Call(site));
             }
-            let element = CanonicalTypeQuery::new_with_global_types(
+            let element = CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 host,
                 global_types,
                 options,
+                session,
                 diagnostics,
             )?
             .get_type_from_type_node(element)?;
@@ -1615,11 +1630,12 @@ fn resolve_global_array_callback_return_annotation(
                     return Err(SourceCheckError::Call(site));
                 }
                 types.push(
-                    CanonicalTypeQuery::new_with_global_types(
+                    CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
                         host,
                         global_types,
                         options,
+                        session,
                         diagnostics,
                     )?
                     .get_type_from_type_node(member)?,
@@ -1864,6 +1880,7 @@ pub(super) fn authenticated_array_callback_contextual_target(
 fn check_authenticated_array_callback_call(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
     plan: &SourceCallPlan,
     callee_type: TypeId,
     argument_types: &[TypeId],
@@ -1910,11 +1927,12 @@ fn check_authenticated_array_callback_call(
     if store
         .authenticated_interface_method_owner(method)
         .is_none_or(|(_, owner)| owner != target)
-        || super::instantiated_members::instantiate_published_generic_interface_method(
+        || super::instantiated_members::instantiate_published_generic_interface_method_with_session(
             store,
             global_types,
             receiver,
             method,
+            session,
         )
         .map_err(|_| SourceCheckError::Call(plan.node))?
             != callee_type
@@ -7646,6 +7664,7 @@ pub(super) fn check_direct_source_call(
     if let Some(checked) = check_authenticated_array_callback_call(
         store,
         global_types,
+        session,
         plan,
         callee_type,
         argument_types,
@@ -8009,6 +8028,7 @@ mod tests {
         },
         reference_types::validate_direct_generic_reference,
         source::{PlannedIdentifierRead, PlannedIdentifierReadKind, SourceSyntaxRole},
+        type_nodes::TypeNodeUnavailable,
         type_records::{LiteralValue, TypeData},
     };
 
@@ -8145,6 +8165,222 @@ mod tests {
             "thisArg?: any): T | undefined; ",
             "}",
         ))
+    }
+
+    fn array_callback_budget_declarations() -> [(&'static str, &'static str); 5] {
+        [
+            (
+                "filter",
+                concat!(
+                    "filter<S extends Element<T, Context<number>>>(predicate: ",
+                    "(value: T, index: number, array: T[]) => value is S, ",
+                    "thisArg?: any): S[]; ",
+                    "filter(predicate: (value: T, index: number, array: T[]) => unknown, ",
+                    "thisArg?: any): T[];",
+                ),
+            ),
+            (
+                "filter",
+                concat!(
+                    "filter<S extends T>(predicate: ",
+                    "(value: T, index: number, array: T[]) => value is S, ",
+                    "thisArg?: any): S[]; ",
+                    "filter(predicate: (value: T, index: number, array: T[]) => unknown, ",
+                    "thisArg?: Context<number>): T[];",
+                ),
+            ),
+            (
+                "forEach",
+                concat!(
+                    "forEach(callbackfn: ",
+                    "(value: T, index: number, array: T[]) => Context<number>, ",
+                    "thisArg?: any): void;",
+                ),
+            ),
+            (
+                "map",
+                concat!(
+                    "map<U>(callbackfn: (value: T, index: number, array: T[]) => U, ",
+                    "thisArg?: any): Context<number>[];",
+                ),
+            ),
+            (
+                "find",
+                concat!(
+                    "find<S extends T>(predicate: ",
+                    "(value: T, index: number, array: T[]) => value is S, ",
+                    "thisArg?: any): S | undefined; ",
+                    "find(predicate: (value: T, index: number, array: T[]) => unknown, ",
+                    "thisArg?: any): Context<number> | undefined;",
+                ),
+            ),
+        ]
+    }
+
+    fn array_callback_budget_sources(
+        method: &str,
+        declaration: &str,
+    ) -> (ParseResult, ParseResult) {
+        (
+            parsed(&format!(
+                "type Context<X> = {{ value: X }}; type Element<X, Unused> = X; \
+                 interface Array<T> {{ {declaration} }} interface ReadonlyArray<T> {{}}",
+            )),
+            parsed(&format!("declare const values: number[]; values.{method};")),
+        )
+    }
+
+    struct ArrayCallbackBudgetFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        receiver: TypeId,
+        site: NodeRef,
+        method: &'static str,
+        plan: GlobalArrayCallbackMethod,
+    }
+
+    impl<'arena> ArrayCallbackBudgetFixture<'arena> {
+        const LIBRARY_FILE: FileId = FileId::new(49_740);
+        const SOURCE_FILE: FileId = FileId::new(49_741);
+
+        fn new(
+            library: &'arena ParseResult,
+            source: &'arena ParseResult,
+            method: &'static str,
+        ) -> Self {
+            let mut context = context_with_default_library(
+                library,
+                Self::LIBRARY_FILE,
+                source,
+                Self::SOURCE_FILE,
+            );
+            let annotation = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                        source.arena.id(),
+                        Self::SOURCE_FILE,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let receiver = context.get_type_from_type_node(annotation).unwrap();
+            let [site]: [NodeRef; 1] = property_accesses(source, Self::SOURCE_FILE)
+                .try_into()
+                .expect("the fixture must retain one real Array property access");
+            let library_bound = context.file(Self::LIBRARY_FILE).unwrap().1.clone();
+            let source_bound = context.file(Self::SOURCE_FILE).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    context.options().name_resolution,
+                ),
+            )
+            .unwrap();
+            let plan = plan_global_array_callback_method(
+                context.store(),
+                &host,
+                context.global_types(),
+                receiver,
+                method,
+                site,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(context.store().value_symbol_links(plan.symbol).is_none());
+            for overload in &plan.overloads {
+                assert!(
+                    context
+                        .store()
+                        .signature_links(overload.declaration)
+                        .is_none()
+                );
+            }
+            Self {
+                context,
+                receiver,
+                site,
+                method,
+                plan,
+            }
+        }
+
+        fn materialize(
+            &mut self,
+            session: &mut InstantiationSession,
+            diagnostics: &mut CanonicalCheckerDiagnostics,
+        ) -> Result<Option<TypeId>, SourceCheckError> {
+            let (library_arena, library_bound) = self.context.file(Self::LIBRARY_FILE).unwrap();
+            let library_bound = library_bound.clone();
+            let (source_arena, source_bound) = self.context.file(Self::SOURCE_FILE).unwrap();
+            let source_bound = source_bound.clone();
+            let options = self.context.options();
+            let globals = self.context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (library_arena, &library_bound),
+                    (source_arena, &source_bound),
+                ],
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    options.name_resolution,
+                ),
+            )
+            .unwrap();
+            materialize_global_array_callback_method(
+                self.context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                session,
+                diagnostics,
+                self.receiver,
+                self.method,
+                self.site,
+            )
+        }
+
+        fn assert_unpublished_method(&self) {
+            let store = self.context.store();
+            assert!(store.value_symbol_links(self.plan.symbol).is_none());
+            for overload in &self.plan.overloads {
+                assert!(store.signature_links(overload.declaration).is_none());
+                for parameter in &overload.parameters {
+                    assert!(store.value_symbol_links(parameter.symbol).is_none());
+                }
+            }
+        }
+
+        fn publication_state(&self) -> ArrayCallbackPublicationState {
+            let store = self.context.store();
+            ArrayCallbackPublicationState {
+                source: call_publication_state(&self.context, self.site),
+                method: store.value_symbol_links(self.plan.symbol).cloned(),
+                overloads: self
+                    .plan
+                    .overloads
+                    .iter()
+                    .map(|overload| store.signature_links(overload.declaration).cloned())
+                    .collect(),
+                parameters: self
+                    .plan
+                    .overloads
+                    .iter()
+                    .flat_map(|overload| &overload.parameters)
+                    .map(|parameter| store.value_symbol_links(parameter.symbol).cloned())
+                    .collect(),
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ArrayCallbackPublicationState {
+        source: CallPublicationState,
+        method: Option<ValueSymbolLinks>,
+        overloads: Vec<Option<SignatureLinks>>,
+        parameters: Vec<Option<ValueSymbolLinks>>,
     }
 
     fn imported_context<'arena>(
@@ -10603,6 +10839,150 @@ mod tests {
                 ),
                 warm,
             );
+        }
+    }
+
+    #[test]
+    fn array_callback_cold_annotations_use_the_callers_count_limit() {
+        for (method, declaration) in array_callback_budget_declarations() {
+            let (library, source) = array_callback_budget_sources(method, declaration);
+            let mut fixture = ArrayCallbackBudgetFixture::new(&library, &source, method);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            let before = session.limit_event_mark();
+            let result = fixture.materialize(&mut session, &mut diagnostics);
+            let store = fixture.context.store();
+            let alias = store
+                .symbol_table(fixture.context.globals())
+                .unwrap()
+                .get_source("Context")
+                .unwrap();
+            let declared_type = store
+                .type_alias_links(alias)
+                .and_then(|links| links.declared_type)
+                .expect("the cold query must reach the real Context template");
+            assert_eq!(
+                result,
+                Err(SourceCheckError::DeclaredType(
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias,
+                            declared_type,
+                        },
+                    ),
+                )),
+                "{declaration}",
+            );
+            assert!(session.limit_event_occurred_since(before));
+            assert_eq!(session.limit_event_count(), 1);
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert!(diagnostics.is_empty());
+            fixture.assert_unpublished_method();
+
+            // Source prerequisites can stay cached after the caller stops mapping.
+            let mut normal = InstantiationSession::new(InstantiationLimits::default());
+            let type_ = fixture
+                .materialize(&mut normal, &mut diagnostics)
+                .unwrap()
+                .unwrap();
+            assert!(normal.total_count() > 0);
+            assert_eq!(normal.limit_event_count(), 0);
+            assert!(matches!(
+                validate_stored_callable_set(fixture.context.store(), type_),
+                StoredCallableSetValidation::Valid { .. }
+            ));
+            let warm = fixture.publication_state();
+            let count = (normal.query_count(), normal.total_count());
+            assert_eq!(
+                fixture.materialize(&mut normal, &mut diagnostics),
+                Ok(Some(type_)),
+            );
+            assert_eq!(fixture.publication_state(), warm);
+            assert_eq!((normal.query_count(), normal.total_count()), count);
+            assert_eq!(normal.limit_event_count(), 0);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn array_callback_annotations_keep_normal_and_recovering_warm_identity() {
+        for (method, declaration) in array_callback_budget_declarations() {
+            for recovering in [false, true] {
+                let (library, source) = array_callback_budget_sources(method, declaration);
+                let mut fixture = ArrayCallbackBudgetFixture::new(&library, &source, method);
+                let store = fixture.context.store();
+                let error = store.intrinsic_bootstrap().unwrap().error_type;
+                let limits = InstantiationLimits {
+                    max_count: 32,
+                    max_depth: 8,
+                };
+                let mut session = if recovering {
+                    InstantiationSession::new_recovering(store, limits, error).unwrap()
+                } else {
+                    InstantiationSession::new(limits)
+                };
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                let type_ = fixture
+                    .materialize(&mut session, &mut diagnostics)
+                    .unwrap()
+                    .unwrap();
+                assert!(session.total_count() > 0, "{declaration}");
+                assert_eq!(session.query_count(), session.total_count());
+                assert_eq!(session.limit_event_count(), 0);
+                assert!(matches!(
+                    validate_stored_callable_set(fixture.context.store(), type_),
+                    StoredCallableSetValidation::Valid { .. }
+                ));
+                let warm = fixture.publication_state();
+                let count = (session.query_count(), session.total_count());
+                for _ in 0..2 {
+                    assert_eq!(
+                        fixture.materialize(&mut session, &mut diagnostics),
+                        Ok(Some(type_)),
+                    );
+                    assert_eq!(fixture.publication_state(), warm);
+                    assert_eq!((session.query_count(), session.total_count()), count);
+                    assert_eq!(session.limit_event_count(), 0);
+                    assert!(diagnostics.is_empty());
+                }
+
+                let method_links = warm.method.clone().unwrap();
+                assert!(fixture.context.store_mut_for_test().set_value_symbol_links(
+                    fixture.plan.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(error),
+                        ..method_links.clone()
+                    },
+                ));
+                let damaged = fixture.publication_state();
+                for _ in 0..2 {
+                    assert_eq!(
+                        fixture.materialize(&mut session, &mut diagnostics),
+                        Err(SourceCheckError::Call(fixture.site)),
+                    );
+                    assert_eq!(fixture.publication_state(), damaged);
+                    assert_eq!((session.query_count(), session.total_count()), count);
+                    assert_eq!(session.limit_event_count(), 0);
+                    assert!(diagnostics.is_empty());
+                }
+                assert!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(fixture.plan.symbol, method_links)
+                );
+                assert_eq!(
+                    fixture.materialize(&mut session, &mut diagnostics),
+                    Ok(Some(type_)),
+                );
+                assert_eq!(fixture.publication_state(), warm);
+                assert_eq!((session.query_count(), session.total_count()), count);
+                assert_eq!(session.limit_event_count(), 0);
+                assert!(diagnostics.is_empty());
+            }
         }
     }
 
