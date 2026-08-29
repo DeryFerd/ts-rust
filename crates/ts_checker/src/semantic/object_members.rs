@@ -940,7 +940,7 @@ fn validate_cold_source_member_symbol(
 }
 
 /// Unread call, construct, and index members can still have queried annotations.
-fn collect_cold_source_member_annotation_edges(
+pub(super) fn collect_cold_source_member_annotation_edges(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,

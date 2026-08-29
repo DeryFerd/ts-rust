@@ -3453,7 +3453,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     /// Rebuilds the annotation identity from source before accepting a cached type.
     #[allow(clippy::too_many_lines)] // Each syntax case uses its canonical type validator.
-    fn lazy_default_library_annotation_type(
+    pub(super) fn lazy_default_library_annotation_type(
         &self,
         node: NodeRef,
         array_targets: Option<CanonicalArrayTargets>,
