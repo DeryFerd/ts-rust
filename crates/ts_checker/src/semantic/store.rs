@@ -104,8 +104,26 @@ struct SourceNodeFacts {
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
+    plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
     exported: bool,
     signature_links_eligible: bool,
+}
+
+/// Exact heritage syntax retained without resolving base names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PlainInterfaceHeritageFacts {
+    NoHeritage,
+    Plain {
+        clause: NodeId,
+        bases: Box<[PlainInterfaceBaseFacts]>,
+    },
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlainInterfaceBaseFacts {
+    pub expression: NodeId,
+    pub name: NodeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,11 +151,18 @@ struct SourceSymbolDeclarations {
     value_declaration: Option<NodeRef>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct SourceGlobalBinding {
     pub(super) table_symbol: SemanticSymbolId,
     pub(super) symbol: SemanticSymbolId,
     pub(super) flags: SymbolFlags,
+    declarations: Option<Box<[NodeRef]>>,
+}
+
+impl SourceGlobalBinding {
+    pub(super) fn declarations(&self) -> Option<&[NodeRef]> {
+        self.declarations.as_deref()
+    }
 }
 
 /// Global bindings retained after all initialization merges finish.
@@ -148,8 +173,12 @@ pub(super) struct SourceGlobalBindings {
 }
 
 impl SourceGlobalBindings {
-    pub(super) fn get(&self, name: EscapedNameRef<'_>) -> Option<SourceGlobalBinding> {
-        self.entries.get(name.as_bytes()).copied()
+    pub(super) fn get(&self, name: EscapedNameRef<'_>) -> Option<&SourceGlobalBinding> {
+        self.entries.get(name.as_bytes())
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &SourceGlobalBinding> {
+        self.entries.values()
     }
 }
 
@@ -593,6 +622,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     source_file_ranks: BTreeMap<FileId, usize>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
     source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
+    source_node_children: BTreeMap<NodeArenaId, Vec<Box<[NodeId]>>>,
     source_symbol_declarations: HashMap<SemanticSymbolId, SourceSymbolDeclarations>,
     source_global_bindings: Option<SourceGlobalBindings>,
     computed_method_name_groups: HashMap<SemanticSymbolId, ComputedMethodNameGroup>,
@@ -761,6 +791,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_file_ranks: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
             source_node_facts: BTreeMap::new(),
+            source_node_children: BTreeMap::new(),
             source_symbol_declarations,
             source_global_bindings: None,
             computed_method_name_groups: HashMap::new(),
@@ -949,6 +980,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return None;
         }
 
+        let node_children = Self::index_source_node_children(&node_facts)?;
         if !self.symbols.register_ast_scope(AstScope::new(file, arena)) {
             return None;
         }
@@ -957,6 +989,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_files.insert(file, source);
         self.source_files_by_arena.insert(arena.id(), source);
         self.source_node_facts.insert(arena.id(), node_facts);
+        self.source_node_children.insert(arena.id(), node_children);
         Some(source)
     }
 
@@ -1088,25 +1121,40 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         {
             return false;
         }
-        let Some(entries) = self.symbol_table(table).and_then(|globals| {
-            globals
-                .iter()
-                .map(|(name, table_symbol)| {
-                    let symbol = self.get_merged_symbol(table_symbol)?;
-                    let flags = self.symbol(symbol)?.flags();
-                    Some((
-                        name.to_owned(),
-                        SourceGlobalBinding {
-                            table_symbol,
-                            symbol,
-                            flags,
-                        },
-                    ))
-                })
-                .collect::<Option<HashMap<_, _>>>()
-        }) else {
+        let Some(globals) = self.symbol_table(table) else {
             return false;
         };
+        let mut entries = HashMap::new();
+        if entries.try_reserve(globals.len()).is_err() {
+            return false;
+        }
+        for (name, table_symbol) in globals.iter() {
+            let Some(symbol) = self.get_merged_symbol(table_symbol) else {
+                return false;
+            };
+            let Some(record) = self.symbol(symbol) else {
+                return false;
+            };
+            let declarations = if let Some(declarations) = record.declarations() {
+                let mut snapshot = Vec::new();
+                if snapshot.try_reserve_exact(declarations.len()).is_err() {
+                    return false;
+                }
+                snapshot.extend_from_slice(declarations);
+                Some(snapshot.into_boxed_slice())
+            } else {
+                None
+            };
+            entries.insert(
+                name.to_owned(),
+                SourceGlobalBinding {
+                    table_symbol,
+                    symbol,
+                    flags: record.flags(),
+                    declarations,
+                },
+            );
+        }
         self.source_global_bindings = Some(SourceGlobalBindings { table, entries });
         true
     }
@@ -8000,6 +8048,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_node_fact(node)?.type_operator
     }
 
+    /// Returns exact source roles, not mutable heritage or type-query caches.
+    pub(super) fn source_plain_interface_heritage(
+        &self,
+        node: NodeRef,
+    ) -> Option<&PlainInterfaceHeritageFacts> {
+        self.source_node_fact(node)?
+            .plain_interface_heritage
+            .as_deref()
+    }
+
     pub(super) fn source_mapped_type_modifiers(
         &self,
         node: NodeRef,
@@ -8047,24 +8105,17 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         .then_some(operands)
     }
 
+    /// Returns registered children in ascending node-ID order.
     pub(super) fn source_direct_children(&self, parent: NodeRef) -> Option<Vec<NodeRef>> {
         self.source_node_fact(parent)?;
-        self.source_node_facts
-            .get(&parent.arena)?
-            .iter()
-            .enumerate()
-            .filter_map(|(index, facts)| {
-                let facts = facts.as_ref()?;
-                (facts.parent == Some(parent.node)).then_some(index)
-            })
-            .map(|index| {
-                Some(NodeRef::new(
-                    parent.arena,
-                    parent.file,
-                    NodeId::new(u32::try_from(index).ok()?),
-                ))
-            })
-            .collect()
+        Some(
+            self.source_node_children
+                .get(&parent.arena)?
+                .get(parent.node.index())?
+                .iter()
+                .map(|&node| NodeRef::new(parent.arena, parent.file, node))
+                .collect(),
+        )
     }
 
     /// Returns the registered name of an exact named default-function declaration.
@@ -8427,6 +8478,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     })),
                     _ => None,
                 },
+                plain_interface_heritage: matches!(&node.data, NodeData::InterfaceDeclaration(_))
+                    .then(|| {
+                        Box::new(
+                            Self::plain_interface_heritage_facts(arena, node_id, node)
+                                .unwrap_or(PlainInterfaceHeritageFacts::Unsupported),
+                        )
+                    }),
                 exported: match &node.data {
                     NodeData::TypeAliasDeclaration(declaration) => {
                         declaration.modifiers.as_ref().is_some_and(|modifiers| {
@@ -8453,6 +8511,119 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             node.for_each_child(|child| pending.push((child, Some(node_id))));
         }
         Some(facts)
+    }
+
+    fn index_source_node_children(facts: &[Option<SourceNodeFacts>]) -> Option<Vec<Box<[NodeId]>>> {
+        let mut children = vec![Vec::new(); facts.len()];
+        for (index, facts) in facts.iter().enumerate() {
+            if let Some(parent) = facts.as_ref().and_then(|facts| facts.parent) {
+                children
+                    .get_mut(parent.index())?
+                    .push(NodeId::new(u32::try_from(index).ok()?));
+            }
+        }
+        Some(children.into_iter().map(Vec::into_boxed_slice).collect())
+    }
+
+    fn plain_interface_heritage_facts(
+        arena: &NodeArena,
+        declaration: NodeId,
+        record: &ts_ast::Node,
+    ) -> Option<PlainInterfaceHeritageFacts> {
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return None;
+        };
+        let identifier = |id, parent| {
+            let node = arena.get(id)?;
+            let NodeData::Identifier(identifier) = &node.data else {
+                return None;
+            };
+            (node.kind == SyntaxKind::Identifier
+                && node.flags.0 == 0
+                && node.parent == Some(parent)
+                && node.range.start < node.range.end
+                && !identifier.text.is_empty()
+                && identifier.flow_node.is_none())
+            .then_some(node)
+        };
+        let name = identifier(interface.name, declaration)?;
+        let parent = arena.get(record.parent?)?;
+        if record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || interface.type_parameters.is_some()
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || parent.range.start > record.range.start
+            || record.range.start >= name.range.start
+            || name.range.end > interface.members.range.start
+            || interface.members.range.start >= interface.members.range.end
+            || interface.members.range.end != record.range.end
+            || record.range.end > parent.range.end
+            || interface.members.has_trailing_comma
+        {
+            return None;
+        }
+        let Some(clauses) = &interface.heritage_clauses else {
+            return Some(PlainInterfaceHeritageFacts::NoHeritage);
+        };
+        let [clause] = clauses.nodes.as_slice() else {
+            return None;
+        };
+        let clause_record = arena.get(*clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return None;
+        };
+        if clauses.has_trailing_comma
+            || clauses.range != clause_record.range
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || clause_record.flags.0 != 0
+            || clause_record.parent != Some(declaration)
+            || clause_record.range.start < name.range.end
+            || clause_record.range.end > interface.members.range.start
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.facts != 0
+            || heritage.types.nodes.is_empty()
+            || heritage.types.has_trailing_comma
+            || heritage.types.range.start <= clause_record.range.start
+            || heritage.types.range.start >= heritage.types.range.end
+            || heritage.types.range.end != clause_record.range.end
+            || arena.source_text()?.get(
+                usize::try_from(clause_record.range.start.get()).ok()?
+                    ..usize::try_from(heritage.types.range.start.get()).ok()?,
+            ) != Some("extends")
+        {
+            return None;
+        }
+        let mut bases = Vec::with_capacity(heritage.types.nodes.len());
+        let mut previous_end = heritage.types.range.start;
+        for &expression in &heritage.types.nodes {
+            let base_record = arena.get(expression)?;
+            let NodeData::ExpressionWithTypeArguments(base) = &base_record.data else {
+                return None;
+            };
+            let name = identifier(base.expression, expression)?;
+            if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+                || base_record.flags.0 != 0
+                || base_record.parent != Some(*clause)
+                || base_record.range.start < previous_end
+                || base_record.range.end > heritage.types.range.end
+                || base_record.range != name.range
+                || base.facts != 0
+                || base.type_arguments.is_some()
+            {
+                return None;
+            }
+            previous_end = base_record.range.end;
+            bases.push(PlainInterfaceBaseFacts {
+                expression,
+                name: base.expression,
+            });
+        }
+        (previous_end == heritage.types.range.end).then(|| PlainInterfaceHeritageFacts::Plain {
+            clause: *clause,
+            bases: bases.into_boxed_slice(),
+        })
     }
 
     fn named_default_function_name(
@@ -12535,7 +12706,10 @@ mod tests {
     use ts_core::TextRange;
     use ts_parser::{parse_isolated_entity_name, parse_source_file};
 
-    use super::{AstScope, CachedSignatureLookup, SemanticStore, type_list_key};
+    use super::{
+        AstScope, CachedSignatureLookup, PlainInterfaceBaseFacts, PlainInterfaceHeritageFacts,
+        SemanticStore, type_list_key,
+    };
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
         AssertionLinks, CacheHashKey, CanonicalCheckerContext, CanonicalCheckerOptions,
@@ -15276,6 +15450,225 @@ mod tests {
     }
 
     #[test]
+    fn source_direct_children_matches_retained_fact_order_and_ownership() {
+        let mut parsed = parse_source_file(concat!(
+            "type Read<T> = { [K in keyof T as K]?: T[K] }; ",
+            "interface Base {} ",
+            "interface Pair extends Base { first: number; run(value: string): boolean }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(51);
+        let leaf = node_ref_of_kind(&parsed.arena, file, SyntaxKind::Identifier);
+        let mut detached = parsed.arena.get(leaf.node).unwrap().clone();
+        detached.parent = None;
+        let detached = parsed.arena.alloc(detached);
+        let root = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
+        assert_eq!(store.source_direct_children(root), None);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+
+        let before = format!("{store:?}");
+        let facts = store.source_node_facts.get(&parsed.arena.id()).unwrap();
+        for (index, parent) in facts.iter().enumerate() {
+            if parent.is_none() {
+                continue;
+            }
+            let parent = NodeRef::new(
+                parsed.arena.id(),
+                file,
+                NodeId::new(u32::try_from(index).unwrap()),
+            );
+            let expected = facts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    (child.as_ref()?.parent == Some(parent.node)).then(|| {
+                        NodeRef::new(
+                            parent.arena,
+                            parent.file,
+                            NodeId::new(u32::try_from(index).unwrap()),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(store.source_direct_children(parent), Some(expected));
+        }
+        let mapped = node_ref_of_kind(&parsed.arena, file, SyntaxKind::MappedType);
+        let mut syntax_order = Vec::new();
+        parsed
+            .arena
+            .get(mapped.node)
+            .unwrap()
+            .for_each_child(|child| syntax_order.push(NodeRef::new(mapped.arena, file, child)));
+        let indexed_order = store.source_direct_children(mapped).unwrap();
+        assert_ne!(indexed_order, syntax_order);
+        assert!(
+            indexed_order
+                .windows(2)
+                .all(|pair| pair[0].node < pair[1].node)
+        );
+        assert_eq!(store.source_direct_children(leaf), Some(Vec::new()));
+        let detached = NodeRef::new(parsed.arena.id(), file, detached);
+        assert!(store.contains_node_ref(detached));
+        assert_eq!(store.source_direct_children(detached), None);
+        let foreign = NodeArena::new();
+        for invalid in [
+            NodeRef::new(foreign.id(), file, root.node),
+            NodeRef::new(root.arena, FileId::new(52), root.node),
+            NodeRef::new(root.arena, file, NodeId::new(u32::MAX)),
+        ] {
+            assert_eq!(store.source_direct_children(invalid), None);
+        }
+        assert_eq!(format!("{store:?}"), before);
+    }
+
+    fn append_source_type_alias(
+        arena: &mut NodeArena,
+        source_file: NodeId,
+    ) -> (NodeId, [NodeId; 2]) {
+        let mut declaration = arena
+            .iter()
+            .find_map(|(_, node)| {
+                matches!(node.data, NodeData::TypeAliasDeclaration(_)).then(|| node.clone())
+            })
+            .unwrap();
+        let NodeData::TypeAliasDeclaration(alias) = &mut declaration.data else {
+            panic!("the fixture contains a type alias")
+        };
+        let mut name = arena.get(alias.name).unwrap().clone();
+        let NodeData::Identifier(identifier) = &mut name.data else {
+            panic!("the alias has an identifier name")
+        };
+        identifier.text = "Appended".to_owned();
+        let annotation = arena.get(alias.type_).unwrap().clone();
+        assert!(annotation.kind.is_keyword_type());
+        alias.name = arena.alloc(name);
+        alias.type_ = arena.alloc(annotation);
+        let children = [alias.name, alias.type_];
+        declaration.parent = Some(source_file);
+        let declaration = arena.alloc(declaration);
+        for child in children {
+            arena.get_mut(child).unwrap().parent = Some(declaration);
+        }
+        let NodeData::SourceFile(source) = &mut arena.get_mut(source_file).unwrap().data else {
+            panic!("the fixture has a source-file root")
+        };
+        source.statements.nodes.push(declaration);
+        (declaration, children)
+    }
+
+    #[test]
+    fn source_direct_children_refreshes_after_accepted_arena_append() {
+        let mut parsed = parse_source_file("type First = number;");
+        let file = FileId::new(53);
+        let mut store = TestStore::new();
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let old_facts = store.source_node_facts[&parsed.arena.id()].clone();
+        let mut expected = store.source_direct_children(source.node_ref()).unwrap();
+        let (appended, children) = append_source_type_alias(&mut parsed.arena, parsed.source_file);
+        let appended = NodeRef::new(parsed.arena.id(), file, appended);
+        assert!(!store.contains_node_ref(appended));
+        assert_eq!(store.source_direct_children(appended), None);
+        assert_eq!(
+            store.source_direct_children(source.node_ref()),
+            Some(expected.clone())
+        );
+
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+        assert_eq!(
+            &store.source_node_facts[&parsed.arena.id()][..old_facts.len()],
+            old_facts.as_slice()
+        );
+        expected.push(appended);
+        assert_eq!(
+            store.source_direct_children(source.node_ref()),
+            Some(expected)
+        );
+        assert_eq!(
+            store.source_direct_children(appended),
+            Some(
+                children
+                    .map(|node| NodeRef::new(appended.arena, file, node))
+                    .to_vec()
+            )
+        );
+        for child in children {
+            assert_eq!(
+                store.source_direct_children(NodeRef::new(appended.arena, file, child)),
+                Some(Vec::new())
+            );
+        }
+        let before = format!("{store:?}");
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+        assert_eq!(format!("{store:?}"), before);
+    }
+
+    #[test]
+    fn source_direct_children_keeps_the_index_after_rejected_registration() {
+        let mut parsed = parse_source_file("type First = number;");
+        let file = FileId::new(54);
+        let original_name = node_ref_of_kind(&parsed.arena, file, SyntaxKind::Identifier).node;
+        let original = parsed.arena.get(original_name).unwrap().clone();
+        let mut store = TestStore::new();
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let index = store.source_node_children.clone();
+        let children = store.source_direct_children(source.node_ref()).unwrap();
+        let (appended, _) = append_source_type_alias(&mut parsed.arena, parsed.source_file);
+        let appended = NodeRef::new(parsed.arena.id(), file, appended);
+        for wrong_parent in [false, true] {
+            let changed = parsed.arena.get_mut(original_name).unwrap();
+            *changed = original.clone();
+            if wrong_parent {
+                changed.parent = None;
+            } else {
+                let NodeData::Identifier(identifier) = &mut changed.data else {
+                    panic!("the selected node is an identifier")
+                };
+                identifier.text = "Changed".to_owned();
+            }
+            let before = format!("{store:?}");
+            assert_eq!(
+                store.register_source_file(&parsed.arena, parsed.source_file, file),
+                None
+            );
+            assert_eq!(store.source_node_children, index);
+            assert_eq!(
+                store.source_direct_children(source.node_ref()),
+                Some(children.clone())
+            );
+            assert!(!store.contains_node_ref(appended));
+            assert_eq!(store.source_direct_children(appended), None);
+            assert_eq!(format!("{store:?}"), before);
+        }
+        *parsed.arena.get_mut(original_name).unwrap() = original;
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            Some(source)
+        );
+        assert!(
+            store
+                .source_direct_children(source.node_ref())
+                .unwrap()
+                .contains(&appended)
+        );
+    }
+
+    #[test]
     fn source_identifier_text_requires_registered_source_ownership() {
         let mut parsed = parse_source_file("type Value = Date;");
         let file = FileId::new(41);
@@ -15341,6 +15734,468 @@ mod tests {
         );
         assert_eq!(store.source_identifier_text(name), Some("Date"));
         assert!(store.contains_source_file(source));
+    }
+
+    #[test]
+    fn source_plain_interface_heritage_retains_exact_ordered_roles() {
+        let mut parsed = parse_source_file(concat!(
+            "interface First {} interface Second {} ",
+            "interface Derived extends Second, First, Second { own: number }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(44);
+        let interfaces = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    id,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [first, second, derived] = interfaces.as_slice() else {
+            panic!("the source has three interfaces")
+        };
+        let clause = node_ref_of_kind(&parsed.arena, file, SyntaxKind::HeritageClause);
+        let bases = parsed
+            .arena
+            .iter()
+            .filter_map(|(expression, node)| match &node.data {
+                NodeData::ExpressionWithTypeArguments(base) => Some(PlainInterfaceBaseFacts {
+                    expression,
+                    name: base.expression,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bases.len(), 3);
+        let expected = PlainInterfaceHeritageFacts::Plain {
+            clause: clause.node,
+            bases: bases.clone().into_boxed_slice(),
+        };
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(AstScope::new(file, &parsed.arena)));
+        assert_eq!(store.source_plain_interface_heritage(*derived), None);
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        for &base in [first, second] {
+            assert_eq!(
+                store.source_plain_interface_heritage(base),
+                Some(&PlainInterfaceHeritageFacts::NoHeritage),
+            );
+        }
+        assert_eq!(
+            store.source_plain_interface_heritage(*derived),
+            Some(&expected)
+        );
+        for (base, name) in bases.iter().zip(["Second", "First", "Second"]) {
+            assert_eq!(
+                store.source_identifier_text(NodeRef::new(derived.arena, file, base.name)),
+                Some(name),
+            );
+        }
+        assert_eq!(
+            store.source_plain_interface_heritage(source.node_ref()),
+            None
+        );
+        assert_eq!(store.source_plain_interface_heritage(clause), None);
+        assert_eq!(
+            store.source_plain_interface_heritage(NodeRef::new(
+                derived.arena,
+                FileId::new(45),
+                derived.node,
+            )),
+            None,
+        );
+        let foreign = parse_source_file("interface Derived extends Other {}");
+        assert_eq!(
+            store.source_plain_interface_heritage(node_ref_of_kind(
+                &foreign.arena,
+                file,
+                SyntaxKind::InterfaceDeclaration,
+            )),
+            None,
+        );
+
+        let NodeData::HeritageClause(heritage) =
+            &mut parsed.arena.get_mut(clause.node).unwrap().data
+        else {
+            panic!("the retained clause has a heritage payload")
+        };
+        heritage.token = SyntaxKind::ImplementsKeyword;
+        assert_eq!(
+            store.register_source_file(&parsed.arena, parsed.source_file, file),
+            None,
+        );
+        assert_eq!(
+            store.source_plain_interface_heritage(*derived),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn source_plain_interface_heritage_keeps_unsupported_source_registered() {
+        for source in [
+            "interface Derived<T> {}",
+            "interface Derived<T> extends Base {}",
+            "interface Derived extends Namespace.Base {}",
+            "interface Derived extends Base<string> {}",
+            "interface Derived implements Base {}",
+            "interface Derived extends First implements Second {}",
+            "interface Derived extends Base, {}",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(46);
+            let declaration =
+                node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration);
+            let mut store = TestStore::new();
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some(),
+                "{source}",
+            );
+            assert_eq!(
+                store.source_plain_interface_heritage(declaration),
+                Some(&PlainInterfaceHeritageFacts::Unsupported),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn source_plain_interface_heritage_rejects_interface_state() {
+        for source in ["interface Base {}", "interface Derived extends Base {}"] {
+            for field in ["flow_node", "local_symbol", "symbol"] {
+                let mut parsed = parse_source_file(source);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let file = FileId::new(51);
+                let declaration =
+                    node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration);
+                let NodeData::InterfaceDeclaration(interface) =
+                    &mut parsed.arena.get_mut(declaration.node).unwrap().data
+                else {
+                    panic!("the declaration is an interface")
+                };
+                match field {
+                    "flow_node" => interface.flow_node = Some(ts_ast::FlowNodeId(1)),
+                    "local_symbol" => interface.local_symbol = Some(ts_ast::SymbolId(1)),
+                    "symbol" => interface.symbol = Some(ts_ast::SymbolId(1)),
+                    _ => unreachable!(),
+                }
+                let mut store = TestStore::new();
+                assert!(
+                    store
+                        .register_source_file(&parsed.arena, parsed.source_file, file)
+                        .is_some(),
+                    "{source}, {field}",
+                );
+                assert_eq!(
+                    store.source_plain_interface_heritage(declaration),
+                    Some(&PlainInterfaceHeritageFacts::Unsupported),
+                    "{source}, {field}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation checks one retained syntax condition.
+    fn source_plain_interface_heritage_rejects_altered_syntax() {
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            EmptyParameters,
+            EmptyClauses,
+            EmptyBases,
+            EmptyArguments,
+            ClauseComma,
+            BaseComma,
+            ClauseFacts,
+            BaseFacts,
+            InterfaceFlags,
+            ClauseFlags,
+            BaseFlags,
+            NameFlags,
+            NameFlow,
+            EmptyName,
+            ClauseRange,
+            BaseListRange,
+            BaseRange,
+            NameRange,
+            BaseOrder,
+        }
+        for damage in [
+            Damage::EmptyParameters,
+            Damage::EmptyClauses,
+            Damage::EmptyBases,
+            Damage::EmptyArguments,
+            Damage::ClauseComma,
+            Damage::BaseComma,
+            Damage::ClauseFacts,
+            Damage::BaseFacts,
+            Damage::InterfaceFlags,
+            Damage::ClauseFlags,
+            Damage::BaseFlags,
+            Damage::NameFlags,
+            Damage::NameFlow,
+            Damage::EmptyName,
+            Damage::ClauseRange,
+            Damage::BaseListRange,
+            Damage::BaseRange,
+            Damage::NameRange,
+            Damage::BaseOrder,
+        ] {
+            let mut parsed = parse_source_file("interface Derived extends First, Second {}");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(47);
+            let declaration =
+                node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration);
+            let clause = node_ref_of_kind(&parsed.arena, file, SyntaxKind::HeritageClause);
+            let expression =
+                node_ref_of_kind(&parsed.arena, file, SyntaxKind::ExpressionWithTypeArguments);
+            let NodeData::ExpressionWithTypeArguments(base) =
+                &parsed.arena.get(expression.node).unwrap().data
+            else {
+                panic!("the base has the expected payload")
+            };
+            let name = base.expression;
+            match damage {
+                Damage::EmptyParameters | Damage::EmptyClauses | Damage::ClauseComma => {
+                    let NodeData::InterfaceDeclaration(interface) =
+                        &mut parsed.arena.get_mut(declaration.node).unwrap().data
+                    else {
+                        panic!("the declaration is an interface")
+                    };
+                    match damage {
+                        Damage::EmptyParameters => {
+                            interface.type_parameters = Some(ts_ast::NodeList::default());
+                        }
+                        Damage::EmptyClauses => {
+                            interface.heritage_clauses.as_mut().unwrap().nodes.clear();
+                        }
+                        Damage::ClauseComma => {
+                            interface
+                                .heritage_clauses
+                                .as_mut()
+                                .unwrap()
+                                .has_trailing_comma = true;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Damage::EmptyBases
+                | Damage::BaseComma
+                | Damage::ClauseFacts
+                | Damage::BaseListRange
+                | Damage::BaseOrder => {
+                    let record = parsed.arena.get_mut(clause.node).unwrap();
+                    let NodeData::HeritageClause(heritage) = &mut record.data else {
+                        panic!("the clause has the expected payload")
+                    };
+                    match damage {
+                        Damage::EmptyBases => heritage.types.nodes.clear(),
+                        Damage::BaseComma => heritage.types.has_trailing_comma = true,
+                        Damage::ClauseFacts => heritage.facts = 1,
+                        Damage::BaseListRange => heritage.types.range.start = record.range.start,
+                        Damage::BaseOrder => heritage.types.nodes.reverse(),
+                        _ => unreachable!(),
+                    }
+                }
+                Damage::EmptyArguments | Damage::BaseFacts => {
+                    let NodeData::ExpressionWithTypeArguments(base) =
+                        &mut parsed.arena.get_mut(expression.node).unwrap().data
+                    else {
+                        panic!("the base has the expected payload")
+                    };
+                    match damage {
+                        Damage::EmptyArguments => {
+                            base.type_arguments = Some(ts_ast::NodeList::default());
+                        }
+                        Damage::BaseFacts => base.facts = 1,
+                        _ => unreachable!(),
+                    }
+                }
+                Damage::InterfaceFlags => {
+                    parsed.arena.get_mut(declaration.node).unwrap().flags = NodeFlags(1);
+                }
+                Damage::ClauseFlags => {
+                    parsed.arena.get_mut(clause.node).unwrap().flags = NodeFlags(1);
+                }
+                Damage::BaseFlags => {
+                    parsed.arena.get_mut(expression.node).unwrap().flags = NodeFlags(1);
+                }
+                Damage::NameFlags => {
+                    parsed.arena.get_mut(name).unwrap().flags = NodeFlags(1);
+                }
+                Damage::NameFlow | Damage::EmptyName => {
+                    let NodeData::Identifier(identifier) =
+                        &mut parsed.arena.get_mut(name).unwrap().data
+                    else {
+                        panic!("the base name is an identifier")
+                    };
+                    match damage {
+                        Damage::NameFlow => identifier.flow_node = Some(ts_ast::FlowNodeId(1)),
+                        Damage::EmptyName => identifier.text.clear(),
+                        _ => unreachable!(),
+                    }
+                }
+                Damage::ClauseRange => {
+                    let record = parsed.arena.get_mut(clause.node).unwrap();
+                    record.range.start = record.range.end;
+                }
+                Damage::BaseRange => {
+                    let record = parsed.arena.get_mut(expression.node).unwrap();
+                    record.range.end = record.range.start;
+                }
+                Damage::NameRange => {
+                    let record = parsed.arena.get_mut(name).unwrap();
+                    record.range.end = record.range.start;
+                }
+            }
+            let mut store = TestStore::new();
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some(),
+                "{damage:?}",
+            );
+            assert_eq!(
+                store.source_plain_interface_heritage(declaration),
+                Some(&PlainInterfaceHeritageFacts::Unsupported),
+                "{damage:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn source_plain_interface_heritage_keeps_registration_parent_checks() {
+        for kind in [
+            SyntaxKind::HeritageClause,
+            SyntaxKind::ExpressionWithTypeArguments,
+            SyntaxKind::Identifier,
+        ] {
+            let mut parsed = parse_source_file("interface Derived extends Base {}");
+            let file = FileId::new(48);
+            let declaration =
+                node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration);
+            let node = if kind == SyntaxKind::Identifier {
+                let expression =
+                    node_ref_of_kind(&parsed.arena, file, SyntaxKind::ExpressionWithTypeArguments);
+                let NodeData::ExpressionWithTypeArguments(base) =
+                    &parsed.arena.get(expression.node).unwrap().data
+                else {
+                    panic!("the base has the expected payload")
+                };
+                base.expression
+            } else {
+                node_ref_of_kind(&parsed.arena, file, kind).node
+            };
+            parsed.arena.get_mut(node).unwrap().parent = None;
+            let mut store = TestStore::new();
+            assert_eq!(
+                store.register_source_file(&parsed.arena, parsed.source_file, file),
+                None,
+                "{kind:?}",
+            );
+            assert_eq!(store.source_plain_interface_heritage(declaration), None);
+        }
+    }
+
+    #[test]
+    fn source_global_bindings_keep_declaration_order_after_symbol_changes() {
+        let first = parse_source_file(concat!(
+            "interface Base { first: string } ",
+            "interface Derived extends Base { first: string }",
+        ));
+        let second = parse_source_file(concat!(
+            "interface Base { second: number } declare var Base: unknown; ",
+            "interface Derived { second: number } declare var Derived: unknown;",
+        ));
+        let files = [(FileId::new(49), &first), (FileId::new(50), &second)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(&format!("\"/heritage-snapshot-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let globals = context.globals();
+        let owners = ["Base", "Derived"].map(|name| {
+            context
+                .store()
+                .symbol_table(globals)
+                .and_then(|table| table.get_source(name))
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap()
+        });
+        let store = context.store_mut_for_test();
+        for owner in owners {
+            let retained = |store: &CanonicalTypeMapperStore| {
+                store
+                    .source_global_bindings()
+                    .unwrap()
+                    .iter()
+                    .find(|binding| binding.symbol == owner)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec()
+            };
+            let record = store.symbol(owner).unwrap();
+            let original = record.declarations().unwrap().to_vec();
+            let value = record.value_declaration();
+            assert_eq!(original.len(), 3);
+            assert_eq!(retained(store), original);
+            let mut reversed = original.clone();
+            reversed.reverse();
+            for declarations in [None, Some(Vec::new()), Some(reversed)] {
+                assert!(store.set_symbol_declarations(owner, declarations, None));
+                let before = format!("{store:?}");
+                assert_eq!(retained(store), original);
+                assert!(!store.record_source_global_bindings(globals));
+                assert_eq!(format!("{store:?}"), before);
+            }
+            assert!(store.set_symbol_declarations(owner, Some(original.clone()), value));
+            assert_eq!(retained(store), original);
+        }
+        let unknown = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source("Unrecorded"),
+            ))
+            .unwrap();
+        assert!(
+            store
+                .source_global_bindings()
+                .unwrap()
+                .iter()
+                .all(|binding| binding.symbol != unknown)
+        );
     }
 
     #[test]

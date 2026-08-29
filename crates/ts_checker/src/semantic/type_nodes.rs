@@ -4229,6 +4229,8 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     function_indirection_depth: usize,
     intersection_planning_depth: usize,
     lazy_interface_values: bool,
+    native_parameter_interface_values: bool,
+    native_parameter_aliases: HashSet<SemanticSymbolId>,
     check_merged_global_interface_members: bool,
     source_callable_alias_planning: bool,
     source_callable_scope: Option<Box<SourceCallablePlan>>,
@@ -4263,6 +4265,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             function_indirection_depth: 0,
             intersection_planning_depth: 0,
             lazy_interface_values: false,
+            native_parameter_interface_values: false,
+            native_parameter_aliases: HashSet::new(),
             check_merged_global_interface_members: false,
             source_callable_alias_planning: false,
             source_callable_scope: None,
@@ -4552,6 +4556,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         alias_owner: Option<SemanticSymbolId>,
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
+        let previous = self.native_parameter_interface_values;
+        if previous {
+            let record = preflight_node(self.store, self.host, node)?;
+            self.native_parameter_interface_values = matches!(
+                record.kind,
+                SyntaxKind::UnionType | SyntaxKind::ParenthesizedType
+            ) || matches!(
+                &record.data,
+                NodeData::TypeReferenceNode(reference)
+                    if record.kind == SyntaxKind::TypeReference
+                        && reference.type_arguments.is_none()
+            );
+        }
+        let result = self.plan_type_node_in_context_worker(node, alias_owner, union_constituent);
+        self.native_parameter_interface_values = previous;
+        result
+    }
+
+    fn plan_type_node_in_context_worker(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+        union_constituent: bool,
+    ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
         if self.source_callable_scope.is_some() {
             self.plan.nodes.insert(node);
@@ -4579,6 +4607,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 match self.validate_cached_union_result(cached, alias_owner.or(derived_alias)) {
                     Ok(())
                         if !self.replay_cached_annotations
+                            && !self.native_parameter_interface_values
                             && !replay_generic_union
                             && self.type_reference_alias_targets.is_empty()
                             && !alias_owner.is_some_and(|owner| {
@@ -4764,7 +4793,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     .map_err(type_construction_error)?;
             }
         }
-        if self.replay_cached_annotations {
+        if self.replay_cached_annotations || self.native_parameter_interface_values {
             self.validate_replayed_annotation_cache(node)?;
         }
         Ok(())
@@ -9380,6 +9409,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<(), DeclaredTypeError> {
+        let previous = self.native_parameter_interface_values;
+        self.native_parameter_interface_values = false;
+        let result = self.plan_property_interface_worker(symbol);
+        self.native_parameter_interface_values = previous;
+        result
+    }
+
+    fn plan_property_interface_worker(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
         let symbol = self
             .store
             .get_merged_symbol(symbol)
@@ -9481,11 +9521,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .chain(planned.call_type_nodes())
             {
                 let previous = self.lazy_interface_values;
+                let previous_native_parameter = self.native_parameter_interface_values;
                 self.lazy_interface_values |= separate_global_value
                     && !library_method_parameters.contains(&annotation)
                     || library_method_returns.contains(&annotation);
+                self.native_parameter_interface_values =
+                    library_method_parameters.contains(&annotation);
                 let result = self.plan_type_node_in_context(annotation, None, false);
                 self.lazy_interface_values = previous;
+                self.native_parameter_interface_values = previous_native_parameter;
                 result?;
             }
             Ok(())
@@ -14498,6 +14542,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !self.replay_cached_annotations
             && !union_constituent
             && !self.lazy_interface_values
+            && !self.native_parameter_interface_values
             && !self.source_callable_alias_planning
             && self.intersection_planning_depth == 0
             && exact_import.is_none()
@@ -14608,6 +14653,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if let Some(symbol) = cached_symbol.filter(|_| {
             !source_parameter_constraint
                 && !self.lazy_interface_values
+                && !self.native_parameter_interface_values
                 && !self.source_callable_alias_planning
                 && !self.replay_cached_annotations
         }) {
@@ -14823,6 +14869,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
+            if local_count != 0 {
+                self.native_parameter_interface_values = false;
+            }
             let global_jsx_element = local_count == 0
                 && flags.contains(SymbolFlags::INTERFACE)
                 && !flags.contains(SymbolFlags::CLASS)
@@ -14850,6 +14899,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && !self.is_default_library_template_strings_array(symbol)
                     && !global_jsx_element
                     && !self.is_default_library_dom_interface_argument(node, symbol)
+                    && !(self.native_parameter_interface_values
+                        && self
+                            .store
+                            .native_global_parameter_interface_is_supported(
+                                symbol,
+                                self.array_targets,
+                                &self.plan.pending_function_proofs,
+                            )
+                            .map_err(type_construction_error)?)
                 {
                     self.plan_property_interface(symbol)?;
                 }
@@ -15013,6 +15071,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         } else if flags.contains(SymbolFlags::TYPE_ALIAS) {
             let type_parameter_count = self.plan_type_alias(symbol, union_constituent)?;
+            if type_parameter_count != 0 {
+                self.native_parameter_interface_values = false;
+            }
             if type_parameter_count != 0
                 && let Some(owner) = alias_owner
                 && !self.is_local_type_alias(symbol)?
@@ -22678,6 +22739,81 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         symbol: SemanticSymbolId,
         union_constituent: bool,
     ) -> Result<usize, DeclaredTypeError> {
+        let previous = self.native_parameter_interface_values;
+        self.native_parameter_interface_values =
+            previous && self.native_parameter_identity_alias_source(symbol);
+        // Mark before entering the body so recursive aliases retain their existing guard.
+        let replay_native_body = self.native_parameter_interface_values
+            && self.native_parameter_aliases.insert(symbol)
+            && self.plan.aliases.contains_key(&symbol);
+        let result = (|| {
+            let count = self.plan_type_alias_worker(symbol, union_constituent)?;
+            if replay_native_body
+                || !self.native_parameter_interface_values
+                    && !self.lazy_interface_values
+                    && self.native_parameter_aliases.remove(&symbol)
+            {
+                // Native replay checks every cache. A later ordinary use also needs the body.
+                let body = self
+                    .plan
+                    .aliases
+                    .get(&symbol)
+                    .expect("a native parameter alias has a completed source plan")
+                    .type_node;
+                self.plan_type_node_in_context(body, Some(symbol), union_constituent)?;
+            }
+            Ok(count)
+        })();
+        self.native_parameter_interface_values = previous;
+        result
+    }
+
+    // Normal alias planning still checks source ownership and every retained cache.
+    fn native_parameter_identity_alias_source(&self, symbol: SemanticSymbolId) -> bool {
+        let Some([declaration]) = self
+            .store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+        else {
+            return false;
+        };
+        let Some(record) = self.host.node(*declaration) else {
+            return false;
+        };
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+            return false;
+        };
+        if record.kind != SyntaxKind::TypeAliasDeclaration || alias.type_parameters.is_some() {
+            return false;
+        }
+        let mut node = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+        let mut visited = HashSet::new();
+        while visited.insert(node) {
+            let Some(record) = self.host.node(node) else {
+                return false;
+            };
+            match &record.data {
+                NodeData::ParenthesizedTypeNode(parenthesized)
+                    if record.kind == SyntaxKind::ParenthesizedType =>
+                {
+                    node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+                }
+                NodeData::TypeReferenceNode(reference)
+                    if record.kind == SyntaxKind::TypeReference =>
+                {
+                    return reference.type_arguments.is_none();
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn plan_type_alias_worker(
+        &mut self,
+        symbol: SemanticSymbolId,
+        union_constituent: bool,
+    ) -> Result<usize, DeclaredTypeError> {
         let cached = cached_type_alias(
             self.store,
             self.host,
@@ -23017,6 +23153,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan_type_alias(target, union_constituent)?;
         }
         if self.replay_cached_annotations
+            || self.native_parameter_interface_values
             || self.intersection_planning_depth != 0
             || self.source_callable_alias_planning
             || cached.is_none()
@@ -36693,6 +36830,510 @@ mod tests {
         }
         assert_eq!(function_store_state(context.store()), before);
         assert!(context.diagnostics().is_empty());
+    }
+
+    fn native_global_parameter_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source(name))
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap()
+    }
+
+    fn native_global_parameter_annotation(
+        parsed: &ParseResult,
+        file: FileId,
+        method_name: &str,
+        parameter_name: &str,
+    ) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                    return None;
+                };
+                if identifier_text(&parsed.arena, method.name) != Some(method_name) {
+                    return None;
+                }
+                method.parameters.nodes.iter().find_map(|parameter| {
+                    let NodeData::ParameterDeclaration(parameter) =
+                        &parsed.arena.get(*parameter)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier_text(&parsed.arena, parameter.name) == Some(parameter_name))
+                        .then(|| NodeRef::new(parsed.arena.id(), file, parameter.type_.unwrap()))
+                })
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep real native roots, optional identities, replay, and alias restoration together.
+    fn native_global_parameters_keep_real_window_and_proxy_cold() {
+        let library = parse_source_file(concat!(
+            include_str!("../../../ts_bundled/libs/lib.es5.d.ts"),
+            "\n",
+            include_str!("../../../ts_bundled/libs/lib.dom.d.ts"),
+        ));
+        let source = parse_source_file(
+            "declare let ui: UIEvent; declare let composition: CompositionEvent;",
+        );
+        for strict_null_checks in [false, true] {
+            let (mut context, library_file, source_file) =
+                native_method_parameter_context(&library, &source, strict_null_checks);
+            let window = native_global_parameter_symbol(&context, "Window");
+            let proxy = native_global_parameter_symbol(&context, "WindowProxy");
+            let owners = ["UIEvent", "CompositionEvent"]
+                .map(|name| native_global_parameter_symbol(&context, name));
+            let annotations = ["initUIEvent", "initCompositionEvent"].map(|method| {
+                native_global_parameter_annotation(&library, library_file, method, "viewArg")
+            });
+            assert!(context.store().declared_type_links(window).is_none());
+            for annotation in annotations {
+                assert!(context.store().type_node_links(annotation).is_none());
+            }
+            let owner_types =
+                owners.map(|owner| context.get_declared_type_of_symbol(owner).unwrap());
+            context.check_source_file(source_file).unwrap();
+            let window_type = context
+                .store()
+                .declared_type_links(window)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            assert_eq!(context.get_declared_type_of_symbol(proxy), Ok(window_type));
+            assert_eq!(
+                context
+                    .store()
+                    .type_alias_links(proxy)
+                    .unwrap()
+                    .declared_type,
+                Some(window_type),
+            );
+            assert_eq!(
+                context.store().type_payload(window_type).unwrap().alias(),
+                None
+            );
+            assert!(context.store().value_symbol_links(window).is_none());
+            let base_owners = [
+                "EventTarget",
+                "AnimationFrameProvider",
+                "GlobalEventHandlers",
+                "WindowEventHandlers",
+                "WindowLocalStorage",
+                "WindowOrWorkerGlobalScope",
+                "WindowSessionStorage",
+            ]
+            .map(|name| native_global_parameter_symbol(&context, name));
+            let cold_types = std::iter::once(window)
+                .chain(base_owners)
+                .map(|owner| {
+                    context
+                        .store()
+                        .declared_type_links(owner)
+                        .unwrap()
+                        .declared_type
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let cold = cold_types
+                .iter()
+                .map(|type_| {
+                    let TypeData::Interface(data) =
+                        context.store().type_payload(*type_).unwrap().data()
+                    else {
+                        panic!("native interface identities must remain interfaces")
+                    };
+                    assert!(!data.base_types_resolved);
+                    assert!(!data.declared_members_resolved);
+                    assert_eq!(data.declared_members, None);
+                    assert_eq!(data.resolved_base_types, None);
+                    assert_eq!(
+                        data.reference.object.structured,
+                        StructuredTypeData::default()
+                    );
+                    assert!(
+                        context
+                            .store()
+                            .direct_interface_heritage_provenance(*type_)
+                            .is_none()
+                    );
+                    data.clone()
+                })
+                .collect::<Vec<_>>();
+            let annotation_types =
+                annotations.map(|annotation| context.get_type_from_type_node(annotation).unwrap());
+            assert_eq!(annotation_types[0], annotation_types[1]);
+            if strict_null_checks {
+                let nullable = union_types(context.store(), annotation_types[0]);
+                assert_eq!(nullable.len(), 2);
+                assert!(nullable.contains(&window_type));
+                assert!(
+                    nullable.contains(&context.store().intrinsic_bootstrap().unwrap().null_type)
+                );
+            } else {
+                assert_eq!(annotation_types, [window_type; 2]);
+            }
+            for ((owner, method_name), annotation_type) in owners
+                .into_iter()
+                .zip(["initUIEvent", "initCompositionEvent"])
+                .zip(annotation_types)
+            {
+                let method = context
+                    .store()
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source(method_name))
+                    .unwrap();
+                let callable = context
+                    .store()
+                    .value_symbol_links(method)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                let signature = context
+                    .store()
+                    .type_payload(callable)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.signatures.as_deref())
+                    .unwrap()[0];
+                let parameters = context
+                    .store()
+                    .callable_signature_parameter_types(signature)
+                    .unwrap();
+                assert_eq!(parameters.len(), 5);
+                assert_eq!(
+                    context
+                        .store()
+                        .validate_optional_parameter_type_metadata(annotation_type, parameters[3]),
+                    Ok(()),
+                );
+            }
+            let warm = (
+                function_store_state(context.store()),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            );
+            for _ in 0..2 {
+                context.recheck_source_file(source_file).unwrap();
+                for (owner, expected) in owners.into_iter().zip(owner_types) {
+                    assert_eq!(context.get_declared_type_of_symbol(owner), Ok(expected));
+                }
+                assert_eq!(context.get_declared_type_of_symbol(proxy), Ok(window_type));
+                for (annotation, expected) in annotations.into_iter().zip(annotation_types) {
+                    assert_eq!(context.get_type_from_type_node(annotation), Ok(expected));
+                }
+                for (type_, expected) in cold_types.iter().zip(&cold) {
+                    let TypeData::Interface(actual) =
+                        context.store().type_payload(*type_).unwrap().data()
+                    else {
+                        unreachable!();
+                    };
+                    assert_eq!(actual, expected);
+                }
+                assert_eq!(
+                    (
+                        function_store_state(context.store()),
+                        context.store().symbol_len(),
+                        context.store().symbol_store().symbol_table_len(),
+                    ),
+                    warm,
+                );
+            }
+            let alias_links = context.store().type_alias_links(proxy).unwrap().clone();
+            let mut poisoned = alias_links.clone();
+            poisoned.type_parameters = Some(Vec::new());
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_alias_links(proxy, poisoned)
+            );
+            let poisoned_state = function_store_state(context.store());
+            assert_eq!(
+                context.get_declared_type_of_symbol(proxy),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(proxy)
+                )),
+            );
+            assert_eq!(function_store_state(context.store()), poisoned_state);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_alias_links(proxy, alias_links)
+            );
+            assert_eq!(context.get_declared_type_of_symbol(proxy), Ok(window_type));
+            assert_eq!(function_store_state(context.store()), warm.0);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_global_parameters_do_not_defer_unrelated_annotation_paths() {
+        for methods in [
+            "accept(value?: Root[]): void;",
+            "accept(value?: Generic<string>): void;",
+            "accept(value?: Defaulted): void;",
+            "accept(value?: Compound): void;",
+            "accept(value?: Native.Options): void;",
+            "accept(first?: Proxy, second?: Proxy[]): void;",
+            "first(value?: Proxy): Proxy; second(value?: Proxy[]): void;",
+        ] {
+            let library = parse_source_file(&format!(
+                concat!(
+                    "interface Array<T> {{}} interface ReadonlyArray<T> {{}} ",
+                    "interface Left {{ left: string; }} interface Middle {{ middle: number; }} ",
+                    "interface Right {{ right: boolean; }} ",
+                    "interface Root extends Left, Middle, Right {{ own: number; }} ",
+                    "declare var Root: unknown; type Proxy = Root; ",
+                    "type Generic<T> = Root; type Compound = Root | null; ",
+                    "type Defaulted<T = Root> = T; ",
+                    "declare namespace Native {{ interface Options {{ nested: Root; }} }} ",
+                    "interface Service {{ {} }} declare var Service: unknown;",
+                ),
+                methods,
+            ));
+            let source = parse_source_file("");
+            let (context, library_file, source_file) =
+                native_method_parameter_context(&library, &source, true);
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(source_file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let root = native_global_parameter_symbol(&context, "Root");
+            let service = native_global_parameter_symbol(&context, "Service");
+            let heritage = library
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::HeritageClause).then_some(NodeRef::new(
+                        library.arena.id(),
+                        library_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let aliases = HashMap::new();
+            let before = function_store_state(context.store());
+            let mut planner = TypeQueryPlanner::new(
+                context.store(),
+                &host,
+                Some(context.global_types().array_type),
+                Some(CanonicalArrayTargets::from_global_types(
+                    context.global_types(),
+                )),
+                false,
+                &aliases,
+            );
+            assert_eq!(
+                planner.plan_property_interface(service),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: heritage,
+                        kind: SyntaxKind::HeritageClause,
+                    }
+                )),
+                "{methods}",
+            );
+            assert!(!planner.native_parameter_interface_values);
+            assert!(!planner.lazy_interface_values);
+            assert!(planner.planning_interfaces.is_empty());
+            assert!(!planner.plan.interfaces.contains_key(&root));
+            assert_eq!(function_store_state(context.store()), before);
+            assert!(context.store().declared_type_links(root).is_none());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check real cold-method annotations before any signature can validate them.
+    fn native_global_parameters_reject_changed_annotation_caches_before_member_publication() {
+        for spelling in ["Root", "Proxy", "Root | null", "(Proxy | null)"] {
+            let library = parse_source_file(&format!(
+                concat!(
+                    "interface Array<T> {{}} interface ReadonlyArray<T> {{}} ",
+                    "interface Left {{ left: string; }} interface Middle {{ middle: number; }} ",
+                    "interface Right {{ right: boolean; }} ",
+                    "interface Root extends Left, Middle, Right {{ own: number; }} ",
+                    "declare var Root: unknown; type Proxy = Root; ",
+                    "interface Service {{ head(): Proxy; accept(value?: {}): void; }} ",
+                    "declare var Service: unknown;",
+                ),
+                spelling,
+            ));
+            let source = parse_source_file("");
+            let (mut context, library_file, source_file) =
+                native_method_parameter_context(&library, &source, true);
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(source_file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let root = native_global_parameter_symbol(&context, "Root");
+            let service = native_global_parameter_symbol(&context, "Service");
+            let annotation =
+                native_global_parameter_annotation(&library, library_file, "accept", "value");
+            let (reference, annotation_roots) = {
+                let mut pending = vec![annotation];
+                let mut roots = vec![annotation];
+                loop {
+                    let node = pending.pop().unwrap();
+                    let record = library.arena.get(node.node).unwrap();
+                    if record.kind == SyntaxKind::TypeReference {
+                        break (node, roots);
+                    }
+                    if record.kind == SyntaxKind::UnionType && node != annotation {
+                        roots.push(node);
+                    }
+                    record.for_each_child(|child| {
+                        pending.push(NodeRef::new(node.arena, node.file, child));
+                    });
+                }
+            };
+            let globals = context.global_types().clone();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            });
+            // The existing identity-only query publishes annotation caches, not the method.
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node_worker(annotation, true)
+            .unwrap();
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            let root_type = context
+                .store()
+                .declared_type_links(root)
+                .unwrap()
+                .declared_type
+                .unwrap();
+            let method = context
+                .store()
+                .symbol(service)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("accept"))
+                .unwrap();
+            assert!(context.store().value_symbol_links(method).is_none());
+            let mut damage = vec![(reference, 0), (reference, 1), (reference, 2)];
+            for node in annotation_roots {
+                if node != reference {
+                    damage.extend([(node, 0), (node, 2)]);
+                }
+            }
+            for (node, kind) in damage {
+                let types = context
+                    .store()
+                    .type_node_links(node)
+                    .cloned()
+                    .unwrap_or_default();
+                let symbols = context
+                    .store()
+                    .symbol_node_links(reference)
+                    .unwrap()
+                    .clone();
+                let mut changed_types = types.clone();
+                let mut changed_symbols = symbols.clone();
+                match kind {
+                    0 => {
+                        changed_types.resolved_type =
+                            Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+                    }
+                    1 => changed_symbols.resolved_symbol = None,
+                    2 => changed_types.outer_type_parameters = Some(Vec::new()),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(node, changed_types)
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(reference, changed_symbols)
+                );
+                let before = function_store_state(context.store());
+                let aliases = HashMap::new();
+                let mut planner = TypeQueryPlanner::new(
+                    context.store(),
+                    &host,
+                    Some(globals.array_type),
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    false,
+                    &aliases,
+                );
+                assert_eq!(
+                    planner.plan_property_interface(service),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidTypeReference(node)
+                    )),
+                    "{spelling}, damage {kind}",
+                );
+                assert!(!planner.native_parameter_interface_values);
+                assert!(!planner.lazy_interface_values);
+                assert!(planner.planning_interfaces.is_empty());
+                assert_eq!(function_store_state(context.store()), before);
+                assert!(context.store().value_symbol_links(method).is_none());
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(node, types)
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(reference, symbols)
+                );
+                let restored = function_store_state(context.store());
+                let mut planner = TypeQueryPlanner::new(
+                    context.store(),
+                    &host,
+                    Some(globals.array_type),
+                    Some(CanonicalArrayTargets::from_global_types(&globals)),
+                    false,
+                    &aliases,
+                );
+                planner.plan_property_interface(service).unwrap();
+                assert!(!planner.plan.interfaces.contains_key(&root));
+                assert_eq!(function_store_state(context.store()), restored);
+                let TypeData::Interface(root_data) =
+                    context.store().type_payload(root_type).unwrap().data()
+                else {
+                    unreachable!();
+                };
+                assert!(!root_data.declared_members_resolved);
+                assert!(!root_data.base_types_resolved);
+            }
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert!(diagnostics.is_empty());
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
