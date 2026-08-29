@@ -140,6 +140,80 @@ pub(super) struct PropertyObjectAliasMembers {
     pub(super) properties: Vec<SemanticSymbolId>,
 }
 
+/// The property-function producer retains the caller's capability on its real copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct InstantiatedPropertyAliasCallable {
+    type_: TypeId,
+    source: TypeId,
+    mapper: TypeMapperId,
+    array_targets: Option<CanonicalArrayTargets>,
+}
+
+impl InstantiatedPropertyAliasCallable {
+    pub(super) const fn type_(self) -> TypeId {
+        self.type_
+    }
+
+    pub(super) fn matches_current_type(self, store: &CanonicalTypeMapperStore) -> bool {
+        let Some((symbol, signature)) = function_member_signature(store, self.source) else {
+            return false;
+        };
+        if self.type_ == self.source
+            || store.mapper_payload(self.mapper).is_none()
+            || instantiated_function_property_owner(store, self.source, self.mapper).is_none()
+            || self.array_targets.is_some_and(|targets| {
+                store.type_payload(targets.array_type()).is_none()
+                    || store.type_payload(targets.readonly_array_type()).is_none()
+            })
+        {
+            return false;
+        }
+        let Some(record) = store.type_payload(self.type_) else {
+            return false;
+        };
+        let TypeData::Object(object) = record.data() else {
+            return false;
+        };
+        let Some([copied_id]) = object.structured.signatures.as_deref() else {
+            return false;
+        };
+        let Some(original) = store.signature(signature.source) else {
+            return false;
+        };
+        record.flags() == TypeFlags::OBJECT
+            && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            && record.symbol() == Some(symbol)
+            && record.alias().is_none()
+            && object.target == Some(self.source)
+            && object.mapper == Some(self.mapper)
+            && object.instantiations == TypeCacheState::Unallocated
+            && object.structured.members.is_none()
+            && object.structured.properties.is_none()
+            && object.structured.index_infos.is_none()
+            && object.structured.call_signature_count == 1
+            && object.structured.constrained == ConstrainedTypeData::default()
+            && object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_none()
+            && store.signature(*copied_id).is_some_and(|copied| {
+                copied.target() == Some(signature.source)
+                    && copied.mapper() == Some(self.mapper)
+                    && copied.flags() == original.flags() & SignatureFlags::PROPAGATING_FLAGS
+                    && copied.declaration() == original.declaration()
+                    && copied.type_parameters().is_empty()
+                    && copied.this_parameter().is_none()
+                    && copied.parameters().len() == original.parameters().len()
+                    && copied.min_argument_count() == original.min_argument_count()
+                    && copied.resolved_min_argument_count() == -1
+                    && copied.resolved_return_type().is_some()
+                    && copied.isolated_signature_type().is_none()
+                    && copied.composite().is_none()
+                    && !store.signature_has_circular_return_type(*copied_id)
+            })
+    }
+}
+
 /// One property selected from a direct generic-interface reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstantiatedInterfaceProperty {
@@ -2006,6 +2080,18 @@ pub(super) fn demand_property_object_alias_property(
     if projection.type_ == projection.target {
         return Ok(template);
     }
+    if store.type_has_function_type_provenance(template) {
+        let (_, signature, _) = function_member_parameters(store, template).ok_or_else(invalid)?;
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_return_type_of_signature(signature)?;
+    }
     let mapper = projection.mapper.ok_or_else(invalid)?;
     let limit_mark = session.limit_event_mark();
     let instantiated =
@@ -3833,7 +3919,11 @@ fn function_member_parameters(
     ) {
         return None;
     }
-    function_member_declaring_method(store, source)?;
+    if function_member_declaring_method(store, source).is_none()
+        && function_member_declaring_property_alias(store, source).is_none()
+    {
+        return None;
+    }
     let record = store.type_payload(source)?;
     let [signature] = record.data().structured()?.signatures.as_deref()? else {
         return None;
@@ -3933,7 +4023,150 @@ fn function_member_declaring_method(
     })
 }
 
-/// Copies a function-valued member through its enclosing method mapper.
+/// Proves a direct function annotation on an original property-object alias.
+fn function_member_declaring_property_alias(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+) -> Option<PropertyObjectAliasProjection> {
+    let symbol = store.type_payload(source)?.symbol()?;
+    let [declaration] = store.symbol(symbol)?.declarations()? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(property) = store.source_node_parent(*declaration)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(owner) = store.source_node_parent(property)? else {
+        return None;
+    };
+    if store.source_node_kind(*declaration) != Some(SyntaxKind::FunctionType)
+        || !matches!(
+            store.source_node_kind(property),
+            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+        )
+        || store.source_node_kind(owner) != Some(SyntaxKind::TypeLiteral)
+        || store.source_direct_type_annotation(property) != Some(*declaration)
+    {
+        return None;
+    }
+    let target = store.type_node_links(owner)?.resolved_type?;
+    let projection = property_object_alias_projection(store, target).ok()??;
+    if projection.type_ != projection.target || projection.declaration != owner {
+        return None;
+    }
+    let index = projection
+        .properties
+        .iter()
+        .position(|planned| planned.declaration == property && planned.type_node == *declaration)?;
+    matches!(
+        selected_property_object_alias_property(store, &projection, index).ok()?,
+        SelectedDeclaredProperty::Resolved(property) if property.type_ == source
+    )
+    .then_some(projection)
+}
+
+/// An alias mapper must belong to an instance in its original target's cache.
+fn instantiated_function_property_owner(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    mapper: TypeMapperId,
+) -> Option<TypeId> {
+    let original = function_member_declaring_property_alias(store, source)?;
+    let TypeData::Object(target) = store.type_payload(original.target)?.data() else {
+        return None;
+    };
+    let TypeCacheState::Allocated(entries) = &target.instantiations else {
+        return None;
+    };
+    entries.values().find_map(|&receiver| {
+        let TypeData::Object(object) = store.type_payload(receiver)?.data() else {
+            return None;
+        };
+        if object.mapper != Some(mapper) {
+            return None;
+        }
+        let projection = property_object_alias_projection(store, receiver).ok()??;
+        (projection.target == original.target
+            && projection.mapper == Some(mapper)
+            && projection.parameters == original.parameters)
+            .then_some(receiver)
+    })
+}
+
+/// Reads a real property recovery without entering the member or callable graph again.
+fn instantiated_function_property_recovery(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    actual: TypeId,
+    mapper: TypeMapperId,
+    receiver: TypeId,
+) -> Option<Option<InstantiatedPropertyRecoveryIdentity<'_>>> {
+    let original = function_member_declaring_property_alias(store, source)?;
+    let declaration = store
+        .type_payload(source)?
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))?
+        .declarations()?
+        .first()?;
+    let index = original
+        .properties
+        .iter()
+        .position(|property| property.type_node == *declaration)?;
+    let record = store.type_payload(receiver)?;
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return (record.data().structured()? == &StructuredTypeData::default()).then_some(None);
+    }
+    let (members, properties) =
+        property_object_alias_member_table(store, receiver, original.properties.len()).ok()?;
+    let property = *properties.get(index)?;
+    let Some(recovery) = store.instantiated_property_recovery(property) else {
+        return Some(None);
+    };
+    let source_property = original.properties.get(index)?;
+    let record = store.symbol(property)?;
+    let target = store.symbol(source_property.symbol)?;
+    let expected_checks = CheckFlags::INSTANTIATED
+        | if source_property.readonly {
+            CheckFlags::READONLY
+        } else {
+            CheckFlags::NONE
+        };
+    if recovery.method
+        || recovery.template != source
+        || recovery.result != actual
+        || recovery.target != source_property.symbol
+        || recovery.mapper != mapper
+        || members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(source_property.name.as_ref()))
+            != Some(property)
+        || record.flags() != target.flags() | SymbolFlags::TRANSIENT
+        || record.check_flags() != expected_checks
+        || record.name() != target.name()
+        || record.declarations() != target.declarations()
+        || record.value_declaration() != target.value_declaration()
+        || record.parent() != target.parent()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(property) != Some(property)
+        || store.value_symbol_links(property)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(actual),
+                target: Some(source_property.symbol),
+                mapper: Some(mapper),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return None;
+    }
+    Some(Some(recovery.checked_identity(store)?))
+}
+
+/// Copies a function-valued member through its authenticated owner mapper.
+#[allow(clippy::too_many_lines)] // Keep cache checks, caller mapping, and publication together.
 fn instantiate_function_member_type(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
@@ -3943,6 +4176,10 @@ fn instantiate_function_member_type(
 ) -> Result<TypeId, GenericInterfaceMemberError> {
     let (symbol, template) = function_member_signature(store, source)
         .ok_or(GenericInterfaceMemberError::UnsupportedPropertyType(source))?;
+    let property_alias = function_member_declaring_property_alias(store, source).is_some();
+    if property_alias && instantiated_function_property_owner(store, source, mapper).is_none() {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+    }
     let mut cached = None;
     for (type_, record) in store.types() {
         let TypeData::Object(object) = record.data() else {
@@ -3951,6 +4188,10 @@ fn instantiate_function_member_type(
         if object.target == Some(source)
             && object.mapper == Some(mapper)
             && (cached.replace(type_).is_some()
+                || property_alias
+                    && store
+                        .instantiated_property_alias_callable(type_)
+                        .is_none_or(|origin| origin.source != source || origin.mapper != mapper)
                 || !instantiated_function_member_type_matches(
                     store,
                     source,
@@ -3965,7 +4206,19 @@ fn instantiate_function_member_type(
     if let Some(cached) = cached {
         return Ok(cached);
     }
-    if !store.try_reserve_types(1) || !store.try_reserve_signatures(1) {
+    let origin = property_alias.then_some((source, mapper, array_targets));
+    if origin.is_some()
+        && array_targets.is_some_and(|targets| {
+            store.type_payload(targets.array_type()).is_none()
+                || store.type_payload(targets.readonly_array_type()).is_none()
+        })
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
+    }
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+        || origin.is_some() && !store.try_reserve_instantiated_property_alias_callables()
+    {
         return Err(GenericInterfaceMemberError::Capacity(source));
     }
     let signature = instantiate_generic_method_signature(
@@ -4017,10 +4270,20 @@ fn instantiate_function_member_type(
     {
         return Err(GenericInterfaceMemberError::InvalidCachedMembers(source));
     }
+    if let Some((source, mapper, array_targets)) = origin {
+        assert!(store.publish_instantiated_property_alias_callable(
+            InstantiatedPropertyAliasCallable {
+                type_: callable,
+                source,
+                mapper,
+                array_targets,
+            },
+        ));
+    }
     Ok(callable)
 }
 
-/// Validates copied callback signatures without changing declaration caches.
+/// Validates copies under both their retained and current caller capabilities.
 pub(super) fn instantiated_function_member_type_matches(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
@@ -4028,7 +4291,28 @@ pub(super) fn instantiated_function_member_type_matches(
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> bool {
-    instantiated_function_member_projection(store, source, actual, mapper, array_targets).is_some()
+    if function_member_declaring_property_alias(store, source).is_some() {
+        let Some(origin) = store.instantiated_property_alias_callable(actual) else {
+            return false;
+        };
+        if origin.source != source
+            || origin.mapper != mapper
+            || origin.array_targets != array_targets
+                && instantiated_function_member_projection(
+                    store,
+                    source,
+                    actual,
+                    mapper,
+                    origin.array_targets,
+                    None,
+                )
+                .is_none()
+        {
+            return false;
+        }
+    }
+    instantiated_function_member_projection(store, source, actual, mapper, array_targets, None)
+        .is_some()
 }
 
 #[allow(clippy::too_many_lines)] // The callback and each parameter retain independent source proofs.
@@ -4038,8 +4322,16 @@ fn instantiated_function_member_projection(
     actual: TypeId,
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
+    recovery: Option<InstantiatedPropertyRecoveryIdentity<'_>>,
 ) -> Option<ValidatedSingleCallable> {
     let (symbol, template) = function_member_signature(store, source)?;
+    if function_member_declaring_property_alias(store, source).is_some() {
+        instantiated_function_property_owner(store, source, mapper)?;
+        let origin = store.instantiated_property_alias_callable(actual)?;
+        if origin.source != source || origin.mapper != mapper {
+            return None;
+        }
+    }
     let original = store.signature(template.source)?;
     let record = store.type_payload(actual)?;
     let TypeData::Object(object) = record.data() else {
@@ -4051,6 +4343,19 @@ fn instantiated_function_member_projection(
     let signature_id = *signature;
     let signature = store.signature(signature_id)?;
     let return_type = signature.resolved_return_type()?;
+    let recovered = match recovery {
+        Some(recovery) => {
+            if recovery.source_type() != source
+                || recovery.result_type() != actual
+                || recovery.mapper() != mapper
+                || recovery.signature_mapper(template.source, signature_id) != Some(mapper)
+            {
+                return None;
+            }
+            true
+        }
+        None => false,
+    };
     if store.mapper_payload(mapper).is_none()
         || record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
@@ -4080,13 +4385,14 @@ fn instantiated_function_member_projection(
         || signature.isolated_signature_type().is_some()
         || signature.composite().is_some()
         || store.signature_has_circular_return_type(signature_id)
-        || !instantiated_method_type_matches(
-            store,
-            template.return_type,
-            return_type,
-            mapper,
-            array_targets,
-        )
+        || !recovered
+            && !instantiated_method_type_matches(
+                store,
+                template.return_type,
+                return_type,
+                mapper,
+                array_targets,
+            )
     {
         return None;
     }
@@ -4103,13 +4409,16 @@ fn instantiated_function_member_projection(
                 || source.parameter_name() != actual.parameter_name()
                 || match (source.type_id(), actual.type_id()) {
                     (None, None) => false,
-                    (Some(source), Some(actual)) => !instantiated_method_type_matches(
-                        store,
-                        source,
-                        actual,
-                        mapper,
-                        array_targets,
-                    ),
+                    (Some(source), Some(actual)) => {
+                        !recovered
+                            && !instantiated_method_type_matches(
+                                store,
+                                source,
+                                actual,
+                                mapper,
+                                array_targets,
+                            )
+                    }
                     _ => true,
                 }
             {
@@ -4165,13 +4474,14 @@ fn instantiated_function_member_projection(
                     }
         };
         if !valid_links
-            || !instantiated_method_type_matches(
-                store,
-                source_type,
-                actual_type,
-                mapper,
-                array_targets,
-            )
+            || !recovered
+                && !instantiated_method_type_matches(
+                    store,
+                    source_type,
+                    actual_type,
+                    mapper,
+                    array_targets,
+                )
         {
             return None;
         }
@@ -4189,7 +4499,7 @@ fn instantiated_function_member_projection(
 }
 
 /// Finds the receiver mapper that owns a copied method callback.
-fn instantiated_function_member_owner(
+pub(super) fn instantiated_function_member_owner(
     store: &CanonicalTypeMapperStore,
     source: TypeId,
     mapper: TypeMapperId,
@@ -4308,9 +4618,28 @@ pub(super) fn validate_instantiated_function_member_callable(
     let family = CallableFamily::FunctionType;
     let validated = (|| {
         let mapper = object.mapper?;
-        let targets = instantiated_function_member_owner(store, source, mapper)?;
-        let callable =
-            instantiated_function_member_projection(store, source, type_, mapper, Some(targets))?;
+        let (targets, recovery, alias) = if let Some(receiver) =
+            instantiated_function_property_owner(store, source, mapper)
+        {
+            let origin = store.instantiated_property_alias_callable(type_)?;
+            if origin.source != source || origin.mapper != mapper {
+                return None;
+            }
+            (
+                origin.array_targets,
+                instantiated_function_property_recovery(store, source, type_, mapper, receiver)?,
+                Some(property_object_alias_projection(store, receiver).ok()??),
+            )
+        } else {
+            (
+                Some(instantiated_function_member_owner(store, source, mapper)?),
+                None,
+                None,
+            )
+        };
+        let callable = instantiated_function_member_projection(
+            store, source, type_, mapper, targets, recovery,
+        )?;
         let mut edges = callable.parameters.clone();
         edges.extend(callable.return_type);
         if let Some(predicate) = store
@@ -4318,6 +4647,13 @@ pub(super) fn validate_instantiated_function_member_callable(
             .resolved_type_predicate()
         {
             edges.extend(store.type_predicate(predicate)?.type_id());
+        }
+        if let Some(alias) = alias {
+            // Keep mapper destinations visible after recovery, without following
+            // the receiver's members back into this callable's recovery proof.
+            edges.push(source);
+            edges.extend(alias.arguments);
+            edges.extend(alias.identity_arguments);
         }
         Some((callable, edges))
     })();
@@ -7003,6 +7339,1023 @@ mod tests {
             .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
             .unwrap();
         context.get_type_from_type_node(annotation).unwrap()
+    }
+
+    struct PropertyFunctionFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        diagnostics: CanonicalCheckerDiagnostics,
+        options: CanonicalCheckerOptions,
+        receiver: TypeId,
+        property: SemanticSymbolId,
+        source_property: SemanticSymbolId,
+        source: TypeId,
+        signature: SignatureId,
+        parameter: TypeId,
+        mapper: TypeMapperId,
+    }
+
+    fn property_function_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> PropertyFunctionFixture<'_> {
+        property_function_fixture_with_options(
+            parsed,
+            file,
+            CanonicalCheckerOptions::default(),
+            true,
+        )
+    }
+
+    fn property_function_fixture_with_options(
+        parsed: &ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+        bare_parameter: bool,
+    ) -> PropertyFunctionFixture<'_> {
+        let mut context = checker_context(parsed, file, options);
+        let receiver = property_object_alias_variable_type(parsed, file, &mut context, "observer");
+        let original = property_object_alias_projection(context.store(), receiver)
+            .unwrap()
+            .unwrap();
+        let source_property = original.properties[0].symbol;
+        let globals = context.global_types().clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        resolve_property_object_alias_members(context.store_mut_for_test(), original.target)
+            .unwrap();
+        let source = demand_property_object_alias_property(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            original.target,
+            source_property,
+        )
+        .unwrap();
+        let (_, signature, parameters) =
+            function_member_parameters(context.store(), source).unwrap();
+        if bare_parameter {
+            assert_eq!(parameters, original.parameters);
+        }
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert!(function_member_declaring_method(context.store(), source).is_none());
+        let members =
+            resolve_property_object_alias_members(context.store_mut_for_test(), receiver).unwrap();
+        PropertyFunctionFixture {
+            context,
+            diagnostics,
+            options,
+            receiver,
+            property: members.properties[0],
+            source_property,
+            source,
+            signature,
+            parameter: original.parameters[0],
+            mapper: original.mapper.unwrap(),
+        }
+    }
+
+    fn demand_property_function(
+        fixture: &mut PropertyFunctionFixture<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, SourceCheckError> {
+        let options = fixture.options;
+        let globals = fixture.context.global_types().clone();
+        let bound = fixture.context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        demand_property_object_alias_property(
+            fixture.context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            session,
+            &mut fixture.diagnostics,
+            fixture.receiver,
+            fixture.property,
+        )
+    }
+
+    fn property_function_source() -> ParseResult {
+        parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Observer<T> = { next: (value: T) => void; }; ",
+            "declare const observer: Observer<string>;",
+        ))
+    }
+
+    fn property_function_callable(
+        store: &CanonicalTypeMapperStore,
+        type_: TypeId,
+        parameter: TypeId,
+    ) -> SignatureId {
+        let Some(StoredCallableSetValidation::Valid {
+            family: CallableFamily::FunctionType,
+            projection,
+            ..
+        }) = validate_instantiated_function_member_callable(store, type_)
+        else {
+            panic!("the real mapped property must retain its callable proof")
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("the source has one call signature")
+        };
+        assert!(projection.construct_signatures.is_empty());
+        assert_eq!(callable.parameters, [parameter]);
+        assert_eq!(
+            callable.return_type,
+            Some(store.intrinsic_bootstrap().unwrap().void_type)
+        );
+        assert_eq!(callable.min_argument_count, 1);
+        callable.signature
+    }
+
+    #[test]
+    fn property_alias_function_mapping_preserves_the_source_and_caller_budget() {
+        let parsed = property_function_source();
+        let file = FileId::new(19_920);
+        let mut fixture = property_function_fixture(&parsed, file);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let source_links = fixture
+            .context
+            .store()
+            .value_symbol_links(fixture.source_property)
+            .cloned();
+        let value = demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+        let store = fixture.context.store_mut_for_test();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let signature = property_function_callable(store, value, string);
+        assert!(
+            !super::super::source_calls::authenticated_array_callback_contextual_target(
+                store, value, string, string,
+            )
+        );
+        assert_eq!(
+            store.signature(signature).unwrap().target(),
+            Some(fixture.signature)
+        );
+        assert_eq!(
+            store.value_symbol_links(fixture.source_property),
+            source_links.as_ref()
+        );
+        assert_eq!(
+            store.callable_signature_parameter_types(fixture.signature),
+            Some(&[fixture.parameter][..]),
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (1, 1, 0)
+        );
+        assert!(
+            instantiated_member_type_matches(store, fixture.source, value, fixture.mapper, None)
+                .unwrap()
+        );
+        let unowned = store
+            .new_simple_type_mapper(fixture.parameter, string)
+            .unwrap();
+        let before = property_recovery_store_counts(store);
+        assert_eq!(
+            instantiate_function_member_type(store, fixture.source, unowned, None, &mut session),
+            Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                fixture.source
+            )),
+        );
+        assert_eq!(property_recovery_store_counts(store), before);
+        assert_eq!(
+            demand_property_function(&mut fixture, &parsed, file, &mut session),
+            Ok(value)
+        );
+        assert_eq!(
+            property_recovery_store_counts(fixture.context.store()),
+            before
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (1, 1, 0)
+        );
+        assert!(fixture.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each poisoned identity must fail before a warm demand can allocate.
+    fn property_alias_function_warm_reads_reject_changed_owners_mappers_and_signatures() {
+        for mutation in [
+            "source_property",
+            "function_owner",
+            "signature_mapper",
+            "parameter_error",
+            "receiver_mapper",
+            "proxy_mapper",
+        ] {
+            let parsed = property_function_source();
+            let file = FileId::new(19_921);
+            let mut fixture = property_function_fixture(&parsed, file);
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let value =
+                demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+            let store = fixture.context.store_mut_for_test();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let error = store.intrinsic_bootstrap().unwrap().error_type;
+            let signature = property_function_callable(store, value, string);
+            let parameter = store.signature(signature).unwrap().parameters()[0];
+            let function_symbol = store
+                .type_payload(fixture.source)
+                .unwrap()
+                .symbol()
+                .unwrap();
+            let source_parent = store.symbol(fixture.source_property).unwrap().parent();
+            let function_members = store.symbol(function_symbol).unwrap().members();
+            let parameter_links = store.value_symbol_links(parameter).cloned().unwrap();
+            let proxy_links = store.value_symbol_links(fixture.property).cloned().unwrap();
+            let target = property_object_alias_projection(store, fixture.receiver)
+                .unwrap()
+                .unwrap()
+                .target;
+            let other_mapper = store
+                .new_simple_type_mapper(fixture.parameter, string)
+                .unwrap();
+            match mutation {
+                "source_property" => assert!(store.set_symbol_relationships(
+                    fixture.source_property,
+                    None,
+                    None,
+                    None,
+                    None
+                )),
+                "function_owner" => assert!(store.set_symbol_relationships(
+                    function_symbol,
+                    function_members,
+                    None,
+                    source_parent,
+                    None
+                )),
+                "signature_mapper" => assert!(store.set_signature_target_and_mapper(
+                    signature,
+                    Some(fixture.signature),
+                    Some(other_mapper)
+                )),
+                "parameter_error" => assert!(store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(error),
+                        ..parameter_links.clone()
+                    }
+                )),
+                "receiver_mapper" => assert!(store.set_object_target_and_mapper(
+                    fixture.receiver,
+                    Some(target),
+                    Some(other_mapper)
+                )),
+                "proxy_mapper" => assert!(store.set_value_symbol_links(
+                    fixture.property,
+                    ValueSymbolLinks {
+                        mapper: Some(other_mapper),
+                        ..proxy_links.clone()
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            let before = property_recovery_store_counts(store);
+            let mark = session.limit_event_mark();
+            if mutation != "proxy_mapper" {
+                assert!(
+                    matches!(
+                        validate_instantiated_function_member_callable(store, value),
+                        Some(StoredCallableSetValidation::Malformed {
+                            family: CallableFamily::FunctionType
+                        }),
+                    ),
+                    "{mutation}"
+                );
+                assert!(
+                    !instantiated_member_type_matches(
+                        store,
+                        fixture.source,
+                        value,
+                        fixture.mapper,
+                        None
+                    )
+                    .unwrap(),
+                    "{mutation}"
+                );
+            }
+            assert!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(
+                property_recovery_store_counts(fixture.context.store()),
+                before,
+                "{mutation}"
+            );
+            assert!(!session.limit_event_occurred_since(mark));
+            let store = fixture.context.store_mut_for_test();
+            match mutation {
+                "source_property" => assert!(store.set_symbol_relationships(
+                    fixture.source_property,
+                    None,
+                    None,
+                    source_parent,
+                    None
+                )),
+                "function_owner" => assert!(store.set_symbol_relationships(
+                    function_symbol,
+                    function_members,
+                    None,
+                    None,
+                    None
+                )),
+                "signature_mapper" => assert!(store.set_signature_target_and_mapper(
+                    signature,
+                    Some(fixture.signature),
+                    Some(fixture.mapper)
+                )),
+                "parameter_error" => {
+                    assert!(store.set_value_symbol_links(parameter, parameter_links))
+                }
+                "receiver_mapper" => assert!(store.set_object_target_and_mapper(
+                    fixture.receiver,
+                    Some(target),
+                    Some(fixture.mapper)
+                )),
+                "proxy_mapper" => {
+                    assert!(store.set_value_symbol_links(fixture.property, proxy_links))
+                }
+                _ => unreachable!(),
+            }
+            property_function_callable(store, value, string);
+            assert_eq!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session),
+                Ok(value),
+                "{mutation}"
+            );
+            assert_eq!(
+                property_recovery_store_counts(fixture.context.store()),
+                before,
+                "{mutation}"
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (1, 1, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn property_alias_function_count_limit_does_not_publish_an_orphan_callable() {
+        let parsed = property_function_source();
+        let file = FileId::new(19_922);
+        let mut fixture = property_function_fixture(&parsed, file);
+        fixture
+            .context
+            .get_return_type_of_signature(fixture.signature)
+            .unwrap();
+        let before = property_recovery_store_counts(fixture.context.store());
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        assert_eq!(
+            demand_property_function(&mut fixture, &parsed, file, &mut session),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnionValidationCapacity(fixture.parameter)
+            )),
+        );
+        assert_eq!(session.limit_event_count(), 1);
+        assert_eq!(
+            property_recovery_store_counts(fixture.context.store()),
+            before
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(fixture.property)
+                .unwrap()
+                .resolved_type,
+            None
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .instantiated_property_recovery(fixture.property)
+                .is_none()
+        );
+        let mut retry = InstantiationSession::new(InstantiationLimits::default());
+        let value = demand_property_function(&mut fixture, &parsed, file, &mut retry).unwrap();
+        property_function_callable(
+            fixture.context.store(),
+            value,
+            fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .string_type,
+        );
+        assert_eq!(retry.limit_event_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Recovery and raw-write invalidation use the same real alias producer.
+    fn property_alias_function_recovery_is_exact_and_separate_from_normal_mapping() {
+        for mutation in ["source", "proxy", "parameter"] {
+            let parsed = property_function_source();
+            let file = FileId::new(19_923);
+            let mut fixture = property_function_fixture(&parsed, file);
+            let error = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .error_type;
+            let mut session = InstantiationSession::new_recovering(
+                fixture.context.store(),
+                InstantiationLimits {
+                    max_count: 0,
+                    ..InstantiationLimits::default()
+                },
+                error,
+            )
+            .unwrap();
+            let value =
+                demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+            assert_eq!(session.limit_event_count(), 1);
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            let store = fixture.context.store();
+            let signature = property_function_callable(store, value, error);
+            let parameter = store.signature(signature).unwrap().parameters()[0];
+            let recovery = store
+                .instantiated_property_recovery(fixture.property)
+                .unwrap();
+            assert!(!recovery.method);
+            assert!(recovery.checked_identity(store).is_some());
+            let Some(StoredCallableSetValidation::Valid { edges, .. }) =
+                validate_instantiated_function_member_callable(store, value)
+            else {
+                unreachable!()
+            };
+            assert!(edges.contains(&fixture.source));
+            assert!(edges.contains(&store.intrinsic_bootstrap().unwrap().string_type));
+            let alias = property_object_alias_projection(store, fixture.receiver)
+                .unwrap()
+                .unwrap();
+            assert!(
+                alias
+                    .arguments
+                    .iter()
+                    .chain(&alias.identity_arguments)
+                    .all(|argument| edges.contains(argument))
+            );
+            assert!(!edges.contains(&fixture.receiver));
+            store
+                .validate_cached_array_capability_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(fixture.context.global_types()),
+                    value,
+                )
+                .unwrap();
+            assert!(
+                !instantiated_member_type_matches(
+                    store,
+                    fixture.source,
+                    value,
+                    fixture.mapper,
+                    None
+                )
+                .unwrap()
+            );
+            let before = property_recovery_store_counts(store);
+            assert_eq!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session),
+                Ok(value)
+            );
+            assert_eq!(
+                property_recovery_store_counts(fixture.context.store()),
+                before
+            );
+            assert_eq!(session.limit_event_count(), 1);
+            let store = fixture.context.store_mut_for_test();
+            let symbol = match mutation {
+                "source" => fixture.source_property,
+                "proxy" => fixture.property,
+                "parameter" => parameter,
+                _ => unreachable!(),
+            };
+            let links = store.value_symbol_links(symbol).cloned().unwrap();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..links.clone()
+                }
+            ));
+            let before = property_recovery_store_counts(store);
+            assert!(
+                matches!(
+                    validate_instantiated_function_member_callable(store, value),
+                    Some(StoredCallableSetValidation::Malformed { .. })
+                ),
+                "{mutation}"
+            );
+            assert!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(
+                property_recovery_store_counts(fixture.context.store()),
+                before
+            );
+            assert_eq!(session.limit_event_count(), 1);
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(symbol, links)
+            );
+            assert!(
+                matches!(
+                    validate_instantiated_function_member_callable(fixture.context.store(), value),
+                    Some(StoredCallableSetValidation::Malformed { .. })
+                ),
+                "a raw restore cannot recreate a producer recovery: {mutation}"
+            );
+            assert_eq!(
+                property_recovery_store_counts(fixture.context.store()),
+                before
+            );
+        }
+    }
+
+    fn array_property_function_source(annotation: &str, argument: &str) -> ParseResult {
+        parse_source_file(&format!(
+            "interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+             type Observer<T> = {{ next: (value: {annotation}) => {annotation}; }}; \
+             declare const observer: Observer<{argument}>;",
+        ))
+    }
+
+    fn array_property_function_options() -> CanonicalCheckerOptions {
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        }
+    }
+
+    #[test]
+    fn property_alias_callable_rejects_foreign_mapping_capabilities_before_copying() {
+        let parsed = property_function_source();
+        let file = FileId::new(19_926);
+        let mut fixture = property_function_fixture(&parsed, file);
+        fixture
+            .context
+            .get_return_type_of_signature(fixture.signature)
+            .unwrap();
+        let mut foreign = CanonicalTypeMapperStore::new();
+        let foreign_type = foreign
+            .alloc_intrinsic_type(TypeFlags::ANY, "foreign")
+            .unwrap();
+        let targets = CanonicalArrayTargets::for_test(foreign_type, foreign_type);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let store = fixture.context.store_mut_for_test();
+        let before = (
+            property_recovery_store_counts(store),
+            store.instantiated_property_alias_callable_len(),
+        );
+        assert_eq!(
+            instantiate_function_member_type(
+                store,
+                fixture.source,
+                fixture.mapper,
+                Some(targets),
+                &mut session
+            ),
+            Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                fixture.source
+            )),
+        );
+        assert_eq!(
+            (
+                property_recovery_store_counts(store),
+                store.instantiated_property_alias_callable_len()
+            ),
+            before
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(fixture.property)
+                .unwrap()
+                .resolved_type,
+            None
+        );
+        let value = demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+        assert!(
+            fixture
+                .context
+                .store()
+                .instantiated_property_alias_callable(value)
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Written arrays and mapped array destinations keep different replay rules.
+    fn property_alias_function_array_unions_retain_the_mapping_capability() {
+        for (annotation, argument, no_capability_matches) in [
+            ("T[] | undefined", "string", false),
+            ("readonly T[] | undefined", "string", false),
+            ("T | undefined", "string[]", false),
+            ("T", "string[]", true),
+        ] {
+            let parsed = array_property_function_source(annotation, argument);
+            let file = FileId::new(19_924);
+            let mut fixture = property_function_fixture_with_options(
+                &parsed,
+                file,
+                array_property_function_options(),
+                false,
+            );
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let value =
+                demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+            let store = fixture.context.store();
+            let origin = store.instantiated_property_alias_callable(value).unwrap();
+            assert_eq!(
+                origin,
+                InstantiatedPropertyAliasCallable {
+                    type_: value,
+                    source: fixture.source,
+                    mapper: fixture.mapper,
+                    array_targets: Some(targets),
+                }
+            );
+            let Some(StoredCallableSetValidation::Valid {
+                projection, edges, ..
+            }) = validate_instantiated_function_member_callable(store, value)
+            else {
+                panic!("mapped array signature must replay: {annotation} / {argument}")
+            };
+            let [callable] = projection.call_signatures.as_ref() else {
+                unreachable!()
+            };
+            let [parameter] = callable.parameters.as_slice() else {
+                unreachable!()
+            };
+            assert_eq!(callable.return_type, Some(*parameter));
+            assert!(edges.contains(&fixture.source));
+            let alias = property_object_alias_projection(store, fixture.receiver)
+                .unwrap()
+                .unwrap();
+            assert!(
+                alias
+                    .arguments
+                    .iter()
+                    .chain(&alias.identity_arguments)
+                    .all(|argument| edges.contains(argument))
+            );
+            assert!(!edges.contains(&fixture.receiver));
+            let array = match store.type_payload(*parameter).unwrap().data() {
+                TypeData::Union(union) => union
+                    .union
+                    .types
+                    .iter()
+                    .copied()
+                    .find(|type_| {
+                        store
+                            .canonical_array_reference_with_targets(targets, *type_)
+                            .unwrap()
+                            .is_some()
+                    })
+                    .unwrap(),
+                _ => *parameter,
+            };
+            let array_shape = store
+                .canonical_array_reference_with_targets(targets, array)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                array_shape.element_type,
+                store.intrinsic_bootstrap().unwrap().string_type
+            );
+            assert_eq!(array_shape.readonly, annotation.starts_with("readonly"));
+            assert!(
+                instantiated_member_type_matches(
+                    store,
+                    fixture.source,
+                    value,
+                    fixture.mapper,
+                    Some(targets)
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                instantiated_member_type_matches(
+                    store,
+                    fixture.source,
+                    value,
+                    fixture.mapper,
+                    None
+                ),
+                Ok(no_capability_matches)
+            );
+            assert!(
+                !super::super::source_calls::authenticated_array_callback_contextual_target(
+                    store, value, *parameter, *parameter
+                )
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, value),
+                Ok(())
+            );
+            assert!(matches!(
+                store.validate_cached_array_capability(value),
+                Err(super::super::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(type_)) if type_ == array
+            ));
+            let before = (
+                property_recovery_store_counts(store),
+                store.instantiated_property_alias_callable_len(),
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            assert_eq!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session),
+                Ok(value)
+            );
+            assert_eq!(
+                instantiate_function_member_type(
+                    fixture.context.store_mut_for_test(),
+                    fixture.source,
+                    fixture.mapper,
+                    Some(targets),
+                    &mut session
+                ),
+                Ok(value),
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .instantiated_property_alias_callable(value),
+                Some(origin)
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(fixture.context.store()),
+                    fixture
+                        .context
+                        .store()
+                        .instantiated_property_alias_callable_len(),
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count(),
+                ),
+                before
+            );
+            assert!(fixture.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each immutable origin field has a separate damage and restore check.
+    fn property_alias_function_array_capability_records_reject_damage_without_growth() {
+        for mutation in [
+            "missing",
+            "key",
+            "source",
+            "mapper",
+            "no_targets",
+            "wrong_targets",
+            "foreign_targets",
+        ] {
+            let parsed = array_property_function_source("T[] | undefined", "string");
+            let file = FileId::new(19_925);
+            let mut fixture = property_function_fixture_with_options(
+                &parsed,
+                file,
+                array_property_function_options(),
+                false,
+            );
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let value =
+                demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+            let mut foreign = CanonicalTypeMapperStore::new();
+            let foreign_type = foreign
+                .alloc_intrinsic_type(TypeFlags::ANY, "foreign")
+                .unwrap();
+            let store = fixture.context.store_mut_for_test();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let mapper = store
+                .new_simple_type_mapper(fixture.parameter, string)
+                .unwrap();
+            let original = store.instantiated_property_alias_callable(value).unwrap();
+            let before = (
+                property_recovery_store_counts(store),
+                store.instantiated_property_alias_callable_len(),
+            );
+            assert!(!store.publish_instantiated_property_alias_callable(original));
+            assert!(!store.publish_instantiated_property_alias_callable(
+                InstantiatedPropertyAliasCallable {
+                    type_: fixture.source,
+                    ..original
+                }
+            ));
+            assert!(!store.publish_instantiated_property_alias_callable(
+                InstantiatedPropertyAliasCallable {
+                    type_: foreign_type,
+                    ..original
+                }
+            ));
+            assert_eq!(
+                (
+                    property_recovery_store_counts(store),
+                    store.instantiated_property_alias_callable_len()
+                ),
+                before
+            );
+            let damaged = match mutation {
+                "missing" => None,
+                "key" => Some(InstantiatedPropertyAliasCallable {
+                    type_: fixture.source,
+                    ..original
+                }),
+                "source" => Some(InstantiatedPropertyAliasCallable {
+                    source: fixture.receiver,
+                    ..original
+                }),
+                "mapper" => Some(InstantiatedPropertyAliasCallable { mapper, ..original }),
+                "no_targets" => Some(InstantiatedPropertyAliasCallable {
+                    array_targets: None,
+                    ..original
+                }),
+                "wrong_targets" => Some(InstantiatedPropertyAliasCallable {
+                    array_targets: Some(CanonicalArrayTargets::for_single_target_validation(
+                        targets.readonly_array_type(),
+                    )),
+                    ..original
+                }),
+                "foreign_targets" => Some(InstantiatedPropertyAliasCallable {
+                    array_targets: Some(CanonicalArrayTargets::for_test(
+                        foreign_type,
+                        foreign_type,
+                    )),
+                    ..original
+                }),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.replace_instantiated_property_alias_callable_for_test(value, damaged),
+                Some(original)
+            );
+            let damaged_counts = (
+                property_recovery_store_counts(store),
+                store.instantiated_property_alias_callable_len(),
+            );
+            let session_counts = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            assert!(
+                matches!(
+                    validate_instantiated_function_member_callable(store, value),
+                    Some(StoredCallableSetValidation::Malformed { .. })
+                ),
+                "{mutation}"
+            );
+            assert!(
+                !instantiated_member_type_matches(
+                    store,
+                    fixture.source,
+                    value,
+                    fixture.mapper,
+                    Some(targets)
+                )
+                .unwrap(),
+                "{mutation}"
+            );
+            assert_eq!(
+                instantiate_function_member_type(
+                    store,
+                    fixture.source,
+                    fixture.mapper,
+                    Some(targets),
+                    &mut session
+                ),
+                Err(GenericInterfaceMemberError::InvalidCachedMembers(value)),
+                "{mutation}"
+            );
+            assert_eq!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::InvalidStructuredMembers(fixture.receiver)
+                )),
+                "{mutation}"
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(fixture.context.store()),
+                    fixture
+                        .context
+                        .store()
+                        .instantiated_property_alias_callable_len()
+                ),
+                damaged_counts,
+                "{mutation}"
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                session_counts
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .replace_instantiated_property_alias_callable_for_test(value, Some(original)),
+                damaged
+            );
+            assert_eq!(
+                demand_property_function(&mut fixture, &parsed, file, &mut session),
+                Ok(value),
+                "{mutation}"
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .instantiated_property_alias_callable(value),
+                Some(original)
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(fixture.context.store()),
+                    fixture
+                        .context
+                        .store()
+                        .instantiated_property_alias_callable_len()
+                ),
+                before,
+                "{mutation}"
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                session_counts
+            );
+        }
     }
 
     #[test]

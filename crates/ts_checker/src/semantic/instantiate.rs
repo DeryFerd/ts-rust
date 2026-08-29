@@ -19,7 +19,9 @@ use super::{
     indexed_access_types::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
-    instantiated_members::validate_generic_interface_members,
+    instantiated_members::{
+        instantiated_function_member_type_matches, validate_generic_interface_members,
+    },
     intersection_types::{
         DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
     },
@@ -1624,6 +1626,15 @@ fn instantiated_member_type_matches_worker(
             array_targets,
         )
         .map(|expected| expected == Some(actual)),
+        TypeData::Object(_) if store.type_has_function_type_provenance(template) => {
+            Ok(instantiated_function_member_type_matches(
+                store,
+                template,
+                actual,
+                mapper,
+                array_targets,
+            ))
+        }
         TypeData::TemplateLiteral(_)
         | TypeData::StringMapping(_)
         | TypeData::IndexedAccess(_)

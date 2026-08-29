@@ -1773,6 +1773,10 @@ pub(super) fn authenticated_array_callback_contextual_target(
     actual_parameter: TypeId,
 ) -> bool {
     if source_parameter == actual_parameter
+        && let Some(TypeData::Object(object)) = store.type_payload(target).map(TypeRecord::data)
+        && let (Some(source), Some(mapper)) = (object.target, object.mapper)
+        && super::instantiated_members::instantiated_function_member_owner(store, source, mapper)
+            .is_some()
         && let Some(StoredCallableSetValidation::Valid { projection, .. }) =
             super::instantiated_members::validate_instantiated_function_member_callable(
                 store, target,

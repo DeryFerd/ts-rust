@@ -35,7 +35,9 @@ use super::{
         TypePredicateId, TypedArena,
     },
     instantiate::PropertyObjectAliasRecovery,
-    instantiated_members::{InstantiatedIndexRecovery, InstantiatedPropertyRecovery},
+    instantiated_members::{
+        InstantiatedIndexRecovery, InstantiatedPropertyAliasCallable, InstantiatedPropertyRecovery,
+    },
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
     links::{
@@ -608,6 +610,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     direct_class_heritage_provenance: HashMap<TypeId, DirectClassHeritageProvenance>,
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
+    instantiated_property_alias_callables: HashMap<TypeId, InstantiatedPropertyAliasCallable>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
     instantiated_index_recoveries: HashMap<IndexInfoId, InstantiatedIndexRecovery>,
     property_object_alias_recoveries: HashMap<TypeId, PropertyObjectAliasRecovery>,
@@ -776,6 +779,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             direct_class_heritage_provenance: HashMap::new(),
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
+            instantiated_property_alias_callables: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
             instantiated_index_recoveries: HashMap::new(),
             property_object_alias_recoveries: HashMap::new(),
@@ -9520,6 +9524,64 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn try_reserve_instantiated_property_alias_callables(&mut self) -> bool {
+        self.instantiated_property_alias_callables
+            .try_reserve(1)
+            .is_ok()
+    }
+
+    /// A copied callable keeps its original mapping capability without granting it to a reader.
+    pub(super) fn instantiated_property_alias_callable(
+        &self,
+        type_: TypeId,
+    ) -> Option<InstantiatedPropertyAliasCallable> {
+        self.observe_relation_type_read(type_);
+        let origin = *self.instantiated_property_alias_callables.get(&type_)?;
+        (origin.type_() == type_ && origin.matches_current_type(self)).then_some(origin)
+    }
+
+    /// Only the property-function producer can construct this immutable record.
+    pub(super) fn publish_instantiated_property_alias_callable(
+        &mut self,
+        origin: InstantiatedPropertyAliasCallable,
+    ) -> bool {
+        let type_ = origin.type_();
+        if self
+            .instantiated_property_alias_callables
+            .contains_key(&type_)
+            || !origin.matches_current_type(self)
+        {
+            return false;
+        }
+        self.instantiated_property_alias_callables
+            .insert(type_, origin);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn instantiated_property_alias_callable_len(&self) -> usize {
+        self.instantiated_property_alias_callables.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_instantiated_property_alias_callable_for_test(
+        &mut self,
+        type_: TypeId,
+        origin: Option<InstantiatedPropertyAliasCallable>,
+    ) -> Option<InstantiatedPropertyAliasCallable> {
+        let previous = match origin {
+            Some(origin) => self
+                .instantiated_property_alias_callables
+                .insert(type_, origin),
+            None => self.instantiated_property_alias_callables.remove(&type_),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
     /// The source alias producer records its supplied inputs after real recovery.
     pub(super) fn publish_property_object_alias_request_recovery(
         &mut self,
