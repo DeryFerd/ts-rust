@@ -563,6 +563,255 @@ fn bundled_animation_event_merge_keeps_repeated_bases_and_lazy_target_identity()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep three real source contributions and their cold/warm identities together.
+fn bundled_animation_event_three_contributions_keep_order_and_replay() {
+    let es5 = parse_source_file(include_str!("../../ts_bundled/libs/lib.es5.d.ts"));
+    let dom = parse_source_file(include_str!("../../ts_bundled/libs/lib.dom.d.ts"));
+    let augmentation = concat!(
+        "interface Event {} interface AnimationEvent extends Event {} ",
+        "interface EventTarget {}",
+    );
+    let first = parse_source_file(augmentation);
+    let second = parse_source_file(augmentation);
+    let second_file = FileId::new(99_014);
+    let contributions = [
+        (&dom, LIBRARY_FILE),
+        (&first, ADDED_FILE),
+        (&second, second_file),
+    ];
+    let event_declaration = interface(&dom, LIBRARY_FILE, "Event");
+    let animation_declaration = interface(&dom, LIBRARY_FILE, "AnimationEvent");
+    let target_declaration = interface(&dom, LIBRARY_FILE, "EventTarget");
+    let animation_declarations =
+        contributions.map(|(parsed, file)| interface(parsed, file, "AnimationEvent"));
+    let base_identifiers = contributions
+        .into_iter()
+        .zip(animation_declarations)
+        .map(|((parsed, _), declaration)| heritage_identifier(parsed, declaration))
+        .collect::<Vec<_>>();
+    let base_nodes = contributions
+        .into_iter()
+        .zip(&base_identifiers)
+        .map(|((parsed, file), identifier)| {
+            NodeRef::new(
+                parsed.arena.id(),
+                file,
+                parsed.arena.get(identifier.node).unwrap().parent.unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(base_nodes.len(), 3);
+    for (index, node) in base_nodes.iter().enumerate() {
+        assert_eq!(node.file, contributions[index].1);
+        assert_eq!(
+            contributions[index].0.arena.get(node.node).unwrap().kind,
+            SyntaxKind::ExpressionWithTypeArguments,
+        );
+        assert!(base_nodes[..index].iter().all(|previous| previous != node));
+    }
+
+    for query_first in [false, true] {
+        let mut checker = context(
+            &[
+                (ES5_FILE, &es5, "\"/lib/lib.es5.d.ts\"", true, true),
+                (LIBRARY_FILE, &dom, "\"/lib/lib.dom.d.ts\"", true, true),
+                (
+                    ADDED_FILE,
+                    &first,
+                    "\"/project/react-first-global.d.ts\"",
+                    true,
+                    false,
+                ),
+                (
+                    second_file,
+                    &second,
+                    "\"/project/react-second-global.d.ts\"",
+                    true,
+                    false,
+                ),
+            ],
+            true,
+            false,
+        );
+        let event = symbol(&checker, event_declaration);
+        let animation = symbol(&checker, animation_declaration);
+        let target = symbol(&checker, target_declaration);
+        for (parsed, file) in contributions {
+            assert_eq!(symbol(&checker, interface(parsed, file, "Event")), event);
+            assert_eq!(
+                symbol(&checker, interface(parsed, file, "AnimationEvent")),
+                animation,
+            );
+            assert_eq!(
+                symbol(&checker, interface(parsed, file, "EventTarget")),
+                target
+            );
+        }
+        let early = query_first.then(|| {
+            [
+                checker.get_declared_type_of_symbol(event).unwrap(),
+                checker.get_declared_type_of_symbol(animation).unwrap(),
+            ]
+        });
+        for name in ["Event", "AnimationEvent", "EventTarget"] {
+            assert_value_annotation_cold(&checker, &dom, LIBRARY_FILE, name);
+        }
+        for file in [ADDED_FILE, second_file] {
+            checker.check_source_file(file).unwrap();
+        }
+        assert!(
+            checker.diagnostics().is_empty(),
+            "{:?}",
+            checker.diagnostics()
+        );
+        let event_type = checker.get_declared_type_of_symbol(event).unwrap();
+        let animation_type = checker.get_declared_type_of_symbol(animation).unwrap();
+        let target_type = checker
+            .store()
+            .declared_type_links(target)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        if let Some(early) = early {
+            assert_eq!(early, [event_type, animation_type]);
+        }
+        for (type_, owner) in [
+            (event_type, event),
+            (animation_type, animation),
+            (target_type, target),
+        ] {
+            assert_eq!(
+                checker.store().type_payload(type_).unwrap().symbol(),
+                Some(owner)
+            );
+        }
+        assert_eq!(
+            interface_data(&checker, animation_type)
+                .resolved_base_types
+                .as_deref(),
+            Some([event_type, event_type, event_type].as_slice()),
+        );
+        assert_target_members_cold(&checker, &dom, target_declaration, target_type);
+
+        let query = |checker: &mut CanonicalCheckerContext<'_>| {
+            for node in &base_identifiers {
+                assert_eq!(checker.get_symbol_at_location(*node).unwrap(), Some(event));
+                assert_eq!(checker.get_type_at_location(*node).unwrap(), event_type);
+            }
+            let mut types = Vec::new();
+            for (declaration, name) in [
+                (animation_declaration, "animationName"),
+                (event_declaration, "type"),
+                (event_declaration, "target"),
+                (event_declaration, "currentTarget"),
+                (event_declaration, "srcElement"),
+                (event_declaration, "composedPath"),
+                (event_declaration, "initEvent"),
+                (event_declaration, "timeStamp"),
+            ] {
+                let (member, name_node) = member(&dom, declaration, name);
+                let owner = symbol(checker, member);
+                assert_eq!(resolved_member(checker, animation_type, name), owner);
+                assert_eq!(
+                    checker.get_symbol_at_location(name_node).unwrap(),
+                    Some(owner)
+                );
+                assert_eq!(
+                    checker
+                        .store()
+                        .symbol(owner)
+                        .unwrap()
+                        .parent()
+                        .and_then(|parent| checker.store().get_merged_symbol(parent)),
+                    Some(if declaration == animation_declaration {
+                        animation
+                    } else {
+                        event
+                    }),
+                );
+                assert_eq!(
+                    interface_data(checker, animation_type)
+                        .reference
+                        .object
+                        .structured
+                        .properties
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .filter(|property| **property == owner)
+                        .count(),
+                    1,
+                );
+                let published = checker
+                    .store()
+                    .value_symbol_links(owner)
+                    .unwrap()
+                    .resolved_type
+                    .unwrap();
+                assert_eq!(checker.get_type_at_location(name_node).unwrap(), published);
+                types.push(published);
+            }
+            let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+            assert_eq!(types[0], bootstrap.string_type);
+            assert_eq!(types[1], bootstrap.string_type);
+            assert_eq!(types[7], bootstrap.number_type);
+            for type_ in &types[2..5] {
+                assert_nullable_target(checker, *type_, target_type);
+            }
+            let (_, path) =
+                method_signature(checker, member(&dom, event_declaration, "composedPath").1);
+            let array = checker.get_return_type_of_signature(path).unwrap();
+            assert_array_target(checker, array, target_type);
+            types.push(array);
+            let (_, init) =
+                method_signature(checker, member(&dom, event_declaration, "initEvent").1);
+            assert_optional_boolean_parameters(checker, init);
+            assert_eq!(
+                checker.get_return_type_of_signature(init).unwrap(),
+                checker.store().intrinsic_bootstrap().unwrap().void_type
+            );
+            types
+        };
+        let types = query(&mut checker);
+        let snapshot = |checker: &CanonicalCheckerContext<'_>| {
+            (
+                counts(checker),
+                [event_type, animation_type, target_type]
+                    .map(|type_| interface_data(checker, type_).clone()),
+                base_identifiers
+                    .iter()
+                    .map(|node| {
+                        (
+                            checker.store().type_node_links(*node).cloned(),
+                            checker.store().symbol_node_links(*node).cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                checker.diagnostics().clone(),
+            )
+        };
+        let warm = snapshot(&checker);
+        for _ in 0..2 {
+            for file in [ADDED_FILE, second_file] {
+                checker.recheck_source_file(file).unwrap();
+            }
+            for declaration in animation_declarations {
+                assert_eq!(
+                    checker.get_type_at_location(declaration).unwrap(),
+                    animation_type
+                );
+            }
+            assert_eq!(query(&mut checker), types);
+            assert_target_members_cold(&checker, &dom, target_declaration, target_type);
+            for name in ["Event", "AnimationEvent", "EventTarget"] {
+                assert_value_annotation_cold(&checker, &dom, LIBRARY_FILE, name);
+            }
+            assert_eq!(snapshot(&checker), warm, "query_first={query_first}");
+        }
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // Repeated and distinct source bases share the same member and replay checks.
 fn neutral_merged_interface_heritage_preserves_base_order_and_separate_values() {
     for repeated in [false, true] {

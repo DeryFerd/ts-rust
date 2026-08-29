@@ -3053,9 +3053,7 @@ pub(super) fn validate_stored_declared_call_set(
                         return false;
                     };
                     provenance.owner_symbol == owner
-                        && provenance.base_symbol == base_owner
-                        && provenance.base_type == base
-                        && provenance.second_base.is_none()
+                        && provenance.bases.as_slice() == [(base_owner, base)]
                         && base_interface.resolved_base_types.is_none()
                         && declared_constructs.is_none()
                         && declared_calls.is_some_and(|calls| {
@@ -5819,24 +5817,27 @@ pub(super) fn plan_interface(
                 kind: SyntaxKind::IndexSignature,
             });
         }
-        if !matches!(heritage.bases.as_slice(), [_] | [_, _]) {
+        if !matches!(heritage.bases.as_slice(), [_] | [_, _])
+            && !super::structured_members::planned_repeated_interface_bases_are_exact(store, &plan)
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
             });
         }
-        if let [first, second] = heritage.bases.as_slice()
-            && first.symbol != second.symbol
-            && store
-                .symbol(second.symbol)
-                .ok_or(PropertyObjectError::InvalidInterfaceSymbol(second.symbol))?
-                .flags()
-                != SymbolFlags::INTERFACE
-        {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: second.node,
-                kind: SyntaxKind::ExpressionWithTypeArguments,
-            });
+        for base in &heritage.bases[1..] {
+            if base.symbol != heritage.bases[0].symbol
+                && store
+                    .symbol(base.symbol)
+                    .ok_or(PropertyObjectError::InvalidInterfaceSymbol(base.symbol))?
+                    .flags()
+                    != SymbolFlags::INTERFACE
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: base.node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                });
+            }
         }
         let mut base_plans = Vec::<PropertyObjectPlan>::with_capacity(heritage.bases.len());
         let mut effective_base_properties =
@@ -7055,7 +7056,28 @@ fn merge_interface_heritage(
             }
             continue;
         }
-        if existing.bases.len() >= maximum_bases {
+        let repeated_nongeneric = preserve_repeated_bases
+            && std::iter::once(&base).chain(&existing.bases).all(|base| {
+                base.kind == DirectInterfaceBaseKind::Interface
+                    && base.type_arguments.is_empty()
+                    && base.defaults.is_empty()
+            });
+        let has_capacity = if repeated_nongeneric {
+            existing
+                .bases
+                .iter()
+                .any(|previous| previous.symbol == base.symbol)
+                || existing
+                    .bases
+                    .iter()
+                    .map(|base| base.symbol)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    < maximum_bases
+        } else {
+            existing.bases.len() < maximum_bases
+        };
+        if !has_capacity {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: planned.clause,
                 kind: SyntaxKind::HeritageClause,
@@ -7218,7 +7240,9 @@ fn collect_interface_property_heritage(
     }
 
     if let Some(heritage) = plan.heritage.as_ref() {
-        if !matches!(heritage.bases.as_slice(), [_] | [_, _]) {
+        if !matches!(heritage.bases.as_slice(), [_] | [_, _])
+            && !super::structured_members::planned_repeated_interface_bases_are_exact(store, plan)
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
