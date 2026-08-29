@@ -288,15 +288,10 @@ fn getter_state(checker: &mut CanonicalCheckerContext<'_>, getter: Getter) -> Ge
         expression_symbol: store.symbol_node_links(getter.expression).cloned(),
         value,
         signature_links,
-        members: store
-            .type_payload(object)
-            .unwrap()
-            .data()
-            .structured()
-            .unwrap()
-            .properties
-            .clone()
-            .unwrap(),
+        members: match store.type_payload(object).unwrap().data() {
+            TypeData::Object(object) => object.structured.properties.clone().unwrap(),
+            _ => panic!("expected the source object literal"),
+        },
     }
 }
 
@@ -382,7 +377,7 @@ fn interleaved_getter_diagnostics_keep_source_member_indices() {
             .arena
             .iter()
             .find_map(|(_, record)| {
-                let NodeData::PropertySignature(property) = &record.data else {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
                     return None;
                 };
                 let node = NodeRef::new(source.arena.id(), FILE, property.name);

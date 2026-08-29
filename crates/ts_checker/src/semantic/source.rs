@@ -30584,6 +30584,46 @@ fn check_source_object_literal_getter_return(
     if !cycle_free {
         return Err(invalid());
     }
+    // The getter proof needs this checked read before the final source publication batch.
+    let return_symbol = match &expression.kind {
+        PlannedExpressionKind::Identifier(read) => Some(read.resolved_symbol),
+        PlannedExpressionKind::GlobalUndefined => Some(
+            store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .undefined_symbol,
+        ),
+        _ => None,
+    };
+    if let Some(symbol) = return_symbol {
+        let node = getter.return_expression;
+        let publication_error =
+            || SourceCheckError::Variable(VariableInvariant::SymbolNodePublication(node));
+        if !store.contains_node_ref(node) || store.symbol(symbol).is_none() {
+            return Err(publication_error());
+        }
+        let prior = store.symbol_node_links(node);
+        if prior.is_some_and(|links| links.resolved_symbol.is_some_and(|cached| cached != symbol)) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node,
+                    cached: prior.and_then(|links| links.resolved_symbol),
+                    expected: symbol,
+                },
+            ));
+        }
+        let expected = SymbolNodeLinks {
+            resolved_symbol: Some(symbol),
+        };
+        if prior != Some(&expected)
+            && (!store.try_reserve_symbol_node_links(usize::from(prior.is_none()))
+                || !store.set_symbol_node_links(node, expected))
+        {
+            return Err(publication_error());
+        }
+    }
     super::object_members::publish_object_literal_getter_return(
         store,
         host,
@@ -68490,6 +68530,73 @@ mod tests {
             );
             assert_eq!(context.store().type_node_links(call), Some(&call_type));
             assert_eq!(context.store().signature_links(call), Some(&call_signature));
+        }
+    }
+
+    #[test]
+    fn source_object_literal_getters_publish_the_actual_undefined_binding() {
+        for (index, (text, shadowed)) in [
+            (
+                "const object = { get value() { return undefined; } }; const read = object.value;",
+                false,
+            ),
+            (
+                "function make() { const undefined = 1; return { get value() { return undefined; } }; }",
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(202_305 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let getter = source.arena.iter().find_map(|(node, record)| {
+                (record.kind == SyntaxKind::GetAccessor)
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+            }).unwrap();
+            let raw = context.file(file).unwrap().1.symbol(getter).unwrap();
+            let returned = context.store().object_literal_getter_origin(raw).unwrap().return_expression();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (expected_symbol, expected_type) = if shadowed {
+                let local = variable_symbol(&context, &source, file, "undefined");
+                assert_ne!(local, bootstrap.undefined_symbol);
+                (local, bootstrap.number_type)
+            } else {
+                (bootstrap.undefined_symbol, bootstrap.undefined_type)
+            };
+            assert_eq!(
+                context.store().symbol_node_links(returned),
+                Some(&SymbolNodeLinks { resolved_symbol: Some(expected_symbol) }),
+            );
+            assert_eq!(context.store().value_symbol_links(raw).unwrap().resolved_type, Some(expected_type));
+            let signature = context.store().signature_links(getter).unwrap().resolved_signature.signature().unwrap();
+            assert_eq!(context.get_return_type_of_signature(signature), Ok(expected_type));
+            if !shadowed {
+                assert_eq!(resolved_node_type(&context, returned), expected_type);
+                assert_eq!(variable_value_type(&context, &source, file, "read"), expected_type);
+            }
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_return_type_of_signature(signature), Ok(expected_type));
+                assert_eq!(observable_state(&context, file), warm);
+                assert_eq!(
+                    context.store().symbol_node_links(returned),
+                    Some(&SymbolNodeLinks { resolved_symbol: Some(expected_symbol) }),
+                );
+            }
         }
     }
 

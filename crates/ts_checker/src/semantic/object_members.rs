@@ -26622,6 +26622,8 @@ mod generic_publication_tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Cold and warm projections share the same retained source.
     fn object_literal_getter_host_projection_rechecks_source_without_publication() {
+        use crate::semantic::declared::DeclaredTypeHostError;
+
         let (mut fixture, object) =
             object_fixture("const result = { get current() { return 2; }, value: 1 };");
         let plan = plan_object_literal(
@@ -26679,6 +26681,15 @@ mod generic_publication_tests {
         let expected = object_literal_getter_projection(&fixture.store, getter.symbol).unwrap();
         assert_eq!(expected.signature, Some(signature));
         let warm = getter_allocations(&fixture.store);
+        assert_eq!(
+            object_literal_getter_projection_with_host(
+                &fixture.store,
+                &host(&fixture.parsed, &fixture.bound),
+                getter.symbol,
+            ),
+            Ok(expected),
+        );
+        assert_eq!(getter_allocations(&fixture.store), warm);
         let empty_host = DeclaredTypeHost::new(std::iter::empty::<(
             &ts_ast::NodeArena,
             &ts_binder::BoundFile,
@@ -26689,12 +26700,6 @@ mod generic_publication_tests {
             Err(invalid),
         );
 
-        let saved = fixture
-            .parsed
-            .arena
-            .get(getter.declaration.node)
-            .unwrap()
-            .clone();
         let NodeData::GetAccessorDeclaration(declaration) = &mut fixture
             .parsed
             .arena
@@ -26710,26 +26715,16 @@ mod generic_publication_tests {
             Ok(expected),
         );
         assert_eq!(
-            object_literal_getter_projection_with_host(
-                &fixture.store,
-                &host(&fixture.parsed, &fixture.bound),
-                getter.symbol,
-            ),
-            Err(invalid),
-        );
-        assert_eq!(getter_allocations(&fixture.store), warm);
-        *fixture
-            .parsed
-            .arena
-            .get_mut(getter.declaration.node)
-            .unwrap() = saved;
-        assert_eq!(
-            object_literal_getter_projection_with_host(
-                &fixture.store,
-                &host(&fixture.parsed, &fixture.bound),
-                getter.symbol,
-            ),
-            Ok(expected),
+            DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap_err(),
+            DeclaredTypeHostError::ArenaRevisionMismatch {
+                file: fixture.file,
+                expected: fixture.bound.node_arena_revision(),
+                actual: fixture.parsed.arena.revision(),
+            },
         );
         assert_eq!(getter_allocations(&fixture.store), warm);
     }
