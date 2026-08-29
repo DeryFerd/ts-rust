@@ -6970,19 +6970,19 @@ impl Program {
         file_system: &dyn FileSystem,
         resolution_options: &ResolutionOptions,
     ) {
-        let names = automatic_type_directive_names(
-            file_system,
-            resolution_options,
-            &self.current_directory,
-        );
+        let containing_directory = self
+            .config_file_path
+            .as_deref()
+            .map_or_else(|| self.current_directory.clone(), directory_path);
+        let names =
+            automatic_type_directive_names(file_system, resolution_options, &containing_directory);
         if names.is_empty() {
             return;
         }
         let resolver = Resolver::new(file_system, resolution_options.clone());
-        let containing_file =
-            resolve_path(&self.current_directory, &["__inferred type names__.ts"]);
+        let containing_file = resolve_path(&containing_directory, &["__inferred type names__.ts"]);
         for name in names {
-            let result = resolver.resolve_type_reference(&name, &containing_file);
+            let result = resolver.resolve_automatic_type_directive(&name, &containing_file);
             self.record_graph_resolution(
                 ProgramGraphResolutionRequest {
                     kind: ProgramGraphResolutionKind::AutomaticTypeDirective,
@@ -7001,11 +7001,7 @@ impl Program {
                     u32::from(resolved.is_external_library_import),
                     false,
                 );
-            } else if resolution_options
-                .types
-                .as_ref()
-                .is_some_and(|types| types.iter().any(|entry| entry == &name))
-            {
+            } else {
                 self.diagnostics.push(type_definition_not_found(&name));
             }
         }
@@ -18693,10 +18689,11 @@ mod tests {
         )
         .unwrap();
         let automatic = Program::from_config(&fs, "/project/automatic.json");
+        // Pinned Go requires `types: ["*"]` to discover installed type packages.
         assert!(
             automatic
                 .source_file("/project/node_modules/@types/auto/index.d.ts")
-                .is_some()
+                .is_none()
         );
     }
 

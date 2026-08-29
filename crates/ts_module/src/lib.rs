@@ -481,10 +481,33 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         result
     }
 
-    /// Resolves a `types` compiler-option entry or automatically discovered
-    /// package through type roots and ancestor `node_modules/@types` folders.
+    /// Resolves a source type reference through type roots and ancestor packages.
     #[must_use]
     pub fn resolve_type_reference(&self, name: &str, containing_file: &str) -> ResolutionResult {
+        self.resolve_type_reference_worker(name, containing_file, TypeReferenceRequestKind::Source)
+    }
+
+    /// Resolves an automatic type directive without leaving supplied type roots.
+    /// Automatic requests use import conditions only with Bundler resolution.
+    #[must_use]
+    pub fn resolve_automatic_type_directive(
+        &self,
+        name: &str,
+        containing_file: &str,
+    ) -> ResolutionResult {
+        self.resolve_type_reference_worker(
+            name,
+            containing_file,
+            TypeReferenceRequestKind::Automatic,
+        )
+    }
+
+    fn resolve_type_reference_worker(
+        &self,
+        name: &str,
+        containing_file: &str,
+        request_kind: TypeReferenceRequestKind,
+    ) -> ResolutionResult {
         let mut state = ResolutionState {
             resolver: self,
             failed_lookups: Vec::new(),
@@ -496,11 +519,22 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             active_package_targets: BTreeSet::new(),
             external_library_classification: ExternalLibraryClassification::LookupCandidate,
         };
-        state.import_condition = state.use_import_condition(containing_file);
+        state.import_condition = match request_kind {
+            TypeReferenceRequestKind::Source => state.use_import_condition(containing_file),
+            TypeReferenceRequestKind::Automatic => self.options.mode == ResolutionMode::Bundler,
+        };
+        let allow_node_modules_fallback =
+            request_kind == TypeReferenceRequestKind::Source || self.options.type_roots.is_none();
         let containing_directory = directory_path(containing_file);
         let resolved = state
             .resolve_type_reference_from_roots(name, &containing_directory)
-            .or_else(|| state.resolve_node_modules(name, &containing_directory))
+            .or_else(|| {
+                if allow_node_modules_fallback {
+                    state.resolve_node_modules(name, &containing_directory)
+                } else {
+                    None
+                }
+            })
             .map(|mut resolved| {
                 resolved.is_external_library_import =
                     resolved.resolved_file_name.contains("/node_modules/");
@@ -567,6 +601,12 @@ struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     candidate_ending_is_from_config: bool,
     active_package_targets: BTreeSet<(String, String)>,
     external_library_classification: ExternalLibraryClassification,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypeReferenceRequestKind {
+    Source,
+    Automatic,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1527,20 +1567,20 @@ pub fn effective_type_roots(options: &ResolutionOptions, current_directory: &str
     })
 }
 
-/// Lists automatic type directive package names in stable order.
+/// Lists explicit type directives and expands `*` in the configured order.
 #[must_use]
 pub fn automatic_type_directive_names(
     file_system: &dyn FileSystem,
     options: &ResolutionOptions,
     current_directory: &str,
 ) -> Vec<String> {
-    if let Some(types) = &options.types
-        && !types.iter().any(|name| name == "*")
-    {
+    let Some(types) = &options.types else {
+        return Vec::new();
+    };
+    if !types.iter().any(|name| name == "*") {
         return types.clone();
     }
     let mut installed = Vec::new();
-    let mut seen = BTreeSet::new();
     for root in effective_type_roots(options, current_directory) {
         if let Ok(entries) = file_system.read_directory(&root) {
             for name in entries.directories {
@@ -1550,27 +1590,20 @@ pub fn automatic_type_directive_names(
                     .ok()
                     .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
                     .is_some_and(|package| package.get("typings").is_some_and(Value::is_null));
-                if !name.starts_with('.') && !is_not_needed && seen.insert(name.clone()) {
+                if !name.starts_with('.') && !is_not_needed {
                     installed.push(name);
                 }
             }
         }
     }
-    let names = options.types.as_ref().map_or_else(
-        || installed.clone(),
-        |types| {
-            types
-                .iter()
-                .flat_map(|name| {
-                    if name == "*" {
-                        installed.clone()
-                    } else {
-                        vec![name.clone()]
-                    }
-                })
-                .collect()
-        },
-    );
+    let mut names = Vec::new();
+    for name in types {
+        if name == "*" {
+            names.extend(installed.iter().cloned());
+        } else {
+            names.push(name.clone());
+        }
+    }
     let mut seen = BTreeSet::new();
     names
         .into_iter()
@@ -3393,6 +3426,59 @@ mod tests {
     }
 
     #[test]
+    fn automatic_type_modes_ignore_the_containing_package_format() {
+        let fs = fs(&[
+            ("/app/package.json", r#"{"type":"module"}"#),
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"name":"pkg","exports":{".":{"import":{"types":"./esm.d.mts"},"require":{"types":"./commonjs.d.cts"}}}}"#,
+            ),
+            ("/app/node_modules/pkg/esm.d.mts", ""),
+            ("/app/node_modules/pkg/commonjs.d.cts", ""),
+        ]);
+        for (mode, expected_mode, expected_path) in [
+            (
+                ResolutionMode::Node16,
+                ModuleFormat::CommonJs,
+                "/app/node_modules/pkg/commonjs.d.cts",
+            ),
+            (
+                ResolutionMode::NodeNext,
+                ModuleFormat::CommonJs,
+                "/app/node_modules/pkg/commonjs.d.cts",
+            ),
+            (
+                ResolutionMode::Bundler,
+                ModuleFormat::Esm,
+                "/app/node_modules/pkg/esm.d.mts",
+            ),
+        ] {
+            let resolver = Resolver::new(
+                &fs,
+                ResolutionOptions {
+                    mode,
+                    types: Some(vec!["pkg".to_owned()]),
+                    ..ResolutionOptions::default()
+                },
+            );
+            let automatic =
+                resolver.resolve_automatic_type_directive("pkg", "/app/__inferred type names__.ts");
+            assert_eq!(automatic.effective_mode, Some(expected_mode));
+            assert_eq!(
+                automatic.resolved.unwrap().resolved_file_name,
+                expected_path
+            );
+
+            let source = resolver.resolve_type_reference("pkg", "/app/main.mts");
+            assert_eq!(source.effective_mode, Some(ModuleFormat::Esm));
+            assert_eq!(
+                source.resolved.unwrap().resolved_file_name,
+                "/app/node_modules/pkg/esm.d.mts"
+            );
+        }
+    }
+
+    #[test]
     fn scoped_type_references_use_scoped_names_under_custom_type_roots() {
         let fs = fs(&[("/custom/@scope/pkg/index.d.ts", "")]);
         let resolved = Resolver::new(
@@ -3407,6 +3493,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.resolved_file_name, "/custom/@scope/pkg/index.d.ts");
+    }
+
+    #[test]
+    fn automatic_type_directives_do_not_leave_supplied_type_roots() {
+        let fs = fs(&[
+            ("/app/node_modules/@types/node/index.d.ts", ""),
+            ("/app/types/local/index.d.ts", ""),
+        ]);
+        for type_roots in [Vec::new(), vec!["/app/types".to_owned()]] {
+            let resolver = Resolver::new(
+                &fs,
+                ResolutionOptions {
+                    type_roots: Some(type_roots),
+                    ..ResolutionOptions::default()
+                },
+            );
+            assert!(
+                resolver
+                    .resolve_automatic_type_directive("node", "/app/main.ts")
+                    .resolved
+                    .is_none()
+            );
+            assert_eq!(
+                resolver
+                    .resolve_type_reference("node", "/app/main.ts")
+                    .resolved
+                    .unwrap()
+                    .resolved_file_name,
+                "/app/node_modules/@types/node/index.d.ts"
+            );
+        }
     }
 
     #[test]
@@ -3663,8 +3780,14 @@ mod tests {
             ),
         ]);
         let options = ResolutionOptions::default();
+        // Pinned Go discovers installed packages only for an explicit wildcard.
+        assert!(automatic_type_directive_names(&fs, &options, "/repo/src").is_empty());
+        let wildcard = ResolutionOptions {
+            types: Some(vec!["*".into()]),
+            ..ResolutionOptions::default()
+        };
         assert_eq!(
-            automatic_type_directive_names(&fs, &options, "/repo/src"),
+            automatic_type_directive_names(&fs, &wildcard, "/repo/src"),
             ["jest", "node"]
         );
         let selected = ResolutionOptions {
@@ -3697,6 +3820,65 @@ mod tests {
                 .unwrap()
                 .resolved_file_name,
             "/repo/src/later.ts"
+        );
+    }
+
+    #[test]
+    fn automatic_types_without_a_wildcard_preserve_explicit_names() {
+        let fs = fs(&[("/repo/types/installed/index.d.ts", "")]);
+        for types in [
+            None,
+            Some(Vec::new()),
+            Some(vec![
+                "missing".to_owned(),
+                ".hidden".to_owned(),
+                "missing".to_owned(),
+            ]),
+        ] {
+            let options = ResolutionOptions {
+                types: types.clone(),
+                type_roots: Some(vec!["/repo/types".to_owned()]),
+                ..ResolutionOptions::default()
+            };
+            assert_eq!(
+                automatic_type_directive_names(&fs, &options, "/repo"),
+                types.unwrap_or_default()
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_type_wildcards_preserve_root_order_and_filter_packages() {
+        let fs = fs(&[
+            ("/repo/second/zeta/index.d.ts", ""),
+            ("/repo/first/alpha/index.d.ts", ""),
+            ("/repo/first/zeta/index.d.ts", ""),
+            ("/repo/first/.hidden/index.d.ts", ""),
+            ("/repo/first/obsolete/package.json", r#"{"typings":null}"#),
+            ("/repo/first/types-null/package.json", r#"{"types":null}"#),
+            ("/repo/first/invalid/package.json", "not valid JSON"),
+        ]);
+        let options = ResolutionOptions {
+            type_roots: Some(vec!["/repo/second".into(), "/repo/first".into()]),
+            types: Some(vec![
+                "explicit".into(),
+                "*".into(),
+                "alpha".into(),
+                "*".into(),
+                "obsolete".into(),
+            ]),
+            ..ResolutionOptions::default()
+        };
+        assert_eq!(
+            automatic_type_directive_names(&fs, &options, "/repo"),
+            [
+                "explicit",
+                "zeta",
+                "alpha",
+                "invalid",
+                "types-null",
+                "obsolete"
+            ]
         );
     }
 }
