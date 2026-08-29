@@ -121,7 +121,7 @@ use super::{
         prepare_source_class_members, validate_class_heritage_members,
     },
     contextual::{
-        LiteralTreatment, PreparedExpression,
+        LiteralTreatment, PreparedExpression, mutable_literal_treatment,
         prepare_expression_context_and_tuple_contexts_with_global_types,
         prepare_expression_context_with_global_types,
         prepare_expression_without_context_with_global_types,
@@ -27383,16 +27383,22 @@ where
             PlannedExpressionKind::Conditional(_),
             PreparedExpression::Conditional {
                 contextual_type,
-                widen_result,
+                mutable_result,
             },
         ) => {
             let mut checked =
                 check_nested_expression(store, session, expression, *contextual_type)?;
-            if *widen_result {
+            if *mutable_result {
                 let global_types =
                     global_types.ok_or(SourceCheckError::Conditional(expression.node))?;
+                let treatment = mutable_literal_treatment(
+                    store,
+                    Some(global_types),
+                    checked.raw,
+                    *contextual_type,
+                )?;
                 checked.result =
-                    widened_fresh_literal_union_type(store, global_types, checked.result)?;
+                    prepared_fresh_literal_union_type(store, global_types, checked.raw, treatment)?;
             }
             Ok(checked)
         }
@@ -43989,13 +43995,31 @@ fn widened_fresh_literal_union_type(
     global_types: &CanonicalGlobalTypes,
     type_: TypeId,
 ) -> Result<TypeId, SourceCheckError> {
+    prepared_fresh_literal_union_type(
+        store,
+        global_types,
+        type_,
+        LiteralTreatment::WidenedPrimitive,
+    )
+}
+
+fn prepared_fresh_literal_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+    treatment: LiteralTreatment,
+) -> Result<TypeId, SourceCheckError> {
     let record = store
         .type_payload(type_)
         .ok_or(SourceCheckError::LiteralCache(
             SourceLiteralCacheError::InvalidCachedLiteral(type_),
         ))?;
     let TypeData::Union(union) = record.data() else {
-        return widened_fresh_literal_type(store, type_);
+        return if matches!(record.data(), TypeData::Literal(_)) {
+            identifier_expression_type(store, type_, treatment)
+        } else {
+            Ok(type_)
+        };
     };
     let constituents = if let Some(origin) = union.origin {
         let origin_record = store
@@ -44013,20 +44037,20 @@ fn widened_fresh_literal_union_type(
         union.union.types.clone()
     };
 
-    let mut widened = Vec::with_capacity(constituents.len());
+    let mut prepared = Vec::with_capacity(constituents.len());
     let mut changed = false;
     for constituent in constituents {
-        let widened_constituent =
-            widened_fresh_literal_union_type(store, global_types, constituent)?;
-        changed |= widened_constituent != constituent;
-        widened.push(widened_constituent);
+        let prepared_constituent =
+            prepared_fresh_literal_union_type(store, global_types, constituent, treatment)?;
+        changed |= prepared_constituent != constituent;
+        prepared.push(prepared_constituent);
     }
     if !changed {
         return Ok(type_);
     }
 
     store
-        .expression_union_type_with_global_types(global_types, &widened, UnionReduction::Literal)
+        .expression_union_type_with_global_types(global_types, &prepared, UnionReduction::Literal)
         .map_err(Into::into)
 }
 
@@ -102862,6 +102886,54 @@ class Foo2 {
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn contextual_conditional_arrays_replay_without_child_links() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(9_890);
+        let source = parsed("const values: (\"a\" | \"b\")[] = [true ? \"a\" : \"b\"];");
+        let file = FileId::new(9_891);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let array = variable_initializer(&source, file, "values");
+        let elements = array_elements(&source, file, array);
+        let [conditional] = elements.as_slice() else {
+            panic!("expected one conditional array element")
+        };
+        let NodeData::ConditionalExpression(data) =
+            &source.arena.get(conditional.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let children = [data.condition, data.when_true, data.when_false]
+            .map(|node| NodeRef::new(source.arena.id(), file, node));
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, array))
+                .unwrap(),
+            "(\"a\" | \"b\")[]",
+        );
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, *conditional))
+                .unwrap(),
+            "\"a\" | \"b\"",
+        );
+        for child in children {
+            assert!(context.store().type_node_links(child).is_none());
+        }
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        for child in children {
+            assert!(context.store().type_node_links(child).is_none());
         }
     }
 

@@ -66,7 +66,7 @@ pub(super) enum PreparedExpression {
     Assertion(Option<TypeId>),
     Conditional {
         contextual_type: Option<TypeId>,
-        widen_result: bool,
+        mutable_result: bool,
     },
 }
 
@@ -509,7 +509,7 @@ fn prepare_expression(
         PlannedExpressionKind::Assertion { .. } => PreparedExpression::Assertion(contextual_type),
         PlannedExpressionKind::Conditional(_) => PreparedExpression::Conditional {
             contextual_type,
-            widen_result: location == ExpressionLocation::Mutable && contextual_type.is_none(),
+            mutable_result: location == ExpressionLocation::Mutable,
         },
         PlannedExpressionKind::Array(elements) => {
             let element_context = match (global_types, contextual_type) {
@@ -1303,6 +1303,51 @@ fn source_matches_discriminant(
         _ => None,
     };
     Ok(result)
+}
+
+pub(super) fn mutable_literal_treatment(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+    contextual_type: Option<TypeId>,
+) -> Result<LiteralTreatment, SourceCheckError> {
+    if contextual_type.is_none() {
+        return Ok(LiteralTreatment::WidenedPrimitive);
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let mut flags = record.flags();
+    if let TypeData::Union(union) = record.data() {
+        let constituents = union.union.types.clone();
+        validate_contextual_union(store, global_types, type_)?;
+        for constituent in constituents {
+            flags |= store
+                .type_payload(constituent)
+                .ok_or(RelationUnavailable::Type(constituent))?
+                .flags();
+        }
+    }
+    // A literal context selects one treatment for the whole expression union.
+    for (kind, flag) in [
+        (LiteralKind::String, TypeFlags::STRING_LITERAL),
+        (LiteralKind::Number, TypeFlags::NUMBER_LITERAL),
+        (LiteralKind::BigInt, TypeFlags::BIG_INT_LITERAL),
+        (LiteralKind::Boolean, TypeFlags::BOOLEAN_LITERAL),
+    ] {
+        if flags.intersects(flag)
+            && is_literal_of_contextual_type(
+                store,
+                global_types,
+                kind,
+                contextual_type,
+                &mut HashSet::new(),
+            )?
+        {
+            return Ok(LiteralTreatment::Regular);
+        }
+    }
+    Ok(LiteralTreatment::WidenedPrimitive)
 }
 
 fn literal_treatment(
