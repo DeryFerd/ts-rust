@@ -53,6 +53,7 @@ use super::{
         TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
+    variables::{PlannedObjectBindingElement, plan_function_object_parameter_bindings},
 };
 
 #[cfg(test)]
@@ -3069,6 +3070,20 @@ fn plan_source_callable_with_owner_shape(
             {
                 format!("__{}", parameters.len())
             }
+            (NodeData::BindingPattern(_), SyntaxKind::ObjectBindingPattern)
+                if view.family == SourceCallableFamily::FunctionDeclaration
+                    && body_mode == SourceCallableBodyMode::Present
+                    && type_parameters.is_empty()
+                    && authenticated_function_object_parameter_bindings(
+                        store,
+                        host,
+                        declaration,
+                        parameter,
+                    )
+                    .is_some() =>
+            {
+                format!("__{}", parameters.len())
+            }
             _ => {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::DestructuredParameter(parameter),
@@ -4265,6 +4280,105 @@ fn function_array_parameter_type_node(
         annotation
     };
     Some(annotation)
+}
+
+/// Retains the separate parameter and leaf owners of a flat typed object pattern.
+pub(super) fn authenticated_function_object_parameter_bindings(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter: NodeRef,
+) -> Option<Vec<PlannedObjectBindingElement>> {
+    let (arena, bound) = host.source(declaration)?;
+    let bindings =
+        plan_function_object_parameter_bindings(arena, bound, store, declaration, parameter)
+            .ok()?;
+    let NodeData::ParameterDeclaration(syntax) = &host.node(parameter)?.data else {
+        return None;
+    };
+    let annotation = NodeRef::new(parameter.arena, parameter.file, syntax.type_?);
+    let parent = source_object_parameter_annotation_plan(store, host, annotation)?;
+    // Named lookup cannot yet supply a property from an index signature.
+    if !parent.indexes.is_empty()
+        && bindings.iter().any(|binding| {
+            !parent
+                .properties
+                .iter()
+                .any(|property| property.name.as_utf8() == Some(binding.property_name.as_str()))
+        })
+    {
+        return None;
+    }
+    Some(bindings)
+}
+
+fn source_object_parameter_annotation_plan(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+) -> Option<super::object_members::PropertyObjectPlan> {
+    let mut annotation = annotation;
+    let mut alias_symbol = None;
+    let mut seen = HashSet::new();
+    loop {
+        annotation = peel_parenthesized_type(store, host, annotation).ok()?;
+        if !seen.insert(annotation) {
+            return None;
+        }
+        let record = preflight_node(store, host, annotation).ok()?;
+        if record.kind == SyntaxKind::TypeLiteral {
+            return super::object_members::plan_type_literal(store, host, annotation, alias_symbol)
+                .ok();
+        }
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            return None;
+        };
+        let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+        let name_record = preflight_node(store, host, name).ok()?;
+        if record.kind != SyntaxKind::TypeReference
+            || reference.type_arguments.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(annotation.node)
+            || !matches!(name_record.data, NodeData::Identifier(_))
+        {
+            return None;
+        }
+        let symbol = source_alias_reference_symbol(store, host, annotation).ok()??;
+        let owner = store.symbol(symbol)?;
+        if owner.flags().contains(SymbolFlags::INTERFACE) {
+            let plan = super::object_members::plan_interface(store, host, symbol).ok()?;
+            if plan.heritage.as_ref().is_some_and(|heritage| {
+                heritage
+                    .bases
+                    .iter()
+                    .any(|base| !base.type_arguments.is_empty() || !base.defaults.is_empty())
+            }) {
+                return None;
+            }
+            return Some(plan);
+        }
+        let [declaration] = owner.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let record = preflight_node(store, host, declaration).ok()?;
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+            return None;
+        };
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || !host.symbol_matches(store, declaration, symbol)
+            || record.kind != SyntaxKind::TypeAliasDeclaration
+            || alias.type_parameters.is_some()
+        {
+            return None;
+        }
+        annotation = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+        if host.node(annotation)?.parent != Some(declaration.node) {
+            return None;
+        }
+        alias_symbol = Some(symbol);
+    }
 }
 
 /// Authenticates typed array parameters and default-inferred patterns with omissions.
@@ -11260,6 +11374,48 @@ pub(super) fn source_callable_display_projection(
         let name = match &name_node.data {
             NodeData::Identifier(identifier) => identifier.text.clone(),
             NodeData::BindingPattern(pattern)
+                if name_node.kind == SyntaxKind::ObjectBindingPattern =>
+            {
+                let bindings = authenticated_function_object_parameter_bindings(
+                    store,
+                    host,
+                    plan.declaration,
+                    parameter.declaration,
+                )
+                .ok_or(SourceCallableDisplayError::Malformed)?;
+                let mut display = String::from("{");
+                if !bindings.is_empty() {
+                    display.push(' ');
+                }
+                for (index, binding) in bindings.iter().enumerate() {
+                    if index != 0 {
+                        display.push_str(", ");
+                    }
+                    if binding.property != binding.name {
+                        if let Some(key) = binding.computed_key {
+                            display.push('[');
+                            display.push_str(&source_object_binding_property_display(host, key)?);
+                            display.push(']');
+                        } else {
+                            display.push_str(&source_object_binding_property_display(
+                                host,
+                                binding.property,
+                            )?);
+                        }
+                        display.push_str(": ");
+                    }
+                    display.push_str(&source_object_binding_property_display(host, binding.name)?);
+                }
+                if pattern.elements.has_trailing_comma {
+                    display.push(',');
+                }
+                if !bindings.is_empty() {
+                    display.push(' ');
+                }
+                display.push('}');
+                display
+            }
+            NodeData::BindingPattern(pattern)
                 if authenticated_function_array_parameter_bindings(
                     store,
                     host,
@@ -11322,6 +11478,47 @@ pub(super) fn source_callable_display_projection(
         parameters,
         return_type,
     })
+}
+
+fn source_object_binding_property_display(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<String, SourceCallableDisplayError> {
+    let record = host
+        .node(node)
+        .ok_or(SourceCallableDisplayError::Malformed)?;
+    if let NodeData::Identifier(identifier) = &record.data {
+        return Ok(identifier.text.clone());
+    }
+    if !matches!(
+        record.kind,
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+    ) {
+        return Err(SourceCallableDisplayError::Malformed);
+    }
+    let (arena, _) = host
+        .source(node)
+        .ok_or(SourceCallableDisplayError::Malformed)?;
+    let start = usize::try_from(record.range.start.get())
+        .map_err(|_| SourceCallableDisplayError::Malformed)?;
+    let end = usize::try_from(record.range.end.get())
+        .map_err(|_| SourceCallableDisplayError::Malformed)?;
+    let text = arena
+        .source_text()
+        .and_then(|text| text.get(start..end))
+        .ok_or(SourceCallableDisplayError::Malformed)?;
+    // Go clones binding names. Keep literal spelling while dropping leading trivia.
+    let mut scanner = ts_scanner::Scanner::new(text);
+    let token = scanner.scan();
+    if token.kind != record.kind
+        || scanner.scan().kind != SyntaxKind::EndOfFile
+        || !scanner.diagnostics().is_empty()
+    {
+        return Err(SourceCallableDisplayError::Malformed);
+    }
+    Ok(token.text.to_owned())
 }
 
 const fn source_callable_display_error(error: SourceCallableError) -> SourceCallableDisplayError {
@@ -18092,6 +18289,83 @@ mod tests {
             StoredSourceCallableValidation::Valid(_)
         ));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn typed_function_object_parameters_reject_changed_annotation_cache() {
+        for warm in [false, true] {
+            let mut fixture = QueryFixture::new(
+                "function read({ first, second }: { first: number; second: string }): void {}",
+                FileId::new(19_741),
+            );
+            let (declaration, parameter, annotation) = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else {
+                        return None;
+                    };
+                    let parameter = function.parameters.nodes[0];
+                    let NodeData::ParameterDeclaration(syntax) =
+                        &fixture.parsed.arena.get(parameter)?.data
+                    else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, parameter),
+                        NodeRef::new(fixture.parsed.arena.id(), fixture.file, syntax.type_?),
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let parent_symbol = fixture.bound.symbol(parameter).unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            if warm {
+                fixture
+                    .query_callable(declaration, owner, &mut diagnostics)
+                    .unwrap();
+            }
+            let saved = fixture
+                .store
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap_or_default();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            assert!(fixture.store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let before = generic_transaction_state(&fixture.store);
+            let parent_links = fixture.store.value_symbol_links(parent_symbol).cloned();
+
+            assert!(
+                fixture
+                    .query_callable(declaration, owner, &mut diagnostics)
+                    .is_err()
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+            assert_eq!(
+                fixture.store.value_symbol_links(parent_symbol),
+                parent_links.as_ref()
+            );
+            assert!(diagnostics.is_empty());
+
+            assert!(fixture.store.set_type_node_links(annotation, saved));
+            let type_ = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let repaired = generic_transaction_state(&fixture.store);
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(type_)
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), repaired);
+        }
     }
 
     #[test]

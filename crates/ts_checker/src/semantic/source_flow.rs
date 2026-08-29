@@ -946,9 +946,11 @@ impl SourceFlowPlan {
     }
 
     /// Proves direct call statements and assignments to exact function parameters.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn preflight_linear(
         arena: &NodeArena,
         bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
         container: NodeRef,
         points: impl IntoIterator<Item = NodeRef>,
         assignments: impl IntoIterator<Item = SourceFlowAssignment>,
@@ -965,7 +967,7 @@ impl SourceFlowPlan {
         let mut planned_assignments = assignments.into_iter().collect::<Vec<_>>();
         let mut effects = SourceFlowEffects::default();
         for assignment in parameter_assignments {
-            validate_parameter_assignment(arena, bound, container, assignment)?;
+            validate_parameter_assignment(arena, bound, store, container, assignment)?;
             if effects
                 .assignment_declarations
                 .insert(assignment.target, assignment.parameter)
@@ -3297,6 +3299,7 @@ fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), 
 fn parameter_assignment_declaration_and_name(
     arena: &NodeArena,
     bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
     container: NodeRef,
     declaration: NodeRef,
 ) -> Option<(NodeRef, NodeRef)> {
@@ -3317,6 +3320,15 @@ fn parameter_assignment_declaration_and_name(
             };
             let parameter =
                 NodeRef::new(declaration.arena, declaration.file, pattern_record.parent?);
+            if pattern_record.kind == SyntaxKind::ObjectBindingPattern {
+                return super::variables::plan_function_object_parameter_bindings(
+                    arena, bound, store, container, parameter,
+                )
+                .ok()?
+                .into_iter()
+                .find(|binding| binding.element == declaration)
+                .map(|binding| (parameter, binding.name));
+            }
             let parameter_record = arena.get(parameter.node)?;
             let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
                 return None;
@@ -3463,6 +3475,7 @@ fn validate_class_local_assignment(
 fn validate_parameter_assignment(
     arena: &NodeArena,
     bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
     container: NodeRef,
     assignment: SourceFlowParameterAssignment,
 ) -> Result<(), SourceFlowError> {
@@ -3484,9 +3497,14 @@ fn validate_parameter_assignment(
     let NodeData::FunctionDeclaration(function_data) = &function.data else {
         return Err(invalid().into());
     };
-    let (parameter_declaration, parameter_name) =
-        parameter_assignment_declaration_and_name(arena, bound, container, assignment.parameter)
-            .ok_or_else(invalid)?;
+    let (parameter_declaration, parameter_name) = parameter_assignment_declaration_and_name(
+        arena,
+        bound,
+        store,
+        container,
+        assignment.parameter,
+    )
+    .ok_or_else(invalid)?;
     let parameter = arena.get(parameter_declaration.node).ok_or_else(invalid)?;
     let parameter_name = arena.get(parameter_name.node).ok_or_else(invalid)?;
     let NodeData::Identifier(parameter_identifier) = &parameter_name.data else {
@@ -5624,6 +5642,7 @@ mod tests {
         let plan = SourceFlowPlan::preflight_linear(
             &parsed.arena,
             &bound,
+            context.store(),
             function,
             [*call_statement, *after_statement],
             [],
@@ -5658,6 +5677,9 @@ mod tests {
         for (index, parameters) in [
             "value: string | number, other: number",
             "[, value, , other]: (string | number)[]",
+            "{ value, other }: { value: string | number; other: number }",
+            "{ item: value, other }: { item: string | number; other: number }",
+            "{ ['item']: value, other }: { item: string | number; other: number }",
         ]
         .into_iter()
         .enumerate()
@@ -5707,6 +5729,7 @@ mod tests {
             let plan = SourceFlowPlan::preflight_linear(
                 &parsed.arena,
                 &bound,
+                context.store(),
                 function,
                 [*assignment_statement, *after_statement],
                 [],
@@ -5718,10 +5741,18 @@ mod tests {
                 let bootstrap = context.store().intrinsic_bootstrap().unwrap();
                 (bootstrap.string_or_number_type, bootstrap.number_type)
             };
+            let mut base = [(symbol, union), (bound.symbol(other).unwrap(), number)]
+                .into_iter()
+                .collect::<SourceFlowTypes>();
+            let parent_symbol = bound.symbol(first_parameter).unwrap();
+            base.entry(parent_symbol).or_insert(union);
+            if first_parameter != parameter {
+                assert_ne!(parent_symbol, symbol);
+            }
+            let mut expected = base.clone();
+            expected.insert(symbol, number);
             for _ in 0..2 {
-                let mut frame = plan
-                    .frame(&bound, [(symbol, union)].into_iter().collect())
-                    .unwrap();
+                let mut frame = plan.frame(&bound, base.clone()).unwrap();
                 let before = frame
                     .snapshot_at(
                         context.store_mut_for_test(),
@@ -5729,7 +5760,7 @@ mod tests {
                         *assignment_statement,
                     )
                     .unwrap();
-                assert_eq!(before.type_of(symbol), Some(union));
+                assert_eq!(before.types(), &base);
                 assert_eq!(
                     frame.snapshot_at(context.store_mut_for_test(), &globals, *after_statement),
                     Err(SourceFlowInvariant::PendingAssignment(target).into()),
@@ -5738,7 +5769,7 @@ mod tests {
                 let after = frame
                     .snapshot_at(context.store_mut_for_test(), &globals, *after_statement)
                     .unwrap();
-                assert_eq!(after.type_of(symbol), Some(number));
+                assert_eq!(after.types(), &expected);
                 assert_eq!(
                     frame.complete_assignment(target, symbol, number),
                     Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into()),
@@ -5758,6 +5789,7 @@ mod tests {
                     SourceFlowPlan::preflight_linear(
                         &parsed.arena,
                         &bound,
+                        context.store(),
                         function,
                         [*assignment_statement, *after_statement],
                         [],
@@ -5770,6 +5802,98 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn object_parameter_assignment_flow_rejects_changed_binding_scope() {
+        let parsed = parse_source_file(concat!(
+            "function effects({ value, other }: { value: number; other: number }): void { ",
+            "value = 1; value; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_408);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let (function, _, statements) = linear_function_nodes(&parsed, file, "effects");
+        let locals = bound.locals(function).unwrap();
+        let [symbol, other] = ["value", "other"].map(|name| {
+            context
+                .store()
+                .symbol_table(locals)
+                .unwrap()
+                .get_source(name)
+                .unwrap()
+        });
+        let parameter = context
+            .store()
+            .symbol(symbol)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let [assignment_statement, after_statement] = statements.as_slice() else {
+            panic!("expected one assignment and one following statement")
+        };
+        let expression = expression_statement_expression(&parsed, file, *assignment_statement);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("expected an assignment expression")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowParameterAssignment {
+            target,
+            parameter,
+            symbol,
+        };
+        assert!(
+            SourceFlowPlan::preflight_linear(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                function,
+                [*assignment_statement, *after_statement],
+                [],
+                [assignment],
+                [],
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                locals,
+                EscapedName::source("other"),
+                symbol,
+            ),
+            Some(Some(other)),
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            SourceFlowPlan::preflight_linear(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                function,
+                [*assignment_statement, *after_statement],
+                [],
+                [assignment],
+                [],
+            ),
+            Err(SourceFlowError::Invariant(
+                SourceFlowInvariant::InvalidParameterAssignment(node)
+            )) if node == target
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

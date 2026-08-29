@@ -187,6 +187,7 @@ use super::{
         SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
         SourceCallableReturnPlan, StoredSourceCallableValidation,
         authenticated_function_array_parameter_bindings,
+        authenticated_function_object_parameter_bindings,
         materialize_anonymous_source_function_expression, materialize_global_wrapper_method,
         plan_callable_type_predicate, plan_javascript_duplicate_function_implementation,
         plan_source_callable, publish_array_filter_predicate_source_callable,
@@ -1089,6 +1090,7 @@ struct PlannedAmbientNamespaceRead {
 struct PlannedFunction {
     callable: SourceCallablePlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
+    object_parameter_bindings: Vec<PlannedObjectParameterBindings>,
     body: PlannedFunctionBody,
 }
 
@@ -1306,6 +1308,12 @@ struct PlannedArrowExpressionStatement {
 struct PlannedParameterInitializer {
     parameter: SourceCallableParameterPlan,
     expression: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedObjectParameterBindings {
+    parameter: SourceCallableParameterPlan,
+    elements: Vec<PlannedObjectVariableElement>,
 }
 
 #[derive(Clone, Debug)]
@@ -3916,8 +3924,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if let Some(duplicate) =
                         preplanned_javascript_duplicate_implementations.remove(&statement)
                     {
-                        let (parameter_initializers, body) = self.plan_function_body(&duplicate)?;
+                        let (parameter_initializers, object_parameter_bindings, body) =
+                            self.plan_function_body(&duplicate)?;
                         if !parameter_initializers.is_empty()
+                            || !object_parameter_bindings.is_empty()
                             || !matches!(body, PlannedFunctionBody::Empty)
                         {
                             return Err(Self::unsupported_function_body(&duplicate));
@@ -3936,8 +3946,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statement,
                         )),
                     )?;
-                    let (parameter_initializers, body) = if callable.body_mode.is_ambient() {
-                        (Vec::new(), PlannedFunctionBody::Ambient)
+                    let (parameter_initializers, object_parameter_bindings, body) = if callable
+                        .body_mode
+                        .is_ambient()
+                    {
+                        (Vec::new(), Vec::new(), PlannedFunctionBody::Ambient)
                     } else {
                         match self.plan_function_body(&callable) {
                             Ok(body) => body,
@@ -3963,6 +3976,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     functions.push(PlannedFunction {
                         callable,
                         parameter_initializers,
+                        object_parameter_bindings,
                         body,
                     });
                     statements.push(PlannedStatement::Function(index));
@@ -5715,13 +5729,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     {
                         return Err(Self::unsupported_function_body(&callable));
                     }
-                    let (parameter_initializers, body) = self.plan_function_body(&callable)?;
+                    let (parameter_initializers, object_parameter_bindings, body) =
+                        self.plan_function_body(&callable)?;
                     if !matches!(&body, PlannedFunctionBody::Linear(_)) {
                         return Err(Self::unsupported_function_body(&callable));
                     }
                     PlannedCapturedIterationBody::Function(Box::new(PlannedFunction {
                         callable,
                         parameter_initializers,
+                        object_parameter_bindings,
                         body,
                     }))
                 }
@@ -11336,7 +11352,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn plan_function_body(
         &mut self,
         callable: &SourceCallablePlan,
-    ) -> Result<(Vec<PlannedParameterInitializer>, PlannedFunctionBody), SourceCheckError> {
+    ) -> Result<
+        (
+            Vec<PlannedParameterInitializer>,
+            Vec<PlannedObjectParameterBindings>,
+            PlannedFunctionBody,
+        ),
+        SourceCheckError,
+    > {
         if callable.body_mode != SourceCallableBodyMode::Present {
             return Err(SourceCheckError::Function(
                 SourceFunctionInvariant::Callable(callable.declaration),
@@ -11347,7 +11370,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let body_readable_variables = self.readable_variables.clone();
         let body_hoisted_functions = self.hoisted_functions.clone();
         let body_prior_enums = self.prior_enums.clone();
-        let result = self.plan_function_body_contents(callable);
+        let result = self
+            .plan_object_parameter_bindings(callable)
+            .and_then(|bindings| {
+                self.plan_function_body_contents(callable)
+                    .map(|body| (bindings, body))
+            });
         // Statement planning may enter leading and branch-local scopes. Always
         // restore the exact parameter-entry state, including on a typed
         // unsupported boundary, before removing the parameters themselves.
@@ -11356,7 +11384,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.hoisted_functions = body_hoisted_functions;
         self.prior_enums = body_prior_enums;
         self.leave_callable_parameter_scope(callable)?;
-        Ok((parameter_initializers, result?))
+        let (object_parameter_bindings, body) = result?;
+        Ok((parameter_initializers, object_parameter_bindings, body))
     }
 
     fn plan_parameter_initializers_and_enter_scope(
@@ -11428,6 +11457,58 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(initializers)
     }
 
+    fn plan_object_parameter_bindings(
+        &mut self,
+        callable: &SourceCallablePlan,
+    ) -> Result<Vec<PlannedObjectParameterBindings>, SourceCheckError> {
+        if callable.family != SourceCallableFamily::FunctionDeclaration {
+            return Ok(Vec::new());
+        }
+        let mut parameters = Vec::new();
+        for parameter in &callable.parameters {
+            let record = self.node(parameter.declaration)?;
+            let NodeData::ParameterDeclaration(syntax) = &record.data else {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            };
+            if self.node(self.reference(syntax.name))?.kind != SyntaxKind::ObjectBindingPattern {
+                continue;
+            }
+            let Some((store, host)) = self.semantic else {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            };
+            let bindings = authenticated_function_object_parameter_bindings(
+                store,
+                host,
+                callable.declaration,
+                parameter.declaration,
+            )
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?;
+            let mut elements = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                let computed_key = binding
+                    .computed_key
+                    .map(|key| self.plan_computed_binding_key(key, binding.property))
+                    .transpose()?;
+                elements.push(PlannedObjectVariableElement {
+                    binding,
+                    computed_key,
+                    initializer: None,
+                });
+            }
+            parameters.push(PlannedObjectParameterBindings {
+                parameter: *parameter,
+                elements,
+            });
+        }
+        Ok(parameters)
+    }
+
     fn callable_parameter_binding_symbols(
         &self,
         callable: &SourceCallablePlan,
@@ -11452,6 +11533,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if callable.family == SourceCallableFamily::FunctionDeclaration {
+            if name_record.kind == SyntaxKind::ObjectBindingPattern {
+                let bindings = authenticated_function_object_parameter_bindings(
+                    store,
+                    host,
+                    callable.declaration,
+                    parameter.declaration,
+                )
+                .ok_or_else(|| {
+                    callable_parameter_execution_error(callable, parameter.declaration)
+                })?;
+                return Ok(bindings.into_iter().map(|binding| binding.symbol).collect());
+            }
             let bindings = authenticated_function_array_parameter_bindings(
                 store,
                 host,
@@ -13165,7 +13258,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .ok_or(SourceCheckError::Function(
                                 SourceFunctionInvariant::MissingDeclaration(declaration),
                             ))?;
-                    let (parameter_initializers, body) = self.plan_function_body(&nested)?;
+                    let (parameter_initializers, object_parameter_bindings, body) =
+                        self.plan_function_body(&nested)?;
                     if !matches!(
                         &body,
                         PlannedFunctionBody::Empty
@@ -13182,6 +13276,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         PlannedFunction {
                             callable: nested,
                             parameter_initializers,
+                            object_parameter_bindings,
                             body,
                         },
                     )));
@@ -13281,9 +13376,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             _ => None,
         });
+        let Some((store, _)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
         let flow = SourceFlowPlan::preflight_linear(
             self.arena,
             self.bound,
+            store,
             callable.declaration,
             points,
             assignments,
@@ -13573,6 +13672,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .into_iter()
                     .find_map(|(declaration, symbol)| {
                         (symbol == read.value_symbol).then_some(declaration)
+                    })
+                })
+            })
+            .or_else(|| {
+                callable.parameters.iter().find_map(|parameter| {
+                    authenticated_function_object_parameter_bindings(
+                        store,
+                        host,
+                        callable.declaration,
+                        parameter.declaration,
+                    )?
+                    .into_iter()
+                    .find_map(|binding| {
+                        (binding.symbol == read.value_symbol).then_some(binding.element)
                     })
                 })
             });
@@ -14981,7 +15094,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         source: SourceArrowPlan,
     ) -> Result<PlannedArrow, SourceCheckError> {
         if let SourceArrowBodyPlan::LinearBlock { block } = source.body {
-            let (parameter_initializers, body) = self.plan_function_body(&source.callable)?;
+            let (parameter_initializers, object_parameter_bindings, body) =
+                self.plan_function_body(&source.callable)?;
+            if !object_parameter_bindings.is_empty() {
+                return Err(SourceCheckError::Arrow(source.callable.declaration));
+            }
             let PlannedFunctionBody::Linear(linear_body) = body else {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Arrow(block),
@@ -26271,6 +26388,14 @@ fn preflight_inferred_function_return_dependencies(
             ) {
                 locals.extend(bindings.into_iter().map(|(_, symbol)| symbol));
             }
+            if let Some(bindings) = authenticated_function_object_parameter_bindings(
+                store,
+                host,
+                function.callable.declaration,
+                parameter.declaration,
+            ) {
+                locals.extend(bindings.into_iter().map(|binding| binding.symbol));
+            }
         }
         let initializers_supported = function.parameter_initializers.iter().all(|initializer| {
             expression_is_closed(
@@ -32928,6 +33053,7 @@ fn check_planned_arrow_argument(
         deferred,
         &arrow.callable,
         &arrow.parameter_initializers,
+        &[],
     )?;
     if let Some(statement) = &arrow.expression_statement {
         let checked = check_expression_type_with_class_context(
@@ -36569,9 +36695,11 @@ fn check_callable_parameter_initializers(
     deferred: &mut Vec<DeferredAssertion>,
     callable: &SourceCallablePlan,
     initializers: &[PlannedParameterInitializer],
+    object_bindings: &[PlannedObjectParameterBindings],
 ) -> Result<HashMap<SemanticSymbolId, TypeId>, SourceCheckError> {
     let mut flow_types = outer_flow_types.clone();
     let mut initializer_index = 0usize;
+    let mut object_binding_index = 0usize;
     for parameter in &callable.parameters {
         let body_type = store
             .value_symbol_links(parameter.symbol)
@@ -36675,6 +36803,52 @@ fn check_callable_parameter_initializers(
         if callable.family != SourceCallableFamily::FunctionDeclaration {
             continue;
         }
+        let NodeData::ParameterDeclaration(parameter_syntax) = &host
+            .node(parameter.declaration)
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration))?
+            .data
+        else {
+            return Err(callable_parameter_execution_error(
+                callable,
+                parameter.declaration,
+            ));
+        };
+        let pattern = NodeRef::new(
+            parameter.declaration.arena,
+            parameter.declaration.file,
+            parameter_syntax.name,
+        );
+        if host
+            .node(pattern)
+            .is_some_and(|record| record.kind == SyntaxKind::ObjectBindingPattern)
+        {
+            let planned = object_bindings.get(object_binding_index).ok_or_else(|| {
+                callable_parameter_execution_error(callable, parameter.declaration)
+            })?;
+            if planned.parameter != *parameter {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            }
+            check_callable_object_parameter_bindings(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &mut flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                callable,
+                planned,
+                body_type,
+            )?;
+            object_binding_index += 1;
+            continue;
+        }
         let Some(bindings) = authenticated_function_array_parameter_bindings(
             store,
             host,
@@ -36763,13 +36937,124 @@ fn check_callable_parameter_initializers(
             }
         }
     }
-    if initializer_index != initializers.len() {
+    if initializer_index != initializers.len() || object_binding_index != object_bindings.len() {
         return Err(callable_parameter_execution_error(
             callable,
             callable.declaration,
         ));
     }
     Ok(flow_types)
+}
+
+#[allow(clippy::too_many_arguments)] // Use the caller's expression session and parameter flow map.
+fn check_callable_object_parameter_bindings(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    planned: &PlannedObjectParameterBindings,
+    parent_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    let invalid = || callable_parameter_execution_error(callable, planned.parameter.declaration);
+    let bindings = authenticated_function_object_parameter_bindings(
+        store,
+        host,
+        callable.declaration,
+        planned.parameter.declaration,
+    )
+    .ok_or_else(invalid)?;
+    if bindings.len() != planned.elements.len()
+        || bindings
+            .iter()
+            .zip(&planned.elements)
+            .any(|(binding, element)| {
+                binding != &element.binding
+                    || element.initializer.is_some()
+                    || element.computed_key.as_ref().map(|key| key.node) != binding.computed_key
+            })
+    {
+        return Err(invalid());
+    }
+
+    let mut binding_types = Vec::with_capacity(bindings.len());
+    for element in &planned.elements {
+        let binding = &element.binding;
+        let (property_node, property_name) = if let Some(key) = &element.computed_key {
+            let checked = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                flow_types,
+                preflighted_type_import_value_uses,
+                key,
+                None,
+                deferred,
+            )?;
+            issue_computed_binding_name_diagnostic(
+                store,
+                global_types,
+                diagnostics,
+                binding.property,
+                checked.result,
+            )?;
+            (
+                key.node,
+                literal_computed_property_name(store, checked.result).ok_or_else(invalid)?,
+            )
+        } else {
+            (binding.property, binding.property_name.clone())
+        };
+        let type_ = object_parameter_property_type(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            parent_type,
+            property_node,
+            &property_name,
+        )?;
+        let expected = ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        };
+        if store
+            .value_symbol_links(binding.symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
+            || flow_types.contains_key(&binding.symbol)
+        {
+            return Err(invalid());
+        }
+        binding_types.push((binding.symbol, expected));
+    }
+
+    let missing = binding_types
+        .iter()
+        .filter(|(symbol, _)| store.value_symbol_links(*symbol).is_none())
+        .count();
+    if !store.try_reserve_value_symbol_links(missing) {
+        return Err(invalid());
+    }
+    for (symbol, links) in binding_types {
+        let type_ = links.resolved_type.ok_or_else(invalid)?;
+        if !store.set_value_symbol_links(symbol, links) {
+            return Err(invalid());
+        }
+        flow_types.insert(symbol, type_);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // Conditional effects retain the active source checker state.
@@ -39705,6 +39990,7 @@ fn check_planned_linear_function_statements(
                     deferred,
                     &function.callable,
                     &function.parameter_initializers,
+                    &function.object_parameter_bindings,
                 )?;
                 let (expression, return_flow_types) = match &function.body {
                     PlannedFunctionBody::Empty => (None, flow_types),
@@ -43372,6 +43658,77 @@ fn check_object_binding_literal_context(
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps property diagnostics in the source execution context.
+fn object_parameter_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    property_node: NodeRef,
+    property_name: &str,
+) -> Result<TypeId, SourceCheckError> {
+    let key = ts_binder::EscapedNameRef::source(property_name);
+    let mut property = super::object_members::resolve_object_property_by_key_with_source(
+        store,
+        host,
+        global_types,
+        options,
+        receiver,
+        key,
+        session,
+        diagnostics,
+    )?;
+    if property.is_none() {
+        let structured = store
+            .type_payload(receiver)
+            .and_then(|record| record.data().structured())
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+        if structured.index_infos.is_some() {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(property_node),
+            ));
+        }
+        let callable = structured
+            .signatures
+            .as_ref()
+            .is_some_and(|signatures| !signatures.is_empty());
+        for target in callable
+            .then_some(global_types.function_type)
+            .into_iter()
+            .chain(std::iter::once(global_types.object_type))
+        {
+            property = super::object_members::resolve_object_property_by_key_with_source(
+                store,
+                host,
+                global_types,
+                options,
+                target,
+                key,
+                session,
+                diagnostics,
+            )?;
+            if property.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(property) = property {
+        return object_binding_property_read_type(store, global_types, options, property);
+    }
+    missing_object_binding_property_type(
+        store,
+        host,
+        global_types,
+        diagnostics,
+        receiver,
+        property_node,
+        property_name,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps property diagnostics in the source execution context.
 fn object_binding_property_type(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -43383,13 +43740,12 @@ fn object_binding_property_type(
     property_name: &str,
     allow_missing: bool,
 ) -> Result<TypeId, SourceCheckError> {
-    let (any, error, undefined, unknown, empty) = store
+    let (any, error, unknown, empty) = store
         .intrinsic_bootstrap()
         .map(|bootstrap| {
             (
                 bootstrap.any_type,
                 bootstrap.error_type,
-                bootstrap.undefined_or_missing_type,
                 bootstrap.unknown_type,
                 bootstrap.empty_object_type,
             )
@@ -43456,17 +43812,7 @@ fn object_binding_property_type(
         )?
         && let Some(property) = store.resolved_own_property(receiver, property_name)?
     {
-        return if property.optional && options.intrinsic.strict_null_checks {
-            store
-                .expression_union_type_with_global_types(
-                    global_types,
-                    &[property.type_, undefined],
-                    UnionReduction::Literal,
-                )
-                .map_err(Into::into)
-        } else {
-            Ok(property.type_)
-        };
+        return object_binding_property_read_type(store, global_types, options, property);
     }
 
     if allow_missing
@@ -43480,6 +43826,52 @@ fn object_binding_property_type(
             .undefined_type);
     }
 
+    missing_object_binding_property_type(
+        store,
+        host,
+        global_types,
+        diagnostics,
+        receiver,
+        property_node,
+        property_name,
+    )
+}
+
+fn object_binding_property_read_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    property: ResolvedOwnProperty,
+) -> Result<TypeId, SourceCheckError> {
+    if !property.optional || !options.intrinsic.strict_null_checks {
+        return Ok(property.type_);
+    }
+    let undefined = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .undefined_or_missing_type;
+    store
+        .expression_union_type_with_global_types(
+            global_types,
+            &[property.type_, undefined],
+            UnionReduction::Literal,
+        )
+        .map_err(Into::into)
+}
+
+fn missing_object_binding_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    receiver: TypeId,
+    property_node: NodeRef,
+    property_name: &str,
+) -> Result<TypeId, SourceCheckError> {
+    let error = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .error_type;
     let receiver = super::formatter::type_to_string_with_host_global_types_and_flags(
         store,
         host,
@@ -56061,6 +56453,7 @@ pub(super) fn check_source_file(
             &mut deferred,
             &function.callable,
             &function.parameter_initializers,
+            &function.object_parameter_bindings,
         )?;
         let (expression, return_flow_types) = match &function.body {
             PlannedFunctionBody::Empty => (None, body_flow_types),
@@ -57587,6 +57980,7 @@ pub(super) fn check_source_file(
                             &mut deferred,
                             &function.callable,
                             &function.parameter_initializers,
+                            &function.object_parameter_bindings,
                         )?;
                         check_planned_linear_function_statements(
                             bound,
@@ -57631,6 +58025,7 @@ pub(super) fn check_source_file(
                     &mut deferred,
                     &function.callable,
                     &function.parameter_initializers,
+                    &function.object_parameter_bindings,
                 )?;
                 match &function.body {
                     PlannedFunctionBody::Ambient
@@ -58110,6 +58505,7 @@ pub(super) fn check_source_file(
                         &mut deferred,
                         &callable,
                         &arrow.parameter_initializers,
+                        &[],
                     )?;
                     let body_flow_types = if let Some(statements) = &arrow.linear_body {
                         check_planned_linear_function_statements(
@@ -61668,6 +62064,7 @@ pub(super) fn check_source_file(
                             &mut deferred,
                             &function.callable,
                             &function.parameter_initializers,
+                            &function.object_parameter_bindings,
                         )?;
                         let PlannedFunctionBody::Linear(statements) = &function.body else {
                             return Err(SourcePlanner::unsupported_function_body(
@@ -61970,6 +62367,7 @@ pub(super) fn check_source_file(
             &mut deferred,
             &arrow.source.callable,
             &arrow.parameter_initializers,
+            &[],
         )?;
         if let Some(statements) = &arrow.linear_body {
             check_planned_linear_function_statements(
@@ -98236,6 +98634,120 @@ class Foo2 {
         );
         assert_eq!(observable_state(&context, file), cold);
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn typed_function_object_parameters_publish_leaf_types_as_one_batch() {
+        let source =
+            parsed("function read({ first, second }: { first: number; second: string }): void {}");
+        let file = FileId::new(19_742);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let declaration = function_declaration(&source, file, "read");
+        let NodeData::FunctionDeclaration(function) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the object-binding function")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, function.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(syntax) =
+            &source.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("expected the object parameter")
+        };
+        let NodeData::BindingPattern(pattern) = &source.arena.get(syntax.name).unwrap().data else {
+            panic!("expected the object pattern")
+        };
+        let symbols = pattern
+            .elements
+            .nodes
+            .iter()
+            .map(|node| {
+                context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .symbol(NodeRef::new(source.arena.id(), file, *node))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = symbols.as_slice() else {
+            panic!("expected two binding leaves")
+        };
+        let first_links = context.store().value_symbol_links(*first).cloned().unwrap();
+        let second_links = context
+            .store()
+            .value_symbol_links(*second)
+            .cloned()
+            .unwrap();
+        let parent_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+        let parent_links = context
+            .store()
+            .value_symbol_links(parent_symbol)
+            .cloned()
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let poisoned_second = ValueSymbolLinks {
+            resolved_type: Some(wrong),
+            ..ValueSymbolLinks::default()
+        };
+        assert_ne!(second_links, poisoned_second);
+        mark_source_unchecked(&mut context, file);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*first, ValueSymbolLinks::default())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*second, poisoned_second.clone())
+        );
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(parameter),
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(
+            context.store().value_symbol_links(*first),
+            Some(&ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            context.store().value_symbol_links(*second),
+            Some(&poisoned_second)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(parent_symbol),
+            Some(&parent_links)
+        );
+        assert!(context.diagnostics().is_empty());
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*first, first_links.clone())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(*second, second_links.clone())
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context.store().value_symbol_links(*first),
+            Some(&first_links)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(*second),
+            Some(&second_links)
+        );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
