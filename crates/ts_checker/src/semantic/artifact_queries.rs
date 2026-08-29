@@ -3344,6 +3344,17 @@ impl CanonicalCheckerContext<'_> {
         else {
             return Ok(None);
         };
+        if matches!(owner_record.data, NodeData::InterfaceDeclaration(_))
+            && interface.resolved_base_types.is_some()
+            && let Some(target) = self.merged_interface_heritage_artifact_target(
+                node,
+                reference,
+                owner_symbol,
+                owner_type,
+            )?
+        {
+            return Ok(Some(target));
+        }
         let Some(base) = interface
             .resolved_base_types
             .as_deref()
@@ -3357,6 +3368,74 @@ impl CanonicalCheckerContext<'_> {
         };
         let symbol = self.merged_artifact_symbol(node, symbol)?;
         Ok(Some((base, symbol)))
+    }
+
+    fn merged_interface_heritage_artifact_target(
+        &self,
+        node: NodeRef,
+        reference: NodeRef,
+        owner: SemanticSymbolId,
+        owner_type: TypeId,
+    ) -> Result<Option<(TypeId, SemanticSymbolId)>, CanonicalArtifactQueryError> {
+        let store = self.store();
+        if !super::object_members::authenticated_nongeneric_global_interface_owner(store, owner)
+            || store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .is_none_or(|declarations| {
+                    declarations
+                        .iter()
+                        .filter(|declaration| {
+                            store.source_node_kind(**declaration)
+                                == Some(SyntaxKind::InterfaceDeclaration)
+                        })
+                        .nth(1)
+                        .is_none()
+                })
+        {
+            return Ok(None);
+        }
+        let invalid = || CanonicalArtifactQueryError::InvalidType {
+            node,
+            type_: owner_type,
+        };
+        let host = self.declared_type_host()?;
+        let plan =
+            super::object_members::plan_interface(store, &host, owner).map_err(|_| invalid())?;
+        let heritage = plan.heritage.as_ref().ok_or_else(invalid)?;
+        if heritage.bases.iter().any(|base| {
+            base.kind != super::interface_heritage::DirectInterfaceBaseKind::Interface
+                || !base.type_arguments.is_empty()
+                || !base.defaults.is_empty()
+                || !super::object_members::authenticated_nongeneric_global_interface_owner(
+                    store,
+                    base.symbol,
+                )
+        }) {
+            return Ok(None);
+        }
+        if !super::structured_members::validate_planned_interface_heritage_members_with_array_targets(
+            store,
+            &plan,
+            owner_type,
+            Some(super::array_types::CanonicalArrayTargets::from_global_types(
+                self.global_types(),
+            )),
+        ) {
+            return Err(invalid());
+        }
+        // Each repeated contribution has its own source node and retained base slot.
+        let index = heritage
+            .bases
+            .iter()
+            .position(|base| base.node == reference && base.expression == node)
+            .ok_or_else(invalid)?;
+        let &(symbol, type_) = store
+            .direct_interface_heritage_provenance(owner_type)
+            .and_then(|provenance| provenance.bases.get(index))
+            .ok_or_else(invalid)?;
+        let symbol = self.merged_artifact_symbol(node, symbol)?;
+        Ok(Some((type_, symbol)))
     }
 
     fn type_of_artifact_symbol(
@@ -9917,6 +9996,257 @@ mod tests {
                     .and_then(|links| links.declared_type),
                 Some(type_)
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source occurrence order, cache damage, and restored queries together.
+    fn merged_heritage_identifiers_keep_source_slots_and_reject_changed_base_caches() {
+        let first = parse_source_file(concat!(
+            "interface First { first: number; } ",
+            "interface Second { second: string; } ",
+            "interface Merged extends First { own: boolean; }",
+        ));
+        let files = [FileId::new(147_220), FileId::new(147_221)];
+        for (text, expected_order) in [
+            (
+                "interface Merged extends Second { added: number; }",
+                [0_usize, 1].as_slice(),
+            ),
+            (
+                concat!(
+                    "interface Merged extends Second { added: number; } ",
+                    "interface Merged extends First {} ",
+                    "interface Merged extends Second {}",
+                ),
+                [0, 1, 0, 1].as_slice(),
+            ),
+        ] {
+            let added = parse_source_file(text);
+            let inputs = [(files[0], &first), (files[1], &added)];
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed) in inputs {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(if file == files[0] {
+                                "\"/project/first.d.ts\""
+                            } else {
+                                "\"/project/added.d.ts\""
+                            }),
+                            CanonicalSourceLanguage::TypeScript,
+                            true,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                inputs
+                    .iter()
+                    .map(|(file, parsed)| (*file, &parsed.arena))
+                    .collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            let owners = ["First", "Second", "Merged"].map(|name| {
+                let store = context.store();
+                store
+                    .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                    .unwrap()
+                    .get_source(name)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap()
+            });
+            let [_, _, owner] = owners;
+            let mut references = Vec::new();
+            let mut raw_owners = Vec::new();
+            for (file, parsed) in inputs {
+                for (node, record) in parsed.arena.iter() {
+                    match &record.data {
+                        NodeData::InterfaceDeclaration(interface) => {
+                            let NodeData::Identifier(name) =
+                                &parsed.arena.get(interface.name).unwrap().data
+                            else {
+                                unreachable!();
+                            };
+                            if name.text == "Merged" {
+                                raw_owners.push(
+                                    context
+                                        .file(file)
+                                        .unwrap()
+                                        .1
+                                        .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                                        .unwrap(),
+                                );
+                            }
+                        }
+                        NodeData::ExpressionWithTypeArguments(expression) => {
+                            let NodeData::Identifier(name) =
+                                &parsed.arena.get(expression.expression).unwrap().data
+                            else {
+                                unreachable!();
+                            };
+                            let index = match name.text.as_str() {
+                                "First" => 0,
+                                "Second" => 1,
+                                _ => unreachable!(),
+                            };
+                            references.push((
+                                NodeRef::new(parsed.arena.id(), file, node),
+                                NodeRef::new(parsed.arena.id(), file, expression.expression),
+                                index,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(
+                references
+                    .iter()
+                    .map(|(_, _, index)| *index)
+                    .collect::<Vec<_>>(),
+                expected_order,
+            );
+            assert_ne!(raw_owners[0], raw_owners[1]);
+            for raw in raw_owners {
+                assert_eq!(context.store().get_merged_symbol(raw), Some(owner));
+            }
+            let cold = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            for &(_, name, _) in &references {
+                assert_eq!(context.heritage_artifact_target(name), Ok(None));
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            for file in files {
+                context.check_source_file(file).unwrap();
+            }
+            assert!(context.diagnostics().is_empty());
+            let types = owners.map(|symbol| context.get_declared_type_of_symbol(symbol).unwrap());
+            let owner_type = types[2];
+            let base_types = expected_order
+                .iter()
+                .map(|index| types[*index])
+                .collect::<Vec<_>>();
+            let provenance = context
+                .store()
+                .direct_interface_heritage_provenance(owner_type)
+                .unwrap();
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(
+                provenance.bases,
+                expected_order
+                    .iter()
+                    .map(|index| (owners[*index], types[*index]))
+                    .collect::<Vec<_>>(),
+            );
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                let store = context.store();
+                let TypeData::Interface(interface) = store.type_payload(owner_type).unwrap().data()
+                else {
+                    unreachable!();
+                };
+                (
+                    [
+                        store.type_len(),
+                        store.type_alias_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                        store.index_info_len(),
+                        store.symbol_store().symbol_table_len(),
+                    ],
+                    store.checker_link_allocated_lengths().to_vec(),
+                    interface.clone(),
+                    store
+                        .direct_interface_heritage_provenance(owner_type)
+                        .cloned(),
+                    references
+                        .iter()
+                        .flat_map(|(reference, name, _)| [reference, name])
+                        .map(|node| {
+                            (
+                                store.type_node_links(*node).cloned(),
+                                store.symbol_node_links(*node).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    files.map(|file| {
+                        store
+                            .source_file_links(context.source_file(file).unwrap())
+                            .cloned()
+                    }),
+                    context.diagnostics().clone(),
+                )
+            };
+            let warm = snapshot(&context);
+            for type_first in [false, true] {
+                for &(_, name, index) in &references {
+                    if type_first {
+                        assert_eq!(context.get_type_at_location(name), Ok(types[index]));
+                    }
+                    assert_eq!(
+                        context.get_symbol_at_location(name),
+                        Ok(Some(owners[index]))
+                    );
+                    assert_eq!(context.get_type_at_location(name), Ok(types[index]));
+                }
+                assert_eq!(snapshot(&context), warm);
+            }
+
+            let mut reordered = base_types.clone();
+            reordered.swap(0, 1);
+            for damaged_bases in [reordered, base_types[..base_types.len() - 1].to_vec()] {
+                assert!(context.store_mut_for_test().set_interface_base_resolution(
+                    owner_type,
+                    true,
+                    None,
+                    Some(damaged_bases),
+                ));
+                let damaged = snapshot(&context);
+                for _ in 0..2 {
+                    for &(_, name, _) in &references {
+                        let error = CanonicalArtifactQueryError::InvalidType {
+                            node: name,
+                            type_: owner_type,
+                        };
+                        assert_eq!(context.get_symbol_at_location(name), Err(error));
+                        assert_eq!(context.get_type_at_location(name), Err(error));
+                    }
+                    assert_eq!(snapshot(&context), damaged);
+                }
+                assert!(context.store_mut_for_test().set_interface_base_resolution(
+                    owner_type,
+                    true,
+                    None,
+                    Some(base_types.clone()),
+                ));
+                for &(_, name, index) in &references {
+                    assert_eq!(
+                        context.get_symbol_at_location(name),
+                        Ok(Some(owners[index]))
+                    );
+                    assert_eq!(context.get_type_at_location(name), Ok(types[index]));
+                }
+                assert_eq!(snapshot(&context), warm);
+            }
         }
     }
 
