@@ -763,6 +763,8 @@ pub(super) struct ConditionalExpressionPlan {
     when_false: PlannedExpression,
     when_false_expectation: ConditionalScalarExpectation,
     expected_result: TypeId,
+    // Cached expressions retain the raw type before contextual conversion.
+    expected_cache: TypeId,
     dynamic_result: bool,
     direct_return: bool,
 }
@@ -22731,7 +22733,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?
         };
-        if let Some((store, _)) = self.semantic {
+        let expected_cache = if let Some((store, _)) = self.semantic {
             let expected_cache = if contextual
                 && store
                     .type_node_links(expression)
@@ -22753,7 +22755,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 &when_false,
                 when_false_expectation,
             )?;
-        }
+            expected_cache
+        } else {
+            expected_result
+        };
         Ok(PlannedExpression::new(
             expression,
             PlannedExpressionKind::Conditional(Box::new(ConditionalExpressionPlan {
@@ -22765,6 +22770,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 when_false,
                 when_false_expectation,
                 expected_result,
+                expected_cache,
                 dynamic_result,
                 direct_return,
             })),
@@ -25875,7 +25881,7 @@ fn preflight_uncached_conditional_operand_links(
                 return preflight_source_expression_cache(
                     store,
                     expression.node,
-                    conditional.expected_result,
+                    conditional.expected_cache,
                 );
             }
             return Ok(());
@@ -25886,6 +25892,18 @@ fn preflight_uncached_conditional_operand_links(
             return Ok(());
         }
         PlannedExpressionKind::Call(_) | PlannedExpressionKind::ImportCall(_) => return Ok(()),
+        PlannedExpressionKind::Parenthesized(inner) => {
+            preflight_uncached_conditional_operand_links(store, inner, expectation)?;
+            // Plain parentheses retain the checked inner expression's raw type.
+            // Scalar operands have no inner cache and must remain uncached.
+            if expression.unparenthesized().node != expression.node
+                && let Some(expected) = store
+                    .type_node_links(inner.node)
+                    .and_then(|links| links.resolved_type)
+            {
+                return preflight_source_expression_cache(store, expression.node, expected);
+            }
+        }
         _ => {}
     }
     if store
@@ -25907,9 +25925,6 @@ fn preflight_uncached_conditional_operand_links(
                 expected,
             },
         ));
-    }
-    if let PlannedExpressionKind::Parenthesized(inner) = &expression.kind {
-        preflight_uncached_conditional_operand_links(store, inner, expectation)?;
     }
     Ok(())
 }
@@ -29388,11 +29403,7 @@ fn check_expression_type_with_class_context(
                     when_true_flow,
                     preflighted_type_import_value_uses,
                     &conditional.when_true,
-                    if conditional.when_true_expectation == ConditionalScalarExpectation::Object {
-                        contextual_type
-                    } else {
-                        None
-                    },
+                    contextual_type,
                     deferred,
                     class_flow.as_deref_mut(),
                 )?
@@ -29436,11 +29447,7 @@ fn check_expression_type_with_class_context(
                     when_false_flow,
                     preflighted_type_import_value_uses,
                     &conditional.when_false,
-                    if conditional.when_false_expectation == ConditionalScalarExpectation::Object {
-                        contextual_type
-                    } else {
-                        None
-                    },
+                    contextual_type,
                     deferred,
                     class_flow.as_deref_mut(),
                 )?
@@ -29456,25 +29463,39 @@ fn check_expression_type_with_class_context(
             )?;
             let raw_type = store.expression_union_type_with_global_types(
                 global_types,
-                &[when_true.result, when_false.result],
+                &[when_true.raw, when_false.raw],
                 UnionReduction::Subtype,
             )?;
-            let result_type = if contextual_type.is_some() && !conditional.direct_return {
-                let widened_types = [
-                    widened_fresh_literal_type(store, when_true.result)?,
-                    widened_fresh_literal_type(store, when_false.result)?,
-                ];
-                store.expression_union_type_with_global_types(
-                    global_types,
-                    &widened_types,
-                    UnionReduction::Subtype,
-                )?
+            let apply_context = contextual_type.is_some() && !conditional.direct_return;
+            if !conditional.dynamic_result {
+                let expected_result = if apply_context {
+                    let widened_types = [
+                        widened_fresh_literal_type(store, when_true.result)?,
+                        widened_fresh_literal_type(store, when_false.result)?,
+                    ];
+                    store.expression_union_type_with_global_types(
+                        global_types,
+                        &widened_types,
+                        UnionReduction::Subtype,
+                    )?
+                } else {
+                    raw_type
+                };
+                if expected_result != conditional.expected_result {
+                    return Err(SourceCheckError::Conditional(conditional.node));
+                }
+            }
+            let result_type = if apply_context {
+                let treatment = mutable_literal_treatment(
+                    store,
+                    Some(global_types),
+                    raw_type,
+                    contextual_type,
+                )?;
+                prepared_fresh_literal_union_type(store, global_types, raw_type, treatment)?
             } else {
                 raw_type
             };
-            if !conditional.dynamic_result && result_type != conditional.expected_result {
-                return Err(SourceCheckError::Conditional(conditional.node));
-            }
             publish_expression_type(store, conditional.node, raw_type)?;
             Ok(CheckedExpressionTypes::leaf(raw_type, result_type))
         }
@@ -102929,6 +102950,247 @@ class Foo2 {
             assert_eq!(observable_state(&context, file), warm);
             for child in children {
                 assert!(context.store().type_node_links(child).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn nested_contextual_conditional_arrays_keep_types_on_recheck() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(9_892);
+        for text in [
+            "const values: { kind: \"a\" | \"b\" }[] = [true ? (true ? { kind: \"a\" } : { kind: \"b\" }) : { kind: \"a\" }];",
+            "const values: { kind: \"a\" | \"b\" }[] = [true ? { kind: \"a\" } : (true ? { kind: \"a\" } : { kind: \"b\" })];",
+            "const values: (\"a\" | \"b\")[] = [true ? (true ? \"a\" : \"b\") : \"a\"];",
+            "const values: (\"a\" | \"b\")[] = [true ? \"a\" : (true ? \"a\" : \"b\")];",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(9_893);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty(), "{text}");
+
+            let mut cached = Vec::new();
+            let mut uncached = Vec::new();
+            for (node, record) in source.arena.iter() {
+                let reference = NodeRef::new(source.arena.id(), file, node);
+                if matches!(
+                    record.kind,
+                    SyntaxKind::ArrayLiteralExpression
+                        | SyntaxKind::ConditionalExpression
+                        | SyntaxKind::ParenthesizedExpression
+                        | SyntaxKind::ObjectLiteralExpression
+                ) {
+                    cached.push((reference, resolved_node_type(&context, reference)));
+                }
+                if record.kind == SyntaxKind::ObjectLiteralExpression {
+                    let expected = if node_text(&source, reference) == "{ kind: \"a\" }" {
+                        "\"a\""
+                    } else {
+                        "\"b\""
+                    };
+                    assert_eq!(
+                        context
+                            .type_to_string(object_property_type(&context, reference, "kind"))
+                            .unwrap(),
+                        expected,
+                        "{text}",
+                    );
+                }
+                if let NodeData::ConditionalExpression(conditional) = &record.data {
+                    for child in [
+                        conditional.condition,
+                        conditional.when_true,
+                        conditional.when_false,
+                    ] {
+                        if matches!(
+                            source.arena.get(child).unwrap().kind,
+                            SyntaxKind::TrueKeyword
+                                | SyntaxKind::FalseKeyword
+                                | SyntaxKind::StringLiteral
+                        ) {
+                            uncached.push(NodeRef::new(source.arena.id(), file, child));
+                        }
+                    }
+                    if !text.contains("kind:") {
+                        assert_eq!(
+                            context
+                                .type_to_string(resolved_node_type(&context, reference))
+                                .unwrap(),
+                            "\"a\" | \"b\"",
+                            "{text}",
+                        );
+                    }
+                }
+            }
+            for &child in &uncached {
+                assert!(context.store().type_node_links(child).is_none());
+            }
+            let warm = observable_state(&context, file);
+            for _ in 0..3 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm, "{text}");
+                assert!(context.diagnostics().is_empty(), "{text}");
+                for &(node, expected) in &cached {
+                    assert_eq!(resolved_node_type(&context, node), expected, "{text}");
+                }
+                for &child in &uncached {
+                    assert!(context.store().type_node_links(child).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_conditional_parentheses_reject_changed_type_caches() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(9_894);
+        for text in [
+            "const values: (\"a\" | \"b\")[] = [true ? (true ? \"a\" : \"b\") : \"a\"];",
+            "const values: (\"a\" | \"b\")[] = [true ? \"a\" : (true ? \"a\" : \"b\")];",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(9_895);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let parenthesized =
+                source
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::ParenthesizedExpression)
+                            .then_some(NodeRef::new(source.arena.id(), file, node))
+                    })
+                    .unwrap();
+            let expected = resolved_node_type(&context, parenthesized);
+            let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_ne!(expected, wrong);
+            assert!(context.store_mut_for_test().set_type_node_links(
+                parenthesized,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            mark_source_unchecked(&mut context, file);
+            let before = observable_state(&context, file);
+            let error = SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                node: parenthesized,
+                cached: Some(wrong),
+                expected,
+            });
+            for _ in 0..2 {
+                assert_eq!(context.check_source_file(file), Err(error), "{text}");
+                assert_eq!(observable_state(&context, file), before, "{text}");
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_conditional_initializers_keep_literal_types_on_recheck() {
+        for (text, expected) in [
+            (
+                "const value: \"a\" | \"b\" = true ? (true ? \"a\" : \"b\") : (false ? \"a\" : \"b\");",
+                "\"a\" | \"b\"",
+            ),
+            (
+                "const value: \"a\" | \"b\" = true ? \"a\" : \"b\";",
+                "\"a\" | \"b\"",
+            ),
+            ("const value: \"a\" | 1 = true ? \"a\" : 1;", "\"a\" | 1"),
+            (
+                "const value: \"a\" | 1 = true ? (true ? \"a\" : 1) : \"a\";",
+                "\"a\" | 1",
+            ),
+            (
+                "const value: \"a\" | 1 = true ? \"a\" : (false ? \"a\" : 1);",
+                "\"a\" | 1",
+            ),
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(9_896);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty(), "{text}");
+            let cached = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::ConditionalExpression | SyntaxKind::ParenthesizedExpression
+                    )
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .map(|node| {
+                    let type_ = resolved_node_type(&context, node);
+                    assert_eq!(context.type_to_string(type_).unwrap(), expected, "{text}");
+                    (node, type_)
+                })
+                .collect::<Vec<_>>();
+            let warm = observable_state(&context, file);
+            for _ in 0..3 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm, "{text}");
+                assert!(context.diagnostics().is_empty(), "{text}");
+                for &(node, type_) in &cached {
+                    assert_eq!(resolved_node_type(&context, node), type_, "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_conditional_object_intersections_keep_diagnostics_on_recheck() {
+        for text in [
+            "const value: { a: number } & { b: string } = true ? \"a\" : \"b\";",
+            "const value: { a: number } & { b: string } = true ? (true ? \"a\" : \"b\") : \"a\";",
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(9_897);
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one intersection assignment diagnostic for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "value");
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                ["string", "{ a: number; } & { b: string; }"],
+            );
+            let diagnostics = context.diagnostics().as_slice().to_vec();
+            let initializer = variable_initializer(&source, file, "value");
+            let raw = resolved_node_type(&context, initializer);
+            assert_eq!(context.type_to_string(raw).unwrap(), "\"a\" | \"b\"");
+            let declared = variable_value_type(&context, &source, file, "value");
+            let warm = observable_state(&context, file);
+            for _ in 0..3 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm, "{text}");
+                assert_eq!(context.diagnostics().as_slice(), diagnostics);
+                assert_eq!(resolved_node_type(&context, initializer), raw);
+                assert_eq!(
+                    variable_value_type(&context, &source, file, "value"),
+                    declared,
+                );
             }
         }
     }

@@ -1438,12 +1438,33 @@ fn is_literal_of_contextual_type(
             .type_payload(contextual_type)
             .ok_or(RelationUnavailable::Type(contextual_type))?;
         let flags = record.flags();
-        if flags.intersects(TypeFlags::UNION) {
-            validate_contextual_union(store, global_types, contextual_type)?;
-            let TypeData::Union(union) = record.data() else {
-                return Err(RelationUnavailable::MalformedUnion(contextual_type).into());
+        if flags.intersects(TypeFlags::UNION | TypeFlags::INTERSECTION) {
+            let types = if flags.intersects(TypeFlags::UNION) {
+                validate_contextual_union(store, global_types, contextual_type)?;
+                let TypeData::Union(union) = record.data() else {
+                    return Err(RelationUnavailable::MalformedUnion(contextual_type).into());
+                };
+                union.union.types.clone()
+            } else {
+                match store.validate_intersection_type(contextual_type) {
+                    Ok(projection) => projection.types,
+                    Err(_)
+                        if store
+                            .validate_deferred_intersection_type(contextual_type)
+                            .is_ok() =>
+                    {
+                        return Err(RelationUnavailable::UnresolvedStructuredMembers(
+                            contextual_type,
+                        )
+                        .into());
+                    }
+                    Err(_) => {
+                        return Err(
+                            RelationUnavailable::MalformedIntersection(contextual_type).into()
+                        );
+                    }
+                }
             };
-            let types = union.union.types.clone();
             for constituent in types {
                 if is_literal_of_contextual_type(
                     store,
@@ -2025,6 +2046,18 @@ mod tests {
             )),
         );
         assert_eq!(
+            is_literal_of_contextual_type(
+                store,
+                Some(&globals),
+                LiteralKind::String,
+                Some(deferred),
+                &mut HashSet::new(),
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnresolvedStructuredMembers(deferred),
+            )),
+        );
+        assert_eq!(
             (
                 store.type_len(),
                 store.mapper_len(),
@@ -2140,6 +2173,18 @@ mod tests {
                     &HashMap::new(),
                     &expression,
                     target,
+                ),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::MalformedIntersection(target),
+                )),
+            );
+            assert_eq!(
+                is_literal_of_contextual_type(
+                    store,
+                    Some(&globals),
+                    LiteralKind::String,
+                    Some(target),
+                    &mut HashSet::new(),
                 ),
                 Err(SourceCheckError::RelationUnavailable(
                     RelationUnavailable::MalformedIntersection(target),

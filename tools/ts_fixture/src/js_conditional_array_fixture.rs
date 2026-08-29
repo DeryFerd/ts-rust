@@ -268,3 +268,169 @@ fn contextual_conditional_arrays_check_variable_conditions() {
         assert_contextual_conditional_array(name, source, codes, types);
     }
 }
+
+#[test]
+fn contextual_conditional_arrays_keep_nested_object_context() {
+    for (name, source) in [
+        (
+            "nested-object-true",
+            "const values: { kind: \"a\" | \"b\" }[] = [true ? (true ? { kind: \"a\" } : { kind: \"b\" }) : { kind: \"a\" }];",
+        ),
+        (
+            "nested-object-false",
+            "const values: { kind: \"a\" | \"b\" }[] = [true ? { kind: \"a\" } : (true ? { kind: \"a\" } : { kind: \"b\" })];",
+        ),
+    ] {
+        assert_contextual_conditional_array(
+            name,
+            source,
+            &[],
+            &[
+                ">{ kind: \"a\" } : { kind: \"a\"; }\r\n",
+                ">{ kind: \"b\" } : { kind: \"b\"; }\r\n",
+            ],
+        );
+    }
+}
+
+#[test]
+fn contextual_conditional_arrays_keep_nested_literal_types() {
+    for (name, source) in [
+        (
+            "nested-literal-true",
+            "const values: (\"a\" | \"b\")[] = [true ? (true ? \"a\" : \"b\") : \"a\"];",
+        ),
+        (
+            "nested-literal-false",
+            "const values: (\"a\" | \"b\")[] = [true ? \"a\" : (true ? \"a\" : \"b\")];",
+        ),
+    ] {
+        assert_contextual_conditional_array(
+            name,
+            source,
+            &[],
+            &[
+                ">values : (\"a\" | \"b\")[]\r\n",
+                ">true ? \"a\" : \"b\" : \"a\" | \"b\"\r\n",
+                ">(true ? \"a\" : \"b\") : \"a\" | \"b\"\r\n",
+            ],
+        );
+    }
+}
+
+#[test]
+fn contextual_conditional_arrays_check_nested_object_types() {
+    for (name, source) in [
+        (
+            "nested-object-wrong-true",
+            "const values: { kind: \"a\" | \"b\" }[] = [true ? (true ? { kind: \"a\" } : { kind: \"c\" }) : { kind: \"a\" }];",
+        ),
+        (
+            "nested-object-wrong-false",
+            "const values: { kind: \"a\" | \"b\" }[] = [true ? { kind: \"a\" } : (true ? { kind: \"c\" } : { kind: \"b\" })];",
+        ),
+    ] {
+        assert_contextual_conditional_array(name, source, &[2322], &[]);
+    }
+}
+
+#[test]
+fn contextual_conditional_initializers_keep_literal_types() {
+    for (name, source, codes) in [
+        (
+            "direct-nested-literal-context",
+            "const value: \"a\" | \"b\" = true ? (true ? \"a\" : \"b\") : (false ? \"a\" : \"b\");",
+            &[][..],
+        ),
+        (
+            "direct-literal-context",
+            "const value: \"a\" | \"b\" = true ? \"a\" : \"b\";",
+            &[][..],
+        ),
+        (
+            "direct-nested-true",
+            "const value: \"a\" | \"b\" = true ? (true ? \"a\" : \"b\") : \"a\";",
+            &[][..],
+        ),
+        (
+            "direct-nested-false",
+            "const value: \"a\" | \"b\" = true ? \"a\" : (false ? \"a\" : \"b\");",
+            &[][..],
+        ),
+        (
+            "direct-nested-wrong-literal",
+            "const value: \"a\" | \"b\" = true ? (true ? \"a\" : \"b\") : (false ? \"a\" : \"c\");",
+            &[2322][..],
+        ),
+        (
+            "direct-wrong-literal",
+            "const value: \"a\" | \"b\" = true ? \"a\" : \"c\";",
+            &[2322][..],
+        ),
+    ] {
+        assert_contextual_conditional_array(name, source, codes, &[">value : \"a\" | \"b\"\r\n"]);
+    }
+}
+
+#[test]
+fn contextual_conditional_initializers_keep_mixed_literal_types() {
+    for (name, source, codes) in [
+        (
+            "direct-mixed-literals",
+            "const value: \"a\" | 1 = true ? \"a\" : 1;",
+            &[][..],
+        ),
+        (
+            "direct-mixed-nested-true",
+            "const value: \"a\" | 1 = true ? (true ? \"a\" : 1) : \"a\";",
+            &[][..],
+        ),
+        (
+            "direct-mixed-nested-false",
+            "const value: \"a\" | 1 = true ? \"a\" : (false ? \"a\" : 1);",
+            &[][..],
+        ),
+        (
+            "direct-mixed-wrong-literal",
+            "const value: \"a\" | 1 = true ? (true ? \"a\" : 1) : (false ? \"a\" : 2);",
+            &[2322][..],
+        ),
+    ] {
+        assert_contextual_conditional_array(name, source, codes, &[">value : \"a\" | 1\r\n"]);
+    }
+}
+
+#[test]
+fn contextual_conditional_initializers_keep_object_intersection_errors() {
+    let case = Case::parse(
+        "contextualConditionalObjectIntersection.ts",
+        concat!(
+            "// @strict: true\n",
+            "// @target: es2015\n",
+            "// @noEmit: true\n",
+            "// @filename: input.ts\n",
+            "const value: { a: number } & { b: string } = true ? \"a\" : \"b\";",
+        ),
+    )
+    .unwrap();
+    let mut variants = expand_option_matrix(&case);
+    assert_eq!(variants.len(), 1);
+    let compilation =
+        compile_case_variant(&case, &mut variants[0], FixtureChecker::Canonical, false).unwrap();
+    let errors = render_error_baseline(&case, &compilation.diagnostics);
+    assert!(errors.unsupported_details.is_empty());
+    let [diagnostic] = compilation.diagnostics.as_slice() else {
+        panic!("expected one intersection assignment diagnostic")
+    };
+    assert_eq!(diagnostic.code, Some(2322));
+    assert_eq!(
+        diagnostic
+            .range
+            .map(|range| (range.start.get(), range.end.get())),
+        Some((6, 11))
+    );
+    assert_eq!(
+        diagnostic.message,
+        "Type 'string' is not assignable to type '{ a: number; } & { b: string; }'.",
+    );
+}
