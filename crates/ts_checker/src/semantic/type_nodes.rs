@@ -46794,7 +46794,7 @@ mod tests {
         let constraint = store
             .create_direct_generic_reference_type(html_attributes, &[image_element])
             .unwrap();
-        let wrong_constraint = heading_projection.alias_arguments[0];
+        let other_element_constraint = heading_projection.alias_arguments[0];
 
         {
             let mut query = CanonicalTypeQuery::new(
@@ -46808,9 +46808,13 @@ mod tests {
                 query.inherited_generic_interface_constraint(image_argument, constraint),
                 Ok(Some(true))
             );
+            // The fixture's attribute properties do not use the element parameter.
             assert_eq!(
-                query.inherited_generic_interface_constraint(image_argument, wrong_constraint),
-                Ok(None)
+                query.inherited_generic_interface_constraint(
+                    image_argument,
+                    other_element_constraint,
+                ),
+                Ok(Some(true))
             );
         }
         for symbol in [

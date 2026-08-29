@@ -236,7 +236,7 @@ fn ordinary_generic_constraints_keep_fixed_type_arguments() {
             assert!(diagnostic.message.starts_with(
                 "Type 'Derived<number>' does not satisfy the constraint 'Base<string>'."
             ));
-            let start = source.find("Derived<number>").unwrap() as u32;
+            let start = u32::try_from(source.find("Derived<number>").unwrap()).unwrap();
             let span = diagnostic.range.unwrap();
             assert_eq!((span.start.get(), span.end.get()), (start, start + 15));
         }
