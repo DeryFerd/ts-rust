@@ -341,7 +341,7 @@ fn alias_owner(checker: &mut CanonicalCheckerContext<'_>, name: &str) -> Semanti
         .unwrap();
     let owner = checker.store().get_merged_symbol(raw).unwrap();
     let declarations = checker.get_symbol_declarations(owner).unwrap();
-    let [declaration] = declarations.as_slice() else {
+    let [declaration] = declarations else {
         panic!("expected one source-owned mapped alias");
     };
     if name == "Pick" {
@@ -539,7 +539,7 @@ fn assert_object_source(
     let properties = record.structured.properties.clone().unwrap();
     assert_eq!(properties.len(), 2);
     let arena = checker.file(source.file).unwrap().0;
-    let NodeData::ObjectLiteralExpression(literal) = &arena.get(source.node).unwrap().data() else {
+    let NodeData::ObjectLiteralExpression(literal) = &arena.get(source.node).unwrap().data else {
         panic!("expected the original object literal");
     };
     assert_eq!(literal.properties.nodes.len(), 2);
@@ -550,7 +550,7 @@ fn assert_object_source(
         .zip(["a", "b"])
     {
         let declaration = NodeRef::new(source.arena, source.file, declaration);
-        let NodeData::PropertyAssignment(syntax) = &arena.get(declaration.node).unwrap().data()
+        let NodeData::PropertyAssignment(syntax) = &arena.get(declaration.node).unwrap().data
         else {
             panic!("expected an object property assignment");
         };
