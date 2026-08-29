@@ -1295,13 +1295,18 @@ pub(super) fn missing_mapped_index_signature_details(
 
 /// Explains required constructor arguments from authenticated signature records.
 fn constructor_assignability_details(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
     source_type: TypeId,
     target_type: TypeId,
     strict_function_types: bool,
 ) -> Result<Vec<String>, SourceCheckError> {
-    let Some((required, available)) =
-        store.constructor_arity_mismatch(source_type, target_type, strict_function_types)?
+    let Some((required, available)) = store.constructor_arity_mismatch(
+        source_type,
+        target_type,
+        global_types,
+        strict_function_types,
+    )?
     else {
         return Ok(Vec::new());
     };
@@ -1614,6 +1619,7 @@ fn generic_assignability_diagnostic(
     if diagnostic.diagnostic.details.is_empty() {
         diagnostic.diagnostic.details = constructor_assignability_details(
             store,
+            global_types,
             source_type,
             target_type,
             options.strict_function_types,

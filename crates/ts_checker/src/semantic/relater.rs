@@ -6642,9 +6642,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
     /// Reports fixed-target arity only after constructor and static requirements are proven.
     pub(super) fn constructor_arity_mismatch(
-        &self,
+        &mut self,
         source: TypeId,
         target: TypeId,
+        global_types: &CanonicalGlobalTypes,
         strict_function_types: bool,
     ) -> Result<Option<(usize, usize)>, RelationUnavailable> {
         for type_ in [source, target] {
@@ -6680,19 +6681,52 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .type_payload(target)
             .and_then(|record| record.data().structured())
             .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
-        // Static member errors precede arity errors. Targets with those requirements
-        // remain with the member diagnostic path until it can report the failure reason.
-        if structured.properties.as_deref().is_some_and(|properties| {
+        let has_properties = structured.properties.as_deref().is_some_and(|properties| {
             properties.iter().any(|property| {
                 self.symbol(*property)
                     .is_none_or(|symbol| !symbol.flags().contains(SymbolFlags::PROTOTYPE))
             })
-        }) || structured
+        });
+        if structured
             .index_infos
             .as_deref()
             .is_some_and(|indexes| !indexes.is_empty())
         {
             return Ok(None);
+        }
+        if has_properties {
+            let target_is_class = self
+                .type_payload(target)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| self.symbol(symbol))
+                .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::CLASS));
+            if !target_is_class {
+                return Ok(None);
+            }
+            if let Err(established) = self.claim_strict_function_types(strict_function_types) {
+                return Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                    established,
+                    requested: strict_function_types,
+                });
+            }
+            let bootstrap = self.relation_bootstrap_facts()?;
+            let mut session = RelaterSession::new_with_global_types_and_options(
+                self,
+                RelationKind::Assignable,
+                bootstrap,
+                Some(RelationGlobalTypes::from_global_types(global_types)),
+                Some(strict_function_types),
+            );
+            session.observe_type_surface(source);
+            session.observe_type_surface(target);
+            let source_members = session.class_constructor_static_members(source)?;
+            let target_members = session.class_constructor_static_members(target)?;
+            let properties =
+                session.properties_related_to(source, target, &source_members, &target_members)?;
+            // This checks only static members, so it cannot publish a constructor relation.
+            if properties == Ternary::False {
+                return Ok(None);
+            }
         }
         Ok(Some((
             source_signature.min_argument_count,
@@ -10722,6 +10756,71 @@ mod tests {
     }
 
     #[test]
+    fn constructor_arity_details_check_static_members_without_caching_partial_success() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "class A { static tag = ''; constructor(x: string) {} } ",
+            "class B { static tag = ''; constructor(x: string, y: string) {} } ",
+            "class C { static tag = 1; constructor(x: string, y: string) {} } ",
+            "class P { static tag = ''; private constructor(x: string, y: string) {} }",
+        ));
+        let file = FileId::new(97_003);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let value_type = |name| {
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            store
+                .value_symbol_links(globals.get_source(name).unwrap())
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        };
+        let a = value_type("A");
+        let b = value_type("B");
+        let c = value_type("C");
+        let p = value_type("P");
+        let globals = context.global_types().clone();
+        for (source, expected) in [(b, Some((2, 1))), (c, None), (p, None)] {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source, a, &globals, true
+                    ),
+                Ok(false)
+            );
+            let before = context.store().relation_state_snapshot();
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .constructor_arity_mismatch(source, a, &globals, true),
+                Ok(expected)
+            );
+            assert_eq!(context.store().relation_state_snapshot(), before);
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source, a, &globals, true
+                    ),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
     fn defaulted_class_constructor_call_types_keep_body_and_property_types() {
         let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
         let source = parse_source_file(concat!(
@@ -10875,20 +10974,28 @@ mod tests {
         assert_eq!(signature.parameters.len(), 2);
         assert_eq!(signature.min_argument_count, 2);
         assert_eq!(
-            context.store().constructor_arity_mismatch(b, a, true),
+            context
+                .store_mut_for_test()
+                .constructor_arity_mismatch(b, a, &globals, true),
             Ok(Some((2, 1)))
         );
         assert_eq!(
-            context.store().constructor_arity_mismatch(c, a, true),
+            context
+                .store_mut_for_test()
+                .constructor_arity_mismatch(c, a, &globals, true),
             Ok(None)
         );
         let number = context.store().intrinsic_bootstrap().unwrap().number_type;
         assert_eq!(
-            context.store().constructor_arity_mismatch(number, a, true),
+            context
+                .store_mut_for_test()
+                .constructor_arity_mismatch(number, a, &globals, true),
             Ok(None)
         );
         assert_eq!(
-            context.store().constructor_arity_mismatch(b, number, true),
+            context
+                .store_mut_for_test()
+                .constructor_arity_mismatch(b, number, &globals, true),
             Ok(None)
         );
 

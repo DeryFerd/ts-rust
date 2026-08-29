@@ -99,6 +99,49 @@ fn defaulted_constructor_relations_accept_undefined_without_widening_the_body() 
 }
 
 #[test]
+fn matching_constructor_statics_keep_arity_details_and_failure_precedence() {
+    let source = "class A {\n    static tag = \"\";\n    constructor(x: string) {}\n}\nclass B {\n    static tag = \"\";\n    constructor(x: string, y: string) {}\n}\nconst result: typeof A = B;";
+    let program = check(source);
+    assert_eq!(
+        program.diagnostics().len(),
+        1,
+        "{:?}",
+        program.diagnostics()
+    );
+    let diagnostic = &program.diagnostics()[0];
+    assert_eq!(diagnostic.code, Some(2322));
+    assert_eq!(
+        diagnostic.message,
+        "Type 'typeof B' is not assignable to type 'typeof A'.\n  Target signature provides too few arguments. Expected 2 or more, but got 1."
+    );
+    let range = diagnostic.range.unwrap();
+    assert_eq!(
+        &source[range.start.get() as usize..range.end.get() as usize],
+        "result"
+    );
+    for source in [
+        "class A { static tag = ''; constructor(x: string) {} } class B { static tag = 1; constructor(x: string, y: string) {} } const result: typeof A = B;",
+        "class A { static tag = ''; constructor(x: string) {} } class B { static tag = ''; private constructor(x: string, y: string) {} } const result: typeof A = B;",
+    ] {
+        let program = check(source);
+        assert_eq!(
+            program.diagnostics().len(),
+            1,
+            "{:?}",
+            program.diagnostics()
+        );
+        assert_eq!(program.diagnostics()[0].code, Some(2322));
+        assert!(
+            !program.diagnostics()[0]
+                .message
+                .contains("Target signature provides too few arguments"),
+            "{source}: {:?}",
+            program.diagnostics()
+        );
+    }
+}
+
+#[test]
 fn constructor_relations_keep_parameter_return_and_static_checks() {
     for (source, expected) in [
         (
