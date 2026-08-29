@@ -6319,31 +6319,47 @@ pub(super) fn optional_constructor_parameter_type(
     optional: bool,
     declaration: NodeRef,
 ) -> Result<Option<TypeId>, ClassError> {
+    optional_constructor_parameter_type_with_context(store, annotation, optional, declaration, None)
+}
+
+fn optional_constructor_parameter_type_with_context(
+    store: &CanonicalTypeMapperStore,
+    annotation: TypeId,
+    optional: bool,
+    declaration: NodeRef,
+    context: Option<&ClassTypeQueryContext>,
+) -> Result<Option<TypeId>, ClassError> {
     let constituents =
         constructor_parameter_type_constituents(store, annotation, optional, declaration)?;
     if let [type_] = constituents.as_slice() {
         return Ok(Some(*type_));
     }
-    // Stored constructor checks retain source bindings but not an array context.
-    let published_annotation = stored_constructor_parameter_annotation(store, declaration)
-        .map(|(node, _)| node)
-        .filter(|node| {
-            matches!(
-                store.source_node_kind(*node),
+    // Stored reads can prove the source identity without granting an array capability.
+    let published_source = context.is_none()
+        && stored_constructor_parameter_annotation(store, declaration).is_some_and(
+            |(node, initializer)| match store.source_node_kind(node) {
                 Some(
                     SyntaxKind::TypeReference
-                        | SyntaxKind::UnionType
-                        | SyntaxKind::ParenthesizedType
-                )
-            )
-        })
-        .is_some_and(|node| {
-            stored_constructor_annotation_type(store, node, &mut HashSet::new()) == Some(annotation)
-        });
-    let cached = if published_annotation {
+                    | SyntaxKind::UnionType
+                    | SyntaxKind::ParenthesizedType,
+                ) => {
+                    stored_constructor_annotation_type(store, node, &mut HashSet::new())
+                        == Some(annotation)
+                }
+                Some(SyntaxKind::NewExpression) if initializer == Some(node) => {
+                    exact_global_date_initializer(store, node, annotation)
+                }
+                _ => false,
+            },
+        );
+    let cached = if published_source {
         store.cached_annotation_union_type(&constituents, None)
     } else {
-        store.cached_literal_union_type_with_alias(&constituents, None, None)
+        store.cached_literal_union_type_with_alias(
+            &constituents,
+            None,
+            context.map(|context| CanonicalArrayTargets::from_global_types(&context.global_types)),
+        )
     };
     cached.map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(declaration)))
 }
@@ -6370,17 +6386,49 @@ fn prepare_constructor_optional_type(
     optional: bool,
     declaration: NodeRef,
 ) -> Result<TypeId, ClassError> {
-    if let Some(type_) = optional_constructor_parameter_type(store, type_, optional, declaration)? {
+    prepare_constructor_optional_type_with_context(store, type_, optional, declaration, None)
+}
+
+fn prepare_constructor_optional_type_with_context(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    optional: bool,
+    declaration: NodeRef,
+    context: Option<&ClassTypeQueryContext>,
+) -> Result<TypeId, ClassError> {
+    if let Some(type_) = optional_constructor_parameter_type_with_context(
+        store,
+        type_,
+        optional,
+        declaration,
+        context,
+    )? {
         return Ok(type_);
     }
     let constituents =
         constructor_parameter_type_constituents(store, type_, optional, declaration)?;
-    let mut prepared = store
-        .prepare_type_query_types(&[], &[], &[], 1, 0)
-        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
-    store
-        .literal_union_type_prepared(&constituents, None, &mut prepared)
-        .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(declaration)))
+    let mut prepared = match context {
+        Some(context) => store.prepare_type_query_types_with_global_types(
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            &context.global_types,
+        ),
+        None => store.prepare_type_query_types(&[], &[], &[], 1, 0),
+    }
+    .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    match context {
+        Some(context) => store.literal_union_type_prepared_with_global_types(
+            &context.global_types,
+            &constituents,
+            None,
+            &mut prepared,
+        ),
+        None => store.literal_union_type_prepared(&constituents, None, &mut prepared),
+    }
+    .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(declaration)))
 }
 
 #[allow(clippy::too_many_lines)] // The local and property share one binder/cache proof.
@@ -13617,7 +13665,10 @@ fn plan_class_declaration(
         implementations,
         constructor,
         type_query_context: constructor
-            .filter(|constructor| constructor.annotated_parameter.is_some())
+            .filter(|constructor| {
+                constructor.annotated_parameter.is_some()
+                    || constructor.inferred_date_parameter.is_some()
+            })
             .and_then(|_| type_context.cloned()),
         accessor,
         index,
@@ -24829,7 +24880,13 @@ pub(super) fn execute_nongeneric_class_members(
         })
         .transpose()?;
     if let (Some(parameter), Some(body_type)) = (inferred_date_parameter, inferred_date_type) {
-        prepare_constructor_optional_type(store, body_type, true, parameter.declaration)?;
+        prepare_constructor_optional_type_with_context(
+            store,
+            body_type,
+            true,
+            parameter.declaration,
+            plan.class.type_query_context.as_ref(),
+        )?;
     }
     let base_constructor = planned_class_base_constructor(store, &plan.class)?;
     let shell = shell_state(store, host, &plan.class)?;
@@ -33799,6 +33856,223 @@ mod tests {
                 warm,
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold creation, source replay, and the two query contexts.
+    fn constructor_date_defaults_keep_array_context_after_member_queries() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Date { toISOString(): string; toJSON(key?: any): string; ",
+            "readonly labels: string[]; } ",
+            "interface DateConstructor { new(): Date; readonly prototype: Date; } ",
+            "declare var Date: DateConstructor;",
+        ));
+        let source = parse_source_file(concat!(
+            "declare let existing: Date; ",
+            "class Model { constructor(readonly timestamp = new Date()) {} }",
+        ));
+        let library_file = FileId::new(8_936);
+        let source_file = FileId::new(8_937);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, default_library, name) in [
+            (&library, library_file, true, "\"/lib.d.ts\""),
+            (&source, source_file, false, "\"/model.ts\""),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            options,
+        )
+        .unwrap();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let store = context.store();
+        let globals = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap();
+        let owner = globals.get_source("Model").unwrap();
+        let existing = globals.get_source("existing").unwrap();
+        let annotation = store
+            .symbol(existing)
+            .and_then(Symbol::value_declaration)
+            .and_then(|declaration| store.source_direct_type_annotation(declaration))
+            .unwrap();
+        let date_type = context.get_type_from_type_node(annotation).unwrap();
+        let mut constituents = [
+            date_type,
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_type,
+        ];
+        constituents.sort_unstable();
+        assert_eq!(
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_union_type(&constituents),
+            None,
+        );
+        assert!(
+            context
+                .store()
+                .validate_cached_array_capability(date_type)
+                .is_err()
+        );
+        let query_context = ClassTypeQueryContext::new(context.global_types(), options);
+        let plan = plan_nongeneric_class_member_query_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&query_context),
+        )
+        .unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("Model must retain a direct class plan")
+        };
+        assert_eq!(
+            class.class.type_query_context.as_ref(),
+            Some(&query_context)
+        );
+        let parameter = class
+            .class
+            .constructor
+            .unwrap()
+            .inferred_date_parameter
+            .unwrap();
+        context.check_source_file(source_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let store = context.store();
+        for symbol in [parameter.local_symbol, parameter.property_symbol] {
+            assert_eq!(
+                store.value_symbol_links(symbol).unwrap().resolved_type,
+                Some(date_type)
+            );
+        }
+        let call_type =
+            optional_constructor_parameter_type(store, date_type, true, parameter.declaration)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            store.validate_canonical_union_metadata(call_type, &constituents),
+            Ok(())
+        );
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let before = snapshot(store);
+        for _ in 0..2 {
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                context.get_nongeneric_class_members(owner).unwrap(),
+                members
+            );
+            assert_eq!(
+                plan_nongeneric_class_member_query_with_type_context(
+                    context.store(),
+                    &host,
+                    owner,
+                    Some(&query_context),
+                ),
+                Ok(plan.clone()),
+            );
+            assert_eq!(
+                optional_constructor_parameter_type_with_context(
+                    context.store(),
+                    date_type,
+                    true,
+                    parameter.declaration,
+                    Some(&query_context),
+                ),
+                Ok(Some(call_type)),
+            );
+            assert_eq!(snapshot(context.store()), before);
+        }
+        let mut wrong_context = query_context.clone();
+        wrong_context.global_types.array_type = wrong_context.global_types.readonly_array_type;
+        assert_eq!(
+            optional_constructor_parameter_type_with_context(
+                context.store(),
+                date_type,
+                true,
+                parameter.declaration,
+                Some(&wrong_context),
+            ),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                parameter.declaration
+            ))),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        let store = context.store_mut_for_test();
+        let initializer = parameter.initializer.node();
+        let original = store.signature_links(initializer).cloned().unwrap();
+        assert!(store.set_signature_links(
+            initializer,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(
+                    store.intrinsic_bootstrap().unwrap().any_signature
+                ),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert_eq!(
+            optional_constructor_parameter_type(store, date_type, true, parameter.declaration),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                parameter.declaration
+            ))),
+        );
+        assert_eq!(snapshot(store), before);
+        assert!(store.set_signature_links(initializer, original));
+        assert_eq!(
+            optional_constructor_parameter_type(store, date_type, true, parameter.declaration),
+            Ok(Some(call_type)),
+        );
+        assert_eq!(snapshot(store), before);
     }
 
     #[test]

@@ -38,15 +38,18 @@ use ts_jsnum::{Number, PseudoBigInt};
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callable_sets::{
+        StoredCallableSetValidation, validate_stored_callable_set,
+        validate_stored_declared_method_callable_set, validated_method_annotation_type,
+    },
     callables::CallableFamily,
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
-    declared::{cached_class_type, cached_ordinary_type_parameter_owner},
+    declared::{cached_class_type, cached_interface_type, cached_ordinary_type_parameter_owner},
     derived_types::DerivedObjectLiteralValidation,
     enums::{validate_enum_type_union_constituent, validate_enum_value_union_constituent},
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
-    links::ValueSymbolLinks,
+    links::{LateBoundLinks, SignatureLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::{TypeMapper, TypeMapperApplication},
     object_members,
     reference_types::{
@@ -57,7 +60,7 @@ use super::{
     store::{SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
-        validate_interface_heritage_members_with_array_targets,
+        valid_declared_member_table, validate_interface_heritage_members_with_array_targets,
     },
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
@@ -2545,6 +2548,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(_) | TypeData::Interface(_) => {
+                let recognized_library_interface = matches!(record.data(), TypeData::Interface(_))
+                    && !record.object_flags().contains(ObjectFlags::REFERENCE)
+                    && record.symbol().is_some_and(|symbol| {
+                        object_members::authenticated_default_library_interface_owner(self, symbol)
+                            && self.source_has_only_interface_property_members(symbol)
+                    });
+                if let TypeData::Interface(interface) = record.data()
+                    && !record.object_flags().contains(ObjectFlags::REFERENCE)
+                    && let Some(edges) = self.lazy_default_library_interface_union_edges(
+                        type_,
+                        record,
+                        interface,
+                        array_validation.targets(),
+                    )
+                {
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 let unsupported_callable = matches!(
                     record.data(),
                     TypeData::Object(object)
@@ -2672,6 +2700,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         }
                         Ok(())
                     }
+                    object_members::DeclaredPropertyTypeGraphValidation::Opaque
+                        if recognized_library_interface =>
+                    {
+                        // A failed library proof must not hide its member type edges.
+                        Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+                    }
                     object_members::DeclaredPropertyTypeGraphValidation::Opaque => Ok(()),
                     object_members::DeclaredPropertyTypeGraphValidation::Malformed => {
                         Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
@@ -2680,6 +2714,36 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => Ok(()),
         }
+    }
+
+    /// The full-member proof owns only source property and method declarations.
+    fn source_has_only_interface_property_members(&self, symbol: SemanticSymbolId) -> bool {
+        let Some(declarations) = self.symbol(symbol).and_then(|owner| owner.declarations()) else {
+            return false;
+        };
+        for &declaration in declarations {
+            if self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+                continue;
+            }
+            let Some(children) = self.source_direct_children(declaration) else {
+                return false;
+            };
+            if children.iter().any(|child| {
+                !matches!(
+                    self.source_node_kind(*child),
+                    Some(
+                        SyntaxKind::Identifier
+                            | SyntaxKind::DeclareKeyword
+                            | SyntaxKind::MethodSignature
+                            | SyntaxKind::PropertyDeclaration
+                            | SyntaxKind::PropertySignature
+                    )
+                )
+            }) {
+                return false;
+            }
+        }
+        true
     }
 
     fn validate_cached_type_reference_array_capability(
@@ -2841,32 +2905,614 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result
     }
 
-    /// Library return annotations can use a declared identity before its members are queried.
-    fn valid_lazy_default_library_interface_union_constituent(
+    /// Library annotations keep their declared identity as member queries populate caches.
+    fn lazy_default_library_interface_union_edges(
         &self,
         type_: TypeId,
         record: &TypeRecord,
         interface: &InterfaceTypeData,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Option<Vec<TypeId>> {
+        let symbol = record.symbol()?;
+        if !object_members::authenticated_default_library_interface_owner(self, symbol)
+            || self.direct_interface_heritage_provenance(type_).is_some()
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.resolved_base_types.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+        {
+            return None;
+        }
+        let flags = record.object_flags()
+            & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES);
+        let structured = &interface.reference.object.structured;
+        let cold = structured == &StructuredTypeData::default()
+            && !interface.declared_members_resolved
+            && interface.declared_members.is_none();
+        let reference = flags == ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+            && cold
+            && !interface.base_types_resolved
+            && validate_nongeneric_interface_argument_origin(self, type_).is_ok();
+        if reference {
+            return Some(Vec::new());
+        }
+        let resolved = flags == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+            && interface.base_types_resolved
+            && interface.declared_members_resolved
+            && interface.declared_members == structured.members
+            && valid_declared_member_table(self, symbol, interface.declared_members)
+            && Self::valid_supported_property_object_tail(&interface.reference.object);
+        let thisless = (flags == ObjectFlags::INTERFACE && cold || resolved)
+            && record.flags() == TypeFlags::OBJECT
+            && record.alias().is_none()
+            && object_members::valid_thisless_interface_identity(interface)
+            && cached_interface_type(self, symbol).ok().flatten() == Some(type_)
+            && !self.declared_type_initialization_in_progress(symbol)
+            && !matches!(
+                object_members::validate_resolved_declared_property_type_graph(self, type_),
+                object_members::DeclaredPropertyTypeGraphValidation::Malformed
+            );
+        if !thisless {
+            return None;
+        }
+        self.lazy_default_library_interface_member_edges(
+            symbol,
+            array_targets,
+            resolved.then_some(structured),
+        )
+    }
+
+    /// Unqueried members add no type edges. Published members retain their source
+    /// checks and contribute every type needed by the array capability scan.
+    #[allow(clippy::too_many_lines)] // Check source ownership and both member tables together.
+    fn lazy_default_library_interface_member_edges(
+        &self,
+        symbol: SemanticSymbolId,
+        array_targets: Option<CanonicalArrayTargets>,
+        resolved: Option<&StructuredTypeData>,
+    ) -> Option<Vec<TypeId>> {
+        let owner = self.symbol(symbol)?;
+        let declarations = owner.declarations()?;
+        let table = match owner.members() {
+            Some(table) => Some(self.symbol_table(table)?),
+            None => None,
+        };
+        let mut named_members = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut resolved_members = Vec::new();
+        let mut edges = Vec::new();
+        for &declaration in declarations {
+            if self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+                continue;
+            }
+            for node in self.source_direct_children(declaration)? {
+                match self.source_node_kind(node)? {
+                    SyntaxKind::Identifier | SyntaxKind::DeclareKeyword => continue,
+                    SyntaxKind::MethodSignature
+                    | SyntaxKind::PropertyDeclaration
+                    | SyntaxKind::PropertySignature
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::IndexSignature
+                    | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature => {}
+                    _ => return None,
+                }
+                let member = self.source_declaration_symbol(node)?;
+                let member_record = self.symbol(member)?;
+                if self.get_parent_of_symbol(member) != Some(symbol)
+                    || !self.source_merged_symbol_declarations_match(member)
+                {
+                    return None;
+                }
+                if member_record.name() != InternalSymbolName::Computed.as_ref() {
+                    if table
+                        .and_then(|table| table.get(member_record.name()))
+                        .and_then(|raw| self.get_merged_symbol(raw))
+                        != Some(member)
+                    {
+                        return None;
+                    }
+                    named_members.insert(member);
+                } else if self
+                    .source_child_with_kind(node, SyntaxKind::ComputedPropertyName)
+                    .is_none()
+                {
+                    return None;
+                }
+                if seen.insert(member) {
+                    if let Some(resolved) = resolved {
+                        let published = self
+                            .late_bound_links(member)
+                            .and_then(|links| links.late_symbol)
+                            .unwrap_or(member);
+                        let name = self.symbol(published)?.name();
+                        if self
+                            .value_symbol_links(published)
+                            .and_then(|links| links.resolved_type)
+                            .is_none()
+                            || self
+                                .symbol_table(resolved.members?)?
+                                .get(name)
+                                .and_then(|symbol| self.get_merged_symbol(symbol))
+                                != Some(published)
+                        {
+                            return None;
+                        }
+                        if !resolved_members.contains(&published) {
+                            resolved_members.push(published);
+                        }
+                    }
+                    edges.extend(self.lazy_default_library_member_edges(member, array_targets)?);
+                }
+            }
+        }
+        if table.is_some_and(|table| {
+            table.len() != named_members.len()
+                || table.iter().any(|(name, raw)| {
+                    self.get_merged_symbol(raw).is_none_or(|member| {
+                        !named_members.contains(&member)
+                            || self
+                                .symbol(member)
+                                .is_none_or(|record| record.name() != name)
+                    })
+                })
+        }) {
+            return None;
+        }
+        if let Some(resolved) = resolved
+            && (resolved.properties.as_deref()
+                != (!resolved_members.is_empty()).then_some(resolved_members.as_slice())
+                || resolved.members.is_some_and(|table| {
+                    self.symbol_table(table)
+                        .is_none_or(|table| table.len() != resolved_members.len())
+                }))
+        {
+            return None;
+        }
+        Some(edges)
+    }
+
+    #[allow(clippy::too_many_lines)] // Validates one member and its published annotation caches.
+    fn lazy_default_library_member_edges(
+        &self,
+        source: SemanticSymbolId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Option<Vec<TypeId>> {
+        let source_record = self.symbol(source)?;
+        let member = self
+            .late_bound_links(source)
+            .and_then(|links| links.late_symbol)
+            .unwrap_or(source);
+        let record = self.symbol(member)?;
+        if member != source
+            && (!record.flags().contains(SymbolFlags::METHOD)
+                || record.check_flags() != CheckFlags::LATE
+                || self.get_parent_of_symbol(member) != self.get_parent_of_symbol(source)
+                || self
+                    .late_bound_method_sources(member)
+                    .is_none_or(|sources| !sources.contains(&source))
+                || self.authenticated_interface_method_owner(member).is_none()
+                || self
+                    .value_symbol_links(source)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default()))
+        {
+            return None;
+        }
+        if let Some(value) = self
+            .value_symbol_links(member)
+            .and_then(|links| links.resolved_type)
+        {
+            if record.flags().contains(SymbolFlags::METHOD) {
+                let (callable, expected) =
+                    object_members::declared_method_value_types(self, member)?;
+                return (expected == value
+                    && record.declarations()?.iter().all(|declaration| {
+                        self.lazy_default_library_annotation_children_are_exact(
+                            *declaration,
+                            array_targets,
+                            &mut HashSet::new(),
+                        )
+                    })
+                    && matches!(
+                        validate_stored_declared_method_callable_set(self, callable),
+                        Some(StoredCallableSetValidation::Valid { .. })
+                    ))
+                .then_some(vec![value]);
+            }
+            if record.flags().without(SymbolFlags::OPTIONAL) != SymbolFlags::PROPERTY
+                || self.value_symbol_links(member)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(value),
+                        ..ValueSymbolLinks::default()
+                    })
+            {
+                return None;
+            }
+            for &declaration in record.declarations()? {
+                let annotation = self.source_direct_type_annotation(declaration)?;
+                let annotation_type = self.lazy_default_library_annotation_type(
+                    annotation,
+                    array_targets,
+                    &mut HashSet::new(),
+                )?;
+                let expected = if record.flags().contains(SymbolFlags::OPTIONAL)
+                    && self.intrinsic_bootstrap()?.options.strict_null_checks
+                {
+                    self.cached_annotation_union_type(
+                        &[
+                            annotation_type,
+                            self.intrinsic_bootstrap()?.undefined_or_missing_type,
+                        ],
+                        None,
+                    )
+                    .ok()??
+                } else {
+                    annotation_type
+                };
+                if value != expected {
+                    return None;
+                }
+            }
+            return Some(vec![value]);
+        }
+        if member != source {
+            return None;
+        }
+        let mut pending = source_record.declarations()?.to_vec();
+        let mut edges = Vec::new();
+        while let Some(node) = pending.pop() {
+            if let Some(type_) = self
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+            {
+                let kind = self.source_node_kind(node)?;
+                if !kind.is_keyword_type()
+                    && !(SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                        .contains(&(kind as u16))
+                    || self.lazy_default_library_annotation_type(
+                        node,
+                        array_targets,
+                        &mut HashSet::new(),
+                    ) != Some(type_)
+                {
+                    return None;
+                }
+                edges.push(type_);
+                if matches!(
+                    self.source_node_kind(node),
+                    Some(SyntaxKind::FunctionType | SyntaxKind::ConstructorType)
+                ) && matches!(
+                    validate_stored_callable_set(self, type_),
+                    StoredCallableSetValidation::Valid { .. }
+                ) {
+                    continue;
+                }
+            } else if self
+                .type_node_links(node)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+            {
+                return None;
+            }
+            if self
+                .signature_links(node)
+                .is_some_and(|links| links != &SignatureLinks::default())
+                || self.source_declaration_symbol(node).is_some_and(|member| {
+                    !self.source_merged_symbol_declarations_match(member)
+                        || self
+                            .value_symbol_links(member)
+                            .is_some_and(|links| links != &ValueSymbolLinks::default())
+                        || self
+                            .late_bound_links(member)
+                            .is_some_and(|links| links != &LateBoundLinks::default())
+                })
+            {
+                return None;
+            }
+            pending.extend(self.source_direct_children(node)?);
+        }
+        Some(edges)
+    }
+
+    /// Rebuilds the annotation identity from source before accepting a cached type.
+    #[allow(clippy::too_many_lines)] // Each syntax case uses its canonical type validator.
+    fn lazy_default_library_annotation_type(
+        &self,
+        node: NodeRef,
+        array_targets: Option<CanonicalArrayTargets>,
+        active: &mut HashSet<NodeRef>,
+    ) -> Option<TypeId> {
+        if !active.insert(node) {
+            return None;
+        }
+        let result = (|| {
+            let kind = self.source_node_kind(node)?;
+            if kind == SyntaxKind::ParenthesizedType {
+                let children = self.source_direct_children(node)?;
+                let [child] = children.as_slice() else {
+                    return None;
+                };
+                let expected =
+                    self.lazy_default_library_annotation_type(*child, array_targets, active)?;
+                return self
+                    .type_node_links(node)
+                    .is_none_or(|links| {
+                        links == &TypeNodeLinks::default()
+                            || links
+                                == &TypeNodeLinks {
+                                    resolved_type: Some(expected),
+                                    ..TypeNodeLinks::default()
+                                }
+                    })
+                    .then_some(expected);
+            }
+            let cached = validated_method_annotation_type(self, node)?;
+            if kind != SyntaxKind::TypeReference
+                && self.source_type_node_result_is_exact(node, cached, &[])
+            {
+                return Some(cached);
+            }
+            let children = self.source_direct_children(node)?;
+            match kind {
+                SyntaxKind::ArrayType => {
+                    let [element] = children.as_slice() else {
+                        return None;
+                    };
+                    let readonly = matches!(
+                        self.source_node_parent(node),
+                        Some(SourceNodeParent::Parent(parent))
+                            if self.source_type_operator(parent) == Some(SyntaxKind::ReadonlyKeyword)
+                    );
+                    let name = if readonly { "ReadonlyArray" } else { "Array" };
+                    let owner = self
+                        .source_global_bindings()?
+                        .get(ts_binder::EscapedNameRef::source(name))?
+                        .symbol;
+                    let target = self.declared_type_links(owner)?.declared_type?;
+                    let targets = array_targets.unwrap_or_else(|| {
+                        CanonicalArrayTargets::for_single_target_validation(target)
+                    });
+                    let expected_target = if readonly {
+                        targets.readonly_array_type()
+                    } else {
+                        targets.array_type()
+                    };
+                    let TypeData::TypeReference(reference) = self.type_payload(cached)?.data()
+                    else {
+                        return None;
+                    };
+                    if target != expected_target || reference.object.target != Some(target) {
+                        return None;
+                    }
+                    let array = self
+                        .canonical_array_reference_with_targets(targets, cached)
+                        .ok()??;
+                    let expected_element =
+                        self.lazy_default_library_annotation_type(*element, array_targets, active)?;
+                    (array.base_type == cached && array.element_type == expected_element)
+                        .then_some(cached)
+                }
+                SyntaxKind::TypeReference => {
+                    let (name, arguments) = children.split_first()?;
+                    let symbol = self.lazy_default_library_reference_symbol(*name)?;
+                    if self
+                        .symbol_node_links(node)
+                        .and_then(|links| links.resolved_symbol)
+                        != Some(symbol)
+                        || !self.source_merged_symbol_declarations_match(symbol)
+                    {
+                        return None;
+                    }
+                    let owner = self.symbol(symbol)?;
+                    if owner.flags() == SymbolFlags::TYPE_PARAMETER {
+                        return (arguments.is_empty()
+                            && cached_ordinary_type_parameter_owner(self, cached) == Some(symbol))
+                        .then_some(cached);
+                    }
+                    if owner.flags() == SymbolFlags::TYPE_ALIAS {
+                        let [declaration] = owner.declarations()? else {
+                            return None;
+                        };
+                        let links = self.type_alias_links(symbol)?;
+                        if !arguments.is_empty()
+                            || links.type_parameters.is_some()
+                            || links.instantiations.is_some()
+                            || links.is_constructor_declared_property
+                            || links.declared_type != Some(cached)
+                        {
+                            return None;
+                        }
+                        let body = self.source_direct_type_annotation(*declaration)?;
+                        return (self.lazy_default_library_annotation_type(
+                            body,
+                            array_targets,
+                            active,
+                        )? == cached)
+                            .then_some(cached);
+                    }
+                    let target = if owner.flags().contains(SymbolFlags::CLASS) {
+                        cached_class_type(self, symbol).ok()??
+                    } else if owner.flags().contains(SymbolFlags::INTERFACE) {
+                        cached_interface_type(self, symbol).ok()??
+                    } else {
+                        return None;
+                    };
+                    if arguments.is_empty() {
+                        return (super::declared::preflight_class_or_interface_reference(
+                            self,
+                            &super::DeclaredTypeHost::default(),
+                            symbol,
+                            owner.flags(),
+                        )
+                        .ok()?
+                            == 0
+                            && target == cached)
+                            .then_some(cached);
+                    }
+                    let reference = validate_direct_generic_reference(self, cached).ok()?;
+                    if reference.target != target
+                        || reference.type_arguments.len() != arguments.len()
+                    {
+                        return None;
+                    }
+                    for (&argument, expected) in arguments.iter().zip(reference.type_arguments) {
+                        if self.lazy_default_library_annotation_type(
+                            argument,
+                            array_targets,
+                            active,
+                        )? != expected
+                        {
+                            return None;
+                        }
+                    }
+                    Some(cached)
+                }
+                SyntaxKind::UnionType => {
+                    let types = children
+                        .into_iter()
+                        .map(|child| {
+                            self.lazy_default_library_annotation_type(child, array_targets, active)
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let mut parent = node;
+                    let alias = loop {
+                        let Some(SourceNodeParent::Parent(next)) = self.source_node_parent(parent)
+                        else {
+                            break None;
+                        };
+                        match self.source_node_kind(next)? {
+                            SyntaxKind::ParenthesizedType => parent = next,
+                            SyntaxKind::TypeAliasDeclaration => {
+                                break self.source_declaration_symbol(next);
+                            }
+                            _ => break None,
+                        }
+                    };
+                    (self
+                        .cached_annotation_union_type(&types, alias.map(|owner| (owner, &[][..])))
+                        .ok()??
+                        == cached)
+                        .then_some(cached)
+                }
+                SyntaxKind::TypeOperator
+                    if self.source_type_operator(node) == Some(SyntaxKind::ReadonlyKeyword) =>
+                {
+                    let [child] = children.as_slice() else {
+                        return None;
+                    };
+                    (self.lazy_default_library_annotation_type(*child, array_targets, active)?
+                        == cached)
+                        .then_some(cached)
+                }
+                SyntaxKind::LiteralType
+                    if matches!(children.as_slice(), [child]
+                    if self.source_node_kind(*child) == Some(SyntaxKind::NullKeyword)) =>
+                {
+                    (cached == self.intrinsic_bootstrap()?.null_type).then_some(cached)
+                }
+                SyntaxKind::FunctionType | SyntaxKind::ConstructorType => {
+                    let StoredCallableSetValidation::Valid {
+                        family: CallableFamily::FunctionType,
+                        projection,
+                        ..
+                    } = validate_stored_callable_set(self, cached)
+                    else {
+                        return None;
+                    };
+                    let signatures = projection
+                        .call_signatures
+                        .iter()
+                        .map(|callable| callable.signature)
+                        .chain(projection.construct_signatures.iter().copied())
+                        .collect::<Vec<_>>();
+                    let [signature] = signatures.as_slice() else {
+                        return None;
+                    };
+                    (self.signature(*signature)?.declaration() == Some(node)
+                        && self.lazy_default_library_annotation_children_are_exact(
+                            node,
+                            array_targets,
+                            active,
+                        ))
+                    .then_some(cached)
+                }
+                _ => None,
+            }
+        })();
+        active.remove(&node);
+        result
+    }
+
+    fn lazy_default_library_annotation_children_are_exact(
+        &self,
+        node: NodeRef,
+        array_targets: Option<CanonicalArrayTargets>,
+        active: &mut HashSet<NodeRef>,
     ) -> bool {
-        let Some(symbol) = record.symbol() else {
+        let Some(mut pending) = self.source_direct_children(node) else {
             return false;
         };
-        object_members::authenticated_default_library_interface_owner(self, symbol)
-            && validate_nongeneric_interface_argument_origin(self, type_).is_ok()
-            && record.object_flags()
-                & !(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
-                    | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
-                == ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
-            && interface.reference.object.structured == StructuredTypeData::default()
-            && !interface.base_types_resolved
-            && self.direct_interface_heritage_provenance(type_).is_none()
-            && interface.resolved_base_constructor_type.is_none()
-            && interface.resolved_base_types.is_none()
-            && !interface.declared_members_resolved
-            && interface.declared_members.is_none()
-            && interface.declared_call_signatures.is_none()
-            && interface.declared_construct_signatures.is_none()
-            && interface.declared_index_infos.is_none()
+        while let Some(child) = pending.pop() {
+            if let Some(type_) = self
+                .type_node_links(child)
+                .and_then(|links| links.resolved_type)
+                && self.source_node_kind(child).is_some_and(|kind| {
+                    kind.is_keyword_type()
+                        || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                            .contains(&(kind as u16))
+                })
+                && self.lazy_default_library_annotation_type(child, array_targets, active)
+                    != Some(type_)
+            {
+                return false;
+            }
+            let Some(children) = self.source_direct_children(child) else {
+                return false;
+            };
+            pending.extend(children);
+        }
+        true
+    }
+
+    fn lazy_default_library_reference_symbol(&self, name: NodeRef) -> Option<SemanticSymbolId> {
+        if self.source_node_kind(name) == Some(SyntaxKind::QualifiedName) {
+            let children = self.source_direct_children(name)?;
+            let [left, right] = children.as_slice() else {
+                return None;
+            };
+            let parent = self.lazy_default_library_reference_symbol(*left)?;
+            let name = self.source_identifier_text(*right)?;
+            return self
+                .symbol(parent)?
+                .exports()
+                .and_then(|table| self.symbol_table(table))?
+                .get_source(name)
+                .and_then(|symbol| self.get_merged_symbol(symbol));
+        }
+        let text = self.source_identifier_text(name)?;
+        let mut scope = name;
+        while let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(scope) {
+            for child in self.source_direct_children(parent)? {
+                if self.source_node_kind(child) == Some(SyntaxKind::TypeParameter)
+                    && self
+                        .source_child_with_kind(child, SyntaxKind::Identifier)
+                        .and_then(|name| self.source_identifier_text(name))
+                        == Some(text)
+                {
+                    return self.source_declaration_symbol(child);
+                }
+            }
+            scope = parent;
+        }
+        let binding = self
+            .source_global_bindings()?
+            .get(ts_binder::EscapedNameRef::source(text))?;
+        let globals = self.intrinsic_bootstrap()?.globals;
+        (self.symbol_table(globals)?.get_source(text) == Some(binding.table_symbol)
+            && self.get_merged_symbol(binding.table_symbol) == Some(binding.symbol))
+        .then_some(binding.symbol)
     }
 
     fn validate_supported_canonical_tuple(
@@ -3555,9 +4201,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             TypeData::Interface(interface) => {
-                if self.valid_lazy_default_library_interface_union_constituent(
-                    type_, record, interface,
+                if let Some(edges) = self.lazy_default_library_interface_union_edges(
+                    type_,
+                    record,
+                    interface,
+                    array_validation.targets(),
                 ) {
+                    if !visiting.insert(type_) {
+                        return Ok(());
+                    }
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            array_visited,
+                            allowed_pending,
+                        )?;
+                    }
                     return Ok(());
                 }
                 match validate_stored_callable_set(self, type_) {

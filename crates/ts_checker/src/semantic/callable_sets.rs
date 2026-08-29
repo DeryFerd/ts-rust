@@ -2161,7 +2161,7 @@ fn validated_method_signature_parameter_types(
     Some(parameter_types)
 }
 
-fn validated_method_annotation_type(
+pub(super) fn validated_method_annotation_type(
     store: &CanonicalTypeMapperStore,
     annotation: ts_ast::NodeRef,
 ) -> Option<TypeId> {

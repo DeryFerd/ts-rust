@@ -28522,12 +28522,109 @@ mod generic_publication_tests {
         );
     }
 
-    fn assert_excluded_date_marker_cache_guard(fixture: &mut DateUnionFixture<'_>) {
+    fn assert_date_union_identity_without_member_writes(
+        fixture: &mut DateUnionFixture<'_>,
+    ) -> TypeId {
+        assert_date_union_identity(fixture, None)
+    }
+
+    fn assert_date_union_identity(
+        fixture: &mut DateUnionFixture<'_>,
+        global_types: Option<&CanonicalGlobalTypes>,
+    ) -> TypeId {
+        let store = fixture.context.store_mut_for_test();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let mut constituents = [fixture.type_, undefined];
+        constituents.sort_unstable();
+        let cached = store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_union_type(&constituents);
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        let query = |store: &mut CanonicalTypeMapperStore| match global_types {
+            Some(global_types) => store.expression_union_type_with_global_types(
+                global_types,
+                &constituents,
+                UnionReduction::Literal,
+            ),
+            None => store.expression_union_type(&constituents, UnionReduction::Literal),
+        };
+        let union = query(store).unwrap();
+        assert_eq!(
+            store.validate_canonical_union_metadata(union, &constituents),
+            Ok(()),
+        );
+        assert!(cached.is_none_or(|cached| cached == union));
+        assert_eq!(query(store), Ok(union));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            (
+                before.0 + usize::from(cached.is_none()),
+                before.1,
+                before.2,
+                before.3,
+                before.4,
+                before.5,
+            ),
+        );
+        union
+    }
+
+    fn assert_date_union_identity_after_method_query(fixture: &mut DateUnionFixture<'_>) {
+        let optional = assert_date_union_identity_without_member_writes(fixture);
+        publish_date_union_marker(fixture);
+        assert_eq!(
+            assert_date_union_identity_without_member_writes(fixture),
+            optional,
+        );
+        let store = fixture.context.store_mut_for_test();
+        let null = store.intrinsic_bootstrap().unwrap().null_type;
+        let mut constituents = [fixture.type_, null];
+        constituents.sort_unstable();
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        let nullable = store
+            .expression_union_type(&constituents, UnionReduction::Literal)
+            .unwrap();
+        assert_ne!(nullable, optional);
+        assert_eq!(
+            store.validate_canonical_union_metadata(nullable, &constituents),
+            Ok(()),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            (before.0 + 1, before.1, before.2, before.3),
+        );
+    }
+
+    fn assert_date_marker_cache_guard(fixture: &mut DateUnionFixture<'_>) {
         use crate::semantic::bootstrap::LiteralTypeCacheError;
 
-        let unsupported = LiteralTypeCacheError::UnsupportedUnionConstituent(fixture.type_);
         let malformed = LiteralTypeCacheError::InvalidCachedUnion(fixture.type_);
-        assert_date_union_rejection_without_writes(fixture, unsupported);
+        assert_date_union_identity_without_member_writes(fixture);
         let store = fixture.context.store_mut_for_test();
         let marker_links = store
             .value_symbol_links(fixture.marker)
@@ -28548,7 +28645,7 @@ mod generic_publication_tests {
                 .store_mut_for_test()
                 .set_value_symbol_links(fixture.marker, marker_links)
         );
-        assert_date_union_rejection_without_writes(fixture, unsupported);
+        assert_date_union_identity_without_member_writes(fixture);
         assert!(
             fixture
                 .context
@@ -28559,7 +28656,7 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn date_unions_keep_generic_siblings_opaque_without_hiding_invalid_caches() {
+    fn date_unions_keep_generic_siblings_cold_without_hiding_invalid_caches() {
         use crate::semantic::bootstrap::LiteralTypeCacheError;
 
         let library = parse_source_file(DATE_UNION_LIBRARY);
@@ -28577,8 +28674,7 @@ mod generic_publication_tests {
                 if warm {
                     publish_date_union_marker(&mut fixture);
                 }
-                assert_excluded_date_marker_cache_guard(&mut fixture);
-                let unsupported = LiteralTypeCacheError::UnsupportedUnionConstituent(fixture.type_);
+                assert_date_marker_cache_guard(&mut fixture);
                 let malformed = LiteralTypeCacheError::InvalidCachedUnion(fixture.type_);
                 let store = fixture.context.store_mut_for_test();
                 let constructor = store
@@ -28606,13 +28702,16 @@ mod generic_publication_tests {
                         .store_mut_for_test()
                         .set_symbol_declarations(constructor, Some(declarations), None,)
                 );
-                assert_date_union_rejection_without_writes(&mut fixture, unsupported);
+                assert_date_union_identity_without_member_writes(&mut fixture);
+                if !warm {
+                    assert_date_union_identity_after_method_query(&mut fixture);
+                }
             }
         }
     }
 
     #[test]
-    fn date_unions_keep_nonmethod_siblings_opaque_without_hiding_marker_caches() {
+    fn date_unions_keep_nonmethod_siblings_cold_without_hiding_marker_caches() {
         let library = parse_source_file(DATE_UNION_LIBRARY);
         for member in [
             "readonly label: string;",
@@ -28628,13 +28727,16 @@ mod generic_publication_tests {
                 if warm {
                     publish_date_union_marker(&mut fixture);
                 }
-                assert_excluded_date_marker_cache_guard(&mut fixture);
+                assert_date_marker_cache_guard(&mut fixture);
+                if !warm {
+                    assert_date_union_identity_after_method_query(&mut fixture);
+                }
             }
         }
     }
 
     #[test]
-    fn date_unions_keep_es2015_computed_siblings_opaque_without_writes() {
+    fn date_unions_keep_es2015_computed_siblings_cold_without_member_writes() {
         let well_known = include_str!("../../../ts_bundled/libs/lib.es2015.symbol.wellknown.d.ts");
         let parsed = parse_source_file(well_known);
         assert!(parsed.diagnostics.is_empty());
@@ -28691,7 +28793,7 @@ mod generic_publication_tests {
             if warm {
                 publish_date_union_marker(&mut fixture);
             }
-            assert_excluded_date_marker_cache_guard(&mut fixture);
+            assert_date_marker_cache_guard(&mut fixture);
             let store = fixture.context.store_mut_for_test();
             let computed = store
                 .source_declaration_symbol(computed_declaration)
@@ -28712,11 +28814,629 @@ mod generic_publication_tests {
                     crate::semantic::links::LateBoundLinks::default(),
                 )
             );
-            let unsupported =
-                crate::semantic::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(
-                    fixture.type_,
+            assert_date_union_identity_without_member_writes(&mut fixture);
+            if !warm {
+                assert_date_union_identity_after_method_query(&mut fixture);
+            }
+        }
+    }
+
+    #[test]
+    fn date_unions_reject_malformed_cold_thisless_member_caches() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
+        let mut fixture = date_union_fixture(&library, &augmentation, true);
+        assert_date_union_identity_without_member_writes(&mut fixture);
+        let type_ = fixture.type_;
+        let members = fixture
+            .context
+            .store()
+            .symbol(fixture.date)
+            .unwrap()
+            .members();
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_interface_declared_members(type_, false, members, None, None, None),
+        );
+        for _ in 0..2 {
+            assert_date_union_rejection_without_writes(
+                &mut fixture,
+                crate::semantic::bootstrap::LiteralTypeCacheError::InvalidCachedUnion(type_),
+            );
+        }
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_interface_declared_members(type_, false, None, None, None, None),
+        );
+        assert_date_union_identity_without_member_writes(&mut fixture);
+    }
+
+    #[test]
+    fn date_unions_reject_replaced_missing_and_extra_cold_members() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        let augmentation = parse_source_file(concat!(
+            "interface Date { toJSON(key?: any): string; } ",
+            "interface Date { readonly label: string; }",
+        ));
+        for poison in 0..3 {
+            let mut fixture = date_union_fixture(&library, &augmentation, true);
+            let union = assert_date_union_identity_without_member_writes(&mut fixture);
+            let store = fixture.context.store_mut_for_test();
+            let original = store.symbol(fixture.date).unwrap().members().unwrap();
+            let entries = store
+                .symbol_table(original)
+                .unwrap()
+                .iter()
+                .map(|(name, member)| (name.to_owned(), member))
+                .collect::<Vec<_>>();
+            let poisoned = store.alloc_symbol_table();
+            for (name, member) in entries {
+                if poison == 1 && name.as_utf8() == Some("label") {
+                    continue;
+                }
+                let member = if poison == 0 && name.as_utf8() == Some("label") {
+                    fixture.sibling
+                } else {
+                    member
+                };
+                assert_eq!(store.insert_symbol(poisoned, name, member), Some(None));
+            }
+            if poison == 2 {
+                assert_eq!(
+                    store.insert_symbol(poisoned, EscapedName::source("extra"), fixture.sibling),
+                    Some(None),
                 );
-            assert_date_union_rejection_without_writes(&mut fixture, unsupported);
+            }
+            assert!(store.set_symbol_relationships(fixture.date, Some(poisoned), None, None, None));
+            let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+            let before = (
+                store.type_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                assert!(
+                    store
+                        .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                        .is_err(),
+                    "table case {poison}",
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.signature_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+            }
+            assert!(store.set_symbol_relationships(fixture.date, Some(original), None, None, None));
+            assert_eq!(
+                assert_date_union_identity_without_member_writes(&mut fixture),
+                union,
+            );
+        }
+    }
+
+    #[test]
+    fn date_unions_reject_composite_annotation_cache_substitution() {
+        let library = parse_source_file(DATE_UNION_LIBRARY);
+        for (annotation_text, annotation_kind) in [
+            ("string[]", SyntaxKind::ArrayType),
+            ("Date", SyntaxKind::TypeReference),
+        ] {
+            let augmentation = parse_source_file(&format!(
+                "{DATE_UNION_AUGMENTATION} interface Date {{ readonly label: {annotation_text}; }}",
+            ));
+            for published_property in [false, true] {
+                let mut fixture = date_union_fixture(&library, &augmentation, true);
+                let union = assert_date_union_identity_without_member_writes(&mut fixture);
+                let store = fixture.context.store_mut_for_test();
+                let property = store
+                    .symbol(fixture.date)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|table| store.symbol_table(table))
+                    .and_then(|members| members.get_source("label"))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let annotation = store
+                    .symbol(property)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .and_then(|declaration| store.source_direct_type_annotation(declaration))
+                    .unwrap();
+                assert_eq!(store.source_node_kind(annotation), Some(annotation_kind));
+                let number = store.intrinsic_bootstrap().unwrap().number_type;
+                let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+                assert!(store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                if published_property {
+                    assert!(store.set_value_symbol_links(
+                        property,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                let before = (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                for _ in 0..2 {
+                    assert!(
+                        store
+                            .expression_union_type(
+                                &[fixture.type_, undefined],
+                                UnionReduction::Literal
+                            )
+                            .is_err(),
+                        "{annotation_text} substituted with number, published property: {published_property}",
+                    );
+                    assert_eq!(
+                        (
+                            store.type_len(),
+                            store.symbol_len(),
+                            store.signature_len(),
+                            store.checker_link_allocated_lengths(),
+                        ),
+                        before,
+                    );
+                }
+                assert!(store.set_type_node_links(annotation, TypeNodeLinks::default()));
+                if published_property {
+                    assert!(store.set_value_symbol_links(property, ValueSymbolLinks::default()));
+                }
+                assert_eq!(
+                    assert_date_union_identity_without_member_writes(&mut fixture),
+                    union,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check real annotation queries and their exact cache identities.
+    fn date_unions_preserve_real_array_and_reference_annotation_queries() {
+        let library = parse_source_file(&format!(
+            "{DATE_UNION_LIBRARY} interface Array<T> {{}} interface ReadonlyArray<T> {{}}",
+        ));
+        for annotation_text in ["string[]", "Date"] {
+            let augmentation = parse_source_file(&format!(
+                "{DATE_UNION_AUGMENTATION} interface Date {{ readonly label: {annotation_text}; }}",
+            ));
+            let mut fixture = date_union_fixture(&library, &augmentation, true);
+            let globals = fixture.context.global_types().clone();
+            let union = assert_date_union_identity(&mut fixture, Some(&globals));
+            let store = fixture.context.store();
+            let label = store
+                .symbol(fixture.date)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("label"))
+                .unwrap();
+            let annotation = store
+                .symbol(label)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .and_then(|declaration| store.source_direct_type_annotation(declaration))
+                .unwrap();
+            let type_ = fixture.context.get_type_from_type_node(annotation).unwrap();
+            if annotation_text == "string[]" {
+                let store = fixture.context.store();
+                let array = store
+                    .canonical_array_reference(fixture.context.global_types(), type_)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    array.element_type,
+                    store.intrinsic_bootstrap().unwrap().string_type
+                );
+            } else {
+                assert_eq!(type_, fixture.type_);
+            }
+            assert_eq!(
+                assert_date_union_identity(&mut fixture, Some(&globals)),
+                union,
+            );
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                fixture.context.get_type_from_type_node(annotation).unwrap(),
+                type_
+            );
+            assert_eq!(
+                assert_date_union_identity(&mut fixture, Some(&globals)),
+                union,
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().signature_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            if annotation_text == "string[]" {
+                let store = fixture.context.store_mut_for_test();
+                let number = store.intrinsic_bootstrap().unwrap().number_type;
+                let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+                let before = (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                assert!(
+                    store
+                        .expression_union_type(&[fixture.type_, undefined], UnionReduction::Literal)
+                        .is_err()
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+                let wrong_array = store
+                    .create_canonical_array_type(&globals, number, false)
+                    .unwrap();
+                let literal_clone = store.create_array_literal_type(&globals, type_).unwrap();
+                assert_ne!(literal_clone, type_);
+                assert_eq!(
+                    store
+                        .canonical_array_reference(&globals, literal_clone)
+                        .unwrap()
+                        .unwrap()
+                        .base_type,
+                    type_,
+                );
+                let original = store.type_node_links(annotation).cloned().unwrap();
+                for wrong_type in [wrong_array, literal_clone] {
+                    assert!(store.set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong_type),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    let before = (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.checker_link_allocated_lengths(),
+                    );
+                    for _ in 0..2 {
+                        assert!(
+                            store
+                                .expression_union_type_with_global_types(
+                                    &globals,
+                                    &[fixture.type_, undefined],
+                                    UnionReduction::Literal,
+                                )
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(
+                        (
+                            store.type_len(),
+                            store.symbol_len(),
+                            store.signature_len(),
+                            store.checker_link_allocated_lengths(),
+                        ),
+                        before,
+                    );
+                }
+                assert!(store.set_type_node_links(annotation, original));
+                assert_eq!(
+                    assert_date_union_identity(&mut fixture, Some(&globals)),
+                    union
+                );
+            } else {
+                let store = fixture.context.store_mut_for_test();
+                let TypeData::Interface(interface) =
+                    store.type_payload(fixture.type_).unwrap().data()
+                else {
+                    panic!("Date must retain its declared interface identity")
+                };
+                assert!(interface.base_types_resolved && interface.declared_members_resolved);
+                let original = interface.reference.object.structured.clone();
+                let mut missing = original.properties.clone().unwrap();
+                assert!(missing.contains(&label));
+                missing.retain(|member| *member != label);
+                assert!(store.set_structured_type_members(
+                    fixture.type_,
+                    original.members,
+                    Some(missing),
+                    None,
+                    None,
+                    None,
+                ));
+                let before = (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+                for _ in 0..2 {
+                    assert!(
+                        store
+                            .expression_union_type_with_global_types(
+                                &globals,
+                                &[fixture.type_, undefined],
+                                UnionReduction::Literal,
+                            )
+                            .is_err()
+                    );
+                }
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+                assert!(store.set_structured_type_members(
+                    fixture.type_,
+                    original.members,
+                    original.properties,
+                    None,
+                    None,
+                    None,
+                ));
+                assert_eq!(
+                    assert_date_union_identity(&mut fixture, Some(&globals)),
+                    union,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A nested cache error must not hide the reachable array.
+    fn date_unions_reject_nested_member_list_poison_without_hiding_array_capability() {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+
+        let library = parse_source_file(&format!(
+            "{DATE_UNION_LIBRARY} interface Array<T> {{}} interface ReadonlyArray<T> {{}} \
+             interface Holder {{ readonly date: Date; }} declare let holder: Holder;",
+        ));
+        let augmentation = parse_source_file(&format!(
+            "{DATE_UNION_AUGMENTATION} interface Date {{ readonly label: string[]; }}",
+        ));
+        let mut fixture = date_union_fixture(&library, &augmentation, true);
+        let globals = fixture.context.global_types().clone();
+        let store = fixture.context.store();
+        let holder_annotation = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .and_then(|table| table.get_source("holder"))
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .and_then(|declaration| store.source_direct_type_annotation(declaration))
+            .unwrap();
+        let holder = fixture
+            .context
+            .get_type_from_type_node(holder_annotation)
+            .unwrap();
+        let store = fixture.context.store_mut_for_test();
+        let label = store
+            .symbol(fixture.date)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get_source("label"))
+            .unwrap();
+        let array = store
+            .value_symbol_links(label)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            store
+                .canonical_array_reference(&globals, array)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            store.intrinsic_bootstrap().unwrap().string_type,
+        );
+        let TypeData::Interface(interface) = store.type_payload(fixture.type_).unwrap().data()
+        else {
+            panic!("Date must retain its interface identity")
+        };
+        assert!(interface.base_types_resolved && interface.declared_members_resolved);
+        let original = interface.reference.object.structured.clone();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let types = [holder, undefined];
+        let union = store
+            .expression_union_type_with_global_types(&globals, &types, UnionReduction::Literal)
+            .unwrap();
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let before = counts(store);
+        assert_eq!(
+            store.expression_union_type(&types, UnionReduction::Literal),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array)),
+        );
+        assert_eq!(counts(store), before);
+        let mut missing = original.properties.clone().unwrap();
+        assert!(missing.contains(&label));
+        missing.retain(|member| *member != label);
+        assert!(store.set_structured_type_members(
+            fixture.type_,
+            original.members,
+            Some(missing),
+            None,
+            None,
+            None,
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                store.expression_union_type(&types, UnionReduction::Literal),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    fixture.type_
+                )),
+            );
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &types,
+                    UnionReduction::Literal,
+                ),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    fixture.type_
+                )),
+            );
+            assert_eq!(counts(store), before);
+        }
+        assert!(store.set_structured_type_members(
+            fixture.type_,
+            original.members,
+            original.properties,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &globals,
+                &types,
+                UnionReduction::Literal
+            ),
+            Ok(union),
+        );
+        assert_eq!(
+            store.expression_union_type(&types, UnionReduction::Literal),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array)),
+        );
+        assert_eq!(counts(store), before);
+    }
+
+    #[test]
+    fn date_unions_preserve_published_source_index_interface_array_checks() {
+        let library = parse_source_file(&format!(
+            "{DATE_UNION_LIBRARY} interface Indexed {{ [index: number]: string; }} \
+             interface IndexHolder {{ readonly value: Indexed; }} \
+             declare let indexHolder: IndexHolder;",
+        ));
+        let augmentation = parse_source_file(DATE_UNION_AUGMENTATION);
+        let mut fixture = date_union_fixture(&library, &augmentation, true);
+        let globals = fixture.context.global_types().clone();
+        let store = fixture.context.store();
+        let annotation = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .and_then(|table| table.get_source("indexHolder"))
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            .and_then(|declaration| store.source_direct_type_annotation(declaration))
+            .unwrap();
+        let holder = fixture.context.get_type_from_type_node(annotation).unwrap();
+        let store = fixture.context.store_mut_for_test();
+        let [property] = store
+            .type_payload(holder)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .unwrap()
+        else {
+            panic!("IndexHolder must publish its source property")
+        };
+        let indexed = store
+            .value_symbol_links(*property)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Interface(interface) = store.type_payload(indexed).unwrap().data() else {
+            panic!("Indexed must retain its interface identity")
+        };
+        assert!(interface.base_types_resolved && interface.declared_members_resolved);
+        let [index] = interface.declared_index_infos.as_deref().unwrap() else {
+            panic!("Indexed must publish its source index signature")
+        };
+        let index = store.index_info(*index).unwrap();
+        assert_eq!(
+            index.key_type(),
+            store.intrinsic_bootstrap().unwrap().number_type
+        );
+        assert_eq!(
+            index.value_type(),
+            store.intrinsic_bootstrap().unwrap().string_type
+        );
+        assert!(matches!(
+            validate_resolved_declared_property_type_graph(store, indexed),
+            DeclaredPropertyTypeGraphValidation::Opaque,
+        ));
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let mut types = [holder, undefined];
+        types.sort_unstable();
+        let union = store
+            .expression_union_type(&types, UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(
+            store.validate_canonical_union_metadata(union, &types),
+            Ok(())
+        );
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.mapper_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(store.validate_cached_array_capability(indexed), Ok(()));
+            assert_eq!(
+                store.expression_union_type(&types, UnionReduction::Literal),
+                Ok(union),
+            );
+            assert_eq!(
+                store.expression_union_type_with_global_types(
+                    &globals,
+                    &types,
+                    UnionReduction::Literal
+                ),
+                Ok(union),
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
         }
     }
 
