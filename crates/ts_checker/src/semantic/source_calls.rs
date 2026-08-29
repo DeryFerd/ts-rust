@@ -2485,7 +2485,7 @@ fn select_object_factory_fallback_for_object(
         || host
             .bound_file(plan.node)
             .and_then(ts_binder::BoundFile::source_facts)
-            .is_none_or(|facts| facts.is_javascript_file())
+            .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
     {
         return Ok(None);
     }

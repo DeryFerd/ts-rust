@@ -13885,7 +13885,7 @@ mod tests {
                     .signature_links(declaration)
                     .and_then(|links| links.resolved_signature.signature())
                     .and_then(|signature| queries.context.store().signature(signature))
-                    .and_then(|signature| signature.resolved_return_type())
+                    .and_then(ts_checker::semantic::signatures::Signature::resolved_return_type)
                     .unwrap();
                 assert_eq!(
                     queries.context.type_to_string(returned).unwrap(),
@@ -14004,7 +14004,7 @@ mod tests {
                     .signature_links(function)
                     .and_then(|links| links.resolved_signature.signature())
                     .and_then(|signature| queries.context.store().signature(signature))
-                    .and_then(|signature| signature.resolved_return_type())
+                    .and_then(ts_checker::semantic::signatures::Signature::resolved_return_type)
                     .unwrap();
                 assert_eq!(
                     queries.context.type_to_string(returned).unwrap(),

@@ -28790,13 +28790,13 @@ fn check_source_selected_method_property(
             | TypeFlags::BIG_INT_LIKE
             | TypeFlags::ES_SYMBOL_LIKE,
     );
-    if !scalar
-        && !(source_is_global_object_factory_method(host, plan.node)
-            && matches!(record.data(), TypeData::Interface(_)))
-        && (!record.flags().intersects(TypeFlags::OBJECT)
-            || store
+    if !(scalar
+        || source_is_global_object_factory_method(host, plan.node)
+            && matches!(record.data(), TypeData::Interface(_))
+        || record.flags().intersects(TypeFlags::OBJECT)
+            && store
                 .canonical_array_reference(global_types, receiver)?
-                .is_none())
+                .is_some())
     {
         return Ok(None);
     }
@@ -64048,7 +64048,7 @@ mod tests {
         let return_type = context
             .store()
             .signature(signature)
-            .and_then(|signature| signature.resolved_return_type())
+            .and_then(super::super::signatures::Signature::resolved_return_type)
             .unwrap();
         assert_eq!(
             context.type_to_string(return_type).unwrap(),

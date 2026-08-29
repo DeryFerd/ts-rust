@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, CanonicalTypeQuery, CheckFlags, CheckedSourceDefaultNew,
+    DeclaredTypeHost, InternalSymbolName, NodeData, NodeRef, ObjectFlags, ResolvedSignatureState,
+    SemanticSymbolId, SignatureFlags, SignatureLinks, SourceDefaultNewPlan, SourceNewError,
+    SourceNewInvariant, SourceNewParameter, SourceNewUnsupported, SymbolFlags, SymbolNodeLinks,
+    SyntaxKind, TypeFlags, TypeNodeLinks, ValueSymbolLinks, exact_class_value_type,
+    exact_signature_cache, exact_symbol_cache, exact_type_cache, invariant,
+    optional_constructor_parameter_type, preflight_class_or_interface_reference, unsupported,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ErrorConstructorPlan {
@@ -279,12 +288,12 @@ pub(super) fn resolve(
     let instance = store
         .declared_type_links(plan.resolved_symbol)
         .and_then(|links| links.declared_type);
-    let annotation = exact_type_cache(store, global.annotation).map_err(|_| invalid())?;
-    let return_type = exact_type_cache(store, global.return_annotation).map_err(|_| invalid())?;
+    let annotation = exact_type_cache(store, global.annotation).map_err(|()| invalid())?;
+    let return_type = exact_type_cache(store, global.return_annotation).map_err(|()| invalid())?;
     let value_links = exact_class_value_type(store, plan.resolved_symbol)?;
-    let annotation_symbol = exact_symbol_cache(store, global.annotation).map_err(|_| invalid())?;
+    let annotation_symbol = exact_symbol_cache(store, global.annotation).map_err(|()| invalid())?;
     let return_symbol =
-        exact_symbol_cache(store, global.return_annotation).map_err(|_| invalid())?;
+        exact_symbol_cache(store, global.return_annotation).map_err(|()| invalid())?;
     if annotation.is_some_and(|type_| Some(type_) != value)
         || return_type.is_some_and(|type_| Some(type_) != instance)
         || value_links.is_some_and(|type_| Some(type_) != value)
@@ -294,7 +303,7 @@ pub(super) fn resolve(
         return Err(invalid());
     }
     let Some(signature) =
-        exact_signature_cache(store, global.declaration).map_err(|_| invalid())?
+        exact_signature_cache(store, global.declaration).map_err(|()| invalid())?
     else {
         return Ok(None);
     };
@@ -359,7 +368,7 @@ pub(super) fn resolve(
         global.parameters.iter().zip(&parameter_types)
     {
         let base = exact_type_cache(store, *annotation)
-            .map_err(|_| invalid())?
+            .map_err(|()| invalid())?
             .ok_or_else(invalid)?;
         if optional_constructor_parameter_type(store, base, true, *declaration)? != Some(type_)
             || store.value_symbol_links(*symbol)
@@ -411,7 +420,7 @@ pub(super) fn prepare(
             return Err(invalid());
         }
         if exact_type_cache(store, annotation)
-            .map_err(|_| invalid())?
+            .map_err(|()| invalid())?
             .is_some_and(|cached| cached != base)
             || !store.set_type_node_links(
                 annotation,
@@ -423,16 +432,17 @@ pub(super) fn prepare(
         {
             return Err(invalid());
         }
-        let type_ = match optional_constructor_parameter_type(store, base, true, declaration)? {
-            Some(type_) => type_,
-            None => {
-                let undefined = store
-                    .intrinsic_bootstrap()
-                    .ok_or_else(invalid)?
-                    .undefined_type;
-                super::super::instantiate::canonical_anonymous_union(store, &[base, undefined])
-                    .map_err(|_| invalid())?
-            }
+        let type_ = if let Some(type_) =
+            optional_constructor_parameter_type(store, base, true, declaration)?
+        {
+            type_
+        } else {
+            let undefined = store
+                .intrinsic_bootstrap()
+                .ok_or_else(invalid)?
+                .undefined_type;
+            super::super::instantiate::canonical_anonymous_union(store, &[base, undefined])
+                .map_err(|_| invalid())?
         };
         let expected = ValueSymbolLinks {
             resolved_type: Some(type_),

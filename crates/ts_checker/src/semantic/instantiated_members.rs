@@ -2348,7 +2348,7 @@ fn instantiate_generic_member_type_inner(
         return instantiate_function_member_type(store, template, mapper, array_targets, session);
     }
     if let Some((callback, undefined)) = optional_function_member(store, template)? {
-        let mapped = instantiate_generic_member_type_worker(
+        let instantiated_callback = instantiate_generic_member_type_worker(
             store,
             callback,
             mapper,
@@ -2356,12 +2356,12 @@ fn instantiate_generic_member_type_inner(
             session,
             active,
         )?;
-        if mapped == callback {
+        if instantiated_callback == callback {
             return Ok(template);
         }
         return store
             .literal_union_type_with_alias_and_array_targets(
-                &[mapped, undefined],
+                &[instantiated_callback, undefined],
                 None,
                 array_targets,
             )
@@ -3089,12 +3089,7 @@ fn instantiated_function_member_owner(
     let SourceNodeParent::Parent(method_declaration) = store.source_node_parent(parameter)? else {
         return None;
     };
-    if store
-        .source_child_with_kind(parameter, SyntaxKind::QuestionToken)
-        .is_none()
-    {
-        return None;
-    }
+    store.source_child_with_kind(parameter, SyntaxKind::QuestionToken)?;
     let signature = store
         .signature_links(method_declaration)?
         .resolved_signature
@@ -3113,13 +3108,13 @@ fn instantiated_function_member_owner(
         .copied()
         .chain([this_type])
         .collect::<Vec<_>>();
-    let mapped = reference
+    let destinations = reference
         .type_arguments
         .iter()
         .copied()
         .chain([receiver])
         .collect::<Vec<_>>();
-    (store.type_mapper_has_exact_endpoints(mapper, &sources, &mapped) == Some(true))
+    (store.type_mapper_has_exact_endpoints(mapper, &sources, &destinations) == Some(true))
         .then_some(targets)
 }
 

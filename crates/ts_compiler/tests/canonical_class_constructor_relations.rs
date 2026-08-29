@@ -23,7 +23,7 @@ fn check(source: &str) -> Program {
 
 #[test]
 fn class_constructor_assignments_keep_arity_details_and_accept_matching_subclasses() {
-    let source = r#"class A {
+    let source = r"class A {
     constructor(public x: string) {
     }
 }
@@ -40,7 +40,7 @@ class C extends A {
 
 var r1: typeof A = B;
 var r2: new (x: string) => A = B;
-var r3: typeof A = C;"#;
+var r3: typeof A = C;";
     let program = check(source);
     let diagnostics = program.diagnostics();
     assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
