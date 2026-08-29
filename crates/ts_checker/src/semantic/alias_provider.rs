@@ -25,7 +25,8 @@ use super::{
     CanonicalModuleResolutionManifest, CanonicalModuleResolutionMode, CanonicalResolvedModule,
     CanonicalSemanticStore, SourceFileRef,
     alias::{
-        CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
+        CanonicalAliasResolutionError, CanonicalAliasResolver, CanonicalAliasTargetHost,
+        CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
     links::ExportTypeLinks,
 };
@@ -88,6 +89,88 @@ pub struct ProductionAliasTargetHost<'source, 'arena, 'manifest> {
     store: SemanticStoreId,
     sources: ProductionAliasTargetSources<'source, 'arena>,
     module_resolutions: &'manifest CanonicalModuleResolutionManifest,
+}
+
+/// Source proof for a named import of an ambient value's own declared method.
+/// Rebuilding it checks the manifest and bound declarations, not warm value caches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AmbientImportMethodSource {
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    name: String,
+    modules: Vec<AmbientMethodModuleSource>,
+    aliases: Vec<AmbientMethodAliasSource>,
+    value: AmbientMethodValueSource,
+    type_only_declaration: Option<NodeRef>,
+}
+
+impl AmbientImportMethodSource {
+    pub(super) const fn alias_symbol(&self) -> SemanticSymbolId {
+        self.alias
+    }
+
+    pub(super) const fn method_symbol(&self) -> SemanticSymbolId {
+        self.value.method
+    }
+
+    pub(super) const fn method_declaration(&self) -> NodeRef {
+        self.value.method_declaration
+    }
+
+    pub(super) fn is_current(
+        &self,
+        store: &super::CanonicalTypeMapperStore,
+        host: &super::DeclaredTypeHost<'_>,
+    ) -> bool {
+        let Some(manifest) = host.module_resolutions() else {
+            return false;
+        };
+        let Ok(aliases) = host.alias_target_host(store, manifest) else {
+            return false;
+        };
+        aliases
+            .source_ambient_method_import(store, self.alias)
+            .is_ok_and(|current| current.as_ref() == Some(self))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmbientMethodModuleSource {
+    declaration: NodeRef,
+    specifier: NodeRef,
+    resolved: CanonicalResolvedModule,
+    module: SemanticSymbolId,
+    assignment: SemanticSymbolId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmbientMethodAliasSource {
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    target: SemanticSymbolId,
+    type_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AmbientMethodValueSource {
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    namespace: NodeRef,
+    annotation: NodeRef,
+    interface: SemanticSymbolId,
+    interface_declaration: NodeRef,
+    method: SemanticSymbolId,
+    method_declaration: NodeRef,
+    overloads: Vec<NodeRef>,
+}
+
+#[derive(Clone, Copy)]
+struct AmbientExportEqualsSource {
+    declaration: NodeRef,
+    block: NodeId,
+    module_declaration: NodeRef,
+    expression: NodeRef,
+    target: SemanticSymbolId,
 }
 
 /// A namespace view exposes source exports without creating a canonical wrapper.
@@ -3112,15 +3195,14 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         Ok(targets)
     }
 
-    fn ambient_export_equals_member<MapperPayload>(
+    fn authenticated_ambient_export_equals<MapperPayload>(
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
         resolved: CanonicalResolvedModule,
         module: SemanticSymbolId,
         assignment: SemanticSymbolId,
-        name: &str,
-    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+    ) -> Result<AmbientExportEqualsSource, CanonicalAliasTargetUnavailable> {
         let malformed = || CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
             declaration,
             module,
@@ -3217,9 +3299,50 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             return Err(malformed());
         }
 
-        let namespace =
+        let target =
             Self::alias_expression_target(store, source, assignment_declaration, export.expression)
                 .map_err(|_| malformed())?;
+        Ok(AmbientExportEqualsSource {
+            declaration: assignment_declaration,
+            block,
+            module_declaration,
+            expression,
+            target,
+        })
+    }
+
+    fn ambient_export_equals_member<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        declaration: NodeRef,
+        resolved: CanonicalResolvedModule,
+        module: SemanticSymbolId,
+        assignment: SemanticSymbolId,
+        name: &str,
+    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+        let malformed = || CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+            declaration,
+            module,
+        };
+        let source = self
+            .sources
+            .get(resolved.target_file())
+            .ok_or_else(malformed)?;
+        let exported = self.authenticated_ambient_export_equals(
+            store,
+            declaration,
+            resolved,
+            module,
+            assignment,
+        )?;
+        let expression_node = source
+            .arena
+            .get(exported.expression.node)
+            .ok_or_else(malformed)?;
+        let NodeData::Identifier(identifier) = &expression_node.data else {
+            return Err(malformed());
+        };
+        let namespace = exported.target;
         let namespace_record = store.symbol(namespace).ok_or_else(malformed)?;
         let namespace_exports = namespace_record.exports().ok_or_else(malformed)?;
         if !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
@@ -3239,7 +3362,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                             .get(namespace_declaration.node)
                             .is_some_and(|node| {
                                 node.kind == SyntaxKind::ModuleDeclaration
-                                    && node.parent == Some(block)
+                                    && node.parent == Some(exported.block)
                             })
                 })
             })
@@ -3275,6 +3398,577 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             return Err(malformed());
         }
         Ok(target)
+    }
+
+    /// Rebuilds a named method's complete source path without querying a value type.
+    pub(super) fn source_ambient_method_import<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+    ) -> Result<Option<AmbientImportMethodSource>, CanonicalAliasTargetUnavailable> {
+        let source = self.plan_ambient_method_import(store, alias)?;
+        if source
+            .as_ref()
+            .is_some_and(|source| Self::ambient_method_has_conflicting_export(store, source))
+        {
+            return Err(
+                CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(
+                    source
+                        .expect("a conflicting method source was checked")
+                        .declaration,
+                ),
+            );
+        }
+        if let Some(source) = &source {
+            Self::validate_ambient_method_alias_links(store, source)?;
+        }
+        Ok(source)
+    }
+
+    fn plan_ambient_method_import<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        alias: SemanticSymbolId,
+    ) -> Result<Option<AmbientImportMethodSource>, CanonicalAliasTargetUnavailable> {
+        let declaration = self.alias_declaration(store, alias)?;
+        let (record, _) = self.checked_node(store, declaration)?;
+        if record.kind != SyntaxKind::ImportSpecifier {
+            return Ok(None);
+        }
+        let SupportedAliasDeclaration::NamedModuleMember {
+            specifier,
+            name,
+            type_only,
+        } = self.supported_declaration(store, declaration)?
+        else {
+            return Ok(None);
+        };
+        let resolved = self.resolved_module(declaration, specifier, store)?;
+        if !self.is_ambient_declaration_target(resolved) {
+            return Ok(None);
+        }
+        let module = self.direct_source_module(store, declaration, resolved, true)?;
+        let Some(assignment) = Self::export_equals_target(store, declaration, module)? else {
+            return Ok(None);
+        };
+        let mut edge = AmbientMethodModuleSource {
+            declaration,
+            specifier,
+            resolved,
+            module,
+            assignment,
+        };
+        let mut modules = Vec::new();
+        let mut aliases = Vec::new();
+        let mut seen = HashSet::new();
+        let mut type_only_declaration = type_only.then_some(declaration);
+        let unsupported =
+            || CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration);
+        let value = loop {
+            if !seen.insert(edge.assignment) {
+                return Err(unsupported());
+            }
+            let exported = self.authenticated_ambient_export_equals(
+                store,
+                declaration,
+                edge.resolved,
+                edge.module,
+                edge.assignment,
+            )?;
+            let source = self.checked_source(store, exported.declaration)?;
+            let Some(NodeData::Identifier(identifier)) = source
+                .arena
+                .get(exported.expression.node)
+                .map(|node| &node.data)
+            else {
+                return Err(unsupported());
+            };
+            if source
+                .bound
+                .locals(exported.module_declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                != Some(exported.target)
+                || !store.source_symbol_declarations_match(edge.assignment)
+            {
+                return Err(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                    declaration,
+                    module: edge.module,
+                });
+            }
+            modules.push(edge);
+            aliases.push(AmbientMethodAliasSource {
+                alias: edge.assignment,
+                declaration: exported.declaration,
+                target: exported.target,
+                type_only: false,
+            });
+            let target = store.symbol(exported.target).ok_or_else(unsupported)?;
+            if target.flags() != SymbolFlags::ALIAS {
+                let Some(value) = self.plan_ambient_method_value(store, exported, &name)? else {
+                    return Ok(None);
+                };
+                break value;
+            }
+            if !seen.insert(exported.target)
+                || !store.source_symbol_declarations_match(exported.target)
+                || target.check_flags() != CheckFlags::NONE
+                || target.members().is_some()
+                || target.exports().is_some()
+                || target.export_symbol().is_some()
+            {
+                return Err(unsupported());
+            }
+            let Some([import_declaration]) = target.declarations() else {
+                return Err(unsupported());
+            };
+            let import_declaration = *import_declaration;
+            let (record, import_source) = self.checked_node(store, import_declaration)?;
+            let NodeData::ImportEqualsDeclaration(import) = &record.data else {
+                return Err(unsupported());
+            };
+            if import_declaration.file != exported.declaration.file
+                || record.parent != Some(exported.block)
+                || record.flags.0 != 0
+                || import.modifiers.is_some()
+                || import.flow_node.is_some()
+                || import.local_symbol.is_some()
+                || import.symbol.is_some()
+                || import.facts != 0
+                || import_source.bound.symbol(import_declaration) != Some(exported.target)
+                || import_source.bound.container(import_declaration)
+                    != Some(exported.module_declaration)
+                || !matches!(
+                    import_source.arena.get(import.name),
+                    Some(Node {
+                        kind: SyntaxKind::Identifier,
+                        parent: Some(parent),
+                        data: NodeData::Identifier(import_name),
+                        ..
+                    }) if *parent == import_declaration.node
+                        && import_name.text == identifier.text
+                        && import_name.flow_node.is_none()
+                )
+            {
+                return Err(unsupported());
+            }
+            let SupportedAliasDeclaration::ExternalImportEquals {
+                specifier,
+                type_only,
+            } = self.supported_declaration(store, import_declaration)?
+            else {
+                return Err(unsupported());
+            };
+            let resolved = self.resolved_module(import_declaration, specifier, store)?;
+            if !self.is_ambient_declaration_target(resolved) {
+                return Err(unsupported());
+            }
+            let module = self.direct_source_module(store, import_declaration, resolved, true)?;
+            let Some(assignment) = Self::export_equals_target(store, import_declaration, module)?
+            else {
+                return Err(unsupported());
+            };
+            aliases.push(AmbientMethodAliasSource {
+                alias: exported.target,
+                declaration: import_declaration,
+                target: assignment,
+                type_only,
+            });
+            if type_only_declaration.is_none() && type_only {
+                type_only_declaration = Some(import_declaration);
+            }
+            edge = AmbientMethodModuleSource {
+                declaration: import_declaration,
+                specifier,
+                resolved,
+                module,
+                assignment,
+            };
+        };
+        let result = AmbientImportMethodSource {
+            alias,
+            declaration,
+            name,
+            modules,
+            aliases,
+            value,
+            type_only_declaration,
+        };
+        Ok(Some(result))
+    }
+
+    fn is_ambient_declaration_target(&self, resolved: CanonicalResolvedModule) -> bool {
+        resolved.is_ambient_module()
+            && self
+                .sources
+                .get(resolved.target_file())
+                .and_then(|source| source.bound.source_facts())
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+    }
+
+    fn plan_ambient_method_value<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        exported: AmbientExportEqualsSource,
+        name: &str,
+    ) -> Result<Option<AmbientMethodValueSource>, CanonicalAliasTargetUnavailable> {
+        let unsupported =
+            || CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(exported.declaration);
+        let invalid =
+            || CanonicalAliasTargetUnavailable::MalformedDeclaration(exported.declaration);
+        let source = self.checked_source(store, exported.declaration)?;
+        let value = store.symbol(exported.target).ok_or_else(invalid)?;
+        if value.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::NAMESPACE_MODULE {
+            return Ok(None);
+        }
+        let declarations = value.declarations().ok_or_else(invalid)?;
+        let declaration = value.value_declaration().ok_or_else(invalid)?;
+        if declarations.len() != 2
+            || !store.source_symbol_declarations_match(exported.target)
+            || value.check_flags() != CheckFlags::NONE
+            || value.members().is_some()
+            || value.export_symbol().is_some()
+            || value.parent().is_some()
+            || store.get_merged_symbol(exported.target) != Some(exported.target)
+        {
+            return Err(invalid());
+        }
+        let namespace = declarations
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != declaration)
+            .ok_or_else(invalid)?;
+        let (variable_node, _) = self.checked_node(store, declaration)?;
+        let NodeData::VariableDeclaration(variable) = &variable_node.data else {
+            return Err(invalid());
+        };
+        let list_id = variable_node.parent.ok_or_else(invalid)?;
+        let list = source.arena.get(list_id).ok_or_else(invalid)?;
+        let NodeData::VariableDeclarationList(variables) = &list.data else {
+            return Err(invalid());
+        };
+        let statement_id = list.parent.ok_or_else(invalid)?;
+        let statement = source.arena.get(statement_id).ok_or_else(invalid)?;
+        let NodeData::VariableStatement(statement_data) = &statement.data else {
+            return Err(invalid());
+        };
+        let (namespace_node, _) = self.checked_node(store, namespace)?;
+        let NodeData::ModuleDeclaration(namespace_data) = &namespace_node.data else {
+            return Err(invalid());
+        };
+        let namespace_body_id = namespace_data.body.ok_or_else(unsupported)?;
+        let namespace_body = source.arena.get(namespace_body_id).ok_or_else(invalid)?;
+        let NodeData::ModuleBlock(namespace_block) = &namespace_body.data else {
+            return Err(unsupported());
+        };
+        let owned_name = |node: NodeId, parent: NodeId| {
+            source.arena.get(node).and_then(|node| match &node.data {
+                NodeData::Identifier(identifier)
+                    if node.kind == SyntaxKind::Identifier
+                        && node.flags.0 == 0
+                        && node.parent == Some(parent)
+                        && identifier.flow_node.is_none() =>
+                {
+                    Some(identifier.text.as_str())
+                }
+                _ => None,
+            })
+        };
+        let value_name = value.name().as_utf8().ok_or_else(invalid)?;
+        if declaration.file != exported.declaration.file
+            || namespace.file != declaration.file
+            || variable_node.kind != SyntaxKind::VariableDeclaration
+            || variable_node.flags.0 != 0
+            || variable.initializer.is_some()
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+            || source.bound.symbol(declaration) != Some(exported.target)
+            || list.kind != SyntaxKind::VariableDeclarationList
+            || list.flags.0 != 1 << 1
+            || variables.declarations.nodes.as_slice() != [declaration.node]
+            || variables.declarations.has_trailing_comma
+            || variables.facts != 0
+            || statement.kind != SyntaxKind::VariableStatement
+            || statement.flags.0 != 0
+            || statement.parent != Some(exported.block)
+            || statement_data.declaration_list != list_id
+            || statement_data.modifiers.is_some()
+            || statement_data.flow_node.is_some()
+            || statement_data.facts != 0
+            || namespace_node.kind != SyntaxKind::ModuleDeclaration
+            || namespace_node.flags.0 != 0
+            || namespace_node.parent != Some(exported.block)
+            || namespace_data.modifiers.is_some()
+            || namespace_data.asterisk_token.is_some()
+            || namespace_data.symbol.is_some()
+            || namespace_data.local_symbol.is_some()
+            || namespace_data.facts != 0
+            || source.bound.symbol(namespace) != Some(exported.target)
+            || namespace_body.kind != SyntaxKind::ModuleBlock
+            || namespace_body.parent != Some(namespace.node)
+            || owned_name(variable.name, declaration.node) != Some(value_name)
+            || owned_name(namespace_data.name, namespace.node) != Some(value_name)
+            || owned_name(exported.expression.node, exported.declaration.node) != Some(value_name)
+        {
+            return Err(invalid());
+        }
+        let annotation = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            variable.type_.ok_or_else(unsupported)?,
+        );
+        let (annotation_node, _) = self.checked_node(store, annotation)?;
+        let NodeData::TypeReferenceNode(reference) = &annotation_node.data else {
+            return Err(unsupported());
+        };
+        if annotation_node.kind != SyntaxKind::TypeReference
+            || annotation_node.flags.0 != 0
+            || annotation_node.parent != Some(declaration.node)
+            || reference.type_arguments.is_some()
+        {
+            return Err(unsupported());
+        }
+        let qualified_node = source.arena.get(reference.type_name).ok_or_else(invalid)?;
+        let NodeData::QualifiedName(qualified) = &qualified_node.data else {
+            return Err(unsupported());
+        };
+        let interface_name =
+            owned_name(qualified.right, reference.type_name).ok_or_else(invalid)?;
+        if qualified_node.kind != SyntaxKind::QualifiedName
+            || qualified_node.flags.0 != 0
+            || qualified_node.parent != Some(annotation.node)
+            || qualified.flow_node.is_some()
+            || qualified.facts != 0
+            || owned_name(qualified.left, reference.type_name) != Some(value_name)
+        {
+            return Err(unsupported());
+        }
+        // The left name is the actual local namespace proved above. Do not consult
+        // alias links or resolved_exports when selecting its annotated interface.
+        let exports = value
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .ok_or_else(invalid)?;
+        let interface = exports.get_source(interface_name).ok_or_else(invalid)?;
+        let interface_record = store.symbol(interface).ok_or_else(invalid)?;
+        let Some([interface_declaration]) = interface_record.declarations() else {
+            return Err(unsupported());
+        };
+        let interface_declaration = *interface_declaration;
+        let (interface_node, _) = self.checked_node(store, interface_declaration)?;
+        let NodeData::InterfaceDeclaration(interface_data) = &interface_node.data else {
+            return Err(unsupported());
+        };
+        if interface_record.flags() != SymbolFlags::INTERFACE
+            || interface_record.check_flags() != CheckFlags::NONE
+            || interface_record.name().as_utf8() != Some(interface_name)
+            || interface_record.value_declaration().is_some()
+            || interface_record.exports().is_some()
+            || interface_record.export_symbol().is_some()
+            || store.get_parent_of_symbol(interface) != Some(exported.target)
+            || store.get_merged_symbol(interface) != Some(interface)
+            || !store.source_symbol_declarations_match(interface)
+            || source.bound.symbol(interface_declaration) != Some(interface)
+            || interface_node.kind != SyntaxKind::InterfaceDeclaration
+            || interface_node.flags.0 != 0
+            || interface_node.parent != Some(namespace_body_id)
+            || interface_data.type_parameters.is_some()
+            || interface_data.heritage_clauses.is_some()
+            || interface_data.modifiers.is_some()
+            || interface_data.local_symbol.is_some()
+            || interface_data.symbol.is_some()
+            || interface_data.flow_node.is_some()
+            || owned_name(interface_data.name, interface_declaration.node) != Some(interface_name)
+            || namespace_block
+                .statements
+                .nodes
+                .iter()
+                .filter(|node| **node == interface_declaration.node)
+                .count()
+                != 1
+        {
+            return Err(unsupported());
+        }
+        let method = interface_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(name))
+            .ok_or(CanonicalAliasTargetUnavailable::MissingExport {
+                declaration: exported.declaration,
+                module: exported.target,
+            })?;
+        let method_record = store.symbol(method).ok_or_else(invalid)?;
+        let method_declaration = method_record.value_declaration().ok_or_else(invalid)?;
+        let overloads = method_record.declarations().ok_or_else(invalid)?;
+        if method_record.flags() != SymbolFlags::METHOD
+            || method_record.check_flags() != CheckFlags::NONE
+            || method_record.name().as_utf8() != Some(name)
+            || method_record.members().is_some()
+            || method_record.exports().is_some()
+            || method_record.export_symbol().is_some()
+            || store.get_parent_of_symbol(method) != Some(interface)
+            || store.get_merged_symbol(method) != Some(method)
+            || !store.source_symbol_declarations_match(method)
+            || overloads.is_empty()
+            || !overloads.contains(&method_declaration)
+        {
+            return Err(unsupported());
+        }
+        let selected = interface_data
+            .members
+            .nodes
+            .iter()
+            .copied()
+            .filter_map(|member| {
+                let node = NodeRef::new(
+                    interface_declaration.arena,
+                    interface_declaration.file,
+                    member,
+                );
+                (source.bound.symbol(node) == Some(method)).then_some(node)
+            })
+            .collect::<Vec<_>>();
+        if selected != overloads {
+            return Err(invalid());
+        }
+        for &overload in overloads {
+            let (node, _) = self.checked_node(store, overload)?;
+            let NodeData::MethodSignatureDeclaration(method_data) = &node.data else {
+                return Err(unsupported());
+            };
+            if node.kind != SyntaxKind::MethodSignature
+                || node.flags.0 != 0
+                || node.parent != Some(interface_declaration.node)
+                || method_data.postfix_token.is_some()
+                || method_data.type_parameters.is_some()
+                || method_data.type_.is_none()
+                || method_data.modifiers.is_some()
+                || method_data.symbol.is_some()
+                || method_data.full_signature.is_some()
+                || owned_name(method_data.name, overload.node) != Some(name)
+            {
+                return Err(unsupported());
+            }
+        }
+        Ok(Some(AmbientMethodValueSource {
+            symbol: exported.target,
+            declaration,
+            namespace,
+            annotation,
+            interface,
+            interface_declaration,
+            method,
+            method_declaration,
+            overloads: overloads.to_vec(),
+        }))
+    }
+
+    fn validate_ambient_method_alias_links<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        source: &AmbientImportMethodSource,
+    ) -> Result<(), CanonicalAliasTargetUnavailable> {
+        let mut marker = None;
+        for hop in source.aliases.iter().rev() {
+            marker = hop.type_only.then_some(hop.declaration).or(marker);
+            if let Some(links) = store.alias_symbol_links(hop.alias)
+                && (links
+                    .immediate_target
+                    .is_some_and(|target| target != hop.target)
+                    || match links.alias_target {
+                        AliasTargetState::Unresolved => false,
+                        AliasTargetState::Unknown => true,
+                        AliasTargetState::Resolved(target) => {
+                            target != source.value.symbol || links.type_only_declaration != marker
+                        }
+                    }
+                    || links
+                        .type_only_declaration
+                        .is_some_and(|actual| Some(actual) != marker))
+            {
+                return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(
+                    hop.alias,
+                ));
+            }
+        }
+        if let Some(links) = store.alias_symbol_links(source.alias)
+            && (links
+                .immediate_target
+                .is_some_and(|target| target != source.value.method)
+                || match links.alias_target {
+                    AliasTargetState::Unresolved => false,
+                    AliasTargetState::Unknown => true,
+                    AliasTargetState::Resolved(target) => {
+                        target != source.value.method
+                            || links.type_only_declaration != source.type_only_declaration
+                    }
+                }
+                || links
+                    .type_only_declaration
+                    .is_some_and(|marker| Some(marker) != source.type_only_declaration))
+        {
+            return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(
+                source.alias,
+            ));
+        }
+        Ok(())
+    }
+
+    fn ambient_method_has_conflicting_export<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        source: &AmbientImportMethodSource,
+    ) -> bool {
+        source
+            .modules
+            .iter()
+            .map(|module| module.module)
+            .chain([source.value.symbol])
+            .any(|owner| {
+                store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| store.symbol_table(exports))
+                    .is_none_or(|exports| exports.get_source(&source.name).is_some())
+            })
+    }
+
+    fn publish_ambient_method_indirections<MapperPayload>(
+        &mut self,
+        store: &mut CanonicalSemanticStore<MapperPayload>,
+        source: &AmbientImportMethodSource,
+    ) -> Result<(), CanonicalAliasTargetUnavailable> {
+        let assignment = source
+            .aliases
+            .first()
+            .ok_or(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                source.declaration,
+            ))?
+            .alias;
+        let resolved = CanonicalAliasResolver::new(store, self)
+            .resolve_alias(assignment)
+            .map_err(|error| match error {
+                CanonicalAliasResolutionError::TargetUnavailable { reason, .. } => reason,
+                _ => CanonicalAliasTargetUnavailable::InvalidAliasLinks(assignment),
+            })?;
+        if resolved.target != AliasTargetState::Resolved(source.value.symbol)
+            || !resolved.events.is_empty()
+        {
+            return Err(
+                CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(source.declaration),
+            );
+        }
+        Self::validate_ambient_method_alias_links(store, source)?;
+        if let Some(marker) = source.type_only_declaration {
+            if !store.ensure_alias_symbol_links(source.alias) {
+                return Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(
+                    source.alias,
+                ));
+            }
+            Self::mark_type_only(store, source.alias, marker)?;
+        }
+        Ok(())
     }
 
     fn direct_namespace_target<MapperPayload>(
@@ -3318,9 +4012,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         Ok(())
     }
 
-    /// Re-derives one immediate target and exposes the declaration only when
-    /// that exact alias hop is syntactically type-only. The ordinary alias
-    /// provider uses the same path, while source import validation retains the
+    /// Re-derives one immediate target and exposes its exact type-only marker.
+    /// Named ambient methods also retain an export-assignment hop's marker.
+    /// The ordinary alias provider uses the same path. Source import validation retains the
     /// marker to prove transitive warm-cache propagation independently.
     pub(super) fn get_target_and_type_only_of_alias_declaration<MapperPayload>(
         &mut self,
@@ -3372,6 +4066,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         if type_only {
             Self::mark_type_only(store, alias, declaration)?;
         }
+        let mut type_only_declaration = type_only.then_some(declaration);
         if let SupportedAliasDeclaration::LocalModuleMember { target, .. } = &supported {
             return Ok((
                 DisplayAliasTarget::Symbol(*target),
@@ -3402,13 +4097,20 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     type_only: true,
                     ..
                 }
-        ) || commonjs_javascript_target
+        ) || self.is_ambient_declaration_target(resolved)
+            && resolved.usage_mode() == CanonicalModuleResolutionMode::Esm
+            && resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
             && matches!(
                 supported,
-                SupportedAliasDeclaration::DefaultModuleMember { .. }
-                    | SupportedAliasDeclaration::NamedModuleMember { .. }
-                    | SupportedAliasDeclaration::NamespaceExport { .. }
-            );
+                SupportedAliasDeclaration::NamedModuleMember { .. }
+            )
+            || commonjs_javascript_target
+                && matches!(
+                    supported,
+                    SupportedAliasDeclaration::DefaultModuleMember { .. }
+                        | SupportedAliasDeclaration::NamedModuleMember { .. }
+                        | SupportedAliasDeclaration::NamespaceExport { .. }
+                );
         let module =
             self.direct_source_module(store, declaration, resolved, allow_mixed_module_modes)?;
         let export_equals = Self::export_equals_target(store, declaration, module)?;
@@ -3540,14 +4242,39 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             SupportedAliasDeclaration::NamedModuleMember { name, .. }
                 if resolved.is_ambient_module() && export_equals.is_some() =>
             {
-                self.ambient_export_equals_member(
-                    store,
-                    declaration,
-                    resolved,
-                    module,
-                    export_equals.expect("ambient export-equals was preflighted"),
-                    name,
-                )?
+                let namespace_target =
+                    |host: &Self, store: &CanonicalSemanticStore<MapperPayload>| {
+                        host.ambient_export_equals_member(
+                            store,
+                            declaration,
+                            resolved,
+                            module,
+                            export_equals.expect("ambient export-equals was preflighted"),
+                            name,
+                        )
+                    };
+                match self.plan_ambient_method_import(store, alias) {
+                    Ok(Some(method)) => {
+                        if Self::ambient_method_has_conflicting_export(store, &method) {
+                            return Err(
+                                CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(
+                                    declaration,
+                                ),
+                            );
+                        }
+                        Self::validate_ambient_method_alias_links(store, &method)?;
+                        self.publish_ambient_method_indirections(store, &method)?;
+                        type_only_declaration = method.type_only_declaration;
+                        method.method_symbol()
+                    }
+                    Ok(None) => namespace_target(self, store)?,
+                    // A namespace-only export does not depend on the merged value's
+                    // annotation. Keep its existing route when no own method was proved.
+                    Err(error) => match namespace_target(self, store) {
+                        Ok(target) => target,
+                        Err(_) => return Err(error),
+                    },
+                }
             }
             SupportedAliasDeclaration::NamedModuleMember { name, .. } => {
                 self.direct_export(store, declaration, module, name, type_only)?
@@ -3559,10 +4286,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 unreachable!("local aliases return before resolving an external module")
             }
         };
-        Ok((
-            DisplayAliasTarget::Symbol(target),
-            type_only.then_some(declaration),
-        ))
+        Ok((DisplayAliasTarget::Symbol(target), type_only_declaration))
     }
 }
 
@@ -6892,6 +7616,401 @@ mod tests {
                     .target,
                 AliasTargetState::Resolved(expected),
             );
+        }
+    }
+
+    #[test]
+    fn ambient_method_import_proof_uses_source_members_and_rechecks_alias_hops() {
+        let importer = parsed(concat!(
+            "import { choose as forwarded } from 'portable'; ",
+            "import { choose as direct } from 'native';",
+        ));
+        let declarations = parsed(concat!(
+            "declare module 'native' { ",
+            "namespace toolkit { ",
+            "interface API { choose(value: string): string; unused(value: Missing): Missing; } ",
+            "interface Other { choose(value: number): number; } ",
+            "} ",
+            "const toolkit: toolkit.API; export = toolkit; ",
+            "} ",
+            "declare module 'portable' { import local = require('native'); export = local; }",
+        ));
+        let importer_file = FileId::new(118);
+        let declaration_file = FileId::new(119);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (
+                declaration_file,
+                &declarations,
+                CanonicalModuleState::Script,
+            ),
+        ];
+        let entries = files.iter().flat_map(|(file, parsed, _)| {
+            module_specifiers(parsed).into_iter().map(move |specifier| {
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(parsed, *file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        declaration_file,
+                        if *file == importer_file {
+                            CanonicalModuleResolutionMode::Esm
+                        } else {
+                            CanonicalModuleResolutionMode::CommonJs
+                        },
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                )
+            })
+        });
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new(entries),
+            &[declaration_file],
+        );
+        let forwarded = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "forwarded"),
+        );
+        let direct = alias(
+            &bound_files,
+            alias_declaration_named(&importer, importer_file, "direct"),
+        );
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let initial = store.checker_link_allocated_lengths();
+        let proof = host
+            .source_ambient_method_import(&store, forwarded)
+            .unwrap()
+            .unwrap();
+        let direct_proof = host
+            .source_ambient_method_import(&store, direct)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.modules.len(), 2);
+        assert_eq!(proof.aliases.len(), 3);
+        assert_eq!(proof.value, direct_proof.value);
+        assert_eq!(store.checker_link_allocated_lengths(), initial);
+        assert_eq!(
+            store.symbol(proof.method_symbol()).unwrap().flags(),
+            SymbolFlags::METHOD
+        );
+        assert_eq!(
+            bound_files
+                .get(&declaration_file)
+                .unwrap()
+                .symbol(proof.method_declaration()),
+            Some(proof.method_symbol()),
+        );
+
+        let namespace_exports = store.symbol(proof.value.symbol).unwrap().exports().unwrap();
+        let other = store
+            .symbol_table(namespace_exports)
+            .unwrap()
+            .get_source("Other")
+            .unwrap();
+        let other_members = store.symbol(other).unwrap().members().unwrap();
+        let other_method = store
+            .symbol_table(other_members)
+            .unwrap()
+            .get_source("choose")
+            .unwrap();
+        let interface_members = store
+            .symbol(proof.value.interface)
+            .unwrap()
+            .members()
+            .unwrap();
+        let unused = store
+            .symbol_table(interface_members)
+            .unwrap()
+            .get_source("unused")
+            .unwrap();
+        for warm in [false, true] {
+            if warm {
+                for alias in [forwarded, direct] {
+                    let resolved = CanonicalAliasResolver::new(&mut store, &mut host)
+                        .resolve_alias(alias)
+                        .unwrap();
+                    assert_eq!(
+                        resolved.target,
+                        AliasTargetState::Resolved(proof.method_symbol())
+                    );
+                    assert!(resolved.events.is_empty());
+                }
+            }
+            let before = store.checker_link_allocated_lengths();
+            assert_eq!(
+                host.source_ambient_method_import(&store, forwarded)
+                    .unwrap(),
+                Some(proof.clone())
+            );
+            assert_eq!(store.checker_link_allocated_lengths(), before);
+            assert!(store.value_symbol_links(proof.value.symbol).is_none());
+            assert!(store.value_symbol_links(proof.method_symbol()).is_none());
+            assert!(store.value_symbol_links(unused).is_none());
+            assert!(store.value_symbol_links(forwarded).is_none());
+
+            // A warm export cache cannot replace the actual namespace member table.
+            assert!(store.set_module_symbol_links(
+                proof.value.symbol,
+                crate::semantic::ModuleSymbolLinks {
+                    resolved_exports: Some(other_members),
+                    ..crate::semantic::ModuleSymbolLinks::default()
+                }
+            ));
+            assert_eq!(
+                host.source_ambient_method_import(&store, forwarded)
+                    .unwrap(),
+                Some(proof.clone())
+            );
+            assert_eq!(
+                store.insert_symbol(namespace_exports, EscapedName::source("API"), other),
+                Some(Some(proof.value.interface))
+            );
+            let before = store.checker_link_allocated_lengths();
+            assert!(
+                host.source_ambient_method_import(&store, forwarded)
+                    .is_err()
+            );
+            assert_eq!(store.checker_link_allocated_lengths(), before);
+            assert_eq!(
+                store.insert_symbol(
+                    namespace_exports,
+                    EscapedName::source("API"),
+                    proof.value.interface
+                ),
+                Some(Some(other))
+            );
+            assert!(store.set_module_symbol_links(
+                proof.value.symbol,
+                crate::semantic::ModuleSymbolLinks::default()
+            ));
+
+            assert_eq!(
+                store.insert_symbol(
+                    interface_members,
+                    EscapedName::source("choose"),
+                    other_method
+                ),
+                Some(Some(proof.method_symbol()))
+            );
+            assert!(
+                host.source_ambient_method_import(&store, forwarded)
+                    .is_err()
+            );
+            assert_eq!(
+                store.insert_symbol(
+                    interface_members,
+                    EscapedName::source("choose"),
+                    proof.method_symbol()
+                ),
+                Some(Some(other_method))
+            );
+
+            for hop in &proof.aliases {
+                let original = store
+                    .alias_symbol_links(hop.alias)
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(store.ensure_alias_symbol_links(hop.alias));
+                assert!(store.set_alias_symbol_links(
+                    hop.alias,
+                    AliasSymbolLinks {
+                        immediate_target: Some(other_method),
+                        alias_target: AliasTargetState::Resolved(other_method),
+                        ..original.clone()
+                    }
+                ));
+                let before = store.checker_link_allocated_lengths();
+                assert_eq!(
+                    host.source_ambient_method_import(&store, forwarded),
+                    Err(CanonicalAliasTargetUnavailable::InvalidAliasLinks(
+                        hop.alias
+                    )),
+                );
+                assert_eq!(store.checker_link_allocated_lengths(), before);
+                assert!(store.set_alias_symbol_links(hop.alias, original));
+            }
+            assert_eq!(
+                host.source_ambient_method_import(&store, forwarded)
+                    .unwrap(),
+                Some(proof.clone())
+            );
+            assert!(store.type_resolution_is_empty());
+        }
+    }
+
+    #[test]
+    fn ambient_method_import_keeps_namespace_only_exports_independent_of_value_annotations() {
+        for annotation in [
+            "N.Shape",
+            "N.Generic<string>",
+            "Shape",
+            "string",
+            "N.Shape[]",
+        ] {
+            let importer = parsed("import type { OnlyType } from 'library';");
+            let declarations = parsed(&format!(
+                "declare module 'library' {{ \
+                 interface Shape {{ run(): string; }} \
+                 namespace N {{ \
+                 interface Shape {{ run(): string; }} \
+                 interface Generic<T> {{ run(value: T): T; }} \
+                 interface OnlyType {{}} \
+                 }} const N: {annotation}; export = N; }}",
+            ));
+            let importer_file = FileId::new(120);
+            let declaration_file = FileId::new(121);
+            let files = [
+                (importer_file, &importer, CanonicalModuleState::External),
+                (
+                    declaration_file,
+                    &declarations,
+                    CanonicalModuleState::Script,
+                ),
+            ];
+            let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+                &files,
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        node_ref(&importer, importer_file, module_specifiers(&importer)[0]),
+                        CanonicalResolvedModuleInput::new(
+                            declaration_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::CommonJs,
+                        ),
+                    ),
+                ]),
+                &[declaration_file],
+            );
+            let imported_declaration =
+                alias_declaration_named(&importer, importer_file, "OnlyType");
+            let imported = alias(&bound_files, imported_declaration);
+            let expected = declarations
+                .arena
+                .iter()
+                .find_map(|(id, node)| {
+                    let NodeData::InterfaceDeclaration(interface) = &node.data else {
+                        return None;
+                    };
+                    (module_export_name(&declarations.arena, interface.name) == Some("OnlyType"))
+                        .then(|| {
+                            bound_files
+                                .get(&declaration_file)
+                                .unwrap()
+                                .symbol(node_ref(&declarations, declaration_file, id))
+                                .unwrap()
+                        })
+                })
+                .unwrap();
+            let mut host =
+                ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                    .unwrap();
+            for _ in 0..2 {
+                let resolution = CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(imported)
+                    .unwrap();
+                assert_eq!(
+                    resolution.target,
+                    AliasTargetState::Resolved(expected),
+                    "{annotation}"
+                );
+                assert!(resolution.events.is_empty());
+                assert_eq!(
+                    store
+                        .alias_symbol_links(imported)
+                        .unwrap()
+                        .type_only_declaration,
+                    Some(imported_declaration)
+                );
+                assert!(store.value_symbol_links(imported).is_none());
+                assert!(store.type_resolution_is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_method_import_collision_cannot_fall_back_through_a_changed_alias_cache() {
+        for poison in [false, true] {
+            let importer = parsed("import { choose } from 'library';");
+            let declarations = parsed(concat!(
+                "declare module 'library' { namespace N { ",
+                "interface Shape { choose(): string; } interface choose {} ",
+                "} const N: N.Shape; export = N; }",
+            ));
+            let importer_file = FileId::new(122);
+            let declaration_file = FileId::new(123);
+            let files = [
+                (importer_file, &importer, CanonicalModuleState::External),
+                (
+                    declaration_file,
+                    &declarations,
+                    CanonicalModuleState::Script,
+                ),
+            ];
+            let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+                &files,
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        node_ref(&importer, importer_file, module_specifiers(&importer)[0]),
+                        CanonicalResolvedModuleInput::new(
+                            declaration_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::CommonJs,
+                        ),
+                    ),
+                ]),
+                &[declaration_file],
+            );
+            let imported_declaration = alias_declaration_named(&importer, importer_file, "choose");
+            let imported = alias(&bound_files, imported_declaration);
+            let mut host =
+                ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                    .unwrap();
+            let proof = host
+                .plan_ambient_method_import(&store, imported)
+                .unwrap()
+                .unwrap();
+            let namespace_member = store
+                .symbol(proof.value.symbol)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("choose"))
+                .unwrap();
+            assert_ne!(namespace_member, proof.method_symbol());
+            assert_eq!(
+                store.symbol(namespace_member).unwrap().flags(),
+                SymbolFlags::INTERFACE
+            );
+            if poison {
+                assert!(store.ensure_alias_symbol_links(imported));
+                assert!(store.set_alias_symbol_links(
+                    imported,
+                    AliasSymbolLinks {
+                        immediate_target: Some(namespace_member),
+                        ..AliasSymbolLinks::default()
+                    }
+                ));
+            }
+            assert!(host.source_ambient_method_import(&store, imported).is_err());
+            for _ in 0..2 {
+                assert_eq!(
+                    unavailable_reason(
+                        CanonicalAliasResolver::new(&mut store, &mut host)
+                            .resolve_alias(imported)
+                            .unwrap_err()
+                    ),
+                    CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(
+                        imported_declaration
+                    ),
+                );
+                assert_eq!(
+                    store.alias_symbol_links(imported).unwrap().alias_target,
+                    AliasTargetState::Unresolved
+                );
+                assert!(store.value_symbol_links(imported).is_none());
+                assert!(store.value_symbol_links(proof.method_symbol()).is_none());
+                assert!(store.type_resolution_is_empty());
+            }
         }
     }
 

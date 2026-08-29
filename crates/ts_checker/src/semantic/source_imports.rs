@@ -14,7 +14,8 @@
 //! classes and generic constructors from declaration files, authenticated
 //! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
-//! `FunctionDeclaration`s, regular and const enums, already-published inferred
+//! `FunctionDeclaration`s, source-proven ambient interface methods, regular and
+//! const enums, already-published inferred
 //! or const-asserted object constants, recursive package namespaces,
 //! cross-file namespace constants, and narrowly authenticated cold async-arrow
 //! object constants. Direct default imports also accept synchronous TypeScript
@@ -61,6 +62,7 @@ use super::{
         CanonicalAliasResolutionError, CanonicalAliasResolutionEvent, CanonicalAliasResolver,
         CanonicalAliasTargetHost, CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
+    alias_provider::AmbientImportMethodSource,
     array_types::CanonicalArrayTargets,
     classes::{
         ClassMemberQueryPlan, execute_nongeneric_class_member_query,
@@ -207,6 +209,7 @@ pub(super) struct ResolvedSourceImportBinding {
     pub(super) binding: SourceImportBindingPlan,
     pub(super) immediate_target_symbol: SemanticSymbolId,
     pub(super) target_symbol: SemanticSymbolId,
+    ambient_method: Option<AmbientImportMethodSource>,
     namespace_aliases: RefCell<Vec<StagedSourceImportNamespaceAlias>>,
 }
 
@@ -719,6 +722,7 @@ enum PreparedSourceImportTarget {
     AnnotatedFunction {
         signature: SignatureId,
     },
+    AmbientMethod(Box<SourceImportAmbientMethodPlan>),
     DefaultArrow {
         export: Box<SourceDefaultArrowExportPlan>,
         signature: SignatureId,
@@ -802,6 +806,14 @@ struct PreparedSourceImportNestedNamespace {
     links: ValueSymbolLinks,
 }
 
+/// The import chain and the selected method's native source plan stay separate.
+/// Neither proof is replaced by the import alias's cached value type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceImportAmbientMethodPlan {
+    source: AmbientImportMethodSource,
+    method: PropertyObjectPlan,
+}
+
 enum PlannedSourceImportValueTarget {
     AnnotatedConst {
         declaration: NodeRef,
@@ -818,6 +830,7 @@ enum PlannedSourceImportValueTarget {
         value: bool,
     },
     AnnotatedFunction(Box<SourceCallablePlan>),
+    AmbientMethod(Box<SourceImportAmbientMethodPlan>),
     DefaultArrow(Box<SourceDefaultArrowExportPlan>),
     AmbientClass(Box<ClassMemberQueryPlan>),
     ConstEnum {
@@ -3993,10 +4006,37 @@ fn resolve_source_import_binding_phase(
         )));
     }
 
+    let ambient_method = if phase == SourceImportPhase::Value
+        && store
+            .symbol(resolved_target)
+            .is_some_and(|symbol| symbol.flags() == SymbolFlags::METHOD)
+    {
+        let source = alias_host
+            .source_ambient_method_import(store, binding.alias_symbol)
+            .map_err(|reason| {
+                SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+                    alias: binding.alias_symbol,
+                    reason,
+                })
+            })?;
+        if source.as_ref().is_some_and(|source| {
+            source.alias_symbol() != binding.alias_symbol
+                || source.method_symbol() != resolved_target
+        }) {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+                binding.alias_symbol,
+            )));
+        }
+        source
+    } else {
+        None
+    };
+
     Ok(ResolvedSourceImportBinding {
         binding: binding.clone(),
         immediate_target_symbol: direct_target,
         target_symbol: resolved_target,
+        ambient_method,
         namespace_aliases: RefCell::default(),
     })
 }
@@ -4613,6 +4653,15 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
     }
     let binding = &resolved.binding;
     let target = resolved.target_symbol;
+    if resolved
+        .ambient_method
+        .as_ref()
+        .is_some_and(|source| source.alias_symbol() != binding.alias_symbol)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+            binding.alias_symbol,
+        )));
+    }
     let alias_links = store
         .alias_symbol_links(binding.alias_symbol)
         .ok_or_else(|| {
@@ -4664,11 +4713,16 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
         )?;
     }
 
-    let planned_target = match default_arrow {
-        Some(export) => Ok(PlannedSourceImportValueTarget::DefaultArrow(Box::new(
+    let planned_target = match (default_arrow, &resolved.ambient_method) {
+        (Some(export), None) => Ok(PlannedSourceImportValueTarget::DefaultArrow(Box::new(
             export,
         ))),
-        None => plan_direct_import_value_target(
+        (None, Some(method)) => {
+            plan_ambient_import_method_target(store, declared_host, target, method)
+                .map(Box::new)
+                .map(PlannedSourceImportValueTarget::AmbientMethod)
+        }
+        (None, None) => plan_direct_import_value_target(
             store,
             declared_host,
             global_types,
@@ -4679,6 +4733,7 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
             &namespace_aliases,
             &mut HashSet::new(),
         ),
+        (Some(_), Some(_)) => Err(invariant(SourceImportInvariant::InvalidTargetLinks(target))),
     };
     let planned_target = match planned_target {
         Ok(planned) => planned,
@@ -4737,6 +4792,7 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
         }
         PlannedSourceImportValueTarget::ColdNamespaceConst(namespace) => namespace.declaration,
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
+        PlannedSourceImportValueTarget::AmbientMethod(method) => method.source.method_declaration(),
         PlannedSourceImportValueTarget::DefaultArrow(export) => export.declaration,
         PlannedSourceImportValueTarget::AmbientClass(class) => class.declaration(),
     };
@@ -4869,6 +4925,18 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
                     signature: provenance.signature,
                 },
             )
+        }
+        PlannedSourceImportValueTarget::AmbientMethod(method) => {
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                declared_host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_of_interface_method(method.source.method_symbol())?;
+            (type_, PreparedSourceImportTarget::AmbientMethod(method))
         }
         PlannedSourceImportValueTarget::DefaultArrow(export) => {
             let (type_, signature) = materialize_imported_default_arrow(
@@ -5027,7 +5095,12 @@ pub(super) fn prepare_source_import_value_with_type_import_capabilities(
             )
         }
     };
-    let target_links = prepare_value_links(store, target, type_, false)?;
+    let target_links = match &prepared_target {
+        PreparedSourceImportTarget::AmbientMethod(method) => {
+            prepare_ambient_import_method_links(store, declared_host, method, type_)?
+        }
+        _ => prepare_value_links(store, target, type_, false)?,
+    };
     let alias_value_links = prepare_value_links(store, binding.alias_symbol, type_, true)?;
     publish_staged_namespace_aliases(store, &namespace_aliases)?;
 
@@ -5069,8 +5142,12 @@ fn preflight_prepared_source_import_publications_impl(
 ) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
     let mut publications = Vec::<PreparedSourceImportPublication>::new();
     let mut publication_indices = HashMap::<SemanticSymbolId, usize>::new();
+    let mut ambient_methods = HashMap::<SemanticSymbolId, &SourceImportAmbientMethodPlan>::new();
     for value in prepared {
         validate_prepared_import_value(store, value, source)?;
+        if let PreparedSourceImportTarget::AmbientMethod(method) = &value.target {
+            ambient_methods.insert(value.target_symbol, method);
+        }
         if let PreparedSourceImportTarget::ModuleNamespace { properties } = &value.target {
             collect_nested_namespace_publications(
                 properties,
@@ -5095,14 +5172,23 @@ fn preflight_prepared_source_import_publications_impl(
         let type_ = publication.links.resolved_type.ok_or(invariant(
             SourceImportInvariant::PreparedStateChanged(publication.symbol),
         ))?;
-        let current = prepare_value_links(
-            store,
-            publication.symbol,
-            type_,
-            store
-                .symbol(publication.symbol)
-                .is_some_and(|record| record.flags() == SymbolFlags::ALIAS),
-        )?;
+        let current = if let Some(method) = ambient_methods.get(&publication.symbol) {
+            let (host, _) = source.ok_or_else(|| {
+                invariant(SourceImportInvariant::PreparedStateChanged(
+                    publication.symbol,
+                ))
+            })?;
+            prepare_ambient_import_method_links(store, host, method, type_)?
+        } else {
+            prepare_value_links(
+                store,
+                publication.symbol,
+                type_,
+                store
+                    .symbol(publication.symbol)
+                    .is_some_and(|record| record.flags() == SymbolFlags::ALIAS),
+            )?
+        };
         if current != publication.links {
             return Err(invariant(SourceImportInvariant::PreparedStateChanged(
                 publication.symbol,
@@ -5898,6 +5984,75 @@ fn plan_direct_exported_type_target(
         )));
     }
     Ok(declaration)
+}
+
+fn plan_ambient_import_method_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: SemanticSymbolId,
+    source: &AmbientImportMethodSource,
+) -> Result<SourceImportAmbientMethodPlan, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(target));
+    if source.method_symbol() != target || !source.is_current(store, host) {
+        return Err(invalid());
+    }
+    let method =
+        object_members::plan_selected_interface_method(store, host, target).map_err(|error| {
+            match error {
+                object_members::PropertyObjectError::UnsupportedMember { node, kind } => {
+                    SourceImportError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        super::type_nodes::TypeNodeUnavailable::UnsupportedSyntax { node, kind },
+                    ))
+                }
+                _ => invalid(),
+            }
+        })?;
+    if method.kind != object_members::PropertyObjectKind::Interface
+        || !store.symbol(target).is_some_and(|record| {
+            record.flags() == SymbolFlags::METHOD
+                && record.value_declaration() == Some(source.method_declaration())
+        })
+        || !method
+            .methods
+            .iter()
+            .any(|overload| overload.declaration == source.method_declaration())
+        || method.methods.iter().any(|overload| {
+            overload.symbol != target
+                || overload.computed_key.is_some()
+                || !overload.type_parameters.is_empty()
+        })
+    {
+        return Err(invalid());
+    }
+    object_members::interface_method_value_state(store, &method).map_err(|_| invalid())?;
+    Ok(SourceImportAmbientMethodPlan {
+        source: source.clone(),
+        method,
+    })
+}
+
+/// A METHOD is a valid import value only through its retained source proof and
+/// native method graph. General import value-link preparation stays unchanged.
+fn prepare_ambient_import_method_links(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: &SourceImportAmbientMethodPlan,
+    type_: TypeId,
+) -> Result<ValueSymbolLinks, SourceImportError> {
+    let target = method.source.method_symbol();
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(target));
+    let current = plan_ambient_import_method_target(store, host, target, &method.source)?;
+    if current != *method
+        || object_members::interface_method_value_state(store, &method.method) != Ok(Some(type_))
+    {
+        return Err(invalid());
+    }
+    let links = object_members::declared_method_value_links(store, target, Some(type_))
+        .ok_or_else(invalid)?;
+    if store.value_symbol_links(target) != Some(&links) {
+        return Err(invalid());
+    }
+    Ok(links)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8149,6 +8304,11 @@ fn materialize_imported_module_member(
                 export.declaration,
             )));
         }
+        PlannedSourceImportValueTarget::AmbientMethod(method) => {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                method.source.method_declaration(),
+            )));
+        }
         PlannedSourceImportValueTarget::AmbientClass(class) => {
             let members =
                 execute_nongeneric_class_member_query(store, host, &class).map_err(|error| {
@@ -8270,6 +8430,11 @@ fn preflight_imported_module_namespace_members(
             PlannedSourceImportValueTarget::DefaultArrow(export) => {
                 return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
                     export.declaration,
+                )));
+            }
+            PlannedSourceImportValueTarget::AmbientMethod(method) => {
+                return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                    method.source.method_declaration(),
                 )));
             }
             PlannedSourceImportValueTarget::AmbientClass(class) => {
@@ -10896,6 +11061,15 @@ fn validate_prepared_import_value(
                     StoredSourceCallableValidation::Valid(_)
                 )
         }
+        PreparedSourceImportTarget::AmbientMethod(method) => {
+            prepared.binding.alias_symbol == method.source.alias_symbol()
+                && prepared.target_symbol == method.source.method_symbol()
+                && prepared.target_declaration == method.source.method_declaration()
+                && source.is_some_and(|(host, _)| {
+                    prepare_ambient_import_method_links(store, host, method, prepared.type_)
+                        == Ok(prepared.target_links.clone())
+                })
+        }
         PreparedSourceImportTarget::DefaultArrow { export, signature } => {
             if let Some((host, global_types)) = source {
                 let current = plan_source_default_arrow_export(
@@ -11203,8 +11377,13 @@ fn validate_prepared_import_value(
             prepared.binding.alias_symbol,
         )));
     }
-    if prepare_value_links(store, prepared.target_symbol, prepared.type_, false)?
-        != prepared.target_links
+    let target_links = match (&prepared.target, source) {
+        (PreparedSourceImportTarget::AmbientMethod(method), Some((host, _))) => {
+            prepare_ambient_import_method_links(store, host, method, prepared.type_)?
+        }
+        _ => prepare_value_links(store, prepared.target_symbol, prepared.type_, false)?,
+    };
+    if target_links != prepared.target_links
         || prepare_value_links(store, prepared.binding.alias_symbol, prepared.type_, true)?
             != prepared.alias_links
     {
@@ -14176,6 +14355,129 @@ export default <T>(): Subject<T> => {
             &mut CanonicalCheckerDiagnostics::default(),
             resolved,
             read,
+        )
+    }
+
+    fn ambient_method_import_fixture() -> Fixture {
+        let mut fixture = fixture_with_module_states_and_wrapper_flags(
+            &[
+                r#"
+                    import { select as chosen, select as other, unused } from "node:tool";
+                    const imported = chosen;
+                "#,
+                r#"
+                    declare module "tool" {
+                        namespace tool {
+                            interface API {
+                                select(value: string): string;
+                                select(value: number): number;
+                                unused(value: Missing): Missing;
+                                recursive: API;
+                            }
+                        }
+                        const tool: tool.API;
+                        export = tool;
+                    }
+                    declare module "node:tool" {
+                        import tool = require("tool");
+                        export = tool;
+                    }
+                "#,
+            ],
+            &[],
+            &[CanonicalModuleState::External, CanonicalModuleState::Script],
+            None,
+            &[1],
+        );
+        fixture.manifest = validate_module_resolution_manifest(
+            CanonicalModuleResolutionManifestInput::new(fixture.files.iter().enumerate().map(
+                |(index, file)| {
+                    CanonicalModuleResolutionEntry::resolved(
+                        NodeRef::new(
+                            file.parsed.arena.id(),
+                            file.file,
+                            module_specifiers(&file.parsed)[0],
+                        ),
+                        CanonicalResolvedModuleInput::new(
+                            fixture.files[1].file,
+                            if index == 0 {
+                                CanonicalModuleResolutionMode::Esm
+                            } else {
+                                CanonicalModuleResolutionMode::CommonJs
+                            },
+                            CanonicalModuleResolutionMode::CommonJs,
+                        ),
+                    )
+                },
+            )),
+            fixture.store.symbol_store(),
+            fixture.files.iter().map(|file| {
+                (
+                    file.file,
+                    &file.parsed.arena,
+                    fixture.bound.get(&file.file).unwrap(),
+                )
+            }),
+        )
+        .unwrap();
+        fixture
+    }
+
+    fn prepare_ambient_method_import(
+        fixture: &mut Fixture,
+        resolved: &ResolvedSourceImportBinding,
+    ) -> Result<PreparedSourceImportValue, SourceImportError> {
+        let node = identifier_initializer(fixture, 0, "chosen");
+        let file = &fixture.files[0];
+        let read = plan_source_import_identifier_read(
+            &file.parsed.arena,
+            fixture.bound.get(&file.file).unwrap(),
+            &fixture.store,
+            &resolved.binding,
+            node,
+            "chosen",
+            resolved.binding.alias_symbol,
+        )?;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            fixture
+                .files
+                .iter()
+                .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap()
+        .with_module_resolutions(&fixture.manifest);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        prepare_source_import_value(
+            &mut fixture.store,
+            &host,
+            &fixture.global_types,
+            CanonicalCheckerOptions::default(),
+            &mut session,
+            &mut CanonicalCheckerDiagnostics::default(),
+            resolved,
+            &read,
+        )
+    }
+
+    fn preflight_ambient_method_import(
+        fixture: &Fixture,
+        prepared: &PreparedSourceImportValue,
+    ) -> Result<Vec<PreparedSourceImportPublication>, SourceImportError> {
+        let host = DeclaredTypeHost::new_after_global_merge(
+            fixture
+                .files
+                .iter()
+                .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap())),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap()
+        .with_module_resolutions(&fixture.manifest);
+        preflight_prepared_source_import_publications_with_host(
+            &fixture.store,
+            &host,
+            &fixture.global_types,
+            std::slice::from_ref(prepared),
         )
     }
 
@@ -23713,6 +24015,334 @@ export default <T>(): Subject<T> => {
                     (poisoned.0, poisoned.1)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ambient_method_import_retains_overloads_and_keeps_unused_members_cold() {
+        let mut fixture = ambient_method_import_fixture();
+        let plan = fixture.plan_import(0, 0);
+        let cold = store_state(&fixture.store);
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(fixture.store.type_len(), cold.0);
+        assert_eq!(resolved[0].target_symbol, resolved[1].target_symbol);
+        for binding in &resolved {
+            let proof = binding.ambient_method.as_ref().unwrap();
+            assert_eq!(proof.alias_symbol(), binding.binding.alias_symbol);
+            assert_eq!(proof.method_symbol(), binding.target_symbol);
+            assert_eq!(
+                fixture.store.value_symbol_links(binding.target_symbol),
+                None
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(binding.binding.alias_symbol),
+                None
+            );
+        }
+
+        let prepared = prepare_ambient_method_import(&mut fixture, &resolved[0]).unwrap();
+        let PreparedSourceImportTarget::AmbientMethod(method) = &prepared.target else {
+            panic!("expected the native ambient method target");
+        };
+        assert_eq!(method.method.methods.len(), 2);
+        assert_eq!(
+            prepared.target_declaration,
+            method.source.method_declaration()
+        );
+        assert_eq!(
+            fixture.store.source_callable_provenance(prepared.type_),
+            None
+        );
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let expected = [bootstrap.string_type, bootstrap.number_type];
+        for (overload, expected) in method.method.methods.iter().zip(expected) {
+            let signature = fixture
+                .store
+                .signature_links(overload.declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let record = fixture.store.signature(signature).unwrap();
+            assert_eq!(record.declaration(), Some(overload.declaration));
+            assert_eq!(record.resolved_return_type(), Some(expected));
+            assert_eq!(record.parameters(), &[overload.parameters[0].symbol]);
+            assert_eq!(
+                fixture.store.interface_method_linked_type(signature),
+                Some(prepared.type_)
+            );
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some(&[expected][..])
+            );
+        }
+        let recursive = fixture
+            .store
+            .symbol_table(method.method.members.unwrap())
+            .unwrap()
+            .get_source("recursive")
+            .unwrap();
+        assert_eq!(fixture.store.value_symbol_links(recursive), None);
+        assert_eq!(
+            fixture.store.value_symbol_links(resolved[2].target_symbol),
+            None
+        );
+        for binding in &resolved {
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(binding.binding.alias_symbol),
+                None
+            );
+        }
+        assert!(
+            prepare_value_links(
+                &fixture.store,
+                prepared.target_symbol,
+                prepared.type_,
+                false
+            )
+            .is_err()
+        );
+        let before = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            preflight_prepared_source_import_publications(
+                &fixture.store,
+                std::slice::from_ref(&prepared)
+            ),
+            Err(invariant(SourceImportInvariant::PreparedStateChanged(
+                prepared.binding.alias_symbol
+            )))
+        );
+        let publications = preflight_ambient_method_import(&fixture, &prepared).unwrap();
+        assert_eq!(publications.len(), 2);
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            before
+        );
+        for publication in publications {
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(publication.symbol, publication.links)
+            );
+        }
+        let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(resolve_all(&mut fixture, &plan.bindings).unwrap(), resolved);
+        assert_eq!(
+            prepare_ambient_method_import(&mut fixture, &resolved[0]).unwrap(),
+            prepared
+        );
+        preflight_ambient_method_import(&fixture, &prepared).unwrap();
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm
+        );
+        assert_eq!(fixture.store.value_symbol_links(recursive), None);
+        assert_eq!(
+            fixture.store.value_symbol_links(resolved[2].target_symbol),
+            None
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(resolved[1].binding.alias_symbol),
+            None
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(resolved[2].binding.alias_symbol),
+            None
+        );
+    }
+
+    #[test]
+    fn ambient_method_import_rejects_changed_native_graph_before_alias_publication() {
+        for poison in 0..6 {
+            let mut fixture = ambient_method_import_fixture();
+            let plan = fixture.plan_import(0, 0);
+            let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+            let prepared = prepare_ambient_method_import(&mut fixture, &resolved[0]).unwrap();
+            let PreparedSourceImportTarget::AmbientMethod(method) = &prepared.target else {
+                panic!("expected the native ambient method target");
+            };
+            let declaration = method.method.methods[0].declaration;
+            let parameter = method.method.methods[0].parameters[0].symbol;
+            let method_links = fixture
+                .store
+                .value_symbol_links(prepared.target_symbol)
+                .cloned()
+                .unwrap();
+            let parameter_links = fixture
+                .store
+                .value_symbol_links(parameter)
+                .cloned()
+                .unwrap();
+            let signature_links = fixture.store.signature_links(declaration).cloned().unwrap();
+            let signature = signature_links.resolved_signature.signature().unwrap();
+            let second_signature = fixture
+                .store
+                .signature_links(method.method.methods[1].declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let signature_record = fixture.store.signature(signature).unwrap();
+            let signature_flags = signature_record.flags();
+            let signature_return_type = signature_record.resolved_return_type();
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            match poison {
+                0 => {
+                    let mut links = method_links.clone();
+                    links.resolved_type = Some(number);
+                    assert!(
+                        fixture
+                            .store
+                            .set_value_symbol_links(prepared.target_symbol, links)
+                    );
+                }
+                1 => {
+                    let mut links = parameter_links.clone();
+                    links.write_type = Some(number);
+                    assert!(fixture.store.set_value_symbol_links(parameter, links));
+                }
+                2 => assert!(fixture.store.set_signature_flags(
+                    signature,
+                    super::super::signatures::SignatureFlags::CONSTRUCT
+                )),
+                3 => assert!(
+                    fixture
+                        .store
+                        .set_signature_resolved_return_type(signature, Some(number))
+                ),
+                4 => assert!(
+                    fixture
+                        .store
+                        .set_type_symbol(prepared.type_, Some(resolved[2].target_symbol))
+                ),
+                5 => {
+                    let mut links = signature_links.clone();
+                    links.resolved_signature =
+                        super::super::ResolvedSignatureState::Resolved(second_signature);
+                    assert!(fixture.store.set_signature_links(declaration, links));
+                }
+                _ => unreachable!(),
+            }
+            let before = (store_state(&fixture.store), fixture.store.signature_len());
+            for _ in 0..2 {
+                assert!(
+                    prepare_ambient_method_import(&mut fixture, &resolved[0]).is_err(),
+                    "poison={poison}"
+                );
+                assert!(
+                    preflight_ambient_method_import(&fixture, &prepared).is_err(),
+                    "poison={poison}"
+                );
+                assert_eq!(
+                    (store_state(&fixture.store), fixture.store.signature_len()),
+                    before,
+                    "poison={poison}"
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .value_symbol_links(prepared.binding.alias_symbol),
+                    None
+                );
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(prepared.target_symbol, method_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(parameter, parameter_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_flags(signature, signature_flags)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_return_type(signature, signature_return_type)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_type_symbol(prepared.type_, Some(prepared.target_symbol))
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_signature_links(declaration, signature_links)
+            );
+            assert_eq!(
+                prepare_ambient_method_import(&mut fixture, &resolved[0]).unwrap(),
+                prepared
+            );
+            preflight_ambient_method_import(&fixture, &prepared).unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(prepared.binding.alias_symbol),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_method_import_rejects_a_proof_for_another_alias_or_changed_native_plan() {
+        let mut fixture = ambient_method_import_fixture();
+        let plan = fixture.plan_import(0, 0);
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let mut changed = resolved[0].clone();
+        changed.ambient_method = resolved[1].ambient_method.clone();
+        let cold = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            prepare_ambient_method_import(&mut fixture, &changed),
+            Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+                resolved[0].binding.alias_symbol
+            )))
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            cold
+        );
+        assert_eq!(
+            fixture.store.value_symbol_links(resolved[0].target_symbol),
+            None
+        );
+
+        let prepared = prepare_ambient_method_import(&mut fixture, &resolved[0]).unwrap();
+        let before = (store_state(&fixture.store), fixture.store.signature_len());
+        let mut changed = prepared.clone();
+        changed.binding = resolved[1].binding.clone();
+        assert!(preflight_ambient_method_import(&fixture, &changed).is_err());
+        let mut changed = prepared.clone();
+        let PreparedSourceImportTarget::AmbientMethod(method) = &mut changed.target else {
+            panic!("expected the native ambient method target");
+        };
+        method.method.methods.pop();
+        assert!(preflight_ambient_method_import(&fixture, &changed).is_err());
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            before
+        );
+        preflight_ambient_method_import(&fixture, &prepared).unwrap();
+        for binding in &resolved {
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(binding.binding.alias_symbol),
+                None
+            );
         }
     }
 
