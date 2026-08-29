@@ -490,7 +490,7 @@ fn source_object_literal_owner(
         .members()
         .map(|members| store.symbol_table(members).ok_or_else(invalid))
         .transpose()?;
-    if members.map_or(0, |members| members.len()) != children.len() {
+    if members.map_or(0, ts_binder::semantic::SymbolTable::len) != children.len() {
         return Err(invalid());
     }
     let mut seen = HashSet::new();

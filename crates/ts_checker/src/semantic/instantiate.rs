@@ -4787,7 +4787,7 @@ mod tests {
         let store = fixture.context.store_mut_for_test();
         let b = store.regular_string_literal_type("b".into()).unwrap();
         let targets = [fixture.fresh, b];
-        let mapper = store
+        let substitution = store
             .new_type_mapper(sources.to_vec(), targets.to_vec())
             .unwrap();
         let projection = supported_mapped_alias_projection(store, fixture.returned, None)
@@ -4862,7 +4862,13 @@ mod tests {
         let before = deferred_intersection_store_state(store);
         for _ in 0..2 {
             assert_eq!(
-                instantiate_type_with_session(store, fixture.returned, mapper, None, &mut session),
+                instantiate_type_with_session(
+                    store,
+                    fixture.returned,
+                    substitution,
+                    None,
+                    &mut session
+                ),
                 Ok(result)
             );
             assert_eq!(
@@ -4877,7 +4883,13 @@ mod tests {
                 Ok(Some(result))
             );
             assert_eq!(
-                instantiated_member_type_matches(store, fixture.returned, result, mapper, None),
+                instantiated_member_type_matches(
+                    store,
+                    fixture.returned,
+                    result,
+                    substitution,
+                    None
+                ),
                 Ok(true)
             );
             assert_eq!(store.type_alias_links(fixture.alias), Some(&alias_links));
@@ -5343,7 +5355,7 @@ mod tests {
             panic!("the source return must remain mapped");
         };
         let target = mapped.object.target;
-        let mapper = mapped.object.mapper;
+        let substitution = mapped.object.mapper;
         let wrong_mapper = store
             .new_type_mapper(sources.to_vec(), targets.to_vec())
             .unwrap();
@@ -5355,7 +5367,7 @@ mod tests {
             &targets,
             fixture.alias,
         );
-        assert!(store.set_object_target_and_mapper(fixture.returned, target, mapper));
+        assert!(store.set_object_target_and_mapper(fixture.returned, target, substitution));
 
         let identity = store
             .type_payload(fixture.returned)

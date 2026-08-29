@@ -2969,10 +2969,10 @@ fn contextual_overload_parameter_types(
         let Some(parameter_type) = parameter_type else {
             return Ok(None);
         };
-        if !signature.type_parameters().is_empty()
-            && !array_callback
-            && !valid_fixed_generic_source_parameter_type(store, parameter_type)
-            && !(array_argument
+        if !(signature.type_parameters().is_empty()
+            || array_callback
+            || valid_fixed_generic_source_parameter_type(store, parameter_type)
+            || array_argument
                 && source_keyof_array_parameter_context(
                     store,
                     global_types,

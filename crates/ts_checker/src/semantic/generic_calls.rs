@@ -10315,7 +10315,10 @@ mod tests {
         let mapper = resolved.projection.instantiation.mapper;
         let type_arguments = resolved.projection.instantiation.type_arguments.clone();
         let b = store
-            .canonical_array_reference_with_targets(array_targets.unwrap(), keys)
+            .canonical_array_reference_with_targets(
+                CanonicalArrayTargets::from_global_types(&globals),
+                keys,
+            )
             .unwrap()
             .unwrap()
             .element_type;

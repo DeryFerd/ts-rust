@@ -387,9 +387,9 @@ fn supported_mapped_alias_projection_inner(
         else {
             return Err(invalid());
         };
-        let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+        let substitution = mapped.object.mapper.ok_or_else(invalid)?;
         let Some(TypeMapperApplication::Composite { second, .. }) =
-            store.mapper_application(mapper, original.type_parameter.ok_or_else(invalid)?)
+            store.mapper_application(substitution, original.type_parameter.ok_or_else(invalid)?)
         else {
             return Err(invalid());
         };
