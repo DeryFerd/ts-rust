@@ -53,7 +53,7 @@ use super::{
     instantiated_members::validate_property_object_alias_members_with_array_targets,
     links::{LateBoundLinks, SignatureLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::{TypeMapper, TypeMapperApplication},
-    object_aliases::property_object_alias_projection,
+    object_aliases::source_property_object_projection,
     object_members,
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
@@ -2570,7 +2570,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             _ => LiteralTypeCacheError::InvalidCachedUnion(type_),
         };
-        let Some(projection) = property_object_alias_projection(self, type_).map_err(invalid)?
+        let Some(projection) = source_property_object_projection(self, type_).map_err(invalid)?
         else {
             return Ok(None);
         };
@@ -2578,7 +2578,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             validate_property_object_alias_members_with_array_targets(self, type_, array_targets)
                 .map_err(invalid)?;
         let mut property_types = Vec::new();
-        for property in projection.properties {
+        for property in projection.properties() {
             if let Some(type_) = self
                 .value_symbol_links(property.symbol)
                 .and_then(|links| links.resolved_type)
@@ -2601,9 +2601,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(Some(PropertyObjectAliasTypeEdges {
             // The visible alias can retain arguments unused by the source mapper.
             arguments: projection
-                .arguments
-                .into_iter()
-                .chain(projection.identity_arguments)
+                .arguments()
+                .iter()
+                .chain(projection.identity_arguments())
+                .copied()
                 .collect(),
             properties: property_types,
         }))
@@ -7148,6 +7149,7 @@ mod tests {
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         declared::type_list_key,
         instantiate::canonical_anonymous_union,
+        object_aliases::property_object_alias_projection,
         signatures::ElementFlags,
         tuple_types::CanonicalTupleTypeRequest,
         type_records::{LiteralTypeData, TypeData},
@@ -7220,6 +7222,222 @@ mod tests {
             .type_node_links(expression)
             .and_then(|links| links.resolved_type)
             .expect("the expression was checked")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep physical edges, lazy values, and the existing callback in one source fixture.
+    fn inline_property_edges_keep_array_capabilities_and_the_existing_walk() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics, DeclaredTypeHost,
+            instantiate::{InstantiationLimits, InstantiationSession},
+            instantiated_members::demand_property_object_alias_property,
+            object_aliases::SourcePropertyObjectProjection,
+            production::GlobalMergeCompletion,
+        };
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Base<T> = { base: T }; ",
+            "type Shape<T> = { own: T; items: string[]; cold: boolean } & Base<T>; ",
+            "declare const nested: Shape<string[]>; declare const plain: Shape<number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(29_851);
+        let mut context = checker_context(file, &parsed);
+        let globals = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let options = context.options();
+        let [nested, plain] = ["nested", "plain"].map(|name| {
+            let annotation = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name)
+                        .then_some(variable.type_)
+                        .flatten()
+                        .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let receiver = context.get_type_from_type_node(annotation).unwrap();
+            let intersection = context
+                .store()
+                .validate_deferred_intersection_type_with_array_targets(receiver, Some(targets))
+                .unwrap();
+            intersection
+                .types
+                .into_iter()
+                .find_map(|type_| {
+                    source_property_object_projection(context.store(), type_)
+                        .unwrap()
+                        .filter(|projection| {
+                            matches!(projection, SourcePropertyObjectProjection::Inline(_))
+                        })
+                })
+                .unwrap()
+        });
+        let array = nested.arguments()[0];
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(plain.arguments(), &[number]);
+        assert!(nested.identity_arguments().is_empty());
+        assert!(
+            context
+                .store()
+                .type_payload(nested.type_())
+                .unwrap()
+                .alias()
+                .is_none()
+        );
+        let edges = context
+            .store()
+            .property_object_alias_type_edges(nested.type_(), Some(targets))
+            .unwrap()
+            .unwrap();
+        assert_eq!(edges.arguments, [array]);
+        assert!(edges.properties.is_empty());
+        assert_eq!(
+            context
+                .store()
+                .validate_cached_array_capability(nested.type_()),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+        );
+        assert_eq!(
+            context
+                .store()
+                .validate_cached_array_capability_with_array_targets(targets, nested.type_()),
+            Ok(())
+        );
+        assert_eq!(
+            context
+                .store()
+                .validate_union_constituent_with_array_targets(targets, nested.type_()),
+            Ok(())
+        );
+        assert_eq!(
+            context
+                .store()
+                .validate_cached_array_capability(plain.type_()),
+            Ok(())
+        );
+
+        let items = plain
+            .properties()
+            .iter()
+            .find(|property| property.name.as_utf8() == Some("items"))
+            .unwrap()
+            .symbol;
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            demand_property_object_alias_property(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                plain.target(),
+                items,
+            )
+            .unwrap(),
+            array
+        );
+        let store = context.store();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        let edges = store
+            .property_object_alias_type_edges(plain.type_(), Some(targets))
+            .unwrap()
+            .unwrap();
+        assert_eq!(edges.arguments, [number]);
+        assert_eq!(edges.properties, [array]);
+        let original = store
+            .property_object_alias_type_edges(plain.target(), Some(targets))
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.arguments.as_slice(), plain.parameters());
+        assert_eq!(original.properties, [array, array]);
+        for _ in 0..2 {
+            assert_eq!(
+                store.validate_cached_array_capability(plain.type_()),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(targets, plain.type_()),
+                Ok(())
+            );
+            assert_eq!(
+                store.validate_union_constituent_with_array_targets(targets, plain.type_()),
+                Ok(())
+            );
+            let seen = std::cell::RefCell::new(Vec::new());
+            let callback = |type_: TypeId| -> Result<Option<Vec<TypeId>>, LiteralTypeCacheError> {
+                seen.borrow_mut().push(type_);
+                Ok(None)
+            };
+            let seed = store.intrinsic_bootstrap().unwrap().unknown_type;
+            let mut walk = CachedArrayWalk {
+                visited: HashSet::from([seed]),
+                source_interfaces: Some(&callback),
+            };
+            let pending = HashSet::new();
+            assert_eq!(
+                store.validate_cached_array_capability_worker(
+                    plain.type_(),
+                    UnionArrayValidation::Targets(targets),
+                    &mut walk,
+                    &pending,
+                ),
+                Ok(())
+            );
+            let seen = seen.borrow();
+            assert_eq!(seen.first(), Some(&plain.type_()));
+            let number_position = seen.iter().position(|type_| *type_ == number).unwrap();
+            let array_position = seen.iter().position(|type_| *type_ == array).unwrap();
+            assert!(number_position < array_position);
+            assert_eq!(seen.iter().filter(|type_| **type_ == array).count(), 1);
+            assert!(walk.visited.contains(&seed));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+        for property in plain
+            .properties()
+            .iter()
+            .filter(|property| property.symbol != items)
+        {
+            assert!(
+                store
+                    .value_symbol_links(property.symbol)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+        }
+        assert!(diagnostics.as_slice().is_empty());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

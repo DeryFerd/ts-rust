@@ -5,8 +5,9 @@
 //! Array/ReadonlyArray references under an explicit target capability, direct
 //! full-arity generic class/interface references, indexed accesses,
 //! authenticated deferred intersections, template literals, intrinsic string
-//! mappings, ordinary property-object aliases, and unions with canonical alias
-//! arguments and union origins. Other object and signature instantiation needs
+//! mappings, ordinary property-object aliases, inline intersection objects,
+//! closed declaration-owned values, and unions with canonical alias arguments
+//! and union origins. Other object and signature instantiation needs
 //! its owning caches and is rejected.
 
 use std::collections::{HashMap, HashSet};
@@ -20,7 +21,7 @@ use super::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
     instantiated_members::{
-        instantiated_function_member_type_matches, validate_generic_interface_members,
+        closed_declared_function_type, instantiated_function_member_type_matches,
     },
     intersection_types::{
         DeferredIntersectionTypeProjection, IntersectionTypeCacheKey, IntersectionTypeError,
@@ -29,8 +30,12 @@ use super::{
     mapped_types::{MappedTypeError, MappedTypeModifiers, escaped_property_name_from_type},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     object_aliases::{
-        PropertyObjectAliasProjection, property_object_alias_identity_source_header,
-        property_object_alias_projection, validate_property_object_alias_arguments,
+        InlinePropertyObjectProjection, PropertyObjectAliasProjection,
+        SourcePropertyObjectProjection, closed_declared_property_object_is_mapping_invariant,
+        inline_property_object_projection, inline_property_object_template_matches,
+        property_object_alias_identity_source_header, property_object_alias_projection,
+        source_property_object_instance_flags_match, source_property_object_projection,
+        validate_property_object_alias_arguments,
     },
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
@@ -387,6 +392,635 @@ impl PropertyObjectAliasRecovery {
     }
 }
 
+/// Physical arguments recovered by the unaliased inline-object producer.
+/// A lexical parameter owner is not a display alias for this object.
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
+pub(super) struct InlinePropertyObjectRecovery {
+    result: TypeId,
+    target: TypeId,
+    declaration: NodeRef,
+    source_symbol: SemanticSymbolId,
+    parameter_owner: SemanticSymbolId,
+    parameters: Vec<TypeId>,
+    mapper: TypeMapperId,
+    arguments: Vec<TypeId>,
+    error_type: TypeId,
+    physical_recovery: Vec<bool>,
+}
+
+impl InlinePropertyObjectRecovery {
+    pub(super) const fn result(&self) -> TypeId {
+        self.result
+    }
+
+    pub(super) const fn error_type(&self) -> TypeId {
+        self.error_type
+    }
+
+    pub(super) fn physical_slot_recovered(&self, index: usize) -> bool {
+        self.physical_recovery.get(index) == Some(&true)
+    }
+
+    /// Checks source and result fields without entering the full projection.
+    pub(super) fn matches_current_result(&self, store: &CanonicalTypeMapperStore) -> bool {
+        if store.intrinsic_bootstrap().is_none_or(|bootstrap| {
+            bootstrap.error_type != self.error_type
+                || !store.type_payload(self.error_type).is_some_and(|record| {
+                    record.flags() == TypeFlags::ANY
+                        && matches!(record.data(), TypeData::Intrinsic(data) if data.intrinsic_name == "error")
+                })
+                || store.validate_union_constituent(self.error_type).is_err()
+        }) || self.parameters.is_empty()
+            || self.arguments.len() != self.parameters.len()
+            || self.physical_recovery.len() != self.arguments.len()
+            || !self.physical_recovery.iter().any(|marked| *marked)
+            || self
+                .physical_recovery
+                .iter()
+                .zip(&self.arguments)
+                .any(|(marked, argument)| *marked && *argument != self.error_type)
+            || validate_property_object_alias_arguments(store, &self.arguments).is_err()
+            || !inline_property_object_template_matches(
+                store,
+                self.declaration,
+                self.target,
+                self.parameter_owner,
+                &self.parameters,
+            )
+            .is_ok_and(|matches| matches)
+            || store.type_payload(self.target).and_then(TypeRecord::symbol)
+                != Some(self.source_symbol)
+            || store
+                .symbol(self.source_symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                != Some(&[self.declaration])
+            || store.source_declaration_symbol(self.declaration) != Some(self.source_symbol)
+            || store.source_node_kind(self.declaration) != Some(SyntaxKind::TypeLiteral)
+        {
+            return false;
+        }
+        let Some(record) = store.type_payload(self.result) else {
+            return false;
+        };
+        let TypeData::Object(object) = record.data() else {
+            return false;
+        };
+        self.result != self.target
+            && record.flags() == TypeFlags::OBJECT
+            && record.symbol() == Some(self.source_symbol)
+            && record.alias().is_none()
+            && object.target == Some(self.target)
+            && object.mapper == Some(self.mapper)
+            && object.instantiations == TypeCacheState::Unallocated
+            && source_property_object_instance_flags_match(
+                store,
+                record.object_flags(),
+                &self.arguments,
+            )
+            .is_ok_and(|matches| matches)
+            && store.type_mapper_has_exact_endpoints(self.mapper, &self.parameters, &self.arguments)
+                == Some(true)
+            && store.relation_object_instantiation(
+                self.target,
+                type_alias_instantiation_cache_key(&self.arguments, None),
+            ) == Some(self.result)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntersectionSlotLimitEvents {
+    before: InstantiationLimitEventMark,
+    after: InstantiationLimitEventMark,
+}
+
+impl IntersectionSlotLimitEvents {
+    fn occurred(self) -> bool {
+        self.after > self.before
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IntersectionObjectRecovery {
+    None,
+    Inline,
+    DirectAlias,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IntersectionObjectReceipt {
+    source: SourcePropertyObjectProjection,
+    result: SourcePropertyObjectProjection,
+    recovery: IntersectionObjectRecovery,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IntersectionConstituentReceipt {
+    source: TypeId,
+    result: TypeId,
+    events: IntersectionSlotLimitEvents,
+    object: Option<Box<IntersectionObjectReceipt>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IntersectionAliasArgumentReceipt {
+    source: TypeId,
+    result: TypeId,
+    events: IntersectionSlotLimitEvents,
+    inherited: bool,
+}
+
+/// Exact slot results observed by one real ordinary-intersection mapper call.
+/// Source queries retain this value with their actual alias request row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct OrdinaryIntersectionRecoveryReceipt {
+    source: TypeId,
+    source_key: IntersectionTypeCacheKey,
+    parameters: Vec<TypeId>,
+    arguments: Vec<TypeId>,
+    alias_override: Option<(SemanticSymbolId, Vec<TypeId>)>,
+    array_targets: Option<CanonicalArrayTargets>,
+    error_type: TypeId,
+    result: TypeId,
+    result_key: IntersectionTypeCacheKey,
+    constituents: Vec<IntersectionConstituentReceipt>,
+    alias_arguments: Vec<IntersectionAliasArgumentReceipt>,
+    inherited: Option<Box<Self>>,
+}
+
+impl OrdinaryIntersectionRecoveryReceipt {
+    pub(super) const fn result(&self) -> TypeId {
+        self.result
+    }
+
+    #[allow(clippy::too_many_arguments)] // Bind the receipt to the caller's complete mapping request.
+    pub(super) fn matches_mapping_request(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        source: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+        alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<bool, InstantiationError> {
+        if self.source != source
+            || self.parameters != parameters
+            || self.arguments != arguments
+            || self
+                .alias_override
+                .as_ref()
+                .map(|(symbol, arguments)| (*symbol, arguments.as_slice()))
+                != alias_override
+        {
+            return Ok(false);
+        }
+        self.validate_current_chain(store, array_targets)?;
+        Ok(true)
+    }
+
+    fn validate_current_chain(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<(), InstantiationError> {
+        let mut current = Some(self);
+        let mut depth = 0;
+        while let Some(receipt) = current {
+            if depth == InstantiationLimits::default().max_depth {
+                return Err(InstantiationError::UnsupportedType(self.source));
+            }
+            receipt.validate_current_result(store, receipt.array_targets)?;
+            if receipt.array_targets != array_targets {
+                receipt.validate_current_result(store, array_targets)?;
+            }
+            current = receipt.inherited.as_deref();
+            depth += 1;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Ordered slots, exact keys, and inherited evidence form one proof.
+    fn validate_current_result(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<(), InstantiationError> {
+        let invalid = || InstantiationError::InvalidType(self.result);
+        let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+        if self.error_type != bootstrap.error_type
+            || self.result == self.error_type
+            || self.parameters.len() != self.arguments.len()
+            || self.parameters.is_empty()
+            || self.parameters.iter().any(|parameter| cached_ordinary_type_parameter_owner(store, *parameter).is_none())
+            || self.parameters.iter().copied().collect::<HashSet<_>>().len() != self.parameters.len()
+            || store.validate_union_constituent(self.error_type).is_err()
+            || !store.type_payload(self.error_type).is_some_and(|record| {
+                record.flags() == TypeFlags::ANY
+                    && matches!(record.data(), TypeData::Intrinsic(data) if data.intrinsic_name == "error")
+            })
+            || array_targets.is_some_and(|targets| {
+                store.type_payload(targets.array_type()).is_none()
+                    || store.type_payload(targets.readonly_array_type()).is_none()
+            })
+        {
+            return Err(invalid());
+        }
+        validate_property_object_alias_arguments(store, &self.arguments).map_err(|_| invalid())?;
+        let source = instantiable_intersection_projection(store, self.source, array_targets)?;
+        let result = instantiable_intersection_projection(store, self.result, array_targets)?;
+        if source.types != self.source_key.types
+            || source.alias_symbol != self.source_key.alias_symbol
+            || source.alias_arguments != self.source_key.alias_arguments
+            || result.types != self.result_key.types
+            || result.alias_symbol != self.result_key.alias_symbol
+            || result.alias_arguments != self.result_key.alias_arguments
+            || self.constituents.len() != source.types.len()
+            || self.inherited.as_ref().is_some_and(|inherited| {
+                inherited.result != self.source || inherited.result_key != self.source_key
+            })
+        {
+            return Err(invalid());
+        }
+        let mut normalized = Vec::with_capacity(self.constituents.len());
+        let mut last_event = None;
+        let mut recovered = false;
+        for (expected_source, slot) in source.types.iter().zip(&self.constituents) {
+            if *expected_source != slot.source
+                || slot.events.after < slot.events.before
+                || last_event.is_some_and(|event| event != slot.events.before)
+            {
+                return Err(invalid());
+            }
+            last_event = Some(slot.events.after);
+            recovered |= validate_intersection_constituent_receipt(
+                store,
+                slot,
+                &self.parameters,
+                &self.arguments,
+                array_targets,
+                self.error_type,
+            )?;
+            store
+                .append_deferred_intersection_constituent_with_array_targets(
+                    slot.result,
+                    &mut normalized,
+                    array_targets,
+                )
+                .map_err(|error| deferred_intersection_error(self.source, error))?;
+        }
+        if normalized != result.types {
+            return Err(invalid());
+        }
+        if let Some((symbol, arguments)) = &self.alias_override {
+            validate_borrowed_alias_input(store, self.source, *symbol, arguments)?;
+            if !self.alias_arguments.is_empty()
+                || result.alias_symbol != Some(*symbol)
+                || result.alias_arguments != *arguments
+            {
+                return Err(invalid());
+            }
+        } else {
+            if result.alias_symbol != source.alias_symbol
+                || self.alias_arguments.len() != source.alias_arguments.len()
+                || result.alias_arguments.len() != source.alias_arguments.len()
+            {
+                return Err(invalid());
+            }
+            for (index, ((source_argument, result_argument), slot)) in source
+                .alias_arguments
+                .iter()
+                .zip(&result.alias_arguments)
+                .zip(&self.alias_arguments)
+                .enumerate()
+            {
+                if slot.source != *source_argument
+                    || slot.result != *result_argument
+                    || slot.events.after < slot.events.before
+                    || last_event.is_some_and(|event| event != slot.events.before)
+                {
+                    return Err(invalid());
+                }
+                last_event = Some(slot.events.after);
+                let inherited = self.inherited.as_ref().is_some_and(|inherited| {
+                    inherited.alias_arguments.get(index).is_some_and(|prior| {
+                        prior.result == self.error_type
+                            && (prior.events.occurred() || prior.inherited)
+                    }) && slot.source == self.error_type
+                        && slot.result == self.error_type
+                });
+                if slot.inherited != inherited {
+                    return Err(invalid());
+                }
+                if slot.events.occurred() || slot.inherited {
+                    if slot.result != self.error_type {
+                        return Err(invalid());
+                    }
+                    recovered = true;
+                } else if cached_instantiation_with_vector(
+                    store,
+                    slot.source,
+                    &self.parameters,
+                    &self.arguments,
+                    array_targets,
+                    None,
+                )? != Some(slot.result)
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        if !recovered {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
+struct OrdinaryIntersectionReceiptBuilder {
+    parameters: Vec<TypeId>,
+    arguments: Vec<TypeId>,
+    inherited: Option<Box<OrdinaryIntersectionRecoveryReceipt>>,
+    receipt: Option<OrdinaryIntersectionRecoveryReceipt>,
+}
+
+struct IntersectionObjectSlotRecovery {
+    kind: IntersectionObjectRecovery,
+    error_type: TypeId,
+    physical: Vec<bool>,
+    identity: Vec<bool>,
+}
+
+fn intersection_object_slot_recovery(
+    store: &CanonicalTypeMapperStore,
+    projection: &SourcePropertyObjectProjection,
+) -> Result<Option<IntersectionObjectSlotRecovery>, InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(projection.type_());
+    match projection {
+        SourcePropertyObjectProjection::Inline(source) => {
+            let Some(recovery) = store.inline_property_object_recovery(source.type_) else {
+                return Ok(None);
+            };
+            if recovery.result() != source.type_ || !recovery.matches_current_result(store) {
+                return Err(invalid());
+            }
+            Ok(Some(IntersectionObjectSlotRecovery {
+                kind: IntersectionObjectRecovery::Inline,
+                error_type: recovery.error_type(),
+                physical: (0..source.arguments.len())
+                    .map(|slot| recovery.physical_slot_recovered(slot))
+                    .collect(),
+                identity: Vec::new(),
+            }))
+        }
+        SourcePropertyObjectProjection::DirectAlias(source) => {
+            let Some(recovery) = store.property_object_alias_recovery(source.type_) else {
+                return Ok(None);
+            };
+            if recovery.result() != source.type_ || !recovery.matches_current_result(store) {
+                return Err(invalid());
+            }
+            Ok(Some(IntersectionObjectSlotRecovery {
+                kind: IntersectionObjectRecovery::DirectAlias,
+                error_type: recovery.error_type(),
+                physical: (0..source.arguments.len())
+                    .map(|slot| recovery.physical_slot_recovered(slot))
+                    .collect(),
+                identity: (0..source.identity_arguments.len())
+                    .map(|slot| recovery.identity_slot_recovered(slot))
+                    .collect(),
+            }))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Check the two physical/display argument lists against their exact slot evidence.
+fn intersection_recovered_argument_list_matches(
+    store: &CanonicalTypeMapperStore,
+    source: &[TypeId],
+    actual: &[TypeId],
+    recovered: &[bool],
+    inherited: Option<&[bool]>,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    error_type: TypeId,
+    events: IntersectionSlotLimitEvents,
+) -> Result<bool, InstantiationError> {
+    if source.len() != actual.len() || recovered.len() != actual.len() {
+        return Ok(false);
+    }
+    for (index, ((source, actual), recovered)) in
+        source.iter().zip(actual).zip(recovered).enumerate()
+    {
+        let expected = cached_instantiation_with_vector(
+            store,
+            *source,
+            parameters,
+            arguments,
+            array_targets,
+            None,
+        )?;
+        if *recovered {
+            if *actual != error_type
+                || !events.occurred()
+                    && expected != Some(*actual)
+                    && !(inherited.is_some_and(|slots| slots.get(index) == Some(&true))
+                        && *source == error_type
+                        && *actual == *source)
+            {
+                return Ok(false);
+            }
+        } else if expected != Some(*actual) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_lines)] // One saved constituent binds source fields, output fields, and exact recovery slots.
+fn validate_intersection_constituent_receipt(
+    store: &CanonicalTypeMapperStore,
+    slot: &IntersectionConstituentReceipt,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    error_type: TypeId,
+) -> Result<bool, InstantiationError> {
+    let invalid = || InstantiationError::InvalidType(slot.result);
+    let source = source_property_object_projection(store, slot.source).map_err(|_| invalid())?;
+    let actual = source_property_object_projection(store, slot.result).map_err(|_| invalid())?;
+    let Some(object) = &slot.object else {
+        if source.is_some()
+            || actual.is_some()
+            || cached_instantiation_with_vector(
+                store,
+                slot.source,
+                parameters,
+                arguments,
+                array_targets,
+                None,
+            )? != Some(slot.result)
+        {
+            return Err(invalid());
+        }
+        return Ok(slot.events.occurred());
+    };
+    if source.as_ref() != Some(&object.source)
+        || actual.as_ref() != Some(&object.result)
+        || object.source.type_() != slot.source
+        || object.result.type_() != slot.result
+        || object.source.target() != object.result.target()
+        || object.source.source_symbol() != object.result.source_symbol()
+        || object.source.parameter_owner() != object.result.parameter_owner()
+        || object.source.parameters() != object.result.parameters()
+        || object.source.display_identity().map(|(symbol, _)| symbol)
+            != object.result.display_identity().map(|(symbol, _)| symbol)
+    {
+        return Err(invalid());
+    }
+    if object.recovery == IntersectionObjectRecovery::None {
+        if cached_instantiation_with_vector(
+            store,
+            slot.source,
+            parameters,
+            arguments,
+            array_targets,
+            None,
+        )? != Some(slot.result)
+        {
+            return Err(invalid());
+        }
+        return Ok(slot.events.occurred());
+    }
+    let recovery = intersection_object_slot_recovery(store, &object.result)?.ok_or_else(invalid)?;
+    let inherited = intersection_object_slot_recovery(store, &object.source)?;
+    if recovery.kind != object.recovery
+        || recovery.error_type != error_type
+        || inherited
+            .as_ref()
+            .is_some_and(|prior| prior.kind != recovery.kind || prior.error_type != error_type)
+        || !intersection_recovered_argument_list_matches(
+            store,
+            object.source.arguments(),
+            object.result.arguments(),
+            &recovery.physical,
+            inherited.as_ref().map(|prior| prior.physical.as_slice()),
+            parameters,
+            arguments,
+            array_targets,
+            error_type,
+            slot.events,
+        )?
+        || !intersection_recovered_argument_list_matches(
+            store,
+            object.source.identity_arguments(),
+            object.result.identity_arguments(),
+            &recovery.identity,
+            inherited.as_ref().map(|prior| prior.identity.as_slice()),
+            parameters,
+            arguments,
+            array_targets,
+            error_type,
+            slot.events,
+        )?
+    {
+        return Err(invalid());
+    }
+    Ok(true)
+}
+
+fn capture_intersection_constituent_receipt(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    source_object: Option<SourcePropertyObjectProjection>,
+    result: TypeId,
+    events: IntersectionSlotLimitEvents,
+    builder: &OrdinaryIntersectionReceiptBuilder,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<IntersectionConstituentReceipt, InstantiationError> {
+    let result_object = source_property_object_projection(store, result)
+        .map_err(|_| InstantiationError::InvalidType(result))?;
+    let object = match (source_object, result_object) {
+        (Some(source), Some(result)) => {
+            let actual_recovery = intersection_object_slot_recovery(store, &result)?;
+            let source_recovery = intersection_object_slot_recovery(store, &source)?;
+            if events.occurred() {
+                let matches = if let Some(recovery) = &actual_recovery {
+                    intersection_recovered_argument_list_matches(
+                        store,
+                        source.arguments(),
+                        result.arguments(),
+                        &recovery.physical,
+                        source_recovery
+                            .as_ref()
+                            .map(|prior| prior.physical.as_slice()),
+                        &builder.parameters,
+                        &builder.arguments,
+                        array_targets,
+                        recovery.error_type,
+                        events,
+                    )? && intersection_recovered_argument_list_matches(
+                        store,
+                        source.identity_arguments(),
+                        result.identity_arguments(),
+                        &recovery.identity,
+                        source_recovery
+                            .as_ref()
+                            .map(|prior| prior.identity.as_slice()),
+                        &builder.parameters,
+                        &builder.arguments,
+                        array_targets,
+                        recovery.error_type,
+                        events,
+                    )?
+                } else {
+                    cached_instantiation_with_vector(
+                        store,
+                        source.type_(),
+                        &builder.parameters,
+                        &builder.arguments,
+                        array_targets,
+                        None,
+                    )? == Some(result.type_())
+                };
+                if !matches {
+                    return Err(InstantiationError::UnsupportedType(source.type_()));
+                }
+            }
+            let recovery = if events.occurred() || source_recovery.is_some() {
+                actual_recovery.map_or(IntersectionObjectRecovery::None, |recovery| recovery.kind)
+            } else {
+                IntersectionObjectRecovery::None
+            };
+            Some(Box::new(IntersectionObjectReceipt {
+                source,
+                result,
+                recovery,
+            }))
+        }
+        (None, None) => None,
+        _ => return Err(InstantiationError::UnsupportedType(source)),
+    };
+    if object.is_none()
+        && cached_instantiation_with_vector(
+            store,
+            source,
+            &builder.parameters,
+            &builder.arguments,
+            array_targets,
+            None,
+        )? != Some(result)
+    {
+        return Err(InstantiationError::UnsupportedType(source));
+    }
+    Ok(IntersectionConstituentReceipt {
+        source,
+        result,
+        events,
+        object,
+    })
+}
+
 /// Checker-query-owned instantiation accounting and recursive mapper cache.
 ///
 /// The per-query count is intentionally not reset by each instantiation call:
@@ -673,6 +1307,62 @@ pub(super) fn instantiate_type_with_vector_and_alias_and_session(
     )
 }
 
+/// Uses the normal caller frame and retains only real intersection recovery.
+#[allow(clippy::too_many_arguments)] // Keep the source request, capability, and caller session together.
+pub(super) fn instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    inherited: Option<&OrdinaryIntersectionRecoveryReceipt>,
+    session: &mut InstantiationSession,
+) -> Result<(TypeId, Option<OrdinaryIntersectionRecoveryReceipt>), InstantiationError> {
+    if parameters.len() != arguments.len() {
+        return Err(InstantiationError::InvalidType(source));
+    }
+    for endpoint in parameters.iter().chain(arguments) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(InstantiationError::InvalidType(*endpoint));
+        }
+    }
+    let mut builder = OrdinaryIntersectionReceiptBuilder {
+        parameters: parameters.to_vec(),
+        arguments: arguments.to_vec(),
+        inherited: inherited.cloned().map(Box::new),
+        receipt: None,
+    };
+    let result = instantiate_type_with_alias_input_and_receipt(
+        store,
+        source,
+        InstantiationMapping::Vector {
+            sources: parameters,
+            targets: arguments,
+        },
+        array_targets,
+        alias_override
+            .map(|(symbol, arguments)| InstantiationAliasInput::Borrowed(symbol, arguments)),
+        session,
+        Some(&mut builder),
+    )?;
+    if let Some(receipt) = &builder.receipt {
+        if receipt.result != result
+            || !receipt.matches_mapping_request(
+                store,
+                source,
+                parameters,
+                arguments,
+                alias_override,
+                array_targets,
+            )?
+        {
+            return Err(InstantiationError::InvalidType(result));
+        }
+    }
+    Ok((result, builder.receipt))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MappedTemplateFrame {
     Optional { template: TypeId, sentinel: TypeId },
@@ -827,6 +1517,26 @@ fn instantiate_type_with_alias_input(
     alias: Option<InstantiationAliasInput<'_>>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_alias_input_and_receipt(
+        store,
+        type_,
+        mapping,
+        array_targets,
+        alias,
+        session,
+        None,
+    )
+}
+
+fn instantiate_type_with_alias_input_and_receipt(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias: Option<InstantiationAliasInput<'_>>,
+    session: &mut InstantiationSession,
+    receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
+) -> Result<TypeId, InstantiationError> {
     if matches!(
         store.type_payload(type_).map(TypeRecord::data),
         Some(TypeData::Union(_))
@@ -853,7 +1563,15 @@ fn instantiate_type_with_alias_input(
                     type_arguments,
                 } => Some((*symbol, type_arguments.as_slice())),
             };
-            instantiate_type_worker(store, type_, mapping, array_targets, alias, session)
+            instantiate_type_worker(
+                store,
+                type_,
+                mapping,
+                array_targets,
+                alias,
+                session,
+                receipt,
+            )
         },
     )
 }
@@ -1006,6 +1724,73 @@ fn could_contain_installed_type_variables(
     could_contain_installed_type_variables_worker(store, type_, array_targets, &mut HashSet::new())
 }
 
+fn mapping_invariant_object_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, InstantiationError> {
+    if closed_declared_property_object_is_mapping_invariant(store, type_)
+        .map_err(|error| closed_mapping_identity_error(type_, error))?
+    {
+        return Ok(true);
+    }
+    if store.type_has_function_type_provenance(type_) {
+        return closed_declared_function_type(store, type_, array_targets)
+            .map_err(|error| closed_mapping_identity_error(type_, error));
+    }
+    Ok(false)
+}
+
+fn closed_mapping_identity_error(
+    type_: TypeId,
+    error: super::relater::RelationUnavailable,
+) -> InstantiationError {
+    use super::relater::RelationUnavailable;
+    match error {
+        RelationUnavailable::UnsupportedStructuredType(_)
+        | RelationUnavailable::UnavailableCanonicalArrayTarget(_)
+        | RelationUnavailable::UnresolvedStructuredMembers(_)
+        | RelationUnavailable::UnresolvedFunctionType(_)
+        | RelationUnavailable::UnresolvedSignatureReturn(_) => {
+            InstantiationError::UnsupportedType(type_)
+        }
+        _ => InstantiationError::InvalidType(type_),
+    }
+}
+
+fn instantiable_intersection_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<DeferredIntersectionTypeProjection, InstantiationError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(InstantiationError::InvalidType(type_))?;
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return store
+            .validate_deferred_intersection_type_with_array_targets(type_, array_targets)
+            .map_err(|error| deferred_intersection_error(type_, error));
+    }
+    let ready = store
+        .validate_intersection_type_with_array_targets(type_, array_targets)
+        .map_err(|error| deferred_intersection_error(type_, error))?;
+    let key = store
+        .intersection_keys_by_type
+        .get(&type_)
+        .ok_or(InstantiationError::InvalidType(type_))?;
+    if key.types != ready.types || store.intersection_types.get(key) != Some(&type_) {
+        return Err(InstantiationError::InvalidType(type_));
+    }
+    Ok(DeferredIntersectionTypeProjection {
+        types: ready.types,
+        alias_symbol: key.alias_symbol,
+        alias_arguments: key.alias_arguments.clone(),
+    })
+}
+
 fn could_contain_installed_type_variables_worker(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -1043,17 +1828,20 @@ fn could_contain_installed_type_variables_worker(
                 Err(InstantiationError::UnsupportedType(type_))
             }
         }
-        TypeData::Object(_) => match property_object_alias_projection(store, type_)
-            .map_err(|_| InstantiationError::InvalidType(type_))?
-        {
-            Some(projection) => {
-                let identity_arguments = if projection.arguments == projection.identity_arguments {
-                    &[][..]
-                } else {
-                    projection.identity_arguments.as_slice()
-                };
+        TypeData::Object(_) => {
+            if mapping_invariant_object_type(store, type_, array_targets)? {
+                Ok(false)
+            } else if let Some(projection) = source_property_object_projection(store, type_)
+                .map_err(|_| InstantiationError::InvalidType(type_))?
+            {
+                let identity_arguments =
+                    if projection.arguments() == projection.identity_arguments() {
+                        &[][..]
+                    } else {
+                        projection.identity_arguments()
+                    };
                 projection
-                    .arguments
+                    .arguments()
                     .iter()
                     .chain(identity_arguments)
                     .try_fold(false, |contains, argument| {
@@ -1065,9 +1853,10 @@ fn could_contain_installed_type_variables_worker(
                                 seen,
                             )?)
                     })
+            } else {
+                Ok(true)
             }
-            None => Ok(true),
-        },
+        }
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
                 Err(TemplateTypeError::InvalidTemplate(type_).into())
@@ -1135,9 +1924,7 @@ fn could_contain_installed_type_variables_worker(
             Ok(contains)
         }
         TypeData::Intersection(_) => {
-            let projection = store
-                .validate_deferred_intersection_type(type_)
-                .map_err(|error| deferred_intersection_error(type_, error))?;
+            let projection = instantiable_intersection_projection(store, type_, array_targets)?;
             let mut contains = false;
             for constituent in projection.types.iter().chain(&projection.alias_arguments) {
                 contains |= could_contain_installed_type_variables_worker(
@@ -1376,7 +2163,8 @@ fn supported_instantiable_union_constituent(
             None => store.validate_cached_union_result(type_, None).is_ok(),
         },
         Some(TypeData::Object(_)) => {
-            matches!(property_object_alias_projection(store, type_), Ok(Some(_)))
+            mapping_invariant_object_type(store, type_, array_targets) == Ok(true)
+                || matches!(source_property_object_projection(store, type_), Ok(Some(_)))
         }
         _ => false,
     }
@@ -1414,27 +2202,32 @@ fn validate_instantiable_member_type_worker(
         }
         TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
         TypeData::Object(_) => {
-            let projection = property_object_alias_projection(store, type_)
-                .map_err(|_| InstantiationError::InvalidType(type_))?
-                .ok_or(InstantiationError::UnsupportedType(type_))?;
-            let identity_arguments = if projection.arguments == projection.identity_arguments {
-                &[][..]
+            if mapping_invariant_object_type(store, type_, array_targets)? {
+                Ok(())
             } else {
-                projection.identity_arguments.as_slice()
-            };
-            projection
-                .arguments
-                .iter()
-                .chain(identity_arguments)
-                .try_for_each(|argument| {
-                    validate_instantiable_member_type_worker(
-                        store,
-                        *argument,
-                        mapper_parameters,
-                        array_targets,
-                        active,
-                    )
-                })
+                let projection = source_property_object_projection(store, type_)
+                    .map_err(|_| InstantiationError::InvalidType(type_))?
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                let identity_arguments =
+                    if projection.arguments() == projection.identity_arguments() {
+                        &[][..]
+                    } else {
+                        projection.identity_arguments()
+                    };
+                projection
+                    .arguments()
+                    .iter()
+                    .chain(identity_arguments)
+                    .try_for_each(|argument| {
+                        validate_instantiable_member_type_worker(
+                            store,
+                            *argument,
+                            mapper_parameters,
+                            array_targets,
+                            active,
+                        )
+                    })
+            }
         }
         TypeData::IndexedAccess(indexed) => {
             if record.flags() != TypeFlags::INDEXED_ACCESS
@@ -1627,13 +2420,17 @@ fn instantiated_member_type_matches_worker(
         )
         .map(|expected| expected == Some(actual)),
         TypeData::Object(_) if store.type_has_function_type_provenance(template) => {
-            Ok(instantiated_function_member_type_matches(
-                store,
-                template,
-                actual,
-                mapper,
-                array_targets,
-            ))
+            if mapping_invariant_object_type(store, template, array_targets)? {
+                Ok(template == actual)
+            } else {
+                Ok(instantiated_function_member_type_matches(
+                    store,
+                    template,
+                    actual,
+                    mapper,
+                    array_targets,
+                ))
+            }
         }
         TypeData::TemplateLiteral(_)
         | TypeData::StringMapping(_)
@@ -1998,15 +2795,23 @@ fn cached_instantiated_type_worker(
             }
         }
         TypeData::Object(_) => {
-            let projection = property_object_alias_projection(store, template)
+            if mapping_invariant_object_type(store, template, array_targets)? {
+                return Ok(Some(template));
+            }
+            let projection = source_property_object_projection(store, template)
                 .map_err(|_| InstantiationError::InvalidType(template))?
                 .ok_or(InstantiationError::UnsupportedType(template))?;
+            if matches!(&projection, SourcePropertyObjectProjection::Inline(_))
+                && alias_override.is_some()
+            {
+                return Err(InstantiationError::UnsupportedType(template));
+            }
             if !could_contain_installed_type_variables(store, template, array_targets)? {
                 return Ok(Some(template));
             }
-            let mut arguments = Vec::with_capacity(projection.arguments.len());
-            for argument in &projection.arguments {
-                let mapped = if projection.mapper.is_none() {
+            let mut arguments = Vec::with_capacity(projection.arguments().len());
+            for argument in projection.arguments() {
+                let mapped = if projection.mapper().is_none() {
                     cached_apply_mapping(store, *argument, mapping, array_targets)?
                 } else {
                     cached_instantiated_type_worker(
@@ -2023,6 +2828,12 @@ fn cached_instantiated_type_worker(
                 };
                 arguments.push(mapped);
             }
+            let projection = match projection {
+                SourcePropertyObjectProjection::DirectAlias(projection) => projection,
+                SourcePropertyObjectProjection::Inline(projection) => {
+                    return cached_inline_property_object_instance(store, &projection, &arguments);
+                }
+            };
             let (identity_symbol, identity_arguments) =
                 if let Some((symbol, arguments)) = alias_override {
                     (symbol, arguments.to_vec())
@@ -2101,9 +2912,7 @@ fn cached_instantiated_intersection_type(
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     active: &mut HashSet<TypeId>,
 ) -> Result<Option<TypeId>, InstantiationError> {
-    let projection = store
-        .validate_deferred_intersection_type(source)
-        .map_err(|error| deferred_intersection_error(source, error))?;
+    let projection = instantiable_intersection_projection(store, source, array_targets)?;
     if !could_contain_installed_type_variables(store, source, array_targets)? {
         return Ok(Some(source));
     }
@@ -2167,7 +2976,7 @@ fn cached_instantiated_intersection_type(
     )? {
         return Ok(Some(reduced));
     }
-    cached_deferred_intersection_result(store, source, &constituents, alias)
+    cached_deferred_intersection_result(store, source, &constituents, alias, array_targets)
 }
 
 /// Mirrors the deferred constructor's flattening without publishing a result.
@@ -2176,6 +2985,7 @@ fn cached_deferred_intersection_result(
     source: TypeId,
     constituents: &[TypeId],
     alias: Option<(SemanticSymbolId, &[TypeId])>,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, InstantiationError> {
     let invalid = || InstantiationError::InvalidType(source);
     if let Some((symbol, arguments)) = alias {
@@ -2195,7 +3005,13 @@ fn cached_deferred_intersection_result(
     }
     let mut types = Vec::with_capacity(constituents.len());
     for constituent in constituents {
-        append_cached_intersection_constituent(store, *constituent, &mut types)?;
+        store
+            .append_deferred_intersection_constituent_with_array_targets(
+                *constituent,
+                &mut types,
+                array_targets,
+            )
+            .map_err(|error| deferred_intersection_error(source, error))?;
     }
     match types.as_slice() {
         [] => {
@@ -2232,107 +3048,14 @@ fn cached_deferred_intersection_result(
         .contains(ObjectFlags::MEMBERS_RESOLVED)
     {
         store
-            .validate_intersection_type(cached)
+            .validate_intersection_type_with_array_targets(cached, array_targets)
             .map_err(|error| deferred_intersection_error(source, error))?;
     } else {
         store
-            .validate_deferred_intersection_type(cached)
+            .validate_deferred_intersection_type_with_array_targets(cached, array_targets)
             .map_err(|error| deferred_intersection_error(source, error))?;
     }
     Ok(Some(cached))
-}
-
-/// A collapsed intersection still requires the constructor's complete leaf proof.
-fn append_cached_intersection_constituent(
-    store: &CanonicalTypeMapperStore,
-    type_: TypeId,
-    output: &mut Vec<TypeId>,
-) -> Result<(), InstantiationError> {
-    let invalid = || InstantiationError::InvalidType(type_);
-    let record = store.type_payload(type_).ok_or_else(invalid)?;
-    match record.data() {
-        TypeData::Intersection(_) => {
-            let constituents = if record
-                .object_flags()
-                .contains(ObjectFlags::MEMBERS_RESOLVED)
-            {
-                store
-                    .validate_intersection_type(type_)
-                    .map_err(|error| deferred_intersection_error(type_, error))?
-                    .types
-            } else {
-                store
-                    .validate_deferred_intersection_type(type_)
-                    .map_err(|error| deferred_intersection_error(type_, error))?
-                    .types
-            };
-            for constituent in constituents {
-                append_cached_intersection_constituent(store, constituent, output)?;
-            }
-            return Ok(());
-        }
-        TypeData::TypeParameter(_) => {
-            let owner = cached_ordinary_type_parameter_owner(store, type_).ok_or_else(invalid)?;
-            let Some([declaration]) = store.symbol(owner).and_then(|owner| owner.declarations())
-            else {
-                return Err(invalid());
-            };
-            if store.get_merged_symbol(owner) != Some(owner)
-                || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
-            {
-                return Err(invalid());
-            }
-        }
-        TypeData::Mapped(_) => store
-            .validate_deferred_mapped_type(type_)
-            .map_err(|_| invalid())?,
-        TypeData::TypeReference(_) | TypeData::Interface(_)
-            if record.object_flags().contains(ObjectFlags::REFERENCE) =>
-        {
-            let reference = validate_direct_generic_reference(store, type_)?;
-            let target = store.type_payload(reference.target).ok_or_else(invalid)?;
-            if !matches!(target.data(), TypeData::Interface(_))
-                || target.symbol().is_none_or(|symbol| {
-                    store.get_merged_symbol(symbol) != Some(symbol)
-                        || store.symbol(symbol).is_none_or(|owner| {
-                            !owner.flags().contains(SymbolFlags::INTERFACE)
-                                || owner
-                                    .flags()
-                                    .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
-                                    != SymbolFlags::NONE
-                        })
-                })
-            {
-                return Err(invalid());
-            }
-            if record
-                .object_flags()
-                .contains(ObjectFlags::MEMBERS_RESOLVED)
-            {
-                if !matches!(
-                    validate_generic_interface_members(store, type_, None),
-                    Ok(Some(_))
-                ) {
-                    return Err(invalid());
-                }
-            } else if record.data().structured() != Some(&StructuredTypeData::default()) {
-                return Err(invalid());
-            }
-        }
-        TypeData::Interface(_) | TypeData::Object(_) => {
-            if !matches!(
-                validate_resolved_declared_property_object(store, type_),
-                DeclaredPropertyObjectValidation::Valid(_)
-            ) {
-                return Err(invalid());
-            }
-        }
-        _ => return Err(InstantiationError::UnsupportedType(type_)),
-    }
-    if !output.contains(&type_) {
-        output.push(type_);
-    }
-    Ok(())
 }
 
 fn instantiated_member_union_matches(
@@ -2399,6 +3122,38 @@ fn cached_property_object_alias_instance(
         || actual.arguments != arguments
         || actual.identity_symbol != identity.0
         || actual.identity_arguments != identity.1
+    {
+        return Err(InstantiationError::InvalidType(cached));
+    }
+    Ok(Some(cached))
+}
+
+fn cached_inline_property_object_instance(
+    store: &CanonicalTypeMapperStore,
+    source: &InlinePropertyObjectProjection,
+    arguments: &[TypeId],
+) -> Result<Option<TypeId>, InstantiationError> {
+    if arguments.len() != source.parameters.len() {
+        return Err(InstantiationError::InvalidType(source.type_));
+    }
+    validate_property_object_alias_arguments(store, arguments)
+        .map_err(|_| InstantiationError::UnsupportedType(source.type_))?;
+    if arguments == source.arguments {
+        return Ok(Some(source.type_));
+    }
+    let key = type_alias_instantiation_cache_key(arguments, None);
+    let Some(cached) = store.relation_object_instantiation(source.target, key) else {
+        return Ok(None);
+    };
+    let actual = inline_property_object_projection(store, cached)
+        .map_err(|_| InstantiationError::InvalidType(cached))?
+        .ok_or(InstantiationError::InvalidType(cached))?;
+    if actual.target != source.target
+        || actual.declaration != source.declaration
+        || actual.source_symbol != source.source_symbol
+        || actual.parameter_owner != source.parameter_owner
+        || actual.parameters != source.parameters
+        || actual.arguments != arguments
     {
         return Err(InstantiationError::InvalidType(cached));
     }
@@ -2618,6 +3373,132 @@ fn instantiate_property_object_alias(
     Ok(instantiated)
 }
 
+/// Maps an inline literal from its original lexical parameters without an alias.
+#[allow(clippy::too_many_lines)] // Mapping, reservation, and exact recovery publication form one operation.
+fn instantiate_inline_property_object(
+    store: &mut CanonicalTypeMapperStore,
+    source: &InlinePropertyObjectProjection,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    let error_type = store
+        .intrinsic_bootstrap()
+        .ok_or(InstantiationError::InvalidType(source.type_))?
+        .error_type;
+    let inherited_recovery =
+        if let Some(recovery) = store.inline_property_object_recovery(source.type_) {
+            if recovery.result() != source.type_
+                || recovery.error_type() != error_type
+                || !recovery.matches_current_result(store)
+            {
+                return Err(InstantiationError::InvalidType(source.type_));
+            }
+            (0..source.arguments.len())
+                .map(|index| recovery.physical_slot_recovered(index))
+                .collect::<Vec<_>>()
+        } else {
+            vec![false; source.arguments.len()]
+        };
+    let mut arguments = Vec::with_capacity(source.arguments.len());
+    let mut physical_recovery = Vec::with_capacity(source.arguments.len());
+    for (index, argument) in source.arguments.iter().enumerate() {
+        let mark = session.limit_event_mark();
+        let mapped = if source.mapper.is_none() {
+            apply_mapping(store, *argument, mapping, array_targets, session)?
+        } else {
+            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?
+        };
+        physical_recovery.push(recovered_property_alias_argument(
+            session,
+            mark,
+            error_type,
+            *argument,
+            mapped,
+            inherited_recovery[index],
+        )?);
+        arguments.push(mapped);
+    }
+    if let Some(cached) = cached_inline_property_object_instance(store, source, &arguments)? {
+        return Ok(cached);
+    }
+    let has_recovery = physical_recovery.iter().any(|marked| *marked);
+    if has_recovery && !store.try_reserve_inline_property_object_recoveries() {
+        return Err(LiteralTypeCacheError::Capacity.into());
+    }
+    let key = type_alias_instantiation_cache_key(&arguments, None);
+    let identity_key = type_alias_instantiation_cache_key(&source.parameters, None);
+    let Some(TypeData::Object(target)) = store.type_payload(source.target).map(TypeRecord::data)
+    else {
+        return Err(InstantiationError::InvalidType(source.target));
+    };
+    let mut new_cache = if matches!(target.instantiations, TypeCacheState::Unallocated) {
+        let mut entries = HashMap::new();
+        entries
+            .try_reserve(2)
+            .map_err(|_| LiteralTypeCacheError::Capacity)?;
+        entries.insert(identity_key, source.target);
+        Some(entries)
+    } else {
+        if !store.try_reserve_object_instantiations(source.target, 1) {
+            return Err(LiteralTypeCacheError::Capacity.into());
+        }
+        None
+    };
+    if !store.try_reserve_types(1) || !store.try_reserve_mappers(1) {
+        return Err(LiteralTypeCacheError::Capacity.into());
+    }
+    let mapper = store
+        .new_type_mapper(source.parameters.clone(), arguments.clone())
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    let propagating_flags = arguments.iter().fold(ObjectFlags::NONE, |flags, argument| {
+        flags
+            | store
+                .type_payload(*argument)
+                .expect("the inline argument proof checked every type")
+                .object_flags()
+                & ObjectFlags::PROPAGATING_FLAGS
+    });
+    let instantiated = store
+        .alloc_plain_object_type(
+            ObjectFlags::ANONYMOUS | ObjectFlags::INSTANTIATED | propagating_flags,
+            Some(source.source_symbol),
+        )
+        .ok_or(InstantiationError::InvalidType(source.target))?;
+    if !store.set_object_target_and_mapper(instantiated, Some(source.target), Some(mapper)) {
+        return Err(InstantiationError::InvalidType(instantiated));
+    }
+    if let Some(entries) = new_cache.as_mut() {
+        entries.insert(key, instantiated);
+    }
+    if let Some(entries) = new_cache {
+        if !store.set_object_instantiations(source.target, TypeCacheState::Allocated(entries)) {
+            return Err(InstantiationError::InvalidType(source.target));
+        }
+    } else if store.insert_object_instantiation(source.target, key, instantiated)
+        != Some(instantiated)
+    {
+        return Err(InstantiationError::InvalidType(source.target));
+    }
+    if has_recovery
+        && !store.publish_inline_property_object_recovery(InlinePropertyObjectRecovery {
+            result: instantiated,
+            target: source.target,
+            declaration: source.declaration,
+            source_symbol: source.source_symbol,
+            parameter_owner: source.parameter_owner,
+            parameters: source.parameters.clone(),
+            mapper,
+            arguments,
+            error_type,
+            physical_recovery,
+        })
+    {
+        return Err(InstantiationError::InvalidType(instantiated));
+    }
+    Ok(instantiated)
+}
+
 fn recovered_property_alias_argument(
     session: &InstantiationSession,
     mark: InstantiationLimitEventMark,
@@ -2650,6 +3531,7 @@ enum InstantiationWork {
     Intersection(DeferredIntersectionTypeProjection),
     TypeReference,
     PropertyObjectAlias(PropertyObjectAliasProjection),
+    InlinePropertyObject(InlinePropertyObjectProjection),
     IndexedAccess {
         object: TypeId,
         index: TypeId,
@@ -2665,6 +3547,7 @@ fn instantiate_type_worker(
     array_targets: Option<CanonicalArrayTargets>,
     alias: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
+    receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
 ) -> Result<TypeId, InstantiationError> {
     let work = {
         let record = store
@@ -2687,9 +3570,7 @@ fn instantiate_type_worker(
             },
             TypeData::Union(_) => InstantiationWork::Union,
             TypeData::Intersection(_) => InstantiationWork::Intersection(
-                store
-                    .validate_deferred_intersection_type(type_)
-                    .map_err(|error| deferred_intersection_error(type_, error))?,
+                instantiable_intersection_projection(store, type_, array_targets)?,
             ),
             TypeData::TypeReference(_) => InstantiationWork::TypeReference,
             TypeData::IndexedAccess(indexed) => InstantiationWork::IndexedAccess {
@@ -2707,12 +3588,26 @@ fn instantiate_type_worker(
                 InstantiationWork::TypeReference
             }
             TypeData::Interface(_) => InstantiationWork::Identity,
-            TypeData::Object(_) => match property_object_alias_projection(store, type_)
-                .map_err(|_| InstantiationError::InvalidType(type_))?
-            {
-                Some(projection) => InstantiationWork::PropertyObjectAlias(projection),
-                None => InstantiationWork::Unsupported,
-            },
+            TypeData::Object(_) => {
+                if mapping_invariant_object_type(store, type_, array_targets)? {
+                    InstantiationWork::Identity
+                } else {
+                    match source_property_object_projection(store, type_)
+                        .map_err(|_| InstantiationError::InvalidType(type_))?
+                    {
+                        Some(SourcePropertyObjectProjection::DirectAlias(projection)) => {
+                            InstantiationWork::PropertyObjectAlias(projection)
+                        }
+                        Some(SourcePropertyObjectProjection::Inline(projection)) => {
+                            if alias.is_some() {
+                                return Err(InstantiationError::UnsupportedType(type_));
+                            }
+                            InstantiationWork::InlinePropertyObject(projection)
+                        }
+                        None => InstantiationWork::Unsupported,
+                    }
+                }
+            }
             _ => InstantiationWork::Unsupported,
         }
     };
@@ -2824,6 +3719,7 @@ fn instantiate_type_worker(
             array_targets,
             alias,
             session,
+            receipt,
         ),
         InstantiationWork::TypeReference => {
             instantiate_reference(store, type_, mapping, array_targets, session)
@@ -2836,6 +3732,9 @@ fn instantiate_type_worker(
             alias,
             session,
         ),
+        InstantiationWork::InlinePropertyObject(projection) => {
+            instantiate_inline_property_object(store, &projection, mapping, array_targets, session)
+        }
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
     }
 }
@@ -3198,6 +4097,7 @@ fn instantiate_reference(
     .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One caller frame maps slots and retains their real limit events.
 fn instantiate_intersection(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
@@ -3206,10 +4106,51 @@ fn instantiate_intersection(
     array_targets: Option<CanonicalArrayTargets>,
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
+    mut receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
 ) -> Result<TypeId, InstantiationError> {
+    if let Some(builder) = receipt.as_deref() {
+        if builder.parameters.is_empty()
+            || builder
+                .parameters
+                .iter()
+                .any(|parameter| cached_ordinary_type_parameter_owner(store, *parameter).is_none())
+            || builder
+                .parameters
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != builder.parameters.len()
+        {
+            return Err(InstantiationError::InvalidType(source));
+        }
+        if let Some(inherited) = &builder.inherited {
+            if inherited.result != source {
+                return Err(InstantiationError::InvalidType(source));
+            }
+            inherited.validate_current_chain(store, array_targets)?;
+        }
+    }
     let mut constituents = Vec::with_capacity(projection.types.len());
+    let mut constituent_receipts = Vec::new();
+    let mut alias_receipts = Vec::new();
+    if receipt.is_some() {
+        constituent_receipts
+            .try_reserve(projection.types.len())
+            .map_err(|_| LiteralTypeCacheError::Capacity)?;
+        alias_receipts
+            .try_reserve(projection.alias_arguments.len())
+            .map_err(|_| LiteralTypeCacheError::Capacity)?;
+    }
     let mut changed = false;
     for constituent in &projection.types {
+        let source_object = if receipt.is_some() {
+            source_property_object_projection(store, *constituent)
+                .map_err(|_| InstantiationError::InvalidType(*constituent))?
+        } else {
+            None
+        };
+        let before = session.limit_event_mark();
         let instantiated = instantiate_type_with_alias(
             store,
             *constituent,
@@ -3218,6 +4159,20 @@ fn instantiate_intersection(
             None,
             session,
         )?;
+        if let Some(builder) = receipt.as_deref() {
+            constituent_receipts.push(capture_intersection_constituent_receipt(
+                store,
+                *constituent,
+                source_object,
+                instantiated,
+                IntersectionSlotLimitEvents {
+                    before,
+                    after: session.limit_event_mark(),
+                },
+                builder,
+                array_targets,
+            )?);
+        }
         changed |= instantiated != *constituent;
         constituents.push(instantiated);
     }
@@ -3230,15 +4185,44 @@ fn instantiate_intersection(
     let alias = if let Some(alias) = alias_override {
         Some(alias)
     } else {
-        for argument in &projection.alias_arguments {
-            alias_arguments.push(instantiate_type_with_alias(
+        for (index, argument) in projection.alias_arguments.iter().enumerate() {
+            let before = session.limit_event_mark();
+            let mapped = instantiate_type_with_alias(
                 store,
                 *argument,
                 mapping,
                 array_targets,
                 None,
                 session,
-            )?);
+            )?;
+            if let Some(builder) = receipt.as_deref() {
+                let error_type = store
+                    .intrinsic_bootstrap()
+                    .ok_or(InstantiationError::InvalidType(source))?
+                    .error_type;
+                let events = IntersectionSlotLimitEvents {
+                    before,
+                    after: session.limit_event_mark(),
+                };
+                if events.occurred()
+                    && (mapped != error_type || session.recovery_error_type() != Some(error_type))
+                {
+                    return Err(InstantiationError::UnsupportedType(source));
+                }
+                let inherited = builder.inherited.as_ref().is_some_and(|prior| {
+                    prior.alias_arguments.get(index).is_some_and(|slot| {
+                        slot.result == error_type && (slot.events.occurred() || slot.inherited)
+                    }) && *argument == error_type
+                        && mapped == error_type
+                });
+                alias_receipts.push(IntersectionAliasArgumentReceipt {
+                    source: *argument,
+                    result: mapped,
+                    events,
+                    inherited,
+                });
+            }
+            alias_arguments.push(mapped);
         }
         projection
             .alias_symbol
@@ -3260,9 +4244,57 @@ fn instantiate_intersection(
         return Ok(reduced);
     }
 
-    store
-        .canonical_deferred_intersection_type(&constituents, alias)
-        .map_err(|error| deferred_intersection_error(source, error))
+    let result = store
+        .canonical_deferred_intersection_type_with_array_targets(
+            &constituents,
+            alias,
+            array_targets,
+        )
+        .map_err(|error| deferred_intersection_error(source, error))?;
+    if let Some(builder) = receipt.as_mut() {
+        let recovered = constituent_receipts.iter().any(|slot| {
+            slot.events.occurred()
+                || slot
+                    .object
+                    .as_ref()
+                    .is_some_and(|object| object.recovery != IntersectionObjectRecovery::None)
+        }) || alias_receipts
+            .iter()
+            .any(|slot| slot.events.occurred() || slot.inherited);
+        if recovered {
+            let error_type = store
+                .intrinsic_bootstrap()
+                .ok_or(InstantiationError::InvalidType(source))?
+                .error_type;
+            let result_key = store
+                .intersection_keys_by_type
+                .get(&result)
+                .cloned()
+                .ok_or(InstantiationError::UnsupportedType(source))?;
+            let retained = OrdinaryIntersectionRecoveryReceipt {
+                source,
+                source_key: IntersectionTypeCacheKey {
+                    types: projection.types.clone(),
+                    alias_symbol: projection.alias_symbol,
+                    alias_arguments: projection.alias_arguments.clone(),
+                },
+                parameters: builder.parameters.clone(),
+                arguments: builder.arguments.clone(),
+                alias_override: alias_override
+                    .map(|(symbol, arguments)| (symbol, arguments.to_vec())),
+                array_targets,
+                error_type,
+                result,
+                result_key,
+                constituents: constituent_receipts,
+                alias_arguments: alias_receipts,
+                inherited: builder.inherited.clone(),
+            };
+            retained.validate_current_chain(store, array_targets)?;
+            builder.receipt = Some(retained);
+        }
+    }
+    Ok(result)
 }
 
 fn authenticated_default_library_non_nullable_empty_object(
@@ -3442,6 +4474,11 @@ fn deferred_intersection_error(source: TypeId, error: IntersectionTypeError) -> 
     match error {
         IntersectionTypeError::Capacity => {
             InstantiationError::Union(LiteralTypeCacheError::Capacity)
+        }
+        IntersectionTypeError::MalformedConstituent(_)
+        | IntersectionTypeError::InvalidAliasSymbol(_)
+        | IntersectionTypeError::InvalidCachedIntersection(_) => {
+            InstantiationError::InvalidType(source)
         }
         _ => InstantiationError::UnsupportedType(source),
     }
@@ -4125,6 +5162,1514 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn source_alias_instantiation_fixture(
+        source: &str,
+        names: &[&str],
+    ) -> (CanonicalTypeMapperStore, Vec<TypeId>) {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics,
+            production::GlobalMergeCompletion,
+            type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
+        };
+        use ts_binder::CanonicalNameResolverOptions;
+
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_561);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/inline-object-mapping.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let globals = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap()
+            .globals;
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let table = store.symbol_table(locals).unwrap();
+        let declarations = table.iter().map(|(_, symbol)| symbol).collect::<Vec<_>>();
+        let requested = names
+            .iter()
+            .map(|name| table.get_source(name).unwrap())
+            .collect::<Vec<_>>();
+        for symbol in declarations {
+            assert_eq!(store.merge_global_symbol(globals, symbol), Ok(symbol));
+        }
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let types = requested
+            .into_iter()
+            .map(|symbol| query.get_declared_type_of_symbol(symbol).unwrap())
+            .collect::<Vec<_>>();
+        assert!(diagnostics.is_empty());
+        (store, types)
+    }
+
+    fn inline_object_instantiation_fixture() -> (
+        CanonicalTypeMapperStore,
+        InlinePropertyObjectProjection,
+        Vec<TypeId>,
+    ) {
+        let (store, aliases) = source_alias_instantiation_fixture(
+            concat!(
+                "type Left<T> = { left: T };\n",
+                "type Inline<T, U> = { first: T; second: U } & Left<T>;\n",
+                "type Other<T, U> = { first: T; second: U };\n",
+            ),
+            &["Inline", "Other"],
+        );
+        let parts = store
+            .validate_deferred_intersection_type(aliases[0])
+            .unwrap();
+        let inline = inline_property_object_projection(&store, parts.types[0])
+            .unwrap()
+            .unwrap();
+        let other_parameters = property_object_alias_projection(&store, aliases[1])
+            .unwrap()
+            .unwrap()
+            .parameters;
+        (store, inline, other_parameters)
+    }
+
+    fn ordinary_intersection_instantiation_fixture()
+    -> (CanonicalTypeMapperStore, TypeId, Vec<TypeId>, Vec<TypeId>) {
+        let (store, inline, other_parameters) = inline_object_instantiation_fixture();
+        let source = store
+            .type_alias_links(inline.parameter_owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        (store, source, inline.parameters, other_parameters)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare real depth/count events, then reject changes to the retained proof.
+    fn ordinary_intersection_receipts_keep_exact_constituent_and_alias_slot_events() {
+        for (limits, child_events, alias_events) in [
+            (
+                InstantiationLimits {
+                    max_depth: 2,
+                    max_count: 100,
+                },
+                2,
+                0,
+            ),
+            (
+                InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 4,
+                },
+                1,
+                1,
+            ),
+        ] {
+            let (mut store, source, parameters, _) = ordinary_intersection_instantiation_fixture();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let arguments = [bootstrap.string_type, bootstrap.number_type];
+            let error = bootstrap.error_type;
+            let mut session = InstantiationSession::new_recovering(&store, limits, error).unwrap();
+            let (result, receipt) =
+                instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                    &mut store,
+                    source,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None,
+                    None,
+                    &mut session,
+                )
+                .unwrap();
+            let receipt = receipt.expect("the child limit has exact recovery evidence");
+            assert_eq!(receipt.result(), result);
+            assert_eq!(session.count, if alias_events == 0 { 5 } else { 4 });
+            assert_eq!(session.limit_event_count(), child_events + 2 * alias_events);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+            assert_eq!(
+                receipt
+                    .constituents
+                    .iter()
+                    .map(|slot| slot.events.after.0 - slot.events.before.0)
+                    .collect::<Vec<_>>(),
+                [0, child_events],
+            );
+            assert_eq!(
+                receipt
+                    .alias_arguments
+                    .iter()
+                    .map(|slot| slot.events.after.0 - slot.events.before.0)
+                    .collect::<Vec<_>>(),
+                [alias_events, alias_events],
+            );
+            assert!(receipt.alias_arguments.iter().all(|slot| !slot.inherited));
+            let result_projection = store.validate_deferred_intersection_type(result).unwrap();
+            assert_eq!(
+                result_projection.alias_arguments,
+                if alias_events == 0 {
+                    arguments
+                } else {
+                    [error, error]
+                },
+            );
+            let inline = inline_property_object_projection(&store, result_projection.types[0])
+                .unwrap()
+                .unwrap();
+            assert_eq!(inline.arguments, arguments);
+            assert!(store.type_payload(inline.type_).unwrap().alias().is_none());
+            let left = property_object_alias_projection(&store, result_projection.types[1])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                left.arguments,
+                [if alias_events == 0 {
+                    error
+                } else {
+                    arguments[0]
+                }],
+            );
+            assert_eq!(left.identity_arguments, [error]);
+            let child = store.property_object_alias_recovery(left.type_).unwrap();
+            assert_eq!(child.physical_slot_recovered(0), alias_events == 0);
+            assert!(child.identity_slot_recovered(0));
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &store,
+                    source,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None,
+                ),
+                Ok(None),
+            );
+
+            let mut normal_session = InstantiationSession::new(InstantiationLimits::default());
+            let normal = instantiate_type_with_vector_and_session(
+                &mut store,
+                source,
+                &parameters,
+                &arguments,
+                None,
+                &mut normal_session,
+            )
+            .unwrap();
+            assert_ne!(normal, result);
+            assert_eq!(normal_session.count, 5);
+            let warm = deferred_intersection_store_state(&store);
+            for _ in 0..2 {
+                assert_eq!(
+                    receipt.matches_mapping_request(
+                        &store,
+                        source,
+                        &parameters,
+                        &arguments,
+                        None,
+                        None,
+                    ),
+                    Ok(true),
+                );
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &store,
+                        source,
+                        &parameters,
+                        &arguments,
+                        None,
+                        None,
+                    ),
+                    Ok(Some(normal)),
+                );
+                assert_eq!(deferred_intersection_store_state(&store), warm);
+            }
+            assert_eq!(
+                receipt.matches_mapping_request(
+                    &store,
+                    source,
+                    &parameters,
+                    &[arguments[1], arguments[0]],
+                    None,
+                    None,
+                ),
+                Ok(false),
+            );
+            for mutation in 0..6 {
+                let mut changed = receipt.clone();
+                match mutation {
+                    0 => changed.source_key.types.swap(0, 1),
+                    1 => changed.result_key.alias_arguments[0] = parameters[0],
+                    2 => changed.constituents.swap(0, 1),
+                    3 => {
+                        changed.constituents[1].events.after =
+                            changed.constituents[1].events.before;
+                    }
+                    4 => changed.alias_arguments[0].source = parameters[1],
+                    5 => changed.error_type = arguments[0],
+                    _ => unreachable!(),
+                }
+                assert!(
+                    changed
+                        .matches_mapping_request(
+                            &store,
+                            source,
+                            &parameters,
+                            &arguments,
+                            None,
+                            None,
+                        )
+                        .is_err(),
+                    "changed receipt field {mutation} must fail",
+                );
+                assert_eq!(deferred_intersection_store_state(&store), warm);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A nested inline limit and inherited inline slots use the same physical cache.
+    fn ordinary_intersection_receipts_validate_inline_slot_recovery_and_inheritance() {
+        let (mut store, source, parameters, other_parameters) =
+            ordinary_intersection_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [bootstrap.string_type, bootstrap.number_type];
+        let error = bootstrap.error_type;
+        let intermediate =
+            instantiate_type_with_vector(&mut store, source, &parameters, &other_parameters)
+                .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 2,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let (result, receipt) =
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                intermediate,
+                &other_parameters,
+                &arguments,
+                None,
+                None,
+                None,
+                &mut session,
+            )
+            .unwrap();
+        let receipt = receipt.unwrap();
+        assert_eq!(session.count, 5);
+        assert_eq!(session.limit_event_count(), 4);
+        assert_eq!(
+            receipt
+                .constituents
+                .iter()
+                .map(|slot| slot.events.after.0 - slot.events.before.0)
+                .collect::<Vec<_>>(),
+            [2, 2],
+        );
+        let parts = store.validate_deferred_intersection_type(result).unwrap();
+        let inline = inline_property_object_projection(&store, parts.types[0])
+            .unwrap()
+            .unwrap();
+        let recovery = store.inline_property_object_recovery(inline.type_).unwrap();
+        assert_eq!(inline.arguments, [error, error]);
+        assert!(recovery.physical_slot_recovered(0));
+        assert!(recovery.physical_slot_recovered(1));
+        assert_eq!(parts.alias_arguments, arguments);
+        assert_eq!(
+            receipt.matches_mapping_request(
+                &store,
+                intermediate,
+                &other_parameters,
+                &arguments,
+                None,
+                None,
+            ),
+            Ok(true),
+        );
+
+        let intermediate_parts = store
+            .validate_deferred_intersection_type(intermediate)
+            .unwrap();
+        let mut partial_session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 2,
+            },
+            error,
+        )
+        .unwrap();
+        let partial_inline = instantiate_type_with_vector_and_session(
+            &mut store,
+            intermediate_parts.types[0],
+            &other_parameters,
+            &[other_parameters[0], arguments[1]],
+            None,
+            &mut partial_session,
+        )
+        .unwrap();
+        assert_eq!(partial_session.limit_event_count(), 1);
+        let inherited_source = instantiate_type_with_vector(
+            &mut store,
+            source,
+            &parameters,
+            &[other_parameters[0], error],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .validate_deferred_intersection_type(inherited_source)
+                .unwrap()
+                .types[0],
+            partial_inline,
+        );
+        let mut next_session = InstantiationSession::new(InstantiationLimits::default());
+        let (inherited_result, inherited_receipt) =
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                inherited_source,
+                &other_parameters[..1],
+                &arguments[..1],
+                None,
+                None,
+                None,
+                &mut next_session,
+            )
+            .unwrap();
+        let inherited_receipt = inherited_receipt.unwrap();
+        let inherited_parts = store
+            .validate_deferred_intersection_type(inherited_result)
+            .unwrap();
+        let inherited_inline = inline_property_object_projection(&store, inherited_parts.types[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited_inline.arguments, [arguments[0], error]);
+        assert!(
+            store
+                .inline_property_object_recovery(inherited_inline.type_)
+                .unwrap()
+                .physical_slot_recovered(1),
+        );
+        assert_eq!(next_session.limit_event_count(), 0);
+        assert!(inherited_receipt.inherited.is_none());
+        assert!(
+            inherited_receipt
+                .alias_arguments
+                .iter()
+                .all(|slot| !slot.inherited)
+        );
+        let warm = deferred_intersection_store_state(&store);
+        assert_eq!(
+            inherited_receipt.matches_mapping_request(
+                &store,
+                inherited_source,
+                &other_parameters[..1],
+                &arguments[..1],
+                None,
+                None,
+            ),
+            Ok(true),
+        );
+        assert_eq!(deferred_intersection_store_state(&store), warm);
+    }
+
+    #[test]
+    fn ordinary_intersection_receipts_retain_exact_outer_inherited_slots() {
+        let (mut store, source, parameters, other_parameters) =
+            ordinary_intersection_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [other_parameters[0], bootstrap.number_type];
+        let string = bootstrap.string_type;
+        let error = bootstrap.error_type;
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 4,
+            },
+            error,
+        )
+        .unwrap();
+        let (intermediate, receipt) =
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                source,
+                &parameters,
+                &arguments,
+                None,
+                None,
+                None,
+                &mut session,
+            )
+            .unwrap();
+        let receipt = receipt.unwrap();
+        assert_eq!(session.limit_event_count(), 3);
+        assert!(
+            receipt
+                .alias_arguments
+                .iter()
+                .all(|slot| slot.events.occurred())
+        );
+        assert_eq!(
+            store
+                .validate_deferred_intersection_type(intermediate)
+                .unwrap()
+                .alias_arguments,
+            [error, error],
+        );
+        let mut next_session = InstantiationSession::new(InstantiationLimits::default());
+        let (result, next) = instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+            &mut store,
+            intermediate,
+            &other_parameters[..1],
+            &[string],
+            None,
+            None,
+            Some(&receipt),
+            &mut next_session,
+        )
+        .unwrap();
+        let next = next.unwrap();
+        assert_eq!(next_session.limit_event_count(), 0);
+        assert_eq!(next.inherited.as_deref(), Some(&receipt));
+        assert!(
+            next.alias_arguments
+                .iter()
+                .all(|slot| { slot.inherited && !slot.events.occurred() && slot.result == error })
+        );
+        let parts = store.validate_deferred_intersection_type(result).unwrap();
+        assert_eq!(parts.alias_arguments, [error, error]);
+        assert_eq!(
+            inline_property_object_projection(&store, parts.types[0])
+                .unwrap()
+                .unwrap()
+                .arguments,
+            [string, arguments[1]],
+        );
+        let warm = deferred_intersection_store_state(&store);
+        assert_eq!(
+            next.matches_mapping_request(
+                &store,
+                intermediate,
+                &other_parameters[..1],
+                &[string],
+                None,
+                None,
+            ),
+            Ok(true),
+        );
+        for mutation in 0..3 {
+            let mut changed = next.clone();
+            match mutation {
+                0 => changed.inherited = None,
+                1 => changed.alias_arguments[0].inherited = false,
+                2 => changed
+                    .inherited
+                    .as_mut()
+                    .unwrap()
+                    .result_key
+                    .types
+                    .swap(0, 1),
+                _ => unreachable!(),
+            }
+            assert!(
+                changed
+                    .matches_mapping_request(
+                        &store,
+                        intermediate,
+                        &other_parameters[..1],
+                        &[string],
+                        None,
+                        None,
+                    )
+                    .is_err(),
+            );
+            assert_eq!(deferred_intersection_store_state(&store), warm);
+        }
+    }
+
+    #[test]
+    fn ordinary_intersection_receipts_do_not_map_borrowed_override_arguments() {
+        let (mut store, types) = source_alias_instantiation_fixture(
+            concat!(
+                "type Left<T> = { left: T };\n",
+                "type Inline<T, U> = { first: T; second: U } & Left<T>;\n",
+                "type Other<T, U> = { first: T; second: U };\n",
+            ),
+            &["Inline", "Other"],
+        );
+        let source = types[0];
+        let parts = store.validate_deferred_intersection_type(source).unwrap();
+        let parameters = inline_property_object_projection(&store, parts.types[0])
+            .unwrap()
+            .unwrap()
+            .parameters;
+        let other = property_object_alias_projection(&store, types[1])
+            .unwrap()
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [bootstrap.string_type, bootstrap.number_type];
+        let error = bootstrap.error_type;
+        let alias = Some((other.identity_symbol, other.parameters.as_slice()));
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 4,
+            },
+            error,
+        )
+        .unwrap();
+        let (result, receipt) =
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                source,
+                &parameters,
+                &arguments,
+                None,
+                alias,
+                None,
+                &mut session,
+            )
+            .unwrap();
+        let receipt = receipt.unwrap();
+        assert_eq!(session.count, 4);
+        assert_eq!(session.limit_event_count(), 1);
+        assert!(receipt.alias_arguments.is_empty());
+        let parts = store.validate_deferred_intersection_type(result).unwrap();
+        assert_eq!(parts.alias_symbol, Some(other.identity_symbol));
+        assert_eq!(parts.alias_arguments, other.parameters);
+        let warm = deferred_intersection_store_state(&store);
+        assert_eq!(
+            receipt.matches_mapping_request(&store, source, &parameters, &arguments, alias, None,),
+            Ok(true),
+        );
+        assert_eq!(
+            receipt.matches_mapping_request(
+                &store,
+                source,
+                &parameters,
+                &arguments,
+                Some((other.identity_symbol, &arguments)),
+                None,
+            ),
+            Ok(false),
+        );
+        assert_eq!(deferred_intersection_store_state(&store), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Guards and scratch hits must precede extra checks of an inherited receipt.
+    fn ordinary_intersection_receipts_preserve_guard_and_scratch_cache_order() {
+        let (mut store, source, parameters, other_parameters) =
+            ordinary_intersection_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [other_parameters[0], bootstrap.number_type];
+        let targets = [bootstrap.string_type];
+        let error = bootstrap.error_type;
+        let mut preparation = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 4,
+            },
+            error,
+        )
+        .unwrap();
+        let (intermediate, receipt) =
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                source,
+                &parameters,
+                &arguments,
+                None,
+                None,
+                None,
+                &mut preparation,
+            )
+            .unwrap();
+        let receipt = receipt.unwrap();
+        let mut normal = InstantiationSession::new(InstantiationLimits::default());
+        let (result, _) = instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+            &mut store,
+            intermediate,
+            &other_parameters[..1],
+            &targets,
+            None,
+            None,
+            Some(&receipt),
+            &mut normal,
+        )
+        .unwrap();
+        let key = instantiation_cache_key_for_input(&store, intermediate, None).unwrap();
+        assert_eq!(
+            store.intersection_types.remove(&receipt.source_key),
+            Some(source)
+        );
+        assert_eq!(
+            could_contain_installed_type_variables(&store, intermediate, None),
+            Ok(true),
+        );
+        let before = deferred_intersection_store_state(&store);
+        let mut scratch = InstantiationSession::new(InstantiationLimits {
+            max_depth: 10,
+            max_count: 5,
+        });
+        scratch.depth = 3;
+        scratch.count = 4;
+        scratch.total_count = 9;
+        scratch.active_mappers.push(ActiveMapperFrame {
+            mapping: InstantiationMapping::Vector {
+                sources: &other_parameters[..1],
+                targets: &targets,
+            }
+            .identity(),
+            cache: HashMap::from([(key.clone(), result)]),
+        });
+        assert_eq!(
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                intermediate,
+                &other_parameters[..1],
+                &targets,
+                None,
+                None,
+                Some(&receipt),
+                &mut scratch,
+            ),
+            Ok((result, None)),
+        );
+        assert_eq!(
+            (scratch.depth, scratch.count, scratch.total_count),
+            (3, 4, 9)
+        );
+        assert_eq!(scratch.limit_event_count(), 0);
+        assert_eq!(deferred_intersection_store_state(&store), before);
+        for limits in [
+            InstantiationLimits {
+                max_depth: 0,
+                max_count: 100,
+            },
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 0,
+            },
+        ] {
+            let mut failing = InstantiationSession::new(limits);
+            let expected = if limits.max_depth == 0 {
+                InstantiationError::DepthLimit { depth: 0, limit: 0 }
+            } else {
+                InstantiationError::CountLimit { count: 0, limit: 0 }
+            };
+            assert_eq!(
+                instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                    &mut store,
+                    intermediate,
+                    &other_parameters[..1],
+                    &targets,
+                    None,
+                    None,
+                    Some(&receipt),
+                    &mut failing,
+                ),
+                Err(expected),
+            );
+            let mut recovering =
+                InstantiationSession::new_recovering(&store, limits, error).unwrap();
+            recovering.active_mappers.push(ActiveMapperFrame {
+                mapping: InstantiationMapping::Vector {
+                    sources: &other_parameters[..1],
+                    targets: &targets,
+                }
+                .identity(),
+                cache: HashMap::from([(key.clone(), result)]),
+            });
+            assert_eq!(
+                instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                    &mut store,
+                    intermediate,
+                    &other_parameters[..1],
+                    &targets,
+                    None,
+                    None,
+                    Some(&receipt),
+                    &mut recovering,
+                ),
+                Ok((error, None)),
+            );
+            assert_eq!(recovering.count, 0);
+            assert_eq!(recovering.limit_event_count(), 1);
+            assert_eq!(recovering.active_mappers[0].cache.get(&key), Some(&result));
+            assert_eq!(deferred_intersection_store_state(&store), before);
+        }
+        let mut active = InstantiationSession::new(InstantiationLimits::default());
+        assert!(
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                intermediate,
+                &other_parameters[..1],
+                &targets,
+                None,
+                None,
+                Some(&receipt),
+                &mut active,
+            )
+            .is_err(),
+        );
+        assert_eq!(active.count, 1);
+        assert_eq!(active.depth, 0);
+        assert!(active.active_mappers.is_empty());
+        assert_eq!(deferred_intersection_store_state(&store), before);
+        assert_eq!(
+            store
+                .intersection_types
+                .insert(receipt.source_key.clone(), source),
+            None
+        );
+        assert_eq!(
+            receipt.matches_mapping_request(&store, source, &parameters, &arguments, None, None,),
+            Ok(true),
+        );
+    }
+
+    #[test]
+    fn ordinary_intersection_receipts_reject_recovered_reference_arguments_and_collapses() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let sources = [fixture.props, fixture.element];
+        let targets = [fixture.attributes_reference, fixture.string];
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits {
+                max_depth: 2,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        assert_eq!(
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut fixture.store,
+                fixture.intersection,
+                &sources,
+                &targets,
+                None,
+                None,
+                None,
+                &mut session,
+            ),
+            Err(InstantiationError::UnsupportedType(fixture.class_reference)),
+        );
+        assert_eq!(session.count, 2);
+        assert_eq!(session.limit_event_count(), 1);
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+
+        let (mut store, source, parameters, _) = ordinary_intersection_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [bootstrap.string_type, bootstrap.number_type];
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            bootstrap.error_type,
+        )
+        .unwrap();
+        let parts = store.validate_deferred_intersection_type(source).unwrap();
+        assert_eq!(
+            instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                &mut store,
+                source,
+                &parameters,
+                &arguments,
+                None,
+                None,
+                None,
+                &mut session,
+            ),
+            Err(InstantiationError::UnsupportedType(parts.types[0])),
+        );
+        assert_eq!(session.count, 1);
+        assert_eq!(session.limit_event_count(), 1);
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A nested recovered reference is unsupported with or without another recovered object slot.
+    fn ordinary_intersection_receipts_reject_nested_recovered_reference_arguments() {
+        for (limits, count, events, has_object_recovery) in [
+            (
+                InstantiationLimits {
+                    max_depth: 3,
+                    max_count: 100,
+                },
+                4,
+                1,
+                false,
+            ),
+            (
+                InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 3,
+                },
+                3,
+                2,
+                true,
+            ),
+        ] {
+            let (mut store, types) = source_alias_instantiation_fixture(
+                concat!(
+                    "interface Generic<T> {}\n",
+                    "type Closed = { closed: string };\n",
+                    "type Packet<T, V> = { value: T; other: V } & Closed;\n",
+                    "type Stage<U, V> = Packet<Generic<U>, V>;\n",
+                ),
+                &["Stage"],
+            );
+            let source = types[0];
+            let parts = store.validate_deferred_intersection_type(source).unwrap();
+            let owner = parts.alias_symbol.unwrap();
+            let links = store.type_alias_links(owner).cloned().unwrap();
+            let parameters = links.type_parameters.clone().unwrap();
+            let inline = inline_property_object_projection(&store, parts.types[0])
+                .unwrap()
+                .unwrap();
+            assert!(inline.mapper.is_some());
+            let generic = validate_direct_generic_reference(&store, inline.arguments[0]).unwrap();
+            assert_eq!(generic.type_arguments, [parameters[0]]);
+            assert_eq!(inline.arguments[1], parameters[1]);
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let arguments = [bootstrap.string_type, bootstrap.number_type];
+            let error = bootstrap.error_type;
+            let mut session = InstantiationSession::new_recovering(&store, limits, error).unwrap();
+            assert_eq!(
+                instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                    &mut store,
+                    source,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None,
+                    None,
+                    &mut session,
+                ),
+                Err(InstantiationError::UnsupportedType(inline.type_)),
+            );
+            assert_eq!(session.count, count);
+            assert_eq!(session.limit_event_count(), events);
+            assert_eq!(session.depth, 0);
+            assert!(session.active_mappers.is_empty());
+            assert_eq!(store.type_alias_links(owner), Some(&links));
+            let recovered_reference = store
+                .relation_object_instantiation(generic.target, type_list_key(&[error]))
+                .unwrap();
+            let recovered_arguments = [
+                recovered_reference,
+                if has_object_recovery {
+                    error
+                } else {
+                    arguments[1]
+                },
+            ];
+            let partial = store
+                .relation_object_instantiation(
+                    inline.target,
+                    type_alias_instantiation_cache_key(&recovered_arguments, None),
+                )
+                .unwrap();
+            assert_eq!(
+                store.inline_property_object_recovery(partial).is_some(),
+                has_object_recovery,
+            );
+            if let Some(recovery) = store.inline_property_object_recovery(partial) {
+                assert!(!recovery.physical_slot_recovered(0));
+                assert!(recovery.physical_slot_recovered(1));
+            }
+            let mut normal = InstantiationSession::new(InstantiationLimits::default());
+            let (result, receipt) =
+                instantiate_ordinary_intersection_with_vector_and_alias_and_session(
+                    &mut store,
+                    source,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None,
+                    None,
+                    &mut normal,
+                )
+                .unwrap();
+            assert!(receipt.is_none());
+            assert_eq!(normal.limit_event_count(), 0);
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &store,
+                    source,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None,
+                ),
+                Ok(Some(result)),
+            );
+            assert_eq!(store.type_alias_links(owner), Some(&links));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source target keeps physical identity across cold, warm, and composed maps.
+    fn inline_objects_map_original_parameters_without_allocating_aliases_or_members() {
+        let (mut store, source, outer_parameters) = inline_object_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let target = source.target;
+        assert_eq!(source.type_, target);
+        assert!(source.mapper.is_none());
+        assert!(store.type_payload(target).unwrap().alias().is_none());
+        for (own, outer) in source.parameters.iter().zip(&outer_parameters) {
+            assert_ne!(own, outer);
+            assert_ne!(
+                cached_ordinary_type_parameter_owner(&store, *own),
+                cached_ordinary_type_parameter_owner(&store, *outer),
+            );
+        }
+        assert_eq!(
+            validate_instantiable_member_type(&store, target, &source.parameters, None),
+            Ok(()),
+        );
+        let alias_count = store.type_alias_len();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut results = Vec::new();
+        for arguments in [
+            vec![string, number],
+            vec![number, string],
+            outer_parameters.clone(),
+        ] {
+            let cold = deferred_intersection_store_state(&store);
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &store,
+                    target,
+                    &source.parameters,
+                    &arguments,
+                    None,
+                    None,
+                ),
+                Ok(None),
+            );
+            assert_eq!(deferred_intersection_store_state(&store), cold);
+            let instance = instantiate_type_with_vector_and_session(
+                &mut store,
+                target,
+                &source.parameters,
+                &arguments,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let mapped = inline_property_object_projection(&store, instance)
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapped.target, target);
+            assert_eq!(mapped.declaration, source.declaration);
+            assert_eq!(mapped.source_symbol, source.source_symbol);
+            assert_eq!(mapped.parameter_owner, source.parameter_owner);
+            assert_eq!(mapped.parameters, source.parameters);
+            assert_eq!(mapped.arguments, arguments);
+            assert!(store.type_payload(instance).unwrap().alias().is_none());
+            let mapper = mapped.mapper.unwrap();
+            assert_eq!(
+                store.type_mapper_has_exact_endpoints(mapper, &source.parameters, &arguments),
+                Some(true),
+            );
+            assert_eq!(
+                store.relation_object_instantiation(
+                    target,
+                    type_alias_instantiation_cache_key(&arguments, None),
+                ),
+                Some(instance),
+            );
+            assert_eq!(store.type_alias_len(), alias_count);
+            assert_eq!(
+                instantiated_member_type_matches(&store, target, instance, mapper, None),
+                Ok(true),
+            );
+            assert!(store.inline_property_object_recovery(instance).is_none());
+            assert!(store.property_object_alias_recovery(instance).is_none());
+            let warm = deferred_intersection_store_state(&store);
+            for _ in 0..2 {
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &store,
+                        target,
+                        &source.parameters,
+                        &arguments,
+                        None,
+                        None,
+                    ),
+                    Ok(Some(instance)),
+                );
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        &mut store,
+                        target,
+                        &source.parameters,
+                        &arguments,
+                        None,
+                        &mut session,
+                    ),
+                    Ok(instance),
+                );
+            }
+            assert_eq!(deferred_intersection_store_state(&store), warm);
+            assert!(!results.contains(&instance));
+            results.push(instance);
+        }
+        let warm = deferred_intersection_store_state(&store);
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                results[2],
+                &outer_parameters,
+                &[string, number],
+                None,
+                &mut session,
+            ),
+            Ok(results[0]),
+        );
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &store,
+                results[2],
+                &outer_parameters,
+                &[string, number],
+                None,
+                None,
+            ),
+            Ok(Some(results[0])),
+        );
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                target,
+                &source.parameters,
+                &source.parameters,
+                None,
+                &mut session,
+            ),
+            Ok(target),
+        );
+        assert_eq!(deferred_intersection_store_state(&store), warm);
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+        assert_eq!(session.limit_event_count(), 0);
+        for property in &source.properties {
+            assert!(store.type_node_links(property.type_node).is_none());
+            assert!(store.value_symbol_links(property.symbol).is_none());
+        }
+        for type_ in std::iter::once(target).chain(results) {
+            let object = store.type_payload(type_).unwrap();
+            assert!(
+                !object
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert_eq!(
+                object.data().structured(),
+                Some(&StructuredTypeData::default())
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Every altered cache must reject without changing the remaining graph.
+    fn inline_object_mapping_rejects_changed_mappers_aliases_nodes_and_target_keys() {
+        let (mut store, source, _) = inline_object_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [bootstrap.string_type, bootstrap.number_type];
+        let reversed = [arguments[1], arguments[0]];
+        let result =
+            instantiate_type_with_vector(&mut store, source.target, &source.parameters, &arguments)
+                .unwrap();
+        let other =
+            instantiate_type_with_vector(&mut store, source.target, &source.parameters, &reversed)
+                .unwrap();
+        let mapper = inline_property_object_projection(&store, result)
+            .unwrap()
+            .unwrap()
+            .mapper;
+        let other_mapper = inline_property_object_projection(&store, other)
+            .unwrap()
+            .unwrap()
+            .mapper;
+        let reject = |store: &mut CanonicalTypeMapperStore| {
+            let before = deferred_intersection_store_state(store);
+            assert!(
+                cached_instantiation_with_vector(
+                    store,
+                    source.target,
+                    &source.parameters,
+                    &arguments,
+                    None,
+                    None,
+                )
+                .is_err()
+            );
+            assert!(
+                instantiate_type_with_vector(store, source.target, &source.parameters, &arguments,)
+                    .is_err()
+            );
+            assert_eq!(deferred_intersection_store_state(store), before);
+        };
+        assert!(store.set_object_target_and_mapper(result, Some(source.target), other_mapper));
+        reject(&mut store);
+        assert!(store.set_object_target_and_mapper(result, Some(source.target), mapper));
+
+        let alias = store
+            .type_alias_links(source.parameter_owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let alias = store.type_payload(alias).unwrap().alias().unwrap();
+        assert!(store.set_type_alias(result, Some(alias)));
+        reject(&mut store);
+        assert!(store.set_type_alias(result, None));
+
+        let original_links = store.type_node_links(source.declaration).unwrap().clone();
+        let mut changed_links = original_links.clone();
+        changed_links.resolved_type = Some(result);
+        assert!(store.set_type_node_links(source.declaration, changed_links));
+        reject(&mut store);
+        assert!(store.set_type_node_links(source.declaration, original_links));
+
+        let TypeData::Object(target) = store.type_payload(source.target).unwrap().data() else {
+            panic!("the original inline literal must remain an object")
+        };
+        let original_cache = target.instantiations.clone();
+        let TypeCacheState::Allocated(mut changed_cache) = original_cache.clone() else {
+            panic!("both inline instances must use the original target cache")
+        };
+        let key = type_alias_instantiation_cache_key(&arguments, None);
+        assert_eq!(changed_cache.insert(key, other), Some(result));
+        assert!(
+            store
+                .set_object_instantiations(source.target, TypeCacheState::Allocated(changed_cache))
+        );
+        reject(&mut store);
+        assert!(store.set_object_instantiations(source.target, original_cache));
+        let before = deferred_intersection_store_state(&store);
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &store,
+                source.target,
+                &source.parameters,
+                &arguments,
+                None,
+                None,
+            ),
+            Ok(Some(result)),
+        );
+        assert_eq!(
+            instantiate_type_with_vector(&mut store, source.target, &source.parameters, &arguments),
+            Ok(result),
+        );
+        assert_eq!(deferred_intersection_store_state(&store), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Real caller limits distinguish recovered physical slots from normal mapping.
+    fn inline_object_recovery_keeps_the_caller_guard_and_exact_physical_slots() {
+        let (mut store, source, outer_parameters) = inline_object_instantiation_fixture();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let arguments = [bootstrap.string_type, bootstrap.number_type];
+        let error = bootstrap.error_type;
+        let intermediate = instantiate_type_with_vector(
+            &mut store,
+            source.target,
+            &source.parameters,
+            &outer_parameters,
+        )
+        .unwrap();
+        let before = deferred_intersection_store_state(&store);
+        for limits in [
+            InstantiationLimits {
+                max_depth: 0,
+                max_count: 100,
+            },
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 0,
+            },
+        ] {
+            let mut session = InstantiationSession::new(limits);
+            let expected = if limits.max_depth == 0 {
+                InstantiationError::DepthLimit { depth: 0, limit: 0 }
+            } else {
+                InstantiationError::CountLimit { count: 0, limit: 0 }
+            };
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    &mut store,
+                    source.target,
+                    &source.parameters,
+                    &outer_parameters,
+                    None,
+                    &mut session,
+                ),
+                Err(expected),
+            );
+            assert_eq!(session.count, 0);
+            assert!(session.active_mappers.is_empty());
+            assert_eq!(deferred_intersection_store_state(&store), before);
+        }
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let alias_count = store.type_alias_len();
+        let signature_count = store.signature_len();
+        let result = instantiate_type_with_vector_and_session(
+            &mut store,
+            intermediate,
+            &outer_parameters,
+            &arguments,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        let mapped = inline_property_object_projection(&store, result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapped.target, source.target);
+        assert_eq!(mapped.parameters, source.parameters);
+        assert_eq!(mapped.arguments, [error, error]);
+        assert!(store.type_payload(result).unwrap().alias().is_none());
+        assert_eq!(store.type_alias_len(), alias_count);
+        assert_eq!(store.signature_len(), signature_count);
+        assert_eq!(session.count, 1);
+        assert_eq!(session.limit_event_count(), 2);
+        assert_eq!(session.depth, 0);
+        assert!(session.active_mappers.is_empty());
+        let retained = store
+            .inline_property_object_recovery(result)
+            .unwrap()
+            .clone();
+        assert_eq!(retained.result(), result);
+        assert_eq!(retained.error_type(), error);
+        assert!(retained.physical_slot_recovered(0));
+        assert!(retained.physical_slot_recovered(1));
+        assert!(!retained.physical_slot_recovered(2));
+        assert!(retained.matches_current_result(&store));
+        assert!(store.property_object_alias_recovery(result).is_none());
+        let warm = deferred_intersection_store_state(&store);
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &store,
+                intermediate,
+                &outer_parameters,
+                &arguments,
+                None,
+                None,
+            ),
+            Ok(None),
+            "a recovered physical key must not claim the normal arguments",
+        );
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut store,
+                intermediate,
+                &outer_parameters,
+                &arguments,
+                None,
+                &mut session,
+            ),
+            Ok(result),
+        );
+        assert_eq!(session.count, 2);
+        assert_eq!(session.limit_event_count(), 4);
+        assert_eq!(deferred_intersection_store_state(&store), warm);
+        for mutation in 0..5 {
+            let mut changed = retained.clone();
+            match mutation {
+                0 => {
+                    assert_eq!(changed.physical_recovery.pop(), Some(true));
+                }
+                1 => changed.physical_recovery.fill(false),
+                2 => changed.arguments[0] = arguments[0],
+                3 => changed.parameters.swap(0, 1),
+                4 => changed.result = source.target,
+                _ => unreachable!(),
+            }
+            assert!(!changed.matches_current_result(&store));
+            assert_eq!(deferred_intersection_store_state(&store), warm);
+        }
+        let mut partial_session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 2,
+            },
+            error,
+        )
+        .unwrap();
+        let partial = instantiate_type_with_vector_and_session(
+            &mut store,
+            intermediate,
+            &outer_parameters,
+            &[source.parameters[0], arguments[1]],
+            None,
+            &mut partial_session,
+        )
+        .unwrap();
+        let partial_projection = inline_property_object_projection(&store, partial)
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial_projection.arguments, [source.parameters[0], error]);
+        assert_eq!(partial_session.limit_event_count(), 1);
+        let partial_recovery = store.inline_property_object_recovery(partial).unwrap();
+        assert!(!partial_recovery.physical_slot_recovered(0));
+        assert!(partial_recovery.physical_slot_recovered(1));
+        let mut next_session = InstantiationSession::new(InstantiationLimits::default());
+        let inherited = instantiate_type_with_vector_and_session(
+            &mut store,
+            partial,
+            &source.parameters[..1],
+            &arguments[..1],
+            None,
+            &mut next_session,
+        )
+        .unwrap();
+        let inherited_projection = inline_property_object_projection(&store, inherited)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited_projection.target, source.target);
+        assert_eq!(inherited_projection.arguments, [arguments[0], error]);
+        let inherited_recovery = store.inline_property_object_recovery(inherited).unwrap();
+        assert!(!inherited_recovery.physical_slot_recovered(0));
+        assert!(inherited_recovery.physical_slot_recovered(1));
+        assert!(inherited_recovery.matches_current_result(&store));
+        assert_eq!(next_session.limit_event_count(), 0);
+        assert_eq!(next_session.depth, 0);
+        assert_eq!(store.type_alias_len(), alias_count);
+        assert_eq!(store.signature_len(), signature_count);
+        let inherited_counts = deferred_intersection_store_state(&store);
+        assert_eq!(
+            cached_instantiation_with_vector(
+                &store,
+                partial,
+                &source.parameters[..1],
+                &arguments[..1],
+                None,
+                None,
+            ),
+            Ok(Some(inherited)),
+        );
+        assert_eq!(deferred_intersection_store_state(&store), inherited_counts);
+        for property in source.properties {
+            assert!(store.type_node_links(property.type_node).is_none());
+            assert!(store.value_symbol_links(property.symbol).is_none());
+        }
+    }
+
+    #[test]
+    fn closed_declared_objects_and_callables_keep_identity_in_all_mapper_readers() {
+        let (mut store, types) = source_alias_instantiation_fixture(
+            concat!(
+                "type Noop = () => void;\n",
+                "type Subscription = { unsubscribe: Noop };\n",
+                "type Scope<T> = { value: T };\n",
+            ),
+            &["Subscription", "Noop", "Scope"],
+        );
+        let scope = property_object_alias_projection(&store, types[2])
+            .unwrap()
+            .unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let mapper = store
+            .new_type_mapper(scope.parameters.clone(), vec![string])
+            .unwrap();
+        let before = deferred_intersection_store_state(&store);
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        for type_ in &types[..2] {
+            assert_eq!(
+                could_contain_installed_type_variables(&store, *type_, None),
+                Ok(false)
+            );
+            assert_eq!(
+                validate_instantiable_member_type(&store, *type_, &scope.parameters, None),
+                Ok(())
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &store,
+                    *type_,
+                    &scope.parameters,
+                    &[string],
+                    None,
+                    None
+                ),
+                Ok(Some(*type_)),
+            );
+            assert_eq!(
+                instantiated_member_type_matches(&store, *type_, *type_, mapper, None),
+                Ok(true),
+            );
+            assert_eq!(
+                instantiated_member_type_matches(&store, *type_, string, mapper, None),
+                Ok(false),
+            );
+            assert_eq!(
+                instantiate_type_with_session(&mut store, *type_, mapper, None, &mut session),
+                Ok(*type_),
+            );
+        }
+        assert_eq!(session.count, 0);
+        assert_eq!(session.limit_event_count(), 0);
+        assert_eq!(deferred_intersection_store_state(&store), before);
     }
 
     fn mapped_frame_fixture() -> (CanonicalTypeMapperStore, TypeId, TypeId, TypeId, TypeId) {
@@ -5188,7 +7733,7 @@ mod tests {
 
             assert_eq!(
                 instantiate_type_with_vector(&mut fixture.store, source, &sources, &targets),
-                Err(InstantiationError::UnsupportedType(source)),
+                Err(InstantiationError::InvalidType(source)),
             );
             assert_eq!(deferred_intersection_store_state(&fixture.store), before);
         }

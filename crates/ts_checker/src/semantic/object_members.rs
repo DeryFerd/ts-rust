@@ -51,7 +51,8 @@ use super::{
         demand_property_object_alias_property,
         instantiate_published_generic_array_property_callable,
         instantiate_published_generic_interface_method_with_session, property_instantiation_error,
-        resolve_members_with_array_targets, resolve_property_object_alias_members,
+        resolve_members_with_array_targets,
+        resolve_property_object_alias_members_with_array_targets,
         resolve_property_with_array_targets_and_session, validate_generic_interface_members,
         validate_property_object_alias_members_with_array_targets,
     },
@@ -64,8 +65,9 @@ use super::{
         ValueSymbolLinks,
     },
     object_aliases::{
-        PropertyObjectAliasProjection, property_object_alias_has_enclosing_type_parameters,
-        property_object_alias_projection, property_object_alias_source_parameters,
+        PropertyObjectAliasProjection, inline_property_object_source_header,
+        property_object_alias_has_enclosing_type_parameters, property_object_alias_projection,
+        property_object_alias_source_parameters, source_property_object_projection,
     },
     reference_types::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
@@ -100,14 +102,18 @@ pub(super) fn resolve_object_property_by_key(
     name: EscapedNameRef<'_>,
     session: &mut InstantiationSession,
 ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
-    if property_object_alias_projection(store, receiver)?.is_some() {
+    if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
             store,
             receiver,
             global_types.map(CanonicalArrayTargets::from_global_types),
         )? {
             Some(members) => members,
-            None => resolve_property_object_alias_members(store, receiver)?,
+            None => resolve_property_object_alias_members_with_array_targets(
+                store,
+                receiver,
+                global_types.map(CanonicalArrayTargets::from_global_types),
+            )?,
         };
         let Some(property) = members
             .members
@@ -340,14 +346,18 @@ pub(super) fn resolve_object_property_by_key_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
-    if property_object_alias_projection(store, receiver)?.is_some() {
+    if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
             store,
             receiver,
             Some(CanonicalArrayTargets::from_global_types(global_types)),
         )? {
             Some(members) => members,
-            None => resolve_property_object_alias_members(store, receiver)?,
+            None => resolve_property_object_alias_members_with_array_targets(
+                store,
+                receiver,
+                Some(CanonicalArrayTargets::from_global_types(global_types)),
+            )?,
         };
         let Some(property) = members
             .members
@@ -4241,7 +4251,7 @@ fn cached_constructor_annotation(
     Some(type_)
 }
 
-fn source_resolved_constructor_name_cache_is_exact(
+pub(super) fn source_resolved_constructor_name_cache_is_exact(
     store: &CanonicalTypeMapperStore,
     name: NodeRef,
     owner: SemanticSymbolId,
@@ -14666,10 +14676,10 @@ pub(super) fn type_literal_state(
     };
     if links.outer_type_parameters.is_some()
         && links.resolved_type.is_none_or(|type_| {
-            !matches!(property_object_alias_projection(store, type_), Ok(Some(projection))
-                if projection.type_ == projection.target
-                    && projection.declaration == plan.node
-                    && Some(projection.alias_symbol) == plan.alias_symbol)
+            !matches!(source_property_object_projection(store, type_), Ok(Some(projection))
+                if projection.type_() == projection.target()
+                    && projection.declaration() == plan.node
+                    && projection.display_identity().map(|(symbol, _)| symbol) == plan.alias_symbol)
         })
     {
         let type_ = links.resolved_type.unwrap_or_else(|| {
@@ -14837,6 +14847,11 @@ pub(super) fn ensure_type_literal_shell(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
 ) -> Result<PropertyObjectState, PropertyObjectError> {
+    if let Some(source) = inline_property_object_source_header(store, plan.node)
+        .map_err(|_| PropertyObjectError::InvalidTypeLiteral(plan.node))?
+    {
+        return ensure_inline_type_literal_shell(store, plan, &source);
+    }
     if property_object_alias_has_enclosing_type_parameters(store, plan.node)
         .map_err(|_| PropertyObjectError::InvalidTypeLiteral(plan.node))?
     {
@@ -14897,6 +14912,80 @@ pub(super) fn ensure_type_literal_shell(
         .unwrap_or_default();
     links.resolved_type = Some(type_);
     assert!(store.set_type_node_links(plan.node, links));
+    Ok(PropertyObjectState::Shell(type_))
+}
+
+/// Checks the inline shell and property caches before lexical parameter allocation.
+pub(super) fn preflight_inline_type_literal_shell_cache(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> Result<Option<PropertyObjectState>, PropertyObjectError> {
+    let source = inline_property_object_source_header(store, plan.node)
+        .map_err(|_| PropertyObjectError::InvalidTypeLiteral(plan.node))?
+        .ok_or(PropertyObjectError::InvalidTypeLiteral(plan.node))?;
+    if plan.kind != PropertyObjectKind::TypeLiteral
+        || plan.alias_symbol.is_some()
+        || plan.symbol != source.source_symbol
+        || plan.declarations != [source.declaration]
+        || plan.properties != source.properties
+        || plan.members
+            != store
+                .symbol(source.source_symbol)
+                .and_then(ts_binder::semantic::Symbol::members)
+        || !plan.methods.is_empty()
+        || !plan.accessors.is_empty()
+        || !plan.object_literal_getters.is_empty()
+        || !plan.spreads.is_empty()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.heritage.is_some()
+    {
+        return Err(PropertyObjectError::InvalidTypeLiteral(plan.node));
+    }
+    if let Some(state) = type_literal_state(store, plan)? {
+        return Ok(Some(state));
+    }
+    if !unresolved_property_links(store, plan) {
+        return Err(PropertyObjectError::InvalidTypeLiteral(plan.node));
+    }
+    Ok(None)
+}
+
+fn ensure_inline_type_literal_shell(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    source: &super::object_aliases::InlinePropertyObjectSourceHeader,
+) -> Result<PropertyObjectState, PropertyObjectError> {
+    if let Some(state) = preflight_inline_type_literal_shell_cache(store, plan)? {
+        return Ok(state);
+    }
+    let parameters = source
+        .parameters
+        .iter()
+        .map(|&(_, symbol)| {
+            let type_ = store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or(PropertyObjectError::InvalidTypeLiteral(plan.node))?;
+            if super::declared::cached_ordinary_type_parameter_owner(store, type_) != Some(symbol) {
+                return Err(PropertyObjectError::InvalidTypeLiteral(plan.node));
+            }
+            Ok(type_)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !store.try_reserve_types(1) || !store.try_reserve_type_node_links(1) {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .expect("the inline source proof checked the original literal symbol");
+    assert!(store.set_type_node_links(
+        plan.node,
+        TypeNodeLinks {
+            resolved_type: Some(type_),
+            outer_type_parameters: Some(parameters),
+        }
+    ));
     Ok(PropertyObjectState::Shell(type_))
 }
 
@@ -15080,13 +15169,13 @@ fn validate_object_record(
     let TypeData::Object(object) = record.data() else {
         return None;
     };
-    let property_alias = property_object_alias_projection(store, type_).ok()?;
+    let property_alias = source_property_object_projection(store, type_).ok()?;
     let property_alias = if let Some(projection) = property_alias {
-        if projection.type_ != projection.target
-            || projection.declaration != plan.node
-            || projection.source_symbol != plan.symbol
-            || Some(projection.alias_symbol) != plan.alias_symbol
-            || projection.properties != plan.properties
+        if projection.type_() != projection.target()
+            || projection.declaration() != plan.node
+            || projection.source_symbol() != plan.symbol
+            || projection.display_identity().map(|(symbol, _)| symbol) != plan.alias_symbol
+            || projection.properties() != plan.properties.as_slice()
             || !plan.methods.is_empty()
             || !plan.accessors.is_empty()
             || !plan.spreads.is_empty()

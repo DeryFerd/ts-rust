@@ -65,7 +65,7 @@ use super::{
         ResolvedMappedTypeMembers,
     },
     mapper::TypeMapper,
-    object_aliases::property_object_alias_projection,
+    object_aliases::source_property_object_projection,
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         validate_resolved_declared_property_object,
@@ -380,12 +380,30 @@ fn validate_property_object_alias_relation_endpoint(
     type_: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<(), RelationUnavailable> {
-    if property_object_alias_projection(store, type_)?.is_some() {
+    if source_property_object_projection(store, type_)?.is_some() {
         // Identity and cached relations still check any published member values.
         // An authenticated cold instance needs no member demand here.
         validate_property_object_alias_members_with_array_targets(store, type_, array_targets)?;
     }
     Ok(())
+}
+
+fn validated_intersection_relation_projection(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<IntersectionTypeProjection, RelationUnavailable> {
+    match store.validate_intersection_type_with_array_targets(type_, array_targets) {
+        Ok(projection) => Ok(projection),
+        Err(_)
+            if store
+                .validate_deferred_intersection_type_with_array_targets(type_, array_targets)
+                .is_ok() =>
+        {
+            Err(RelationUnavailable::UnresolvedStructuredMembers(type_))
+        }
+        Err(_) => Err(RelationUnavailable::MalformedIntersection(type_)),
+    }
 }
 
 /// Rejects strict nullish sources after proving a supported object target.
@@ -2078,9 +2096,11 @@ impl<'store> RelaterSession<'store> {
         &self,
         type_id: TypeId,
     ) -> Result<IntersectionTypeProjection, RelationUnavailable> {
-        self.store
-            .validate_intersection_type(type_id)
-            .map_err(|_| RelationUnavailable::MalformedIntersection(type_id))
+        validated_intersection_relation_projection(
+            self.store,
+            type_id,
+            self.global_types.map(|globals| globals.array_targets),
+        )
     }
 
     fn reduced_intersection_type(&self, type_id: TypeId) -> Result<TypeId, RelationUnavailable> {
@@ -6688,7 +6708,7 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<(), RelationUnavailable> {
-        if property_object_alias_projection(self.store, type_id)?.is_some() {
+        if source_property_object_projection(self.store, type_id)?.is_some() {
             return validate_property_object_alias_members_with_array_targets(
                 self.store,
                 type_id,
@@ -7297,7 +7317,7 @@ impl<'store> RelaterSession<'store> {
                     error
                 }
             })?;
-        if property_object_alias_projection(self.store, type_id)?.is_some() {
+        if source_property_object_projection(self.store, type_id)?.is_some() {
             let members = validate_property_object_alias_members_with_array_targets(
                 self.store,
                 type_id,
@@ -8193,7 +8213,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
-    fn resolved_own_property_by_key_with_optional_context(
+    pub(super) fn resolved_own_property_by_key_with_optional_context(
         &mut self,
         type_id: TypeId,
         name: EscapedNameRef<'_>,
@@ -8286,9 +8306,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(None);
         }
 
-        if let Some(projection) = property_object_alias_projection(self, type_id)? {
-            if !host.symbol_matches(self, projection.declaration, projection.source_symbol)
-                || projection.properties.iter().any(|property| {
+        if let Some(projection) = source_property_object_projection(self, type_id)? {
+            if !host.symbol_matches(self, projection.declaration(), projection.source_symbol())
+                || projection.properties().iter().any(|property| {
                     !host.symbol_matches(self, property.declaration, property.symbol)
                 })
             {
@@ -8302,7 +8322,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 global_types,
             );
             let resolved = session.resolved_object_members(type_id, false)?;
-            if resolved.properties.len() != projection.properties.len()
+            if resolved.properties.len() != projection.properties().len()
                 || !matches!(
                     resolved.property_origin,
                     ObjectPropertyOrigin::PropertyObjectAlias(receiver) if receiver == type_id
@@ -8312,7 +8332,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             let mut properties = Vec::with_capacity(resolved.properties.len());
             let mut by_name = HashMap::with_capacity(resolved.properties.len());
-            for (symbol, planned) in resolved.properties.into_iter().zip(projection.properties) {
+            for (symbol, planned) in resolved.properties.into_iter().zip(projection.properties()) {
                 let record = session.property_symbol(symbol, resolved.property_origin)?;
                 if record.name() != planned.name.as_ref()
                     || record.flags().contains(SymbolFlags::OPTIONAL) != planned.optional
@@ -8326,7 +8346,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 properties.push(ResolvedDeclaredProperty {
                     symbol,
-                    name: planned.name,
+                    name: planned.name.clone(),
                     type_,
                     optional: planned.optional,
                     declaration: planned.declaration,
@@ -9129,9 +9149,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let original_target = target;
         let source = self.regular_type_if_fresh(source)?;
         let source = if self.type_flags(source)?.intersects(TypeFlags::INTERSECTION) {
-            let projection = self
-                .validate_intersection_type(source)
-                .map_err(|_| RelationUnavailable::MalformedIntersection(source))?;
+            let projection = validated_intersection_relation_projection(
+                self,
+                source,
+                global_types.map(|globals| globals.array_targets),
+            )?;
             if projection.reduced_to_never {
                 bootstrap.never_type
             } else {
@@ -9142,9 +9164,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         };
         let target = self.regular_type_if_fresh(target)?;
         let target = if self.type_flags(target)?.intersects(TypeFlags::INTERSECTION) {
-            let projection = self
-                .validate_intersection_type(target)
-                .map_err(|_| RelationUnavailable::MalformedIntersection(target))?;
+            let projection = validated_intersection_relation_projection(
+                self,
+                target,
+                global_types.map(|globals| globals.array_targets),
+            )?;
             if projection.reduced_to_never {
                 bootstrap.never_type
             } else {
@@ -11717,6 +11741,191 @@ mod tests {
             fixture.store.is_type_assignable_to(unknown_empty, numbers),
             Ok(false)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both early relation operands require the same exact deferred key and array authority.
+    fn inline_intersection_relation_cold_signal_requires_exact_key_and_array_authority() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "type Tail<T> = { tail: T }; type Packet<T> = { value: T } & Tail<T>; ",
+            "declare const input: Packet<string[]>;",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(99_156);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = source_relation_context(&library, &source, file, options);
+        let annotation = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let receiver = context.get_type_from_type_node(annotation).unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let key = context
+            .store()
+            .intersection_keys_by_type
+            .get(&receiver)
+            .cloned()
+            .unwrap();
+        let expected = RelationUnavailable::UnresolvedStructuredMembers(receiver);
+        let malformed = RelationUnavailable::MalformedIntersection(receiver);
+        assert_eq!(
+            super::validated_intersection_relation_projection(context.store(), receiver, targets),
+            Err(expected)
+        );
+        assert_eq!(
+            super::validated_intersection_relation_projection(context.store(), receiver, None),
+            Err(malformed)
+        );
+        let mut session = super::InstantiationSession::new(super::InstantiationLimits::default());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_assignable_to_with_session(
+                    receiver,
+                    receiver,
+                    Some(&globals),
+                    Some(options.strict_function_types),
+                    &mut session
+                ),
+            Err(expected)
+        );
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            let store = context.store();
+            (
+                [
+                    store.type_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.type_alias_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.intersection_types.len(),
+                store.intersection_keys_by_type.len(),
+            )
+        };
+        let before = snapshot(&context);
+        for (source, target) in [(receiver, receiver), (string, receiver)] {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_session(
+                        source,
+                        target,
+                        Some(&globals),
+                        Some(options.strict_function_types),
+                        &mut session
+                    ),
+                Err(expected)
+            );
+            assert_eq!(snapshot(&context), before);
+        }
+        for reverse_key in [false, true] {
+            if reverse_key {
+                let mut wrong = key.clone();
+                wrong.alias_arguments = vec![string];
+                assert_ne!(wrong, key);
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .intersection_keys_by_type
+                        .insert(receiver, wrong),
+                    Some(key.clone())
+                );
+            } else {
+                assert_eq!(
+                    context.store_mut_for_test().intersection_types.remove(&key),
+                    Some(receiver)
+                );
+            }
+            let before = snapshot(&context);
+            let work = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    super::validated_intersection_relation_projection(
+                        context.store(),
+                        receiver,
+                        targets
+                    ),
+                    Err(malformed)
+                );
+                for (source, target) in [(receiver, receiver), (string, receiver)] {
+                    assert_eq!(
+                        context
+                            .store_mut_for_test()
+                            .is_type_assignable_to_with_session(
+                                source,
+                                target,
+                                Some(&globals),
+                                Some(options.strict_function_types),
+                                &mut session
+                            ),
+                        Err(malformed)
+                    );
+                }
+                assert_eq!(snapshot(&context), before);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    work
+                );
+            }
+            if reverse_key {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .intersection_keys_by_type
+                        .insert(receiver, key.clone())
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .intersection_types
+                        .insert(key.clone(), receiver)
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                super::validated_intersection_relation_projection(
+                    context.store(),
+                    receiver,
+                    targets
+                ),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            context.store().intersection_keys_by_type.get(&receiver),
+            Some(&key)
+        );
+        assert_eq!(
+            context.store().intersection_types.get(&key),
+            Some(&receiver)
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

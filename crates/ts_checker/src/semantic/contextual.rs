@@ -13,11 +13,12 @@
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
-use ts_binder::{EscapedName, SemanticSymbolId, SymbolFlags};
+use ts_binder::{EscapedName, EscapedNameRef, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId,
     RelationUnavailable, SymbolTableId, TypeId, VariableInvariant,
+    array_types::CanonicalArrayTargets,
     callables::{StoredSingleCallableValidation, validate_stored_single_callable},
     declared::cached_ordinary_type_parameter_owner,
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
@@ -330,10 +331,11 @@ fn preflight_contextual_type_graph(
             return Ok(());
         }
         if flags.intersects(TypeFlags::INTERSECTION) {
-            let contextual = resolve_contextual_property_object(store, host, contextual_type)?
-                .ok_or(RelationUnavailable::UnsupportedStructuredType(
-                    contextual_type,
-                ))?;
+            let contextual =
+                resolve_contextual_property_object(store, host, global_types, contextual_type)?
+                    .ok_or(RelationUnavailable::UnsupportedStructuredType(
+                        contextual_type,
+                    ))?;
             for property_type in contextual.property_types() {
                 preflight_contextual_type_graph(
                     store,
@@ -400,10 +402,11 @@ fn preflight_contextual_type_graph(
                 }
                 return Ok(());
             }
-            let contextual = resolve_contextual_property_object(store, host, contextual_type)?
-                .ok_or(RelationUnavailable::UnsupportedStructuredType(
-                    contextual_type,
-                ))?;
+            let contextual =
+                resolve_contextual_property_object(store, host, global_types, contextual_type)?
+                    .ok_or(RelationUnavailable::UnsupportedStructuredType(
+                        contextual_type,
+                    ))?;
             for property_type in contextual.property_types() {
                 preflight_contextual_type_graph(
                     store,
@@ -738,8 +741,9 @@ fn contextual_objects(
                 .map(TypeRecord::flags)
                 .ok_or(RelationUnavailable::Type(constituent))?;
             if flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION) {
-                let candidate = resolve_contextual_property_object(store, host, constituent)?
-                    .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
+                let candidate =
+                    resolve_contextual_property_object(store, host, global_types, constituent)?
+                        .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
                 candidates.push(candidate);
             } else if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
                 return Err(RelationUnavailable::UnsupportedStructuredType(constituent).into());
@@ -786,7 +790,7 @@ fn contextual_objects(
         return Ok(candidates);
     }
     if flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION) {
-        return resolve_contextual_property_object(store, host, contextual_type)
+        return resolve_contextual_property_object(store, host, global_types, contextual_type)
             .map(|object| object.into_iter().collect());
     }
     if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
@@ -798,15 +802,21 @@ fn contextual_objects(
 fn resolve_contextual_property_object(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     contextual_type: TypeId,
 ) -> Result<Option<ContextualPropertyObject>, SourceCheckError> {
     if store
         .type_payload(contextual_type)
         .is_some_and(|record| record.flags().intersects(TypeFlags::INTERSECTION))
     {
-        return intersection_contextual_property_projection(store, host, contextual_type)
-            .map(ContextualPropertyObject::Synthetic)
-            .map(Some);
+        return intersection_contextual_property_projection(
+            store,
+            host,
+            global_types,
+            contextual_type,
+        )
+        .map(ContextualPropertyObject::Synthetic)
+        .map(Some);
     }
 
     let mapped_key = match store.type_payload(contextual_type).map(TypeRecord::data) {
@@ -836,7 +846,15 @@ fn resolve_contextual_property_object(
     if let Some(properties) = synthetic_contextual_property_projection(store, contextual_type)? {
         return Ok(Some(ContextualPropertyObject::Synthetic(properties)));
     }
-    let Some(object) = store.resolved_declared_property_object(host, contextual_type)? else {
+    let object = match global_types {
+        Some(global_types) => store.resolved_declared_property_object_with_global_types(
+            host,
+            contextual_type,
+            global_types,
+        )?,
+        None => store.resolved_declared_property_object(host, contextual_type)?,
+    };
+    let Some(object) = object else {
         return Ok(None);
     };
     let string = store
@@ -865,13 +883,20 @@ fn resolve_contextual_property_object(
 fn intersection_contextual_property_projection(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     contextual_type: TypeId,
 ) -> Result<Vec<(EscapedName, TypeId)>, SourceCheckError> {
-    let projection = match store.validate_intersection_type(contextual_type) {
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+    let projection = match store
+        .validate_intersection_type_with_array_targets(contextual_type, array_targets)
+    {
         Ok(projection) => projection,
         Err(_)
             if store
-                .validate_deferred_intersection_type(contextual_type)
+                .validate_deferred_intersection_type_with_array_targets(
+                    contextual_type,
+                    array_targets,
+                )
                 .is_ok() =>
         {
             return Err(RelationUnavailable::UnresolvedStructuredMembers(contextual_type).into());
@@ -902,7 +927,7 @@ fn intersection_contextual_property_projection(
         if !flags.intersects(TypeFlags::OBJECT) {
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
-        let object = resolve_contextual_property_object(store, host, constituent)?
+        let object = resolve_contextual_property_object(store, host, global_types, constituent)?
             .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
         constituents.push(object);
     }
@@ -917,7 +942,12 @@ fn intersection_contextual_property_projection(
             .as_utf8()
             .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
         let merged = store
-            .resolved_own_property(contextual_type, source_name)?
+            .resolved_own_property_by_key_with_optional_context(
+                contextual_type,
+                EscapedNameRef::source(source_name),
+                global_types,
+                None,
+            )?
             .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
         if merged.symbol != symbol {
             return Err(RelationUnavailable::MalformedIntersection(contextual_type).into());
@@ -1457,11 +1487,17 @@ fn is_literal_of_contextual_type(
                 };
                 union.union.types.clone()
             } else {
-                match store.validate_intersection_type(contextual_type) {
+                let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+                match store
+                    .validate_intersection_type_with_array_targets(contextual_type, array_targets)
+                {
                     Ok(projection) => projection.types,
                     Err(_)
                         if store
-                            .validate_deferred_intersection_type(contextual_type)
+                            .validate_deferred_intersection_type_with_array_targets(
+                                contextual_type,
+                                array_targets,
+                            )
                             .is_ok() =>
                     {
                         return Err(RelationUnavailable::UnresolvedStructuredMembers(
@@ -1828,7 +1864,7 @@ mod tests {
             store.relation_state_snapshot(),
         );
 
-        let projected = resolve_contextual_property_object(store, &host, target)
+        let projected = resolve_contextual_property_object(store, &host, None, target)
             .unwrap()
             .unwrap();
         assert_eq!(projected.property_types(), vec![number, string]);
@@ -1985,7 +2021,7 @@ mod tests {
             );
 
             for _ in 0..2 {
-                let contextual = resolve_contextual_property_object(store, &host, target)
+                let contextual = resolve_contextual_property_object(store, &host, None, target)
                     .unwrap()
                     .unwrap();
                 assert_eq!(contextual.get_source("item"), Some(expected));
@@ -2017,6 +2053,138 @@ mod tests {
                 assert!(store.type_node_links(object).is_none());
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the cold, ready, and missing-capability reads on the same source result.
+    fn ready_inline_intersection_context_keeps_caller_array_capabilities() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics,
+            instantiate::{InstantiationLimits, InstantiationSession},
+            intersection_types::demand_source_intersection_members,
+            production::GlobalMergeCompletion,
+        };
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Base<T> = { base: T }; ",
+            "type Shape<T> = { tag: \"ok\"; items: T[] } & Base<T>; ",
+            "const value: Shape<number> = { tag: \"ok\" };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(29_852);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let expression = intersection_object_expression(&parsed, context.store(), &host, object);
+        let store = context.store_mut_for_test();
+        let cold = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert!(
+            matches!(resolve_contextual_property_object(store, &host, Some(&globals), target),
+            Err(SourceCheckError::RelationUnavailable(RelationUnavailable::UnresolvedStructuredMembers(type_))) if type_ == target)
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths()
+            ),
+            cold
+        );
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            demand_source_intersection_members(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                target,
+            )
+            .unwrap(),
+            target
+        );
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            let projected =
+                resolve_contextual_property_object(store, &host, Some(&globals), target)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(projected.get_source("base"), Some(number));
+            let items = projected.get_source("items").unwrap();
+            assert_eq!(
+                store.canonical_array_element_type(&globals, items).unwrap(),
+                Some(number)
+            );
+            assert!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                )
+                .is_ok()
+            );
+            let mut visited = HashSet::new();
+            assert!(
+                !is_literal_of_contextual_type(
+                    store,
+                    Some(&globals),
+                    LiteralKind::String,
+                    Some(target),
+                    &mut visited,
+                )
+                .unwrap()
+            );
+            assert!(visited.is_empty());
+            assert!(
+                matches!(resolve_contextual_property_object(store, &host, None, target),
+                Err(SourceCheckError::RelationUnavailable(RelationUnavailable::MalformedIntersection(type_))) if type_ == target)
+            );
+            assert!(matches!(is_literal_of_contextual_type(
+                store, None, LiteralKind::String, Some(target), &mut visited,
+            ), Err(SourceCheckError::RelationUnavailable(RelationUnavailable::MalformedIntersection(type_))) if type_ == target));
+            assert!(visited.is_empty());
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths()
+                ),
+                warm
+            );
+        }
+        assert!(diagnostics.as_slice().is_empty());
     }
 
     #[test]
@@ -2305,7 +2473,7 @@ mod tests {
                     &mut HashSet::new(),
                 )
                 .unwrap();
-                let contextual = resolve_contextual_property_object(store, &host, target)
+                let contextual = resolve_contextual_property_object(store, &host, None, target)
                     .unwrap()
                     .unwrap();
                 assert_eq!(contextual.get_source("value"), Some(parameter));
@@ -2559,12 +2727,12 @@ mod tests {
                 &mut HashSet::new(),
             )
             .unwrap();
-            let root = resolve_contextual_property_object(store, &host, target)
+            let root = resolve_contextual_property_object(store, &host, None, target)
                 .unwrap()
                 .unwrap();
             assert_eq!(root.get_source("callback"), Some(callables[0].1));
             let nested = root.get_source("nested").unwrap();
-            let nested = resolve_contextual_property_object(store, &host, nested)
+            let nested = resolve_contextual_property_object(store, &host, None, nested)
                 .unwrap()
                 .unwrap();
             assert_eq!(nested.get_source("handler"), Some(callables[1].1));
@@ -2970,7 +3138,7 @@ mod tests {
                 PreparedExpression::Literal(LiteralTreatment::Regular),
             ]),
         );
-        let contextual = resolve_contextual_property_object(store, &host, target)
+        let contextual = resolve_contextual_property_object(store, &host, None, target)
             .unwrap()
             .unwrap();
         let expected = contextual.get_source("first").unwrap();

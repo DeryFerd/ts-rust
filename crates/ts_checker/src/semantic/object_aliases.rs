@@ -1,8 +1,8 @@
-//! Read-only source and cache checks for ordinary property-object aliases.
+//! Read-only source and cache checks for ordinary property-object types.
 //!
 //! The type-literal symbol owns the properties. The alias symbol owns the
-//! ordered type parameters. Instances retain both identities and a mapper
-//! from those original parameters to their effective arguments. Member and
+//! ordered type parameters. Direct aliases retain a display identity. Inline
+//! literals retain only a mapper from lexical parameters to arguments. Member and
 //! property-value publication has separate validation in `instantiated_members`.
 
 use std::collections::HashSet;
@@ -14,7 +14,7 @@ use super::{
     CanonicalTypeMapperStore, TypeId, TypeMapperId,
     declared::cached_ordinary_type_parameter_owner,
     instantiate::PropertyObjectAliasRecovery,
-    links::{SourceFileRef, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks},
+    links::{SourceFileRef, SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperKind,
     object_members::PlannedProperty,
     relater::RelationUnavailable,
@@ -52,6 +52,131 @@ pub(super) struct PropertyObjectAliasSourceHeader {
     pub(super) parameters: Vec<(NodeRef, SemanticSymbolId)>,
 }
 
+/// The enclosing alias supplies parameters, but does not name this literal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InlinePropertyObjectSourceHeader {
+    pub(super) declaration: NodeRef,
+    pub(super) source_symbol: SemanticSymbolId,
+    pub(super) alias_declaration: NodeRef,
+    pub(super) parameter_owner: SemanticSymbolId,
+    pub(super) parameters: Vec<(NodeRef, SemanticSymbolId)>,
+    pub(super) properties: Vec<PlannedProperty>,
+}
+
+/// Physical identity of an unaliased literal inside a generic intersection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct InlinePropertyObjectProjection {
+    pub(super) type_: TypeId,
+    pub(super) target: TypeId,
+    pub(super) declaration: NodeRef,
+    pub(super) source_symbol: SemanticSymbolId,
+    pub(super) parameter_owner: SemanticSymbolId,
+    pub(super) parameters: Vec<TypeId>,
+    pub(super) arguments: Vec<TypeId>,
+    pub(super) mapper: Option<TypeMapperId>,
+    pub(super) properties: Vec<PlannedProperty>,
+}
+
+/// Shared physical operations keep the two source proofs distinct.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SourcePropertyObjectProjection {
+    DirectAlias(PropertyObjectAliasProjection),
+    Inline(InlinePropertyObjectProjection),
+}
+
+impl SourcePropertyObjectProjection {
+    pub(super) fn type_(&self) -> TypeId {
+        match self {
+            Self::DirectAlias(source) => source.type_,
+            Self::Inline(source) => source.type_,
+        }
+    }
+
+    pub(super) fn target(&self) -> TypeId {
+        match self {
+            Self::DirectAlias(source) => source.target,
+            Self::Inline(source) => source.target,
+        }
+    }
+
+    pub(super) fn declaration(&self) -> NodeRef {
+        match self {
+            Self::DirectAlias(source) => source.declaration,
+            Self::Inline(source) => source.declaration,
+        }
+    }
+
+    pub(super) fn source_symbol(&self) -> SemanticSymbolId {
+        match self {
+            Self::DirectAlias(source) => source.source_symbol,
+            Self::Inline(source) => source.source_symbol,
+        }
+    }
+
+    pub(super) fn parameter_owner(&self) -> SemanticSymbolId {
+        match self {
+            Self::DirectAlias(source) => source.alias_symbol,
+            Self::Inline(source) => source.parameter_owner,
+        }
+    }
+
+    pub(super) fn parameters(&self) -> &[TypeId] {
+        match self {
+            Self::DirectAlias(source) => &source.parameters,
+            Self::Inline(source) => &source.parameters,
+        }
+    }
+
+    pub(super) fn arguments(&self) -> &[TypeId] {
+        match self {
+            Self::DirectAlias(source) => &source.arguments,
+            Self::Inline(source) => &source.arguments,
+        }
+    }
+
+    pub(super) fn mapper(&self) -> Option<TypeMapperId> {
+        match self {
+            Self::DirectAlias(source) => source.mapper,
+            Self::Inline(source) => source.mapper,
+        }
+    }
+
+    pub(super) fn properties(&self) -> &[PlannedProperty] {
+        match self {
+            Self::DirectAlias(source) => &source.properties,
+            Self::Inline(source) => &source.properties,
+        }
+    }
+
+    pub(super) fn display_identity(&self) -> Option<(SemanticSymbolId, &[TypeId])> {
+        match self {
+            Self::DirectAlias(source) => Some((source.identity_symbol, &source.identity_arguments)),
+            Self::Inline(_) => None,
+        }
+    }
+
+    pub(super) fn identity_arguments(&self) -> &[TypeId] {
+        self.display_identity()
+            .map_or(&[], |(_, arguments)| arguments)
+    }
+
+    pub(super) fn as_direct_alias(&self) -> Option<&PropertyObjectAliasProjection> {
+        match self {
+            Self::DirectAlias(source) => Some(source),
+            Self::Inline(_) => None,
+        }
+    }
+}
+
+/// A direct nongeneric alias body with no captured source parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ClosedTypeAliasSourceHeader {
+    pub(super) declaration: NodeRef,
+    pub(super) source_symbol: SemanticSymbolId,
+    pub(super) alias_declaration: NodeRef,
+    pub(super) alias_symbol: SemanticSymbolId,
+}
+
 struct SourceSyntax {
     declaration: NodeRef,
     alias_declaration: NodeRef,
@@ -66,6 +191,895 @@ struct SourceObject {
     alias_symbol: SemanticSymbolId,
     parameters: Vec<TypeId>,
     properties: Vec<PlannedProperty>,
+}
+
+pub(super) fn source_property_object_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<SourcePropertyObjectProjection>, RelationUnavailable> {
+    if let Some(source) = property_object_alias_projection(store, type_)? {
+        return Ok(Some(SourcePropertyObjectProjection::DirectAlias(source)));
+    }
+    Ok(
+        inline_property_object_projection(store, type_)?
+            .map(SourcePropertyObjectProjection::Inline),
+    )
+}
+
+/// Reads the literal and its lexical parameter scope before semantic allocation.
+pub(super) fn inline_property_object_source_header(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Result<Option<InlinePropertyObjectSourceHeader>, RelationUnavailable> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::TypeLiteral) {
+        return Ok(None);
+    }
+    let Some(syntax) = inline_source_syntax(store, declaration) else {
+        if source_syntax(store, declaration).is_none()
+            && let Some(links) = store.type_node_links(declaration)
+            && links.outer_type_parameters.is_some()
+            && let Some(type_) = links.resolved_type
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+        }
+        return Ok(None);
+    };
+    let Some((source_symbol, parameter_owner)) = source_symbols(store, &syntax)? else {
+        return Ok(None);
+    };
+    if alias_has_enclosing_type_parameters(store, syntax.alias_declaration, parameter_owner)? {
+        return Ok(None);
+    }
+    let owner = property_object_alias_identity_source_header(store, parameter_owner)?;
+    let invalid = || RelationUnavailable::Symbol(source_symbol);
+    if owner.alias_declaration != syntax.alias_declaration
+        || owner.parameters.is_empty()
+        || !owner
+            .parameters
+            .iter()
+            .map(|(declaration, _)| *declaration)
+            .eq(syntax.parameters.iter().copied())
+    {
+        return Err(invalid());
+    }
+    let header = InlinePropertyObjectSourceHeader {
+        declaration,
+        source_symbol,
+        alias_declaration: syntax.alias_declaration,
+        parameter_owner,
+        parameters: owner.parameters,
+        properties: source_properties(store, &syntax, source_symbol)?,
+    };
+    if let Some(target) = store
+        .type_node_links(declaration)
+        .and_then(|links| links.resolved_type)
+    {
+        let parameters = inline_source_parameters(store, &header)?;
+        validate_inline_template_fields(store, &syntax, &header, target, &parameters)?;
+    } else {
+        for node in std::iter::once(declaration).chain(syntax.wrappers.iter().copied()) {
+            if store
+                .type_node_links(node)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+                || store
+                    .symbol_node_links(node)
+                    .is_some_and(|links| links.resolved_symbol.is_some())
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(Some(header))
+}
+
+fn inline_source_parameters(
+    store: &CanonicalTypeMapperStore,
+    source: &InlinePropertyObjectSourceHeader,
+) -> Result<Vec<TypeId>, RelationUnavailable> {
+    source
+        .parameters
+        .iter()
+        .map(|&(declaration, symbol)| {
+            let parameter = source_parameter(store, declaration, source.parameter_owner)?;
+            if cached_ordinary_type_parameter_owner(store, parameter) != Some(symbol) {
+                return Err(RelationUnavailable::Symbol(symbol));
+            }
+            Ok(parameter)
+        })
+        .collect()
+}
+
+/// This check does not enter instance caches, recovery records, or member values.
+pub(super) fn inline_property_object_template_matches(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    target: TypeId,
+    parameter_owner: SemanticSymbolId,
+    parameters: &[TypeId],
+) -> Result<bool, RelationUnavailable> {
+    let Some(syntax) = inline_source_syntax(store, declaration) else {
+        return Ok(false);
+    };
+    let Some((source_symbol, owner)) = source_symbols(store, &syntax)? else {
+        return Ok(false);
+    };
+    if owner != parameter_owner
+        || alias_has_enclosing_type_parameters(store, syntax.alias_declaration, owner)?
+    {
+        return Ok(false);
+    }
+    let scope = property_object_alias_identity_source_header(store, owner)?;
+    let header = InlinePropertyObjectSourceHeader {
+        declaration,
+        source_symbol,
+        alias_declaration: syntax.alias_declaration,
+        parameter_owner: owner,
+        parameters: scope.parameters,
+        properties: source_properties(store, &syntax, source_symbol)?,
+    };
+    if inline_source_parameters(store, &header)? != parameters {
+        return Ok(false);
+    }
+    validate_inline_template_fields(store, &syntax, &header, target, parameters)?;
+    Ok(true)
+}
+
+fn validate_inline_template_fields(
+    store: &CanonicalTypeMapperStore,
+    syntax: &SourceSyntax,
+    source: &InlinePropertyObjectSourceHeader,
+    target: TypeId,
+    parameters: &[TypeId],
+) -> Result<(), RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(target);
+    let record = store.type_payload(target).ok_or_else(invalid)?;
+    let object = target_object(store, target)?;
+    if parameters.is_empty()
+        || record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(source.source_symbol)
+        || record.alias().is_some()
+        || !valid_original_object_flags(record.object_flags())
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || store.property_object_alias_recovery(target).is_some()
+        || store.inline_property_object_recovery(target).is_some()
+        || store.type_node_links(source.declaration)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(target),
+                outer_type_parameters: Some(parameters.to_vec()),
+            })
+        || store
+            .type_alias_links(source.parameter_owner)
+            .is_some_and(|links| {
+                links.is_constructor_declared_property
+                    || links.declared_type == Some(target)
+                    || links
+                        .type_parameters
+                        .as_deref()
+                        .is_some_and(|actual| actual != parameters)
+            })
+    {
+        return Err(invalid());
+    }
+    for node in std::iter::once(source.declaration).chain(syntax.wrappers.iter().copied()) {
+        if store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+            || node != source.declaration
+                && store.type_node_links(node).is_some_and(|links| {
+                    links.outer_type_parameters.is_some()
+                        || links.resolved_type.is_some_and(|cached| cached != target)
+                })
+        {
+            return Err(invalid());
+        }
+    }
+    if let TypeCacheState::Allocated(entries) = &object.instantiations
+        && entries.get(&type_alias_instantiation_cache_key(parameters, None)) != Some(&target)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Reads only original source fields and an instance's physical mapper edges.
+fn inline_instance_fields(
+    store: &CanonicalTypeMapperStore,
+    source: &InlinePropertyObjectSourceHeader,
+    target: TypeId,
+    parameters: &[TypeId],
+    type_: TypeId,
+) -> Result<(Vec<TypeId>, TypeMapperId), RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let object = target_object(store, type_)?;
+    let mapper = object.mapper.ok_or_else(invalid)?;
+    if !matches!(
+        store.mapper_kind(mapper),
+        Some(TypeMapperKind::Simple | TypeMapperKind::Array)
+    ) {
+        return Err(invalid());
+    }
+    let arguments = parameters
+        .iter()
+        .map(|&parameter| store.map_type(mapper, parameter).ok_or_else(invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    if type_ == target
+        || record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(source.source_symbol)
+        || record.alias().is_some()
+        || object.target != Some(target)
+        || object.instantiations != TypeCacheState::Unallocated
+        || arguments == parameters
+        || !valid_instance_object_flag_header(store, record.object_flags(), &arguments)?
+        || store.type_mapper_has_exact_endpoints(mapper, parameters, &arguments) != Some(true)
+        || store.property_object_alias_recovery(type_).is_some()
+    {
+        return Err(invalid());
+    }
+    validate_property_object_alias_arguments(store, &arguments).map_err(|_| invalid())?;
+    Ok((arguments, mapper))
+}
+
+fn inline_source_for_record(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<InlinePropertyObjectSourceHeader>, RelationUnavailable> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let target = match record.data() {
+        TypeData::Object(object) => object.target,
+        _ => None,
+    };
+    for candidate in std::iter::once(type_).chain(target) {
+        let Some(symbol) = store.type_payload(candidate).and_then(TypeRecord::symbol) else {
+            continue;
+        };
+        let Some(declarations) = store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.declarations())
+        else {
+            continue;
+        };
+        for &declaration in declarations {
+            if let Some(source) = inline_property_object_source_header(store, declaration)? {
+                return Ok(Some(source));
+            }
+        }
+    }
+    if store.inline_property_object_recovery(type_).is_some() {
+        return Err(RelationUnavailable::InvalidStructuredMembers(type_));
+    }
+    Ok(None)
+}
+
+pub(super) fn inline_property_object_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<InlinePropertyObjectProjection>, RelationUnavailable> {
+    let Some(source) = inline_source_for_record(store, type_)? else {
+        return Ok(None);
+    };
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let target = store
+        .type_node_links(source.declaration)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let parameters = inline_source_parameters(store, &source)?;
+    let (arguments, mapper) = if type_ == target {
+        (parameters.clone(), None)
+    } else {
+        let (arguments, mapper) =
+            inline_instance_fields(store, &source, target, &parameters, type_)?;
+        if !valid_instance_variable_flags(
+            store,
+            store
+                .type_payload(type_)
+                .ok_or_else(invalid)?
+                .object_flags(),
+            &arguments,
+        )? || cached_instantiation(
+            &target_object(store, target)?.instantiations,
+            type_alias_instantiation_cache_key(&arguments, None),
+        ) != Some(type_)
+        {
+            return Err(invalid());
+        }
+        (arguments, Some(mapper))
+    };
+    if let TypeCacheState::Allocated(entries) = &target_object(store, target)?.instantiations {
+        for (&key, &cached) in entries {
+            if cached == target {
+                if key != type_alias_instantiation_cache_key(&parameters, None) {
+                    return Err(invalid());
+                }
+                continue;
+            }
+            let (arguments, _) =
+                inline_instance_fields(store, &source, target, &parameters, cached)?;
+            if key != type_alias_instantiation_cache_key(&arguments, None)
+                || !valid_instance_variable_flags(
+                    store,
+                    store
+                        .type_payload(cached)
+                        .ok_or_else(invalid)?
+                        .object_flags(),
+                    &arguments,
+                )?
+                || store
+                    .inline_property_object_recovery(cached)
+                    .is_some_and(|recovery| {
+                        recovery.result() != cached || !recovery.matches_current_result(store)
+                    })
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    if store
+        .inline_property_object_recovery(type_)
+        .is_some_and(|recovery| {
+            recovery.result() != type_ || !recovery.matches_current_result(store)
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(Some(InlinePropertyObjectProjection {
+        type_,
+        target,
+        declaration: source.declaration,
+        source_symbol: source.source_symbol,
+        parameter_owner: source.parameter_owner,
+        parameters,
+        arguments,
+        mapper,
+        properties: source.properties,
+    }))
+}
+
+fn cached_inline_property_object_physical_arguments(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<Vec<TypeId>>, RelationUnavailable> {
+    let Some(source) = inline_source_for_record(store, type_)? else {
+        return Ok(None);
+    };
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let target = store
+        .type_node_links(source.declaration)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let parameters = inline_source_parameters(store, &source)?;
+    if type_ == target {
+        return Ok(Some(parameters));
+    }
+    let (arguments, _) = inline_instance_fields(store, &source, target, &parameters, type_)?;
+    if cached_instantiation(
+        &target_object(store, target)?.instantiations,
+        type_alias_instantiation_cache_key(&arguments, None),
+    ) != Some(type_)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(arguments))
+}
+
+/// Parent proof for literals in an intersection, never for a direct alias RHS.
+fn inline_source_syntax<M>(
+    store: &SemanticStore<TypeRecord, M>,
+    rhs: NodeRef,
+) -> Option<SourceSyntax> {
+    if store.source_node_kind(rhs) != Some(SyntaxKind::TypeLiteral) {
+        return None;
+    }
+    let mut root = rhs;
+    let mut wrappers = Vec::new();
+    let mut seen = HashSet::from([rhs]);
+    let mut intersection = false;
+    let alias_declaration = loop {
+        let SourceNodeParent::Parent(parent) = store.source_node_parent(root)? else {
+            return None;
+        };
+        if parent.arena != rhs.arena || parent.file != rhs.file || !seen.insert(parent) {
+            return None;
+        }
+        let children = store.source_direct_children(parent)?;
+        if children.iter().filter(|&&child| child == root).count() != 1
+            || children.iter().any(|child| {
+                child.arena != rhs.arena
+                    || child.file != rhs.file
+                    || store.source_node_parent(*child) != Some(SourceNodeParent::Parent(parent))
+            })
+        {
+            return None;
+        }
+        match store.source_node_kind(parent)? {
+            SyntaxKind::ParenthesizedType if children.as_slice() == [root] => {
+                if !intersection {
+                    wrappers.push(parent);
+                }
+                root = parent;
+            }
+            SyntaxKind::IntersectionType if children.len() >= 2 => {
+                let mut previous = None;
+                for child in children {
+                    let start = store.source_node_start(child)?;
+                    if previous.is_some_and(|previous| previous >= start) {
+                        return None;
+                    }
+                    previous = Some(start);
+                }
+                intersection = true;
+                root = parent;
+            }
+            SyntaxKind::TypeAliasDeclaration if intersection => break parent,
+            _ => return None,
+        }
+    };
+    if store.source_direct_type_annotation(alias_declaration) != Some(root) {
+        return None;
+    }
+    let mut parameters = store
+        .source_direct_children(alias_declaration)?
+        .into_iter()
+        .filter(|child| store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter))
+        .collect::<Vec<_>>();
+    if parameters.is_empty() {
+        return None;
+    }
+    parameters.sort_by_key(|parameter| store.source_node_start(*parameter));
+    let mut properties = store.source_direct_children(rhs)?;
+    if properties.is_empty()
+        || properties.iter().any(|property| {
+            !matches!(
+                store.source_node_kind(*property),
+                Some(SyntaxKind::PropertySignature | SyntaxKind::PropertyDeclaration)
+            ) || store
+                .source_child_with_kind(*property, SyntaxKind::ComputedPropertyName)
+                .is_some()
+        })
+    {
+        return None;
+    }
+    properties.sort_by_key(|property| store.source_node_start(*property));
+    Some(SourceSyntax {
+        declaration: rhs,
+        alias_declaration,
+        wrappers,
+        parameters,
+        properties,
+    })
+}
+
+/// Proves a closed alias body from source without evaluating its annotations.
+pub(super) fn closed_type_alias_source_header(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Result<Option<ClosedTypeAliasSourceHeader>, RelationUnavailable> {
+    if !matches!(
+        store.source_node_kind(declaration),
+        Some(SyntaxKind::TypeLiteral | SyntaxKind::FunctionType)
+    ) {
+        return Ok(None);
+    }
+    let mut root = declaration;
+    let mut wrappers = Vec::new();
+    let mut seen = HashSet::from([root]);
+    let alias_declaration = loop {
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(root) else {
+            return Ok(None);
+        };
+        if parent.arena != declaration.arena
+            || parent.file != declaration.file
+            || !seen.insert(parent)
+        {
+            return Ok(None);
+        }
+        match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType)
+                if store.source_direct_children(parent).as_deref() == Some(&[root]) =>
+            {
+                wrappers.push(parent);
+                root = parent;
+            }
+            Some(SyntaxKind::TypeAliasDeclaration) => break parent,
+            _ => return Ok(None),
+        }
+    };
+    if store.source_direct_type_annotation(alias_declaration) != Some(root)
+        || store
+            .source_direct_children(declaration)
+            .is_none_or(|children| {
+                children
+                    .iter()
+                    .any(|node| store.source_node_kind(*node) == Some(SyntaxKind::TypeParameter))
+            })
+    {
+        return Ok(None);
+    }
+    let Some(alias_symbol) = bound_declaration_symbol(store, alias_declaration) else {
+        return Ok(None);
+    };
+    if alias_has_enclosing_type_parameters(store, alias_declaration, alias_symbol)? {
+        return Ok(None);
+    }
+    let owner = property_object_alias_identity_source_header(store, alias_symbol)?;
+    if !owner.parameters.is_empty() {
+        return Ok(None);
+    }
+    let source_symbol = if store.source_node_kind(declaration) == Some(SyntaxKind::FunctionType) {
+        closed_function_type_source_symbol(store, declaration, alias_symbol)?
+    } else {
+        let syntax = SourceSyntax {
+            declaration,
+            alias_declaration,
+            wrappers,
+            parameters: Vec::new(),
+            properties: Vec::new(),
+        };
+        let Some((source_symbol, actual_alias)) = source_symbols(store, &syntax)? else {
+            return Ok(None);
+        };
+        if actual_alias != alias_symbol {
+            return Err(RelationUnavailable::Symbol(alias_symbol));
+        }
+        source_symbol
+    };
+    Ok(Some(ClosedTypeAliasSourceHeader {
+        declaration,
+        source_symbol,
+        alias_declaration,
+        alias_symbol,
+    }))
+}
+
+fn closed_function_type_source_symbol(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    alias: SemanticSymbolId,
+) -> Result<SemanticSymbolId, RelationUnavailable> {
+    let symbol =
+        bound_declaration_symbol(store, declaration).ok_or(RelationUnavailable::Symbol(alias))?;
+    let invalid = || RelationUnavailable::Symbol(symbol);
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let members = record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let call = members
+        .get(InternalSymbolName::Call.as_ref())
+        .ok_or_else(invalid)?;
+    let call_record = store.symbol(call).ok_or_else(invalid)?;
+    if store.get_merged_symbol(symbol) != Some(symbol)
+        || !store.source_declaration_belongs_to_symbol(declaration, symbol)
+        || !store.source_symbol_declarations_match(symbol)
+        || record.flags() != SymbolFlags::TYPE_LITERAL
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != InternalSymbolName::Type.as_ref()
+        || record.declarations() != Some(&[declaration])
+        || record.value_declaration().is_some()
+        || record.parent().is_some()
+        || record.exports().is_some()
+        || record.export_symbol().is_some()
+        || members.len() != 1
+        || store.get_merged_symbol(call) != Some(call)
+        || !store.source_declaration_belongs_to_symbol(declaration, call)
+        || !store.source_symbol_declarations_match(call)
+        || call_record.flags() != SymbolFlags::SIGNATURE
+        || call_record.check_flags() != CheckFlags::NONE
+        || call_record.name() != InternalSymbolName::Call.as_ref()
+        || call_record.declarations() != Some(&[declaration])
+        || call_record.value_declaration().is_some()
+        || call_record.parent().is_some()
+        || call_record.members().is_some()
+        || call_record.exports().is_some()
+        || call_record.export_symbol().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(symbol)
+}
+
+/// Reads only source and identity fields, without entering member or signature proofs.
+fn closed_declared_object_source_identity(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<ClosedTypeAliasSourceHeader>, RelationUnavailable> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    let TypeData::Object(object) = record.data() else {
+        return Ok(None);
+    };
+    let Some(symbol) = record.symbol() else {
+        return Ok(None);
+    };
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+    else {
+        return Ok(None);
+    };
+    let Some(header) = closed_type_alias_source_header(store, *declaration)? else {
+        return Ok(None);
+    };
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let alias = record
+        .alias()
+        .and_then(|alias| store.type_alias(alias))
+        .ok_or_else(invalid)?;
+    let mutable =
+        ObjectFlags::MEMBERS_RESOLVED | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED;
+    if record.flags() != TypeFlags::OBJECT
+        || symbol != header.source_symbol
+        || record.object_flags() & !mutable != ObjectFlags::ANONYMOUS
+        || alias.symbol() != Some(header.alias_symbol)
+        || alias.type_arguments().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || store.property_object_alias_recovery(type_).is_some()
+        || store.inline_property_object_recovery(type_).is_some()
+        || store.type_node_links(*declaration)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        || store
+            .type_alias_links(header.alias_symbol)
+            .is_some_and(|links| {
+                links.declared_type.is_some_and(|cached| cached != type_)
+                    || links.type_parameters.is_some()
+                    || links.instantiations.is_some()
+                    || links.is_constructor_declared_property
+            })
+    {
+        return Err(invalid());
+    }
+    let root = store
+        .source_direct_type_annotation(header.alias_declaration)
+        .ok_or_else(invalid)?;
+    let (inner, wrappers) = source_parentheses(store, root, header.alias_symbol)?;
+    if inner != *declaration {
+        return Err(invalid());
+    }
+    for wrapper in wrappers {
+        if store.type_node_links(wrapper).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != type_)
+        }) || store
+            .symbol_node_links(wrapper)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(header))
+}
+
+/// Mapping a closed declared object preserves its identity and leaves values lazy.
+#[allow(clippy::too_many_lines)] // The source record and all present cache edges form one proof.
+pub(super) fn closed_declared_property_object_is_mapping_invariant(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<bool, RelationUnavailable> {
+    let Some(header) = closed_declared_object_source_identity(store, type_)? else {
+        return Ok(false);
+    };
+    if store.source_node_kind(header.declaration) != Some(SyntaxKind::TypeLiteral) {
+        return Ok(false);
+    }
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let object = target_object(store, type_)?;
+    let syntax = SourceSyntax {
+        declaration: header.declaration,
+        alias_declaration: header.alias_declaration,
+        wrappers: Vec::new(),
+        parameters: Vec::new(),
+        properties: store
+            .source_direct_children(header.declaration)
+            .ok_or_else(invalid)?,
+    };
+    let properties = source_properties(store, &syntax, header.source_symbol)?;
+    let ready = record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED);
+    let expected = if ready {
+        super::type_records::StructuredTypeData {
+            members: store
+                .symbol(header.source_symbol)
+                .ok_or_else(invalid)?
+                .members(),
+            properties: (!properties.is_empty())
+                .then(|| properties.iter().map(|property| property.symbol).collect()),
+            ..super::type_records::StructuredTypeData::default()
+        }
+    } else {
+        super::type_records::StructuredTypeData::default()
+    };
+    if object.structured != expected {
+        return Err(invalid());
+    }
+    for property in properties {
+        if ready
+            && store
+                .value_symbol_links(property.symbol)
+                .is_none_or(|links| links.resolved_type.is_none())
+        {
+            return Err(invalid());
+        }
+        if let Some(links) = store.value_symbol_links(property.symbol)
+            && (links
+                != &ValueSymbolLinks {
+                    resolved_type: links.resolved_type,
+                    ..ValueSymbolLinks::default()
+                }
+                || links.resolved_type.is_some_and(|value| {
+                    store.type_payload(value).is_none()
+                        || store.symbol(property.symbol).is_none_or(|symbol| {
+                            symbol.check_flags()
+                                != if property.readonly {
+                                    CheckFlags::READONLY
+                                } else {
+                                    CheckFlags::NONE
+                                }
+                        })
+                        || !closed_property_annotation_value_matches(
+                            store,
+                            property.type_node,
+                            value,
+                            &mut HashSet::new(),
+                        )
+                }))
+        {
+            return Err(invalid());
+        }
+        if store
+            .type_node_links(property.type_node)
+            .is_some_and(|links| {
+                links.resolved_type.is_some_and(|value| {
+                    store.type_payload(value).is_none()
+                        || !closed_property_annotation_value_matches(
+                            store,
+                            property.type_node,
+                            value,
+                            &mut HashSet::new(),
+                        )
+                })
+            })
+        {
+            return Err(invalid());
+        }
+        if store
+            .type_node_links(property.type_node)
+            .is_none_or(|links| links.resolved_type.is_none())
+            && (store
+                .type_node_links(property.type_node)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+                || store
+                    .symbol_node_links(property.type_node)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default()))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(true)
+}
+
+/// Checks stored annotation results. Name resolution and import authority stay with the query.
+fn closed_property_annotation_value_matches(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    value: TypeId,
+    active: &mut HashSet<NodeRef>,
+) -> bool {
+    if !active.insert(node) {
+        return false;
+    }
+    let valid = closed_property_annotation_value_matches_worker(store, node, value, active);
+    active.remove(&node);
+    valid
+}
+
+#[allow(clippy::too_many_lines)] // Keep the source form, original provider, and alias row together.
+fn closed_property_annotation_value_matches_worker(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    value: TypeId,
+    active: &mut HashSet<NodeRef>,
+) -> bool {
+    if store.source_type_node_result_is_exact(node, value, &[]) {
+        return true;
+    }
+    if !store.source_direct_type_annotation_is_exact(node, value) {
+        return false;
+    }
+    let Some(children) = store.source_direct_children(node) else {
+        return false;
+    };
+    if children.iter().any(|child| {
+        child.arena != node.arena
+            || child.file != node.file
+            || store.source_node_parent(*child) != Some(SourceNodeParent::Parent(node))
+    }) {
+        return false;
+    }
+    match store.source_node_kind(node) {
+        Some(SyntaxKind::ParenthesizedType) => {
+            matches!(children.as_slice(), [child]
+                if store.symbol_node_links(node).is_none_or(|links| links == &SymbolNodeLinks::default())
+                    && closed_property_annotation_value_matches(store, *child, value, active))
+        }
+        Some(SyntaxKind::FunctionType) => {
+            matches!(
+                super::functions::validate_stored_function_type(store, value),
+                super::functions::StoredFunctionTypeValidation::Valid(_)
+            ) && store
+                .type_payload(value)
+                .and_then(TypeRecord::symbol)
+                .is_some_and(|symbol| {
+                    store
+                        .symbol(symbol)
+                        .is_some_and(|record| record.declarations() == Some(&[node]))
+                        && store.source_declaration_belongs_to_symbol(node, symbol)
+                })
+        }
+        Some(SyntaxKind::TypeLiteral) => {
+            matches!(closed_declared_object_source_identity(store, value), Ok(Some(source))
+                if source.declaration == node)
+        }
+        Some(SyntaxKind::TypeReference) => {
+            let Some(owner) = store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+            else {
+                return false;
+            };
+            let Ok(source) = property_object_alias_identity_source_header(store, owner) else {
+                return false;
+            };
+            let [name, argument_nodes @ ..] = children.as_slice() else {
+                return false;
+            };
+            if !super::object_members::source_resolved_constructor_name_cache_is_exact(
+                store, *name, owner,
+            ) {
+                return false;
+            }
+            let Some(arguments) = argument_nodes
+                .iter()
+                .map(|&argument| {
+                    let value =
+                        super::object_members::cached_planned_type_identity(store, argument)?;
+                    closed_property_annotation_value_matches(store, argument, value, active)
+                        .then_some(value)
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            if !super::object_members::cached_alias_reference_annotation_matches(
+                store, owner, &arguments, value,
+            ) {
+                return false;
+            }
+            if let Ok(Some(projection)) = property_object_alias_projection(store, value) {
+                return projection.identity_symbol == owner
+                    && projection.identity_arguments.starts_with(&arguments);
+            }
+            if !source.parameters.is_empty() || !arguments.is_empty() {
+                return false;
+            }
+            store
+                .source_direct_type_annotation(source.alias_declaration)
+                .is_some_and(|body| {
+                    closed_property_annotation_value_matches(store, body, value, active)
+                })
+        }
+        _ => false,
+    }
 }
 
 /// The first alias slice maps its own parameters, not captured outer ones.
@@ -643,7 +1657,7 @@ pub(super) fn cached_property_object_alias_physical_arguments(
             .and_then(|target| store.type_payload(target))
             .and_then(|target| source_syntax_for_record(store, target))
     }) else {
-        return Ok(None);
+        return cached_inline_property_object_physical_arguments(store, type_);
     };
     if property_object_alias_has_enclosing_type_parameters(store, syntax.declaration)? {
         return Err(RelationUnavailable::UnsupportedStructuredType(type_));
@@ -1973,6 +2987,18 @@ fn valid_original_object_flags(flags: ObjectFlags) -> bool {
         && (flags & variable_flags == ObjectFlags::NONE || flags & variable_flags == variable_flags)
 }
 
+/// Checks inline instance flags without entering its projection or recovery proof.
+pub(super) fn source_property_object_instance_flags_match(
+    store: &CanonicalTypeMapperStore,
+    flags: ObjectFlags,
+    physical_arguments: &[TypeId],
+) -> Result<bool, RelationUnavailable> {
+    Ok(
+        valid_instance_object_flag_header(store, flags, physical_arguments)?
+            && valid_instance_variable_flags(store, flags, physical_arguments)?,
+    )
+}
+
 fn valid_instance_object_flag_header(
     store: &CanonicalTypeMapperStore,
     flags: ObjectFlags,
@@ -2077,6 +3103,17 @@ fn argument_contains_variables(
         {
             Some(true)
         }
+        TypeData::Object(_) => {
+            if let Some(arguments) = cached_inline_property_object_physical_arguments(store, type_)?
+            {
+                children.extend(arguments);
+                None
+            } else if closed_declared_object_source_identity(store, type_)?.is_some() {
+                Some(true)
+            } else {
+                Some(false)
+            }
+        }
         _ => Some(false),
     };
     let mut contains = constant == Some(false);
@@ -2102,6 +3139,516 @@ fn append_alias_arguments(
         arguments.extend_from_slice(alias.type_arguments().unwrap_or_default());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inline_source_tests {
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeHost,
+        object_members::{
+            PropertyObjectState, ensure_type_literal_shell, plan_type_literal,
+            preflight_inline_type_literal_shell_cache, publish_property_members,
+        },
+        production::GlobalMergeCompletion,
+    };
+
+    const FILE: FileId = FileId::new(29_840);
+
+    fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        context_with_module_state(parsed, CanonicalModuleState::Script)
+    }
+
+    fn context_with_module_state(
+        parsed: &ParseResult,
+        module_state: CanonicalModuleState,
+    ) -> CanonicalCheckerContext<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/inline-source.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    module_state,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, FILE)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(FILE, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn alias_body(context: &CanonicalCheckerContext<'_>, name: &str) -> NodeRef {
+        let store = context.store();
+        let symbol = store
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source(name)
+            .unwrap();
+        let symbol = store.get_merged_symbol(symbol).unwrap();
+        let declaration = store.symbol(symbol).unwrap().declarations().unwrap()[0];
+        store.source_direct_type_annotation(declaration).unwrap()
+    }
+
+    fn literal_under(store: &CanonicalTypeMapperStore, node: NodeRef) -> NodeRef {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if store.source_node_kind(node) == Some(SyntaxKind::TypeLiteral) {
+                return node;
+            }
+            pending.extend(store.source_direct_children(node).unwrap());
+        }
+        panic!("the test alias must contain a literal")
+    }
+
+    fn counts(store: &CanonicalTypeMapperStore) -> ([usize; 6], [usize; 26]) {
+        (
+            [
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.type_alias_len(),
+            ],
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the original source, poison, and restored proof together.
+    fn inline_source_keeps_lexical_parameters_and_original_literal_identity() {
+        let parsed = parse_source_file(concat!(
+            "type Observer<T> = { next: (value: T) => void; }; ",
+            "type Subject<T> = ({ readonly observers: Observer<T>[]; ",
+            "subscribe: (value: Observer<T>) => number; }) & Observer<T>;",
+        ));
+        let mut context = context(&parsed);
+        let observer = alias_body(&context, "Observer");
+        let subject_body = alias_body(&context, "Subject");
+        let literal = literal_under(context.store(), subject_body);
+        let before = counts(context.store());
+        let source = inline_property_object_source_header(context.store(), literal)
+            .unwrap()
+            .unwrap();
+        let observer_source = property_object_alias_source_header(context.store(), observer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.declaration, literal);
+        assert_eq!(source.parameters.len(), 1);
+        assert_eq!(source.properties.len(), 2);
+        assert!(source.properties[0].readonly);
+        assert!(!source.properties[1].readonly);
+        assert_ne!(source.parameters[0].1, observer_source.parameters[0].1);
+        assert_ne!(source.parameter_owner, observer_source.alias_symbol);
+        assert!(
+            property_object_alias_source_header(context.store(), literal)
+                .unwrap()
+                .is_none()
+        );
+        for property in &source.properties {
+            assert_eq!(
+                context.store().symbol(property.symbol).unwrap().parent(),
+                Some(source.source_symbol)
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(property.symbol)
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store()
+                    .type_node_links(property.type_node)
+                    .is_none()
+            );
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                inline_property_object_source_header(context.store(), literal).unwrap(),
+                Some(source.clone())
+            );
+            assert_eq!(counts(context.store()), before);
+        }
+
+        let parameter = context
+            .get_declared_type_of_symbol(source.parameters[0].1)
+            .unwrap();
+        let other_parameter = context
+            .get_declared_type_of_symbol(observer_source.parameters[0].1)
+            .unwrap();
+        assert_ne!(parameter, other_parameter);
+        let bound = context.file(FILE).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let plan = plan_type_literal(store, &host, literal, None).unwrap();
+        let state = ensure_type_literal_shell(store, &plan).unwrap();
+        let PropertyObjectState::Shell(target) = state else {
+            panic!("a new inline object must have a cold shell")
+        };
+        assert!(store.type_payload(target).unwrap().alias().is_none());
+        assert_eq!(
+            store.type_payload(target).unwrap().symbol(),
+            Some(source.source_symbol)
+        );
+        assert!(
+            property_object_alias_projection(store, target)
+                .unwrap()
+                .is_none()
+        );
+        let projection = source_property_object_projection(store, target)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            projection,
+            SourcePropertyObjectProjection::Inline(_)
+        ));
+        assert_eq!(projection.target(), target);
+        assert_eq!(projection.parameters(), &[parameter]);
+        assert_eq!(projection.arguments(), &[parameter]);
+        assert_eq!(projection.parameter_owner(), source.parameter_owner);
+        assert!(projection.mapper().is_none());
+        assert!(projection.display_identity().is_none());
+        assert!(projection.identity_arguments().is_empty());
+        let original = store.type_node_links(literal).unwrap().clone();
+        assert_eq!(
+            original.outer_type_parameters.as_deref(),
+            Some(&[parameter][..])
+        );
+        assert!(store.set_type_node_links(
+            literal,
+            TypeNodeLinks {
+                resolved_type: Some(target),
+                outer_type_parameters: Some(vec![other_parameter]),
+            }
+        ));
+        let poisoned = counts(store);
+        for _ in 0..2 {
+            assert!(source_property_object_projection(store, target).is_err());
+            assert!(ensure_type_literal_shell(store, &plan).is_err());
+            assert_eq!(counts(store), poisoned);
+        }
+        assert!(store.set_type_node_links(literal, original));
+        let warm = counts(store);
+        for _ in 0..2 {
+            assert_eq!(ensure_type_literal_shell(store, &plan).unwrap(), state);
+            assert_eq!(
+                source_property_object_projection(store, target).unwrap(),
+                Some(projection.clone())
+            );
+            assert_eq!(counts(store), warm);
+            for property in &source.properties {
+                assert!(store.value_symbol_links(property.symbol).is_none());
+                assert!(store.type_node_links(property.type_node).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn inline_shell_rejects_cold_property_link_poison_before_publication() {
+        let parsed = parse_source_file(
+            "type Other<T> = { other: T }; type Subject<T> = { value: T; fixed: \"fixed\" } & Other<T>;",
+        );
+        let mut context = context(&parsed);
+        let body = alias_body(&context, "Subject");
+        let literal = literal_under(context.store(), body);
+        let source = inline_property_object_source_header(context.store(), literal)
+            .unwrap()
+            .unwrap();
+        let bound = context.file(FILE).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_type_literal(context.store(), &host, literal, None).unwrap();
+        let annotation = plan.properties[1].type_node;
+        let fixed = context.get_type_from_type_node(annotation).unwrap();
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            store.type_node_links(annotation).unwrap().resolved_type,
+            Some(fixed)
+        );
+        assert!(store.declared_type_links(source.parameters[0].1).is_none());
+        let property = plan.properties[0].symbol;
+        let links = ValueSymbolLinks {
+            write_type: Some(store.intrinsic_bootstrap().unwrap().number_type),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(store.set_value_symbol_links(property, links.clone()));
+        let poisoned = counts(store);
+        for _ in 0..2 {
+            assert!(preflight_inline_type_literal_shell_cache(store, &plan).is_err());
+            assert!(ensure_type_literal_shell(store, &plan).is_err());
+            assert_eq!(store.value_symbol_links(property), Some(&links));
+            assert!(store.type_node_links(literal).is_none());
+            assert!(store.declared_type_links(source.parameters[0].1).is_none());
+            assert_eq!(
+                store.type_node_links(annotation).unwrap().resolved_type,
+                Some(fixed)
+            );
+            assert_eq!(counts(store), poisoned);
+        }
+        assert!(store.set_value_symbol_links(property, ValueSymbolLinks::default()));
+        assert_eq!(
+            preflight_inline_type_literal_shell_cache(store, &plan).unwrap(),
+            None
+        );
+        assert_eq!(counts(store), poisoned);
+        context
+            .get_declared_type_of_symbol(source.parameters[0].1)
+            .unwrap();
+        let store = context.store_mut_for_test();
+        assert!(matches!(
+            ensure_type_literal_shell(store, &plan),
+            Ok(PropertyObjectState::Shell(_))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold source, cache poison, and restoration share the same object.
+    fn closed_alias_source_identity_keeps_properties_cold_and_checks_present_values() {
+        let parsed = parse_source_file(concat!(
+            "type Closed = { value: number; }; type Noop = () => void; ",
+            "type Generic<T> = { value: T; }; ",
+            "function outer<T>() { type Captured = { value: T; }; }",
+        ));
+        let mut context = context(&parsed);
+        let closed = alias_body(&context, "Closed");
+        let noop = alias_body(&context, "Noop");
+        let generic = alias_body(&context, "Generic");
+        let captured = parsed
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                if record.kind != SyntaxKind::TypeAliasDeclaration {
+                    return None;
+                }
+                let node = NodeRef::new(parsed.arena.id(), FILE, id);
+                let name = context
+                    .store()
+                    .source_child_with_kind(node, SyntaxKind::Identifier)?;
+                (context.store().source_identifier_text(name) == Some("Captured"))
+                    .then(|| context.store().source_direct_type_annotation(node).unwrap())
+            })
+            .unwrap();
+        let before = counts(context.store());
+        let source = closed_type_alias_source_header(context.store(), closed)
+            .unwrap()
+            .unwrap();
+        assert!(
+            closed_type_alias_source_header(context.store(), noop)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            closed_type_alias_source_header(context.store(), generic)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            closed_type_alias_source_header(context.store(), captured)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(counts(context.store()), before);
+        let bound = context.file(FILE).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let plan = plan_type_literal(store, &host, closed, Some(source.alias_symbol)).unwrap();
+        let target = ensure_type_literal_shell(store, &plan).unwrap().type_id();
+        let property = &plan.properties[0];
+        assert!(store.value_symbol_links(property.symbol).is_none());
+        assert!(store.type_node_links(property.type_node).is_none());
+        let warm = counts(store);
+        for _ in 0..2 {
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).unwrap());
+            assert_eq!(counts(store), warm);
+            assert!(store.value_symbol_links(property.symbol).is_none());
+            assert!(store.type_node_links(property.type_node).is_none());
+        }
+        let partial = TypeNodeLinks {
+            outer_type_parameters: Some(vec![store.intrinsic_bootstrap().unwrap().number_type]),
+            ..TypeNodeLinks::default()
+        };
+        assert!(store.set_type_node_links(property.type_node, partial.clone()));
+        let poisoned = counts(store);
+        for _ in 0..2 {
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).is_err());
+            assert_eq!(store.type_node_links(property.type_node), Some(&partial));
+            assert_eq!(counts(store), poisoned);
+        }
+        assert!(store.set_type_node_links(property.type_node, TypeNodeLinks::default()));
+        let partial = SymbolNodeLinks {
+            resolved_symbol: Some(source.alias_symbol),
+        };
+        assert!(store.set_symbol_node_links(property.type_node, partial.clone()));
+        let poisoned = counts(store);
+        for _ in 0..2 {
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).is_err());
+            assert_eq!(store.symbol_node_links(property.type_node), Some(&partial));
+            assert_eq!(counts(store), poisoned);
+        }
+        assert!(store.set_symbol_node_links(property.type_node, SymbolNodeLinks::default()));
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let links = ValueSymbolLinks {
+            resolved_type: Some(string),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(store.set_value_symbol_links(property.symbol, links.clone()));
+        let poisoned = counts(store);
+        for _ in 0..2 {
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).is_err());
+            assert_eq!(store.value_symbol_links(property.symbol), Some(&links));
+            assert_eq!(counts(store), poisoned);
+        }
+        assert!(store.set_value_symbol_links(property.symbol, ValueSymbolLinks::default()));
+        assert!(closed_declared_property_object_is_mapping_invariant(store, target).unwrap());
+        assert_eq!(counts(store), poisoned);
+    }
+
+    #[test]
+    fn closed_property_named_cache_must_match_real_alias_provider() {
+        let parsed = parse_source_file("type Noop = () => void; type Closed = { value: Noop; };");
+        let mut context = context(&parsed);
+        let literal = alias_body(&context, "Closed");
+        let source = closed_type_alias_source_header(context.store(), literal)
+            .unwrap()
+            .unwrap();
+        let bound = context.file(FILE).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan =
+            plan_type_literal(context.store(), &host, literal, Some(source.alias_symbol)).unwrap();
+        let state = ensure_type_literal_shell(context.store_mut_for_test(), &plan).unwrap();
+        let property = &plan.properties[0];
+        let value = context.get_type_from_type_node(property.type_node).unwrap();
+        let store = context.store_mut_for_test();
+        let target = publish_property_members(store, &plan, state, &[value]).unwrap();
+        assert!(closed_declared_property_object_is_mapping_invariant(store, target).unwrap());
+        let value_links = store.value_symbol_links(property.symbol).unwrap().clone();
+        let type_links = store.type_node_links(property.type_node).unwrap().clone();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert_ne!(value, number);
+        assert!(store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(store.set_type_node_links(
+            property.type_node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let poisoned = counts(store);
+        for _ in 0..2 {
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).is_err());
+            assert_eq!(counts(store), poisoned);
+        }
+        assert!(store.set_value_symbol_links(property.symbol, value_links));
+        assert!(store.set_type_node_links(property.type_node, type_links));
+        for _ in 0..2 {
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).unwrap());
+            assert_eq!(counts(store), poisoned);
+        }
+    }
+
+    #[test]
+    fn closed_exported_alias_source_identity_replays_resolved_members() {
+        for text in [
+            "export type Closed = { readonly value: number; };",
+            "export type Closed = {};",
+        ] {
+            let parsed = parse_source_file(text);
+            let mut context = context_with_module_state(&parsed, CanonicalModuleState::External);
+            let literal = literal_under(
+                context.store(),
+                NodeRef::new(parsed.arena.id(), FILE, parsed.source_file),
+            );
+            let source = closed_type_alias_source_header(context.store(), literal)
+                .unwrap()
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .symbol(source.alias_symbol)
+                    .unwrap()
+                    .parent()
+                    .is_some()
+            );
+            let bound = context.file(FILE).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let store = context.store_mut_for_test();
+            let plan = plan_type_literal(store, &host, literal, Some(source.alias_symbol)).unwrap();
+            let state = ensure_type_literal_shell(store, &plan).unwrap();
+            let target = state.type_id();
+            assert!(closed_declared_property_object_is_mapping_invariant(store, target).unwrap());
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let values = vec![number; plan.properties.len()];
+            assert_eq!(
+                publish_property_members(store, &plan, state, &values).unwrap(),
+                target
+            );
+            let warm = counts(store);
+            for _ in 0..2 {
+                assert!(
+                    closed_declared_property_object_is_mapping_invariant(store, target).unwrap()
+                );
+                assert_eq!(counts(store), warm);
+                for property in &plan.properties {
+                    assert_eq!(
+                        store.symbol(property.symbol).unwrap().parent(),
+                        Some(source.source_symbol)
+                    );
+                    assert_eq!(
+                        store
+                            .value_symbol_links(property.symbol)
+                            .unwrap()
+                            .resolved_type,
+                        Some(number)
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

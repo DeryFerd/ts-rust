@@ -137,6 +137,7 @@ use super::{
         type_to_string_with_host_global_types_and_flags,
     },
     instantiate::InstantiationSession,
+    intersection_types::{IntersectionTypeError, demand_source_intersection_members},
     iteration_types::{
         IterationPropertyResolver, SynchronousIterationGlobals, SynchronousIterationQuery,
         SynchronousIterationUse, prepare_iteration_diagnostics,
@@ -32417,6 +32418,20 @@ fn check_expression_type_with_capture_context(
                     diagnostics,
                     contextual_type,
                 )?;
+                if store
+                    .type_payload(contextual_type)
+                    .is_some_and(|record| matches!(record.data(), TypeData::Intersection(_)))
+                {
+                    demand_source_intersection_members(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        contextual_type,
+                    )?;
+                }
             }
             let (prepared, tuple_contexts) = if let Some(contextual_type) = contextual_type {
                 if matches!(
@@ -37822,7 +37837,81 @@ fn prepare_source_nongeneric_interface_members(
     Ok(true)
 }
 
+struct SourceMemberRetryCandidate {
+    type_: TypeId,
+    intersection: Option<TypeId>,
+}
+
+fn source_member_retry_intersection_error(
+    receiver: TypeId,
+    error: IntersectionTypeError,
+) -> RelationUnavailable {
+    match error {
+        IntersectionTypeError::BootstrapUninitialized => RelationUnavailable::MissingBootstrap,
+        IntersectionTypeError::Capacity => RelationUnavailable::UnionValidationCapacity(receiver),
+        IntersectionTypeError::UnsupportedConstituent(type_)
+        | IntersectionTypeError::UnsupportedPropertyType(type_) => {
+            RelationUnavailable::UnsupportedStructuredType(type_)
+        }
+        IntersectionTypeError::MalformedConstituent(type_) => {
+            RelationUnavailable::InvalidStructuredMembers(type_)
+        }
+        IntersectionTypeError::InvalidAliasSymbol(symbol) => RelationUnavailable::Symbol(symbol),
+        IntersectionTypeError::InvalidCachedIntersection(type_) => {
+            RelationUnavailable::MalformedIntersection(type_)
+        }
+    }
+}
+
+/// Expands only the exact stored intersection edges, without demanding member values.
+fn source_member_retry_candidates(
+    store: &CanonicalTypeMapperStore,
+    candidates: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Vec<SourceMemberRetryCandidate>, SourceCheckError> {
+    let mut result = Vec::new();
+    for &candidate in candidates {
+        if let Some(record) = store.type_payload(candidate)
+            && matches!(record.data(), TypeData::Intersection(_))
+        {
+            let types = if record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                store
+                    .validate_intersection_type_with_array_targets(candidate, array_targets)
+                    .map(|projection| projection.types)
+            } else {
+                store
+                    .validate_deferred_intersection_type_with_array_targets(
+                        candidate,
+                        array_targets,
+                    )
+                    .map(|projection| projection.types)
+            }
+            .map_err(|error| source_member_retry_intersection_error(candidate, error))?;
+            result
+                .try_reserve(types.len())
+                .map_err(|_| RelationUnavailable::UnionValidationCapacity(candidate))?;
+            result.extend(types.into_iter().map(|type_| SourceMemberRetryCandidate {
+                type_,
+                intersection: Some(candidate),
+            }));
+        } else {
+            result
+                .try_reserve(1)
+                .map_err(|_| RelationUnavailable::UnionValidationCapacity(candidate))?;
+            result.push(SourceMemberRetryCandidate {
+                type_: candidate,
+                intersection: None,
+            });
+        }
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)] // Lazy annotations retain the caller's complete query state.
+#[allow(clippy::too_many_lines)] // Keep exact intersection retries separate from the existing direct fallback.
 pub(super) fn retry_source_generic_member_failure(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -37852,8 +37941,25 @@ pub(super) fn retry_source_generic_member_failure(
             )? {
                 return Ok(());
             }
-            if super::object_aliases::property_object_alias_projection(store, type_)?.is_some() {
-                super::instantiated_members::resolve_property_object_alias_members(store, type_)?;
+            if store
+                .type_payload(type_)
+                .is_some_and(|record| matches!(record.data(), TypeData::Intersection(_)))
+            {
+                demand_source_intersection_members(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    type_,
+                )?;
+                return Ok(());
+            }
+            if super::object_aliases::source_property_object_projection(store, type_)?.is_some() {
+                super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+                    store, type_, array_targets,
+                )?;
             } else if super::instantiated_members::resolve_members_with_array_targets_and_session(
                 store,
                 type_,
@@ -37869,8 +37975,10 @@ pub(super) fn retry_source_generic_member_failure(
             if !resolved_properties.insert(symbol) {
                 return Err(error.into());
             }
-            for &candidate in candidates {
-                if super::object_aliases::property_object_alias_projection(store, candidate)?
+            let candidates = source_member_retry_candidates(store, candidates, array_targets)?;
+            for candidate in &candidates {
+                let candidate = candidate.type_;
+                if super::object_aliases::source_property_object_projection(store, candidate)?
                     .is_some()
                     && super::instantiated_members::validate_property_object_alias_members_with_array_targets(
                         store,
@@ -37892,30 +38000,70 @@ pub(super) fn retry_source_generic_member_failure(
                     return Ok(());
                 }
             }
-            let reference = candidates.iter().copied().find(|candidate| {
-                super::instantiated_members::validate_generic_interface_members(
+            for candidate in candidates {
+                let reference = candidate.type_;
+                if candidate.intersection.is_some() {
+                    if !store.type_payload(reference).is_some_and(|record| {
+                        record.object_flags().contains(ObjectFlags::REFERENCE)
+                            && matches!(
+                                record.data(),
+                                TypeData::TypeReference(_) | TypeData::Interface(_)
+                            )
+                    }) {
+                        continue;
+                    }
+                    let members = super::instantiated_members::validate_generic_interface_members(
+                        store,
+                        reference,
+                        array_targets,
+                    )
+                    .map_err(|error| {
+                        super::instantiated_members::property_object_alias_member_error(
+                            reference, &error,
+                        )
+                    })?;
+                    if !members.is_some_and(|members| members.properties().contains(&symbol)) {
+                        continue;
+                    }
+                    super::instantiated_members::demand_instantiated_property_type(
+                        store,
+                        reference,
+                        symbol,
+                        array_targets,
+                        session,
+                    )
+                    .map_err(|error| {
+                        super::instantiated_members::property_object_alias_member_error(
+                            reference, &error,
+                        )
+                    })?;
+                    return Ok(());
+                }
+                if !super::instantiated_members::validate_generic_interface_members(
                     store,
-                    *candidate,
+                    reference,
                     array_targets,
                 )
                 .ok()
                 .flatten()
                 .is_some_and(|members| members.properties().contains(&symbol))
-            });
-            let Some(reference) = reference else {
-                return Err(error.into());
-            };
-            if super::instantiated_members::demand_instantiated_property_type(
-                store,
-                reference,
-                symbol,
-                array_targets,
-                session,
-            )
-            .is_err()
-            {
-                return Err(error.into());
+                {
+                    continue;
+                }
+                if super::instantiated_members::demand_instantiated_property_type(
+                    store,
+                    reference,
+                    symbol,
+                    array_targets,
+                    session,
+                )
+                .is_err()
+                {
+                    return Err(error.into());
+                }
+                return Ok(());
             }
+            return Err(error.into());
         }
         _ => return Err(error.into()),
     }
@@ -67382,6 +67530,484 @@ mod tests {
         {
             AliasTargetState::Resolved(target) => target,
             state => panic!("import alias {alias:?} is not resolved: {state:?}"),
+        }
+    }
+
+    const INLINE_INTERSECTION_CONSUMER_DECLARATIONS: &str = concat!(
+        "type Tail<T> = { tail: T }; ",
+        "type Packet<T> = { value: T; untouched: T[] } & Tail<T>; ",
+    );
+
+    #[test]
+    fn inline_intersection_context_demands_members_before_object_alignment() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let library_file = FileId::new(99_150);
+        let source = parsed(&format!(
+            "{INLINE_INTERSECTION_CONSUMER_DECLARATIONS}\
+             const text: Packet<string> = {{ value: 'first', untouched: ['later'], tail: 'last' }};"
+        ));
+        let file = FileId::new(99_151);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let annotation = variable_type_node(&source, file, "text");
+        let receiver = context.get_type_from_type_node(annotation).unwrap();
+        let key = context
+            .store()
+            .intersection_keys_by_type
+            .get(&receiver)
+            .cloned()
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .type_payload(receiver)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .is_none()
+        );
+        context.check_source_file(file).unwrap();
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(receiver));
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let ready = context
+            .store()
+            .validate_intersection_type_with_array_targets(receiver, targets)
+            .unwrap();
+        assert_eq!(ready.types, key.types);
+        assert_eq!(ready.properties.len(), 3);
+        assert_eq!(
+            context.store().intersection_keys_by_type.get(&receiver),
+            Some(&key)
+        );
+        assert_eq!(
+            context.store().intersection_types.get(&key),
+            Some(&receiver)
+        );
+        let initializer = variable_initializer(&source, file, "text");
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(object_property_type(&context, initializer, "value"), string);
+        assert_eq!(object_property_type(&context, initializer, "tail"), string);
+        let untouched = object_property_type(&context, initializer, "untouched");
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(context.global_types(), untouched),
+            Ok(Some(string))
+        );
+        let before = observable_state(&context, file);
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(context.get_type_from_type_node(annotation), Ok(receiver));
+            assert_eq!(
+                context.store().intersection_keys_by_type.get(&receiver),
+                Some(&key)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The same receiver and caller session cross cold demand and warm replay.
+    fn inline_intersection_relation_retry_preserves_receiver_and_caller_session() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let library_file = FileId::new(99_152);
+        let source = parsed(&format!(
+            "{INLINE_INTERSECTION_CONSUMER_DECLARATIONS}declare const text: Packet<string>;"
+        ));
+        let file = FileId::new(99_153);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(library_file, &library), (file, &source)], options);
+        let receiver = context
+            .get_type_from_type_node(variable_type_node(&source, file, "text"))
+            .unwrap();
+        let key = context
+            .store()
+            .intersection_keys_by_type
+            .get(&receiver)
+            .cloned()
+            .unwrap();
+        let inline = super::super::object_aliases::source_property_object_projection(
+            context.store(),
+            key.types[0],
+        )
+        .unwrap()
+        .unwrap();
+        let parameter = inline.parameters()[0];
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits::default(),
+            error_type,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::instantiate::instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter,
+                &[parameter],
+                &[string],
+                targets,
+                &mut session
+            ),
+            Ok(string)
+        );
+        let seeded = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        assert!(seeded.0 > 0);
+        let error = RelationUnavailable::UnresolvedStructuredMembers(receiver);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_assignable_to_with_session(
+                    receiver,
+                    receiver,
+                    Some(&globals),
+                    Some(options.strict_function_types),
+                    &mut session
+                ),
+            Err(error)
+        );
+        let cold = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_session(
+                        receiver,
+                        receiver,
+                        Some(&globals),
+                        Some(options.strict_function_types),
+                        &mut session
+                    ),
+                Err(error)
+            );
+            assert_eq!(observable_state(&context, file), cold);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                seeded
+            );
+        }
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut resolved_members = HashSet::new();
+        let mut resolved_properties = HashSet::new();
+        retry_source_generic_member_failure(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            error,
+            &[receiver],
+            &mut resolved_members,
+            &mut resolved_properties,
+        )
+        .unwrap();
+        assert_eq!(resolved_members, HashSet::from([receiver]));
+        assert!(resolved_properties.is_empty());
+        assert_eq!(
+            context.store().intersection_keys_by_type.get(&receiver),
+            Some(&key)
+        );
+        assert_eq!(
+            context.store().intersection_types.get(&key),
+            Some(&receiver)
+        );
+        let ready = context
+            .store()
+            .validate_intersection_type_with_array_targets(receiver, targets)
+            .unwrap();
+        assert_eq!(ready.types, key.types);
+        assert_eq!(ready.properties.len(), 3);
+        assert!(session.query_count() >= seeded.0);
+        assert!(session.total_count() >= seeded.1);
+        assert_eq!(session.limit_event_count(), seeded.2);
+        assert_eq!(session.recovery_error_type(), Some(error_type));
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .is_type_assignable_to_with_session(
+                    receiver,
+                    receiver,
+                    Some(&globals),
+                    Some(options.strict_function_types),
+                    &mut session
+                ),
+            Ok(true)
+        );
+        let before = observable_state(&context, file);
+        let work = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                demand_source_intersection_members(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    receiver
+                ),
+                Ok(receiver)
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to_with_session(
+                        receiver,
+                        receiver,
+                        Some(&globals),
+                        Some(options.strict_function_types),
+                        &mut session
+                    ),
+                Ok(true)
+            );
+            assert_eq!(
+                retry_source_generic_member_failure(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                    error,
+                    &[receiver],
+                    &mut resolved_members,
+                    &mut resolved_properties
+                ),
+                Err(SourceCheckError::RelationUnavailable(error))
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                work
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exact symbol retry must leave the other template and proxy values cold.
+    fn inline_intersection_property_retry_keeps_unselected_values_cold() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let library_file = FileId::new(99_154);
+        let source = parsed(&format!(
+            "{INLINE_INTERSECTION_CONSUMER_DECLARATIONS}declare const text: Packet<string>;"
+        ));
+        let file = FileId::new(99_155);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&[(library_file, &library), (file, &source)], options);
+        let receiver = context
+            .get_type_from_type_node(variable_type_node(&source, file, "text"))
+            .unwrap();
+        let key = context
+            .store()
+            .intersection_keys_by_type
+            .get(&receiver)
+            .cloned()
+            .unwrap();
+        let [inline, tail] = key.types.as_slice() else {
+            panic!("the source keeps both constituents")
+        };
+        let (inline, tail) = (*inline, *tail);
+        let original = super::super::object_aliases::source_property_object_projection(
+            context.store(),
+            inline,
+        )
+        .unwrap()
+        .unwrap();
+        let tail_original =
+            super::super::object_aliases::source_property_object_projection(context.store(), tail)
+                .unwrap()
+                .unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let members = super::super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+            context.store_mut_for_test(), inline, targets).unwrap();
+        let property = members.properties[0];
+        assert_eq!(
+            context.store().symbol(property).unwrap().name().as_utf8(),
+            Some("value")
+        );
+        let candidates =
+            source_member_retry_candidates(context.store(), &[tail, receiver, inline], targets)
+                .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.type_, candidate.intersection))
+                .collect::<Vec<_>>(),
+            [
+                (tail, None),
+                (inline, Some(receiver)),
+                (tail, Some(receiver)),
+                (inline, None)
+            ]
+        );
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut resolved_members = HashSet::new();
+        let mut resolved_properties = HashSet::new();
+        let error = RelationUnavailable::UnresolvedPropertyType(property);
+        retry_source_generic_member_failure(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+            error,
+            &[tail, receiver],
+            &mut resolved_members,
+            &mut resolved_properties,
+        )
+        .unwrap();
+        assert!(resolved_members.is_empty());
+        assert_eq!(resolved_properties, HashSet::from([property]));
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(property)
+                .unwrap()
+                .resolved_type,
+            Some(string)
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(members.properties[1])
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        for property in original
+            .properties()
+            .iter()
+            .skip(1)
+            .chain(tail_original.properties())
+        {
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(property.symbol)
+                    .is_none_or(|links| links.resolved_type.is_none())
+            );
+            assert!(
+                context
+                    .store()
+                    .type_node_links(property.type_node)
+                    .is_none()
+            );
+        }
+        assert!(
+            context
+                .store()
+                .type_payload(tail)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .type_payload(receiver)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .is_none()
+        );
+        assert_eq!(
+            context.store().intersection_keys_by_type.get(&receiver),
+            Some(&key)
+        );
+        let before = observable_state(&context, file);
+        let work = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        for _ in 0..2 {
+            let mut properties = HashSet::new();
+            retry_source_generic_member_failure(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                error,
+                &[receiver],
+                &mut resolved_members,
+                &mut properties,
+            )
+            .unwrap();
+            assert_eq!(properties, HashSet::from([property]));
+            assert_eq!(observable_state(&context, file), before);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                work
+            );
+            assert!(diagnostics.is_empty());
         }
     }
 

@@ -34,7 +34,7 @@ use super::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
     },
-    instantiate::PropertyObjectAliasRecovery,
+    instantiate::{InlinePropertyObjectRecovery, PropertyObjectAliasRecovery},
     instantiated_members::{
         InstantiatedIndexRecovery, InstantiatedPropertyAliasCallable, InstantiatedPropertyRecovery,
         PublishedInterfaceMethodRecovery,
@@ -72,9 +72,10 @@ use super::{
     source_meta::ImportMetaExpressionIdentity,
     source_namespaces::ModuleValueIdentity,
     type_nodes::{
-        ConstructorAnnotationProof, PropertyObjectAliasRequestRecovery,
-        SourceCallableAliasResolution, SourceCallableInterfaceReturnProof,
-        SourceCallableTypeQueryEvidence, UnionAliasInstantiationProof,
+        ConstructorAnnotationProof, OrdinaryIntersectionAliasRequestRecovery,
+        PropertyObjectAliasRequestRecovery, SourceCallableAliasResolution,
+        SourceCallableInterfaceReturnProof, SourceCallableTypeQueryEvidence,
+        UnionAliasInstantiationProof,
     },
     type_records::{
         CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
@@ -618,8 +619,11 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
     instantiated_index_recoveries: HashMap<IndexInfoId, InstantiatedIndexRecovery>,
     property_object_alias_recoveries: HashMap<TypeId, PropertyObjectAliasRecovery>,
+    inline_property_object_recoveries: HashMap<TypeId, InlinePropertyObjectRecovery>,
     property_object_alias_request_recoveries:
         HashMap<(SemanticSymbolId, CacheHashKey), PropertyObjectAliasRequestRecovery>,
+    ordinary_intersection_alias_request_recoveries:
+        HashMap<(SemanticSymbolId, CacheHashKey), OrdinaryIntersectionAliasRequestRecovery>,
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
@@ -790,7 +794,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             instantiated_property_recoveries: HashMap::new(),
             instantiated_index_recoveries: HashMap::new(),
             property_object_alias_recoveries: HashMap::new(),
+            inline_property_object_recoveries: HashMap::new(),
             property_object_alias_request_recoveries: HashMap::new(),
+            ordinary_intersection_alias_request_recoveries: HashMap::new(),
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
             source_class_provenance: HashMap::new(),
@@ -5617,6 +5623,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.property_object_alias_recoveries.try_reserve(1).is_ok()
     }
 
+    pub(super) fn inline_property_object_recovery(
+        &self,
+        type_: TypeId,
+    ) -> Option<&InlinePropertyObjectRecovery> {
+        self.observe_relation_type_read(type_);
+        self.inline_property_object_recoveries.get(&type_)
+    }
+
+    pub(super) fn try_reserve_inline_property_object_recoveries(&mut self) -> bool {
+        self.inline_property_object_recoveries
+            .try_reserve(1)
+            .is_ok()
+    }
+
     pub(super) fn property_object_alias_request_recovery(
         &self,
         symbol: SemanticSymbolId,
@@ -5629,6 +5649,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn try_reserve_property_object_alias_request_recoveries(&mut self) -> bool {
         self.property_object_alias_request_recoveries
+            .try_reserve(1)
+            .is_ok()
+    }
+
+    pub(super) fn ordinary_intersection_alias_request_recovery(
+        &self,
+        symbol: SemanticSymbolId,
+        key: CacheHashKey,
+    ) -> Option<&OrdinaryIntersectionAliasRequestRecovery> {
+        self.observe_relation_symbol_read(symbol);
+        self.ordinary_intersection_alias_request_recoveries
+            .get(&(symbol, key))
+    }
+
+    pub(super) fn try_reserve_ordinary_intersection_alias_request_recoveries(&mut self) -> bool {
+        self.ordinary_intersection_alias_request_recoveries
             .try_reserve(1)
             .is_ok()
     }
@@ -9786,6 +9822,26 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         true
     }
 
+    /// The source query retains the real request and its exact mapper receipt.
+    pub(super) fn publish_ordinary_intersection_alias_request_recovery(
+        &mut self,
+        recovery: OrdinaryIntersectionAliasRequestRecovery,
+    ) -> bool {
+        let key = recovery.cache_key();
+        if self
+            .ordinary_intersection_alias_request_recoveries
+            .contains_key(&key)
+            || !recovery.matches_current_row(self)
+        {
+            return false;
+        }
+        self.ordinary_intersection_alias_request_recoveries
+            .insert(key, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
     /// Only the real anonymous-object producer can create this immutable record.
     pub(super) fn publish_property_object_alias_recovery(
         &mut self,
@@ -9798,6 +9854,24 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             return false;
         }
         self.property_object_alias_recoveries
+            .insert(result, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    /// Only a real inline-object limit event can produce this immutable record.
+    pub(super) fn publish_inline_property_object_recovery(
+        &mut self,
+        recovery: InlinePropertyObjectRecovery,
+    ) -> bool {
+        let result = recovery.result();
+        if self.inline_property_object_recoveries.contains_key(&result)
+            || !recovery.matches_current_result(self)
+        {
+            return false;
+        }
+        self.inline_property_object_recoveries
             .insert(result, recovery);
         self.mark_relation_inputs_dirty();
         self.mark_union_cache_validation_dirty();
@@ -12850,6 +12924,244 @@ mod tests {
             RelationComparisonResult::NONE
         );
         assert!(store.union_cache_needs_validation);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A real inline producer checks immutable publication and restored cache ownership.
+    fn inline_object_recovery_records_require_the_exact_result_and_publish_once() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics,
+            instantiate::{
+                InstantiationLimits, InstantiationSession, instantiate_type_with_vector,
+                instantiate_type_with_vector_and_session,
+            },
+            object_aliases::{inline_property_object_projection, property_object_alias_projection},
+            type_nodes::{
+                CanonicalTypeQuery, CanonicalTypeQueryOptions, type_alias_instantiation_cache_key,
+            },
+        };
+
+        let parsed = parse_source_file(concat!(
+            "type Left<T> = { left: T };\n",
+            "type Inline<T> = { value: T } & Left<T>;\n",
+            "type Other<T> = { other: T };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(90_074);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/inline-object-recovery.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = bootstrap.globals;
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let error = bootstrap.error_type;
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let table = store.symbol_table(locals).unwrap();
+        let inline_alias = table.get_source("Inline").unwrap();
+        let other_alias = table.get_source("Other").unwrap();
+        let declarations = table.iter().map(|(_, symbol)| symbol).collect::<Vec<_>>();
+        for symbol in declarations {
+            assert_eq!(store.merge_global_symbol(globals, symbol), Ok(symbol));
+        }
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let intersection = query.get_declared_type_of_symbol(inline_alias).unwrap();
+        let other = query.get_declared_type_of_symbol(other_alias).unwrap();
+        let target = store
+            .validate_deferred_intersection_type(intersection)
+            .unwrap()
+            .types[0];
+        let source = inline_property_object_projection(&store, target)
+            .unwrap()
+            .unwrap();
+        let outer = property_object_alias_projection(&store, other)
+            .unwrap()
+            .unwrap()
+            .parameters;
+        let normal =
+            instantiate_type_with_vector(&mut store, target, &source.parameters, &[string])
+                .unwrap();
+        let intermediate =
+            instantiate_type_with_vector(&mut store, target, &source.parameters, &outer).unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            &store,
+            InstantiationLimits {
+                max_depth: 1,
+                max_count: 100,
+            },
+            error,
+        )
+        .unwrap();
+        let result = instantiate_type_with_vector_and_session(
+            &mut store,
+            intermediate,
+            &outer,
+            &[number],
+            None,
+            &mut session,
+        )
+        .unwrap();
+        let projection = inline_property_object_projection(&store, result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.arguments, [error]);
+        assert_eq!(projection.target, target);
+        assert_eq!(session.limit_event_count(), 1);
+        assert!(store.type_payload(result).unwrap().alias().is_none());
+        assert_eq!(store.inline_property_object_recoveries.len(), 1);
+        assert!(store.property_object_alias_recoveries.is_empty());
+        assert!(store.property_object_alias_request_recoveries.is_empty());
+        assert_eq!(
+            store.relation_object_instantiation(
+                target,
+                type_alias_instantiation_cache_key(&[error], None)
+            ),
+            Some(result),
+        );
+        let counts = |store: &CanonicalTypeMapperStore| {
+            (
+                [
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let stable = counts(&store);
+        let retained = store
+            .inline_property_object_recovery(result)
+            .unwrap()
+            .clone();
+        assert!(retained.matches_current_result(&store));
+        assert!(store.try_reserve_inline_property_object_recoveries());
+        assert!(!store.publish_inline_property_object_recovery(retained.clone()));
+        assert_eq!(store.inline_property_object_recoveries.len(), 1);
+        assert_eq!(counts(&store), stable);
+
+        let flags = store.type_payload(result).unwrap().object_flags();
+        for changed in [
+            flags | ObjectFlags::CLASS,
+            flags
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+                | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
+        ] {
+            let saved = store
+                .inline_property_object_recoveries
+                .remove(&result)
+                .unwrap();
+            assert!(store.set_type_object_flags(result, changed));
+            assert!(!store.publish_inline_property_object_recovery(saved.clone()));
+            assert!(store.inline_property_object_recovery(result).is_none());
+            assert_eq!(counts(&store), stable);
+            assert!(store.set_type_object_flags(result, flags));
+            assert!(store.publish_inline_property_object_recovery(saved));
+        }
+
+        let saved = store
+            .inline_property_object_recoveries
+            .remove(&result)
+            .unwrap();
+        assert!(
+            store
+                .inline_property_object_recoveries
+                .insert(target, saved)
+                .is_none()
+        );
+        assert!(inline_property_object_projection(&store, target).is_err());
+        assert!(inline_property_object_projection(&store, result).is_err());
+        assert_eq!(counts(&store), stable);
+        let saved = store
+            .inline_property_object_recoveries
+            .remove(&target)
+            .unwrap();
+        assert!(store.publish_inline_property_object_recovery(saved));
+
+        let saved = store
+            .inline_property_object_recoveries
+            .remove(&result)
+            .unwrap();
+        let other_mapper = inline_property_object_projection(&store, normal)
+            .unwrap()
+            .unwrap()
+            .mapper;
+        assert!(store.set_object_target_and_mapper(result, Some(target), other_mapper));
+        assert!(!store.publish_inline_property_object_recovery(retained.clone()));
+        assert!(store.inline_property_object_recovery(result).is_none());
+        assert!(inline_property_object_projection(&store, result).is_err());
+        assert_eq!(counts(&store), stable);
+        assert!(store.set_object_target_and_mapper(result, Some(target), projection.mapper));
+        assert!(store.publish_inline_property_object_recovery(saved));
+
+        let saved = store
+            .inline_property_object_recoveries
+            .remove(&result)
+            .unwrap();
+        let identity = store.type_payload(intersection).unwrap().alias().unwrap();
+        assert!(store.set_type_alias(result, Some(identity)));
+        assert!(!store.publish_inline_property_object_recovery(retained));
+        assert!(store.inline_property_object_recovery(result).is_none());
+        assert_eq!(counts(&store), stable);
+        assert!(store.set_type_alias(result, None));
+        assert!(store.publish_inline_property_object_recovery(saved));
+        assert_eq!(store.inline_property_object_recoveries.len(), 1);
+        assert!(
+            store
+                .inline_property_object_recovery(result)
+                .unwrap()
+                .matches_current_result(&store)
+        );
+        assert_eq!(
+            inline_property_object_projection(&store, result)
+                .unwrap()
+                .unwrap(),
+            projection
+        );
+        assert_eq!(counts(&store), stable);
+        assert!(diagnostics.is_empty());
+        for property in source.properties {
+            assert!(store.type_node_links(property.type_node).is_none());
+            assert!(store.value_symbol_links(property.symbol).is_none());
+        }
     }
 
     #[test]
