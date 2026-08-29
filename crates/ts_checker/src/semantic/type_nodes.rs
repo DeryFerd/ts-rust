@@ -3355,7 +3355,7 @@ fn property_type_import_error(node: NodeRef, error: SourceImportError) -> Declar
             type_construction_error(error)
         }
         SourceImportError::ModuleExport { alias, error } => {
-            property_module_export_error(node, alias, *error)
+            property_module_export_error(node, alias, error.as_ref())
         }
     }
 }
@@ -3363,11 +3363,11 @@ fn property_type_import_error(node: NodeRef, error: SourceImportError) -> Declar
 fn property_module_export_error(
     node: NodeRef,
     alias: SemanticSymbolId,
-    error: super::module_exports::CanonicalModuleExportQueryError,
+    error: &super::module_exports::CanonicalModuleExportQueryError,
 ) -> DeclaredTypeError {
     use super::{module_exports::CanonicalModuleExportQueryError, source::SourceCheckError};
 
-    match error {
+    match *error {
         CanonicalModuleExportQueryError::TargetHost(error) => {
             type_node_unavailable(TypeNodeUnavailable::NamespaceAliasHost { node, error })
         }
@@ -37748,10 +37748,10 @@ mod tests {
         FileId::new(98_332),
     ];
 
-    fn property_type_import_test_context<'arena>(
-        sources: [&'arena ParseResult; 3],
+    fn property_type_import_test_context(
+        sources: [&ParseResult; 3],
     ) -> (
-        CanonicalCheckerContext<'arena>,
+        CanonicalCheckerContext<'_>,
         [BoundFile; 3],
         super::super::module_resolution::CanonicalModuleResolutionManifest,
     ) {

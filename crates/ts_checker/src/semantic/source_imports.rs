@@ -3628,7 +3628,7 @@ fn validate_source_property_type_import_caches(
     }
     let target_type = match store
         .symbol(plan.target_symbol())
-        .map(|target| target.flags())
+        .map(ts_binder::semantic::Symbol::flags)
     {
         Some(SymbolFlags::TYPE_ALIAS) => store
             .type_alias_links(plan.target_symbol())
@@ -13330,7 +13330,7 @@ mod tests {
     fn property_type_import_plans_original_create_subject_roots_without_writes() {
         let mut fixture = fixture(
             &[
-                r#"import type { Noop } from '../types';
+                r"import type { Noop } from '../types';
 
 export type Observer<T> = {
   next: (value: T) => void;
@@ -13377,7 +13377,7 @@ export default <T>(): Subject<T> => {
     unsubscribe,
   };
 };
-"#,
+",
                 "export * from './utils';",
                 "export type Noop = () => void;",
             ],
