@@ -19,7 +19,8 @@ use super::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
     intersection_types::{DeferredIntersectionTypeProjection, IntersectionTypeError},
-    mapped_types::escaped_property_name_from_type,
+    keyof_types::plan_nongeneric_keyof_type,
+    mapped_types::{MappedTypeError, MappedTypeModifiers, escaped_property_name_from_type},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
@@ -30,7 +31,7 @@ use super::{
     },
     store::SourceNodeParent,
     template_types::TemplateTypeError,
-    type_records::{TypeData, TypeRecord},
+    type_records::{StructuredTypeData, TypeData, TypeRecord},
     types::{AccessFlags, ObjectFlags, TypeFlags},
 };
 use ts_ast::SyntaxKind;
@@ -938,6 +939,7 @@ fn supported_instantiable_union_constituent(
             | TypeData::TemplateLiteral(_)
             | TypeData::StringMapping(_),
         ) => true,
+        Some(TypeData::IndexedAccess(_)) => store.validate_union_constituent(type_).is_ok(),
         Some(TypeData::TypeReference(_)) => {
             authenticated_instantiable_interface_reference(store, type_, array_targets).is_some()
         }
@@ -982,6 +984,29 @@ fn validate_instantiable_member_type_worker(
             }
         }
         TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
+        TypeData::IndexedAccess(indexed) => {
+            if record.flags() != TypeFlags::INDEXED_ACCESS
+                || record.symbol().is_some()
+                || record.alias().is_some()
+                || indexed.access_flags & !AccessFlags::PERSISTENT != AccessFlags::NONE
+            {
+                return Err(InstantiationError::InvalidType(type_));
+            }
+            validate_instantiable_member_type_worker(
+                store,
+                indexed.object_type,
+                mapper_parameters,
+                array_targets,
+                active,
+            )?;
+            validate_instantiable_member_type_worker(
+                store,
+                indexed.index_type,
+                mapper_parameters,
+                array_targets,
+                active,
+            )
+        }
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
                 Err(TemplateTypeError::InvalidTemplate(type_).into())
@@ -1302,36 +1327,26 @@ fn cached_instantiated_type_worker(
             let (Some(object), Some(index)) = (object, index) else {
                 return Ok(None);
             };
-            match indexed_access_resolution(store, object, index, array_targets)? {
+            match indexed_access_resolution(
+                store,
+                object,
+                index,
+                indexed.access_flags,
+                array_targets,
+            )? {
                 IndexedAccessResolution::Type(type_) => Ok(Some(type_)),
+                IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
+                    .cached_literal_union_type_with_alias(&[type_, sentinel], None, array_targets)
+                    .map_err(Into::into),
                 IndexedAccessResolution::Deferred => {
                     cached_deferred_indexed_access_type(store, object, index, indexed.access_flags)
                         .map_err(InstantiationError::InvalidType)
                 }
                 IndexedAccessResolution::Property(name) => {
-                    let record = store
-                        .type_payload(object)
-                        .ok_or(InstantiationError::InvalidType(object))?;
-                    if !record
-                        .object_flags()
-                        .contains(ObjectFlags::MEMBERS_RESOLVED)
-                    {
+                    let Some(structured) =
+                        resolved_indexed_access_members(store, object, array_targets)?
+                    else {
                         return Ok(None);
-                    }
-                    match validate_resolved_declared_property_object(store, object) {
-                        DeclaredPropertyObjectValidation::Valid(_) => {}
-                        _ => {
-                            super::instantiated_members::validate_generic_interface_members(
-                                store,
-                                object,
-                                array_targets,
-                            )
-                            .map_err(|_| InstantiationError::InvalidType(object))?
-                            .ok_or(InstantiationError::UnsupportedType(object))?;
-                        }
-                    }
-                    let Some(structured) = record.data().structured() else {
-                        return Err(InstantiationError::InvalidType(object));
                     };
                     let property = structured
                         .members
@@ -1354,13 +1369,19 @@ fn cached_instantiated_type_worker(
                     else {
                         return Ok(None);
                     };
-                    let optional = store
-                        .symbol(property)
-                        .is_some_and(|property| property.flags().contains(SymbolFlags::OPTIONAL));
-                    let types = indexed_access_property_types(store, value, optional)?;
                     store
-                        .cached_literal_union_type_with_alias(&types, None, array_targets)
-                        .map_err(Into::into)
+                        .type_payload(value)
+                        .ok_or(InstantiationError::InvalidType(value))?;
+                    match indexed_access_property_optional_sentinel(store, property, value)? {
+                        Some(sentinel) => store
+                            .cached_literal_union_type_with_alias(
+                                &[value, sentinel],
+                                None,
+                                array_targets,
+                            )
+                            .map_err(Into::into),
+                        None => Ok(Some(value)),
+                    }
                 }
             }
         }
@@ -1654,13 +1675,45 @@ fn instantiate_type_worker(
                 instantiate_type_with_alias(store, object, mapping, array_targets, None, session)?;
             let index =
                 instantiate_type_with_alias(store, index, mapping, array_targets, None, session)?;
-            match indexed_access_resolution(store, object, index, array_targets)? {
+            match indexed_access_resolution(store, object, index, flags, array_targets)? {
                 IndexedAccessResolution::Type(type_) => Ok(type_),
+                IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
+                    .literal_union_type_with_alias_and_array_targets(
+                        &[type_, sentinel],
+                        None,
+                        array_targets,
+                    )
+                    .map_err(Into::into),
                 IndexedAccessResolution::Deferred => {
                     get_instantiated_indexed_access_type(store, object, index, flags)
                         .ok_or(InstantiationError::InvalidType(type_))
                 }
                 IndexedAccessResolution::Property(name) => {
+                    if matches!(
+                        store.type_payload(object).map(TypeRecord::data),
+                        Some(TypeData::Mapped(_))
+                    ) {
+                        store
+                            .validate_mapped_type_relation_endpoint(object)
+                            .map_err(|error| mapped_indexed_access_error(object, error))?;
+                        let members = store
+                            .resolve_mapped_type_members_with_session(
+                                object,
+                                MappedTypeModifiers::NONE,
+                                session,
+                            )
+                            .map_err(|error| mapped_indexed_access_error(object, error))?;
+                        let symbol = store
+                            .symbol_table(members.members())
+                            .and_then(|members| members.get(name.as_ref()))
+                            .ok_or(InstantiationError::UnsupportedType(type_))?;
+                        if !members.properties().contains(&symbol) {
+                            return Err(InstantiationError::InvalidType(object));
+                        }
+                        return store
+                            .resolve_mapped_symbol_type_with_session(symbol, session)
+                            .map_err(|error| mapped_indexed_access_error(object, error));
+                    }
                     let property = super::object_members::resolve_object_property_by_key(
                         store,
                         None,
@@ -1670,15 +1723,20 @@ fn instantiate_type_worker(
                     )
                     .map_err(|_| InstantiationError::UnsupportedType(type_))?
                     .ok_or(InstantiationError::UnsupportedType(type_))?;
-                    let values =
-                        indexed_access_property_types(store, property.type_, property.optional)?;
-                    store
-                        .literal_union_type_with_alias_and_array_targets(
-                            &values,
-                            None,
-                            array_targets,
-                        )
-                        .map_err(Into::into)
+                    match indexed_access_property_optional_sentinel(
+                        store,
+                        property.symbol,
+                        property.type_,
+                    )? {
+                        Some(sentinel) => store
+                            .literal_union_type_with_alias_and_array_targets(
+                                &[property.type_, sentinel],
+                                None,
+                                array_targets,
+                            )
+                            .map_err(Into::into),
+                        None => Ok(property.type_),
+                    }
                 }
             }
         }
@@ -1719,37 +1777,16 @@ fn instantiate_type_worker(
 
 enum IndexedAccessResolution {
     Type(TypeId),
+    TypeWithSentinel(TypeId, TypeId),
     Deferred,
     Property(EscapedName),
-}
-
-fn indexed_access_property_types(
-    store: &CanonicalTypeMapperStore,
-    property_type: TypeId,
-    optional: bool,
-) -> Result<Vec<TypeId>, InstantiationError> {
-    let record = store
-        .type_payload(property_type)
-        .ok_or(InstantiationError::InvalidType(property_type))?;
-    let bootstrap = store
-        .intrinsic_bootstrap()
-        .ok_or(InstantiationError::InvalidType(property_type))?;
-    if !bootstrap.options.strict_null_checks || !optional {
-        return Ok(vec![property_type]);
-    }
-    let mut types = match record.data() {
-        TypeData::Union(union) => union.union.types.clone(),
-        _ => vec![property_type],
-    };
-    types.retain(|type_| *type_ != bootstrap.missing_type);
-    types.push(bootstrap.undefined_type);
-    Ok(types)
 }
 
 fn indexed_access_resolution(
     store: &CanonicalTypeMapperStore,
     object: TypeId,
     index: TypeId,
+    access_flags: AccessFlags,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<IndexedAccessResolution, InstantiationError> {
     let object_record = store
@@ -1769,17 +1806,245 @@ fn indexed_access_resolution(
         .intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
         || index_record.flags().intersects(TypeFlags::INSTANTIABLE)
     {
+        if object_record.flags().contains(TypeFlags::UNKNOWN) {
+            return Ok(IndexedAccessResolution::Type(object));
+        }
         return Ok(IndexedAccessResolution::Deferred);
     }
     if let Some(targets) = array_targets
         && index_record.flags().intersects(TypeFlags::NUMBER_LIKE)
         && let Some(array) = store.canonical_array_reference_with_targets(targets, object)?
     {
-        return Ok(IndexedAccessResolution::Type(array.element_type));
+        return Ok(if access_flags.contains(AccessFlags::INCLUDE_UNDEFINED) {
+            IndexedAccessResolution::TypeWithSentinel(
+                array.element_type,
+                store
+                    .intrinsic_bootstrap()
+                    .ok_or(InstantiationError::InvalidType(array.element_type))?
+                    .missing_type,
+            )
+        } else {
+            IndexedAccessResolution::Type(array.element_type)
+        });
     }
-    escaped_property_name_from_type(store, index)
-        .map(IndexedAccessResolution::Property)
-        .ok_or(InstantiationError::UnsupportedType(index))
+    let name = escaped_property_name_from_type(store, index);
+    let has_resolved_indexes = object_record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+        && object_record
+            .data()
+            .structured()
+            .and_then(|structured| structured.index_infos.as_ref())
+            .is_some_and(|indexes| !indexes.is_empty());
+    if !has_resolved_indexes {
+        return name
+            .map(IndexedAccessResolution::Property)
+            .ok_or(InstantiationError::UnsupportedType(index));
+    }
+    let structured = resolved_indexed_access_members(store, object, array_targets)?
+        .ok_or(InstantiationError::UnsupportedType(object))?;
+    if let Some(name) = name.as_ref()
+        && let Some(property) = structured
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(name.as_ref()))
+    {
+        if !structured
+            .properties
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&property)
+        {
+            return Err(InstantiationError::InvalidType(object));
+        }
+        return match store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+        {
+            Some(value) => {
+                store
+                    .type_payload(value)
+                    .ok_or(InstantiationError::InvalidType(value))?;
+                Ok(
+                    match indexed_access_property_optional_sentinel(store, property, value)? {
+                        Some(sentinel) => {
+                            IndexedAccessResolution::TypeWithSentinel(value, sentinel)
+                        }
+                        None => IndexedAccessResolution::Type(value),
+                    },
+                )
+            }
+            None => Ok(IndexedAccessResolution::Property(name.clone())),
+        };
+    }
+    if !index_record
+        .flags()
+        .intersects(TypeFlags::STRING_LIKE | TypeFlags::NUMBER_LIKE | TypeFlags::ES_SYMBOL_LIKE)
+    {
+        return Err(InstantiationError::UnsupportedType(index));
+    }
+    let numeric = index_record.flags().intersects(TypeFlags::NUMBER_LIKE)
+        || index_record.flags().intersects(TypeFlags::STRING_LITERAL)
+            && name
+                .as_ref()
+                .and_then(|name| name.as_ref().as_utf8())
+                .is_some_and(|name| ts_jsnum::from_string(name).to_string() == name);
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(InstantiationError::InvalidType(object))?;
+    let mut string_value = None;
+    let mut number_value = None;
+    for index in structured.index_infos.as_deref().unwrap_or_default() {
+        let info = store
+            .index_info(*index)
+            .ok_or(InstantiationError::InvalidType(object))?;
+        let value = info.value_type();
+        store
+            .type_payload(value)
+            .ok_or(InstantiationError::InvalidType(value))?;
+        let slot = if info.key_type() == bootstrap.string_type {
+            &mut string_value
+        } else if info.key_type() == bootstrap.number_type {
+            &mut number_value
+        } else {
+            // Pattern and symbol indexes need their own applicability proof.
+            return Err(InstantiationError::UnsupportedType(object));
+        };
+        if slot.replace(value).is_some() {
+            return Err(InstantiationError::InvalidType(object));
+        }
+    }
+    // Go also falls back to a string index for symbol-like keys. Instantiation
+    // passes no access node, so this fallback does not report an index error.
+    let value = numeric
+        .then_some(number_value)
+        .flatten()
+        .or(string_value)
+        .ok_or(InstantiationError::UnsupportedType(index))?;
+    Ok(if access_flags.contains(AccessFlags::INCLUDE_UNDEFINED) {
+        IndexedAccessResolution::TypeWithSentinel(value, bootstrap.missing_type)
+    } else {
+        IndexedAccessResolution::Type(value)
+    })
+}
+
+fn resolved_indexed_access_members(
+    store: &CanonicalTypeMapperStore,
+    object: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<&StructuredTypeData>, InstantiationError> {
+    let record = store
+        .type_payload(object)
+        .ok_or(InstantiationError::InvalidType(object))?;
+    if matches!(record.data(), TypeData::Mapped(_)) {
+        return match store
+            .validate_mapped_type_relation_endpoint(object)
+            .map_err(|error| mapped_indexed_access_error(object, error))?
+        {
+            None => Ok(None),
+            Some(_) => record
+                .data()
+                .structured()
+                .map(Some)
+                .ok_or(InstantiationError::InvalidType(object)),
+        };
+    }
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Ok(None);
+    }
+    let declared = matches!(
+        validate_resolved_declared_property_object(store, object),
+        DeclaredPropertyObjectValidation::Valid(_)
+    );
+    let indexed = matches!(record.data(), TypeData::Object(_) | TypeData::Interface(_))
+        && plan_nongeneric_keyof_type(store, object).is_ok();
+    if !declared && !indexed {
+        super::instantiated_members::validate_generic_interface_members(
+            store,
+            object,
+            array_targets,
+        )
+        .map_err(|_| InstantiationError::InvalidType(object))?
+        .ok_or(InstantiationError::UnsupportedType(object))?;
+    }
+    record
+        .data()
+        .structured()
+        .map(Some)
+        .ok_or(InstantiationError::InvalidType(object))
+}
+
+/// Declared property caches can retain the annotation and a separate OPTIONAL
+/// flag. Read them like getTypeOfSymbol without changing the declaration cache.
+fn indexed_access_property_optional_sentinel(
+    store: &CanonicalTypeMapperStore,
+    property: SemanticSymbolId,
+    value: TypeId,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let symbol = store
+        .symbol(property)
+        .ok_or(InstantiationError::InvalidType(value))?;
+    if !symbol
+        .flags()
+        .contains(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+        || symbol
+            .check_flags()
+            .intersects(CheckFlags::MAPPED | CheckFlags::INSTANTIATED)
+        || !matches!(
+            symbol
+                .value_declaration()
+                .and_then(|declaration| store.source_node_kind(declaration)),
+            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+        )
+    {
+        return Ok(None);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(InstantiationError::InvalidType(value))?;
+    if !bootstrap.options.strict_null_checks {
+        return Ok(None);
+    }
+    let record = store
+        .type_payload(value)
+        .ok_or(InstantiationError::InvalidType(value))?;
+    let sentinel = bootstrap.undefined_or_missing_type;
+    // Match getOptionalType's identity return, including an existing alias.
+    // A nil access node does not replace an exact-optional missing sentinel.
+    if value == sentinel
+        || matches!(
+            record.data(),
+            TypeData::Union(union) if union.union.types.first() == Some(&sentinel)
+        )
+    {
+        return Ok(None);
+    }
+    Ok(Some(sentinel))
+}
+
+fn mapped_indexed_access_error(object: TypeId, error: MappedTypeError) -> InstantiationError {
+    match error {
+        MappedTypeError::InstantiationDepthLimit { depth, limit } => {
+            InstantiationError::DepthLimit { depth, limit }
+        }
+        MappedTypeError::InstantiationCountLimit { count, limit } => {
+            InstantiationError::CountLimit { count, limit }
+        }
+        MappedTypeError::Capacity => InstantiationError::Union(LiteralTypeCacheError::Capacity),
+        MappedTypeError::UnsupportedSource(_)
+        | MappedTypeError::UnsupportedConstraint(_)
+        | MappedTypeError::UnsupportedNameType(_)
+        | MappedTypeError::UnsupportedTemplate(_)
+        | MappedTypeError::RecursiveMembers(_)
+        | MappedTypeError::CircularProperty(_)
+        | MappedTypeError::CrossProductTooLarge { .. } => {
+            InstantiationError::UnsupportedType(object)
+        }
+        _ => InstantiationError::InvalidType(object),
+    }
 }
 
 fn instantiate_template_literal(

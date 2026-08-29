@@ -1172,6 +1172,8 @@ fn broad_record_mapped_error(
         | MappedTypeError::UnsupportedNameType(_)
         | MappedTypeError::UnsupportedTemplate(_)
         | MappedTypeError::RecursiveMembers(_)
+        | MappedTypeError::InstantiationDepthLimit { .. }
+        | MappedTypeError::InstantiationCountLimit { .. }
         | MappedTypeError::CrossProductTooLarge { .. } => {
             RelationUnavailable::UnsupportedStructuredType(contextual_type)
         }
@@ -1200,6 +1202,8 @@ fn contextual_mapped_error(contextual_type: TypeId, error: MappedTypeError) -> S
         | MappedTypeError::UnsupportedNameType(_)
         | MappedTypeError::UnsupportedTemplate(_)
         | MappedTypeError::RecursiveMembers(_)
+        | MappedTypeError::InstantiationDepthLimit { .. }
+        | MappedTypeError::InstantiationCountLimit { .. }
         | MappedTypeError::CrossProductTooLarge { .. } => {
             RelationUnavailable::UnsupportedStructuredType(contextual_type).into()
         }

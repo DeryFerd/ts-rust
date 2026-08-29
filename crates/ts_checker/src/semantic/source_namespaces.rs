@@ -16578,6 +16578,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Checks the source owners, generic constraint, mapped return, and warm replay.
     fn ambient_generic_functions_validate_constraints_and_mapped_returns() {
         let mut fixture = declaration_fixture(
             concat!(
@@ -16593,29 +16594,48 @@ mod tests {
         );
         let namespace = plan(&fixture, 0);
         let [
-            SourceNamespaceMemberPlan::Interface { .. },
-            SourceNamespaceMemberPlan::Interface { .. },
-            SourceNamespaceMemberPlan::DeferredAmbientFunction {
+            SourceNamespaceMemberPlan::Interface {
+                symbol: validator, ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: requireable,
+                ..
+            },
+            SourceNamespaceMemberPlan::Function {
                 declaration,
                 symbol,
-                type_parameters,
-                parameters,
-                annotations,
             },
         ] = namespace.members.as_slice()
         else {
-            panic!("the mapped return must retain its checked generic declaration")
+            panic!("the supported mapped return must use a callable function plan")
         };
+        let validator = *validator;
+        let requireable = *requireable;
         let declaration = *declaration;
         let symbol = *symbol;
-        let annotations = annotations.clone();
         let (arena, bound) = fixture.context.file(fixture.file).unwrap();
-
-        assert_eq!(type_parameters.len(), 1);
-        assert_eq!(parameters.len(), 1);
-        assert!(annotations.iter().any(|annotation| {
-            arena.get(annotation.node).unwrap().kind == SyntaxKind::TypeOperator
-        }));
+        let NodeData::FunctionDeclaration(function) = &arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the callable must retain its function declaration")
+        };
+        let [type_parameter] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("objectOf must declare one type parameter")
+        };
+        let [parameter] = function.parameters.nodes.as_slice() else {
+            panic!("objectOf must declare one value parameter")
+        };
+        let type_parameter_node = child(declaration, *type_parameter);
+        let parameter_node = child(declaration, *parameter);
+        let type_parameter_symbol = bound.symbol(type_parameter_node).unwrap();
+        let parameter_symbol = bound.symbol(parameter_node).unwrap();
+        let return_node = child(declaration, function.type_.unwrap());
+        let export_local = bound.local_symbol(declaration).unwrap();
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &arena.get(type_parameter_node.node).unwrap().data
+        else {
+            panic!("the generic parameter must retain its source constraint")
+        };
+        let constraint_node = child(type_parameter_node, parameter.constraint.unwrap());
         let mapped = arena
             .iter()
             .find_map(|(node, record)| {
@@ -16631,6 +16651,14 @@ mod tests {
         };
         let mapped_parameter = child(mapped, mapped_type.type_parameter);
         let mapped_symbol = bound.symbol(mapped_parameter).unwrap();
+        let mapped_owner = bound.symbol(mapped).unwrap();
+        let template_node = child(mapped, mapped_type.type_.unwrap());
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &arena.get(mapped_parameter.node).unwrap().data
+        else {
+            panic!("the mapped key must retain its source constraint")
+        };
+        let mapped_constraint_node = child(mapped_parameter, parameter.constraint.unwrap());
         assert_eq!(
             fixture
                 .context
@@ -16640,8 +16668,6 @@ mod tests {
                 .flags(),
             SymbolFlags::TYPE_PARAMETER,
         );
-
-        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
         assert!(fixture.context.store().value_symbol_links(symbol).is_none());
         assert!(
             fixture
@@ -16650,6 +16676,187 @@ mod tests {
                 .source_callable_type_for_declaration(declaration)
                 .is_none()
         );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let store = fixture.context.store();
+        let callable = store
+            .value_symbol_links(symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let provenance = *store.source_callable_provenance(callable).unwrap();
+        assert_eq!(provenance.declaration, declaration);
+        assert_eq!(provenance.owner_symbol, symbol);
+        assert_eq!(provenance.owner_parent, Some(namespace.symbol));
+        assert_eq!(provenance.export_local, Some(export_local));
+        assert_eq!(
+            store.source_callable_type_for_declaration(declaration),
+            Some(callable)
+        );
+        let signature = store.signature(provenance.signature).unwrap();
+        let type_parameter = store
+            .declared_type_links(type_parameter_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(signature.declaration(), Some(declaration));
+        assert_eq!(signature.type_parameters(), &[type_parameter]);
+        assert_eq!(signature.parameters(), &[parameter_symbol]);
+        assert_eq!(signature.min_argument_count(), 1);
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(store, type_parameter),
+            Some(type_parameter_symbol)
+        );
+        for (node, owner) in [
+            (type_parameter_node, type_parameter_symbol),
+            (parameter_node, parameter_symbol),
+            (mapped_parameter, mapped_symbol),
+            (mapped, mapped_owner),
+        ] {
+            assert!(store.source_declaration_belongs_to_symbol(node, owner));
+            assert_eq!(
+                store.symbol(owner).unwrap().declarations(),
+                Some(&[node][..])
+            );
+        }
+        let [parameter_provenance] = store
+            .source_callable_type_parameters(provenance.signature)
+            .unwrap()
+        else {
+            panic!("the signature must retain one source type parameter")
+        };
+        assert_eq!(parameter_provenance.declaration, type_parameter_node);
+        assert_eq!(parameter_provenance.symbol, type_parameter_symbol);
+        assert_eq!(parameter_provenance.type_parameter, type_parameter);
+        assert_eq!(parameter_provenance.constraint, Some(constraint_node));
+        assert_eq!(parameter_provenance.default_type, None);
+        let TypeData::TypeParameter(parameter) = store.type_payload(type_parameter).unwrap().data()
+        else {
+            panic!("the signature must retain its declared type parameter")
+        };
+        let constraint = parameter.constraint.unwrap();
+        assert_eq!(
+            store
+                .type_node_links(constraint_node)
+                .unwrap()
+                .resolved_type,
+            Some(constraint)
+        );
+        let validator_type = store
+            .declared_type_links(validator)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let constraint_reference = validate_direct_generic_reference(store, constraint).unwrap();
+        assert_eq!(constraint_reference.target, validator_type);
+        assert_eq!(
+            constraint_reference.type_arguments,
+            [store.intrinsic_bootstrap().unwrap().any_type]
+        );
+        let parameter_type = store
+            .value_symbol_links(parameter_symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let parameter_reference = validate_direct_generic_reference(store, parameter_type).unwrap();
+        assert_eq!(parameter_reference.target, validator_type);
+        assert_eq!(parameter_reference.type_arguments, [type_parameter]);
+
+        let result = signature.resolved_return_type().unwrap();
+        let result_reference = validate_direct_generic_reference(store, result).unwrap();
+        assert_eq!(
+            Some(result_reference.target),
+            store
+                .declared_type_links(requireable)
+                .unwrap()
+                .declared_type
+        );
+        let [mapped_type] = result_reference.type_arguments.as_slice() else {
+            panic!("Requireable must retain one mapped argument")
+        };
+        let mapped_type = *mapped_type;
+        let mapped_record = store.type_payload(mapped_type).unwrap();
+        let TypeData::Mapped(mapped_data) = mapped_record.data() else {
+            panic!("the return argument must remain a mapped type")
+        };
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let key_type = store
+            .declared_type_links(mapped_symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_ne!(key_type, type_parameter);
+        assert_eq!(mapped_record.symbol(), Some(mapped_owner));
+        assert!(
+            !mapped_record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert_eq!(mapped_data.declaration, Some(mapped));
+        assert_eq!(mapped_data.type_parameter, Some(key_type));
+        assert_eq!(
+            mapped_data.constraint_type,
+            Some(bootstrap.string_number_symbol_type)
+        );
+        assert_eq!(mapped_data.modifiers_type, Some(bootstrap.any_type));
+        assert_eq!(mapped_data.template_type, Some(type_parameter));
+        assert_eq!(mapped_data.name_type, None);
+        assert_eq!(mapped_data.object.target, None);
+        assert_eq!(mapped_data.object.mapper, None);
+        let TypeData::TypeParameter(key) = store.type_payload(key_type).unwrap().data() else {
+            panic!("the mapped key must retain its own type parameter")
+        };
+        assert_eq!(key.constraint, mapped_data.constraint_type);
+        for (node, expected) in [
+            (return_node, result),
+            (mapped, mapped_type),
+            (template_node, type_parameter),
+            (mapped_constraint_node, bootstrap.string_number_symbol_type),
+        ] {
+            assert_eq!(
+                store.type_node_links(node).unwrap().resolved_type,
+                Some(expected)
+            );
+        }
+        assert!(fixture.context.diagnostics().is_empty());
+
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            )
+        };
+        let warm = snapshot(store);
+        for _ in 0..2 {
+            assert_eq!(plan(&fixture, 0), namespace);
+            assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+            assert_eq!(
+                fixture
+                    .context
+                    .get_return_type_of_signature(provenance.signature),
+                Ok(result)
+            );
+            let store = fixture.context.store();
+            assert_eq!(
+                store.source_callable_type_for_declaration(declaration),
+                Some(callable)
+            );
+            assert_eq!(
+                store.value_symbol_links(symbol).unwrap().resolved_type,
+                Some(callable)
+            );
+            assert_eq!(
+                store.type_node_links(mapped).unwrap().resolved_type,
+                Some(mapped_type)
+            );
+            assert_eq!(snapshot(store), warm);
+            assert!(fixture.context.diagnostics().is_empty());
+        }
     }
 
     #[test]

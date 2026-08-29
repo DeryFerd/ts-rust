@@ -4,7 +4,9 @@
 //! a published enum value, a validated class constructor, an imported
 //! namespace, an authenticated published scalar-wrapper or `Math.random`
 //! method, an exact global array reference with a published member, or belong
-//! to the validated own-property object domain in `relater`. Enum values reuse
+//! to the validated own-property object domain in `relater`. Ordinary reads can
+//! query one source member before a generic interface's member table is ready.
+//! Enum values reuse
 //! their published
 //! member identities. Class
 //! constructors read their validated static member tables without treating
@@ -38,10 +40,10 @@ use ts_binder::{CheckFlags, EscapedNameRef, SemanticSymbolId, SymbolFlags};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
-    CanonicalGlobalTypes, CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost,
-    RelationUnavailable, SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
-    ValueSymbolLinks,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+    CanonicalCheckerRelatedInformation, CanonicalGlobalTypes, CanonicalTypeFormatFlags,
+    CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, SymbolNodeLinks,
+    TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
@@ -55,7 +57,7 @@ use super::{
     instantiate::InstantiationSession,
     member_resolution::UnionPropertyError,
     relater::ResolvedOwnProperty,
-    source::{PlannedExpression, PlannedExpressionKind},
+    source::{PlannedExpression, PlannedExpressionKind, SourceCheckError},
     source_callables::{
         SourceCallableFamily, StoredSourceCallableValidation,
         source_arrow_owner_expando_exports_are_valid,
@@ -174,6 +176,25 @@ impl std::error::Error for SourcePropertyError {
             | Self::MissingDiagnostic(_)
             | Self::Flow(_) => None,
         }
+    }
+}
+
+/// Keeps source-query errors separate from property access errors.
+#[derive(Debug)]
+pub(super) enum SourcePropertyQueryError {
+    Property(SourcePropertyError),
+    Source(SourceCheckError),
+}
+
+impl From<SourcePropertyError> for SourcePropertyQueryError {
+    fn from(error: SourcePropertyError) -> Self {
+        Self::Property(error)
+    }
+}
+
+impl From<RelationUnavailable> for SourcePropertyQueryError {
+    fn from(error: RelationUnavailable) -> Self {
+        Self::Property(SourcePropertyError::Relation(error))
     }
 }
 
@@ -1320,7 +1341,7 @@ impl SourcePropertyPlan {
         self.name_node == name && self.position == SourcePropertyPosition::CallCallee(call)
     }
 
-    fn is_read(&self) -> bool {
+    pub(super) fn is_read(&self) -> bool {
         self.position == SourcePropertyPosition::Read
     }
 
@@ -1687,8 +1708,131 @@ pub(super) fn check_direct_source_property_with_session(
     receiver_type: TypeId,
     session: &mut InstantiationSession,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
+    check_direct_source_property_worker(
+        store,
+        global_types,
+        plan,
+        receiver_type,
+        session,
+        |store, receiver, name, session| {
+            resolve_direct_source_own_property(store, global_types, receiver, name, session)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Uses the caller's source query for unresolved members.
+pub(super) fn check_direct_source_property_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<CheckedSourceProperty, SourcePropertyQueryError> {
+    if !plan.is_read() {
+        return check_direct_source_property_with_session(
+            store,
+            Some(global_types),
+            plan,
+            receiver_type,
+            session,
+        )
+        .map_err(SourcePropertyQueryError::Property);
+    }
+    check_direct_source_property_worker(
+        store,
+        Some(global_types),
+        plan,
+        receiver_type,
+        session,
+        |store, receiver, name, session| {
+            let target = store
+                .type_payload(receiver)
+                .and_then(|record| match record.data() {
+                    TypeData::TypeReference(reference) => reference.object.target,
+                    TypeData::Interface(interface)
+                        if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+                    {
+                        interface.reference.object.target
+                    }
+                    _ => None,
+                });
+            let cold_interface = target
+                .and_then(|target| store.type_payload(target))
+                .is_some_and(|record| {
+                    matches!(record.data(), TypeData::Interface(interface)
+                        if !interface.declared_members_resolved
+                            && !record.object_flags().contains(ObjectFlags::CLASS))
+                });
+            if !cold_interface {
+                return resolve_direct_source_own_property(
+                    store,
+                    Some(global_types),
+                    receiver,
+                    name,
+                    session,
+                )
+                .map_err(SourcePropertyQueryError::Property);
+            }
+            super::object_members::resolve_object_property_by_key_with_source(
+                store,
+                host,
+                global_types,
+                options,
+                receiver,
+                EscapedNameRef::source(name),
+                session,
+                diagnostics,
+            )
+            .map_err(SourcePropertyQueryError::Source)
+        },
+    )
+}
+
+fn resolve_direct_source_own_property(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    receiver: TypeId,
+    name: &str,
+    session: &mut InstantiationSession,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    if store
+        .direct_interface_heritage_provenance(receiver)
+        .is_some()
+    {
+        super::object_members::resolve_object_property_by_key(
+            store,
+            global_types,
+            receiver,
+            EscapedNameRef::source(name),
+            session,
+        )
+    } else {
+        store.resolved_own_property(receiver, name)
+    }
+    .map_err(SourcePropertyError::from)
+}
+
+fn check_direct_source_property_worker<E>(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    session: &mut InstantiationSession,
+    mut resolve_own_property: impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        &str,
+        &mut InstantiationSession,
+    ) -> Result<Option<ResolvedOwnProperty>, E>,
+) -> Result<CheckedSourceProperty, E>
+where
+    E: From<SourcePropertyError> + From<RelationUnavailable>,
+{
     if plan.class_access.is_some() {
-        return Err(unsupported_access(plan.node));
+        return Err(unsupported_access(plan.node).into());
     }
     let (any, error_type, undefined) = {
         let bootstrap = store
@@ -1707,7 +1851,8 @@ pub(super) fn check_direct_source_property_with_session(
             receiver_type,
             error_type,
             enclosing_class,
-        );
+        )
+        .map_err(E::from);
     }
     let (receiver_type, propagate_undefined) = if plan.optional && receiver_type != any {
         optional_property_receiver(store, global_types, plan, receiver_type)?
@@ -1758,7 +1903,8 @@ pub(super) fn check_direct_source_property_with_session(
                     node: plan.node,
                     receiver_type,
                 },
-            ));
+            )
+            .into());
         }
         match union_constituents
             .map(|constituents| {
@@ -1777,7 +1923,8 @@ pub(super) fn check_direct_source_property_with_session(
                                 node: plan.node,
                                 receiver_type,
                             },
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -1811,7 +1958,8 @@ pub(super) fn check_direct_source_property_with_session(
                         node: plan.node,
                         receiver_type,
                     },
-                ));
+                )
+                .into());
             }
         }
     } else if receiver_type == any || receiver_type == error_type {
@@ -1844,13 +1992,13 @@ pub(super) fn check_direct_source_property_with_session(
             (property.type_id(), Some(property.symbol()), None)
         } else {
             let CopiedMissingUnionProperty::Missing(missing_type) = missing_union_property else {
-                return Err(SourcePropertyError::InvalidCache(plan.node));
+                return Err(SourcePropertyError::InvalidCache(plan.node).into());
             };
             let suggestion = match union_suggestion {
                 CopiedSourcePropertySuggestion::Candidate(candidate) => Some(candidate),
                 CopiedSourcePropertySuggestion::None => None,
                 CopiedSourcePropertySuggestion::Unavailable => {
-                    return Err(SourcePropertyError::InvalidCache(plan.node));
+                    return Err(SourcePropertyError::InvalidCache(plan.node).into());
                 }
             };
             (
@@ -1907,19 +2055,9 @@ pub(super) fn check_direct_source_property_with_session(
                         )? {
                             Some(CanonicalArrayProperty::Present(property)) => Some(property),
                             Some(CanonicalArrayProperty::Missing) => None,
-                            None if store
-                                .direct_interface_heritage_provenance(receiver_type)
-                                .is_some() =>
-                            {
-                                super::object_members::resolve_object_property_by_key(
-                                    store,
-                                    global_types,
-                                    receiver_type,
-                                    EscapedNameRef::source(&plan.name),
-                                    session,
-                                )?
+                            None => {
+                                resolve_own_property(store, receiver_type, &plan.name, session)?
                             }
-                            None => store.resolved_own_property(receiver_type, &plan.name)?,
                         },
                     },
                 },
@@ -1943,7 +2081,8 @@ pub(super) fn check_direct_source_property_with_session(
                         node: plan.node,
                         property: property.symbol,
                     },
-                ));
+                )
+                .into());
             }
             let bootstrap = store
                 .intrinsic_bootstrap()
@@ -1971,7 +2110,8 @@ pub(super) fn check_direct_source_property_with_session(
                     node: plan.node,
                     receiver_type,
                 },
-            ));
+            )
+            .into());
         }
         (
             error_type,

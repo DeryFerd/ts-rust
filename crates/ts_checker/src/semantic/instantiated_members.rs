@@ -35,8 +35,9 @@ use super::{
     },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
-        instantiable_member_type_contains_variables, instantiate_type_with_session,
-        instantiate_type_with_vector_and_session, instantiated_member_type_matches,
+        cached_instantiation_with_vector, instantiable_member_type_contains_variables,
+        instantiate_type_with_session, instantiate_type_with_vector_and_session,
+        instantiated_member_type_matches,
     },
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     object_members::{
@@ -44,7 +45,9 @@ use super::{
         validate_resolved_declared_property_object,
     },
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
-    signatures::{ElementFlags, SignatureFlags, SignatureInstantiationError, TupleElementInfo},
+    signatures::{
+        ElementFlags, IndexInfo, SignatureFlags, SignatureInstantiationError, TupleElementInfo,
+    },
     store::SourceNodeParent,
     structured_members::{
         valid_index_symbol, valid_interface_method_value, valid_late_bound_unique_symbol_member,
@@ -219,7 +222,7 @@ impl From<DirectGenericReferenceError> for GenericInterfaceMemberError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DeclaredProperty {
     symbol: SemanticSymbolId,
     name: EscapedName,
@@ -238,7 +241,7 @@ type DeclaredTargetHeader = (
 
 type InheritedInterfaceMembers = (Vec<SemanticSymbolId>, Vec<IndexInfoId>);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GenericInterfaceShape {
     reference: TypeId,
     target: TypeId,
@@ -266,6 +269,156 @@ pub(super) struct InstantiatedPropertyRecovery {
     identity: Vec<RecoveredPropertyTypeIdentity>,
 }
 
+/// Records an index result only after its producer observes a caller limit event.
+#[derive(Debug)]
+pub(super) struct InstantiatedIndexRecovery {
+    valid: bool,
+    index: IndexInfoId,
+    source: IndexInfoId,
+    shape: GenericInterfaceShape,
+    mapper: Option<TypeMapperId>,
+    mapper_sources: Vec<TypeId>,
+    mapper_targets: Vec<TypeId>,
+    key_type: TypeId,
+    template: TypeId,
+    result: TypeId,
+    readonly: bool,
+    declaration: Option<NodeRef>,
+    components: Vec<NodeRef>,
+    array_targets: Option<CanonicalArrayTargets>,
+    error_type: TypeId,
+    identity: Vec<RecoveredPropertyTypeIdentity>,
+}
+
+impl InstantiatedIndexRecovery {
+    pub(super) const fn index(&self) -> IndexInfoId {
+        self.index
+    }
+
+    pub(super) fn invalidate_for_raw_write(&mut self, symbol: SemanticSymbolId) -> bool {
+        let invalidated = self.valid
+            && (self
+                .shape
+                .properties
+                .iter()
+                .any(|property| property.symbol == symbol)
+                || self.identity.iter().any(|identity| match &identity.shape {
+                    RecoveredPropertyTypeShape::Object { signatures, .. } => {
+                        signatures.iter().any(|signature| {
+                            signature
+                                .parameters
+                                .iter()
+                                .any(|(parameter, _)| *parameter == symbol)
+                                || signature
+                                    .this_parameter
+                                    .as_ref()
+                                    .is_some_and(|(parameter, _)| *parameter == symbol)
+                        })
+                    }
+                    _ => false,
+                }));
+        if invalidated {
+            self.valid = false;
+        }
+        invalidated
+    }
+
+    pub(super) fn invalidate_for_index_write(&mut self, index: IndexInfoId) -> bool {
+        let invalidated = self.valid && (index == self.index || index == self.source);
+        if invalidated {
+            self.valid = false;
+        }
+        invalidated
+    }
+
+    pub(super) fn matches_published_info(&self, info: Option<&IndexInfo>) -> bool {
+        self.valid
+            && info.is_some_and(|info| {
+                info.id() == self.index
+                    && info.key_type() == self.key_type
+                    && info.value_type() == self.result
+                    && info.is_readonly() == self.readonly
+                    && info.declaration() == self.declaration
+                    && info.components() == self.components
+                    && info.index_symbol().is_none()
+            })
+    }
+
+    fn matches(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        shape: &GenericInterfaceShape,
+        source: IndexInfoId,
+        actual: IndexInfoId,
+        mapper: Option<TypeMapperId>,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        self.source == source
+            && self.index == actual
+            && self.shape == *shape
+            && self.mapper == mapper
+            && self.matches_cached_identity(store, array_targets)
+            && mapper_parameters_for_target(store, shape.target, &shape.source_parameters)
+                .ok()
+                .as_deref()
+                == Some(self.mapper_sources.as_slice())
+            && self.mapper_targets
+                == shape
+                    .target_arguments
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(shape.reference))
+                    .collect::<Vec<_>>()
+    }
+
+    fn matches_cached_identity(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        self.array_targets == array_targets
+            && self.matches_published_info(store.index_info(self.index))
+            && store.index_info(self.source).is_some_and(|info| {
+                info.value_type() == self.template && info.index_symbol().is_none()
+            })
+            && self.mapper.is_none_or(|mapper| {
+                store.type_mapper_has_exact_endpoints(
+                    mapper,
+                    &self.mapper_sources,
+                    &self.mapper_targets,
+                ) == Some(true)
+            })
+            && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                bootstrap.error_type == self.error_type
+                    && store.validate_union_constituent(self.error_type).is_ok()
+            })
+            && instantiated_index_recovery_identity(
+                store,
+                &[self.key_type, self.template, self.result, self.error_type],
+                &self.mapper_sources,
+                &self.mapper_targets,
+                array_targets,
+            )
+            .is_some_and(|identity| identity == self.identity)
+    }
+}
+
+fn instantiated_index_recovery_identity(
+    store: &CanonicalTypeMapperStore,
+    roots: &[TypeId],
+    mapper_sources: &[TypeId],
+    mapper_targets: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<Vec<RecoveredPropertyTypeIdentity>> {
+    let roots = roots
+        .iter()
+        .chain(mapper_sources)
+        .chain(mapper_targets)
+        .copied()
+        .collect::<Vec<_>>();
+    property_recovery_type_identity(store, &roots, array_targets)
+}
+
 /// A current producer record borrowed without entering callable or graph validation.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct InstantiatedPropertyRecoveryIdentity<'a> {
@@ -273,7 +426,7 @@ pub(super) struct InstantiatedPropertyRecoveryIdentity<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct RecoveredPropertyTypeIdentity {
+pub(super) struct RecoveredPropertyTypeIdentity {
     type_: TypeId,
     flags: TypeFlags,
     object_flags: ObjectFlags,
@@ -571,7 +724,7 @@ impl InstantiatedPropertyRecoveryIdentity<'_> {
 }
 
 /// Retains type arguments but not member caches that can legitimately warm later.
-fn property_recovery_type_identity(
+pub(super) fn property_recovery_type_identity(
     store: &CanonicalTypeMapperStore,
     roots: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
@@ -767,12 +920,28 @@ enum ColdPropertyPlan {
 
 #[derive(Debug)]
 struct ColdMembersPlan {
-    mapper_sources: Vec<TypeId>,
-    mapper_targets: Vec<TypeId>,
-    requires_mapper: bool,
     table: Option<PreparedSymbolTable>,
     properties: Vec<ColdPropertyPlan>,
-    index_infos: Vec<IndexInfoId>,
+}
+
+#[derive(Debug)]
+struct ColdIndexValues {
+    mapper: Option<TypeMapperId>,
+    mapper_sources: Vec<TypeId>,
+    mapper_targets: Vec<TypeId>,
+    indexes: Vec<ColdIndexValue>,
+}
+
+#[derive(Debug)]
+struct ColdIndexValue {
+    source: IndexInfoId,
+    key_type: TypeId,
+    template: TypeId,
+    result: TypeId,
+    readonly: bool,
+    declaration: Option<NodeRef>,
+    components: Vec<NodeRef>,
+    recovery: Option<(TypeId, Vec<RecoveredPropertyTypeIdentity>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -850,8 +1019,8 @@ impl CanonicalTypeMapperStore {
     /// Returns [`GenericInterfaceMemberError`] for a foreign identity,
     /// malformed or poisoned cache, nonlocal/merged/class target, unsupported
     /// member or property type, or capacity failure. A rejected cold query
-    /// publishes no mapper, transient symbol, table, or structured-member
-    /// cache.
+    /// publishes no transient property symbol, table, or structured-member
+    /// cache. Failed instantiation can retain type and mapper identities.
     pub fn resolve_generic_interface_members(
         &mut self,
         reference: TypeId,
@@ -953,19 +1122,41 @@ pub(super) fn resolve_members_with_array_targets(
     reference: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    resolve_members_with_array_targets_and_session(store, reference, array_targets, &mut session)
+}
+
+/// Resolves inherited tables and index values within the caller's query budget.
+/// Property proxies remain lazy until their values are demanded.
+pub(super) fn resolve_members_with_array_targets_and_session(
+    store: &mut CanonicalTypeMapperStore,
+    reference: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
     let mut shape = validate_shape(store, reference, array_targets)?;
     if let Some(cached) = validate_warm_members(store, &shape, array_targets)? {
         return Ok(cached);
     }
+    if session.recovery_error_type().is_some_and(|error_type| {
+        store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| bootstrap.error_type != error_type)
+            || store.validate_union_constituent(error_type).is_err()
+    }) {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
+    }
+    // Go substitutes own indexes before it resolves inherited members.
+    let indexes = prepare_cold_index_values(store, &shape, array_targets, session)?;
     if !shape.inherited_members_ready {
-        materialize_inherited_members(store, &shape, array_targets)?;
+        materialize_inherited_members(store, &shape, array_targets, session)?;
         shape = validate_shape(store, reference, array_targets)?;
         if !shape.inherited_members_ready {
             return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
         }
     }
     let plan = prepare_cold_members(store, &shape)?;
-    publish_cold_members(store, &shape, plan, array_targets)
+    publish_cold_members(store, &shape, plan, indexes, array_targets)
 }
 
 /// Validates the declaration graph and any published member cache without
@@ -1002,7 +1193,8 @@ pub(super) fn resolve_property_with_array_targets_and_session(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<Option<InstantiatedInterfaceProperty>, GenericInterfaceMemberError> {
-    let members = resolve_members_with_array_targets(store, reference, array_targets)?;
+    let members =
+        resolve_members_with_array_targets_and_session(store, reference, array_targets, session)?;
     let Some(table) = members.members else {
         return Ok(None);
     };
@@ -2394,7 +2586,7 @@ fn instantiate_generic_member_type_inner(
         .map_err(|error| property_instantiation_error(template, &error))?;
     let name = indexed_property_escaped_name(store, index);
     if validate_direct_generic_reference(store, object).is_ok() {
-        resolve_members_with_array_targets(store, object, array_targets)?;
+        resolve_members_with_array_targets_and_session(store, object, array_targets, session)?;
     }
     let symbol = name.as_ref().and_then(|name| {
         store
@@ -2415,7 +2607,7 @@ fn instantiate_generic_member_type_inner(
         .check_flags();
     if checks.contains(CheckFlags::MAPPED) {
         return store
-            .resolve_mapped_symbol_type(symbol)
+            .resolve_mapped_symbol_type_with_session(symbol, session)
             .map_err(|_| GenericInterfaceMemberError::InvalidCachedProperty(symbol));
     }
     if checks.contains(CheckFlags::INSTANTIATED) {
@@ -3634,6 +3826,7 @@ fn materialize_inherited_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
 ) -> Result<(), GenericInterfaceMemberError> {
     let sources = mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
     let targets = shape
@@ -3642,19 +3835,30 @@ fn materialize_inherited_members(
         .copied()
         .chain(std::iter::once(shape.reference))
         .collect::<Vec<_>>();
-    let mut session = InstantiationSession::new(InstantiationLimits::default());
     for base in &shape.base_types {
+        let limit_mark = session.limit_event_mark();
         let resolved = instantiate_type_with_vector_and_session(
             store,
             *base,
             &sources,
             &targets,
             array_targets,
-            &mut session,
+            session,
         )
         .map_err(|error| property_instantiation_error(*base, &error))?;
+        if session.limit_event_occurred_since(limit_mark) {
+            // Recovered base arguments need their own proof before heritage can reuse them.
+            return Err(GenericInterfaceMemberError::UnsupportedTarget(
+                shape.reference,
+            ));
+        }
         if validate_direct_generic_reference(store, resolved).is_ok() {
-            resolve_members_with_array_targets(store, resolved, array_targets)?;
+            resolve_members_with_array_targets_and_session(
+                store,
+                resolved,
+                array_targets,
+                session,
+            )?;
         } else if !matches!(
             validate_resolved_declared_property_object(store, resolved),
             DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
@@ -3670,6 +3874,21 @@ fn validate_shape(
     reference: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<GenericInterfaceShape, GenericInterfaceMemberError> {
+    // Check produced recovery graphs before an invalid nested reference can
+    // make the declared member domain appear merely unsupported.
+    for index in store
+        .type_payload(reference)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.index_infos.as_deref())
+        .unwrap_or_default()
+    {
+        if let Some(recovery) = store.instantiated_index_recovery(*index)
+            && recovery.shape.reference == reference
+            && !recovery.matches_cached_identity(store, recovery.array_targets)
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(reference));
+        }
+    }
     let direct = validate_direct_generic_reference(store, reference)?;
     let mut active = Vec::new();
     let mut validated = HashSet::new();
@@ -5335,6 +5554,9 @@ fn valid_instantiated_index_info(
     {
         return false;
     }
+    if let Some(recovery) = store.instantiated_index_recovery(actual) {
+        return recovery.matches(store, shape, source, actual, mapper, array_targets);
+    }
     let value_matches = if let Some(mapper) = mapper {
         cached_instantiated_property_type_matches(
             store,
@@ -5344,9 +5566,27 @@ fn valid_instantiated_index_info(
             array_targets,
         )
     } else {
-        mapped_inherited_type(store, shape, source_info.value_type())
-            .ok()
-            .flatten()
+        let Ok(sources) =
+            mapper_parameters_for_target(store, shape.target, &shape.source_parameters)
+        else {
+            return false;
+        };
+        let targets = shape
+            .target_arguments
+            .iter()
+            .copied()
+            .chain(std::iter::once(shape.reference))
+            .collect::<Vec<_>>();
+        cached_instantiation_with_vector(
+            store,
+            source_info.value_type(),
+            &sources,
+            &targets,
+            array_targets,
+            None,
+        )
+        .ok()
+        .flatten()
             == Some(actual_info.value_type())
     };
     value_matches && (source == actual) == (source_info.value_type() == actual_info.value_type())
@@ -5366,46 +5606,16 @@ fn prepare_cold_members(
         .iter()
         .filter(|property| property.requires_proxy)
         .count();
-    let index_count = shape
-        .index_infos
-        .len()
-        .checked_add(shape.inherited_index_infos.len())
-        .ok_or(GenericInterfaceMemberError::Capacity(shape.reference))?;
     let table = if count == 0 {
         None
     } else {
         Some(prepare_member_table(shape.reference, count)?)
     };
     if !store.try_reserve_checker_symbol_allocations(proxy_count, usize::from(count != 0))
-        || !store.try_reserve_mappers(usize::from(proxy_count != 0))
         || !store.try_reserve_value_symbol_links(proxy_count)
-        || !store.try_reserve_index_infos(shape.index_infos.len())
     {
         return Err(GenericInterfaceMemberError::Capacity(shape.reference));
     }
-    let mut index_infos = Vec::new();
-    index_infos
-        .try_reserve_exact(index_count)
-        .map_err(|_| GenericInterfaceMemberError::Capacity(shape.reference))?;
-    let this_type = store
-        .type_payload(shape.target)
-        .and_then(|record| match record.data() {
-            TypeData::Interface(interface) => interface.this_type,
-            _ => None,
-        })
-        .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
-    let mapper_sources = shape
-        .source_parameters
-        .iter()
-        .copied()
-        .chain(std::iter::once(this_type))
-        .collect::<Vec<_>>();
-    let mapper_targets = shape
-        .target_arguments
-        .iter()
-        .copied()
-        .chain(std::iter::once(shape.reference))
-        .collect::<Vec<_>>();
     let mut properties = Vec::with_capacity(count);
     for source in &shape.properties {
         if !source.requires_proxy {
@@ -5450,13 +5660,94 @@ fn prepare_cold_members(
             name,
         });
     }
-    Ok(ColdMembersPlan {
+    Ok(ColdMembersPlan { table, properties })
+}
+
+fn prepare_cold_index_values(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &GenericInterfaceShape,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<ColdIndexValues, GenericInterfaceMemberError> {
+    let mapper_sources =
+        mapper_parameters_for_target(store, shape.target, &shape.source_parameters)?;
+    let mapper_targets = shape
+        .target_arguments
+        .iter()
+        .copied()
+        .chain(std::iter::once(shape.reference))
+        .collect::<Vec<_>>();
+    let requires_mapper = !shape.index_infos.is_empty()
+        && shape
+            .properties
+            .iter()
+            .any(|property| property.requires_proxy);
+    if !store.try_reserve_mappers(usize::from(requires_mapper)) {
+        return Err(GenericInterfaceMemberError::Capacity(shape.reference));
+    }
+    let mapper = requires_mapper.then(|| {
+        store
+            .new_type_mapper(mapper_sources.clone(), mapper_targets.clone())
+            .expect("prevalidated mapper endpoints remain store-owned")
+    });
+    let mut indexes = Vec::with_capacity(shape.index_infos.len());
+    for source in &shape.index_infos {
+        let info = store
+            .index_info(*source)
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
+        let key_type = info.key_type();
+        let template = info.value_type();
+        let readonly = info.is_readonly();
+        let declaration = info.declaration();
+        let components = info.components().to_vec();
+        let limit_mark = session.limit_event_mark();
+        let result = if let Some(mapper) = mapper {
+            instantiate_generic_member_type(store, template, mapper, array_targets, session)?
+        } else {
+            instantiate_type_with_vector_and_session(
+                store,
+                template,
+                &mapper_sources,
+                &mapper_targets,
+                array_targets,
+                session,
+            )
+            .map_err(|error| property_instantiation_error(template, &error))?
+        };
+        let recovery = if session.limit_event_occurred_since(limit_mark) {
+            let error_type = session.recovery_error_type().ok_or(
+                GenericInterfaceMemberError::UnsupportedPropertyType(template),
+            )?;
+            let identity = instantiated_index_recovery_identity(
+                store,
+                &[key_type, template, result, error_type],
+                &mapper_sources,
+                &mapper_targets,
+                array_targets,
+            )
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                shape.reference,
+            ))?;
+            Some((error_type, identity))
+        } else {
+            None
+        };
+        indexes.push(ColdIndexValue {
+            source: *source,
+            key_type,
+            template,
+            result,
+            readonly,
+            declaration,
+            components,
+            recovery,
+        });
+    }
+    Ok(ColdIndexValues {
+        mapper,
         mapper_sources,
         mapper_targets,
-        requires_mapper: proxy_count != 0,
-        table,
-        properties,
-        index_infos,
+        indexes,
     })
 }
 
@@ -5464,58 +5755,84 @@ fn publish_cold_members(
     store: &mut CanonicalTypeMapperStore,
     shape: &GenericInterfaceShape,
     plan: ColdMembersPlan,
+    indexes: ColdIndexValues,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<InstantiatedInterfaceMembers, GenericInterfaceMemberError> {
     let ColdMembersPlan {
-        mapper_sources,
-        mapper_targets,
-        requires_mapper,
         table,
         properties: planned_properties,
-        mut index_infos,
     } = plan;
-    let mapper = requires_mapper.then(|| {
-        store
-            .new_type_mapper(mapper_sources.clone(), mapper_targets.clone())
-            .expect("prevalidated mapper endpoints remain store-owned")
+    let ColdIndexValues {
+        mapper,
+        mapper_sources,
+        mapper_targets,
+        indexes,
+    } = indexes;
+    let count = indexes
+        .len()
+        .checked_add(shape.inherited_index_infos.len())
+        .ok_or(GenericInterfaceMemberError::Capacity(shape.reference))?;
+    let recovery_count = indexes
+        .iter()
+        .filter(|index| index.recovery.is_some())
+        .count();
+    let needs_mapper = mapper.is_none()
+        && shape
+            .properties
+            .iter()
+            .any(|property| property.requires_proxy);
+    if !store.try_reserve_index_infos(indexes.len())
+        || !store.try_reserve_instantiated_index_recoveries(recovery_count)
+        || !store.try_reserve_mappers(usize::from(needs_mapper))
+    {
+        return Err(GenericInterfaceMemberError::Capacity(shape.reference));
+    }
+    let mut index_infos = Vec::new();
+    index_infos
+        .try_reserve_exact(count)
+        .map_err(|_| GenericInterfaceMemberError::Capacity(shape.reference))?;
+    let mut recoveries = Vec::with_capacity(recovery_count);
+    let mapper = mapper.or_else(|| {
+        needs_mapper.then(|| {
+            store
+                .new_type_mapper(mapper_sources.clone(), mapper_targets.clone())
+                .expect("prevalidated mapper endpoints remain store-owned")
+        })
     });
-    let mut session = InstantiationSession::new(InstantiationLimits::default());
-    for source in &shape.index_infos {
-        let index = if let Some(mapper) = mapper {
-            instantiate_generic_index_info_with_array_targets(
-                store,
-                shape.reference,
-                *source,
-                mapper,
-                array_targets,
-                &mut session,
-            )?
+    for value in indexes {
+        let index = if value.result == value.template {
+            value.source
         } else {
-            let info = store
-                .index_info(*source)
-                .ok_or(GenericInterfaceMemberError::InvalidTarget(shape.target))?;
-            let key = info.key_type();
-            let value = info.value_type();
-            let readonly = info.is_readonly();
-            let declaration = info.declaration();
-            let components = info.components().to_vec();
-            let instantiated = instantiate_type_with_vector_and_session(
-                store,
-                value,
-                &mapper_sources,
-                &mapper_targets,
-                array_targets,
-                &mut session,
-            )
-            .map_err(|error| property_instantiation_error(value, &error))?;
-            if instantiated == value {
-                *source
-            } else {
-                store
-                    .alloc_index_info(key, instantiated, readonly, declaration, components)
-                    .ok_or(GenericInterfaceMemberError::Capacity(shape.reference))?
-            }
+            store
+                .alloc_index_info(
+                    value.key_type,
+                    value.result,
+                    value.readonly,
+                    value.declaration,
+                    value.components.clone(),
+                )
+                .expect("reserved index allocation has prevalidated source metadata")
         };
+        if let Some((error_type, identity)) = value.recovery {
+            recoveries.push(InstantiatedIndexRecovery {
+                valid: true,
+                index,
+                source: value.source,
+                shape: shape.clone(),
+                mapper,
+                mapper_sources: mapper_sources.clone(),
+                mapper_targets: mapper_targets.clone(),
+                key_type: value.key_type,
+                template: value.template,
+                result: value.result,
+                readonly: value.readonly,
+                declaration: value.declaration,
+                components: value.components,
+                array_targets,
+                error_type,
+                identity,
+            });
+        }
         index_infos.push(index);
     }
     index_infos.extend_from_slice(&shape.inherited_index_infos);
@@ -5563,6 +5880,9 @@ fn publish_cold_members(
         None,
         (!index_infos.is_empty()).then_some(index_infos),
     ));
+    for recovery in recoveries {
+        assert!(store.publish_instantiated_index_recovery(recovery));
+    }
     Ok(InstantiatedInterfaceMembers {
         reference: shape.reference,
         target: shape.target,
@@ -11293,6 +11613,754 @@ mod tests {
             Ok(unchanged),
         );
         assert_eq!(context.store().index_info_len(), before);
+    }
+
+    struct GenericIndexSessionFixture<'arena> {
+        context: CanonicalCheckerContext<'arena>,
+        reference: TypeId,
+        target: TypeId,
+        parameter: TypeId,
+        wrapper: TypeId,
+        sources: Vec<IndexInfoId>,
+    }
+
+    fn generic_index_session_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> GenericIndexSessionFixture<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(parsed, file, CanonicalCheckerOptions::default());
+        let wrapper_owner = source_symbol(parsed, file, &context, "Wrapper");
+        let wrapper = context.get_declared_type_of_symbol(wrapper_owner).unwrap();
+        let TypeData::Interface(wrapper_data) =
+            context.store().type_payload(wrapper).unwrap().data()
+        else {
+            panic!("Wrapper must retain its generic target")
+        };
+        let wrapper_parameter = wrapper_data
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        publish_generic_target_for_test(
+            &mut context,
+            wrapper,
+            &[("value", wrapper_parameter)],
+            None,
+        );
+
+        let owner = source_symbol(parsed, file, &context, "Lookup");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let TypeData::Interface(target_data) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("Lookup must retain its generic target")
+        };
+        let parameter = target_data
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .unwrap()[0];
+        let table = context.store().symbol(owner).unwrap().members().unwrap();
+        let own = context
+            .store()
+            .symbol_table(table)
+            .unwrap()
+            .get_source("own");
+        let mut properties = Vec::new();
+        if let Some(own) = own {
+            let declaration = context
+                .store()
+                .symbol(own)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let annotation = context
+                .store()
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            properties.push(("own", context.get_type_from_type_node(annotation).unwrap()));
+        }
+        let index_symbol = context
+            .store()
+            .symbol_table(table)
+            .unwrap()
+            .get(InternalSymbolName::Index.as_ref())
+            .unwrap();
+        let declarations = context
+            .store()
+            .symbol(index_symbol)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let mut infos = Vec::new();
+        for declaration in declarations {
+            let children = context
+                .store()
+                .source_direct_children(declaration)
+                .unwrap()
+                .to_vec();
+            let key_parameter = children
+                .iter()
+                .copied()
+                .find(|child| {
+                    context.store().source_node_kind(*child) == Some(SyntaxKind::Parameter)
+                })
+                .unwrap();
+            let key_annotation = context
+                .store()
+                .source_direct_type_annotation(key_parameter)
+                .unwrap();
+            let value_annotation = context
+                .store()
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            let readonly = children.iter().any(|child| {
+                context.store().source_node_kind(*child) == Some(SyntaxKind::ReadonlyKeyword)
+            });
+            let key = context.get_type_from_type_node(key_annotation).unwrap();
+            let value = context.get_type_from_type_node(value_annotation).unwrap();
+            infos.push((key, value, readonly, declaration));
+        }
+        publish_generic_target_for_test(&mut context, target, &properties, None);
+        let store = context.store_mut_for_test();
+        let members = match store.type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface.declared_members,
+            _ => unreachable!(),
+        };
+        let sources = infos
+            .into_iter()
+            .map(|(key, value, readonly, declaration)| {
+                store
+                    .alloc_index_info(key, value, readonly, Some(declaration), Vec::new())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(store.set_interface_declared_members(
+            target,
+            true,
+            members,
+            None,
+            None,
+            Some(sources.clone()),
+        ));
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let reference = store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        GenericIndexSessionFixture {
+            context,
+            reference,
+            target,
+            parameter,
+            wrapper,
+            sources,
+        }
+    }
+
+    fn generic_index_value(
+        store: &CanonicalTypeMapperStore,
+        reference: TypeId,
+    ) -> (IndexInfoId, TypeId) {
+        let indexes = store
+            .type_payload(reference)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .index_infos
+            .as_deref()
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+        (
+            indexes[0],
+            store.index_info(indexes[0]).unwrap().value_type(),
+        )
+    }
+
+    #[test]
+    fn generic_index_recovery_uses_the_caller_budget_and_replays_warm_identity() {
+        for own in [false, true] {
+            for (annotation, remaining) in [("T", 0), ("Wrapper<T>", 1)] {
+                let member = if own {
+                    format!("own: {annotation};")
+                } else {
+                    String::new()
+                };
+                let parsed = parse_source_file(&format!(
+                    "interface Wrapper<T> {{ value: T }} \
+                     interface Lookup<T> {{ readonly [key: string]: {annotation}; {member} }}",
+                ));
+                let mut fixture = generic_index_session_fixture(&parsed, FileId::new(6_310));
+                let store = fixture.context.store_mut_for_test();
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let (number, error_type) = (bootstrap.number_type, bootstrap.error_type);
+                let mut session = InstantiationSession::new_recovering(
+                    store,
+                    InstantiationLimits {
+                        max_count: 1 + remaining,
+                        ..InstantiationLimits::default()
+                    },
+                    error_type,
+                )
+                .unwrap();
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        store,
+                        fixture.parameter,
+                        &[fixture.parameter],
+                        &[number],
+                        None,
+                        &mut session,
+                    ),
+                    Ok(number)
+                );
+                assert_eq!(session.query_count(), 1);
+                let mark = session.limit_event_mark();
+                let members = resolve_members_with_array_targets_and_session(
+                    store,
+                    fixture.reference,
+                    None,
+                    &mut session,
+                )
+                .unwrap();
+                assert!(session.limit_event_occurred_since(mark));
+                assert_eq!(session.query_count(), 1 + remaining);
+                assert_eq!(session.total_count(), 1 + remaining);
+                let (index, result) = generic_index_value(store, fixture.reference);
+                assert!(store.instantiated_index_recovery(index).is_some());
+                if annotation == "T" {
+                    assert_eq!(result, error_type);
+                } else {
+                    let result = validate_direct_generic_reference(store, result).unwrap();
+                    assert_eq!(result.target, fixture.wrapper);
+                    assert_eq!(result.type_arguments, [error_type]);
+                }
+                for property in members.properties() {
+                    assert!(
+                        store
+                            .value_symbol_links(*property)
+                            .unwrap()
+                            .resolved_type
+                            .is_none()
+                    );
+                }
+                if annotation == "Wrapper<T>" {
+                    let wrapped_value = store
+                        .resolve_generic_interface_property(result, "value", None)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(wrapped_value.type_id(), error_type);
+                }
+                if own {
+                    let property = store
+                        .resolve_generic_interface_property(fixture.reference, "own", None)
+                        .unwrap()
+                        .unwrap();
+                    if annotation == "T" {
+                        assert_eq!(property.type_id(), number);
+                    } else {
+                        let value =
+                            validate_direct_generic_reference(store, property.type_id()).unwrap();
+                        assert_eq!(value.target, fixture.wrapper);
+                        assert_eq!(value.type_arguments, [number]);
+                    }
+                }
+                let before = property_recovery_store_counts(store);
+                let mark = session.limit_event_mark();
+                for _ in 0..2 {
+                    assert_eq!(
+                        resolve_members_with_array_targets_and_session(
+                            store,
+                            fixture.reference,
+                            None,
+                            &mut session,
+                        ),
+                        Ok(members.clone())
+                    );
+                    assert_eq!(
+                        resolve_property_with_array_targets_and_session(
+                            store,
+                            fixture.reference,
+                            EscapedNameRef::source("absent"),
+                            None,
+                            &mut session,
+                        ),
+                        Ok(None)
+                    );
+                    assert_eq!(
+                        generic_index_value(store, fixture.reference),
+                        (index, result)
+                    );
+                    assert_eq!(property_recovery_store_counts(store), before);
+                    assert_eq!(session.query_count(), 1 + remaining);
+                    assert_eq!(session.total_count(), 1 + remaining);
+                    assert!(!session.limit_event_occurred_since(mark));
+                }
+                let mut warm = InstantiationSession::new(InstantiationLimits {
+                    max_count: 0,
+                    ..InstantiationLimits::default()
+                });
+                assert_eq!(
+                    resolve_members_with_array_targets_and_session(
+                        store,
+                        fixture.reference,
+                        None,
+                        &mut warm,
+                    ),
+                    Ok(members)
+                );
+                assert_eq!(warm.total_count(), 0);
+                assert_eq!(property_recovery_store_counts(store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_index_only_wrappers_and_unions_replay_without_mapper_allocation() {
+        for annotation in ["Wrapper<T>", "T | string"] {
+            let parsed = parse_source_file(&format!(
+                "interface Wrapper<T> {{ value: T }} \
+                 interface Lookup<T> {{ readonly [key: string]: {annotation} }}",
+            ));
+            let mut fixture = generic_index_session_fixture(&parsed, FileId::new(6_311));
+            let store = fixture.context.store_mut_for_test();
+            let mappers = store.mapper_len();
+            let members =
+                resolve_members_with_array_targets(store, fixture.reference, None).unwrap();
+            assert!(members.mapper().is_none());
+            assert_eq!(store.mapper_len(), mappers);
+            let (index, result) = generic_index_value(store, fixture.reference);
+            if annotation == "T | string" {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let TypeData::Union(union) = store.type_payload(result).unwrap().data() else {
+                    panic!("Lookup<number> must retain the number|string index value")
+                };
+                assert_eq!(union.union.types.len(), 2);
+                assert!(union.union.types.contains(&bootstrap.number_type));
+                assert!(union.union.types.contains(&bootstrap.string_type));
+            }
+            assert!(store.instantiated_index_recovery(index).is_none());
+            let before = property_recovery_store_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_members_with_array_targets(store, fixture.reference, None),
+                    Ok(members.clone())
+                );
+                assert_eq!(
+                    generic_index_value(store, fixture.reference),
+                    (index, result)
+                );
+                assert_eq!(property_recovery_store_counts(store), before);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_index_failures_do_not_publish_earlier_index_records_or_members() {
+        let parsed = parse_source_file(concat!(
+            "interface Wrapper<T> { value: T } ",
+            "interface Lookup<T> { readonly [key: string]: T; readonly [key: number]: Wrapper<T> }",
+        ));
+        let mut fixture = generic_index_session_fixture(&parsed, FileId::new(6_312));
+        let store = fixture.context.store_mut_for_test();
+        let before = property_recovery_store_counts(store);
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        for _ in 0..2 {
+            assert!(
+                resolve_members_with_array_targets_and_session(
+                    store,
+                    fixture.reference,
+                    None,
+                    &mut session,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                store
+                    .type_payload(fixture.reference)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&StructuredTypeData::default())
+            );
+            assert_eq!(property_recovery_store_counts(store), before);
+            assert_eq!(session.query_count(), 1);
+            assert_eq!(session.total_count(), 1);
+        }
+    }
+
+    #[test]
+    fn generic_index_recovery_rejects_noncanonical_error_before_writes() {
+        let parsed = parse_source_file(concat!(
+            "interface Wrapper<T> { value: T } ",
+            "interface Lookup<T> { readonly [key: string]: Wrapper<T>; own: Wrapper<T> }",
+        ));
+        let mut fixture = generic_index_session_fixture(&parsed, FileId::new(6_313));
+        let store = fixture.context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let before = property_recovery_store_counts(store);
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            number,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_members_with_array_targets_and_session(
+                    store,
+                    fixture.reference,
+                    None,
+                    &mut session,
+                ),
+                Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                    fixture.reference
+                ))
+            );
+            assert_eq!(property_recovery_store_counts(store), before);
+            assert_eq!(session.total_count(), 0);
+        }
+    }
+
+    #[test]
+    fn generic_index_recovery_rejects_raw_index_writes_and_unproven_results() {
+        for change_source in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "interface Wrapper<T> { value: T } ",
+                "interface Lookup<T> { readonly [key: string]: Wrapper<T> }",
+            ));
+            let mut fixture = generic_index_session_fixture(&parsed, FileId::new(6_314));
+            let store = fixture.context.store_mut_for_test();
+            let error_type = store.intrinsic_bootstrap().unwrap().error_type;
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count: 1,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            resolve_members_with_array_targets_and_session(
+                store,
+                fixture.reference,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let (index, result) = generic_index_value(store, fixture.reference);
+            let written = if change_source {
+                fixture.sources[0]
+            } else {
+                index
+            };
+            assert!(store.set_index_info_symbol(written, None));
+            let before = property_recovery_store_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_members_with_array_targets_and_session(
+                        store,
+                        fixture.reference,
+                        None,
+                        &mut session,
+                    ),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                        fixture.reference
+                    ))
+                );
+                assert_eq!(property_recovery_store_counts(store), before);
+            }
+            let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+            let other = store
+                .create_direct_generic_reference_type(fixture.target, &[boolean])
+                .unwrap();
+            let source = store.index_info(fixture.sources[0]).unwrap();
+            let forged = store
+                .alloc_index_info(
+                    source.key_type(),
+                    result,
+                    source.is_readonly(),
+                    source.declaration(),
+                    source.components().to_vec(),
+                )
+                .unwrap();
+            assert!(store.set_structured_type_members(
+                other,
+                None,
+                None,
+                None,
+                None,
+                Some(vec![forged])
+            ));
+            assert!(store.instantiated_index_recovery(forged).is_none());
+            let before = property_recovery_store_counts(store);
+            assert_eq!(
+                resolve_members_with_array_targets_and_session(store, other, None, &mut session),
+                Err(GenericInterfaceMemberError::InvalidCachedMembers(other))
+            );
+            assert_eq!(property_recovery_store_counts(store), before);
+        }
+    }
+
+    #[test]
+    fn generic_index_recovery_rejects_source_link_and_result_graph_writes() {
+        for source_link in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "interface Wrapper<T> { value: T } ",
+                "interface Lookup<T> { readonly [key: string]: Wrapper<T>; own: Wrapper<T> }",
+            ));
+            let mut fixture = generic_index_session_fixture(&parsed, FileId::new(6_315));
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (error_type, number) = (bootstrap.error_type, bootstrap.number_type);
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count: 1,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            let members = resolve_members_with_array_targets_and_session(
+                store,
+                fixture.reference,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let (_, result) = generic_index_value(store, fixture.reference);
+            if source_link {
+                let source = store
+                    .value_symbol_links(members.properties()[0])
+                    .unwrap()
+                    .target
+                    .unwrap();
+                let links = store.value_symbol_links(source).unwrap().clone();
+                assert!(store.set_value_symbol_links(source, links));
+            } else {
+                assert!(store.set_type_reference_resolution(result, None, Some(vec![number])));
+            }
+            let before = property_recovery_store_counts(store);
+            let mark = session.limit_event_mark();
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_members_with_array_targets_and_session(
+                        store,
+                        fixture.reference,
+                        None,
+                        &mut session,
+                    ),
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                        fixture.reference
+                    ))
+                );
+                assert_eq!(property_recovery_store_counts(store), before);
+                assert!(!session.limit_event_occurred_since(mark));
+            }
+        }
+    }
+
+    #[test]
+    fn generic_inherited_members_share_the_budget_and_keep_unavailable_replay_stable() {
+        for (own_index, max_count) in [(false, 1), (false, 2), (true, 3)] {
+            let own = if own_index {
+                "readonly [key: number]: T"
+            } else {
+                "own: T"
+            };
+            let parsed = parse_source_file(&format!(
+                "interface Base<T> {{ readonly [key: string]: T }} \
+                 interface Derived<T> extends Base<T> {{ {own} }}",
+            ));
+            let file = FileId::new(6_316);
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let base_owner = source_symbol(&parsed, file, &context, "Base");
+            let owner = source_symbol(&parsed, file, &context, "Derived");
+            let base = context.get_declared_type_of_symbol(base_owner).unwrap();
+            let target = context.get_declared_type_of_symbol(owner).unwrap();
+            let TypeData::Interface(base_data) = context.store().type_payload(base).unwrap().data()
+            else {
+                panic!("Base must retain its generic target")
+            };
+            let base_parameter = base_data
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0];
+            let TypeData::Interface(target_data) =
+                context.store().type_payload(target).unwrap().data()
+            else {
+                panic!("Derived must retain its generic target")
+            };
+            let parameter = target_data
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0];
+            let declaration = context
+                .store()
+                .symbol(base_owner)
+                .unwrap()
+                .members()
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+                .and_then(|symbol| context.store().symbol(symbol))
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .unwrap()[0];
+            publish_generic_target_for_test(&mut context, base, &[], None);
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let source = context
+                .store_mut_for_test()
+                .alloc_index_info(string, base_parameter, true, Some(declaration), Vec::new())
+                .unwrap();
+            assert!(context.store_mut_for_test().set_interface_declared_members(
+                base,
+                true,
+                None,
+                None,
+                None,
+                Some(vec![source]),
+            ));
+            let base_template = context
+                .store_mut_for_test()
+                .create_direct_generic_reference_type(base, &[parameter])
+                .unwrap();
+            let properties = if own_index {
+                Vec::new()
+            } else {
+                vec![("own", parameter)]
+            };
+            publish_generic_target_for_test(
+                &mut context,
+                target,
+                &properties,
+                Some(vec![base_template]),
+            );
+            if own_index {
+                let declaration = context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .members()
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+                    .and_then(|symbol| context.store().symbol(symbol))
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    .unwrap()[0];
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                let index = context
+                    .store_mut_for_test()
+                    .alloc_index_info(number, parameter, true, Some(declaration), Vec::new())
+                    .unwrap();
+                assert!(context.store_mut_for_test().set_interface_declared_members(
+                    target,
+                    true,
+                    None,
+                    None,
+                    None,
+                    Some(vec![index]),
+                ));
+            }
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (number, error_type) = (bootstrap.number_type, bootstrap.error_type);
+            let reference = store
+                .create_direct_generic_reference_type(target, &[number])
+                .unwrap();
+            let before_mappers = store.mapper_len();
+            let before_indexes = store.index_info_len();
+            let mut session = InstantiationSession::new_recovering(
+                store,
+                InstantiationLimits {
+                    max_count,
+                    ..InstantiationLimits::default()
+                },
+                error_type,
+            )
+            .unwrap();
+            let mark = session.limit_event_mark();
+            let result = resolve_members_with_array_targets_and_session(
+                store,
+                reference,
+                None,
+                &mut session,
+            );
+            assert!(session.limit_event_occurred_since(mark));
+            assert_eq!(session.query_count(), max_count);
+            assert_eq!(session.total_count(), max_count);
+            if max_count == 1 {
+                assert_eq!(
+                    result,
+                    Err(GenericInterfaceMemberError::UnsupportedTarget(reference))
+                );
+                assert_eq!(store.mapper_len(), before_mappers);
+                assert_eq!(store.index_info_len(), before_indexes);
+                assert_eq!(
+                    store.type_payload(reference).unwrap().data().structured(),
+                    Some(&StructuredTypeData::default())
+                );
+            } else {
+                let members = result.as_ref().unwrap();
+                if own_index {
+                    let indexes = store
+                        .type_payload(reference)
+                        .unwrap()
+                        .data()
+                        .structured()
+                        .unwrap()
+                        .index_infos
+                        .as_deref()
+                        .unwrap();
+                    assert_eq!(indexes.len(), 2);
+                    let own = store.index_info(indexes[0]).unwrap();
+                    let inherited = store.index_info(indexes[1]).unwrap();
+                    assert_eq!((own.key_type(), own.value_type()), (number, number));
+                    assert_eq!(
+                        (inherited.key_type(), inherited.value_type()),
+                        (string, error_type)
+                    );
+                    assert!(store.instantiated_index_recovery(indexes[0]).is_none());
+                    assert!(store.instantiated_index_recovery(indexes[1]).is_some());
+                    assert!(members.properties().is_empty());
+                } else {
+                    let (index, value) = generic_index_value(store, reference);
+                    assert_eq!(value, error_type);
+                    assert!(store.instantiated_index_recovery(index).is_some());
+                    assert!(
+                        store
+                            .value_symbol_links(members.properties()[0])
+                            .unwrap()
+                            .resolved_type
+                            .is_none()
+                    );
+                }
+            }
+            let before = property_recovery_store_counts(store);
+            let mark = session.limit_event_mark();
+            for _ in 0..2 {
+                assert_eq!(
+                    resolve_members_with_array_targets_and_session(
+                        store,
+                        reference,
+                        None,
+                        &mut session,
+                    ),
+                    result
+                );
+                assert_eq!(property_recovery_store_counts(store), before);
+                assert_eq!(session.query_count(), max_count);
+                assert_eq!(session.total_count(), max_count);
+                assert_eq!(session.limit_event_occurred_since(mark), max_count == 1);
+            }
+        }
     }
 
     #[test]

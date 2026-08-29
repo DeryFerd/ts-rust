@@ -49,6 +49,7 @@ use super::{
     enums::{validate_enum_type_union_constituent, validate_enum_value_union_constituent},
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
+    indexed_access_types::cached_deferred_indexed_access_type,
     links::{LateBoundLinks, SignatureLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::{TypeMapper, TypeMapperApplication},
     object_members,
@@ -64,10 +65,11 @@ use super::{
     },
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
-        ConstituentMapState, ConstrainedTypeData, InterfaceTypeData, LiteralValue, ObjectTypeData,
-        RegularLiteralLink, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
+        ConstituentMapState, ConstrainedTypeData, IndexedAccessTypeData, InterfaceTypeData,
+        LiteralValue, ObjectTypeData, RegularLiteralLink, StructuredTypeData, TypeCacheState,
+        TypeData, TypeRecord,
     },
-    types::{ObjectFlags, TypeFlags},
+    types::{AccessFlags, ObjectFlags, TypeFlags},
 };
 
 /// The two compiler options that alter pinned intrinsic bootstrap identity.
@@ -2107,10 +2109,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             (candidate == type_).then_some((flags, name, object_flags))
         })
         .or_else(|| {
-            (bootstrap.options.strict_null_checks
-                && bootstrap.options.exact_optional_property_types
-                && type_ == bootstrap.missing_type)
-                .then_some((TypeFlags::UNDEFINED, "undefined", ObjectFlags::NONE))
+            (type_ == bootstrap.missing_type).then_some((
+                TypeFlags::UNDEFINED,
+                "undefined",
+                ObjectFlags::NONE,
+            ))
         });
         if expected != Some((record.flags(), intrinsic_name, record.object_flags()))
             || record.symbol().is_some()
@@ -3507,6 +3510,70 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         .then_some(binding.symbol)
     }
 
+    /// Validates deferred operands without evaluating the indexed access.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_supported_deferred_indexed_access(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        indexed: &IndexedAccessTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        array_visited: &mut HashSet<TypeId>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+        if record.flags() != TypeFlags::INDEXED_ACCESS
+            || record.object_flags() != ObjectFlags::NONE && record.object_flags() != variable_flags
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || indexed.constrained != ConstrainedTypeData::default()
+            || indexed.access_flags & !AccessFlags::PERSISTENT != AccessFlags::NONE
+            || cached_deferred_indexed_access_type(
+                self,
+                indexed.object_type,
+                indexed.index_type,
+                indexed.access_flags,
+            ) != Ok(Some(type_))
+        {
+            return Err(invalid());
+        }
+        let index_owner = cached_ordinary_type_parameter_owner(self, indexed.index_type)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if !self.source_symbol_declarations_match(index_owner) {
+            return Err(invalid());
+        }
+        let object_owner = cached_ordinary_type_parameter_owner(self, indexed.object_type);
+        if let Some(object_owner) = object_owner {
+            if !self.source_symbol_declarations_match(object_owner) {
+                return Err(invalid());
+            }
+        } else if !self.source_mapped_indexed_template_is_exact(type_) {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+
+        if !visiting.insert(type_) {
+            return Err(invalid());
+        }
+        let result = object_owner
+            .map(|_| indexed.object_type)
+            .into_iter()
+            .chain(std::iter::once(indexed.index_type))
+            .try_for_each(|operand| {
+                self.validate_union_constituent_worker(
+                    operand,
+                    array_validation,
+                    visiting,
+                    array_visited,
+                    allowed_pending,
+                )
+            });
+        visiting.remove(&type_);
+        result
+    }
+
     fn validate_supported_canonical_tuple(
         &self,
         type_: TypeId,
@@ -4367,6 +4434,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 type_,
                 record,
                 mapped,
+                array_validation,
+                visiting,
+                array_visited,
+                allowed_pending,
+            ),
+            TypeData::IndexedAccess(indexed) => self.validate_supported_deferred_indexed_access(
+                type_,
+                record,
+                indexed,
                 array_validation,
                 visiting,
                 array_visited,
@@ -6753,6 +6829,7 @@ mod tests {
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         declared::type_list_key,
+        instantiate::canonical_anonymous_union,
         signatures::ElementFlags,
         tuple_types::CanonicalTupleTypeRequest,
         type_records::{LiteralTypeData, TypeData},
@@ -8664,16 +8741,20 @@ mod tests {
             store.validate_union_constituent(bootstrap.undefined_widening_type),
             Ok(()),
         );
-        for sentinel in [bootstrap.missing_type, bootstrap.optional_type] {
-            assert_eq!(
-                store.validate_union_constituent(sentinel),
-                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(sentinel)),
-            );
-        }
+        assert_eq!(
+            store.validate_union_constituent(bootstrap.missing_type),
+            Ok(())
+        );
+        assert_eq!(
+            store.validate_union_constituent(bootstrap.optional_type),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                bootstrap.optional_type
+            )),
+        );
     }
 
     #[test]
-    fn exact_optional_missing_type_is_a_union_constituent_only_in_strict_exact_mode() {
+    fn indexed_access_missing_type_retains_its_identity_in_each_optional_mode() {
         for (strict_null_checks, exact_optional_property_types) in
             [(false, false), (false, true), (true, false), (true, true)]
         {
@@ -8694,31 +8775,28 @@ mod tests {
                 store.validate_union_constituent(optional),
                 Err(LiteralTypeCacheError::UnsupportedUnionConstituent(optional)),
             );
-            if strict_null_checks && exact_optional_property_types {
-                assert_eq!(store.validate_union_constituent(missing), Ok(()));
-                let union = store.literal_union_type(&[string, missing], None).unwrap();
+            assert_eq!(store.validate_union_constituent(missing), Ok(()));
+            let union = store.literal_union_type(&[string, missing], None).unwrap();
+            if strict_null_checks {
                 assert_eq!(union_types(&store, union), &[missing, string]);
-                let warm = (
-                    store.type_len(),
-                    store.intrinsic_bootstrap().unwrap().union_cache_len(),
-                );
-                assert_eq!(
-                    store.literal_union_type(&[string, missing], None),
-                    Ok(union)
-                );
-                assert_eq!(
-                    (
-                        store.type_len(),
-                        store.intrinsic_bootstrap().unwrap().union_cache_len()
-                    ),
-                    warm
-                );
             } else {
-                assert_eq!(
-                    store.validate_union_constituent(missing),
-                    Err(LiteralTypeCacheError::UnsupportedUnionConstituent(missing)),
-                );
+                assert_eq!(union, string);
             }
+            let warm = (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            );
+            assert_eq!(
+                store.literal_union_type(&[string, missing], None),
+                Ok(union)
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.intrinsic_bootstrap().unwrap().union_cache_len()
+                ),
+                warm
+            );
         }
     }
 
@@ -10167,6 +10245,255 @@ mod tests {
             store.validate_union_constituent_with_array_targets(targets, mapped),
             Ok(()),
         );
+    }
+
+    fn deferred_indexed_union_context(
+        parsed: &ParseResult,
+        exact_optional_property_types: bool,
+    ) -> (CanonicalCheckerContext<'_>, NodeRef, TypeId, TypeId) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(197);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(file, parsed),
+            [(file, &parsed.arena)].into_iter().collect(),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types,
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let node = |kind| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap()
+        };
+        let indexed_node = node(SyntaxKind::IndexedAccessType);
+        let indexed = context
+            .store()
+            .type_node_links(indexed_node)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let mapped = context
+            .store()
+            .type_node_links(node(SyntaxKind::MappedType))
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let TypeData::Mapped(mapped) = context.store().type_payload(mapped).unwrap().data() else {
+            panic!("the source must retain its mapped type")
+        };
+        let template = mapped.template_type.unwrap();
+        (context, indexed_node, indexed, template)
+    }
+
+    fn deferred_indexed_union_snapshot(store: &TestStore) -> (CheckerStateSnapshot, usize, usize) {
+        (
+            checker_state(store),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len(),
+        )
+    }
+
+    fn assert_deferred_indexed_union_rejected(
+        store: &mut TestStore,
+        indexed: TypeId,
+        template: TypeId,
+        sentinel: TypeId,
+    ) {
+        let before = deferred_indexed_union_snapshot(store);
+        assert!(store.validate_union_constituent(indexed).is_err());
+        assert!(canonical_anonymous_union(store, &[template, sentinel]).is_err());
+        assert_eq!(deferred_indexed_union_snapshot(store), before);
+    }
+
+    #[test]
+    fn deferred_indexed_union_inputs_preserve_source_identity_and_warm_caches() {
+        for body in [
+            "interface Wrapper<T> { value: T } \
+             type Soft<Model> = { [Key in keyof Model]?: Wrapper<Model[Key]> };",
+            "interface Input { readonly [key: string]: number | undefined } \
+             type Preserved = { [Key in keyof Input]+?: Input[Key] };",
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} {body}",
+            ));
+            for exact in [false, true] {
+                let (mut context, _, indexed, template) =
+                    deferred_indexed_union_context(&parsed, exact);
+                let store = context.store_mut_for_test();
+                let sentinel = store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .undefined_or_missing_type;
+                let indexed_snapshot = |store: &TestStore| {
+                    let record = store.type_payload(indexed).unwrap();
+                    let TypeData::IndexedAccess(data) = record.data() else {
+                        panic!("the deferred operand must keep its indexed-access record");
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data.clone(),
+                    )
+                };
+                let indexed_record = indexed_snapshot(store);
+                let before = deferred_indexed_union_snapshot(store);
+                assert_eq!(store.validate_union_constituent(indexed), Ok(()));
+                assert_eq!(deferred_indexed_union_snapshot(store), before);
+                let union = canonical_anonymous_union(store, &[template, sentinel]).unwrap();
+                assert_eq!(union_types(store, union).len(), 2);
+                assert!(union_types(store, union).contains(&template));
+                assert!(union_types(store, union).contains(&sentinel));
+
+                let warm = deferred_indexed_union_snapshot(store);
+                for _ in 0..2 {
+                    assert_eq!(store.validate_union_constituent(indexed), Ok(()));
+                    assert_eq!(store.validate_union_constituent(union), Ok(()));
+                    assert_eq!(
+                        canonical_anonymous_union(store, &[sentinel, template]),
+                        Ok(union),
+                    );
+                    assert_eq!(deferred_indexed_union_snapshot(store), warm);
+                    assert_eq!(indexed_snapshot(store), indexed_record);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_indexed_union_rejects_stale_source_ownership_and_warm_metadata() {
+        for body in [
+            "interface Wrapper<T> { value: T } \
+             type Soft<Model> = { [Key in keyof Model]?: Wrapper<Model[Key]> };",
+            "interface Input { readonly [key: string]: number | undefined } \
+             type Preserved = { [Key in keyof Input]+?: Input[Key] };",
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface Array<T> {{}} interface ReadonlyArray<T> {{}} {body}",
+            ));
+            let (mut context, indexed_node, indexed, template) =
+                deferred_indexed_union_context(&parsed, true);
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let sentinel = bootstrap.undefined_or_missing_type;
+            let number = bootstrap.number_type;
+            let union = canonical_anonymous_union(store, &[template, sentinel]).unwrap();
+            let TypeData::IndexedAccess(data) = store.type_payload(indexed).unwrap().data() else {
+                panic!("the source must retain its deferred indexed access")
+            };
+            let object = data.object_type;
+            let key = data.index_type;
+            let key_owner = cached_ordinary_type_parameter_owner(store, key).unwrap();
+            let declarations = store
+                .symbol(key_owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let object_owner = store.type_payload(object).unwrap().symbol().unwrap();
+            let borrowed = store
+                .symbol(object_owner)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            assert!(store.set_symbol_declarations(key_owner, Some(borrowed), None));
+            assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+            assert!(store.set_symbol_declarations(key_owner, Some(declarations), None));
+
+            let links = store.declared_type_links(key_owner).unwrap().clone();
+            let mut wrong_links = links.clone();
+            wrong_links.declared_type = Some(number);
+            assert!(store.set_declared_type_links(key_owner, wrong_links));
+            assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+            assert!(store.set_declared_type_links(key_owner, links));
+
+            assert!(store.set_type_symbol(indexed, Some(key_owner)));
+            assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+            assert!(store.set_type_symbol(indexed, None));
+            let alias = store.alloc_type_alias(None).unwrap();
+            assert!(store.set_type_alias(indexed, Some(alias)));
+            assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+            assert!(store.set_type_alias(indexed, None));
+            assert!(store.set_resolved_base_constraint(indexed, Some(number)));
+            assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+            assert!(store.set_resolved_base_constraint(indexed, None));
+
+            if template == indexed {
+                let links = store.type_node_links(indexed_node).unwrap().clone();
+                let mut wrong_links = links.clone();
+                wrong_links.resolved_type = Some(number);
+                assert!(store.set_type_node_links(indexed_node, wrong_links));
+                assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+                assert!(store.set_type_node_links(indexed_node, links));
+            }
+            let repaired = deferred_indexed_union_snapshot(store);
+            assert_eq!(
+                canonical_anonymous_union(store, &[template, sentinel]),
+                Ok(union),
+            );
+            assert_eq!(deferred_indexed_union_snapshot(store), repaired);
+        }
+    }
+
+    #[test]
+    fn deferred_indexed_union_rejects_wrong_operands_and_duplicate_identity() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Wrapper<T> { value: T } ",
+            "type Soft<Model> = { [Key in keyof Model]?: Wrapper<Model[Key]> };",
+        ));
+        let (mut context, _, indexed, template) = deferred_indexed_union_context(&parsed, true);
+        let store = context.store_mut_for_test();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let sentinel = bootstrap.undefined_or_missing_type;
+        let number = bootstrap.number_type;
+        canonical_anonymous_union(store, &[template, sentinel]).unwrap();
+        let TypeData::IndexedAccess(data) = store.type_payload(indexed).unwrap().data() else {
+            panic!("the source must retain its deferred indexed access")
+        };
+        let object = data.object_type;
+        let key = data.index_type;
+        let orphan = store.alloc_type_parameter(None).unwrap();
+        for (object, key) in [
+            (number, key),
+            (object, number),
+            (orphan, key),
+            (object, orphan),
+        ] {
+            let forged = store
+                .alloc_indexed_access_type(object, key, AccessFlags::NONE)
+                .unwrap();
+            assert_deferred_indexed_union_rejected(store, forged, forged, sentinel);
+        }
+
+        let duplicate = store
+            .alloc_indexed_access_type(object, key, AccessFlags::NONE)
+            .unwrap();
+        let before = deferred_indexed_union_snapshot(store);
+        assert_eq!(
+            store.validate_union_constituent(indexed),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(indexed)),
+        );
+        assert_eq!(
+            store.validate_union_constituent(duplicate),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(duplicate)),
+        );
+        assert_deferred_indexed_union_rejected(store, indexed, template, sentinel);
+        assert_eq!(deferred_indexed_union_snapshot(store), before);
     }
 
     #[test]

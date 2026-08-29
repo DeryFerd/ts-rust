@@ -17,14 +17,13 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, MinArgumentCountFlags, RelationUnavailable,
     SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
-    bootstrap::{LiteralTypeCacheError, UnionReduction},
+    bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
     classes::{
         ClassBodyCallable, ClassHeritageMembersValidation, optional_constructor_parameter_type,
         validate_class_heritage_members,
     },
-    instantiate::canonical_anonymous_union,
     signatures::{ElementFlags, Signature, SignatureFlags, SignatureKind, TupleElementInfo},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{TypeData, TypeRecord},
@@ -827,7 +826,7 @@ fn validate_signature_parameters<'store>(
 
 fn rest_parameter_shape(
     store: &CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
+    array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
     type_: TypeId,
     active: &mut HashSet<TypeId>,
@@ -844,12 +843,10 @@ fn rest_parameter_shape(
     }
     let result = (|| {
         if let TypeData::Union(union) = record.data() {
-            let valid = match global_types {
-                Some(globals) => store.validate_cached_union_result_with_array_targets(
-                    CanonicalArrayTargets::from_global_types(globals),
-                    type_,
-                    None,
-                ),
+            let valid = match array_targets {
+                Some(targets) => {
+                    store.validate_cached_union_result_with_array_targets(targets, type_, None)
+                }
                 None => store.validate_cached_union_result(type_, None),
             };
             if !record.flags().intersects(TypeFlags::UNION) {
@@ -860,7 +857,7 @@ fn rest_parameter_shape(
                     LiteralTypeCacheError::UnsupportedUnionConstituent(_) => {
                         DirectCallUnsupported::RestSignature(signature).into()
                     }
-                    LiteralTypeCacheError::ArrayType { .. } if global_types.is_none() => {
+                    LiteralTypeCacheError::ArrayType { .. } if array_targets.is_none() => {
                         DirectCallUnsupported::RestSignature(signature).into()
                     }
                     LiteralTypeCacheError::Capacity => {
@@ -873,7 +870,9 @@ fn rest_parameter_shape(
                 .union
                 .types
                 .iter()
-                .map(|&member| rest_parameter_shape(store, global_types, signature, member, active))
+                .map(|&member| {
+                    rest_parameter_shape(store, array_targets, signature, member, active)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(RestParameterShape::Union { type_, members });
         }
@@ -889,9 +888,9 @@ fn rest_parameter_shape(
                 combined_flags: tuple.combined_flags(),
             });
         }
-        if let Some(globals) = global_types
+        if let Some(targets) = array_targets
             && let Some(array) = store
-                .canonical_array_reference(globals, type_)
+                .canonical_array_reference_with_targets(targets, type_)
                 .map_err(|_| invalid())?
         {
             return Ok(RestParameterShape::Array {
@@ -913,7 +912,7 @@ fn rest_parameter_shape(
 
 fn callable_rest_shape(
     store: &CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
+    array_targets: Option<CanonicalArrayTargets>,
     callable: &ValidatedSingleCallable,
 ) -> Result<Option<RestParameterShape>, DirectCallError> {
     callable
@@ -921,7 +920,7 @@ fn callable_rest_shape(
         .map(|rest| {
             rest_parameter_shape(
                 store,
-                global_types,
+                array_targets,
                 callable.signature,
                 rest,
                 &mut HashSet::new(),
@@ -936,9 +935,22 @@ pub(super) fn get_parameter_count(
     global_types: Option<&CanonicalGlobalTypes>,
     callable: &ValidatedSingleCallable,
 ) -> Result<usize, DirectCallError> {
+    get_parameter_count_with_array_targets(
+        store,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+        callable,
+    )
+}
+
+/// Counts parameter positions using the supplied global array targets.
+pub(super) fn get_parameter_count_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    callable: &ValidatedSingleCallable,
+) -> Result<usize, DirectCallError> {
     validate_signature_parameters(store, callable)?;
     Ok(callable.parameters.len()
-        + callable_rest_shape(store, global_types, callable)?
+        + callable_rest_shape(store, array_targets, callable)?
             .as_ref()
             .map_or(0, RestParameterShape::parameter_count))
 }
@@ -984,15 +996,28 @@ pub(super) fn has_effective_rest_parameter(
     global_types: Option<&CanonicalGlobalTypes>,
     callable: &ValidatedSingleCallable,
 ) -> Result<bool, DirectCallError> {
+    has_effective_rest_parameter_with_array_targets(
+        store,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+        callable,
+    )
+}
+
+/// Tests for an effective rest parameter using the supplied global array targets.
+pub(super) fn has_effective_rest_parameter_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    callable: &ValidatedSingleCallable,
+) -> Result<bool, DirectCallError> {
     validate_signature_parameters(store, callable)?;
-    Ok(callable_rest_shape(store, global_types, callable)?
+    Ok(callable_rest_shape(store, array_targets, callable)?
         .as_ref()
         .is_some_and(RestParameterShape::has_effective_rest))
 }
 
 fn collect_rest_position_types(
     store: &CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
+    array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
     rest: &RestParameterShape,
     position: Option<usize>,
@@ -1021,7 +1046,7 @@ fn collect_rest_position_types(
                 let before = result.len();
                 collect_rest_position_types(
                     store,
-                    global_types,
+                    array_targets,
                     signature,
                     member,
                     position,
@@ -1052,14 +1077,14 @@ fn collect_rest_position_types(
                 if flags.contains(ElementFlags::VARIADIC) {
                     let nested = rest_parameter_shape(
                         store,
-                        global_types,
+                        array_targets,
                         signature,
                         element,
                         &mut HashSet::new(),
                     )?;
                     collect_rest_position_types(
                         store,
-                        global_types,
+                        array_targets,
                         signature,
                         &nested,
                         None,
@@ -1081,7 +1106,7 @@ fn collect_rest_position_types(
 
 fn position_types(
     store: &CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
+    array_targets: Option<CanonicalArrayTargets>,
     callable: &ValidatedSingleCallable,
     rest: Option<&RestParameterShape>,
     position: usize,
@@ -1093,7 +1118,7 @@ fn position_types(
     if let Some(rest) = rest {
         collect_rest_position_types(
             store,
-            global_types,
+            array_targets,
             callable.signature,
             rest,
             Some(position - callable.parameters.len()),
@@ -1112,8 +1137,23 @@ pub(super) fn get_min_argument_count(
     callable: &ValidatedSingleCallable,
     flags: MinArgumentCountFlags,
 ) -> Result<usize, DirectCallError> {
+    get_min_argument_count_with_array_targets(
+        store,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+        callable,
+        flags,
+    )
+}
+
+/// Reads the minimum argument count using the supplied global array targets.
+pub(super) fn get_min_argument_count_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    callable: &ValidatedSingleCallable,
+    flags: MinArgumentCountFlags,
+) -> Result<usize, DirectCallError> {
     let signature = validate_signature_parameters(store, callable)?;
-    let rest = callable_rest_shape(store, global_types, callable)?;
+    let rest = callable_rest_shape(store, array_targets, callable)?;
     let required_rest = match rest.as_ref() {
         Some(RestParameterShape::Tuple {
             infos,
@@ -1143,7 +1183,7 @@ pub(super) fn get_min_argument_count(
         return Ok(minimum);
     }
     while minimum > 0 {
-        let types = position_types(store, global_types, callable, rest.as_ref(), minimum - 1)?;
+        let types = position_types(store, array_targets, callable, rest.as_ref(), minimum - 1)?;
         let mut accepts_void = false;
         for type_ in types {
             accepts_void |= type_contains_void(store, callable.signature, minimum - 1, type_)?;
@@ -1174,15 +1214,30 @@ pub(super) fn try_get_type_at_position(
     callable: &ValidatedSingleCallable,
     position: usize,
 ) -> Result<Option<TypeId>, DirectCallError> {
+    try_get_type_at_position_with_array_targets(
+        store,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+        callable,
+        position,
+    )
+}
+
+/// Reads a parameter position and validates unions with the supplied array targets.
+pub(super) fn try_get_type_at_position_with_array_targets(
+    store: &mut CanonicalTypeMapperStore,
+    array_targets: Option<CanonicalArrayTargets>,
+    callable: &ValidatedSingleCallable,
+    position: usize,
+) -> Result<Option<TypeId>, DirectCallError> {
     validate_signature_parameters(store, callable)?;
-    let rest = callable_rest_shape(store, global_types, callable)?;
-    let types = position_types(store, global_types, callable, rest.as_ref(), position)?;
-    parameter_position_union(store, global_types, callable.signature, &types)
+    let rest = callable_rest_shape(store, array_targets, callable)?;
+    let types = position_types(store, array_targets, callable, rest.as_ref(), position)?;
+    parameter_position_union(store, array_targets, callable.signature, &types)
 }
 
 fn parameter_position_union(
     store: &mut CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
+    array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
     types: &[TypeId],
 ) -> Result<Option<TypeId>, DirectCallError> {
@@ -1190,14 +1245,8 @@ fn parameter_position_union(
         [] => Ok(None),
         [single] => Ok(Some(*single)),
         _ => {
-            let result = match global_types {
-                Some(globals) => store.expression_union_type_with_global_types(
-                    globals,
-                    types,
-                    UnionReduction::Literal,
-                ),
-                None => canonical_anonymous_union(store, types),
-            };
+            let result =
+                store.literal_union_type_with_alias_and_array_targets(types, None, array_targets);
             result.map(Some).map_err(|error| match error {
                 LiteralTypeCacheError::Capacity => {
                     DirectCallInvariant::ParameterProjectionCapacity(signature).into()
@@ -1237,7 +1286,11 @@ fn prepare_direct_call_parameters(
     if signature.this_parameter().is_some() {
         return Err(DirectCallUnsupported::ExplicitThisParameter(callable.signature).into());
     }
-    let rest = callable_rest_shape(store, global_types, callable)?;
+    let rest = callable_rest_shape(
+        store,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+        callable,
+    )?;
     let has_effective_rest = has_effective_rest_parameter(store, global_types, callable)?;
     let parameter_count = get_parameter_count(store, global_types, callable)?;
     let maximum_argument_count = parameter_count - usize::from(has_effective_rest);
@@ -1328,13 +1381,14 @@ fn project_direct_call_arguments(
         .map_or(request.arguments.len(), |(index, _)| {
             (*index).min(request.arguments.len())
         });
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
     let positions = (0..fixed_arguments)
-        .map(|index| position_types(store, global_types, callable, rest.as_ref(), index))
+        .map(|index| position_types(store, array_targets, callable, rest.as_ref(), index))
         .collect::<Result<Vec<_>, _>>()?;
     let mut argument_targets = Vec::with_capacity(positions.len());
     for (index, types) in positions.into_iter().enumerate() {
         if let Some(parameter_type) =
-            parameter_position_union(store, global_types, callable.signature, &types)?
+            parameter_position_union(store, array_targets, callable.signature, &types)?
         {
             argument_targets.push(DirectCallArgumentTarget {
                 index,
@@ -1534,9 +1588,10 @@ pub(super) fn rest_argument_types(
     rest_type: TypeId,
     arguments: &[TypeId],
 ) -> Result<Vec<TypeId>, DirectCallError> {
+    let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
     let rest = rest_parameter_shape(
         store,
-        global_types,
+        array_targets,
         signature,
         rest_type,
         &mut HashSet::new(),
@@ -1547,7 +1602,7 @@ pub(super) fn rest_argument_types(
             let mut types = Vec::new();
             contextual_rest_position_types(
                 store,
-                global_types,
+                array_targets,
                 signature,
                 &rest,
                 position,
@@ -1580,7 +1635,7 @@ pub(super) fn rest_argument_types(
 #[allow(clippy::too_many_arguments)] // Indexed union contexts and length-aware tuple contexts follow separate upstream paths.
 fn contextual_rest_position_types(
     store: &CanonicalTypeMapperStore,
-    global_types: Option<&CanonicalGlobalTypes>,
+    array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
     rest: &RestParameterShape,
     position: usize,
@@ -1595,7 +1650,7 @@ fn contextual_rest_position_types(
             for member in members {
                 contextual_rest_position_types(
                     store,
-                    global_types,
+                    array_targets,
                     signature,
                     member,
                     position,
@@ -1617,7 +1672,7 @@ fn contextual_rest_position_types(
             } else if indexed {
                 collect_rest_position_types(
                     store,
-                    global_types,
+                    array_targets,
                     signature,
                     rest,
                     None,
@@ -1642,14 +1697,14 @@ fn contextual_rest_position_types(
                         if infos[index].flags().contains(ElementFlags::VARIADIC) {
                             let nested = rest_parameter_shape(
                                 store,
-                                global_types,
+                                array_targets,
                                 signature,
                                 elements[index],
                                 &mut HashSet::new(),
                             )?;
                             collect_rest_position_types(
                                 store,
-                                global_types,
+                                array_targets,
                                 signature,
                                 &nested,
                                 None,
@@ -1761,9 +1816,13 @@ fn contextual_literal_argument_type(
             if mapped == original {
                 Ok(type_)
             } else {
-                parameter_position_union(store, global_types, signature, &mapped)?.ok_or_else(
-                    || DirectCallInvariant::InvalidParameterProjection(signature).into(),
-                )
+                parameter_position_union(
+                    store,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                    signature,
+                    &mapped,
+                )?
+                .ok_or_else(|| DirectCallInvariant::InvalidParameterProjection(signature).into())
             }
         }
         _ => Ok(type_),
@@ -1895,8 +1954,9 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeHost, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, ValueSymbolLinks, mapper::TypeMapper,
-        production::GlobalMergeCompletion, types::ObjectFlags,
+        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, ValueSymbolLinks,
+        bootstrap::UnionReduction, mapper::TypeMapper, production::GlobalMergeCompletion,
+        types::ObjectFlags,
     };
 
     fn initialized_store() -> CanonicalTypeMapperStore {

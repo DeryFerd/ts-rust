@@ -3004,11 +3004,25 @@ pub(super) fn validate_stored_declared_call_set(
                         ..ValueSymbolLinks::default()
                     })
                 || store.source_node_kind(provider_declaration) == Some(SyntaxKind::ConstructorType)
-                    && store
-                        .source_direct_type_annotation(*parameter_declaration)
-                        .is_none_or(|annotation| {
-                            !store.source_direct_type_annotation_is_exact(annotation, *type_)
-                        })
+                    && match declared_signature_parameter_is_optional(
+                        store,
+                        *parameter_declaration,
+                        *type_,
+                    ) {
+                        Some(false) => {
+                            cached_constructor_parameter_annotation_type(
+                                store,
+                                *parameter_declaration,
+                            ) != Some(*type_)
+                        }
+                        Some(true) => {
+                            cached_constructor_optional_parameter_type(
+                                store,
+                                *parameter_declaration,
+                            ) != Some(*type_)
+                        }
+                        None => true,
+                    }
                 || declared_signature_parameter_is_implicit_any_rest(
                     store,
                     *parameter_declaration,
@@ -3370,11 +3384,78 @@ fn declared_signature_parameter_is_optional(
                 type_,
             )
             && !valid_optional_generic_predicate_parameter(store, declaration, annotation, type_)
+            && cached_constructor_optional_parameter_type(store, declaration) != Some(type_)
         {
             return None;
         }
     }
     Some(optional)
+}
+
+/// Reads the exact annotation identity through source-owned parentheses.
+fn cached_constructor_parameter_annotation_type(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Option<TypeId> {
+    let SourceNodeParent::Parent(constructor) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    if store.source_node_kind(declaration) != Some(SyntaxKind::Parameter)
+        || store.source_node_kind(constructor) != Some(SyntaxKind::ConstructorType)
+    {
+        return None;
+    }
+    let mut annotation = store.source_direct_type_annotation(declaration)?;
+    let mut wrappers = Vec::new();
+    while store.source_node_kind(annotation) == Some(SyntaxKind::ParenthesizedType) {
+        let children = store.source_direct_children(annotation)?;
+        let [inner] = children.as_slice() else {
+            return None;
+        };
+        wrappers.push(annotation);
+        annotation = *inner;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let base = cached_planned_type_identity(store, annotation).or_else(|| {
+        store
+            .source_direct_type_annotation_is_exact(annotation, bootstrap.null_type)
+            .then_some(bootstrap.null_type)
+    })?;
+    if !store.source_direct_type_annotation_is_exact(annotation, base) {
+        return None;
+    }
+    let exact_links = TypeNodeLinks {
+        resolved_type: Some(base),
+        ..TypeNodeLinks::default()
+    };
+    if wrappers.into_iter().any(|wrapper| {
+        store
+            .type_node_links(wrapper)
+            .is_some_and(|links| links != &TypeNodeLinks::default() && links != &exact_links)
+            || store
+                .symbol_node_links(wrapper)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+    }) {
+        return None;
+    }
+    Some(base)
+}
+
+/// Reads a constructor parameter's optional value without changing its annotation.
+fn cached_constructor_optional_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Option<TypeId> {
+    let base = cached_constructor_parameter_annotation_type(store, declaration)?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    if !bootstrap.options.strict_null_checks {
+        return Some(base);
+    }
+    let type_ = bootstrap.cached_optional_parameter_type(base)?;
+    store
+        .validate_optional_parameter_type_metadata(base, type_)
+        .ok()?;
+    Some(type_)
 }
 
 fn authenticated_global_boolean_constructor_optional_parameter(
@@ -11829,7 +11910,10 @@ pub(super) fn plan_call_signature(
                 || token_record.parent != Some(parameter.node)
                 || token_record.range.start < name_record.range.end
                 || token_record.range.end > type_start
-                || !ordinary_any && !boolean_constructor && !generic_predicate_parameter
+                || !ordinary_any
+                    && !constructor_type
+                    && !boolean_constructor
+                    && !generic_predicate_parameter
             {
                 return Err(unsupported());
             }
@@ -15555,7 +15639,7 @@ fn valid_planned_signature_return(
     }
 }
 
-fn planned_call_parameter_type(
+pub(super) fn planned_call_parameter_type(
     store: &CanonicalTypeMapperStore,
     parameter: &PlannedCallParameter,
 ) -> Option<TypeId> {
@@ -15565,11 +15649,25 @@ fn planned_call_parameter_type(
         declared_signature_parameter_is_implicit_any_rest(store, declaration, type_)
             .then_some(type_)
     } else {
-        cached_annotation_identity(
+        let base = cached_annotation_identity(
             store,
             parameter.identity_node,
             parameter.null_literal_identity,
-        )
+        )?;
+        let declaration = store.symbol(parameter.symbol)?.value_declaration()?;
+        if let Some(SourceNodeParent::Parent(constructor)) = store.source_node_parent(declaration)
+            && store.source_node_kind(constructor) == Some(SyntaxKind::ConstructorType)
+        {
+            if store.source_direct_type_annotation(declaration) != Some(parameter.type_node)
+                || cached_constructor_parameter_annotation_type(store, declaration) != Some(base)
+            {
+                return None;
+            }
+            if parameter.optional {
+                return cached_constructor_optional_parameter_type(store, declaration);
+            }
+        }
+        Some(base)
     }
 }
 

@@ -33,7 +33,7 @@ use super::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
     },
-    instantiated_members::InstantiatedPropertyRecovery,
+    instantiated_members::{InstantiatedIndexRecovery, InstantiatedPropertyRecovery},
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
     links::{
@@ -48,7 +48,7 @@ use super::{
         TypeResolutionCheckpoint, TypeResolutionStack, TypeResolutionTarget,
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
-    mapped_types::MappedTypeModifiers,
+    mapped_types::{MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers},
     object_members::ObjectLiteralPropertyCloneOrigin,
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
@@ -97,9 +97,27 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
-    mapped_modifiers: Option<MappedTypeModifiers>,
+    mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     exported: bool,
     signature_links_eligible: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MappedTypeSyntaxFacts {
+    type_parameter: NodeId,
+    constraint: Option<NodeId>,
+    name_type: Option<NodeId>,
+    template: Option<NodeId>,
+    modifiers: Option<MappedTypeModifiers>,
+}
+
+/// Exact operand roles retained from one registered mapped declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceMappedTypeOperands {
+    pub type_parameter: NodeRef,
+    pub constraint: NodeRef,
+    pub name_type: Option<NodeRef>,
+    pub template: Option<NodeRef>,
 }
 
 #[derive(Debug)]
@@ -587,6 +605,9 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
+    instantiated_index_recoveries: HashMap<IndexInfoId, InstantiatedIndexRecovery>,
+    mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
+    mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
     class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
@@ -744,6 +765,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
+            instantiated_index_recoveries: HashMap::new(),
+            mapped_property_recoveries: HashMap::new(),
+            mapped_index_recoveries: HashMap::new(),
             source_class_provenance: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
             class_instance_super_views: HashMap::new(),
@@ -5270,6 +5294,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         for recovery in self.instantiated_property_recoveries.values_mut() {
             recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
         }
+        for recovery in self.instantiated_index_recoveries.values_mut() {
+            recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
+        }
+        for recovery in self.mapped_property_recoveries.values_mut() {
+            recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
+        }
+        for recovery in self.mapped_index_recoveries.values_mut() {
+            recovery_invalidated |= recovery.invalidate_for_raw_write(symbol);
+        }
         if let Some(type_) = published_type
             && let Some(identity) = self.module_value_identities.get_mut(&symbol)
             && identity.type_() == type_
@@ -5294,6 +5327,87 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     ) -> Option<&InstantiatedPropertyRecovery> {
         self.observe_relation_symbol_read(symbol);
         self.instantiated_property_recoveries.get(&symbol)
+    }
+
+    pub(super) fn instantiated_index_recovery(
+        &self,
+        index: IndexInfoId,
+    ) -> Option<&InstantiatedIndexRecovery> {
+        self.instantiated_index_recoveries.get(&index)
+    }
+
+    pub(super) fn try_reserve_instantiated_index_recoveries(&mut self, additional: usize) -> bool {
+        self.instantiated_index_recoveries
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    /// Only generic index evaluation can create this recovery evidence.
+    pub(super) fn publish_instantiated_index_recovery(
+        &mut self,
+        recovery: InstantiatedIndexRecovery,
+    ) -> bool {
+        let index = recovery.index();
+        if self.instantiated_index_recoveries.contains_key(&index)
+            || !recovery.matches_published_info(self.index_info(index))
+        {
+            return false;
+        }
+        self.instantiated_index_recoveries.insert(index, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    pub(super) fn mapped_property_recovery(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&MappedPropertyRecovery> {
+        self.observe_relation_symbol_read(symbol);
+        self.mapped_property_recoveries.get(&symbol)
+    }
+
+    pub(super) fn try_reserve_mapped_property_recoveries(&mut self) -> bool {
+        self.mapped_property_recoveries.try_reserve(1).is_ok()
+    }
+
+    /// Only mapped property evaluation can create this recovery evidence.
+    pub(super) fn publish_mapped_property_recovery(
+        &mut self,
+        recovery: MappedPropertyRecovery,
+    ) -> bool {
+        let symbol = recovery.symbol();
+        if self.mapped_property_recoveries.contains_key(&symbol)
+            || !recovery.matches_published_links(self.value_symbol_links(symbol))
+        {
+            return false;
+        }
+        self.mapped_property_recoveries.insert(symbol, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    pub(super) fn mapped_index_recovery(&self, index: IndexInfoId) -> Option<&MappedIndexRecovery> {
+        self.mapped_index_recoveries.get(&index)
+    }
+
+    pub(super) fn try_reserve_mapped_index_recoveries(&mut self, additional: usize) -> bool {
+        self.mapped_index_recoveries.try_reserve(additional).is_ok()
+    }
+
+    /// Only mapped index evaluation can create this recovery evidence.
+    pub(super) fn publish_mapped_index_recovery(&mut self, recovery: MappedIndexRecovery) -> bool {
+        let index = recovery.index();
+        if self.mapped_index_recoveries.contains_key(&index)
+            || !recovery.matches_published_info(self.index_info(index))
+        {
+            return false;
+        }
+        self.mapped_index_recoveries.insert(index, recovery);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub(super) fn instantiated_property_method_recovery(
@@ -7616,8 +7730,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if !self.index_infos.set_index_symbol(id, symbol) {
             return false;
         }
-        if relation_dirty {
+        let mut recovery_invalidated = self
+            .mapped_index_recoveries
+            .get_mut(&id)
+            .is_some_and(MappedIndexRecovery::invalidate_for_index_write);
+        for recovery in self.instantiated_index_recoveries.values_mut() {
+            recovery_invalidated |= recovery.invalidate_for_index_write(id);
+        }
+        if relation_dirty || recovery_invalidated {
             self.mark_relation_inputs_dirty();
+        }
+        if recovery_invalidated {
+            self.mark_union_cache_validation_dirty();
         }
         true
     }
@@ -7699,7 +7823,47 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         &self,
         node: NodeRef,
     ) -> Option<MappedTypeModifiers> {
-        self.source_node_fact(node)?.mapped_modifiers
+        self.source_node_fact(node)?
+            .mapped_type
+            .as_deref()?
+            .modifiers
+    }
+
+    /// Mapped parameters are allocated after their template, so adjacency is not a role proof.
+    pub(super) fn source_mapped_type_operands(
+        &self,
+        node: NodeRef,
+    ) -> Option<SourceMappedTypeOperands> {
+        let syntax = self.source_node_fact(node)?.mapped_type.as_deref()?;
+        let reference = |child| NodeRef::new(node.arena, node.file, child);
+        let operands = SourceMappedTypeOperands {
+            type_parameter: reference(syntax.type_parameter),
+            constraint: reference(syntax.constraint?),
+            name_type: syntax.name_type.map(reference),
+            template: syntax.template.map(reference),
+        };
+        let is_type = |child| {
+            self.source_node_kind(child).is_some_and(|kind| {
+                kind.is_keyword_type()
+                    || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                        .contains(&(kind as u16))
+            })
+        };
+        (self.source_node_kind(operands.type_parameter) == Some(SyntaxKind::TypeParameter)
+            && self.source_node_parent(operands.type_parameter)
+                == Some(SourceNodeParent::Parent(node))
+            && self.source_node_parent(operands.constraint)
+                == Some(SourceNodeParent::Parent(operands.type_parameter))
+            && is_type(operands.constraint)
+            && operands
+                .name_type
+                .into_iter()
+                .chain(operands.template)
+                .all(|child| {
+                    self.source_node_parent(child) == Some(SourceNodeParent::Parent(node))
+                        && is_type(child)
+                }))
+        .then_some(operands)
     }
 
     pub(super) fn source_direct_children(&self, parent: NodeRef) -> Option<Vec<NodeRef>> {
@@ -8048,17 +8212,30 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
                     _ => None,
                 },
-                mapped_modifiers: match &node.data {
-                    NodeData::MappedTypeNode(mapped) => MappedTypeModifiers::from_token_kinds(
-                        mapped
-                            .readonly_token
-                            .and_then(|token| arena.get(token))
-                            .map(|token| token.kind),
-                        mapped
-                            .question_token
-                            .and_then(|token| arena.get(token))
-                            .map(|token| token.kind),
-                    ),
+                mapped_type: match &node.data {
+                    NodeData::MappedTypeNode(mapped) => Some(Box::new(MappedTypeSyntaxFacts {
+                        type_parameter: mapped.type_parameter,
+                        constraint: arena.get(mapped.type_parameter).and_then(|parameter| {
+                            match &parameter.data {
+                                NodeData::TypeParameterDeclaration(parameter) => {
+                                    parameter.constraint
+                                }
+                                _ => None,
+                            }
+                        }),
+                        name_type: mapped.name_type,
+                        template: mapped.type_,
+                        modifiers: MappedTypeModifiers::from_token_kinds(
+                            mapped
+                                .readonly_token
+                                .and_then(|token| arena.get(token))
+                                .map(|token| token.kind),
+                            mapped
+                                .question_token
+                                .and_then(|token| arena.get(token))
+                                .map(|token| token.kind),
+                        ),
+                    })),
                     _ => None,
                 },
                 exported: match &node.data {

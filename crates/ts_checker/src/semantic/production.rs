@@ -50,6 +50,7 @@ use super::{
     merge::{CheckerDiagnosticMergeHost, SymbolMergeDiagnostic, SymbolMergeHost},
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
+    relation::RelationKind,
     source,
     symbol_display::{SymbolDisplayContext, SymbolDisplayError},
     type_nodes::CanonicalTypeQuery,
@@ -953,18 +954,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        let Self {
-            options,
-            store,
-            global_types,
-            ..
-        } = self;
-        store.is_type_assignable_to_with_global_types_and_strict_function_types(
-            source,
-            target,
-            global_types,
-            options.strict_function_types,
-        )
+        self.relate_types_with_current_session(source, target, RelationKind::Assignable)
     }
 
     /// Tests exact type identity using the context's authoritative global identities.
@@ -978,8 +968,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        self.store
-            .is_type_identical_to_with_global_types(source, target, &self.global_types)
+        self.relate_types_with_current_session(source, target, RelationKind::Identity)
     }
 
     /// Tests comparability using the context's authoritative global identities.
@@ -993,8 +982,35 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         source: TypeId,
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
-        self.store
-            .is_type_comparable_to_with_global_types(source, target, &self.global_types)
+        self.relate_types_with_current_session(source, target, RelationKind::Comparable)
+    }
+
+    fn relate_types_with_current_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+    ) -> Result<bool, RelationUnavailable> {
+        let Self {
+            options,
+            store,
+            global_types,
+            instantiation_session,
+            ..
+        } = self;
+        let limit_mark = instantiation_session.limit_event_mark();
+        let result = store.is_type_related_to_with_session(
+            source,
+            target,
+            relation,
+            Some(global_types),
+            Some(options.strict_function_types),
+            instantiation_session,
+        );
+        if instantiation_session.limit_event_occurred_since(limit_mark) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(source));
+        }
+        result
     }
 
     fn type_format_flags(&self, mut flags: CanonicalTypeFormatFlags) -> CanonicalTypeFormatFlags {
@@ -4434,6 +4450,69 @@ mod tests {
                 Ok(narrow_to_wide)
             );
             assert_eq!(context.is_type_assignable_to(wide, narrow), Ok(true));
+        }
+    }
+
+    #[test]
+    fn context_relation_queries_share_the_current_instantiation_budget() {
+        let source = parsed(concat!(
+            "interface Wrapper<Value> { value: Value } ",
+            "type First = { [Key in 'first']: Wrapper<Key> }; ",
+            "type FirstTarget = { first: Wrapper<'first'> }; ",
+            "type Second = { [Key in 'second']: Wrapper<Key> }; ",
+            "type SecondTarget = { second: Wrapper<'second'> };",
+        ));
+        let file = FileId::new(806);
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Identity,
+            RelationKind::Comparable,
+        ] {
+            let mut context = CanonicalCheckerContext::new(
+                completed_bindings(&[(file, &source)]),
+                vec![(file, &source.arena)],
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            context.check_source_file(file).unwrap();
+            let mut types = Vec::new();
+            for name in ["First", "FirstTarget", "Second", "SecondTarget"] {
+                types.push(
+                    context
+                        .get_type_from_type_node(type_alias_body(&source, file, name))
+                        .unwrap(),
+                );
+            }
+            let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+            context.instantiation_session = InstantiationSession::new_recovering(
+                context.store(),
+                InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 2,
+                },
+                error,
+            )
+            .unwrap();
+            assert_eq!(context.is_type_assignable_to(types[0], types[1]), Ok(true));
+            assert_eq!(context.instantiation_session.total_count(), 2);
+            let limit_mark = context.instantiation_session.limit_event_mark();
+            let result = match relation {
+                RelationKind::Assignable => context.is_type_assignable_to(types[2], types[3]),
+                RelationKind::Identity => context.is_type_identical_to(types[2], types[3]),
+                RelationKind::Comparable => context.is_type_comparable_to(types[2], types[3]),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                result,
+                Err(RelationUnavailable::UnsupportedStructuredType(types[2]))
+            );
+            assert!(
+                context
+                    .instantiation_session
+                    .limit_event_occurred_since(limit_mark)
+            );
+            assert_eq!(context.instantiation_session.total_count(), 2);
+            assert!(context.diagnostics().is_empty());
         }
     }
 

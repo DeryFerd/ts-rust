@@ -31,6 +31,13 @@ use super::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable,
     },
+    calls::{
+        DirectCallError, DirectCallInvariant,
+        get_min_argument_count_with_array_targets as get_min_argument_count,
+        get_parameter_count_with_array_targets as get_parameter_count,
+        has_effective_rest_parameter_with_array_targets as has_effective_rest_parameter,
+        try_get_type_at_position_with_array_targets as try_get_type_at_position,
+    },
     classes::{
         ClassConstructorVisibility, ClassHeritageMembersValidation,
         authenticated_class_constructor_value, class_constructor_call_parameter_type,
@@ -48,25 +55,29 @@ use super::{
     instantiate::{InstantiationLimits, InstantiationSession},
     instantiated_members::{
         GenericInterfaceMemberError, demand_instantiated_property_type,
-        validate_generic_interface_members,
+        resolve_members_with_array_targets_and_session, validate_generic_interface_members,
     },
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, TypeNodeLinks, ValueSymbolLinks},
-    mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
+    mapped_types::{
+        FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers,
+        ResolvedMappedTypeMembers,
+    },
     mapper::TypeMapper,
     reference_types::validate_direct_generic_reference,
     relation::{
-        ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
-        RelationComparisonResult, RelationKeyUnavailable, RelationKind, SignatureCheckMode,
+        ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
+        RecursionIdentityUnavailable, RelationComparisonResult, RelationKeyUnavailable,
+        RelationKind, SignatureCheckMode,
     },
-    signatures::{ElementFlags, SignatureFlags, Ternary},
+    signatures::{ElementFlags, SignatureFlags, Ternary, TupleElementInfo},
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
         validate_interface_heritage_members, validate_planned_interface_heritage_members,
     },
     template_types::StringMappingKind,
-    tuple_types::TupleShape,
+    tuple_types::{CanonicalTupleTypeRequest, TupleShape, TupleTypeError},
     type_records::{
         CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
     },
@@ -357,6 +368,47 @@ fn validate_class_members_relation_endpoint(
     Ok(())
 }
 
+/// Rejects strict nullish sources only after proving the generic target's cache.
+/// A valid cold target needs no member publication or property value demand.
+fn authenticated_nullish_generic_nonmatch(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    source: TypeId,
+    target: TypeId,
+    bootstrap: RelationBootstrapFacts,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, RelationUnavailable> {
+    if !bootstrap.strict_null_checks
+        || !store.type_flags(source)?.intersects(TypeFlags::NULLABLE)
+        || !matches!(
+            store.type_payload(target).map(TypeRecord::data),
+            Some(TypeData::TypeReference(_))
+        )
+    {
+        return Ok(false);
+    }
+    store
+        .validate_union_constituent(source)
+        .map_err(|error| union_validation_unavailable(source, error))?;
+    match validate_generic_interface_members(store, target, array_targets) {
+        Ok(_) => Ok(true),
+        Err(
+            GenericInterfaceMemberError::UnsupportedTarget(_)
+            | GenericInterfaceMemberError::UnsupportedMember(_)
+            | GenericInterfaceMemberError::UnsupportedPropertyType(_),
+        ) => Ok(false),
+        Err(GenericInterfaceMemberError::Capacity(_)) => {
+            Err(RelationUnavailable::UnionValidationCapacity(target))
+        }
+        Err(
+            GenericInterfaceMemberError::Reference(_)
+            | GenericInterfaceMemberError::InvalidTarget(_)
+            | GenericInterfaceMemberError::InvalidMember(_)
+            | GenericInterfaceMemberError::InvalidCachedMembers(_)
+            | GenericInterfaceMemberError::InvalidCachedProperty(_),
+        ) => Err(RelationUnavailable::InvalidStructuredMembers(target)),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RelationBootstrapFacts {
     strict_null_checks: bool,
@@ -419,6 +471,22 @@ struct ResolvedObjectMembers {
     property_origin: ObjectPropertyOrigin,
     call_signature: Option<ValidatedSingleCallable>,
     exact_callable: bool,
+}
+
+fn signature_parameter_relation_error(
+    callable: &ValidatedSingleCallable,
+    error: DirectCallError,
+) -> RelationUnavailable {
+    match error {
+        DirectCallError::Relation(error) => error,
+        DirectCallError::Unsupported(_) => {
+            RelationUnavailable::StructuredSignatures(callable.owner)
+        }
+        DirectCallError::Invariant(DirectCallInvariant::ParameterProjectionCapacity(_)) => {
+            RelationUnavailable::UnionValidationCapacity(callable.owner)
+        }
+        DirectCallError::Invariant(_) => RelationUnavailable::MalformedFunctionType(callable.owner),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -531,6 +599,7 @@ enum ObjectPropertyOrigin {
     ValidatedClass,
     SyntheticStructural(TypeId),
     FiniteMappedRecord(TypeId),
+    Mapped(TypeId),
     GenericReference(TypeId),
     Intersection(TypeId),
     FreshObjectLiteral(SemanticSymbolId),
@@ -617,6 +686,20 @@ impl PendingRelationCache {
     }
 }
 
+enum RelationInstantiationSession<'session> {
+    Borrowed(&'session mut InstantiationSession),
+    Owned(InstantiationSession),
+}
+
+impl RelationInstantiationSession<'_> {
+    fn as_mut(&mut self) -> &mut InstantiationSession {
+        match self {
+            Self::Borrowed(session) => session,
+            Self::Owned(session) => session,
+        }
+    }
+}
+
 struct RelaterSession<'store> {
     store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
     relation: RelationKind,
@@ -625,6 +708,8 @@ struct RelaterSession<'store> {
     strict_function_types: Option<bool>,
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
     inherited_property_references: HashMap<SemanticSymbolId, TypeId>,
+    mapped_property_receivers: HashMap<SemanticSymbolId, TypeId>,
+    instantiation_session: RelationInstantiationSession<'store>,
     observation: RelationObservationToken,
     pending: PendingRelationCache,
     maybe_keys: Vec<CacheHashKey>,
@@ -663,8 +748,26 @@ impl<'store> RelaterSession<'store> {
         global_types: Option<RelationGlobalTypes>,
         strict_function_types: Option<bool>,
     ) -> Self {
+        Self::new_with_global_types_options_and_session(
+            store,
+            relation,
+            bootstrap,
+            global_types,
+            strict_function_types,
+            None,
+        )
+    }
+
+    fn new_with_global_types_options_and_session(
+        store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
+        relation: RelationKind,
+        bootstrap: RelationBootstrapFacts,
+        global_types: Option<RelationGlobalTypes>,
+        strict_function_types: Option<bool>,
+        instantiation_session: Option<&'store mut InstantiationSession>,
+    ) -> Self {
         let relation_count = store.relation_comparison_budget(relation);
-        Self::new_with_limits_and_global_types(
+        let mut session = Self::new_with_limits_and_global_types(
             store,
             relation,
             bootstrap,
@@ -672,7 +775,12 @@ impl<'store> RelaterSession<'store> {
             strict_function_types,
             relation_count,
             PINNED_RELATION_STACK_DEPTH,
-        )
+        );
+        if let Some(instantiation_session) = instantiation_session {
+            session.instantiation_session =
+                RelationInstantiationSession::Borrowed(instantiation_session);
+        }
+        session
     }
 
     #[cfg(test)]
@@ -703,6 +811,13 @@ impl<'store> RelaterSession<'store> {
         relation_count: isize,
         stack_depth_limit: usize,
     ) -> Self {
+        let error_type = store
+            .intrinsic_bootstrap()
+            .expect("relation initialization requires the intrinsic types")
+            .error_type;
+        let instantiation_session =
+            InstantiationSession::new_recovering(store, InstantiationLimits::default(), error_type)
+                .expect("the relation error type belongs to the same store");
         let observation = store
             .begin_relation_read_observation()
             .expect("nested relation read observations are not supported");
@@ -714,6 +829,8 @@ impl<'store> RelaterSession<'store> {
             strict_function_types,
             validated_unions: HashMap::new(),
             inherited_property_references: HashMap::new(),
+            mapped_property_receivers: HashMap::new(),
+            instantiation_session: RelationInstantiationSession::Owned(instantiation_session),
             observation,
             pending: PendingRelationCache::default(),
             maybe_keys: Vec::new(),
@@ -2084,6 +2201,16 @@ impl<'store> RelaterSession<'store> {
             )?
         {
             return Ok(Ternary::True);
+        }
+
+        if authenticated_nullish_generic_nonmatch(
+            self.store,
+            source,
+            target,
+            self.bootstrap,
+            self.global_types.map(|globals| globals.array_targets),
+        )? {
+            return Ok(Ternary::False);
         }
 
         if source_flags.intersects(TypeFlags::OBJECT)
@@ -4093,8 +4220,31 @@ impl<'store> RelaterSession<'store> {
         if source.signature == target.signature {
             return Ok(Ternary::True);
         }
-        if source.parameters.len() != target.parameters.len()
-            || source.min_argument_count != target.min_argument_count
+        let source_error = |error| signature_parameter_relation_error(source, error);
+        let target_error = |error| signature_parameter_relation_error(target, error);
+        let array_targets = self.global_types.map(|globals| globals.array_targets);
+        let parameter_count =
+            get_parameter_count(self.store, array_targets, target).map_err(target_error)?;
+        if get_parameter_count(self.store, array_targets, source).map_err(source_error)?
+            != parameter_count
+            || get_min_argument_count(
+                self.store,
+                array_targets,
+                source,
+                MinArgumentCountFlags::NONE,
+            )
+            .map_err(source_error)?
+                != get_min_argument_count(
+                    self.store,
+                    array_targets,
+                    target,
+                    MinArgumentCountFlags::NONE,
+                )
+                .map_err(target_error)?
+            || has_effective_rest_parameter(self.store, array_targets, source)
+                .map_err(source_error)?
+                != has_effective_rest_parameter(self.store, array_targets, target)
+                    .map_err(target_error)?
         {
             return Ok(Ternary::False);
         }
@@ -4104,10 +4254,18 @@ impl<'store> RelaterSession<'store> {
         }
         let result = (|| {
             let mut result = Ternary::True;
-            for (source_type, target_type) in source.parameters.iter().zip(&target.parameters) {
+            for index in 0..parameter_count {
+                let source_type =
+                    try_get_type_at_position(self.store, array_targets, source, index)
+                        .map_err(source_error)?
+                        .unwrap_or(self.bootstrap.any_type);
+                let target_type =
+                    try_get_type_at_position(self.store, array_targets, target, index)
+                        .map_err(target_error)?
+                        .unwrap_or(self.bootstrap.any_type);
                 let related = self.is_related_to_ex(
-                    *target_type,
-                    *source_type,
+                    target_type,
+                    source_type,
                     RecursionFlags::BOTH,
                     intersection_state,
                 )?;
@@ -4151,6 +4309,14 @@ impl<'store> RelaterSession<'store> {
         if source.signature == target.signature {
             return Ok(Ternary::True);
         }
+        let strict_top_source = check_mode.intersects(SignatureCheckMode::STRICT_TOP_SIGNATURE)
+            && self.is_top_signature(source)?;
+        if !strict_top_source && self.is_top_signature(target)? {
+            return Ok(Ternary::True);
+        }
+        if strict_top_source && !self.is_top_signature(target)? {
+            return Ok(Ternary::False);
+        }
         let key = (source.signature, target.signature, check_mode.bits());
         if !self.active_signature_pairs.insert(key) {
             return Ok(Ternary::Maybe);
@@ -4159,6 +4325,57 @@ impl<'store> RelaterSession<'store> {
             self.compare_signatures_related_worker(source, target, check_mode, intersection_state);
         self.active_signature_pairs.remove(&key);
         result
+    }
+
+    fn is_top_signature(
+        &self,
+        callable: &ValidatedSingleCallable,
+    ) -> Result<bool, RelationUnavailable> {
+        let signature = self
+            .store
+            .signature(callable.signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(callable.owner))?;
+        if !signature.type_parameters().is_empty() {
+            return Ok(false);
+        }
+        if let Some(this) = signature.this_parameter() {
+            let this_type = self
+                .store
+                .value_symbol_links(this)
+                .and_then(|links| links.resolved_type)
+                .ok_or(RelationUnavailable::UnresolvedPropertyType(this))?;
+            if !self.store.type_flags(this_type)?.intersects(TypeFlags::ANY) {
+                return Ok(false);
+            }
+        }
+        if signature.parameters().len() != 1
+            || !signature
+                .flags()
+                .contains(SignatureFlags::HAS_REST_PARAMETER)
+        {
+            return Ok(false);
+        }
+        let rest = callable
+            .rest_parameter
+            .ok_or(RelationUnavailable::MalformedFunctionType(callable.owner))?;
+        let rest = self.effective_array_rest_element(callable)?.unwrap_or(rest);
+        if !self
+            .store
+            .type_flags(rest)?
+            .intersects(TypeFlags::ANY | TypeFlags::NEVER)
+        {
+            return Ok(false);
+        }
+        let return_type =
+            callable
+                .return_type
+                .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                    callable.signature,
+                ))?;
+        Ok(self
+            .store
+            .type_flags(return_type)?
+            .intersects(TypeFlags::ANY_OR_UNKNOWN))
     }
 
     fn effective_array_rest_element(
@@ -4180,6 +4397,590 @@ impl<'store> RelaterSession<'store> {
             Some(_) => Err(RelationUnavailable::MalformedFunctionType(callable.owner)),
             None => Ok(None),
         }
+    }
+
+    fn signature_has_non_array_rest(
+        &self,
+        callable: &ValidatedSingleCallable,
+    ) -> Result<bool, RelationUnavailable> {
+        let Some(rest) = callable.rest_parameter else {
+            return Ok(false);
+        };
+        if let Some(tuple) = self
+            .store
+            .canonical_tuple_shape(rest)
+            .map_err(|_| RelationUnavailable::MalformedFunctionType(callable.owner))?
+        {
+            return Ok(tuple.combined_flags().intersects(ElementFlags::VARIABLE)
+                && (tuple.element_infos().len() != tuple.fixed_length() + 1
+                    || tuple.element_infos()[tuple.fixed_length()].flags() != ElementFlags::REST));
+        }
+        Ok(self.effective_array_rest_element(callable)?.is_none()
+            && !self.store.type_flags(rest)?.intersects(TypeFlags::ANY))
+    }
+
+    /// Builds the remaining parameter tuple at the rest comparison position.
+    /// Fixed tuple elements stay separate from a variable tail and its suffix.
+    fn signature_rest_type_at_position(
+        &mut self,
+        callable: &ValidatedSingleCallable,
+        position: usize,
+        parameter_count: usize,
+        minimum: usize,
+    ) -> Result<TypeId, RelationUnavailable> {
+        let parameter_error = |error| signature_parameter_relation_error(callable, error);
+        let array_targets = self.global_types.map(|globals| globals.array_targets);
+        let effective_rest = has_effective_rest_parameter(self.store, array_targets, callable)
+            .map_err(parameter_error)?;
+        let fixed_count = parameter_count - usize::from(effective_rest);
+        let mut types = Vec::with_capacity(parameter_count - position);
+        let mut infos = Vec::with_capacity(parameter_count - position);
+        for index in position..fixed_count {
+            types.push(
+                try_get_type_at_position(self.store, array_targets, callable, index)
+                    .map_err(parameter_error)?
+                    .ok_or(RelationUnavailable::MalformedFunctionType(callable.owner))?,
+            );
+            infos.push(TupleElementInfo::new(
+                if index < minimum {
+                    ElementFlags::REQUIRED
+                } else {
+                    ElementFlags::OPTIONAL
+                },
+                None,
+            ));
+        }
+        if effective_rest {
+            let rest = callable
+                .rest_parameter
+                .ok_or(RelationUnavailable::MalformedFunctionType(callable.owner))?;
+            if let Some(tuple) = self
+                .store
+                .canonical_tuple_shape(rest)
+                .map_err(|_| RelationUnavailable::MalformedFunctionType(callable.owner))?
+            {
+                types.extend_from_slice(&tuple.element_types()[tuple.fixed_length()..]);
+                infos.extend_from_slice(&tuple.element_infos()[tuple.fixed_length()..]);
+            } else if let Some(element) = self.effective_array_rest_element(callable)? {
+                if types.is_empty() {
+                    return Ok(if element == self.bootstrap.any_type {
+                        element
+                    } else {
+                        rest
+                    });
+                }
+                types.push(element);
+                infos.push(TupleElementInfo::new(ElementFlags::REST, None));
+            } else if self.store.type_flags(rest)?.intersects(TypeFlags::ANY) {
+                if types.is_empty() {
+                    return Ok(rest);
+                }
+                types.push(rest);
+                infos.push(TupleElementInfo::new(ElementFlags::REST, None));
+            } else if types.is_empty() || self.store.type_flags(rest)?.intersects(TypeFlags::NEVER)
+            {
+                return Ok(rest);
+            } else {
+                return self.signature_tuple_with_rest(callable.owner, &types, &infos, rest);
+            }
+        }
+        self.signature_parameter_tuple(callable.owner, &types, &infos)
+    }
+
+    fn signature_tuple_with_rest(
+        &mut self,
+        owner: TypeId,
+        prefix: &[TypeId],
+        prefix_infos: &[TupleElementInfo],
+        rest: TypeId,
+    ) -> Result<TypeId, RelationUnavailable> {
+        if self.store.type_flags(rest)?.intersects(TypeFlags::UNION) {
+            let mut types = Vec::new();
+            for member in self.union_types(rest)? {
+                types.push(self.signature_tuple_with_rest(owner, prefix, prefix_infos, member)?);
+            }
+            return self
+                .store
+                .literal_union_type_with_alias_and_array_targets(
+                    &types,
+                    None,
+                    self.global_types.map(|globals| globals.array_targets),
+                )
+                .map_err(|error| match error {
+                    LiteralTypeCacheError::Capacity => {
+                        RelationUnavailable::UnionValidationCapacity(owner)
+                    }
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(type_) => {
+                        RelationUnavailable::UnsupportedUnionConstituent(type_)
+                    }
+                    _ => RelationUnavailable::MalformedUnion(owner),
+                });
+        }
+        if self.store.type_flags(rest)?.intersects(TypeFlags::NEVER) {
+            return Ok(rest);
+        }
+        let mut types = prefix.to_vec();
+        let mut infos = prefix_infos.to_vec();
+        if let Some(tuple) = self
+            .store
+            .canonical_tuple_shape(rest)
+            .map_err(|_| RelationUnavailable::MalformedFunctionType(owner))?
+        {
+            types.extend_from_slice(tuple.element_types());
+            infos.extend_from_slice(tuple.element_infos());
+        } else if let Some(globals) = self.global_types
+            && let Some(array) = self
+                .store
+                .canonical_array_reference_with_targets(globals.array_targets, rest)
+                .map_err(|_| RelationUnavailable::MalformedFunctionType(owner))?
+        {
+            types.push(array.element_type);
+            infos.push(TupleElementInfo::new(ElementFlags::REST, None));
+        } else {
+            types.push(rest);
+            infos.push(TupleElementInfo::new(
+                if self.store.type_flags(rest)?.intersects(TypeFlags::ANY) {
+                    ElementFlags::REST
+                } else {
+                    ElementFlags::VARIADIC
+                },
+                None,
+            ));
+        }
+        self.signature_parameter_tuple(owner, &types, &infos)
+    }
+
+    fn signature_parameter_tuple(
+        &mut self,
+        owner: TypeId,
+        types: &[TypeId],
+        infos: &[TupleElementInfo],
+    ) -> Result<TypeId, RelationUnavailable> {
+        if types.len() == 1
+            && infos[0].flags() == ElementFlags::REST
+            && types[0] == self.bootstrap.any_type
+        {
+            return Ok(self.bootstrap.any_type);
+        }
+        let mut infos = infos.to_vec();
+        if let Some(last_required) = infos
+            .iter()
+            .rposition(|info| info.flags().intersects(ElementFlags::REQUIRED))
+        {
+            for info in &mut infos[..last_required] {
+                if info.flags().intersects(ElementFlags::OPTIONAL) {
+                    *info =
+                        TupleElementInfo::new(ElementFlags::REQUIRED, info.labeled_declaration());
+                }
+            }
+        }
+        let request = CanonicalTupleTypeRequest::new(types, &infos, false);
+        let request = self.global_types.map_or(request, |globals| {
+            request.with_array_targets(globals.array_targets)
+        });
+        self.store
+            .create_canonical_tuple_type(request)
+            .map_err(|error| match error {
+                TupleTypeError::Capacity => RelationUnavailable::UnionValidationCapacity(owner),
+                _ => RelationUnavailable::MalformedFunctionType(owner),
+            })
+    }
+
+    /// Compares full parameter tails with the tuple element rules from
+    /// `propertiesRelatedTo`. This keeps required suffixes out of element unions.
+    fn signature_rest_types_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        self.signature_rest_types_related_to_excluding(source, target, &[], intersection_state)
+    }
+
+    fn signature_rest_types_related_to_excluding(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        excluded_positions: &[usize],
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if source == target {
+            return Ok(Ternary::True);
+        }
+        if self.store.type_flags(source)?.intersects(TypeFlags::UNION) {
+            if self.relation == RelationKind::Comparable {
+                for member in self.union_types(source)? {
+                    let result =
+                        self.signature_rest_types_related_to(member, target, intersection_state)?;
+                    if result != Ternary::False {
+                        return Ok(result);
+                    }
+                }
+                return Ok(Ternary::False);
+            }
+            let mut result = Ternary::True;
+            for member in self.union_types(source)? {
+                result &=
+                    self.signature_rest_types_related_to(member, target, intersection_state)?;
+                if result == Ternary::False {
+                    break;
+                }
+            }
+            return Ok(result);
+        }
+        if self.store.type_flags(target)?.intersects(TypeFlags::UNION) {
+            let members = self.union_types(target)?;
+            for member in &members {
+                let result =
+                    self.signature_rest_types_related_to(source, *member, intersection_state)?;
+                if result != Ternary::False {
+                    return Ok(result);
+                }
+            }
+            return self.signature_tuple_related_to_discriminated_union(
+                source,
+                &members,
+                intersection_state,
+            );
+        }
+        let source_tuple = self
+            .store
+            .canonical_tuple_shape(source)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(source))?;
+        let target_tuple = self
+            .store
+            .canonical_tuple_shape(target)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(target))?;
+        let source_array = self
+            .global_types
+            .map(|globals| {
+                self.store
+                    .canonical_array_reference_with_targets(globals.array_targets, source)
+            })
+            .transpose()
+            .map_err(|_| RelationUnavailable::MalformedCanonicalArrayReference(source))?
+            .flatten();
+        let target_array = self
+            .global_types
+            .map(|globals| {
+                self.store
+                    .canonical_array_reference_with_targets(globals.array_targets, target)
+            })
+            .transpose()
+            .map_err(|_| RelationUnavailable::MalformedCanonicalArrayReference(target))?
+            .flatten();
+        let comparisons = if let Some(target_tuple) = target_tuple
+            && (source_tuple.is_some() || source_array.is_some())
+        {
+            let (source_types, source_infos, source_minimum, source_rest, source_readonly) =
+                if let Some(tuple) = source_tuple {
+                    (
+                        tuple.element_types().to_vec(),
+                        tuple.element_infos().to_vec(),
+                        tuple.min_length(),
+                        tuple.combined_flags().intersects(ElementFlags::REST),
+                        tuple.is_readonly(),
+                    )
+                } else {
+                    let array = source_array.expect("one array or tuple source was checked");
+                    (
+                        vec![array.element_type],
+                        vec![TupleElementInfo::new(ElementFlags::REST, None)],
+                        0,
+                        true,
+                        array.readonly,
+                    )
+                };
+            let source_arity = source_types.len();
+            let target_arity = target_tuple.element_types().len();
+            let target_rest = target_tuple
+                .combined_flags()
+                .intersects(ElementFlags::VARIABLE);
+            if source_readonly && !target_tuple.is_readonly()
+                || !source_rest && source_arity < target_tuple.min_length()
+                || !target_rest && target_arity < source_minimum
+                || !target_rest && (source_rest || target_arity < source_arity)
+            {
+                return Ok(Ternary::False);
+            }
+            let target_start = target_tuple
+                .element_infos()
+                .iter()
+                .take_while(|info| !info.flags().intersects(ElementFlags::REST))
+                .count();
+            let target_end = target_tuple
+                .element_infos()
+                .iter()
+                .rev()
+                .take_while(|info| !info.flags().intersects(ElementFlags::REST))
+                .count();
+            let mut comparisons = Vec::with_capacity(source_arity);
+            for (position, (source_type, source_info)) in
+                source_types.into_iter().zip(source_infos).enumerate()
+            {
+                let target_position = if target_rest && position >= target_start {
+                    let Some(position) =
+                        target_arity.checked_sub(1 + (source_arity - 1 - position).min(target_end))
+                    else {
+                        return Ok(Ternary::False);
+                    };
+                    position
+                } else {
+                    position
+                };
+                let source_flags = source_info.flags();
+                let Some(target_info) = target_tuple.element_infos().get(target_position) else {
+                    return Ok(Ternary::False);
+                };
+                let target_flags = target_info.flags();
+                if target_flags.intersects(ElementFlags::VARIADIC)
+                    && !source_flags.intersects(ElementFlags::VARIADIC)
+                    || source_flags.intersects(ElementFlags::VARIADIC)
+                        && !target_flags.intersects(ElementFlags::VARIABLE)
+                    || target_flags.intersects(ElementFlags::REQUIRED)
+                        && !source_flags.intersects(ElementFlags::REQUIRED)
+                {
+                    return Ok(Ternary::False);
+                }
+                if excluded_positions.contains(&position)
+                    && source_tuple.is_some_and(|tuple| position < tuple.fixed_length())
+                    && target_position < target_tuple.fixed_length()
+                {
+                    continue;
+                }
+                comparisons.push((
+                    source_type,
+                    target_tuple.element_types()[target_position],
+                    source_flags,
+                    target_flags,
+                ));
+            }
+            comparisons
+        } else if let (Some(source_tuple), Some(target_array)) = (source_tuple, target_array) {
+            if source_tuple.is_readonly() && !target_array.readonly {
+                return Ok(Ternary::False);
+            }
+            source_tuple
+                .element_types()
+                .iter()
+                .copied()
+                .zip(source_tuple.element_infos())
+                .map(|(source_type, info)| {
+                    (
+                        source_type,
+                        target_array.element_type,
+                        info.flags(),
+                        ElementFlags::REST,
+                    )
+                })
+                .collect()
+        } else {
+            return self.is_related_to_ex(source, target, RecursionFlags::BOTH, intersection_state);
+        };
+        let mut result = Ternary::True;
+        for (source_type, target_type, source_flags, target_flags) in comparisons {
+            let related = if source_flags.intersects(ElementFlags::VARIADIC)
+                && target_flags.intersects(ElementFlags::REST)
+            {
+                let globals = self
+                    .global_types
+                    .ok_or(RelationUnavailable::StructuredSignatures(target))?;
+                let target_array = self
+                    .store
+                    .create_canonical_array_type_with_targets(
+                        globals.array_targets,
+                        target_type,
+                        false,
+                    )
+                    .map_err(|_| RelationUnavailable::MalformedCanonicalArrayReference(target))?;
+                self.is_related_to_ex(
+                    source_type,
+                    target_array,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?
+            } else if self.bootstrap.exact_optional_property_types {
+                let source_types = self.effective_property_types(
+                    source_type,
+                    (source_flags & target_flags).intersects(ElementFlags::OPTIONAL),
+                )?;
+                let target_types = self.effective_property_types(
+                    target_type,
+                    target_flags.intersects(ElementFlags::OPTIONAL),
+                )?;
+                self.property_types_related(&source_types, &target_types)?
+            } else {
+                self.is_related_to_ex(
+                    source_type,
+                    target_type,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?
+            };
+            if related == Ternary::False {
+                return Ok(related);
+            }
+            result &= related;
+        }
+        Ok(result)
+    }
+
+    /// Tests every discriminant combination, then checks the other elements
+    /// against every matching tuple, as in `typeRelatedToDiscriminatedType`.
+    fn signature_tuple_related_to_discriminated_union(
+        &mut self,
+        source: TypeId,
+        targets: &[TypeId],
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let Some(source_tuple) = self
+            .store
+            .canonical_tuple_shape(source)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(source))?
+        else {
+            return Ok(Ternary::False);
+        };
+        let source_types = source_tuple.element_types()[..source_tuple.fixed_length()].to_vec();
+        let source_infos = source_tuple.element_infos()[..source_tuple.fixed_length()].to_vec();
+        let mut target_types = Vec::with_capacity(targets.len());
+        let mut target_infos = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(tuple) = self
+                .store
+                .canonical_tuple_shape(*target)
+                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(*target))?
+            else {
+                return Ok(Ternary::False);
+            };
+            target_types.push(tuple.element_types()[..tuple.fixed_length()].to_vec());
+            target_infos.push(tuple.element_infos()[..tuple.fixed_length()].to_vec());
+        }
+        let mut discriminants = Vec::new();
+        let mut combinations = 1usize;
+        for (position, source_type) in source_types.into_iter().enumerate() {
+            let Some(first) = target_types
+                .first()
+                .and_then(|types| types.get(position))
+                .copied()
+            else {
+                continue;
+            };
+            if target_types
+                .iter()
+                .any(|types| types.get(position).is_none())
+                || target_types.iter().all(|types| types[position] == first)
+            {
+                continue;
+            }
+            let mut literal = false;
+            let mut generic = false;
+            for types in &target_types {
+                let type_ = types[position];
+                let flags = self.store.type_flags(type_)?;
+                let constituents = if flags.intersects(TypeFlags::UNION) {
+                    self.union_types(type_)?
+                } else {
+                    vec![type_]
+                };
+                literal |= flags.intersects(TypeFlags::BOOLEAN | TypeFlags::ENUM_LITERAL)
+                    || constituents.iter().all(|constituent| {
+                        self.store
+                            .type_payload(*constituent)
+                            .is_some_and(|record| record.flags().intersects(TypeFlags::UNIT))
+                    })
+                    || is_template_pattern_index_key(self.store, type_);
+                generic |= constituents.iter().any(|constituent| {
+                    self.store.type_payload(*constituent).is_some_and(|record| {
+                        record.flags().intersects(TypeFlags::INSTANTIABLE)
+                            && !is_template_pattern_index_key(self.store, *constituent)
+                            || record
+                                .object_flags()
+                                .intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+                    })
+                });
+            }
+            if !literal || generic {
+                continue;
+            }
+            let mut choices = if self
+                .store
+                .type_flags(source_type)?
+                .intersects(TypeFlags::UNION)
+            {
+                self.union_types(source_type)?
+            } else {
+                vec![source_type]
+            };
+            if source_infos[position]
+                .flags()
+                .intersects(ElementFlags::OPTIONAL)
+            {
+                choices.retain(|type_| *type_ != self.bootstrap.missing_type);
+            }
+            let Some(count) = combinations
+                .checked_mul(choices.len())
+                .filter(|count| *count <= 25)
+            else {
+                return Ok(Ternary::False);
+            };
+            combinations = count;
+            if combinations == 0 {
+                return Ok(Ternary::False);
+            }
+            discriminants.push((position, choices));
+        }
+        if discriminants.is_empty() {
+            return Ok(Ternary::False);
+        }
+        let mut matching_targets = HashSet::new();
+        for combination in 0..combinations {
+            let mut found = false;
+            for (target_index, types) in target_types.iter().enumerate() {
+                let mut index = combination;
+                let mut matches = true;
+                for (position, choices) in discriminants.iter().rev() {
+                    let choice = choices[index % choices.len()];
+                    index /= choices.len();
+                    let target_types = self.effective_property_types(
+                        types[*position],
+                        target_infos[target_index][*position]
+                            .flags()
+                            .intersects(ElementFlags::OPTIONAL),
+                    )?;
+                    if self.property_types_related(&[choice], &target_types)? == Ternary::False {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    found = true;
+                    matching_targets.insert(target_index);
+                }
+            }
+            if !found {
+                return Ok(Ternary::False);
+            }
+        }
+        let positions = discriminants
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>();
+        let mut result = Ternary::True;
+        for (index, target) in targets.iter().enumerate() {
+            if !matching_targets.contains(&index) {
+                continue;
+            }
+            result &= self.signature_rest_types_related_to_excluding(
+                source,
+                *target,
+                &positions,
+                intersection_state,
+            )?;
+            if result == Ternary::False {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     /// Instantiates an authenticated source generic against its canonical
@@ -4252,49 +5053,95 @@ impl<'store> RelaterSession<'store> {
         check_mode: SignatureCheckMode,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
-        let target_rest_element = self.effective_array_rest_element(target)?;
-        let source_rest_element = self.effective_array_rest_element(source)?;
-        let target_has_effective_rest = target_rest_element.is_some();
-        let target_count = target.parameters.len() + usize::from(target_has_effective_rest);
+        let source_error = |error| signature_parameter_relation_error(source, error);
+        let target_error = |error| signature_parameter_relation_error(target, error);
+        let array_targets = self.global_types.map(|globals| globals.array_targets);
+        let target_has_effective_rest =
+            has_effective_rest_parameter(self.store, array_targets, target)
+                .map_err(target_error)?;
+        let target_count =
+            get_parameter_count(self.store, array_targets, target).map_err(target_error)?;
+        let source_minimum = get_min_argument_count(
+            self.store,
+            array_targets,
+            source,
+            MinArgumentCountFlags::NONE,
+        )
+        .map_err(source_error)?;
         let source_has_more_parameters = !target_has_effective_rest
             && if check_mode.intersects(SignatureCheckMode::STRICT_ARITY) {
-                source.parameters.len() + usize::from(source_rest_element.is_some()) > target_count
+                has_effective_rest_parameter(self.store, array_targets, source)
+                    .map_err(source_error)?
+                    || get_parameter_count(self.store, array_targets, source)
+                        .map_err(source_error)?
+                        > target_count
             } else {
-                source.min_argument_count > target_count
+                source_minimum > target_count
             };
         if source_has_more_parameters {
             return Ok(Ternary::False);
         }
 
+        let target_rest_element = self.effective_array_rest_element(target)?;
         let contextual_source =
             self.contextual_generic_rest_source(source, target, target_rest_element)?;
         let source = contextual_source.as_ref().unwrap_or(source);
-        let source_rest_element = if contextual_source.is_some() {
-            self.effective_array_rest_element(source)?
-        } else {
-            source_rest_element
-        };
+        let source_error = |error| signature_parameter_relation_error(source, error);
+        let source_minimum = get_min_argument_count(
+            self.store,
+            array_targets,
+            source,
+            MinArgumentCountFlags::NONE,
+        )
+        .map_err(source_error)?;
+        let target_minimum = get_min_argument_count(
+            self.store,
+            array_targets,
+            target,
+            MinArgumentCountFlags::NONE,
+        )
+        .map_err(target_error)?;
         let strict_variance = !check_mode.intersects(SignatureCheckMode::CALLBACK)
             && !target.strict_variance_exempt
             && self
                 .strict_function_types
                 .ok_or(RelationUnavailable::StructuredSignatures(target.owner))?;
         let mut result = Ternary::True;
-        let source_count = source.parameters.len() + usize::from(source_rest_element.is_some());
-        let parameter_count = source_count.max(target_count);
+        let source_count =
+            get_parameter_count(self.store, array_targets, source).map_err(source_error)?;
+        let compare_rest = self.signature_has_non_array_rest(source)?
+            || self.signature_has_non_array_rest(target)?;
+        let parameter_count = if compare_rest {
+            source_count.min(target_count)
+        } else {
+            source_count.max(target_count)
+        };
         for index in 0..parameter_count {
-            let (Some(source_type), Some(target_type)) = (
-                source
-                    .parameters
-                    .get(index)
-                    .copied()
-                    .or(source_rest_element),
-                target
-                    .parameters
-                    .get(index)
-                    .copied()
-                    .or(target_rest_element),
-            ) else {
+            let is_rest_position = compare_rest && index + 1 == parameter_count;
+            let parameter_types = if is_rest_position {
+                (
+                    Some(self.signature_rest_type_at_position(
+                        source,
+                        index,
+                        source_count,
+                        source_minimum,
+                    )?),
+                    Some(self.signature_rest_type_at_position(
+                        target,
+                        index,
+                        target_count,
+                        target_minimum,
+                    )?),
+                )
+            } else {
+                (
+                    try_get_type_at_position(self.store, array_targets, source, index)
+                        .map_err(source_error)?,
+                    try_get_type_at_position(self.store, array_targets, target, index)
+                        .map_err(target_error)?,
+                )
+            };
+            let (Some(source_type), Some(target_type)) = parameter_types else {
                 continue;
             };
             if source_type == target_type
@@ -4304,13 +5151,13 @@ impl<'store> RelaterSession<'store> {
             }
 
             let (source_callback, source_nullable_facts) =
-                if check_mode.intersects(SignatureCheckMode::CALLBACK) {
+                if is_rest_position || check_mode.intersects(SignatureCheckMode::CALLBACK) {
                     (None, 0)
                 } else {
                     self.project_non_nullable_callable_signature(source_type)?
                 };
             let (target_callback, target_nullable_facts) =
-                if check_mode.intersects(SignatureCheckMode::CALLBACK) {
+                if is_rest_position || check_mode.intersects(SignatureCheckMode::CALLBACK) {
                     (None, 0)
                 } else {
                     self.project_non_nullable_callable_signature(target_type)?
@@ -4334,20 +5181,36 @@ impl<'store> RelaterSession<'store> {
             } else {
                 let mut related = Ternary::False;
                 if !check_mode.intersects(SignatureCheckMode::CALLBACK) && !strict_variance {
-                    related = self.is_related_to_ex(
-                        source_type,
-                        target_type,
-                        RecursionFlags::BOTH,
-                        intersection_state,
-                    )?;
+                    related = if is_rest_position {
+                        self.signature_rest_types_related_to(
+                            source_type,
+                            target_type,
+                            intersection_state,
+                        )?
+                    } else {
+                        self.is_related_to_ex(
+                            source_type,
+                            target_type,
+                            RecursionFlags::BOTH,
+                            intersection_state,
+                        )?
+                    };
                 }
                 if related == Ternary::False {
-                    related = self.is_related_to_ex(
-                        target_type,
-                        source_type,
-                        RecursionFlags::BOTH,
-                        intersection_state,
-                    )?;
+                    related = if is_rest_position {
+                        self.signature_rest_types_related_to(
+                            target_type,
+                            source_type,
+                            intersection_state,
+                        )?
+                    } else {
+                        self.is_related_to_ex(
+                            target_type,
+                            source_type,
+                            RecursionFlags::BOTH,
+                            intersection_state,
+                        )?
+                    };
                 }
                 related
             };
@@ -4357,14 +5220,22 @@ impl<'store> RelaterSession<'store> {
             // relation itself succeeds.
             if related != Ternary::False
                 && check_mode.intersects(SignatureCheckMode::STRICT_ARITY)
-                && index >= source.min_argument_count
-                && index < target.min_argument_count
-                && self.is_related_to_ex(
-                    source_type,
-                    target_type,
-                    RecursionFlags::BOTH,
-                    intersection_state,
-                )? != Ternary::False
+                && index >= source_minimum
+                && index < target_minimum
+                && if is_rest_position {
+                    self.signature_rest_types_related_to(
+                        source_type,
+                        target_type,
+                        intersection_state,
+                    )?
+                } else {
+                    self.is_related_to_ex(
+                        source_type,
+                        target_type,
+                        RecursionFlags::BOTH,
+                        intersection_state,
+                    )?
+                } != Ternary::False
             {
                 related = Ternary::False;
             }
@@ -4488,18 +5359,31 @@ impl<'store> RelaterSession<'store> {
         if self.relation == RelationKind::StrictSubtype && source_readonly && !target_readonly {
             return Ok(Ternary::False);
         }
-        let source_type = self.property_type(source_property)?;
         let target_type = self.property_type(target_property)?;
-        let source_types = self.effective_property_types(
-            source_type,
-            source_flags.intersects(SymbolFlags::OPTIONAL)
-                && self.relation != RelationKind::Comparable,
-        )?;
         let target_types = self.effective_property_types(
             target_type,
             target_flags.intersects(SymbolFlags::OPTIONAL),
         )?;
-        let related = self.property_types_related(&source_types, &target_types)?;
+        let skip_source = if self.relation == RelationKind::StrictSubtype {
+            TypeFlags::ANY
+        } else {
+            TypeFlags::ANY_OR_UNKNOWN
+        };
+        let related = if target_types.iter().any(|type_| {
+            self.store
+                .type_payload(*type_)
+                .is_some_and(|record| record.flags().intersects(skip_source))
+        }) {
+            Ternary::True
+        } else {
+            let source_type = self.property_type(source_property)?;
+            let source_types = self.effective_property_types(
+                source_type,
+                source_flags.intersects(SymbolFlags::OPTIONAL)
+                    && self.relation != RelationKind::Comparable,
+            )?;
+            self.property_types_related(&source_types, &target_types)?
+        };
         if self.relation != RelationKind::Comparable
             && related != Ternary::False
             && source_flags.intersects(SymbolFlags::OPTIONAL)
@@ -4566,6 +5450,37 @@ impl<'store> RelaterSession<'store> {
         }
         let mut result = Ternary::True;
         for source_type in source_types {
+            if target_types.len() > 1
+                && self
+                    .store
+                    .type_flags(*source_type)?
+                    .intersects(TypeFlags::UNION)
+            {
+                // The target list represents one union. Source union members
+                // can match different target members without a new union type.
+                let source_members = self.union_types(*source_type)?;
+                let related = if self.relation == RelationKind::Comparable {
+                    let mut related = Ternary::False;
+                    for source_member in source_members {
+                        let candidate = self.property_types_related(
+                            std::slice::from_ref(&source_member),
+                            target_types,
+                        )?;
+                        if candidate != Ternary::False {
+                            related = candidate;
+                            break;
+                        }
+                    }
+                    related
+                } else {
+                    self.property_types_related(&source_members, target_types)?
+                };
+                if related == Ternary::False {
+                    return Ok(Ternary::False);
+                }
+                result &= related;
+                continue;
+            }
             let mut related = Ternary::False;
             for target_type in target_types {
                 let candidate = self.is_related_to_ex(
@@ -4588,16 +5503,57 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        if let Some(receiver) = self.mapped_property_receivers.get(&symbol).copied() {
+            self.store
+                .validate_mapped_type_relation_endpoint(receiver)
+                .map_err(|error| mapped_relation_error(receiver, error))?
+                .filter(|members| members.properties().contains(&symbol))
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            let owned = matches!(
+                self.instantiation_session,
+                RelationInstantiationSession::Owned(_)
+            );
+            let limit_mark = self.instantiation_session.as_mut().limit_event_mark();
+            let type_ = self
+                .store
+                .resolve_mapped_symbol_type_with_session(
+                    symbol,
+                    self.instantiation_session.as_mut(),
+                )
+                .map_err(|error| mapped_relation_error(receiver, error))?;
+            if owned
+                && self
+                    .instantiation_session
+                    .as_mut()
+                    .limit_event_occurred_since(limit_mark)
+            {
+                return Err(RelationUnavailable::UnsupportedStructuredType(receiver));
+            }
+            return Ok(type_);
+        }
         if let Some(reference) = self.inherited_property_references.get(&symbol).copied() {
-            let mut session = InstantiationSession::new(InstantiationLimits::default());
-            return demand_instantiated_property_type(
+            let owned = matches!(
+                self.instantiation_session,
+                RelationInstantiationSession::Owned(_)
+            );
+            let limit_mark = self.instantiation_session.as_mut().limit_event_mark();
+            let type_ = demand_instantiated_property_type(
                 self.store,
                 reference,
                 symbol,
                 self.global_types.map(|globals| globals.array_targets),
-                &mut session,
+                self.instantiation_session.as_mut(),
             )
-            .map_err(|_| RelationUnavailable::UnsupportedProperty(symbol));
+            .map_err(|_| RelationUnavailable::UnsupportedProperty(symbol))?;
+            if owned
+                && self
+                    .instantiation_session
+                    .as_mut()
+                    .limit_event_occurred_since(limit_mark)
+            {
+                return Err(RelationUnavailable::UnsupportedProperty(symbol));
+            }
+            return Ok(type_);
         }
         self.store
             .value_symbol_links(symbol)
@@ -4973,11 +5929,20 @@ impl<'store> RelaterSession<'store> {
         origin: ObjectPropertyOrigin,
     ) -> Result<&ts_binder::semantic::Symbol, RelationUnavailable> {
         let origin = self.property_origin_for_symbol(symbol, origin)?;
+        if let ObjectPropertyOrigin::Mapped(receiver) = origin {
+            self.store
+                .validate_mapped_type_relation_endpoint(receiver)
+                .map_err(|error| mapped_relation_error(receiver, error))?
+                .filter(|members| members.properties().contains(&symbol))
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(receiver))?;
+            self.mapped_property_receivers.insert(symbol, receiver);
+        }
         let record = self
             .store
             .symbol(symbol)
             .ok_or(RelationUnavailable::Symbol(symbol))?;
         match origin {
+            ObjectPropertyOrigin::Mapped(_) => return Ok(record),
             ObjectPropertyOrigin::Intersection(owner) => {
                 return if self
                     .intersection_projection(owner)?
@@ -5228,7 +6193,8 @@ impl<'store> RelaterSession<'store> {
                 | ObjectPropertyOrigin::DerivedObjectLiteral { .. }
                 | ObjectPropertyOrigin::Intersection(_)
                 | ObjectPropertyOrigin::SyntheticStructural(_)
-                | ObjectPropertyOrigin::FiniteMappedRecord(_) => {
+                | ObjectPropertyOrigin::FiniteMappedRecord(_)
+                | ObjectPropertyOrigin::Mapped(_) => {
                     unreachable!("literal property origins return before declared validation")
                 }
             };
@@ -5519,7 +6485,13 @@ impl<'store> RelaterSession<'store> {
                 }
                 None => {}
             }
-            self.validated_finite_record_mapped_projection(type_id)?;
+            if self
+                .validated_finite_record_mapped_projection(type_id)
+                .is_err()
+            {
+                self.resolved_mapped_relation_members(type_id)?
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+            }
             return Ok(());
         }
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
@@ -5569,11 +6541,37 @@ impl<'store> RelaterSession<'store> {
                 if !source_declared_target {
                     return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
                 }
-                return match validate_generic_interface_members(
+                let validation = validate_generic_interface_members(
                     self.store,
                     type_id,
                     self.global_types.map(|globals| globals.array_targets),
-                ) {
+                );
+                let validation = match validation {
+                    Ok(None) => {
+                        let owned = matches!(
+                            self.instantiation_session,
+                            RelationInstantiationSession::Owned(_)
+                        );
+                        let mark = self.instantiation_session.as_mut().limit_event_mark();
+                        let members = resolve_members_with_array_targets_and_session(
+                            self.store,
+                            type_id,
+                            self.global_types.map(|globals| globals.array_targets),
+                            self.instantiation_session.as_mut(),
+                        );
+                        if owned
+                            && self
+                                .instantiation_session
+                                .as_mut()
+                                .limit_event_occurred_since(mark)
+                        {
+                            return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+                        }
+                        members.map(Some)
+                    }
+                    validation => validation,
+                };
+                return match validation {
                     Ok(Some(_)) => Ok(()),
                     Ok(None) => Err(RelationUnavailable::UnresolvedStructuredMembers(type_id)),
                     Err(GenericInterfaceMemberError::UnsupportedTarget(_)) => {
@@ -5653,6 +6651,31 @@ impl<'store> RelaterSession<'store> {
         Ok(())
     }
 
+    fn resolved_mapped_relation_members(
+        &mut self,
+        type_id: TypeId,
+    ) -> Result<Option<ResolvedMappedTypeMembers>, RelationUnavailable> {
+        let owned = matches!(
+            self.instantiation_session,
+            RelationInstantiationSession::Owned(_)
+        );
+        let limit_mark = self.instantiation_session.as_mut().limit_event_mark();
+        let members = prepare_general_mapped_relation_endpoint(
+            self.store,
+            type_id,
+            self.instantiation_session.as_mut(),
+        )?;
+        if owned
+            && self
+                .instantiation_session
+                .as_mut()
+                .limit_event_occurred_since(limit_mark)
+        {
+            return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
+        }
+        Ok(members)
+    }
+
     fn validated_finite_record_mapped_projection(
         &self,
         type_id: TypeId,
@@ -5675,6 +6698,8 @@ impl<'store> RelaterSession<'store> {
                 | MappedTypeError::UnsupportedNameType(_)
                 | MappedTypeError::UnsupportedTemplate(_)
                 | MappedTypeError::RecursiveMembers(_)
+                | MappedTypeError::InstantiationDepthLimit { .. }
+                | MappedTypeError::InstantiationCountLimit { .. }
                 | MappedTypeError::CrossProductTooLarge { .. } => {
                     RelationUnavailable::UnsupportedStructuredType(type_id)
                 }
@@ -5773,7 +6798,7 @@ impl<'store> RelaterSession<'store> {
         &mut self,
         type_: TypeId,
     ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
-        let mut callable = match validate_stored_single_callable(self.store, type_) {
+        let callable = match validate_stored_single_callable(self.store, type_) {
             StoredSingleCallableValidation::NotCallable => {
                 let Some(symbol) = self.store.type_payload(type_).and_then(TypeRecord::symbol)
                 else {
@@ -5808,11 +6833,6 @@ impl<'store> RelaterSession<'store> {
         };
         if self.strict_function_types.is_none() && !callable.strict_variance_exempt {
             return Err(RelationUnavailable::StructuredSignatures(type_));
-        }
-        while callable.min_argument_count != 0
-            && self.type_contains_void(callable.parameters[callable.min_argument_count - 1])?
-        {
-            callable.min_argument_count -= 1;
         }
         Ok(Some(callable))
     }
@@ -5874,21 +6894,6 @@ impl<'store> RelaterSession<'store> {
             self.project_exact_callable_signature(*non_nullable)?,
             nullable_facts,
         ))
-    }
-
-    fn type_contains_void(&mut self, type_: TypeId) -> Result<bool, RelationUnavailable> {
-        let flags = self.store.type_flags(type_)?;
-        if flags.intersects(TypeFlags::VOID) {
-            return Ok(true);
-        }
-        if !flags.intersects(TypeFlags::UNION) {
-            return Ok(false);
-        }
-        Ok(self.union_types(type_)?.into_iter().any(|constituent| {
-            self.store
-                .type_payload(constituent)
-                .is_some_and(|record| record.flags().intersects(TypeFlags::VOID))
-        }))
     }
 
     /// The flag requires a local index-symbol slot, not merely an index record.
@@ -6072,7 +7077,34 @@ impl<'store> RelaterSession<'store> {
                     exact_callable: false,
                 });
             }
-            let projection = self.validated_finite_record_mapped_projection(type_id)?;
+            let projection = match self.validated_finite_record_mapped_projection(type_id) {
+                Ok(projection) => projection,
+                Err(_) => {
+                    let members = self
+                        .resolved_mapped_relation_members(type_id)?
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    self.observe_symbol_table(members.members());
+                    for property in members.properties() {
+                        self.property_symbol(*property, ObjectPropertyOrigin::Mapped(type_id))?;
+                    }
+                    let indexes = self
+                        .store
+                        .type_payload(type_id)
+                        .and_then(|record| record.data().structured())
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?
+                        .index_infos
+                        .clone()
+                        .unwrap_or_default();
+                    return Ok(ResolvedObjectMembers {
+                        members: Some(members.members()),
+                        properties: members.properties().to_vec(),
+                        index_infos: indexes,
+                        property_origin: ObjectPropertyOrigin::Mapped(type_id),
+                        call_signature: None,
+                        exact_callable: false,
+                    });
+                }
+            };
             self.observe_symbol_table(projection.members);
             for property in &projection.properties {
                 self.property_symbol(
@@ -6204,7 +7236,18 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::UnsupportedProperty(readonly));
         }
         let (index_infos, has_index_member) =
-            self.validated_declared_index_infos(type_id, record_symbol, &structured)?;
+            if matches!(property_origin, ObjectPropertyOrigin::GenericReference(_)) {
+                validate_generic_interface_members(
+                    self.store,
+                    type_id,
+                    self.global_types.map(|globals| globals.array_targets),
+                )
+                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?
+                .ok_or(RelationUnavailable::UnresolvedStructuredMembers(type_id))?;
+                (structured.index_infos.clone().unwrap_or_default(), false)
+            } else {
+                self.validated_declared_index_infos(type_id, record_symbol, &structured)?
+            };
         let class_members = if property_origin.is_declared() {
             validate_class_heritage_members(self.store, type_id)
         } else {
@@ -6233,9 +7276,7 @@ impl<'store> RelaterSession<'store> {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
             }
             let origin = self.property_origin_for_symbol(*property, property_origin)?;
-            if matches!(property_origin, ObjectPropertyOrigin::InterfaceHeritage(_))
-                && let ObjectPropertyOrigin::GenericReference(reference) = origin
-            {
+            if let ObjectPropertyOrigin::GenericReference(reference) = origin {
                 self.inherited_property_references
                     .entry(*property)
                     .or_insert(reference);
@@ -6575,7 +7616,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             (None, None) => Ok(None),
             (Some(source), Some(target))
-                if relation == RelationKind::Assignable && strict_function_types.is_some() =>
+                if matches!(
+                    relation,
+                    RelationKind::Assignable | RelationKind::Comparable
+                ) && strict_function_types.is_some() =>
             {
                 Ok(Some((source, target)))
             }
@@ -7357,6 +8401,45 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )
     }
 
+    /// Keeps member instantiation in the caller's checker query.
+    pub(super) fn is_type_assignable_to_with_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: Option<&CanonicalGlobalTypes>,
+        strict_function_types: Option<bool>,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_session(
+            source,
+            target,
+            RelationKind::Assignable,
+            global_types,
+            strict_function_types,
+            instantiation_session,
+        )
+    }
+
+    /// Borrows the checker query's instantiation session for any relation.
+    pub(super) fn is_type_related_to_with_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<&CanonicalGlobalTypes>,
+        strict_function_types: Option<bool>,
+        instantiation_session: &mut InstantiationSession,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_options_and_session(
+            source,
+            target,
+            relation,
+            global_types.map(RelationGlobalTypes::from_global_types),
+            strict_function_types,
+            Some(instantiation_session),
+        )
+    }
+
     /// Pinned `isTypeSubtypeOf`.
     ///
     /// # Errors
@@ -7594,6 +8677,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         global_types: Option<RelationGlobalTypes>,
         strict_function_types: Option<bool>,
     ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types_options_and_session(
+            source,
+            target,
+            relation,
+            global_types,
+            strict_function_types,
+            None,
+        )
+    }
+
+    fn is_type_related_to_with_optional_global_types_options_and_session(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<RelationGlobalTypes>,
+        strict_function_types: Option<bool>,
+        instantiation_session: Option<&mut InstantiationSession>,
+    ) -> Result<bool, RelationUnavailable> {
         if let Some(requested) = strict_function_types
             && let Err(established) = self.claim_strict_function_types(requested)
         {
@@ -7661,12 +8763,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         ) && let Some(branded_relation) =
             self.authenticated_branded_string_relation(source, target, relation)?
         {
-            let mut session = RelaterSession::new_with_global_types_and_options(
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
                 self,
                 relation,
                 bootstrap,
                 global_types,
                 strict_function_types,
+                instantiation_session,
             );
             session.observe_type_surface(original_source);
             session.observe_type_surface(original_target);
@@ -7701,6 +8804,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
+        if authenticated_nullish_generic_nonmatch(
+            self,
+            source,
+            target,
+            bootstrap,
+            global_types.map(|globals| globals.array_targets),
+        )? {
+            return Ok(false);
+        }
+
         if source_flags == TypeFlags::OBJECT
             && target_flags == TypeFlags::OBJECT
             && self.type_has_function_type_provenance(source)
@@ -7708,12 +8821,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && let Some((source_callable, target_callable)) =
                 self.authenticated_branded_conditional_function_pair(source, target)?
         {
-            let mut session = RelaterSession::new_with_global_types_and_options(
+            let mut session = RelaterSession::new_with_global_types_options_and_session(
                 self,
                 relation,
                 bootstrap,
                 global_types,
                 strict_function_types,
+                instantiation_session,
             );
             session.observe_type_surface(original_source);
             session.observe_type_surface(original_target);
@@ -7747,12 +8861,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     self,
                     source,
                     bootstrap.string_type,
-                )?;
+                )? || validate_general_mapped_relation_endpoint(self, source)?;
                 let broad_target = prepare_broad_string_record_mapped_endpoint(
                     self,
                     target,
                     bootstrap.string_type,
-                )?;
+                )? || validate_general_mapped_relation_endpoint(self, target)?;
                 (
                     canonical_fixed_tuple_pair(self, source, target)?.is_some(),
                     broad_source || broad_target,
@@ -7817,12 +8931,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 || supported_array_concat_relation
                 || supported_apparent_relation
             {
-                let mut session = RelaterSession::new_with_global_types_and_options(
+                let mut session = RelaterSession::new_with_global_types_options_and_session(
                     self,
                     relation,
                     bootstrap,
                     global_types,
                     strict_function_types,
+                    instantiation_session,
                 );
                 session.observe_type_surface(original_source);
                 session.observe_type_surface(original_target);
@@ -8919,6 +10034,78 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         Ok(is_unknown_like)
     }
+}
+
+fn mapped_relation_error(type_id: TypeId, error: MappedTypeError) -> RelationUnavailable {
+    match error {
+        MappedTypeError::BootstrapUninitialized => RelationUnavailable::MissingBootstrap,
+        MappedTypeError::UnsupportedSource(_)
+        | MappedTypeError::UnsupportedConstraint(_)
+        | MappedTypeError::UnsupportedNameType(_)
+        | MappedTypeError::UnsupportedTemplate(_)
+        | MappedTypeError::RecursiveMembers(_)
+        | MappedTypeError::InstantiationDepthLimit { .. }
+        | MappedTypeError::InstantiationCountLimit { .. }
+        | MappedTypeError::CrossProductTooLarge { .. } => {
+            RelationUnavailable::UnsupportedStructuredType(type_id)
+        }
+        MappedTypeError::Capacity => RelationUnavailable::UnionValidationCapacity(type_id),
+        MappedTypeError::Declared(_)
+        | MappedTypeError::InvalidDeclaration(_)
+        | MappedTypeError::InvalidSymbol(_)
+        | MappedTypeError::InvalidTypeParameter(_)
+        | MappedTypeError::InvalidMappedType(_)
+        | MappedTypeError::InvalidModifiers
+        | MappedTypeError::InvalidSource(_)
+        | MappedTypeError::InvalidCachedMembers(_)
+        | MappedTypeError::InvalidCachedProperty(_)
+        | MappedTypeError::CircularProperty(_) => {
+            RelationUnavailable::InvalidStructuredMembers(type_id)
+        }
+    }
+}
+
+fn validate_general_mapped_relation_endpoint(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+) -> Result<bool, RelationUnavailable> {
+    if !matches!(
+        store.type_payload(type_id).map(TypeRecord::data),
+        Some(TypeData::Mapped(_))
+    ) {
+        return Ok(false);
+    }
+    store
+        .validate_mapped_type_relation_endpoint(type_id)
+        .map_err(|error| mapped_relation_error(type_id, error))?;
+    Ok(true)
+}
+
+fn prepare_general_mapped_relation_endpoint(
+    store: &mut SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+    session: &mut InstantiationSession,
+) -> Result<Option<ResolvedMappedTypeMembers>, RelationUnavailable> {
+    if !matches!(
+        store.type_payload(type_id).map(TypeRecord::data),
+        Some(TypeData::Mapped(_))
+    ) {
+        return Ok(None);
+    }
+    if let Some(members) = store
+        .validate_mapped_type_relation_endpoint(type_id)
+        .map_err(|error| mapped_relation_error(type_id, error))?
+    {
+        return Ok(Some(members));
+    }
+    store
+        .resolve_mapped_type_members_with_session(type_id, MappedTypeModifiers::NONE, session)
+        .map_err(|error| mapped_relation_error(type_id, error))?;
+    store
+        .validate_mapped_type_relation_endpoint(type_id)
+        .map_err(|error| mapped_relation_error(type_id, error))?
+        .map(Some)
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))
 }
 
 fn prepare_broad_string_record_mapped_endpoint(
@@ -10094,7 +11281,7 @@ mod tests {
         );
         assert_eq!(
             fixture.store.is_type_assignable_to(unknown_empty, numbers),
-            Err(RelationUnavailable::UnsupportedStructuredType(numbers))
+            Ok(false)
         );
     }
 
@@ -12972,6 +14159,250 @@ mod tests {
         );
     }
 
+    fn nullish_generic_relation_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        intrinsic: IntrinsicBootstrapOptions,
+    ) -> (CanonicalCheckerContext<'arena>, TypeId) {
+        let file = FileId::new(96_451);
+        let mut context = source_relation_context(
+            library,
+            source,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let store = context.store();
+        let owner = store
+            .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+            .unwrap()
+            .get_source("Target")
+            .unwrap();
+        let target = store
+            .type_alias_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        (context, target)
+    }
+
+    #[test]
+    fn nullish_generic_targets_stay_cold_in_both_relation_entries() {
+        let library = parse_source_file("");
+        let source = parse_source_file(
+            "interface Wrapper<Value> { value: Value } type Target = Wrapper<number>;",
+        );
+        for (strict, exact) in [(false, false), (true, false), (true, true)] {
+            let (mut context, target) = nullish_generic_relation_context(
+                &library,
+                &source,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: strict,
+                    exact_optional_property_types: exact,
+                },
+            );
+            let store = context.store_mut_for_test();
+            let (undefined, missing, null, error) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.undefined_type,
+                    bootstrap.missing_type,
+                    bootstrap.null_type,
+                    bootstrap.error_type,
+                )
+            };
+            assert_eq!(
+                super::validate_generic_interface_members(store, target, None),
+                Ok(None)
+            );
+            let counts = (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+            );
+            let relations = store.relation_state_snapshot();
+            let mut instantiation = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            let limit_mark = instantiation.limit_event_mark();
+            for source in [undefined, missing, null] {
+                for _ in 0..2 {
+                    assert_eq!(store.is_type_assignable_to(source, target), Ok(!strict));
+                    let bootstrap = store.relation_bootstrap_facts().unwrap();
+                    let mut relation =
+                        super::RelaterSession::new_with_global_types_options_and_session(
+                            store,
+                            RelationKind::Assignable,
+                            bootstrap,
+                            None,
+                            None,
+                            Some(&mut instantiation),
+                        );
+                    assert_eq!(
+                        relation.is_related_to_ex(
+                            source,
+                            target,
+                            super::RecursionFlags::BOTH,
+                            super::IntersectionState::NONE,
+                        ),
+                        Ok(if strict {
+                            Ternary::False
+                        } else {
+                            Ternary::True
+                        })
+                    );
+                }
+            }
+            assert_eq!(instantiation.query_count(), 0);
+            assert_eq!(instantiation.total_count(), 0);
+            assert!(!instantiation.limit_event_occurred_since(limit_mark));
+            assert_eq!(
+                super::validate_generic_interface_members(store, target, None),
+                Ok(None)
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.index_info_len(),
+                ),
+                counts
+            );
+            assert_eq!(store.relation_state_snapshot(), relations);
+        }
+    }
+
+    #[test]
+    fn nullish_generic_targets_validate_warm_values_without_demanding_them() {
+        let library = parse_source_file("");
+        let source = parse_source_file(
+            "interface Wrapper<Value> { value: Value } type Target = Wrapper<number>;",
+        );
+        let (mut context, target) = nullish_generic_relation_context(
+            &library,
+            &source,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let store = context.store_mut_for_test();
+        let (undefined, string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let members = store
+            .resolve_generic_interface_members(target, None)
+            .unwrap();
+        let [property] = members.properties() else {
+            panic!("Wrapper must publish one lazy property")
+        };
+        let property = *property;
+        let lazy = store.value_symbol_links(property).unwrap().clone();
+        assert_eq!(lazy.resolved_type, None);
+        let counts = (store.type_len(), store.symbol_len(), store.mapper_len());
+        let relations = store.relation_state_snapshot();
+        for _ in 0..2 {
+            assert_eq!(store.is_type_assignable_to(undefined, target), Ok(false));
+            assert_eq!(store.value_symbol_links(property), Some(&lazy));
+        }
+        assert_eq!(store.relation_state_snapshot(), relations);
+
+        assert!(store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..lazy.clone()
+            },
+        ));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(undefined, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(target))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_value_symbol_links(property, lazy));
+        let resolved = store
+            .resolve_generic_interface_property(target, "value", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.type_id(), number);
+        assert_eq!(store.is_type_assignable_to(undefined, target), Ok(false));
+        assert_eq!(
+            (store.type_len(), store.symbol_len(), store.mapper_len(),),
+            counts
+        );
+    }
+
+    #[test]
+    fn nullish_generic_nonmatches_reject_forged_intrinsics_and_reference_shells() {
+        let library = parse_source_file("");
+        let source = parse_source_file(
+            "interface Wrapper<Value> { value: Value } type Target = Wrapper<number>;",
+        );
+        let (mut context, target) = nullish_generic_relation_context(
+            &library,
+            &source,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let store = context.store_mut_for_test();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let TypeData::TypeReference(reference) = store.type_payload(target).unwrap().data() else {
+            panic!("the target must retain its generic reference")
+        };
+        let source_target = reference.object.target;
+        let source_mapper = reference.object.mapper;
+        assert!(store.set_object_target_and_mapper(target, None, None));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(undefined, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(target))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_object_target_and_mapper(target, source_target, source_mapper,));
+        assert_eq!(store.is_type_assignable_to(undefined, target), Ok(false));
+
+        let owner = store.type_payload(target).unwrap().symbol();
+        assert!(owner.is_some());
+        assert!(store.set_type_symbol(undefined, owner));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(undefined, target),
+            Err(RelationUnavailable::UnsupportedUnionConstituent(undefined))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_type_symbol(undefined, None));
+        assert_eq!(store.is_type_assignable_to(undefined, target), Ok(false));
+        let unowned = alloc_property_object(store, Vec::new());
+        assert_eq!(
+            store.is_type_assignable_to(undefined, unowned),
+            Err(RelationUnavailable::StructuralRelation {
+                source: undefined,
+                target: unowned,
+                relation: RelationKind::Assignable,
+            })
+        );
+    }
+
     #[test]
     fn generic_interface_relations_revalidate_proxy_mappers_and_cached_types() {
         let mut fixture =
@@ -13309,6 +14740,61 @@ mod tests {
             ),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn top_signature_sources_are_not_strict_subtypes_of_ordinary_signatures() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "declare function topAny(...values: any[]): any; ",
+            "declare function topUnknown(...values: never[]): unknown; ",
+            "declare function ordinary(value: string): string;",
+        ));
+        let file = FileId::new(96_459);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (top_any, _) = source_function_callable(&context, &source, file, "topAny");
+        let (top_unknown, _) = source_function_callable(&context, &source, file, "topUnknown");
+        let (ordinary, _) = source_function_callable(&context, &source, file, "ordinary");
+        let globals = Some(RelationGlobalTypes::from_global_types(
+            context.global_types(),
+        ));
+        let store = context.store_mut_for_test();
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            for (source, target, expected) in [
+                (top_any, ordinary, relation == RelationKind::Assignable),
+                (ordinary, top_any, true),
+                (ordinary, top_unknown, true),
+                (top_unknown, top_any, relation == RelationKind::Assignable),
+            ] {
+                for _ in 0..2 {
+                    assert_eq!(
+                        store.is_type_related_to_with_optional_global_types_and_options(
+                            source,
+                            target,
+                            relation,
+                            globals,
+                            Some(true),
+                        ),
+                        Ok(expected),
+                        "{source:?} -> {target:?}, {relation:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

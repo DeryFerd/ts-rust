@@ -269,10 +269,11 @@ use super::{
     source_properties::{
         CheckedClassPropertyWriteTarget, ClassAccessContext, SourceClassPropertyWritePlan,
         SourcePropertyDiagnostic, SourcePropertyError, SourcePropertyPlan,
-        SourcePropertyUnsupported, attach_class_access_context, check_class_property_write_target,
-        check_class_receiver, check_direct_source_property_with_class_context_and_session,
-        check_direct_source_property_with_session, finish_direct_source_property_plan,
-        plan_class_access_context, plan_class_property_write,
+        SourcePropertyQueryError, SourcePropertyUnsupported, attach_class_access_context,
+        check_class_property_write_target, check_class_receiver,
+        check_direct_source_property_with_class_context_and_session,
+        check_direct_source_property_with_session, check_direct_source_property_with_source,
+        finish_direct_source_property_plan, plan_class_access_context, plan_class_property_write,
         plan_direct_source_property_call_syntax, plan_direct_source_property_syntax,
         prepare_source_property_diagnostic,
     },
@@ -27361,7 +27362,9 @@ where
             PlannedExpressionKind::Property(property),
             PreparedExpression::Property(prepared_receiver),
         ) => {
-            if property.class_access_context().is_some() {
+            if property.class_access_context().is_some()
+                || (global_types.is_some() && property.is_read())
+            {
                 return check_nested_expression(store, session, expression, None);
             }
             let receiver = execute_expression_types(
@@ -29732,6 +29735,53 @@ fn check_expression_type_with_class_context(
                     }
                 }
             };
+            for diagnostic in checked.diagnostics {
+                publish_or_defer_class_property_diagnostic(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    expression.node,
+                    diagnostic,
+                    class_flow.as_deref_mut(),
+                )?;
+            }
+            publish_expression_type(store, expression.node, checked.type_)?;
+            Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
+        }
+        PlannedExpressionKind::Property(property) if property.is_read() => {
+            let receiver = check_expression_type_with_class_context(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                &property.receiver,
+                None,
+                deferred,
+                class_flow.as_deref_mut(),
+            )?;
+            let checked = check_direct_source_property_with_source(
+                store,
+                host,
+                global_types,
+                options,
+                property,
+                receiver.result,
+                session,
+                diagnostics,
+            )
+            .map_err(|error| match error {
+                SourcePropertyQueryError::Property(error) => {
+                    SourcePlanner::property_plan_error(expression.node, error)
+                }
+                SourcePropertyQueryError::Source(error) => error,
+            })?;
             for diagnostic in checked.diagnostics {
                 publish_or_defer_class_property_diagnostic(
                     store,
@@ -35163,6 +35213,7 @@ fn check_assignment_to_type_with_class_context(
             assigned_type: source_type,
         });
     }
+    let limit_mark = session.limit_event_mark();
     let assignable = source_type_is_assignable_to(
         store,
         host,
@@ -35173,6 +35224,19 @@ fn check_assignment_to_type_with_class_context(
         source_type,
         target,
     )?;
+    if session.limit_event_occurred_since(limit_mark) {
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(fallback_node),
+                range_override: None,
+                diagnostic: Diagnostic::new(
+                    message_by_code(2589).ok_or(SourceCheckError::MissingDiagnostic(2589))?,
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
     if !assignable {
         let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
             store,
@@ -35798,11 +35862,12 @@ fn source_type_is_assignable_to(
     let mut resolved_members = HashSet::new();
     let mut resolved_properties = HashSet::new();
     loop {
-        match store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        match store.is_type_assignable_to_with_session(
             source,
             target,
-            global_types,
-            options.strict_function_types,
+            Some(global_types),
+            Some(options.strict_function_types),
+            session,
         ) {
             Ok(assignable) => return Ok(assignable),
             Err(RelationUnavailable::UnresolvedSignatureReturn(signature)) => {
@@ -35921,10 +35986,11 @@ pub(super) fn retry_source_generic_member_failure(
     match error {
         RelationUnavailable::UnresolvedStructuredMembers(type_) => {
             if !resolved_members.insert(type_)
-                || super::instantiated_members::resolve_members_with_array_targets(
+                || super::instantiated_members::resolve_members_with_array_targets_and_session(
                     store,
                     type_,
                     array_targets,
+                    session,
                 )
                 .is_err()
             {

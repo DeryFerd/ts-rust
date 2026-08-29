@@ -3003,8 +3003,43 @@ fn display_direct_generic_reference(
         .declarations()
         .filter(|declarations| !declarations.is_empty())
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let ordinary_interface =
+        symbol_record.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE;
+    // Removing a merged declaration must not bypass the source identity check.
+    if ordinary_interface
+        && (store.get_merged_symbol(symbol) != Some(symbol)
+            || !store.source_merged_symbol_declarations_match(symbol))
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
     let declaration = match declarations {
         [declaration] => *declaration,
+        declarations if ordinary_interface => {
+            let identity = object_members::plan_generic_interface_identity(store, host, symbol)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+            let TypeData::Interface(interface) = target.data() else {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            };
+            let parameters = interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            if identity.symbol != symbol
+                || identity.node != declarations[0]
+                || identity.parameters.len() != parameters.len()
+                || identity
+                    .parameters
+                    .iter()
+                    .zip(parameters)
+                    .any(|(owner, parameter)| {
+                        cached_ordinary_type_parameter_owner(store, *parameter) != Some(*owner)
+                    })
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            identity.node
+        }
         declarations => {
             let name = symbol_record
                 .name()
@@ -10753,6 +10788,192 @@ mod tests {
             ),
             warm
         );
+    }
+
+    #[test]
+    fn merged_generic_references_keep_names_and_argument_order_without_writes() {
+        let first = parse_source_file(concat!(
+            "interface Pair<Left, Right> { left: Left; } ",
+            "namespace Shapes { export interface Pair<Left, Right> { left: Left; } } ",
+            "type Plain = Pair<string, number>; ",
+            "type Nested = Pair<Pair<string, number>, boolean>; ",
+            "type Qualified = Shapes.Pair<number, string>;",
+        ));
+        let second = parse_source_file(concat!(
+            "interface Pair<Left, Right> { right: Right; } ",
+            "namespace Shapes { export interface Pair<Left, Right> { right: Right; } }",
+        ));
+        for parsed in [&first, &second] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        }
+        let files = [
+            (FileId::new(1_920), &first, false),
+            (FileId::new(1_921), &second, false),
+        ];
+        let mut context = merged_interface_display_context(&files);
+        for (alias, expected) in [
+            ("Plain", "Pair<string, number>"),
+            ("Nested", "Pair<Pair<string, number>, boolean>"),
+            ("Qualified", "Pair<number, string>"),
+        ] {
+            let node = type_alias_body(&first, files[0].0, alias);
+            let reference = context.get_type_from_type_node(node).unwrap();
+            let target = validate_direct_generic_reference(context.store(), reference)
+                .unwrap()
+                .target;
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+                context.diagnostics().len(),
+            );
+            for _ in 0..2 {
+                assert_eq!(context.type_to_string(reference).unwrap(), expected);
+                assert_eq!(context.type_to_string(target).unwrap(), "Pair<Left, Right>");
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot(),
+                    context.diagnostics().len(),
+                ),
+                before
+            );
+            assert_eq!(context.get_type_from_type_node(node).unwrap(), reference);
+        }
+        let qualified_node = type_alias_body(&first, files[0].0, "Qualified");
+        let qualified = context.get_type_from_type_node(qualified_node).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .type_to_string_at_location(qualified, qualified_node)
+                    .unwrap(),
+                "Shapes.Pair<number, string>"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Repeat each owner and cache change before and after display.
+    fn merged_generic_reference_display_rejects_wrong_owners_cold_and_warm() {
+        let parsed = parse_source_file(concat!(
+            "namespace Current { ",
+            "export interface Entry<Left, Right> { left: Left; } ",
+            "export interface Entry<Left, Right> { right: Right; } } ",
+            "namespace Other { ",
+            "export interface Entry<Left, Right> { left: Left; } ",
+            "export interface Entry<Left, Right> { right: Right; } } ",
+            "type CurrentEntry = Current.Entry<string, number>; ",
+            "type OtherEntry = Other.Entry<string, number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_922);
+        let current_node = type_alias_body(&parsed, file, "CurrentEntry");
+        let other_node = type_alias_body(&parsed, file, "OtherEntry");
+        for warm in [false, true] {
+            for poison in 0..6 {
+                let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+                let reference = context.get_type_from_type_node(current_node).unwrap();
+                let other_reference = context.get_type_from_type_node(other_node).unwrap();
+                let owner = namespace_export(&context, file, &["Current", "Entry"]);
+                let other_owner = namespace_export(&context, file, &["Other", "Entry"]);
+                let other_namespace = namespace_export(&context, file, &["Other"]);
+                let (declarations, members, parent) = {
+                    let record = context.store().symbol(owner).unwrap();
+                    (
+                        record.declarations().unwrap().to_vec(),
+                        record.members(),
+                        record.parent(),
+                    )
+                };
+                let (other_declarations, other_members) = {
+                    let record = context.store().symbol(other_owner).unwrap();
+                    (record.declarations().unwrap().to_vec(), record.members())
+                };
+                let links = context.store().declared_type_links(owner).unwrap().clone();
+                let other_target =
+                    validate_direct_generic_reference(context.store(), other_reference)
+                        .unwrap()
+                        .target;
+                if warm {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            context.type_to_string(reference).unwrap(),
+                            "Entry<string, number>"
+                        );
+                    }
+                }
+                let store = context.store_mut_for_test();
+                match poison {
+                    0 => assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(other_declarations),
+                        None
+                    )),
+                    1 => assert!(store.set_symbol_declarations(
+                        owner,
+                        Some(vec![declarations[0]]),
+                        None
+                    )),
+                    2 => assert!(store.set_symbol_relationships(
+                        owner,
+                        members,
+                        None,
+                        Some(other_namespace),
+                        None
+                    )),
+                    3 => assert!(store.set_symbol_relationships(
+                        owner,
+                        other_members,
+                        None,
+                        parent,
+                        None
+                    )),
+                    4 => assert!(store.set_declared_type_links(
+                        owner,
+                        crate::semantic::DeclaredTypeLinks {
+                            declared_type: Some(other_target),
+                            ..links.clone()
+                        }
+                    )),
+                    5 => assert!(store.set_type_symbol(reference, Some(other_owner))),
+                    _ => unreachable!(),
+                }
+                for _ in 0..2 {
+                    assert_malformed_display_without_writes(&context, reference);
+                }
+                let store = context.store_mut_for_test();
+                assert!(store.set_symbol_declarations(owner, Some(declarations), None));
+                assert!(store.set_symbol_relationships(owner, members, None, parent, None));
+                assert!(store.set_declared_type_links(owner, links));
+                assert!(store.set_type_symbol(reference, Some(owner)));
+                assert_eq!(
+                    context.type_to_string(reference).unwrap(),
+                    "Entry<string, number>"
+                );
+            }
+        }
+        let mut first = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let mut second = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let first_reference = first.get_type_from_type_node(current_node).unwrap();
+        let foreign_reference = second.get_type_from_type_node(current_node).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                first.type_to_string(first_reference).unwrap(),
+                "Entry<string, number>"
+            );
+            assert_eq!(
+                first.type_to_string(foreign_reference),
+                Err(TypeDisplayUnavailable::Type(foreign_reference))
+            );
+        }
     }
 
     #[test]
