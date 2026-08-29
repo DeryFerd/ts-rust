@@ -809,9 +809,9 @@ fn array_type_error_is_unsupported(error: &ArrayTypeError) -> bool {
 
 fn derived_type_error_is_unsupported(error: &DerivedTypeError) -> bool {
     match error {
-        DerivedTypeError::UnresolvedPropertyType(_) => true,
         DerivedTypeError::ArrayType(error) => array_type_error_is_unsupported(error),
-        DerivedTypeError::UnsupportedWideningType(_)
+        DerivedTypeError::UnresolvedPropertyType(_)
+        | DerivedTypeError::UnsupportedWideningType(_)
         | DerivedTypeError::RecursiveWideningType(_)
         | DerivedTypeError::RecursiveObjectLiteral(_) => true,
         DerivedTypeError::BootstrapUninitialized
@@ -997,8 +997,8 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
 
 fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
     match error {
-        TypeDisplayUnavailable::UnresolvedPropertyType(_) => true,
-        TypeDisplayUnavailable::Alias { .. }
+        TypeDisplayUnavailable::UnresolvedPropertyType(_)
+        | TypeDisplayUnavailable::Alias { .. }
         | TypeDisplayUnavailable::UnsupportedType { .. }
         | TypeDisplayUnavailable::UnsupportedUnionConstituent { .. }
         | TypeDisplayUnavailable::CyclicType(_)

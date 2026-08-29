@@ -26921,10 +26921,24 @@ mod generic_publication_tests {
         let host = host(&fixture.parsed, &fixture.bound);
         let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
         let getter = &plan.object_literal_getters[0];
+        let initializer = plan.properties[1].type_node;
+        let NodeData::NumericLiteral(literal) =
+            &fixture.parsed.arena.get(initializer.node).unwrap().data
+        else {
+            panic!("the control has a real numeric property initializer");
+        };
         let one = fixture
             .store
-            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .regular_number_literal_type(ts_jsnum::from_string(&literal.text))
             .unwrap();
+        let fresh_one = fixture.store.fresh_type_of_literal_type(one).unwrap();
+        assert!(fixture.store.set_type_node_links(
+            initializer,
+            TypeNodeLinks {
+                resolved_type: Some(fresh_one),
+                ..TypeNodeLinks::default()
+            }
+        ));
         let type_ =
             publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[one]).unwrap();
         assert!(plan.const_context);
@@ -27018,14 +27032,6 @@ mod generic_publication_tests {
             29_510,
         );
         let file = fixture.source_bound.file_id();
-        let host = DeclaredTypeHost::new_after_global_merge(
-            [
-                (&fixture.library.arena, &fixture.library_bound),
-                (&fixture.source.arena, &fixture.source_bound),
-            ],
-            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
-        )
-        .unwrap();
         let objects = fixture
             .source
             .arena
@@ -27062,6 +27068,19 @@ mod generic_publication_tests {
                     .flatten()
             })
             .unwrap();
+        let global_symbols = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture
+            .store
+            .merge_global_symbol(global_symbols, entries)
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&fixture.library.arena, &fixture.library_bound),
+                (&fixture.source.arena, &fixture.source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
         let options = CanonicalCheckerOptions::default();
         let globals = fixture.global_types.clone();
         let targets = CanonicalArrayTargets::from_global_types(&globals);
