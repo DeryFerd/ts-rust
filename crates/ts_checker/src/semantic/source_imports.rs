@@ -13934,9 +13934,7 @@ export default <T>(): Subject<T> => {
                 store.type_node_links(reference).cloned(),
                 (
                     store.value_symbol_links(plan.property_symbol()).cloned(),
-                    store
-                        .declared_value_provenance(plan.property_symbol())
-                        .cloned(),
+                    store.declared_value_provenance(plan.property_symbol()),
                 ),
                 (
                     store.type_alias_links(plan.target_symbol()).cloned(),
