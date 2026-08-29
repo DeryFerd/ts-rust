@@ -8202,8 +8202,14 @@ mod tests {
         )
         .unwrap();
         let access = property_access(source, source_file);
+        let call = NodeRef::new(
+            source.arena.id(),
+            source_file,
+            source.arena.get(access.node).unwrap().parent.unwrap(),
+        );
         let syntax =
-            plan_direct_source_property_syntax(&source.arena, context.store(), access).unwrap();
+            plan_direct_source_property_call_syntax(&source.arena, context.store(), access, call)
+                .unwrap();
         let variable =
             source
                 .arena
@@ -8789,49 +8795,46 @@ mod tests {
                 );
             }
         }
-        match checked {
-            Ok(checked) => {
-                assert!(matches!(
-                    validate_stored_callable_set(store, checked.type_),
-                    StoredCallableSetValidation::Valid { .. }
-                ));
-                let counts = array_filter_property_counts(store);
-                let events = session.limit_event_count();
-                assert_eq!(
-                    check_direct_source_property_with_session(
-                        fixture.context.store_mut_for_test(),
-                        Some(&globals),
-                        &fixture.plan,
-                        fixture.receiver,
-                        &mut session
-                    ),
-                    Ok(checked)
-                );
-                assert_eq!(
-                    array_filter_property_counts(fixture.context.store()),
-                    counts
-                );
-                assert_eq!(
-                    (
-                        session.query_count(),
-                        session.total_count(),
-                        session.limit_event_count()
-                    ),
-                    (0, 0, events)
-                );
-            }
-            Err(_) => {
-                assert!(
-                    store
-                        .type_node_links(fixture.plan.node)
-                        .is_none_or(|links| links == &TypeNodeLinks::default())
-                );
-                assert!(
-                    store
-                        .symbol_node_links(fixture.plan.node)
-                        .is_none_or(|links| links == &SymbolNodeLinks::default())
-                );
-            }
+        if let Ok(checked) = checked {
+            assert!(matches!(
+                validate_stored_callable_set(store, checked.type_),
+                StoredCallableSetValidation::Valid { .. }
+            ));
+            let counts = array_filter_property_counts(store);
+            let events = session.limit_event_count();
+            assert_eq!(
+                check_direct_source_property_with_session(
+                    fixture.context.store_mut_for_test(),
+                    Some(&globals),
+                    &fixture.plan,
+                    fixture.receiver,
+                    &mut session
+                ),
+                Ok(checked)
+            );
+            assert_eq!(
+                array_filter_property_counts(fixture.context.store()),
+                counts
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, events)
+            );
+        } else {
+            assert!(
+                store
+                    .type_node_links(fixture.plan.node)
+                    .is_none_or(|links| links == &TypeNodeLinks::default())
+            );
+            assert!(
+                store
+                    .symbol_node_links(fixture.plan.node)
+                    .is_none_or(|links| links == &SymbolNodeLinks::default())
+            );
         }
     }
 
