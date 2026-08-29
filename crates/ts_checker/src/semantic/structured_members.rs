@@ -6811,6 +6811,7 @@ mod tests {
                 properties: Vec::new(),
                 methods: Vec::new(),
                 accessors: Vec::new(),
+                object_literal_getters: Vec::new(),
                 spreads: Vec::new(),
                 indexes: Vec::new(),
                 call_signatures: Vec::new(),

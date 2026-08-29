@@ -22,7 +22,10 @@
 //! parameter and separate binding-element locals. Selected default-library
 //! `Math` methods also retain their numeric rest parameters.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ts_ast::{NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
@@ -267,7 +270,7 @@ pub(super) fn resolve_object_property_by_key(
             }) {
                 return Err(RelationUnavailable::InvalidStructuredMembers(receiver));
             }
-            store.resolved_own_property_by_key(receiver, name)
+            store.resolved_own_property_by_key_with_context(receiver, name, global_types, session)
         }
     }
 }
@@ -2390,6 +2393,97 @@ pub(super) struct PlannedProperty {
     pub name: EscapedName,
 }
 
+/// A getter body belongs to its own deferred scope, not to the object initializer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PlannedObjectLiteralGetter {
+    pub object: NodeRef,
+    pub owner: SemanticSymbolId,
+    pub property_index: usize,
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub name_node: NodeRef,
+    pub body: NodeRef,
+    pub return_statement: NodeRef,
+    pub return_expression: NodeRef,
+    pub return_annotation: Option<NodeRef>,
+}
+
+/// Retained outside mutable symbol and signature caches after object publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ObjectLiteralGetterOrigin {
+    getter: PlannedObjectLiteralGetter,
+    object_type: TypeId,
+    object_plan: Arc<PropertyObjectPlan>,
+}
+
+impl ObjectLiteralGetterOrigin {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.getter.symbol
+    }
+
+    pub(super) const fn object(&self) -> NodeRef {
+        self.getter.object
+    }
+
+    pub(super) const fn object_type(&self) -> TypeId {
+        self.object_type
+    }
+
+    pub(super) const fn declaration(&self) -> NodeRef {
+        self.getter.declaration
+    }
+
+    pub(super) const fn return_expression(&self) -> NodeRef {
+        self.getter.return_expression
+    }
+}
+
+/// The body checker supplies this result only after it checks the real return expression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ObjectLiteralGetterReturnProof {
+    symbol: SemanticSymbolId,
+    signature: SignatureId,
+    expression_type: TypeId,
+    read_type: TypeId,
+    expression_symbol: Option<SemanticSymbolId>,
+}
+
+impl ObjectLiteralGetterReturnProof {
+    pub(super) const fn symbol(&self) -> SemanticSymbolId {
+        self.symbol
+    }
+
+    pub(super) const fn signature(&self) -> SignatureId {
+        self.signature
+    }
+}
+
+/// All getter consumers share this proof and retain every checked type edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ObjectLiteralGetterProjection {
+    pub symbol: SemanticSymbolId,
+    pub owner: SemanticSymbolId,
+    pub object_type: TypeId,
+    pub declaration: NodeRef,
+    pub type_: Option<TypeId>,
+    pub signature: Option<SignatureId>,
+    pub checked_return: Option<TypeId>,
+}
+
+impl ObjectLiteralGetterProjection {
+    pub(super) fn require_type(self) -> Result<TypeId, RelationUnavailable> {
+        self.type_
+            .ok_or(RelationUnavailable::UnresolvedPropertyType(self.symbol))
+    }
+
+    pub(super) fn type_edges(self) -> impl Iterator<Item = TypeId> {
+        self.type_.into_iter().chain(
+            self.checked_return
+                .filter(|checked| Some(*checked) != self.type_),
+        )
+    }
+}
+
 /// The source chosen when this provider publishes an object-literal property clone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ObjectLiteralPropertyCloneOrigin {
@@ -2790,6 +2884,7 @@ pub(super) struct PropertyObjectPlan {
     pub properties: Vec<PlannedProperty>,
     pub methods: Vec<PlannedInterfaceMethod>,
     pub accessors: Vec<PlannedInterfaceAccessor>,
+    pub object_literal_getters: Vec<PlannedObjectLiteralGetter>,
     pub spreads: Vec<PlannedObjectSpread>,
     pub indexes: Vec<PlannedIndexSignature>,
     pub call_signatures: Vec<PlannedCallSignature>,
@@ -2798,6 +2893,24 @@ pub(super) struct PropertyObjectPlan {
 }
 
 impl PropertyObjectPlan {
+    pub(super) fn object_literal_getter(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&PlannedObjectLiteralGetter> {
+        self.object_literal_getters
+            .iter()
+            .find(|getter| getter.symbol == symbol)
+    }
+
+    pub(super) fn eager_object_literal_properties(
+        &self,
+    ) -> impl Iterator<Item = (usize, &PlannedProperty)> {
+        self.properties
+            .iter()
+            .enumerate()
+            .filter(|(_, property)| self.object_literal_getter(property.symbol).is_none())
+    }
+
     fn raw_property_count(&self) -> usize {
         self.properties
             .iter()
@@ -4815,6 +4928,7 @@ fn plan_javascript_expando_object_literal(
         properties,
         methods: Vec::new(),
         accessors: Vec::new(),
+        object_literal_getters: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -10007,6 +10121,7 @@ fn plan_members(
         properties: Vec::new(),
         methods: Vec::new(),
         accessors: Vec::new(),
+        object_literal_getters: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -10097,6 +10212,7 @@ fn plan_members(
     let mut computed_properties = HashSet::new();
     let mut computed_method_groups = HashMap::<SemanticSymbolId, usize>::new();
     let mut accessors = Vec::new();
+    let mut object_literal_getters = Vec::new();
     let mut spreads = Vec::new();
     let mut indexes = Vec::with_capacity(1);
     let mut call_signatures = Vec::with_capacity(member_count);
@@ -10133,6 +10249,7 @@ fn plan_members(
                 SyntaxKind::PropertyAssignment
                     | SyntaxKind::ShorthandPropertyAssignment
                     | SyntaxKind::SpreadAssignment
+                    | SyntaxKind::GetAccessor
             ),
             PropertyObjectKind::TypeLiteral => matches!(
                 member_record.kind,
@@ -10208,6 +10325,43 @@ fn plan_members(
                 });
             }
             indexes.push(index);
+            continue;
+        }
+
+        if kind == PropertyObjectKind::ObjectLiteral
+            && member_record.kind == SyntaxKind::GetAccessor
+        {
+            let getter = plan_object_literal_getter(
+                store,
+                host,
+                member_owner,
+                symbol,
+                properties.len(),
+                member,
+            )?;
+            let name = store
+                .symbol(getter.symbol)
+                .ok_or_else(|| invalid_plan(&provisional))?
+                .name()
+                .to_owned();
+            if table.and_then(|table| table.get(name.as_ref())) != Some(getter.symbol)
+                || !seen_symbols.insert(getter.symbol)
+                || !seen_names.insert(name.clone())
+            {
+                return Err(invalid_plan(&provisional));
+            }
+            planned_symbol_declarations.insert(getter.symbol, vec![member]);
+            properties.push(PlannedProperty {
+                declaration: member,
+                symbol: getter.symbol,
+                name_node: getter.name_node,
+                // Source planning must select the deferred getter, not an eager expression.
+                type_node: getter.declaration,
+                optional: false,
+                readonly: true,
+                name,
+            });
+            object_literal_getters.push(getter);
             continue;
         }
 
@@ -10881,6 +11035,7 @@ fn plan_members(
         properties,
         methods,
         accessors,
+        object_literal_getters,
         spreads,
         indexes,
         call_signatures,
@@ -10930,6 +11085,636 @@ fn equivalent_merged_property_annotations(
     let second_text = second_source
         .get(second_record.range.start.get() as usize..second_record.range.end.get() as usize);
     first_text.is_some() && first_text == second_text
+}
+
+#[allow(clippy::too_many_lines)] // The declaration, binder owner, and deferred body form one proof.
+fn plan_object_literal_getter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    object: NodeRef,
+    owner: SemanticSymbolId,
+    property_index: usize,
+    declaration: NodeRef,
+) -> Result<PlannedObjectLiteralGetter, PropertyObjectError> {
+    let reject = || PropertyObjectError::UnsupportedMember {
+        node: declaration,
+        kind: SyntaxKind::GetAccessor,
+    };
+    let record = preflight_node(store, host, declaration).map_err(|_| reject())?;
+    let NodeData::GetAccessorDeclaration(accessor) = &record.data else {
+        return Err(reject());
+    };
+    let bound = host.bound_file(declaration).ok_or_else(reject)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+        || record.kind != SyntaxKind::GetAccessor
+        || record.flags.0 != 0
+        || record.parent != Some(object.node)
+        || accessor.asterisk_token.is_some()
+        || accessor.end_flow_node.is_some()
+        || accessor.flow_node.is_some()
+        || accessor.full_signature.is_some()
+        || accessor.next_container.is_some()
+        || accessor.postfix_token.is_some()
+        || accessor.symbol.is_some()
+        || accessor.type_parameters.is_some()
+        || accessor.facts != 0
+        || accessor.modifiers.is_some()
+        || !accessor.parameters.nodes.is_empty()
+        || accessor.parameters.has_trailing_comma
+        || accessor.parameters.range.start < record.range.start
+        || accessor.parameters.range.end > record.range.end
+        || bound.locals(declaration).is_some_and(|locals| {
+            store
+                .symbol_table(locals)
+                .is_none_or(|locals| !locals.is_empty())
+        })
+    {
+        return Err(reject());
+    }
+    let name_node = NodeRef::new(declaration.arena, declaration.file, accessor.name);
+    let name_record = preflight_node(store, host, name_node).map_err(|_| reject())?;
+    let NodeData::Identifier(name) = &name_record.data else {
+        return Err(reject());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > accessor.parameters.range.start
+        || name.text.is_empty()
+        || name.flow_node.is_some()
+    {
+        return Err(reject());
+    }
+    let symbol = bound.symbol(declaration).ok_or_else(reject)?;
+    let member = store.symbol(symbol).ok_or_else(reject)?;
+    if !host.symbol_matches(store, declaration, symbol)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || member.flags() != SymbolFlags::GET_ACCESSOR
+        || member.check_flags() != CheckFlags::NONE
+        || member.name().as_utf8() != Some(name.text.as_str())
+        || member.name().is_reserved_member_name()
+        || member.name().is_private_identifier()
+        || member.name().is_late_bound()
+        || member.declarations() != Some(&[declaration])
+        || member.value_declaration() != Some(declaration)
+        || member.parent() != Some(owner)
+        || member.members().is_some()
+        || member.exports().is_some()
+        || member.export_symbol().is_some()
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(member.name()))
+            != Some(symbol)
+    {
+        return Err(reject());
+    }
+    let body = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        accessor.body.ok_or_else(reject)?,
+    );
+    let body_record = preflight_node(store, host, body).map_err(|_| reject())?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(reject());
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(declaration.node)
+        || body_record.range.start < accessor.parameters.range.end
+        || body_record.range.end > record.range.end
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || block.statements.nodes.len() != 1
+        || block.statements.range.start < body_record.range.start
+        || block.statements.range.end > body_record.range.end
+    {
+        return Err(reject());
+    }
+    let return_annotation = accessor
+        .type_
+        .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation));
+    if let Some(annotation) = return_annotation {
+        let annotation_record = preflight_node(store, host, annotation).map_err(|_| reject())?;
+        if annotation_record.parent != Some(declaration.node)
+            || annotation_record.flags.0 != 0
+            || annotation_record.range.start < accessor.parameters.range.end
+            || annotation_record.range.end > body_record.range.start
+            || !(annotation_record.kind.is_keyword_type()
+                || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                    .contains(&(annotation_record.kind as u16)))
+        {
+            return Err(reject());
+        }
+    }
+    let return_statement = NodeRef::new(body.arena, body.file, block.statements.nodes[0]);
+    let statement_record = preflight_node(store, host, return_statement).map_err(|_| reject())?;
+    let NodeData::ReturnStatement(statement) = &statement_record.data else {
+        return Err(reject());
+    };
+    if statement_record.kind != SyntaxKind::ReturnStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || statement_record.range.start < block.statements.range.start
+        || statement_record.range.end > block.statements.range.end
+        || statement.flow_node.is_some()
+        || statement.facts != 0
+    {
+        return Err(reject());
+    }
+    let return_expression = NodeRef::new(
+        return_statement.arena,
+        return_statement.file,
+        statement.expression.ok_or_else(reject)?,
+    );
+    let expression_record = preflight_node(store, host, return_expression).map_err(|_| reject())?;
+    if expression_record.parent != Some(return_statement.node)
+        || expression_record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+        || expression_record.range.start < statement_record.range.start
+        || expression_record.range.end > statement_record.range.end
+    {
+        return Err(reject());
+    }
+    let mut pending = vec![return_expression];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            store.source_node_kind(node),
+            Some(SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword)
+        ) {
+            return Err(reject());
+        }
+        pending.extend(store.source_direct_children(node).ok_or_else(reject)?);
+    }
+    Ok(PlannedObjectLiteralGetter {
+        object,
+        owner,
+        property_index,
+        declaration,
+        symbol,
+        name_node,
+        body,
+        return_statement,
+        return_expression,
+        return_annotation,
+    })
+}
+
+fn valid_object_literal_getter_source(
+    store: &CanonicalTypeMapperStore,
+    getter: &PlannedObjectLiteralGetter,
+) -> bool {
+    let Some(owner) = store.symbol(getter.owner) else {
+        return false;
+    };
+    let Some(member) = store.symbol(getter.symbol) else {
+        return false;
+    };
+    let direct =
+        |parent, child| store.source_node_parent(child) == Some(SourceNodeParent::Parent(parent));
+    let exact_children = |parent, mut expected: Vec<NodeRef>| {
+        let Some(mut actual) = store.source_direct_children(parent) else {
+            return false;
+        };
+        actual.sort_unstable();
+        expected.sort_unstable();
+        actual == expected
+    };
+    let mut declaration_children = vec![getter.name_node, getter.body];
+    declaration_children.extend(getter.return_annotation);
+    owner.flags() == SymbolFlags::OBJECT_LITERAL
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name() == InternalSymbolName::Object.as_ref()
+        && owner.declarations() == Some(&[getter.object])
+        && owner.value_declaration() == Some(getter.object)
+        && owner.parent().is_none()
+        && owner.exports().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(getter.owner) == Some(getter.owner)
+        && store.source_symbol_declarations_match(getter.owner)
+        && store.source_node_kind(getter.object) == Some(SyntaxKind::ObjectLiteralExpression)
+        && member.flags() == SymbolFlags::GET_ACCESSOR
+        && member.check_flags() == CheckFlags::NONE
+        && member.declarations() == Some(&[getter.declaration])
+        && member.value_declaration() == Some(getter.declaration)
+        && member.parent() == Some(getter.owner)
+        && member.members().is_none()
+        && member.exports().is_none()
+        && member.export_symbol().is_none()
+        && store.get_merged_symbol(getter.symbol) == Some(getter.symbol)
+        && store.source_symbol_flags(getter.symbol) == Some(SymbolFlags::GET_ACCESSOR)
+        && store.source_symbol_declarations_match(getter.symbol)
+        && member.name().as_utf8() == store.source_identifier_text(getter.name_node)
+        && !member.name().is_reserved_member_name()
+        && !member.name().is_private_identifier()
+        && !member.name().is_late_bound()
+        && owner
+            .members()
+            .and_then(|table| store.symbol_table(table))
+            .and_then(|table| table.get(member.name()))
+            == Some(getter.symbol)
+        && store.source_node_kind(getter.declaration) == Some(SyntaxKind::GetAccessor)
+        && direct(getter.object, getter.declaration)
+        && store.source_node_kind(getter.body) == Some(SyntaxKind::Block)
+        && direct(getter.declaration, getter.body)
+        && store.source_node_kind(getter.return_statement) == Some(SyntaxKind::ReturnStatement)
+        && direct(getter.body, getter.return_statement)
+        && direct(getter.return_statement, getter.return_expression)
+        && exact_children(getter.declaration, declaration_children)
+        && exact_children(getter.body, vec![getter.return_statement])
+        && exact_children(getter.return_statement, vec![getter.return_expression])
+}
+
+fn object_literal_getter_annotation_is_exact(
+    store: &CanonicalTypeMapperStore,
+    annotation: NodeRef,
+    type_: TypeId,
+) -> bool {
+    if store
+        .source_node_kind(annotation)
+        .is_some_and(SyntaxKind::is_keyword_type)
+    {
+        return store.source_type_node_result_is_exact(annotation, type_, &[]);
+    }
+    store.type_node_links(annotation)
+        == Some(&TypeNodeLinks {
+            resolved_type: Some(type_),
+            ..TypeNodeLinks::default()
+        })
+}
+
+/// Reads a getter without checking its body or creating a replacement property.
+#[allow(clippy::too_many_lines)] // The source, object tables, and getter caches share one proof.
+pub(super) fn object_literal_getter_projection(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+) -> Result<ObjectLiteralGetterProjection, RelationUnavailable> {
+    let invalid = || RelationUnavailable::InvalidSymbolMembers(symbol);
+    let origin = store
+        .object_literal_getter_origin(symbol)
+        .ok_or_else(invalid)?;
+    let getter = &origin.getter;
+    let record = store.type_payload(origin.object_type).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid());
+    };
+    let mut source_members = store
+        .source_direct_children(getter.object)
+        .ok_or_else(invalid)?;
+    source_members.sort_by_key(|member| store.source_node_start(*member));
+    let properties = object
+        .structured
+        .properties
+        .as_deref()
+        .ok_or_else(invalid)?;
+    let raw_table = store
+        .symbol(getter.owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let result_table = object
+        .structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    if source_members.len() != properties.len()
+        || source_members.len() != raw_table.len()
+        || source_members.len() != result_table.len()
+        || source_members.get(getter.property_index) != Some(&getter.declaration)
+        || source_members
+            .iter()
+            .zip(properties)
+            .any(|(declaration, property)| {
+                let Some(raw) = store.source_declaration_symbol(*declaration) else {
+                    return true;
+                };
+                let Some(raw_record) = store.symbol(raw) else {
+                    return true;
+                };
+                raw_table.get(raw_record.name()) != Some(raw)
+                    || result_table.get(raw_record.name()) != Some(*property)
+                    || match store.source_node_kind(*declaration) {
+                        Some(SyntaxKind::GetAccessor) => *property != raw,
+                        Some(
+                            SyntaxKind::PropertyAssignment
+                            | SyntaxKind::ShorthandPropertyAssignment,
+                        ) => store
+                            .object_literal_property_clone_origin(*property)
+                            .is_none_or(|origin| {
+                                origin.owner() != getter.object || origin.source() != raw
+                            }),
+                        _ => true,
+                    }
+            })
+    {
+        return Err(invalid());
+    }
+    if !valid_object_literal_getter_source(store, getter)
+        || record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(getter.owner)
+        || record.alias().is_some()
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || !record.object_flags().contains(
+            ObjectFlags::OBJECT_LITERAL
+                | ObjectFlags::FRESH_LITERAL
+                | ObjectFlags::MEMBERS_RESOLVED,
+        )
+        || object
+            .structured
+            .properties
+            .as_deref()
+            .and_then(|properties| properties.get(getter.property_index))
+            != Some(&symbol)
+        || object.structured.members
+            == store
+                .symbol(getter.owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+        || object
+            .structured
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| {
+                store
+                    .symbol(symbol)
+                    .and_then(|member| members.get(member.name()))
+            })
+            != Some(symbol)
+        || store.type_node_links(getter.object)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(origin.object_type),
+                ..TypeNodeLinks::default()
+            })
+    {
+        return Err(invalid());
+    }
+    let mut projection = ObjectLiteralGetterProjection {
+        symbol,
+        owner: getter.owner,
+        object_type: origin.object_type,
+        declaration: getter.declaration,
+        type_: None,
+        signature: None,
+        checked_return: None,
+    };
+    let Some(proof) = store.object_literal_getter_return_proof(symbol) else {
+        if store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || store
+                .signature_links(getter.declaration)
+                .is_some_and(|links| links != &SignatureLinks::default())
+        {
+            return Err(invalid());
+        }
+        return Ok(projection);
+    };
+    let signature = store.signature(proof.signature).ok_or_else(invalid)?;
+    if store.type_payload(proof.read_type).is_none()
+        || store.type_payload(proof.expression_type).is_none()
+        || store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(proof.read_type),
+                ..ValueSymbolLinks::default()
+            })
+        || store.signature_links(getter.declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(proof.signature),
+                ..SignatureLinks::default()
+            })
+        || signature.flags() != SignatureFlags::NONE
+        || signature.declaration() != Some(getter.declaration)
+        || !signature.type_parameters().is_empty()
+        || !signature.parameters().is_empty()
+        || signature.this_parameter().is_some()
+        || signature.min_argument_count() != 0
+        || signature.resolved_min_argument_count() != -1
+        || signature.resolved_return_type() != Some(proof.read_type)
+        || signature.resolved_type_predicate().is_some()
+        || signature.target().is_some()
+        || signature.mapper().is_some()
+        || signature.isolated_signature_type().is_some()
+        || signature.composite().is_some()
+        || store.type_node_links(getter.return_expression)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(proof.expression_type),
+                ..TypeNodeLinks::default()
+            })
+        || store
+            .symbol_node_links(getter.return_expression)
+            .and_then(|links| links.resolved_symbol)
+            != proof.expression_symbol
+        || getter.return_annotation.is_some_and(|annotation| {
+            !object_literal_getter_annotation_is_exact(store, annotation, proof.read_type)
+        })
+    {
+        return Err(invalid());
+    }
+    projection.type_ = Some(proof.read_type);
+    projection.signature = Some(proof.signature);
+    projection.checked_return = Some(proof.expression_type);
+    Ok(projection)
+}
+
+/// Follows only objects owned by the getter provider. Unrelated objects stay opaque.
+pub(super) fn object_literal_getter_object_edges(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<Vec<TypeId>>, RelationUnavailable> {
+    let Some(record) = store.type_payload(type_) else {
+        return Err(RelationUnavailable::Type(type_));
+    };
+    let TypeData::Object(object) = record.data() else {
+        return Ok(None);
+    };
+    let has_source_getter = record
+        .symbol()
+        .and_then(|owner| store.symbol(owner))
+        .and_then(ts_binder::semantic::Symbol::declarations)
+        .is_some_and(|declarations| {
+            declarations.iter().any(|declaration| {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::ObjectLiteralExpression)
+                    && store
+                        .source_direct_children(*declaration)
+                        .is_some_and(|members| {
+                            members.iter().any(|member| {
+                                store.source_node_kind(*member) == Some(SyntaxKind::GetAccessor)
+                            })
+                        })
+            })
+        });
+    if store.object_literal_getter_origin_for_type(type_).is_none()
+        && !store.derived_object_literal_has_getter_origin(type_)
+        && !has_source_getter
+        && !object
+            .structured
+            .properties
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|symbol| store.object_literal_getter_origin(*symbol).is_some())
+    {
+        return Ok(None);
+    }
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let mut source = type_;
+    let mut visited = HashSet::new();
+    let origin = loop {
+        if !visited.insert(source) {
+            return Err(invalid());
+        }
+        if let Some(origin) = store.object_literal_getter_origin_for_type(source) {
+            break origin;
+        }
+        let derived = match array_targets {
+            Some(targets) => {
+                store.validate_derived_object_literal_structure_with_array_targets(source, targets)
+            }
+            None => store.validate_derived_object_literal_for_relation(source),
+        };
+        let super::derived_types::DerivedObjectLiteralValidation::Valid { source: next, .. } =
+            derived
+        else {
+            return Err(invalid());
+        };
+        source = next;
+    };
+    if object_literal_state(store, &origin.object_plan)
+        .map_err(|_| invalid())?
+        .is_none_or(|state| state.type_id() != source)
+    {
+        return Err(invalid());
+    }
+    let mut edges = Vec::new();
+    for property in object.structured.properties.as_deref().unwrap_or_default() {
+        if store.object_literal_getter_origin(*property).is_some() {
+            let getter = object_literal_getter_projection(store, *property)?;
+            if getter.object_type != source {
+                return Err(invalid());
+            }
+            getter.require_type()?;
+            edges.extend(getter.type_edges());
+        } else {
+            edges.push(
+                store
+                    .value_symbol_links(*property)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or_else(invalid)?,
+            );
+        }
+    }
+    Ok(Some(edges))
+}
+
+/// The caller checks the body in its getter scope and supplies its actual return cache.
+/// A written annotation remains the read type even when the body has a diagnostic.
+#[allow(dead_code)] // The source-body adapter joins after its separate linear-body checkpoint.
+pub(super) fn publish_object_literal_getter_return(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    getter: &PlannedObjectLiteralGetter,
+    expression_type: TypeId,
+    read_type: TypeId,
+) -> Result<SignatureId, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(getter.object);
+    let expression_symbol = store
+        .symbol_node_links(getter.return_expression)
+        .and_then(|links| links.resolved_symbol);
+    if plan_object_literal_getter(
+        store,
+        host,
+        getter.object,
+        getter.owner,
+        getter.property_index,
+        getter.declaration,
+    )? != *getter
+        || store
+            .object_literal_getter_origin(getter.symbol)
+            .is_none_or(|origin| origin.getter != *getter)
+        || store.type_payload(expression_type).is_none()
+        || store.type_payload(read_type).is_none()
+        || store.source_node_kind(getter.return_expression) == Some(SyntaxKind::Identifier)
+            && expression_symbol.is_none()
+        || store.type_node_links(getter.return_expression)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(expression_type),
+                ..TypeNodeLinks::default()
+            })
+        || getter.return_annotation.is_some_and(|annotation| {
+            !object_literal_getter_annotation_is_exact(store, annotation, read_type)
+        })
+    {
+        return Err(invalid());
+    }
+    let projection =
+        object_literal_getter_projection(store, getter.symbol).map_err(|_| invalid())?;
+    if let Some(signature) = projection.signature {
+        return if projection.type_ == Some(read_type)
+            && projection.checked_return == Some(expression_type)
+        {
+            Ok(signature)
+        } else {
+            Err(invalid())
+        };
+    }
+    if !store.try_reserve_signatures(1)
+        || !store.try_reserve_signature_links(usize::from(
+            store.signature_links(getter.declaration).is_none(),
+        ))
+        || !store.try_reserve_value_symbol_links(usize::from(
+            store.value_symbol_links(getter.symbol).is_none(),
+        ))
+        || !store.try_reserve_object_literal_getter_return_proofs(1)
+    {
+        return Err(PropertyObjectError::Capacity(getter.declaration));
+    }
+    let signature = store
+        .alloc_signature(
+            SignatureFlags::NONE,
+            Some(getter.declaration),
+            Vec::new(),
+            None,
+            Vec::new(),
+            Some(read_type),
+            None,
+            0,
+        )
+        .expect("the getter plan proves its declaration and return type");
+    assert!(store.set_signature_links(
+        getter.declaration,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        }
+    ));
+    assert!(store.set_value_symbol_links(
+        getter.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(read_type),
+            ..ValueSymbolLinks::default()
+        }
+    ));
+    assert!(
+        store.record_object_literal_getter_return_proof(ObjectLiteralGetterReturnProof {
+            symbol: getter.symbol,
+            signature,
+            expression_type,
+            read_type,
+            expression_symbol,
+        })
+    );
+    Ok(signature)
 }
 
 fn plan_interface_accessor(
@@ -11965,6 +12750,7 @@ pub(super) fn plan_selected_interface_method(
         }],
         methods,
         accessors: Vec::new(),
+        object_literal_getters: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -12406,6 +13192,7 @@ fn selected_method_plan(
             })
             .collect(),
         accessors: Vec::new(),
+        object_literal_getters: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -14848,6 +15635,7 @@ fn property_object_alias_source_plan(
         properties: projection.properties,
         methods: Vec::new(),
         accessors: Vec::new(),
+        object_literal_getters: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -17569,6 +18357,17 @@ fn object_literal_property_types(
         {
             return None;
         }
+        if plan.object_literal_getter(property.symbol).is_some() {
+            let getter = object_literal_getter_projection(store, *cloned_symbol).ok()?;
+            if *cloned_symbol != property.symbol
+                || getter.owner != plan.symbol
+                || store.type_node_links(plan.node)?.resolved_type != Some(getter.object_type)
+            {
+                return None;
+            }
+            // Go does not propagate flags from a deferred getter return at construction.
+            continue;
+        }
         property_types.push(valid_object_literal_property(
             store,
             plan.symbol,
@@ -17776,6 +18575,25 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                 });
         }
         if record.flags().intersects(SymbolFlags::ACCESSOR) {
+            if let Some(getter) = plan.object_literal_getter(property.symbol) {
+                return if store
+                    .object_literal_getter_origin(property.symbol)
+                    .is_some()
+                {
+                    object_literal_getter_projection(store, property.symbol).is_ok()
+                } else {
+                    valid_object_literal_getter_source(store, getter)
+                        && store
+                            .value_symbol_links(property.symbol)
+                            .is_none_or(|links| links == &ValueSymbolLinks::default())
+                        && store
+                            .signature_links(getter.declaration)
+                            .is_none_or(|links| links == &SignatureLinks::default())
+                        && store
+                            .object_literal_getter_return_proof(property.symbol)
+                            .is_none()
+                };
+            }
             return record.check_flags() == CheckFlags::NONE
                 && store
                     .value_symbol_links(property.symbol)
@@ -21128,6 +21946,7 @@ pub(super) fn publish_object_literal(
 ) -> Result<TypeId, PropertyObjectError> {
     if plan.kind != PropertyObjectKind::ObjectLiteral
         || store.source_node_kind(plan.node) != Some(SyntaxKind::ObjectLiteralExpression)
+        || !plan.object_literal_getters.is_empty()
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
@@ -21257,6 +22076,205 @@ pub(super) fn publish_object_literal(
         .unwrap_or_default();
     links.resolved_type = Some(type_);
     assert!(store.set_type_node_links(plan.node, links));
+    Ok(type_)
+}
+
+/// Publishes eager properties and raw getter symbols without evaluating a getter body.
+#[allow(dead_code)] // The source-body adapter joins after its separate linear-body checkpoint.
+#[allow(clippy::too_many_lines)] // Complete preflight precedes every object and member write.
+pub(super) fn publish_object_literal_with_getters(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &PropertyObjectPlan,
+    eager_types: &[TypeId],
+) -> Result<TypeId, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(plan.node);
+    if plan_object_literal(store, host, plan.node)? != *plan {
+        return Err(invalid());
+    }
+    if plan.object_literal_getters.is_empty() {
+        return publish_object_literal(store, plan, eager_types);
+    }
+    let mut source_members = store
+        .source_direct_children(plan.node)
+        .ok_or_else(invalid)?;
+    source_members.sort_by_key(|member| store.source_node_start(*member));
+    let table = plan
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let mut seen_symbols = HashSet::new();
+    let mut seen_names = HashSet::new();
+    if plan.declarations != [plan.node]
+        || source_members.len() != plan.properties.len()
+        || table.len() != plan.properties.len()
+        || source_members
+            .iter()
+            .zip(&plan.properties)
+            .any(|(declaration, property)| {
+                !seen_symbols.insert(property.symbol)
+                    || !seen_names.insert(property.name.clone())
+                    || property.declaration != *declaration
+                    || store.source_declaration_symbol(*declaration) != Some(property.symbol)
+                    || table.get(property.name.as_ref()) != Some(property.symbol)
+                    || store
+                        .symbol(property.symbol)
+                        .is_none_or(|symbol| symbol.name() != property.name.as_ref())
+                    || (store.source_node_kind(*declaration) == Some(SyntaxKind::GetAccessor))
+                        != plan.object_literal_getter(property.symbol).is_some()
+            })
+    {
+        return Err(invalid());
+    }
+    if plan.kind != PropertyObjectKind::ObjectLiteral
+        || !plan.spreads.is_empty()
+        || !plan.methods.is_empty()
+        || !plan.accessors.is_empty()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.alias_symbol.is_some()
+        || plan.heritage.is_some()
+        || !valid_object_literal_owner(store, plan)
+        || plan.eager_object_literal_properties().count() != eager_types.len()
+        || plan
+            .eager_object_literal_properties()
+            .zip(eager_types)
+            .any(|((_, property), type_)| {
+                property.readonly != plan.const_context
+                    || !valid_bound_object_literal_property(store, plan, property)
+                    || !valid_object_literal_property_type(store, property, *type_)
+            })
+        || plan.object_literal_getters.iter().any(|getter| {
+            !valid_object_literal_getter_source(store, getter)
+                || getter.object != plan.node
+                || getter.owner != plan.symbol
+                || plan
+                    .properties
+                    .get(getter.property_index)
+                    .is_none_or(|property| {
+                        property.symbol != getter.symbol
+                            || property.declaration != getter.declaration
+                            || property.name_node != getter.name_node
+                            || property.type_node != getter.declaration
+                            || property.optional
+                            || !property.readonly
+                    })
+        })
+        || plan
+            .object_literal_getters
+            .iter()
+            .map(|getter| getter.symbol)
+            .collect::<HashSet<_>>()
+            .len()
+            != plan.object_literal_getters.len()
+        || !unresolved_property_links(store, plan)
+    {
+        return Err(invalid());
+    }
+    if let Some(state) = object_literal_state(store, plan)? {
+        validate_resolved_property_types(store, plan, eager_types)?;
+        return Ok(state.type_id());
+    }
+    if plan
+        .object_literal_getters
+        .iter()
+        .any(|getter| store.object_literal_getter_origin(getter.symbol).is_some())
+    {
+        return Err(invalid());
+    }
+    let object_flags = expected_object_literal_flags(store, eager_types).ok_or_else(invalid)?;
+    let mut ordinary = Vec::with_capacity(eager_types.len());
+    for ((_, property), type_) in plan.eager_object_literal_properties().zip(eager_types) {
+        let bound = store.symbol(property.symbol).ok_or_else(invalid)?;
+        let mut data = SymbolData::new(
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            bound.name().to_owned(),
+        );
+        data.check_flags = source_property_check_flags(property.readonly);
+        data.declarations = bound.declarations().map(<[NodeRef]>::to_vec);
+        data.value_declaration = bound.value_declaration();
+        data.parent = bound.parent();
+        ordinary.push((data, *type_));
+    }
+    let prepared_members = PreparedSymbolTable::new(plan.properties.len())
+        .ok_or(PropertyObjectError::Capacity(plan.node))?;
+    let mut properties = Vec::new();
+    properties
+        .try_reserve_exact(plan.properties.len())
+        .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_checker_symbol_allocations(ordinary.len(), 1)
+        || !store.try_reserve_value_symbol_links(ordinary.len())
+        || !store.try_reserve_object_literal_property_clone_origins(ordinary.len())
+        || !store.try_reserve_object_literal_getter_origins(plan.object_literal_getters.len())
+        || !store
+            .try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none()))
+    {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+    let object_plan = Arc::new(plan.clone());
+    let members = store.alloc_prepared_symbol_table(prepared_members);
+    let mut ordinary = ordinary.into_iter();
+    for property in &plan.properties {
+        let symbol = if plan.object_literal_getter(property.symbol).is_some() {
+            property.symbol
+        } else {
+            let (data, type_) = ordinary
+                .next()
+                .expect("eager properties retain their source order");
+            let clone = store
+                .alloc_symbol(data)
+                .expect("the property plan proves clone ownership");
+            assert!(store.set_value_symbol_links(
+                clone,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    target: Some(property.symbol),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            assert!(store.record_object_literal_property_clone_origin(
+                ObjectLiteralPropertyCloneOrigin {
+                    symbol: clone,
+                    owner: plan.node,
+                    source: property.symbol,
+                }
+            ));
+            clone
+        };
+        assert_eq!(
+            store.insert_symbol(members, property.name.clone(), symbol),
+            Some(None)
+        );
+        properties.push(symbol);
+    }
+    let type_ = store
+        .alloc_plain_object_type(object_flags, Some(plan.symbol))
+        .expect("the object plan proves its raw owner");
+    assert!(store.set_structured_type_members(
+        type_,
+        Some(members),
+        Some(properties),
+        None,
+        None,
+        None
+    ));
+    assert!(store.set_type_node_links(
+        plan.node,
+        TypeNodeLinks {
+            resolved_type: Some(type_),
+            ..TypeNodeLinks::default()
+        }
+    ));
+    for getter in &plan.object_literal_getters {
+        assert!(
+            store.record_object_literal_getter_origin(ObjectLiteralGetterOrigin {
+                getter: getter.clone(),
+                object_type: type_,
+                object_plan: Arc::clone(&object_plan),
+            })
+        );
+    }
     Ok(type_)
 }
 
@@ -25450,6 +26468,868 @@ mod generic_publication_tests {
             ),
             before,
         );
+    }
+
+    fn getter_allocations(
+        store: &CanonicalTypeMapperStore,
+    ) -> (usize, usize, usize, usize, [usize; 26]) {
+        (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    // This is the provider protocol. The separate source adapter owns deferred body execution.
+    fn checked_numeric_getter_return(
+        store: &mut CanonicalTypeMapperStore,
+        parsed: &ParseResult,
+        getter: &PlannedObjectLiteralGetter,
+    ) -> (TypeId, TypeId) {
+        let NodeData::NumericLiteral(literal) = &parsed
+            .arena
+            .get(getter.return_expression.node)
+            .unwrap()
+            .data
+        else {
+            panic!("the control has a real numeric return expression");
+        };
+        let regular = store
+            .regular_number_literal_type(ts_jsnum::from_string(&literal.text))
+            .unwrap();
+        let expression_type = store.fresh_type_of_literal_type(regular).unwrap();
+        assert!(store.set_type_node_links(
+            getter.return_expression,
+            TypeNodeLinks {
+                resolved_type: Some(expression_type),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let widened =
+            super::super::source::widened_fresh_literal_type(store, expression_type).unwrap();
+        (expression_type, store.get_widened_type(widened).unwrap())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold demands and warm identities use one unchanged object.
+    fn object_literal_getters_defer_raw_members_and_preserve_warm_signatures() {
+        use crate::semantic::derived_types::DerivedTypeError;
+        use crate::semantic::formatter::{TypeDisplayUnavailable, type_to_string};
+        let (mut fixture, object) =
+            object_fixture("const result = { get current() { return 2; }, value: 1 };");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = getter_allocations(&fixture.store);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        assert_eq!(getter_allocations(&fixture.store), before);
+        let [getter] = plan.object_literal_getters.as_slice() else {
+            panic!("one source getter");
+        };
+        assert_eq!(getter.property_index, 0);
+        assert!(plan.properties[0].readonly);
+        assert!(!plan.properties[1].readonly);
+        assert_eq!(plan.properties[0].type_node, getter.declaration);
+        assert_eq!(
+            plan.eager_object_literal_properties()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let undefined = fixture.store.intrinsic_bootstrap().unwrap().undefined_type;
+        let type_ =
+            publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[number])
+                .unwrap();
+        let properties = fixture
+            .store
+            .type_payload(type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .clone()
+            .unwrap();
+        assert_eq!(properties[0], getter.symbol);
+        assert_ne!(properties[1], plan.properties[1].symbol);
+        assert!(
+            fixture
+                .store
+                .object_literal_property_clone_origin(getter.symbol)
+                .is_none()
+        );
+        assert!(fixture.store.value_symbol_links(getter.symbol).is_none());
+        assert!(fixture.store.signature_links(getter.declaration).is_none());
+        assert!(
+            fixture
+                .store
+                .type_node_links(getter.return_expression)
+                .is_none()
+        );
+        let cold = getter_allocations(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[number]),
+                Ok(type_)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .resolved_own_property_by_key(type_, EscapedNameRef::source("current")),
+                Err(RelationUnavailable::UnresolvedPropertyType(getter.symbol))
+            );
+            assert_eq!(
+                type_to_string(&fixture.store, type_),
+                Err(TypeDisplayUnavailable::UnresolvedPropertyType(
+                    getter.symbol
+                ))
+            );
+            assert_eq!(
+                fixture.store.get_regular_type_of_object_literal(type_),
+                Err(DerivedTypeError::UnresolvedPropertyType(getter.symbol))
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .expression_union_type(&[type_, undefined], UnionReduction::Literal),
+                Err(
+                    super::super::bootstrap::LiteralTypeCacheError::UnsupportedUnionConstituent(
+                        type_
+                    )
+                )
+            );
+            let value = fixture
+                .store
+                .resolved_own_property_by_key(type_, EscapedNameRef::source("value"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.type_, number);
+            assert!(!value.readonly);
+        }
+        assert_eq!(getter_allocations(&fixture.store), cold);
+        let (body_type, read_type) =
+            checked_numeric_getter_return(&mut fixture.store, &fixture.parsed, getter);
+        assert_eq!(read_type, number);
+        let signature = publish_object_literal_getter_return(
+            &mut fixture.store,
+            &host,
+            getter,
+            body_type,
+            read_type,
+        )
+        .unwrap();
+        let projection = object_literal_getter_projection(&fixture.store, getter.symbol).unwrap();
+        assert_eq!(projection.signature, Some(signature));
+        assert_eq!(
+            projection.type_edges().collect::<Vec<_>>(),
+            [read_type, body_type]
+        );
+        assert_eq!(
+            fixture.store.signature(signature).unwrap().declaration(),
+            Some(getter.declaration)
+        );
+        assert_eq!(
+            fixture.store.symbol(getter.symbol).unwrap().flags(),
+            SymbolFlags::GET_ACCESSOR
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(getter.symbol)
+                .unwrap()
+                .target,
+            None
+        );
+        assert_eq!(
+            type_to_string(&fixture.store, type_).unwrap(),
+            "{ readonly current: number; value: number; }"
+        );
+        let regular = fixture
+            .store
+            .get_regular_type_of_object_literal(type_)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(regular)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .properties
+                .as_ref()
+                .unwrap()[0],
+            getter.symbol
+        );
+        assert_eq!(
+            type_to_string(&fixture.store, regular).unwrap(),
+            "{ readonly current: number; value: number; }"
+        );
+        let union = fixture
+            .store
+            .expression_union_type(&[type_, undefined], UnionReduction::Literal)
+            .unwrap();
+        let warm = getter_allocations(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                publish_object_literal_getter_return(
+                    &mut fixture.store,
+                    &host,
+                    getter,
+                    body_type,
+                    read_type
+                ),
+                Ok(signature)
+            );
+            assert_eq!(
+                publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[number]),
+                Ok(type_)
+            );
+            assert_eq!(
+                fixture.store.get_regular_type_of_object_literal(type_),
+                Ok(regular)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .expression_union_type(&[type_, undefined], UnionReduction::Literal),
+                Ok(union)
+            );
+            let selected = fixture
+                .store
+                .resolved_own_property_by_key(type_, EscapedNameRef::source("current"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                selected,
+                ResolvedOwnProperty {
+                    symbol: getter.symbol,
+                    type_: number,
+                    readonly: true,
+                    optional: false
+                }
+            );
+        }
+        assert_eq!(getter_allocations(&fixture.store), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep declaration mismatch, poison, and restoration together.
+    fn object_literal_getters_keep_declared_returns_and_reject_paired_cache_poison() {
+        let (mut fixture, object) =
+            object_fixture("const result = { get current(): string { return 1; } };");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let getter = &plan.object_literal_getters[0];
+        let type_ =
+            publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let annotation = getter.return_annotation.unwrap();
+        let declared = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(annotation)
+        .unwrap();
+        let (body_type, widened) =
+            checked_numeric_getter_return(&mut fixture.store, &fixture.parsed, getter);
+        assert_ne!(declared, widened);
+        // The caller reports the return mismatch. The getter still has its written read type.
+        let signature = publish_object_literal_getter_return(
+            &mut fixture.store,
+            &host,
+            getter,
+            body_type,
+            declared,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(getter.symbol)
+                .unwrap()
+                .resolved_type,
+            Some(declared)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(declared)
+        );
+        let value_links = fixture
+            .store
+            .value_symbol_links(getter.symbol)
+            .unwrap()
+            .clone();
+        let body_links = fixture
+            .store
+            .type_node_links(getter.return_expression)
+            .unwrap()
+            .clone();
+        let annotation_links = fixture
+            .store
+            .type_node_links(annotation)
+            .cloned()
+            .unwrap_or_default();
+        assert!(fixture.store.set_value_symbol_links(
+            getter.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(widened),
+                ..ValueSymbolLinks::default()
+            }
+        ));
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(widened))
+        );
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(widened),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        assert!(fixture.store.set_type_node_links(
+            getter.return_expression,
+            TypeNodeLinks {
+                resolved_type: Some(widened),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let poisoned = getter_allocations(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                object_literal_getter_projection(&fixture.store, getter.symbol),
+                Err(RelationUnavailable::InvalidSymbolMembers(getter.symbol))
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .resolved_own_property_by_key(type_, EscapedNameRef::source("current")),
+                Err(RelationUnavailable::InvalidSymbolMembers(getter.symbol))
+            );
+            assert_eq!(
+                publish_object_literal_getter_return(
+                    &mut fixture.store,
+                    &host,
+                    getter,
+                    widened,
+                    widened
+                ),
+                Err(PropertyObjectError::InvalidObjectLiteral(object))
+            );
+        }
+        assert_eq!(getter_allocations(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(getter.symbol, value_links)
+        );
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(declared))
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(annotation, annotation_links)
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(getter.return_expression, body_links)
+        );
+        assert_eq!(
+            object_literal_getter_projection(&fixture.store, getter.symbol)
+                .unwrap()
+                .require_type(),
+            Ok(declared)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn object_literal_getters_reject_incomplete_cold_plans_without_publication() {
+        let (mut fixture, object) =
+            object_fixture("const result = { get current() { return 2; }, value: 1 };");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let before = getter_allocations(&fixture.store);
+        let ordinary_types = [number];
+        for case in 0..6 {
+            let mut invalid = plan.clone();
+            let values: &[TypeId] = match case {
+                0 => {
+                    invalid.properties.pop();
+                    &[]
+                }
+                1 => {
+                    invalid.properties.push(invalid.properties[0].clone());
+                    &ordinary_types
+                }
+                2 => {
+                    invalid.properties[0].name = EscapedName::source("changed");
+                    &ordinary_types
+                }
+                3 => {
+                    invalid.properties.swap(0, 1);
+                    &ordinary_types
+                }
+                4 => {
+                    invalid.object_literal_getters[0].property_index = 1;
+                    &ordinary_types
+                }
+                5 => {
+                    invalid.const_context = true;
+                    invalid.properties[1].readonly = true;
+                    &ordinary_types
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                publish_object_literal_with_getters(&mut fixture.store, &host, &invalid, values),
+                Err(PropertyObjectError::InvalidObjectLiteral(object))
+            );
+            assert_eq!(getter_allocations(&fixture.store), before);
+        }
+        assert!(
+            fixture
+                .store
+                .object_literal_getter_origin(plan.properties[0].symbol)
+                .is_none()
+        );
+        assert!(fixture.store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn object_literal_getters_keep_const_context_separate_from_getter_readonly() {
+        use crate::semantic::formatter::{
+            CanonicalTypeFormatFlags, type_to_string_with_host_and_flags,
+        };
+        let (mut fixture, object) =
+            object_fixture("const result = ({ get current() { return 2; }, value: 1 }) as const;");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let getter = &plan.object_literal_getters[0];
+        let one = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+        let type_ =
+            publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[one]).unwrap();
+        assert!(plan.const_context);
+        assert_eq!(
+            fixture
+                .store
+                .resolved_own_property_by_key(type_, EscapedNameRef::source("current")),
+            Err(RelationUnavailable::UnresolvedPropertyType(getter.symbol))
+        );
+        let (body_type, read_type) =
+            checked_numeric_getter_return(&mut fixture.store, &fixture.parsed, getter);
+        publish_object_literal_getter_return(
+            &mut fixture.store,
+            &host,
+            getter,
+            body_type,
+            read_type,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.store.symbol(getter.symbol).unwrap().check_flags(),
+            CheckFlags::NONE
+        );
+        assert_eq!(
+            type_to_string_with_host_and_flags(
+                &fixture.store,
+                &host,
+                type_,
+                CanonicalTypeFormatFlags::NO_TRUNCATION
+            )
+            .unwrap(),
+            "{ readonly current: number; readonly value: 1; }"
+        );
+        assert_eq!(
+            fixture.store.validate_cached_array_capability(type_),
+            Ok(())
+        );
+        let (mut ordinary, object) = object_fixture("const result = ({ value: 1 }) as const;");
+        let ordinary_host = self::host(&ordinary.parsed, &ordinary.bound);
+        let plan = plan_object_literal(&ordinary.store, &ordinary_host, object).unwrap();
+        let one = ordinary
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+        let type_ = publish_object_literal(&mut ordinary.store, &plan, &[one]).unwrap();
+        assert_eq!(
+            ordinary.store.validate_cached_array_capability(type_),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn object_literal_getters_preserve_outer_generic_source_scope() {
+        let (fixture, object) = object_fixture(
+            "function make<T>(items: T[]) { return { get current() { return items; } }; }",
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = getter_allocations(&fixture.store);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let getter = &plan.object_literal_getters[0];
+        assert_eq!(
+            fixture
+                .store
+                .source_identifier_text(getter.return_expression),
+            Some("items")
+        );
+        assert_eq!(
+            fixture.store.source_node_parent(getter.declaration),
+            Some(SourceNodeParent::Parent(object))
+        );
+        assert_eq!(
+            fixture.store.source_node_parent(getter.return_expression),
+            Some(SourceNodeParent::Parent(getter.return_statement))
+        );
+        assert!(fixture.store.signature_links(getter.declaration).is_none());
+        assert_eq!(getter_allocations(&fixture.store), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source proves inferred and annotated getter array edges.
+    fn object_literal_getters_preserve_captured_array_edges_and_caller_targets() {
+        use crate::semantic::bootstrap::LiteralTypeCacheError;
+        use crate::semantic::derived_types::DerivedObjectLiteralValidation;
+        use crate::semantic::formatter::{type_to_string, type_to_string_with_global_types};
+        let mut fixture = global_array_augmentation_fixture(
+            concat!(
+                "interface Marker {} declare var entries: number[]; ",
+                "const inferred = { get current() { return entries; } }; ",
+                "const annotated = { get current(): number { return entries; } };",
+            ),
+            29_510,
+        );
+        let file = fixture.source_bound.file_id();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&fixture.library.arena, &fixture.library_bound),
+                (&fixture.source.arena, &fixture.source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let objects = fixture
+            .source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    fixture.source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(objects.len(), 2);
+        let entries = fixture
+            .source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(declaration) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.source.arena.get(declaration.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "entries")
+                    .then(|| {
+                        fixture.source_bound.symbol(NodeRef::new(
+                            fixture.source.arena.id(),
+                            file,
+                            node,
+                        ))
+                    })
+                    .flatten()
+            })
+            .unwrap();
+        let options = CanonicalCheckerOptions::default();
+        let globals = fixture.global_types.clone();
+        let targets = CanonicalArrayTargets::from_global_types(&globals);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let array = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut fixture.store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_declared_value(entries)
+        .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let undefined = fixture.store.intrinsic_bootstrap().unwrap().undefined_type;
+        let wrong_targets = CanonicalArrayTargets::for_test(number, number);
+        for (index, object) in objects.into_iter().enumerate() {
+            let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+            let getter = &plan.object_literal_getters[0];
+            let type_ =
+                publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[]).unwrap();
+            let original_flags = fixture.store.type_payload(type_).unwrap().object_flags();
+            assert!(
+                fixture
+                    .store
+                    .symbol_node_links(getter.return_expression)
+                    .is_none()
+            );
+            let read = super::super::variables::plan_identifier_read(
+                &fixture.source.arena,
+                &fixture.source_bound,
+                &fixture.store,
+                &host,
+                &HashSet::from([entries]),
+                &HashSet::from([entries]),
+                getter.return_expression,
+                "entries",
+            )
+            .unwrap();
+            assert_eq!(read.value_symbol, entries);
+            assert!(fixture.store.set_symbol_node_links(
+                getter.return_expression,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(read.resolved_symbol)
+                }
+            ));
+            let body_type = fixture
+                .store
+                .value_symbol_links(read.value_symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert_eq!(body_type, array);
+            assert!(fixture.store.set_type_node_links(
+                getter.return_expression,
+                TypeNodeLinks {
+                    resolved_type: Some(body_type),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let read_type = match getter.return_annotation {
+                Some(annotation) => CanonicalTypeQuery::new_with_global_types_and_session(
+                    &mut fixture.store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(annotation)
+                .unwrap(),
+                None => fixture
+                    .store
+                    .get_widened_type_with_global_types(body_type, &globals)
+                    .unwrap(),
+            };
+            assert_eq!(read_type, if index == 0 { array } else { number });
+            let signature = publish_object_literal_getter_return(
+                &mut fixture.store,
+                &host,
+                getter,
+                body_type,
+                read_type,
+            )
+            .unwrap();
+            assert_eq!(
+                fixture.store.type_payload(type_).unwrap().object_flags(),
+                original_flags
+            );
+            let selected = resolve_object_property_by_key(
+                &mut fixture.store,
+                Some(&globals),
+                type_,
+                EscapedNameRef::source("current"),
+                &mut session,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.symbol, getter.symbol);
+            assert_eq!(selected.type_, read_type);
+            assert!(selected.readonly);
+            assert_eq!(
+                fixture.store.validate_cached_array_capability(type_),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_cached_array_capability_with_array_targets(targets, type_),
+                Ok(())
+            );
+            assert!(type_to_string(&fixture.store, type_).is_err());
+            assert_eq!(
+                type_to_string_with_global_types(&fixture.store, &globals, type_).unwrap(),
+                if index == 0 {
+                    "{ readonly current: number[]; }"
+                } else {
+                    "{ readonly current: number; }"
+                }
+            );
+            let regular = fixture
+                .store
+                .get_regular_type_of_object_literal(type_)
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(regular)
+                    .unwrap()
+                    .data()
+                    .structured()
+                    .unwrap()
+                    .properties
+                    .as_ref()
+                    .unwrap(),
+                &[getter.symbol]
+            );
+            assert_eq!(
+                fixture.store.validate_cached_array_capability(regular),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array))
+            );
+            assert!(
+                matches!(fixture.store.validate_derived_object_literal_structure_with_array_targets(regular, wrong_targets), DerivedObjectLiteralValidation::Valid { source, .. } if source == type_)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_derived_object_literal_with_array_targets(regular, wrong_targets),
+                DerivedObjectLiteralValidation::Invalid
+            );
+            assert!(
+                matches!(fixture.store.validate_derived_object_literal_with_array_targets(regular, targets), DerivedObjectLiteralValidation::Valid { source, .. } if source == type_)
+            );
+            let union = fixture
+                .store
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &[type_, undefined],
+                    UnionReduction::Literal,
+                )
+                .unwrap();
+            let warm = getter_allocations(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    publish_object_literal_getter_return(
+                        &mut fixture.store,
+                        &host,
+                        getter,
+                        body_type,
+                        read_type
+                    ),
+                    Ok(signature)
+                );
+                assert_eq!(
+                    publish_object_literal_with_getters(&mut fixture.store, &host, &plan, &[]),
+                    Ok(type_)
+                );
+                assert_eq!(
+                    fixture.store.expression_union_type_with_global_types(
+                        &globals,
+                        &[type_, undefined],
+                        UnionReduction::Literal
+                    ),
+                    Ok(union)
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .validate_cached_array_capability_with_array_targets(targets, regular),
+                    Ok(())
+                );
+            }
+            assert_eq!(getter_allocations(&fixture.store), warm);
+            let structured = fixture
+                .store
+                .type_payload(regular)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            assert!(fixture.store.set_type_symbol(regular, None));
+            assert!(
+                fixture
+                    .store
+                    .set_structured_type_members(regular, None, None, None, None, None)
+            );
+            let poisoned = getter_allocations(&fixture.store);
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_cached_array_capability_with_array_targets(targets, regular),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(regular))
+            );
+            assert_eq!(getter_allocations(&fixture.store), poisoned);
+            assert!(fixture.store.set_type_symbol(regular, Some(plan.symbol)));
+            assert!(fixture.store.set_structured_type_members(
+                regular,
+                structured.members,
+                structured.properties,
+                None,
+                None,
+                None
+            ));
+            assert_eq!(
+                fixture
+                    .store
+                    .validate_cached_array_capability_with_array_targets(targets, regular),
+                Ok(())
+            );
+            assert!(fixture.store.set_symbol_node_links(
+                getter.return_expression,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(fixture.symbol)
+                }
+            ));
+            let poisoned = getter_allocations(&fixture.store);
+            assert_eq!(
+                object_literal_getter_projection(&fixture.store, getter.symbol),
+                Err(RelationUnavailable::InvalidSymbolMembers(getter.symbol))
+            );
+            assert_eq!(
+                fixture.store.expression_union_type_with_global_types(
+                    &globals,
+                    &[type_, undefined],
+                    UnionReduction::Literal
+                ),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+            );
+            assert_eq!(getter_allocations(&fixture.store), poisoned);
+            assert!(fixture.store.set_symbol_node_links(
+                getter.return_expression,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(read.resolved_symbol)
+                }
+            ));
+            assert_eq!(
+                object_literal_getter_projection(&fixture.store, getter.symbol)
+                    .unwrap()
+                    .require_type(),
+                Ok(read_type)
+            );
+        }
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

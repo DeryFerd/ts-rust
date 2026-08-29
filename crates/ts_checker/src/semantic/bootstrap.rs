@@ -2347,6 +2347,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let property_record = self
                     .symbol(*property)
                     .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                if property_record.flags() == SymbolFlags::GET_ACCESSOR
+                    || self.object_literal_getter_origin(*property).is_some()
+                {
+                    let getter = object_members::object_literal_getter_projection(self, *property)
+                        .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                    getter
+                        .require_type()
+                        .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                    if getter.owner != owner
+                        || getter.object_type != type_
+                        || table.get(property_record.name()) != Some(*property)
+                        || raw_table.and_then(|raw| raw.get(property_record.name()))
+                            != Some(*property)
+                        || !seen_raw.insert(*property)
+                    {
+                        return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                    }
+                    for edge in getter.type_edges() {
+                        self.validate_union_constituent_worker(
+                            edge,
+                            array_validation,
+                            visiting,
+                            array_visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    continue;
+                }
                 let property_links = self
                     .value_symbol_links(*property)
                     .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
@@ -2663,6 +2691,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 Ok(())
             }
             TypeData::Object(_) | TypeData::Interface(_) => {
+                if let Some(edges) = object_members::object_literal_getter_object_edges(
+                    self,
+                    type_,
+                    array_validation.targets(),
+                )
+                .map_err(|error| match error {
+                    super::relater::RelationUnavailable::UnresolvedPropertyType(_) => {
+                        LiteralTypeCacheError::UnsupportedUnionConstituent(type_)
+                    }
+                    _ => LiteralTypeCacheError::InvalidCachedUnion(type_),
+                })? {
+                    for edge in edges {
+                        self.validate_cached_array_capability_worker(
+                            edge,
+                            array_validation,
+                            visited,
+                            allowed_pending,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 if let Some(edges) =
                     self.property_object_alias_type_edges(type_, array_validation.targets())?
                 {

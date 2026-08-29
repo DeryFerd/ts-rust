@@ -166,6 +166,7 @@ pub enum TypeDisplayUnavailable {
         kind: TypeDataKind,
     },
     MalformedType(TypeId),
+    UnresolvedPropertyType(SemanticSymbolId),
     InvalidUnion(TypeId),
     InvalidIntersection(TypeId),
     UnsupportedUnionConstituent {
@@ -208,6 +209,9 @@ impl std::fmt::Display for TypeDisplayUnavailable {
             ),
             Self::MalformedType(type_id) => {
                 write!(formatter, "type {type_id:?} has an invalid display payload")
+            }
+            Self::UnresolvedPropertyType(property) => {
+                write!(formatter, "property {property:?} has no resolved type")
             }
             Self::InvalidUnion(type_id) => {
                 write!(
@@ -4887,7 +4891,7 @@ pub(super) fn validate_source_jsdoc_object(
     let properties = structured.properties.as_deref().unwrap_or_default();
     validate_structured_member_table(store, type_id, structured.members, properties)?;
     for property in properties {
-        validated_property(store, Some(host), type_id, proof, *property)?;
+        validated_property(store, Some(host), global_types, type_id, proof, *property)?;
     }
     Ok(())
 }
@@ -5116,6 +5120,24 @@ fn validate_object_literal_contract(
         let clone_record = store
             .symbol(*clone)
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        if store.object_literal_getter_origin(*clone).is_some()
+            || clone_record.flags() == SymbolFlags::GET_ACCESSOR
+        {
+            let getter = object_members::object_literal_getter_projection(store, *clone)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+            if getter.object_type != type_id
+                || getter.owner != owner
+                || !raw_targets.insert(*clone)
+                || result_table.get(clone_record.name()) != Some(*clone)
+                || raw_table.and_then(|table| table.get(clone_record.name())) != Some(*clone)
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            getter
+                .require_type()
+                .map_err(|_| TypeDisplayUnavailable::UnresolvedPropertyType(*clone))?;
+            continue;
+        }
         let clone_links = store
             .value_symbol_links(*clone)
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
@@ -5206,16 +5228,12 @@ fn const_asserted_object_literal(
     };
     let plan = object_members::plan_object_literal(store, host, declaration)
         .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
-    let readonly = plan
-        .properties
-        .first()
-        .is_some_and(|property| property.readonly);
+    let readonly = plan.const_context;
     if plan.node != declaration
         || store.type_payload(type_id).and_then(TypeRecord::symbol) != Some(plan.symbol)
-        || plan
-            .properties
-            .iter()
-            .any(|property| property.readonly != readonly)
+        || plan.properties.iter().any(|property| {
+            plan.object_literal_getter(property.symbol).is_none() && property.readonly != readonly
+        })
         || readonly
             && store
                 .type_node_links(declaration)
@@ -5330,7 +5348,7 @@ fn display_structural_properties(
     validate_host_member_order(store, host, type_id, proof, properties)?;
     let properties = properties
         .iter()
-        .map(|property| validated_property(store, host, type_id, proof, *property))
+        .map(|property| validated_property(store, host, global_types, type_id, proof, *property))
         .collect::<Result<Vec<_>, _>>()?;
     if properties.is_empty() {
         state.add(2);
@@ -5612,6 +5630,7 @@ fn validate_host_member_order(
 fn validated_property(
     store: &CanonicalTypeMapperStore,
     host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
     proof: StructuralObjectProof,
     property: SemanticSymbolId,
@@ -5619,6 +5638,28 @@ fn validated_property(
     let record = store
         .symbol(property)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if (store.object_literal_getter_origin(property).is_some()
+        || record.flags() == SymbolFlags::GET_ACCESSOR)
+        && matches!(
+            proof,
+            StructuralObjectProof::ObjectLiteral | StructuralObjectProof::ConstObjectLiteral
+        )
+    {
+        let getter = validated_object_literal_getter(store, global_types, type_id, property)?;
+        let property_type = getter
+            .require_type()
+            .map_err(|_| TypeDisplayUnavailable::UnresolvedPropertyType(property))?;
+        let name = record
+            .name()
+            .as_utf8()
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        return Ok(StructuralPropertyDisplay::Property {
+            name: structural_property_display_name(host, type_id, proof, record, name)?,
+            type_id: property_type,
+            optional: false,
+            readonly: true,
+        });
+    }
     let valid_flags_and_checks = match proof {
         StructuralObjectProof::Synthetic => {
             let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
@@ -5732,6 +5773,60 @@ fn validated_property(
         optional,
         readonly,
     })
+}
+
+fn validated_object_literal_getter(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    property: SemanticSymbolId,
+) -> Result<object_members::ObjectLiteralGetterProjection, TypeDisplayUnavailable> {
+    let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
+    let getter =
+        object_members::object_literal_getter_projection(store, property).map_err(|_| invalid())?;
+    if store.type_payload(type_id).and_then(TypeRecord::symbol) != Some(getter.owner) {
+        return Err(invalid());
+    }
+
+    let mut source = type_id;
+    let mut seen = HashSet::new();
+    while source != getter.object_type {
+        if !seen.insert(source) {
+            return Err(invalid());
+        }
+        let derived = match global_types {
+            Some(global_types) => {
+                store.validate_derived_object_literal_with_global_types(source, global_types)
+            }
+            None => store.validate_derived_object_literal_for_relation(source),
+        };
+        match derived {
+            DerivedObjectLiteralValidation::Valid {
+                owner,
+                source: original,
+            } if owner == getter.owner => source = original,
+            _ => return Err(invalid()),
+        }
+    }
+    for edge in getter.type_edges() {
+        let validation = match global_types {
+            Some(global_types) => store.validate_cached_array_capability_with_array_targets(
+                CanonicalArrayTargets::from_global_types(global_types),
+                edge,
+            ),
+            None => store.validate_cached_array_capability(edge),
+        };
+        validation.map_err(|error| match error {
+            LiteralTypeCacheError::ArrayType { error, .. } => {
+                TypeDisplayUnavailable::ArrayType(error)
+            }
+            LiteralTypeCacheError::BootstrapUninitialized => {
+                TypeDisplayUnavailable::MissingBootstrap
+            }
+            _ => invalid(),
+        })?;
+    }
+    Ok(getter)
 }
 
 fn structural_property_display_name(

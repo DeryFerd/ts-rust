@@ -53,7 +53,9 @@ use super::{
         TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
     mapped_types::{MappedIndexRecovery, MappedPropertyRecovery, MappedTypeModifiers},
-    object_members::ObjectLiteralPropertyCloneOrigin,
+    object_members::{
+        ObjectLiteralGetterOrigin, ObjectLiteralGetterReturnProof, ObjectLiteralPropertyCloneOrigin,
+    },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
         CompositeSignature, ElementFlags, IndexFlags, IndexInfo, IndexInfoArena, Signature,
@@ -645,6 +647,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     module_value_identities: HashMap<SemanticSymbolId, ModuleValueIdentity>,
     object_literal_property_clone_origins:
         HashMap<SemanticSymbolId, ObjectLiteralPropertyCloneOrigin>,
+    object_literal_getter_origins: HashMap<SemanticSymbolId, ObjectLiteralGetterOrigin>,
+    object_literal_getter_return_proofs: HashMap<SemanticSymbolId, ObjectLiteralGetterReturnProof>,
     source_file_namespace_identities: HashMap<SemanticSymbolId, SourceFileNamespaceIdentity>,
     source_file_namespace_wrappers: HashMap<SemanticSymbolId, SourceFileNamespaceWrapper>,
     source_file_namespace_wrapper_aliases: HashMap<SemanticSymbolId, SemanticSymbolId>,
@@ -804,6 +808,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             source_callable_type_queries: HashMap::new(),
             module_value_identities: HashMap::new(),
             object_literal_property_clone_origins: HashMap::new(),
+            object_literal_getter_origins: HashMap::new(),
+            object_literal_getter_return_proofs: HashMap::new(),
             source_file_namespace_identities: HashMap::new(),
             source_file_namespace_wrappers: HashMap::new(),
             source_file_namespace_wrapper_aliases: HashMap::new(),
@@ -3200,6 +3206,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || !self.declared_call_set_provenance.is_empty()
             || !self.source_callable_provenance.is_empty()
             || !self.source_overload_provenance.is_empty()
+            || !self.object_literal_getter_origins.is_empty()
             || self.signatures.iter().any(|(_, signature)| {
                 signature.declaration().is_some_and(|node| {
                     self.node_is_declared_callable_signature(node)
@@ -3232,6 +3239,87 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
     ) -> Option<&ObjectLiteralPropertyCloneOrigin> {
         self.object_literal_property_clone_origins.get(&symbol)
+    }
+
+    pub(super) fn object_literal_getter_origin(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&ObjectLiteralGetterOrigin> {
+        self.observe_relation_symbol_read(symbol);
+        self.object_literal_getter_origins.get(&symbol)
+    }
+
+    pub(super) fn object_literal_getter_origin_for_type(
+        &self,
+        type_: TypeId,
+    ) -> Option<&ObjectLiteralGetterOrigin> {
+        self.object_literal_getter_origins
+            .values()
+            .find(|origin| origin.object_type() == type_)
+    }
+
+    pub(super) fn try_reserve_object_literal_getter_origins(&mut self, count: usize) -> bool {
+        self.object_literal_getter_origins
+            .try_reserve(count)
+            .is_ok()
+    }
+
+    pub(super) fn record_object_literal_getter_origin(
+        &mut self,
+        origin: ObjectLiteralGetterOrigin,
+    ) -> bool {
+        if self.source_node_kind(origin.object()) != Some(SyntaxKind::ObjectLiteralExpression)
+            || self.source_node_kind(origin.declaration()) != Some(SyntaxKind::GetAccessor)
+            || self.source_declaration_symbol(origin.declaration()) != Some(origin.symbol())
+            || self.type_payload(origin.object_type()).is_none()
+        {
+            return false;
+        }
+        match self.object_literal_getter_origins.entry(origin.symbol()) {
+            std::collections::hash_map::Entry::Occupied(existing) => existing.get() == &origin,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(origin);
+                true
+            }
+        }
+    }
+
+    pub(super) fn object_literal_getter_return_proof(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<&ObjectLiteralGetterReturnProof> {
+        self.observe_relation_symbol_read(symbol);
+        self.object_literal_getter_return_proofs.get(&symbol)
+    }
+
+    pub(super) fn try_reserve_object_literal_getter_return_proofs(&mut self, count: usize) -> bool {
+        self.object_literal_getter_return_proofs
+            .try_reserve(count)
+            .is_ok()
+    }
+
+    pub(super) fn record_object_literal_getter_return_proof(
+        &mut self,
+        proof: ObjectLiteralGetterReturnProof,
+    ) -> bool {
+        if !self
+            .object_literal_getter_origins
+            .contains_key(&proof.symbol())
+            || self.signature(proof.signature()).is_none()
+        {
+            return false;
+        }
+        match self
+            .object_literal_getter_return_proofs
+            .entry(proof.symbol())
+        {
+            std::collections::hash_map::Entry::Occupied(existing) => existing.get() == &proof,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(proof);
+                self.mark_union_cache_validation_dirty();
+                true
+            }
+        }
     }
 
     pub(super) fn try_reserve_object_literal_property_clone_origins(
@@ -4663,6 +4751,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some(type_)
     }
 
+    fn node_is_object_literal_getter_declaration(&self, node: NodeRef) -> bool {
+        self.source_declaration_symbol(node)
+            .and_then(|symbol| self.object_literal_getter_origins.get(&symbol))
+            .is_some_and(|origin| origin.declaration() == node)
+    }
+
     fn node_is_source_callable_declaration(&self, node: NodeRef) -> bool {
         self.source_callable_type_for_declaration(node)
             .and_then(|type_| self.source_callable_provenance(type_))
@@ -4693,6 +4787,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 return false;
             }
             if self.node_is_function_type(node)
+                || self.node_is_object_literal_getter_declaration(node)
                 || self.node_is_source_callable_declaration(node)
                 || self.node_is_source_overload_declaration(node)
                 || self.node_is_declared_callable_signature(node)
@@ -4745,6 +4840,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     fn signature_is_callable(&self, signature: SignatureId) -> bool {
+        if self
+            .object_literal_getter_return_proofs
+            .values()
+            .any(|proof| proof.signature() == signature)
+        {
+            return true;
+        }
         if self
             .source_jsdoc_callback_type_for_signature(signature)
             .is_some()
@@ -5209,6 +5311,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         if relation_dirty {
             self.mark_relation_inputs_dirty();
         }
+        if changed
+            && self
+                .object_literal_getter_origins
+                .values()
+                .any(|origin| origin.return_expression() == node)
+        {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -5335,6 +5445,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         });
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         let dirty = (self.node_is_function_type(node)
+            || self.node_is_object_literal_getter_declaration(node)
             || self.node_is_source_callable_declaration(node)
             || self.node_is_source_overload_declaration(node)
             || self.node_is_declared_callable_signature(node)
@@ -5430,7 +5541,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             });
         let relation_dirty = self.relation_observable_symbols.contains(&symbol) && changed;
         let dirty = (self.symbol_is_callable_parameter(symbol)
-            || self.symbol_is_source_callable_owner(symbol))
+            || self.symbol_is_source_callable_owner(symbol)
+            || self.object_literal_getter_origins.contains_key(&symbol))
             && published
             && changed;
         let published_type = links.resolved_type.filter(|type_| {

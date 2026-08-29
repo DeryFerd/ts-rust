@@ -22,7 +22,8 @@ use super::{
     links::ValueSymbolLinks,
     mapper::TypeMapper,
     object_members::{
-        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+        DeclaredPropertyObjectValidation, object_literal_getter_projection,
+        validate_resolved_declared_property_object,
     },
     store::{SemanticStore, SourceNodeParent},
     type_records::{
@@ -90,6 +91,7 @@ pub enum DerivedTypeError {
     Type(TypeId),
     ArrayType(ArrayTypeError),
     MalformedObjectLiteral(TypeId),
+    UnresolvedPropertyType(SemanticSymbolId),
     InvalidRegularObjectLiteralCache { source: TypeId, cached: TypeId },
     InvalidWidenedTypeCache { source: TypeId, cached: TypeId },
     UnsupportedWideningType(TypeId),
@@ -108,6 +110,9 @@ impl std::fmt::Display for DerivedTypeError {
             Self::ArrayType(error) => write!(formatter, "array widening failed: {error}"),
             Self::MalformedObjectLiteral(type_) => {
                 write!(formatter, "object-literal type {type_:?} is malformed")
+            }
+            Self::UnresolvedPropertyType(property) => {
+                write!(formatter, "property {property:?} has no resolved type")
             }
             Self::InvalidRegularObjectLiteralCache { source, cached } => write!(
                 formatter,
@@ -145,6 +150,7 @@ impl std::error::Error for DerivedTypeError {
             Self::BootstrapUninitialized
             | Self::Type(_)
             | Self::MalformedObjectLiteral(_)
+            | Self::UnresolvedPropertyType(_)
             | Self::InvalidRegularObjectLiteralCache { .. }
             | Self::InvalidWidenedTypeCache { .. }
             | Self::UnsupportedWideningType(_)
@@ -516,13 +522,70 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 
     /// Relation-facing form that retains only the exact global-array
-    /// capability installed on the relation session.
+    /// capability installed on the relation session. Getter-owned objects
+    /// retain the read and checked-body array edges.
     pub(super) fn validate_derived_object_literal_with_array_targets(
         &self,
         type_: TypeId,
         array_targets: CanonicalArrayTargets,
     ) -> DerivedObjectLiteralValidation {
+        let structure =
+            self.validate_derived_object_literal_structure_with_array_targets(type_, array_targets);
+        if matches!(structure, DerivedObjectLiteralValidation::Valid { .. })
+            && self.derived_object_literal_has_getter_origin(type_)
+            && self
+                .validate_cached_array_capability_with_array_targets(array_targets, type_)
+                .is_err()
+        {
+            return DerivedObjectLiteralValidation::Invalid;
+        }
+        structure
+    }
+
+    /// Checks source-cache identity without starting another array graph walk.
+    pub(super) fn validate_derived_object_literal_structure_with_array_targets(
+        &self,
+        type_: TypeId,
+        array_targets: CanonicalArrayTargets,
+    ) -> DerivedObjectLiteralValidation {
         self.validate_derived_object_literal(type_, Some(array_targets))
+    }
+
+    /// Recognizes getter-owned source chains even when a derived payload is damaged.
+    /// Callers must still validate the caches before using their source identities.
+    pub(super) fn derived_object_literal_has_getter_origin(&self, type_: TypeId) -> bool {
+        let mut pending = vec![type_];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if self
+                .object_literal_getter_origin_for_type(current)
+                .is_some()
+            {
+                return true;
+            }
+            self.observe_relation_derived_cache_target_read(current);
+            for (&source, &target) in self
+                .derived_types
+                .regular_object_literals
+                .iter()
+                .chain(&self.derived_types.widened_types)
+            {
+                if target == current {
+                    self.observe_relation_derived_cache_source_read(source);
+                    pending.push(source);
+                }
+            }
+            for (&(_, source), &target) in &self.derived_types.contextual_widened_types {
+                if target == current {
+                    self.observe_relation_derived_cache_source_read(source);
+                    pending.push(source);
+                }
+            }
+        }
+        false
     }
 
     /// Authenticates a donor-owned optional property on a contextual object.
@@ -640,12 +703,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if !visiting.insert(source) {
             return Err(DerivedTypeError::RecursiveObjectLiteral(source));
         }
+        self.preflight_fresh_object_getters(source)?;
         let shape = self
             .fresh_object_shape(source)
             .ok_or(DerivedTypeError::MalformedObjectLiteral(source))?;
         let mut properties = Vec::with_capacity(shape.properties.len());
         for property in &shape.properties {
             let transform = if self.is_fresh_object_literal(property.type_) {
+                if self.object_literal_getter_origin(property.symbol).is_some()
+                    || self
+                        .symbol(property.symbol)
+                        .is_some_and(|record| record.flags() == SymbolFlags::GET_ACCESSOR)
+                {
+                    return Err(DerivedTypeError::UnsupportedWideningType(source));
+                }
                 self.plan_regular_object(property.type_, plans, visiting, planned)?;
                 RegularTransform::Object(property.type_)
             } else {
@@ -794,6 +865,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if !visiting.insert(source) {
             return Err(DerivedTypeError::RecursiveObjectLiteral(source));
         }
+        self.preflight_fresh_object_getters(source)?;
         let mut regular_visiting = HashSet::new();
         let shape = self
             .validated_widening_object_shape(source, &mut regular_visiting)
@@ -802,6 +874,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         for property in &shape.properties {
             let transform =
                 self.plan_widened_type(property.type_, global_types, plans, visiting, planned)?;
+            if (self.object_literal_getter_origin(property.symbol).is_some()
+                || self
+                    .symbol(property.symbol)
+                    .is_some_and(|record| record.flags() == SymbolFlags::GET_ACCESSOR))
+                && !matches!(transform, WidenTransform::Identity(type_) if type_ == property.type_)
+            {
+                return Err(DerivedTypeError::UnsupportedWideningType(source));
+            }
             properties.push(WidenPropertyPlan {
                 source: property.symbol,
                 name: property.name.clone(),
@@ -944,6 +1024,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 } else {
                     WidenTransform::Identity(property.type_)
                 };
+                if (self.object_literal_getter_origin(property.symbol).is_some()
+                    || self
+                        .symbol(property.symbol)
+                        .is_some_and(|record| record.flags() == SymbolFlags::GET_ACCESSOR))
+                    && !matches!(transform, WidenTransform::Identity(type_) if type_ == property.type_)
+                {
+                    return Err(DerivedTypeError::UnsupportedWideningType(*member));
+                }
                 properties.push(WidenPropertyPlan {
                     source: property.symbol,
                     name: property.name.clone(),
@@ -962,6 +1050,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .cloned()
                 .collect::<Vec<_>>();
             for property in &undefined_properties {
+                if self.object_literal_getter_origin(property.symbol).is_some()
+                    || self
+                        .symbol(property.symbol)
+                        .is_some_and(|record| record.flags() == SymbolFlags::GET_ACCESSOR)
+                {
+                    return Err(DerivedTypeError::UnsupportedWideningType(*member));
+                }
                 if let Some(cached) = self
                     .derived_types
                     .undefined_properties
@@ -1576,6 +1671,41 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         })
     }
 
+    fn preflight_fresh_object_getters(&self, type_: TypeId) -> Result<(), DerivedTypeError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(DerivedTypeError::Type(type_))?;
+        if !record
+            .object_flags()
+            .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+        {
+            return Ok(());
+        }
+        for property in record
+            .data()
+            .structured()
+            .and_then(|structured| structured.properties.as_deref())
+            .unwrap_or_default()
+        {
+            if self.object_literal_getter_origin(*property).is_none()
+                && self
+                    .symbol(*property)
+                    .is_none_or(|record| record.flags() != SymbolFlags::GET_ACCESSOR)
+            {
+                continue;
+            }
+            let getter = object_literal_getter_projection(self, *property)
+                .map_err(|_| DerivedTypeError::MalformedObjectLiteral(type_))?;
+            if getter.object_type != type_ || record.symbol() != Some(getter.owner) {
+                return Err(DerivedTypeError::MalformedObjectLiteral(type_));
+            }
+            getter
+                .require_type()
+                .map_err(|_| DerivedTypeError::UnresolvedPropertyType(*property))?;
+        }
+        Ok(())
+    }
+
     fn fresh_object_shape(&self, type_: TypeId) -> Option<ObjectShape> {
         let record = self.type_payload(type_)?;
         let TypeData::Object(object) = record.data() else {
@@ -1623,7 +1753,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if raw_table.is_some_and(|raw| raw.len() != properties.len()) {
             return None;
         }
-        let expected_property_checks = match properties.first() {
+        let first_ordinary_property = properties.iter().find(|property| {
+            self.object_literal_getter_origin(**property).is_none()
+                && self
+                    .symbol(**property)
+                    .is_none_or(|record| record.flags() != SymbolFlags::GET_ACCESSOR)
+        });
+        let expected_property_checks = match first_ordinary_property {
             Some(property) if self.symbol(*property)?.check_flags() == CheckFlags::READONLY => {
                 if !self.readonly_object_literal_source(*owner_declaration) {
                     return None;
@@ -1649,6 +1785,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 return None;
             }
             let property_record = self.symbol(*property)?;
+            if self.object_literal_getter_origin(*property).is_some()
+                || property_record.flags() == SymbolFlags::GET_ACCESSOR
+            {
+                let getter = object_literal_getter_projection(self, *property).ok()?;
+                let property_type = getter.require_type().ok()?;
+                if getter.object_type != type_
+                    || getter.owner != owner
+                    || !seen_raw.insert(*property)
+                    || table.get(property_record.name()) != Some(*property)
+                    || raw_table.and_then(|raw| raw.get(property_record.name())) != Some(*property)
+                {
+                    return None;
+                }
+                result.push(PropertyShape {
+                    symbol: *property,
+                    name: property_record.name().to_owned(),
+                    type_: property_type,
+                });
+                continue;
+            }
             let property_links = self.value_symbol_links(*property)?;
             let property_type = property_links.resolved_type?;
             let property_type_record = self.type_payload(property_type)?;
@@ -2295,6 +2451,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(source_record) = self.symbol(source) else {
             return false;
         };
+        if self.object_literal_getter_origin(source).is_some()
+            || source_record.flags().intersects(SymbolFlags::GET_ACCESSOR)
+        {
+            return false;
+        }
         let Some(target_record) = self.symbol(target) else {
             return false;
         };

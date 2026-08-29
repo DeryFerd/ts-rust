@@ -4037,7 +4037,8 @@ impl<'store> RelaterSession<'store> {
                 (
                     source.name().to_owned(),
                     source.flags().intersects(SymbolFlags::OPTIONAL),
-                    source.check_flags().contains(CheckFlags::READONLY),
+                    source.check_flags().contains(CheckFlags::READONLY)
+                        || source.flags() == SymbolFlags::GET_ACCESSOR,
                     source.value_declaration(),
                 )
             };
@@ -4054,7 +4055,8 @@ impl<'store> RelaterSession<'store> {
                     self.property_symbol(target_property, target_members.property_origin)?;
                 (
                     target.flags().intersects(SymbolFlags::OPTIONAL),
-                    target.check_flags().contains(CheckFlags::READONLY),
+                    target.check_flags().contains(CheckFlags::READONLY)
+                        || target.flags() == SymbolFlags::GET_ACCESSOR,
                     target.value_declaration(),
                 )
             };
@@ -5445,7 +5447,8 @@ impl<'store> RelaterSession<'store> {
             let source = self.property_symbol(source_property, source_origin)?;
             (
                 source.flags(),
-                source.check_flags().contains(CheckFlags::READONLY),
+                source.check_flags().contains(CheckFlags::READONLY)
+                    || source.flags() == SymbolFlags::GET_ACCESSOR,
                 source.value_declaration(),
                 source.parent(),
             )
@@ -5454,7 +5457,8 @@ impl<'store> RelaterSession<'store> {
             let target = self.property_symbol(target_property, target_origin)?;
             (
                 target.flags(),
-                target.check_flags().contains(CheckFlags::READONLY),
+                target.check_flags().contains(CheckFlags::READONLY)
+                    || target.flags() == SymbolFlags::GET_ACCESSOR,
                 target.value_declaration(),
                 target.parent(),
             )
@@ -5654,6 +5658,9 @@ impl<'store> RelaterSession<'store> {
     }
 
     fn property_type(&mut self, symbol: SemanticSymbolId) -> Result<TypeId, RelationUnavailable> {
+        if self.store.object_literal_getter_origin(symbol).is_some() {
+            return self.validated_object_literal_getter(symbol)?.require_type();
+        }
         if let Some(receiver) = self.property_object_alias_receivers.get(&symbol).copied() {
             let members = validate_property_object_alias_members_with_array_targets(
                 self.store,
@@ -6141,6 +6148,15 @@ impl<'store> RelaterSession<'store> {
                 };
             }
             ObjectPropertyOrigin::FreshObjectLiteral(owner) => {
+                if record.flags() == SymbolFlags::GET_ACCESSOR
+                    || self.store.object_literal_getter_origin(symbol).is_some()
+                {
+                    return if self.validated_object_literal_getter(symbol)?.owner == owner {
+                        Ok(record)
+                    } else {
+                        Err(RelationUnavailable::InvalidSymbolMembers(symbol))
+                    };
+                }
                 return if self.is_canonical_object_literal_property(symbol, record, owner) {
                     Ok(record)
                 } else {
@@ -6473,6 +6489,26 @@ impl<'store> RelaterSession<'store> {
             return Err(unsupported());
         }
         Ok(callable.clone())
+    }
+
+    fn validated_object_literal_getter(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<super::object_members::ObjectLiteralGetterProjection, RelationUnavailable> {
+        let getter = super::object_members::object_literal_getter_projection(self.store, symbol)?;
+        for edge in getter.type_edges() {
+            match self.global_types {
+                Some(globals) => self
+                    .store
+                    .validate_cached_array_capability_with_array_targets(
+                        globals.array_targets,
+                        edge,
+                    ),
+                None => self.store.validate_cached_array_capability(edge),
+            }
+            .map_err(|error| union_validation_unavailable(getter.object_type, error))?;
+        }
+        Ok(getter)
     }
 
     fn is_canonical_object_literal_property(
@@ -7450,6 +7486,23 @@ impl<'store> RelaterSession<'store> {
         }
         let properties = structured.properties.clone().unwrap_or_default();
         if matches!(property_origin, ObjectPropertyOrigin::FreshObjectLiteral(_))
+            && properties.iter().any(|property| {
+                self.store
+                    .symbol(*property)
+                    .is_some_and(|record| record.check_flags() == CheckFlags::READONLY)
+            })
+        {
+            for property in &properties {
+                if self.store.object_literal_getter_origin(*property).is_some() {
+                    let getter = self.validated_object_literal_getter(*property)?;
+                    if getter.object_type != type_id {
+                        return Err(RelationUnavailable::UnsupportedProperty(*property));
+                    }
+                    getter.require_type()?;
+                }
+            }
+        }
+        if matches!(property_origin, ObjectPropertyOrigin::FreshObjectLiteral(_))
             && let Some(readonly) = properties.iter().copied().find(|property| {
                 self.store
                     .symbol(*property)
@@ -7527,6 +7580,17 @@ impl<'store> RelaterSession<'store> {
                 | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
                 | ObjectFlags::MEMBERS_RESOLVED;
             for property in &properties {
+                if self
+                    .store
+                    .symbol(*property)
+                    .is_some_and(|record| record.flags() == SymbolFlags::GET_ACCESSOR)
+                {
+                    let getter = self.validated_object_literal_getter(*property)?;
+                    if getter.object_type != type_id || getter.owner != owner {
+                        return Err(RelationUnavailable::UnsupportedProperty(*property));
+                    }
+                    continue;
+                }
                 let property_type = self
                     .store
                     .value_symbol_links(*property)
@@ -7561,11 +7625,22 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
             let mut raw_targets = HashSet::with_capacity(properties.len());
             for property in &properties {
-                let target = self
+                let target = if self
                     .store
-                    .value_symbol_links(*property)
-                    .and_then(|links| links.target)
-                    .ok_or(RelationUnavailable::UnsupportedProperty(*property))?;
+                    .symbol(*property)
+                    .is_some_and(|record| record.flags() == SymbolFlags::GET_ACCESSOR)
+                {
+                    let getter = self.validated_object_literal_getter(*property)?;
+                    if getter.object_type != type_id || getter.owner != owner {
+                        return Err(RelationUnavailable::UnsupportedProperty(*property));
+                    }
+                    *property
+                } else {
+                    self.store
+                        .value_symbol_links(*property)
+                        .and_then(|links| links.target)
+                        .ok_or(RelationUnavailable::UnsupportedProperty(*property))?
+                };
                 if !raw_targets.insert(target) {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
@@ -8100,8 +8175,40 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_id: TypeId,
         name: EscapedNameRef<'_>,
     ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        self.resolved_own_property_by_key_with_optional_context(type_id, name, None, None)
+    }
+
+    pub(super) fn resolved_own_property_by_key_with_context(
+        &mut self,
+        type_id: TypeId,
+        name: EscapedNameRef<'_>,
+        global_types: Option<&CanonicalGlobalTypes>,
+        session: &mut InstantiationSession,
+    ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
+        self.resolved_own_property_by_key_with_optional_context(
+            type_id,
+            name,
+            global_types,
+            Some(session),
+        )
+    }
+
+    fn resolved_own_property_by_key_with_optional_context(
+        &mut self,
+        type_id: TypeId,
+        name: EscapedNameRef<'_>,
+        global_types: Option<&CanonicalGlobalTypes>,
+        instantiation_session: Option<&mut InstantiationSession>,
+    ) -> Result<Option<ResolvedOwnProperty>, RelationUnavailable> {
         let bootstrap = self.relation_bootstrap_facts()?;
-        let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+        let mut session = RelaterSession::new_with_global_types_options_and_session(
+            self,
+            RelationKind::Assignable,
+            bootstrap,
+            global_types.map(RelationGlobalTypes::from_global_types),
+            None,
+            instantiation_session,
+        );
         let resolved = session.resolved_object_members(type_id, true)?;
         if resolved.exact_callable || resolved.call_signature.is_some() {
             return Err(RelationUnavailable::StructuredSignatures(type_id));
@@ -8124,7 +8231,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let record = session.property_symbol(property, resolved.property_origin)?;
             (
                 record.flags().contains(SymbolFlags::OPTIONAL),
-                record.check_flags().contains(CheckFlags::READONLY),
+                record.check_flags().contains(CheckFlags::READONLY)
+                    || record.flags() == SymbolFlags::GET_ACCESSOR,
             )
         };
         let type_ = session.property_type(property)?;
