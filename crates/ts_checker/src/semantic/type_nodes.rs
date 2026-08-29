@@ -75029,8 +75029,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // Call and construct containers publish signatures, not value-symbol links.
-    fn resolved_builtin_interface_replay_keeps_call_and_construct_edges() {
+    #[allow(clippy::too_many_lines)] // Keep the rejected source and its complete no-publication checks together.
+    fn resolved_builtin_interface_replay_rejects_anonymous_signatures_without_publication() {
         let library = parse_source_file(concat!(
             "interface Array<T> {} interface ReadonlyArray<T> {} ",
             "interface Math { readonly [Symbol.toStringTag]: string; } declare var Math: Math;",
@@ -75067,7 +75067,123 @@ mod tests {
                 ))
             })
             .unwrap();
-        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let declaration = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&library.arena, interface.name) == Some("Math"))
+                    .then_some(NodeRef::new(library.arena.id(), library_file, node))
+            })
+            .unwrap();
+        let owner = context
+            .store()
+            .source_declaration_symbol(declaration)
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        let signatures = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::CallSignature | SyntaxKind::ConstructSignature
+                )
+                .then_some(NodeRef::new(source.arena.id(), source_file, node))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(signatures.len(), 2);
+        let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            context.store(),
+            InstantiationLimits::default(),
+            error,
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let before = format!("{:?}", query.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_from_type_node(annotation),
+                Err(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::InvalidInterfaceDeclaration(declaration)
+                ))
+            );
+            assert_eq!(format!("{:?}", query.store), before);
+            assert!(
+                query
+                    .store
+                    .declared_type_links(owner)
+                    .and_then(|links| links.declared_type)
+                    .is_none()
+            );
+            assert!(
+                query
+                    .store
+                    .type_node_links(annotation)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+            assert!(signatures.iter().all(|node| {
+                query
+                    .store
+                    .signature_links(*node)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .is_none()
+            }));
+        }
+        assert!(diagnostics.is_empty());
+        assert_eq!(session.limit_event_count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check lazy replay, demanded callable edges, and each array cache mutation.
+    fn resolved_builtin_interface_replay_keeps_function_property_edges() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Math { readonly [Symbol.toStringTag]: string; } declare var Math: Math;",
+        ));
+        let source =
+            parse_source_file("interface Math { call: (...values: symbol[]) => bigint[]; }");
+        let (mut context, library_file, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let annotation = library
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    variable.type_.unwrap(),
+                ))
+            })
+            .unwrap();
         let unknown = context.store().intrinsic_bootstrap().unwrap().unknown_type;
         let error = context.store().intrinsic_bootstrap().unwrap().error_type;
         let mut session = InstantiationSession::new_recovering(
@@ -75098,11 +75214,67 @@ mod tests {
             object_members::interface_state(query.store, &plan, expected),
             Ok(PropertyObjectState::Resolved(expected))
         );
-        assert!(plan.properties.is_empty());
+        assert_eq!(plan.properties.len(), 1);
         assert!(plan.indexes.is_empty());
-        assert_eq!(plan.call_signatures.len(), 2);
-        assert!(!plan.call_signatures[0].is_construct());
-        assert!(plan.call_signatures[1].is_construct());
+        assert!(plan.call_signatures.is_empty());
+        assert!(plan.methods.is_empty());
+        let property = &plan.properties[0];
+        assert_eq!(
+            query.store.symbol(property.symbol).unwrap().name(),
+            EscapedName::source("call").as_ref()
+        );
+        let callable = query
+            .store
+            .value_symbol_links(property.symbol)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            query
+                .store
+                .type_node_links(property.type_node)
+                .unwrap()
+                .resolved_type,
+            Some(callable)
+        );
+        let signature = function_signature(query.store, property.type_node);
+        let NodeData::FunctionTypeNode(function) =
+            &source.arena.get(property.type_node.node).unwrap().data
+        else {
+            panic!("the property must retain its written function type");
+        };
+        let return_annotation =
+            NodeRef::new(source.arena.id(), source_file, function.type_.unwrap());
+        assert_eq!(
+            query
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            None
+        );
+        assert!(query.store.type_node_links(return_annotation).is_none());
+        let lazy = format!("{:?}", query.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query.preflight_nongeneric_interface_reference_identity(annotation),
+                Ok(Some(owner))
+            );
+            assert_eq!(
+                query.get_type_identity_from_type_reference(annotation),
+                Ok(expected)
+            );
+            assert_eq!(format!("{:?}", query.store), lazy);
+        }
+        let return_type = query.get_return_type_of_signature(signature).unwrap();
+        assert_eq!(
+            query
+                .store
+                .type_node_links(return_annotation)
+                .unwrap()
+                .resolved_type,
+            Some(return_type)
+        );
         let arrays = source
             .arena
             .iter()
@@ -75122,8 +75294,25 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(arrays.len(), 4);
-        assert_eq!(arrays.iter().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(arrays.len(), 2);
+        assert_eq!(arrays.iter().collect::<HashSet<_>>().len(), 2);
+        assert!(arrays.contains(&return_type));
+        let StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges: callable_edges,
+        } = validate_stored_callable_set(query.store, callable)
+        else {
+            panic!("the function property must retain its callable provider");
+        };
+        assert_eq!(
+            family,
+            super::super::callables::CallableFamily::FunctionType
+        );
+        assert_eq!(projection.call_signatures.len(), 1);
+        assert_eq!(projection.call_signatures[0].signature, signature);
+        assert!(projection.construct_signatures.is_empty());
+        assert!(arrays.iter().all(|array| callable_edges.contains(array)));
         let aliases = HashMap::new();
         let planner = TypeQueryPlanner::new(
             query.store,
@@ -75137,18 +75326,24 @@ mod tests {
             .cold_source_interface_cache_edges(expected)
             .unwrap()
             .unwrap();
-        assert!(arrays.iter().all(|array| edges.contains(array)));
-        let warm = function_store_state(query.store);
+        assert!(edges.contains(&callable));
+        let warm = format!("{:?}", query.store);
         for array in arrays {
-            assert_eq!(
-                query.preflight_nongeneric_interface_reference_identity(annotation),
-                Ok(Some(owner))
-            );
-            assert_eq!(
-                query.get_type_identity_from_type_reference(annotation),
-                Ok(expected)
-            );
-            assert_eq!(function_store_state(query.store), warm);
+            for _ in 0..2 {
+                assert_eq!(
+                    query.preflight_nongeneric_interface_reference_identity(annotation),
+                    Ok(Some(owner))
+                );
+                assert_eq!(
+                    query.get_type_identity_from_type_reference(annotation),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    query.get_return_type_of_signature(signature),
+                    Ok(return_type)
+                );
+                assert_eq!(format!("{:?}", query.store), warm);
+            }
             let TypeData::TypeReference(reference) =
                 query.store.type_payload(array).unwrap().data()
             else {
@@ -75176,77 +75371,20 @@ mod tests {
                     .store
                     .set_type_reference_resolution(array, node, arguments)
             );
-            assert_eq!(
-                query.preflight_nongeneric_interface_reference_identity(annotation),
-                Ok(Some(owner))
-            );
-            assert_eq!(
-                query.get_type_identity_from_type_reference(annotation),
-                Ok(expected)
-            );
-            assert_eq!(function_store_state(query.store), warm);
-        }
-        for signature in &plan.call_signatures {
-            for late in [false, true] {
-                let value = query
-                    .store
-                    .value_symbol_links(signature.symbol)
-                    .cloned()
-                    .unwrap_or_default();
-                let late_links = query
-                    .store
-                    .late_bound_links(signature.symbol)
-                    .cloned()
-                    .unwrap_or_default();
-                assert_eq!(value, ValueSymbolLinks::default());
-                assert_eq!(late_links, super::super::links::LateBoundLinks::default());
-                if late {
-                    assert!(query.store.set_late_bound_links(
-                        signature.symbol,
-                        super::super::links::LateBoundLinks {
-                            late_symbol: Some(owner),
-                        }
-                    ));
-                } else {
-                    assert!(query.store.set_value_symbol_links(
-                        signature.symbol,
-                        ValueSymbolLinks {
-                            resolved_type: Some(number),
-                            ..ValueSymbolLinks::default()
-                        }
-                    ));
-                }
-                let poisoned = format!("{:?}", query.store);
-                for _ in 0..2 {
-                    assert_eq!(
-                        query.preflight_nongeneric_interface_reference_identity(annotation),
-                        Err(type_node_unavailable(
-                            TypeNodeUnavailable::InvalidCachedUnionType(expected)
-                        ))
-                    );
-                    assert_eq!(format!("{:?}", query.store), poisoned);
-                }
-                if late {
-                    assert!(
-                        query
-                            .store
-                            .set_late_bound_links(signature.symbol, late_links)
-                    );
-                } else {
-                    assert!(query.store.set_value_symbol_links(signature.symbol, value));
-                }
-                let restored = function_store_state(query.store);
-                for _ in 0..2 {
-                    assert_eq!(
-                        query.preflight_nongeneric_interface_reference_identity(annotation),
-                        Ok(Some(owner))
-                    );
-                    assert_eq!(
-                        query.get_type_identity_from_type_reference(annotation),
-                        Ok(expected)
-                    );
-                    assert_eq!(function_store_state(query.store), restored);
-                }
+            for _ in 0..2 {
+                assert_eq!(
+                    query.preflight_nongeneric_interface_reference_identity(annotation),
+                    Ok(Some(owner))
+                );
+                assert_eq!(
+                    query.get_type_identity_from_type_reference(annotation),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    query.get_return_type_of_signature(signature),
+                    Ok(return_type)
+                );
+                assert_eq!(format!("{:?}", query.store), warm);
             }
         }
         assert!(diagnostics.is_empty());
