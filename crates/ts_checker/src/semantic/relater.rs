@@ -77,6 +77,7 @@ use super::{
         RelationKind, SignatureCheckMode,
     },
     signatures::{ElementFlags, SignatureFlags, Ternary, TupleElementInfo},
+    source_callables::validate_source_callable_signature_identity,
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, inherited_generic_property_reference,
@@ -444,6 +445,93 @@ fn authenticated_nullish_object_nonmatch(
             | GenericInterfaceMemberError::InvalidCachedProperty(_),
         ) => Err(RelationUnavailable::InvalidStructuredMembers(target)),
     }
+}
+
+/// Concrete scalars cannot satisfy a source parameter with no constraint or default.
+/// The retained signature proof excludes synthetic and recovery parameters.
+fn authenticated_scalar_source_parameter_nonmatch(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    source: TypeId,
+    target: TypeId,
+    relation: RelationKind,
+) -> Result<bool, RelationUnavailable> {
+    if relation != RelationKind::Assignable {
+        return Ok(false);
+    }
+    let source_record = store
+        .type_payload(source)
+        .ok_or(RelationUnavailable::Type(source))?;
+    if !source_record.flags().intersects(TypeFlags::PRIMITIVE)
+        || source_record.flags().intersects(
+            TypeFlags::STRUCTURED_OR_INSTANTIABLE
+                | TypeFlags::ENUM_LIKE
+                | TypeFlags::UNIQUE_ES_SYMBOL,
+        )
+        || !matches!(
+            source_record.data(),
+            TypeData::Intrinsic(_) | TypeData::Literal(_)
+        )
+    {
+        return Ok(false);
+    }
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, target) else {
+        return Ok(false);
+    };
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return Ok(false);
+    };
+    let Some(SourceNodeParent::Parent(callable_declaration)) =
+        store.source_node_parent(*declaration)
+    else {
+        return Ok(false);
+    };
+    let Some(callable) = store.source_callable_type_for_declaration(callable_declaration) else {
+        return Ok(false);
+    };
+    let Some(provenance) = store.source_callable_provenance(callable) else {
+        return Ok(false);
+    };
+    let Some(evidence) = store.source_callable_type_query(provenance.signature) else {
+        return Ok(false);
+    };
+    let plan = evidence.callable();
+    if plan.declaration != callable_declaration
+        || validate_source_callable_signature_identity(store, plan, provenance.signature).is_err()
+    {
+        return Ok(false);
+    }
+    let Some(index) = evidence.type_parameters().iter().position(|row| {
+        row.provenance.type_parameter == target
+            && row.provenance.symbol == symbol
+            && row.provenance.declaration == *declaration
+    }) else {
+        return Ok(false);
+    };
+    let Some(planned) = plan.type_parameters.get(index) else {
+        return Ok(false);
+    };
+    let resolved = &evidence.type_parameters()[index];
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let no_constraint = bootstrap.no_constraint_type;
+    if planned.constraint.is_some()
+        || planned.default_type.is_some()
+        || resolved.constraint != no_constraint
+        || resolved.default_type != no_constraint
+        || evidence.base_constraints().get(index) != Some(&no_constraint)
+        || source == bootstrap.missing_type
+        || source == bootstrap.optional_type
+    {
+        return Ok(false);
+    }
+    store
+        .validate_union_constituent(source)
+        .map_err(|error| union_validation_unavailable(source, error))?;
+    Ok(true)
 }
 
 #[derive(Clone, Copy)]
@@ -2255,6 +2343,15 @@ impl<'store> RelaterSession<'store> {
             )?
         {
             return Ok(Ternary::True);
+        }
+
+        if authenticated_scalar_source_parameter_nonmatch(
+            self.store,
+            source,
+            target,
+            self.relation,
+        )? {
+            return Ok(Ternary::False);
         }
 
         if authenticated_nullish_object_nonmatch(
@@ -9029,6 +9126,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
+        if authenticated_scalar_source_parameter_nonmatch(self, source, target, relation)? {
+            return Ok(false);
+        }
+
         if authenticated_nullish_object_nonmatch(
             self,
             source,
@@ -14381,6 +14482,570 @@ mod tests {
         assert_eq!(
             store.relation_cache_get(RelationKind::Assignable, union_key),
             RelationComparisonResult::NONE
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both callable families share one precharged session.
+    fn scalar_source_parameters_keep_the_caller_session_and_simple_exceptions() {
+        let library = parse_source_file("");
+        let source = parse_source_file(concat!(
+            "function identity<T>(value: T): T { return value; }\n",
+            "const arrow = <U>(value: U): U => value;",
+        ));
+        let file = FileId::new(96_452);
+        for strict_null_checks in [false, true] {
+            let mut context = source_relation_context(
+                &library,
+                &source,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types: false,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let (_, function_signature) =
+                source_function_callable(&context, &source, file, "identity");
+            let arrow = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let arrow_signature = context
+                .store()
+                .signature_links(arrow)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let targets = [function_signature, arrow_signature].map(|signature| {
+                let [target] = context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .type_parameters()
+                else {
+                    panic!("the source callable must have one type parameter")
+                };
+                *target
+            });
+            let store = context.store_mut_for_test();
+            let (number, error, cases) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.number_type,
+                    bootstrap.error_type,
+                    [
+                        (bootstrap.number_type, false),
+                        (bootstrap.string_type, false),
+                        (bootstrap.bigint_type, false),
+                        (bootstrap.es_symbol_type, false),
+                        (bootstrap.regular_true_type, false),
+                        (bootstrap.regular_false_type, false),
+                        (bootstrap.void_type, false),
+                        (bootstrap.undefined_type, !strict_null_checks),
+                        (bootstrap.null_type, !strict_null_checks),
+                        (bootstrap.any_type, true),
+                        (bootstrap.never_type, true),
+                        (bootstrap.wildcard_type, true),
+                        (bootstrap.error_type, true),
+                    ],
+                )
+            };
+            let mapper = store.new_simple_type_mapper(targets[0], number).unwrap();
+            let mut instantiation = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 1,
+                },
+                error,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::semantic::instantiate::instantiate_type_with_session(
+                    store,
+                    targets[0],
+                    mapper,
+                    None,
+                    &mut instantiation,
+                ),
+                Ok(number)
+            );
+            assert_eq!(instantiation.query_count(), 1);
+            assert_eq!(instantiation.total_count(), 1);
+            let limit_mark = instantiation.limit_event_mark();
+            let counts = (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.source_callable_provenance_lengths(),
+                store.source_callable_type_query_len(),
+            );
+            let relations = store.relation_state_snapshot();
+            for target in targets {
+                for (source, expected) in cases.into_iter().chain([(target, true)]) {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            store.is_type_assignable_to_with_session(
+                                source,
+                                target,
+                                None,
+                                Some(false),
+                                &mut instantiation,
+                            ),
+                            Ok(expected)
+                        );
+                        let bootstrap = store.relation_bootstrap_facts().unwrap();
+                        let mut relation =
+                            super::RelaterSession::new_with_global_types_options_and_session(
+                                store,
+                                RelationKind::Assignable,
+                                bootstrap,
+                                None,
+                                Some(false),
+                                Some(&mut instantiation),
+                            );
+                        assert_eq!(
+                            relation.is_related_to_ex(
+                                source,
+                                target,
+                                super::RecursionFlags::BOTH,
+                                super::IntersectionState::NONE,
+                            ),
+                            Ok(if expected {
+                                Ternary::True
+                            } else {
+                                Ternary::False
+                            })
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    number,
+                    targets[0],
+                    None,
+                    Some(true),
+                    &mut instantiation,
+                ),
+                Err(RelationUnavailable::StrictFunctionTypesOptionMismatch {
+                    established: false,
+                    requested: true,
+                })
+            );
+            assert_eq!(instantiation.query_count(), 1);
+            assert_eq!(instantiation.total_count(), 1);
+            assert_eq!(instantiation.recovery_error_type(), Some(error));
+            assert!(!instantiation.limit_event_occurred_since(limit_mark));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.source_callable_provenance_lengths(),
+                    store.source_callable_type_query_len(),
+                ),
+                counts
+            );
+            assert_eq!(store.relation_state_snapshot(), relations);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each poison must retain and restore the same source proof.
+    fn scalar_source_parameters_require_unchanged_source_query_evidence() {
+        let library = parse_source_file("");
+        let source = parse_source_file("function identity<T>(value: T): T { return value; }");
+        let file = FileId::new(96_453);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (_, signature) = source_function_callable(&context, &source, file, "identity");
+        let store = context.store_mut_for_test();
+        let evidence = store.source_callable_type_query(signature).unwrap();
+        let row = evidence.type_parameters()[0].provenance;
+        let annotation = evidence.callable().parameters[0]
+            .explicit_type_node()
+            .unwrap();
+        let target = row.type_parameter;
+        let (number, error, no_constraint) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.error_type,
+                bootstrap.no_constraint_type,
+            )
+        };
+        let mapper = store.new_simple_type_mapper(target, number).unwrap();
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        let assert_rejected = |store: &mut TestStore| {
+            let counts = (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+            );
+            let relations = store.relation_state_snapshot();
+            for _ in 0..2 {
+                assert_eq!(
+                    store.is_type_assignable_to(number, target),
+                    Err(RelationUnavailable::StructuralRelation {
+                        source: number,
+                        target,
+                        relation: RelationKind::Assignable,
+                    })
+                );
+            }
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len()
+                ),
+                counts
+            );
+            assert_eq!(store.relation_state_snapshot(), relations);
+        };
+
+        let owner_links = store.declared_type_links(row.symbol).unwrap().clone();
+        let poisoned_owner = DeclaredTypeLinks {
+            declared_type: Some(number),
+            ..owner_links.clone()
+        };
+        assert!(store.set_declared_type_links(row.symbol, poisoned_owner.clone()));
+        assert_rejected(store);
+        assert_eq!(store.declared_type_links(row.symbol), Some(&poisoned_owner));
+        assert!(store.set_declared_type_links(row.symbol, owner_links));
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+
+        let annotation_links = store.type_node_links(annotation).unwrap().clone();
+        let poisoned_annotation = TypeNodeLinks {
+            resolved_type: Some(number),
+            ..annotation_links.clone()
+        };
+        assert!(store.set_type_node_links(annotation, poisoned_annotation.clone()));
+        assert_rejected(store);
+        assert_eq!(
+            store.type_node_links(annotation),
+            Some(&poisoned_annotation)
+        );
+        assert!(store.set_type_node_links(annotation, annotation_links));
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+
+        let evidence = store
+            .replace_source_callable_type_query_for_test(signature, None)
+            .unwrap();
+        assert_rejected(store);
+        assert!(store.source_callable_type_query(signature).is_none());
+        assert!(
+            store
+                .replace_source_callable_type_query_for_test(signature, Some(evidence))
+                .is_none()
+        );
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+
+        let snapshot = |store: &TestStore| -> crate::semantic::type_records::TypeParameterData {
+            let TypeData::TypeParameter(data) = store.type_payload(target).unwrap().data() else {
+                panic!("the source parameter must retain its type-parameter payload")
+            };
+            data.clone()
+        };
+        let data = snapshot(store);
+        for (constraint, origin, mapper, default_type) in [
+            (None, None, None, Some(no_constraint)),
+            (Some(number), None, None, Some(no_constraint)),
+            (Some(error), None, None, Some(no_constraint)),
+            (Some(no_constraint), Some(target), None, Some(no_constraint)),
+            (Some(no_constraint), None, Some(mapper), Some(no_constraint)),
+            (Some(no_constraint), None, None, Some(error)),
+        ] {
+            assert!(store.set_type_parameter_resolution(
+                target,
+                constraint,
+                origin,
+                mapper,
+                default_type
+            ));
+            let poisoned = snapshot(store);
+            assert_rejected(store);
+            assert_eq!(snapshot(store), poisoned);
+            assert!(store.set_type_parameter_resolution(
+                target,
+                Some(no_constraint),
+                None,
+                None,
+                Some(no_constraint)
+            ));
+            assert_eq!(snapshot(store), data);
+            assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        }
+        assert!(store.set_resolved_base_constraint(target, Some(number)));
+        assert_rejected(store);
+        assert_eq!(
+            store
+                .type_payload(target)
+                .unwrap()
+                .data()
+                .constrained()
+                .unwrap()
+                .resolved_base_constraint,
+            Some(number)
+        );
+        assert!(store.set_resolved_base_constraint(target, Some(no_constraint)));
+        assert_eq!(snapshot(store), data);
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Source and payload boundaries share the same real parameters.
+    fn scalar_source_parameters_keep_constrained_unproved_and_relation_kind_boundaries() {
+        let library = parse_source_file("");
+        let source = parse_source_file(concat!(
+            "function identity<T>(value: T): T { return value; }\n",
+            "function constrained<T extends number>(value: T): T { return value; }\n",
+            "function defaulted<T = string>(value: T): T { return value; }",
+        ));
+        let file = FileId::new(96_454);
+        let mut context = source_relation_context(
+            &library,
+            &source,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let [target, constrained, defaulted] =
+            ["identity", "constrained", "defaulted"].map(|name| {
+                let (_, signature) = source_function_callable(&context, &source, file, name);
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .type_parameters()[0]
+            });
+        let store = context.store_mut_for_test();
+        let (number, unknown, missing, optional, no_constraint) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.unknown_type,
+                bootstrap.missing_type,
+                bootstrap.optional_type,
+                bootstrap.no_constraint_type,
+            )
+        };
+        let unproved = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(
+            unproved,
+            Some(no_constraint),
+            None,
+            None,
+            Some(no_constraint)
+        ));
+        assert!(store.set_resolved_base_constraint(unproved, Some(no_constraint)));
+        let forged_number = store
+            .alloc_intrinsic_type(TypeFlags::NUMBER, "number")
+            .unwrap();
+        let counts = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.mapper_len(),
+        );
+        let relations = store.relation_state_snapshot();
+        for target in [constrained, defaulted, unproved] {
+            assert_eq!(
+                store.is_type_assignable_to(number, target),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: number,
+                    target,
+                    relation: RelationKind::Assignable
+                })
+            );
+        }
+        for source in [unknown, missing, optional] {
+            assert_eq!(
+                store.is_type_assignable_to(source, target),
+                Err(RelationUnavailable::StructuralRelation {
+                    source,
+                    target,
+                    relation: RelationKind::Assignable
+                })
+            );
+        }
+        for relation in [
+            RelationKind::Comparable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            assert_eq!(
+                store.is_type_related_to(number, target, relation),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: number,
+                    target,
+                    relation
+                })
+            );
+        }
+        assert_eq!(
+            store.is_type_related_to(number, target, RelationKind::Identity),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_assignable_to(forged_number, target),
+            Err(RelationUnavailable::UnsupportedUnionConstituent(
+                forged_number
+            ))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len()
+            ),
+            counts
+        );
+        assert_eq!(store.relation_state_snapshot(), relations);
+
+        let snapshot = |store: &TestStore| -> crate::semantic::type_records::TypeParameterData {
+            let TypeData::TypeParameter(data) = store.type_payload(constrained).unwrap().data()
+            else {
+                panic!("the constrained parameter must retain its type-parameter payload")
+            };
+            data.clone()
+        };
+        let constrained_data = snapshot(store);
+        assert!(store.set_type_parameter_resolution(
+            constrained,
+            Some(no_constraint),
+            None,
+            None,
+            Some(no_constraint)
+        ));
+        assert!(store.set_resolved_base_constraint(constrained, Some(no_constraint)));
+        let poisoned = snapshot(store);
+        let relations = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(number, constrained),
+            Err(RelationUnavailable::StructuralRelation {
+                source: number,
+                target: constrained,
+                relation: RelationKind::Assignable
+            })
+        );
+        assert_eq!(snapshot(store), poisoned);
+        assert_eq!(store.relation_state_snapshot(), relations);
+        assert!(store.set_type_parameter_resolution(
+            constrained,
+            Some(number),
+            None,
+            None,
+            Some(no_constraint)
+        ));
+        assert!(store.set_resolved_base_constraint(constrained, Some(number)));
+        assert_eq!(snapshot(store), constrained_data);
+        assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len()
+            ),
+            counts
+        );
+    }
+
+    #[test]
+    fn scalar_source_parameter_function_return_reports_ts2322_and_replays() {
+        let library = parse_source_file("");
+        let source = parse_source_file(
+            "function bad<T>(value: T): T { const wrong: number = 1; return wrong; }",
+        );
+        let file = FileId::new(96_455);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let returned = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ReturnStatement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the actual generic return must report one assignment error")
+        };
+        assert_eq!(diagnostic.node, Some(returned));
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(diagnostic.diagnostic.arguments, ["number", "T"]);
+        let (_, signature) = source_function_callable(&context, &source, file, "bad");
+        let target = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(target)
+        );
+        let counts = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+        );
+        let diagnostics = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &diagnostics);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len()
+            ),
+            counts
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(target)
         );
     }
 

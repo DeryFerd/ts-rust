@@ -30024,7 +30024,21 @@ fn check_expression_type_with_capture_context(
             if class_flow.is_some()
                 || property.class_access_context().is_some()
                 || source_property_is_direct_method_call(host, property.node)
-                    && !source_property_is_contextual_sort_call(host, property.node)
+                    && (!source_property_is_contextual_sort_call(host, property.node)
+                        || matches!(
+                            &property.receiver.unparenthesized().kind,
+                            PlannedExpressionKind::Identifier(read)
+                                if current_flow_types
+                                    .get(&read.value_symbol)
+                                    .copied()
+                                    .map(|receiver| source_contextual_sort_needs_method_query(
+                                        store,
+                                        global_types,
+                                        receiver,
+                                    ))
+                                    .transpose()?
+                                    .unwrap_or(false)
+                        ))
                     && source_method_receiver_needs_source_query(
                         store,
                         global_types,
@@ -33235,10 +33249,10 @@ fn check_planned_arrow_argument(
     }
     if outer_capture.is_some()
         && host.node(expression).is_none_or(|record| {
-            !matches!(
+            !(matches!(
                 (&record.data, record.kind),
                 (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction)
-            ) && !(arrow.callable.parameters.is_empty()
+            ) || arrow.callable.parameters.is_empty()
                 && matches!(
                     (&record.data, record.kind),
                     (
@@ -105468,7 +105482,7 @@ class Foo2 {
     }
 
     #[test]
-    fn function_expression_properties_keep_outer_capture_rules_for_nested_arrows() {
+    fn function_expression_logical_initializers_keep_the_unplanned_condition_atomic() {
         for (file, text, mutable_var) in [
             (
                 FileId::new(98_331),
@@ -105478,6 +105492,89 @@ class Foo2 {
             (
                 FileId::new(98_332),
                 "let value:number|false=1; export default <T>(seed:T):T=>{ const box=value && { read:function(){ return { nested:():number=>value }; } };return seed; };",
+                false,
+            ),
+            (
+                FileId::new(98_333),
+                "var value:number|false=1; export default <T>(seed:T):T=>{ const box=value && { read:function(){ return value; } };return seed; };",
+                true,
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let value = variable_declaration(&source, file, "value");
+            let list = source.arena.get(value.node).unwrap().parent.unwrap();
+            assert_eq!(
+                source.arena.get(list).unwrap().flags.0 & NODE_FLAG_LET == 0,
+                mutable_var
+            );
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::ExportAssignment(export) => {
+                        Some(NodeRef::new(source.arena.id(), file, export.expression))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                source.arena.get(declaration.node).unwrap().kind,
+                SyntaxKind::ArrowFunction
+            );
+            let callables = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression
+                    )
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .map(|node| (node, context.file(file).unwrap().1.symbol(node).unwrap()))
+                .collect::<Vec<_>>();
+            let before = observable_state(&context, file);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Function(
+                        SourceFunctionInvariant::Callable(declaration)
+                    )),
+                    "{text}",
+                );
+                assert_eq!(observable_state(&context, file), before, "{text}");
+                assert!(!is_type_checked(&context, file));
+                for (node, owner) in &callables {
+                    assert!(
+                        context
+                            .store()
+                            .source_callable_type_for_owner(*owner)
+                            .is_none()
+                    );
+                    assert!(context.store().signature_links(*node).is_none());
+                    assert!(context.store().type_node_links(*node).is_none());
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn function_expression_properties_keep_outer_capture_rules_for_nested_arrows() {
+        for (file, text, mutable_var) in [
+            (
+                FileId::new(98_341),
+                "var value:number|false=1; export default <T>(seed:T):T=>{ const box=():unknown=>value && { read:function(){ return { nested:():number=>value }; } };return seed; };",
+                true,
+            ),
+            (
+                FileId::new(98_342),
+                "let value:number|false=1; export default <T>(seed:T):T=>{ const box=():unknown=>value && { read:function(){ return { nested:():number=>value }; } };return seed; };",
                 false,
             ),
         ] {
@@ -105490,6 +105587,20 @@ class Foo2 {
             context
                 .check_source_file(file)
                 .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            let wrapper = variable_initializer(&source, file, "box");
+            let wrapper_type = resolved_node_type(&context, wrapper);
+            let wrapper_signature = context
+                .store()
+                .source_callable_provenance(wrapper_type)
+                .unwrap()
+                .signature;
+            let wrapper_signature = context.store().signature(wrapper_signature).unwrap();
+            assert!(wrapper_signature.parameters().is_empty());
+            assert!(wrapper_signature.type_parameters().is_empty());
+            assert_eq!(
+                wrapper_signature.resolved_return_type(),
+                Some(context.store().intrinsic_bootstrap().unwrap().unknown_type)
+            );
             let function = source
                 .arena
                 .iter()
@@ -105581,6 +105692,7 @@ class Foo2 {
             for _ in 0..2 {
                 context.recheck_source_file(file).unwrap();
                 for (node, type_) in [
+                    (wrapper, wrapper_type),
                     (function, function_type),
                     (nested, nested_type),
                     (captured, expected),
@@ -105595,81 +105707,113 @@ class Foo2 {
 
     #[test]
     fn function_expression_direct_return_uses_the_declared_var_capture() {
-        let source = parsed(
-            "var value:number|false=1; export default <T>(seed:T):T=>{ const box=value && { read:function(){ return value; } };return seed; };",
-        );
-        let file = FileId::new(98_333);
-        let mut context = context_with_module_state(
-            &[(file, &source)],
-            CanonicalModuleState::External,
-            CanonicalCheckerOptions::default(),
-        );
-        context.check_source_file(file).unwrap();
-        let function = source
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
-                    source.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        let NodeData::FunctionExpression(function_data) =
-            &source.arena.get(function.node).unwrap().data
-        else {
-            panic!("expected the actual function expression")
-        };
-        let NodeData::Block(block) = &source.arena.get(function_data.body).unwrap().data else {
-            panic!("expected the existing return-only body")
-        };
-        let NodeData::ReturnStatement(statement) =
-            &source.arena.get(block.statements.nodes[0]).unwrap().data
-        else {
-            panic!("expected the direct captured return")
-        };
-        let captured = NodeRef::new(source.arena.id(), file, statement.expression.unwrap());
-        let declared = variable_value_type(&context, &source, file, "value");
-        assert!(matches!(
-            context.store().type_payload(declared).unwrap().data(),
-            TypeData::Union(_)
-        ));
-        assert_eq!(resolved_node_type(&context, captured), declared);
-        let type_ = resolved_node_type(&context, function);
-        let signature = context
-            .store()
-            .source_callable_provenance(type_)
-            .unwrap()
-            .signature;
-        assert_eq!(
-            context.store().signature(signature).unwrap().declaration(),
-            Some(function)
-        );
-        assert_eq!(
+        for (file, text, mutable_var) in [
+            (
+                FileId::new(98_343),
+                "var value:number|false=1; export default <T>(seed:T):T=>{ const box=():unknown=>value && { read:function(){ return value; } };return seed; };",
+                true,
+            ),
+            (
+                FileId::new(98_344),
+                "let value:number|false=1; export default <T>(seed:T):T=>{ const box=():unknown=>value && { read:function(){ return value; } };return seed; };",
+                false,
+            ),
+        ] {
+            let source = parsed(text);
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
             context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            let wrapper = variable_initializer(&source, file, "box");
+            let wrapper_type = resolved_node_type(&context, wrapper);
+            let wrapper_signature = context
                 .store()
-                .signature(signature)
+                .source_callable_provenance(wrapper_type)
                 .unwrap()
-                .resolved_return_type(),
-            Some(declared)
-        );
-        assert!(context.diagnostics().is_empty());
-        let warm = observable_state(&context, file);
-        for _ in 0..2 {
-            context.recheck_source_file(file).unwrap();
-            assert_eq!(context.get_type_at_location(function).unwrap(), type_);
-            assert_eq!(context.get_type_at_location(captured).unwrap(), declared);
+                .signature;
+            let wrapper_signature = context.store().signature(wrapper_signature).unwrap();
+            assert!(wrapper_signature.parameters().is_empty());
+            assert!(wrapper_signature.type_parameters().is_empty());
+            assert_eq!(
+                wrapper_signature.resolved_return_type(),
+                Some(context.store().intrinsic_bootstrap().unwrap().unknown_type)
+            );
+            let function = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let NodeData::FunctionExpression(function_data) =
+                &source.arena.get(function.node).unwrap().data
+            else {
+                panic!("expected the actual function expression")
+            };
+            let NodeData::Block(block) = &source.arena.get(function_data.body).unwrap().data else {
+                panic!("expected the existing return-only body")
+            };
+            let NodeData::ReturnStatement(statement) =
+                &source.arena.get(block.statements.nodes[0]).unwrap().data
+            else {
+                panic!("expected the direct captured return")
+            };
+            let captured = NodeRef::new(source.arena.id(), file, statement.expression.unwrap());
+            let declared = variable_value_type(&context, &source, file, "value");
+            let expected = if mutable_var {
+                declared
+            } else {
+                context.store().intrinsic_bootstrap().unwrap().number_type
+            };
+            assert!(matches!(
+                context.store().type_payload(declared).unwrap().data(),
+                TypeData::Union(_)
+            ));
+            assert_eq!(resolved_node_type(&context, captured), expected);
+            let type_ = resolved_node_type(&context, function);
+            let signature = context
+                .store()
+                .source_callable_provenance(type_)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context.store().signature(signature).unwrap().declaration(),
+                Some(function)
+            );
             assert_eq!(
                 context
                     .store()
                     .signature(signature)
                     .unwrap()
                     .resolved_return_type(),
-                Some(declared)
+                Some(expected)
             );
             assert!(context.diagnostics().is_empty());
-            assert_eq!(observable_state(&context, file), warm);
+            let warm = observable_state(&context, file);
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.get_type_at_location(wrapper).unwrap(), wrapper_type);
+                assert_eq!(context.get_type_at_location(function).unwrap(), type_);
+                assert_eq!(context.get_type_at_location(captured).unwrap(), expected);
+                assert_eq!(
+                    context
+                        .store()
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(expected)
+                );
+                assert!(context.diagnostics().is_empty());
+                assert_eq!(observable_state(&context, file), warm);
+            }
         }
     }
 
