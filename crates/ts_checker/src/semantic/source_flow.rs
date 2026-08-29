@@ -167,13 +167,111 @@ pub(super) struct SourceFlowAssignment {
     pub(super) symbol: SemanticSymbolId,
 }
 
-/// One parameter assignment with its exact binder declaration and target.
+/// One retained assignment with its exact binder declaration and target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceFlowParameterAssignment {
     pub(super) target: NodeRef,
-    /// The direct parameter or binding element that owns the assigned symbol.
+    /// The declaration that owns the assigned symbol.
     pub(super) parameter: NodeRef,
     pub(super) symbol: SemanticSymbolId,
+}
+
+/// A non-hoisted closure can keep flow narrowing only after the last write.
+/// Writes in another callable prevent that proof, including earlier IIFEs.
+pub(super) fn captured_variables_with_later_writes(
+    host: &DeclaredTypeHost<'_>,
+    location: NodeRef,
+    assignments: &[SourceFlowParameterAssignment],
+) -> Result<HashSet<SemanticSymbolId>, SourceFlowError> {
+    let location_start = host
+        .node(location)
+        .ok_or(SourceFlowInvariant::ForeignNode(location))?
+        .range
+        .start
+        .get();
+    let mut captured = HashSet::new();
+    for assignment in assignments {
+        let target = assignment.target;
+        let declaration = assignment.parameter;
+        let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
+        let declaration_start = host
+            .node(declaration)
+            .ok_or_else(invalid)?
+            .range
+            .start
+            .get();
+        if capture_write_container(host, target)? != capture_write_container(host, declaration)? {
+            captured.insert(assignment.symbol);
+            continue;
+        }
+        let mut position = host.node(target).ok_or_else(invalid)?.range.start.get();
+        let mut current = target;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(invalid().into());
+            }
+            let record = host.node(current).ok_or_else(invalid)?;
+            if record.range.start.get() <= declaration_start {
+                break;
+            }
+            if matches!(
+                record.kind,
+                SyntaxKind::VariableStatement
+                    | SyntaxKind::ExpressionStatement
+                    | SyntaxKind::IfStatement
+                    | SyntaxKind::DoStatement
+                    | SyntaxKind::WhileStatement
+                    | SyntaxKind::ForStatement
+                    | SyntaxKind::ForInStatement
+                    | SyntaxKind::ForOfStatement
+                    | SyntaxKind::WithStatement
+                    | SyntaxKind::SwitchStatement
+                    | SyntaxKind::TryStatement
+                    | SyntaxKind::ClassDeclaration
+            ) {
+                position = record.range.end.get();
+            }
+            let Some(parent) = record.parent else {
+                break;
+            };
+            current = NodeRef::new(current.arena, current.file, parent);
+        }
+        if position >= location_start {
+            captured.insert(assignment.symbol);
+        }
+    }
+    Ok(captured)
+}
+
+fn capture_write_container(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidParameterAssignment(node);
+    let mut current = node;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(invalid().into());
+        }
+        let record = host.node(current).ok_or_else(invalid)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::SourceFile
+                | SyntaxKind::FunctionDeclaration
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::Constructor
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+        ) {
+            return Ok(current);
+        }
+        let parent = record.parent.ok_or_else(invalid)?;
+        current = NodeRef::new(current.arena, current.file, parent);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1171,6 +1269,29 @@ impl SourceFlowPlan {
         })
     }
 
+    /// Uses only retained reassignments. An initializer or array mutation does
+    /// not replace the captured variable's value.
+    pub(super) fn captured_variables_with_later_writes(
+        &self,
+        host: &DeclaredTypeHost<'_>,
+        location: NodeRef,
+    ) -> Result<HashSet<SemanticSymbolId>, SourceFlowError> {
+        let mut assignments = Vec::with_capacity(self.assignment_declarations.len());
+        for (&target, &declaration) in &self.assignment_declarations {
+            let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
+            let assignment = self.assignments.get(&target).ok_or_else(invalid)?;
+            if host.node(target).ok_or_else(invalid)?.kind == SyntaxKind::CallExpression {
+                continue;
+            }
+            assignments.push(SourceFlowParameterAssignment {
+                target,
+                parameter: declaration,
+                symbol: assignment.symbol,
+            });
+        }
+        captured_variables_with_later_writes(host, location, &assignments)
+    }
+
     fn validate_flow_paths(&self, bound: &BoundFile) -> Result<(), SourceFlowError> {
         let mut validated = HashSet::new();
         let mut visiting = HashSet::new();
@@ -1410,56 +1531,11 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         host: &DeclaredTypeHost<'_>,
         location: NodeRef,
     ) -> Result<HashSet<SemanticSymbolId>, SourceFlowError> {
-        let location_start = host
-            .node(location)
-            .ok_or(SourceFlowInvariant::InvalidClassBody(self.body.declaration))?
-            .range
-            .start
-            .get();
-        let mut captured = HashSet::new();
-        for (&target, &declaration) in &self.flow.plan.assignment_declarations {
-            let invalid = || SourceFlowInvariant::InvalidParameterAssignment(target);
-            let assignment = self
-                .flow
-                .plan
-                .assignments
-                .get(&target)
-                .ok_or_else(invalid)?;
-            let declaration_start = host
-                .node(declaration)
-                .ok_or_else(invalid)?
-                .range
-                .start
-                .get();
-            let mut position = host.node(target).ok_or_else(invalid)?.range.start.get();
-            let mut current = target;
-            let mut visited = HashSet::new();
-            loop {
-                if !visited.insert(current) {
-                    return Err(invalid().into());
-                }
-                let record = host.node(current).ok_or_else(invalid)?;
-                if record.range.start.get() <= declaration_start {
-                    break;
-                }
-                if matches!(
-                    record.kind,
-                    SyntaxKind::VariableStatement
-                        | SyntaxKind::ExpressionStatement
-                        | SyntaxKind::IfStatement
-                ) {
-                    position = record.range.end.get();
-                }
-                let Some(parent) = record.parent else {
-                    break;
-                };
-                current = NodeRef::new(current.arena, current.file, parent);
-            }
-            if position >= location_start {
-                captured.insert(assignment.symbol);
-            }
-        }
-        Ok(captured)
+        host.node(location)
+            .ok_or(SourceFlowInvariant::InvalidClassBody(self.body.declaration))?;
+        self.flow
+            .plan
+            .captured_variables_with_later_writes(host, location)
     }
 
     pub(super) fn snapshot_at(
