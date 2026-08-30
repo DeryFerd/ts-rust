@@ -12878,12 +12878,18 @@ mod tests {
                     validate_class_heritage_members(context.store(), types[0]),
                     ClassHeritageMembersValidation::Malformed,
                 );
-                for type_ in types {
+                for (type_, error) in types.into_iter().zip([
+                    TypeDisplayUnavailable::MalformedType(types[0]),
+                    TypeDisplayUnavailable::FunctionType {
+                        type_id: types[1],
+                        reason: FunctionTypeDisplayUnavailable::CallableProperties,
+                    },
+                ]) {
                     assert_source_class_display_without_writes(
                         &mut context,
                         type_,
                         declaration,
-                        Err(TypeDisplayUnavailable::MalformedType(type_)),
+                        Err(error),
                     );
                 }
                 assert!(context.store_mut_for_test().set_symbol_declarations(
@@ -12930,12 +12936,18 @@ mod tests {
                 validate_class_heritage_members(context.store(), types[0]),
                 ClassHeritageMembersValidation::Malformed,
             );
-            for type_ in types {
+            for (type_, error) in types.into_iter().zip([
+                TypeDisplayUnavailable::MalformedType(types[0]),
+                TypeDisplayUnavailable::FunctionType {
+                    type_id: types[1],
+                    reason: FunctionTypeDisplayUnavailable::CallableProperties,
+                },
+            ]) {
                 assert_source_class_display_without_writes(
                     &mut context,
                     type_,
                     declaration,
-                    Err(TypeDisplayUnavailable::MalformedType(type_)),
+                    Err(error),
                 );
             }
             assert!(
