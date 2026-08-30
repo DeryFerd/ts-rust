@@ -7,8 +7,10 @@ use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalImportCallMode, ConditionalRootId,
     DeclaredTypeError, DeclaredTypeLinks, IntrinsicBootstrapOptions, NodeLinks, SignatureId,
     SignatureLinks, SourceFileLinks, SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks,
-    TypeNodeUnavailable, ValueSymbolLinks, signatures::TypePredicateKind,
-    type_records::TypeCacheState, types::TypeFlags,
+    TypeNodeUnavailable, ValueSymbolLinks,
+    signatures::TypePredicateKind,
+    type_records::{StructuredTypeData, TypeCacheState},
+    types::TypeFlags,
 };
 use ts_options::{CompilerOptions, ScriptTarget};
 use ts_parser::{ParseResult, parse_source_file};
@@ -243,6 +245,22 @@ impl Fixture {
             unreachable!()
         };
         self.node(data.initializer.unwrap())
+    }
+}
+
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
     }
 }
 
@@ -696,12 +714,7 @@ fn explicit_generic_receiver_calls_keep_inline_conditional_returns_and_exact_err
                 .get_type_from_type_node(fixture.variable_annotation("anys"))
                 .unwrap();
             let callable = context.get_type_at_location(property).unwrap();
-            let [mapped] = context
-                .store()
-                .type_payload(callable)
-                .unwrap()
-                .data()
-                .structured()
+            let [mapped] = structured_data(context.store().type_payload(callable).unwrap().data())
                 .unwrap()
                 .signatures
                 .as_deref()
@@ -733,7 +746,7 @@ fn explicit_generic_receiver_calls_keep_inline_conditional_returns_and_exact_err
         let members = context
             .store()
             .type_payload(receiver)
-            .and_then(|record| record.data().structured())
+            .and_then(|record| structured_data(record.data()))
             .and_then(|members| members.members)
             .and_then(|members| context.store().symbol_table(members))
             .unwrap();
@@ -811,14 +824,20 @@ fn explicit_generic_receiver_calls_keep_inline_conditional_returns_and_exact_err
             assert_eq!(record.declaration(), Some(method));
             assert!(record.type_parameters().is_empty());
             assert_eq!(record.resolved_return_type(), Some(receiver));
-            let mapper = record.mapper().unwrap();
+            let call_mapper = record.mapper().unwrap();
             assert_eq!(
-                store.mapper_kind(mapper),
+                store.mapper_kind(call_mapper),
                 Some(ts_checker::semantic::TypeMapperKind::Simple)
             );
-            assert_eq!(store.map_type(mapper, fresh), Some(string));
-            assert_eq!(store.map_type(mapper, parameters[1]), Some(parameters[1]));
-            assert_eq!(store.map_type(mapper, parameters[0]), Some(parameters[0]));
+            assert_eq!(store.map_type(call_mapper, fresh), Some(string));
+            assert_eq!(
+                store.map_type(call_mapper, parameters[1]),
+                Some(parameters[1])
+            );
+            assert_eq!(
+                store.map_type(call_mapper, parameters[0]),
+                Some(parameters[0])
+            );
             let [parameter] = record.parameters() else {
                 panic!("select must keep one value parameter")
             };
@@ -827,7 +846,7 @@ fn explicit_generic_receiver_calls_keep_inline_conditional_returns_and_exact_err
             let links = store.value_symbol_links(*parameter).unwrap();
             assert_eq!(links.target, Some(source_parameter));
             let composed = links.mapper.unwrap();
-            assert_ne!(composed, mapper);
+            assert_ne!(composed, call_mapper);
             assert_ne!(composed, receiver_mapper);
             assert_eq!(
                 store.mapper_kind(composed),

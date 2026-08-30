@@ -4,8 +4,8 @@ use ts_binder::{
     EscapedName, InternalSymbolName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureFlags, SignatureId,
-    SourceCheckError, TypeData, TypeId,
+    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, SourceCheckError, TypeData,
+    TypeId, signatures::SignatureFlags, type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -83,6 +83,23 @@ fn counts(context: &CanonicalCheckerContext<'_>) -> [usize; 6] {
         store.index_info_len(),
         store.symbol_store().symbol_table_len(),
     ]
+}
+
+// Read the stored member fields without resolving or changing the type.
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
 }
 
 struct DeclaredOverloads {
@@ -318,12 +335,7 @@ fn assert_replay(
         .iter()
         .flat_map(|declared| declared.signatures.iter().copied())
         .chain(expected_calls.iter().flat_map(|&(type_, _, _)| {
-            context
-                .store()
-                .type_payload(type_)
-                .unwrap()
-                .data()
-                .structured()
+            structured_data(context.store().type_payload(type_).unwrap().data())
                 .unwrap()
                 .signatures
                 .as_ref()
@@ -341,7 +353,10 @@ fn assert_replay(
                 .iter()
                 .map(|&type_| {
                     let record = store.type_payload(type_).unwrap();
-                    (record.object_flags(), record.data().structured().cloned())
+                    (
+                        record.object_flags(),
+                        structured_data(record.data()).cloned(),
+                    )
                 })
                 .collect::<Vec<_>>(),
             signatures
@@ -660,13 +675,7 @@ fn generic_interface_overloads_keep_multiple_argument_failures_unselected() {
             context.store().type_node_links(calls[0]).cloned(),
             context.store().signature_links(calls[0]).cloned(),
             context.store().type_node_links(annotation).cloned(),
-            context
-                .store()
-                .type_payload(instance)
-                .unwrap()
-                .data()
-                .structured()
-                .cloned(),
+            structured_data(context.store().type_payload(instance).unwrap().data()).cloned(),
         )
     };
     let warm = snapshot(&context);

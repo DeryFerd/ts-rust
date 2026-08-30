@@ -4,7 +4,8 @@ use ts_binder::{
     EscapedName, SemanticSymbolId,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, TypeData, TypeId, types::ObjectFlags,
+    CanonicalCheckerContext, CanonicalCheckerOptions, TypeData, TypeId,
+    type_records::StructuredTypeData, types::ObjectFlags,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -81,6 +82,22 @@ fn counts(context: &CanonicalCheckerContext<'_>) -> [usize; 6] {
     ]
 }
 
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
+
 fn assert_cold(context: &CanonicalCheckerContext<'_>, type_: TypeId) {
     let record = context.store().type_payload(type_).unwrap();
     assert!(
@@ -88,7 +105,7 @@ fn assert_cold(context: &CanonicalCheckerContext<'_>, type_: TypeId) {
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
     );
-    let structured = record.data().structured().unwrap();
+    let structured = structured_data(record.data()).unwrap();
     assert!(structured.members.is_none());
     assert!(structured.properties.is_none());
     assert!(structured.signatures.is_none());
@@ -172,12 +189,7 @@ fn conditional_validator_inference_keeps_array_calls_and_cold_and_warm_identity(
     assert_eq!(parameter.mapper, signature.mapper());
     assert!(parameter.target.is_some());
     assert_eq!(
-        context
-            .store()
-            .type_payload(warm)
-            .unwrap()
-            .data()
-            .structured()
+        structured_data(context.store().type_payload(warm).unwrap().data())
             .unwrap()
             .signatures
             .as_deref(),

@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId, TypeMapperId,
-    TypeMapperKind,
+    TypeMapperKind, type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -371,6 +371,22 @@ fn assert_call(
     selected
 }
 
+const fn structured_data(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
+
 fn snapshot(
     context: &CanonicalCheckerContext<'_>,
     parsed: &ParseResult,
@@ -433,10 +449,7 @@ fn snapshot(
         store
             .types()
             .filter_map(|(id, record)| {
-                record
-                    .data()
-                    .structured()
-                    .map(|data| (id, record.object_flags(), data.clone()))
+                structured_data(record.data()).map(|data| (id, record.object_flags(), data.clone()))
             })
             .collect::<Vec<_>>(),
         store
@@ -520,12 +533,7 @@ fn generic_receiver_method_calls_select_on_choice_any_and_demand_the_copied_retu
             let callable = context
                 .get_type_at_location(callee(&parsed, calls[0]))
                 .unwrap();
-            let copied = context
-                .store()
-                .type_payload(callable)
-                .unwrap()
-                .data()
-                .structured()
+            let copied = structured_data(context.store().type_payload(callable).unwrap().data())
                 .unwrap()
                 .signatures
                 .as_ref()
