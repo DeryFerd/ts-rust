@@ -30,7 +30,8 @@ use super::{
     links::ValueSymbolLinks,
     mapper::TypeMapperApplication,
     object_members::{
-        StoredDeclaredCallSetValidation, declared_method_value_links, declared_method_value_types,
+        StoredDeclaredCallSetValidation, declared_method_type_parameter_view,
+        declared_method_value_links, declared_method_value_types,
         validate_stored_declared_call_set,
     },
     reference_types::validate_direct_generic_reference,
@@ -2107,6 +2108,9 @@ pub(super) fn valid_declared_method_type_parameters(
     signature: &super::signatures::Signature,
     declaration: ts_ast::NodeRef,
 ) -> bool {
+    if store.source_node_kind(declaration) == Some(SyntaxKind::MethodSignature) {
+        return declared_method_type_parameter_view(store, signature, declaration).is_some();
+    }
     if signature.type_parameters().is_empty() {
         return true;
     }

@@ -57,6 +57,7 @@ use super::{
     },
     mapped_types::{MappedTypeError, supported_mapped_alias_projection},
     object_aliases::property_object_alias_nonempty_projection,
+    object_members::{DeclaredMethodTypeParameterView, declared_method_type_parameter_view},
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
     relation::RelationKind,
     signatures::{ElementFlags, IndexFlags, SignatureFlags},
@@ -400,6 +401,11 @@ struct GenericCallSignatureShape {
 struct GenericCallInstantiatedMethod {
     source: SignatureId,
     mapper: TypeMapperId,
+}
+
+struct GenericCallMethodTypeParameters {
+    instantiated: Option<GenericCallInstantiatedMethod>,
+    parameters: Vec<DeclaredMethodTypeParameterView>,
 }
 
 /// An attempted overload retains its checked shell, but has no recovery shell.
@@ -1627,6 +1633,82 @@ fn validate_generic_call_instantiated_method(
     }))
 }
 
+/// Reads source absence only after the original method and any receiver copy agree.
+fn validate_generic_method_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<GenericCallMethodTypeParameters>, GenericCallVectorError> {
+    let instantiated =
+        validate_generic_call_instantiated_method(store, callee, signature, array_targets)?;
+    if instantiated.is_none() && declared_method_signature_callee(store, signature) != Some(callee)
+    {
+        return Ok(None);
+    }
+    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
+    let original = instantiated.map_or(signature, |method| method.source);
+    let original = store.signature(original).ok_or_else(invalid)?;
+    let mut parameters = declared_method_type_parameter_view(
+        store,
+        original,
+        original.declaration().ok_or_else(invalid)?,
+    )
+    .ok_or_else(invalid)?;
+    if let Some(method) = instantiated {
+        let copied = store.signature(signature).ok_or_else(invalid)?;
+        if copied.type_parameters().len() != parameters.len() {
+            return Err(invalid().into());
+        }
+        for (parameter, &fresh) in parameters.iter_mut().zip(copied.type_parameters()) {
+            let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(fresh).map(super::TypeRecord::data)
+            else {
+                return Err(invalid().into());
+            };
+            if data.target != Some(parameter.type_parameter)
+                || data.mapper != Some(method.mapper)
+                || data.constraint.is_some() != parameter.constraint.is_some()
+                || data.resolved_default_type.is_some() != parameter.default_type.is_some()
+            {
+                return Err(invalid().into());
+            }
+            // The receiver provider already proved both mapped annotation values.
+            *parameter = DeclaredMethodTypeParameterView {
+                type_parameter: fresh,
+                constraint: data.constraint,
+                default_type: data.resolved_default_type,
+            };
+        }
+    }
+    Ok(Some(GenericCallMethodTypeParameters {
+        instantiated,
+        parameters,
+    }))
+}
+
+pub(super) fn generic_method_type_argument_bounds(
+    store: &CanonicalTypeMapperStore,
+    callable: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(usize, usize), GenericCallVectorError> {
+    let view = validate_generic_method_type_parameter_view(
+        store,
+        callable.owner,
+        callable.signature,
+        array_targets,
+    )?
+    .ok_or(GenericCallVectorInvariant::CallableSignatureMismatch(
+        callable.signature,
+    ))?;
+    let minimum = view
+        .parameters
+        .iter()
+        .rposition(|parameter| parameter.default_type.is_none())
+        .map_or(0, |index| index + 1);
+    Ok((minimum, view.parameters.len()))
+}
+
 fn validate_generic_call_signature_shape_with_unresolved_return(
     store: &CanonicalTypeMapperStore,
     callee: TypeId,
@@ -1653,14 +1735,16 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
         );
     }
     let has_rest_parameter = signature.has_rest_parameter();
-    let instantiated_method = validate_generic_call_instantiated_method(
+    let method_parameters = validate_generic_method_type_parameter_view(
         store,
         callee,
         callable.signature,
         array_targets,
     )?;
-    let method = instantiated_method.is_some()
-        || declared_method_signature_callee(store, callable.signature) == Some(callee);
+    let instantiated_method = method_parameters
+        .as_ref()
+        .and_then(|view| view.instantiated);
+    let method = method_parameters.is_some();
     let mut expected_flags = if has_rest_parameter {
         SignatureFlags::HAS_REST_PARAMETER
     } else {
@@ -1754,6 +1838,9 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             no_constraint,
             query_evidence,
             instantiated_method,
+            method_parameters
+                .as_ref()
+                .and_then(|view| view.parameters.get(type_parameters.len())),
         )?;
         type_parameters.push(GenericCallTypeParameter {
             type_: type_parameter,
@@ -2300,6 +2387,7 @@ pub(super) fn source_generic_type_parameter_constraint(
             no_constraint,
             Some(evidence),
             None,
+            None,
         )?;
         if parameter == type_parameter {
             selected = Some(SourceGenericConstraint {
@@ -2393,6 +2481,7 @@ fn validate_generic_call_type_parameter(
     no_constraint: TypeId,
     query_evidence: Option<&SourceCallableTypeQueryEvidence>,
     instantiated_method: Option<GenericCallInstantiatedMethod>,
+    method_parameter: Option<&DeclaredMethodTypeParameterView>,
 ) -> Result<(Option<TypeId>, Option<TypeId>, TypeId), GenericCallVectorError> {
     let record = store.type_payload(type_parameter).ok_or(
         GenericCallVectorInvariant::InvalidTypeParameter(type_parameter),
@@ -2439,16 +2528,30 @@ fn validate_generic_call_type_parameter(
     {
         return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
     }
-    let constraint = data
-        .constraint
-        .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
-            type_parameter,
-        ))?;
-    let default_type =
-        data.resolved_default_type
-            .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
-                type_parameter,
-            ))?;
+    let (constraint, default_type) = if let Some(parameter) = method_parameter {
+        if query_evidence.is_some()
+            || parameter.type_parameter != type_parameter
+            || parameter.constraint != data.constraint
+            || parameter.default_type != data.resolved_default_type
+        {
+            return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
+        }
+        (
+            parameter.constraint.unwrap_or(no_constraint),
+            parameter.default_type.unwrap_or(no_constraint),
+        )
+    } else {
+        (
+            data.constraint
+                .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+                    type_parameter,
+                ))?,
+            data.resolved_default_type
+                .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+                    type_parameter,
+                ))?,
+        )
+    };
     if let Some(evidence) = query_evidence {
         let invalid = || GenericCallVectorInvariant::InvalidTypeParameter(type_parameter);
         let resolved = evidence
@@ -7179,6 +7282,520 @@ mod tests {
             StoredSingleCallableValidation::Valid { callable, .. } => callable,
             other => panic!("expected a source generic callable: {other:?}"),
         }
+    }
+
+    fn checked_method_signature(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> (TypeId, SignatureId) {
+        let call = property_alias_variable_nodes(parsed, file, name).1.unwrap();
+        let selected = property_alias_call_state(context.store(), call).0;
+        let signature = context
+            .store()
+            .signature(selected)
+            .unwrap()
+            .target()
+            .unwrap();
+        let callee = generic_method_signature_callee(
+            context.store(),
+            signature,
+            Some(CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        (callee, signature)
+    }
+
+    #[test]
+    fn method_type_parameter_views_keep_source_absence_and_written_defaults() {
+        for (header, terminator) in [("interface Methods", ""), ("type Methods =", ";")] {
+            let parsed = parse_source_file(&format!(
+                "{header} {{ echo<T>(value: T): T; \
+                 constrained<T extends string>(value: T): T; defaulted<T = string>(): T; }}{terminator} \
+                 declare const methods: Methods; \
+                 const echo = methods.echo<number>(1); \
+                 const constrained = methods.constrained<string>('x'); \
+                 const defaulted = methods.defaulted();"
+            ));
+            let file = FileId::new(96_540);
+            let mut context = property_alias_call_context(&[(file, &parsed)]);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            ));
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let string = bootstrap.string_type;
+            let number = bootstrap.number_type;
+            let no_constraint = bootstrap.no_constraint_type;
+            let mut states = Vec::new();
+            for (name, constraint, default_type, minimum, result) in [
+                ("echo", None, None, 1, number),
+                ("constrained", Some(string), None, 1, string),
+                ("defaulted", None, Some(string), 0, string),
+            ] {
+                let (callee, signature) = checked_method_signature(&context, &parsed, file, name);
+                let callable =
+                    generic_call_signature_candidate(context.store(), callee, signature, targets)
+                        .unwrap();
+                let shape = validate_generic_call_signature_shape(
+                    context.store(),
+                    callee,
+                    &callable,
+                    targets,
+                )
+                .unwrap();
+                assert_eq!(shape.type_parameters.len(), 1);
+                let parameter = shape.type_parameters[0];
+                assert_eq!(parameter.constraint, constraint);
+                assert_eq!(parameter.default_type, default_type);
+                assert_eq!(
+                    parameter.base_constraint,
+                    constraint.unwrap_or(no_constraint)
+                );
+                let TypeData::TypeParameter(data) = context
+                    .store()
+                    .type_payload(parameter.type_)
+                    .unwrap()
+                    .data()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(data.constraint, constraint);
+                assert_eq!(data.resolved_default_type, default_type);
+                assert_eq!(data.target, None);
+                assert_eq!(data.mapper, None);
+                assert_eq!(
+                    generic_method_type_argument_bounds(context.store(), &callable, targets),
+                    Ok((minimum, 1))
+                );
+                let call = property_alias_variable_nodes(&parsed, file, name)
+                    .1
+                    .unwrap();
+                let state = property_alias_call_state(context.store(), call);
+                assert_eq!(state.1, result);
+                states.push((call, state, parameter.type_, constraint, default_type));
+            }
+            let before = vector_cache_graph_counts(context.store());
+            for _ in 0..2 {
+                context.check_source_file(file).unwrap();
+                for &(call, state, parameter, constraint, default_type) in &states {
+                    assert_eq!(context.get_type_at_location(call).unwrap(), state.1);
+                    assert_eq!(property_alias_call_state(context.store(), call), state);
+                    let TypeData::TypeParameter(data) =
+                        context.store().type_payload(parameter).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(data.constraint, constraint);
+                    assert_eq!(data.resolved_default_type, default_type);
+                }
+                assert!(context.diagnostics().is_empty());
+                assert_eq!(vector_cache_graph_counts(context.store()), before);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Erasure, role swaps, and node damage share the same real method proof.
+    fn method_type_parameter_views_reject_changed_written_roles_and_restore() {
+        let parsed = parse_source_file(concat!(
+            "interface Methods { constrained<T extends string>(value: T): T; ",
+            "defaulted<T = string>(): T; } ",
+            "declare const methods: Methods; ",
+            "const constrained = methods.constrained<string>('x'); ",
+            "const defaulted = methods.defaulted();",
+        ));
+        let file = FileId::new(96_541);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        for name in ["constrained", "defaulted"] {
+            let (callee, signature) = checked_method_signature(&context, &parsed, file, name);
+            let store = context.store_mut_for_test();
+            let original = store
+                .signature(signature)
+                .unwrap()
+                .type_parameters()
+                .to_vec();
+            let parameter = original[0];
+            let TypeData::TypeParameter(data) = store.type_payload(parameter).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let (constraint, default_type) = (data.constraint, data.resolved_default_type);
+            let declaration = store.signature(signature).unwrap().declaration().unwrap();
+            let valid = declared_method_type_parameter_view(
+                store,
+                store.signature(signature).unwrap(),
+                declaration,
+            )
+            .unwrap();
+            let symbol = store.type_payload(parameter).unwrap().symbol().unwrap();
+            let [parameter_node] = store.symbol(symbol).unwrap().declarations().unwrap() else {
+                unreachable!()
+            };
+            let annotations = store
+                .source_type_parameter_annotations(*parameter_node)
+                .unwrap();
+            let annotation = annotations.constraint.or(annotations.default_type).unwrap();
+            let links = store
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap_or_default();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            for mutation in 0..4 {
+                match mutation {
+                    0 => assert!(
+                        store.set_type_parameter_resolution(parameter, None, None, None, None)
+                    ),
+                    1 => assert!(store.set_type_parameter_resolution(
+                        parameter,
+                        default_type,
+                        None,
+                        None,
+                        constraint,
+                    )),
+                    2 => assert!(store.set_type_node_links(
+                        annotation,
+                        crate::semantic::TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..crate::semantic::TypeNodeLinks::default()
+                        },
+                    )),
+                    3 => assert!(store.set_signature_type_parameters(signature, Vec::new())),
+                    _ => unreachable!(),
+                }
+                let before = vector_cache_graph_counts(store);
+                for _ in 0..2 {
+                    assert_eq!(
+                        declared_method_type_parameter_view(
+                            store,
+                            store.signature(signature).unwrap(),
+                            declaration,
+                        ),
+                        None
+                    );
+                    assert_eq!(
+                        generic_call_signature_candidate(store, callee, signature, targets),
+                        Err(GenericCallVectorError::Invariant(
+                            GenericCallVectorInvariant::MalformedCallable(callee)
+                        ))
+                    );
+                    assert_eq!(vector_cache_graph_counts(store), before);
+                }
+                assert!(store.set_type_parameter_resolution(
+                    parameter,
+                    constraint,
+                    None,
+                    None,
+                    default_type,
+                ));
+                assert!(store.set_type_node_links(annotation, links.clone()));
+                assert!(store.set_signature_type_parameters(signature, original.clone()));
+                assert_eq!(
+                    declared_method_type_parameter_view(
+                        store,
+                        store.signature(signature).unwrap(),
+                        declaration,
+                    ),
+                    Some(valid.clone())
+                );
+                assert!(
+                    generic_call_signature_candidate(store, callee, signature, targets).is_ok()
+                );
+            }
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn method_type_parameter_views_reject_named_bound_cache_substitution() {
+        let parsed = parse_source_file(concat!(
+            "interface Methods { constrained<T, U extends T>(first: T, second: U): U; ",
+            "defaulted<T, U = T>(first: T): U; } ",
+            "declare const methods: Methods; ",
+            "const constrained = methods.constrained<string, string>('x', 'value'); ",
+            "const defaulted = methods.defaulted<string>('x');",
+        ));
+        let file = FileId::new(96_544);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        for name in ["constrained", "defaulted"] {
+            let (callee, signature) = checked_method_signature(&context, &parsed, file, name);
+            let store = context.store_mut_for_test();
+            let parameters = store
+                .signature(signature)
+                .unwrap()
+                .type_parameters()
+                .to_vec();
+            assert_eq!(parameters.len(), 2);
+            let parameter = parameters[1];
+            let symbol = store.type_payload(parameter).unwrap().symbol().unwrap();
+            let [declaration] = store.symbol(symbol).unwrap().declarations().unwrap() else {
+                unreachable!()
+            };
+            let annotations = store
+                .source_type_parameter_annotations(*declaration)
+                .unwrap();
+            let annotation = annotations.constraint.or(annotations.default_type).unwrap();
+            assert_eq!(
+                store.source_node_kind(annotation),
+                Some(SyntaxKind::TypeReference)
+            );
+            let type_links = store.type_node_links(annotation).unwrap().clone();
+            let symbol_links = store.symbol_node_links(annotation).unwrap().clone();
+            assert_eq!(type_links.resolved_type, Some(parameters[0]));
+            assert_eq!(
+                symbol_links.resolved_symbol,
+                store.type_payload(parameters[0]).unwrap().symbol()
+            );
+            let TypeData::TypeParameter(data) = store.type_payload(parameter).unwrap().data()
+            else {
+                unreachable!()
+            };
+            let (constraint, default_type) = (data.constraint, data.resolved_default_type);
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(store.set_type_node_links(
+                annotation,
+                crate::semantic::TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..crate::semantic::TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_type_parameter_resolution(
+                parameter,
+                constraint.map(|_| number),
+                None,
+                None,
+                default_type.map(|_| number),
+            ));
+            let before = vector_cache_graph_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    generic_call_signature_candidate(store, callee, signature, targets),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::MalformedCallable(callee)
+                    ))
+                );
+                assert_eq!(store.symbol_node_links(annotation), Some(&symbol_links));
+                assert_eq!(vector_cache_graph_counts(store), before);
+            }
+            assert!(store.set_type_node_links(annotation, type_links));
+            assert!(store.set_type_parameter_resolution(
+                parameter,
+                constraint,
+                None,
+                None,
+                default_type,
+            ));
+            let callable =
+                generic_call_signature_candidate(store, callee, signature, targets).unwrap();
+            assert!(
+                validate_generic_call_signature_shape(store, callee, &callable, targets).is_ok()
+            );
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check original and receiver slots before using their absent defaults.
+    fn method_type_parameter_views_revalidate_receiver_source_and_mapped_slots() {
+        let parsed = parse_source_file(concat!(
+            "interface Choice<T> { select<U extends string>(outer: T, value: U): U; ",
+            "defaulted<U = T>(outer: T): U; } ",
+            "declare const choice: Choice<string>; ",
+            "const selected = choice.select<string>('x', 'value'); ",
+            "const defaulted = choice.defaulted('x');",
+        ));
+        let file = FileId::new(96_542);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        for name in ["selected", "defaulted"] {
+            let (callee, signature) = checked_method_signature(&context, &parsed, file, name);
+            let store = context.store_mut_for_test();
+            let copied = store.signature(signature).unwrap();
+            let source = copied.target().unwrap();
+            let mapper = copied.mapper().unwrap();
+            let fresh = copied.type_parameters()[0];
+            let original = store.signature(source).unwrap().type_parameters()[0];
+            let view =
+                validate_generic_method_type_parameter_view(store, callee, signature, targets)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(view.instantiated.unwrap().source, source);
+            assert_eq!(view.instantiated.unwrap().mapper, mapper);
+            assert_eq!(view.parameters[0].type_parameter, fresh);
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let expected = if name == "selected" {
+                (Some(string), None)
+            } else {
+                (None, Some(string))
+            };
+            assert_eq!(
+                (
+                    view.parameters[0].constraint,
+                    view.parameters[0].default_type
+                ),
+                expected
+            );
+            let slots = [original, fresh].map(|parameter| {
+                let TypeData::TypeParameter(data) = store.type_payload(parameter).unwrap().data()
+                else {
+                    unreachable!()
+                };
+                (
+                    data.constraint,
+                    data.target,
+                    data.mapper,
+                    data.resolved_default_type,
+                )
+            });
+            let source_view = declared_method_type_parameter_view(
+                store,
+                store.signature(source).unwrap(),
+                store.signature(source).unwrap().declaration().unwrap(),
+            )
+            .unwrap();
+            if name == "defaulted" {
+                assert_ne!(source_view[0].default_type, Some(string));
+            }
+            for damaged in [vec![0], vec![1], vec![0, 1]] {
+                for &index in &damaged {
+                    let (constraint, target, mapper, default_type) = slots[index];
+                    assert!(store.set_type_parameter_resolution(
+                        [original, fresh][index],
+                        default_type,
+                        target,
+                        mapper,
+                        constraint,
+                    ));
+                }
+                let before = vector_cache_graph_counts(store);
+                for _ in 0..2 {
+                    assert!(matches!(
+                        validate_generic_method_type_parameter_view(store, callee, signature, targets),
+                        Err(GenericCallVectorError::Invariant(
+                            GenericCallVectorInvariant::CallableSignatureMismatch(failed)
+                        )) if failed == signature
+                    ));
+                    assert_eq!(vector_cache_graph_counts(store), before);
+                }
+                for (parameter, (constraint, target, mapper, default_type)) in
+                    [original, fresh].into_iter().zip(slots)
+                {
+                    assert!(store.set_type_parameter_resolution(
+                        parameter,
+                        constraint,
+                        target,
+                        mapper,
+                        default_type
+                    ));
+                }
+                let restored =
+                    validate_generic_method_type_parameter_view(store, callee, signature, targets)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(restored.parameters, view.parameters);
+                let callable =
+                    generic_call_signature_candidate(store, callee, signature, targets).unwrap();
+                assert!(
+                    validate_generic_call_signature_shape(store, callee, &callable, targets)
+                        .is_ok()
+                );
+            }
+        }
+        let before = vector_cache_graph_counts(context.store());
+        for _ in 0..2 {
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(vector_cache_graph_counts(context.store()), before);
+        }
+    }
+
+    #[test]
+    fn method_type_parameter_views_do_not_normalize_ordinary_function_caches() {
+        let parsed = parse_source_file(concat!(
+            "declare function identity<T>(value: T): T; ",
+            "const result = identity<number>(1);",
+        ));
+        let file = FileId::new(96_543);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        let call = property_alias_variable_nodes(&parsed, file, "result")
+            .1
+            .unwrap();
+        let callable = property_alias_original_callable(context.store(), call);
+        let targets = Some(CanonicalArrayTargets::from_global_types(
+            context.global_types(),
+        ));
+        let store = context.store_mut_for_test();
+        let parameter = store
+            .signature(callable.signature)
+            .unwrap()
+            .type_parameters()[0];
+        let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
+        let TypeData::TypeParameter(data) = store.type_payload(parameter).unwrap().data() else {
+            unreachable!()
+        };
+        assert_eq!(data.constraint, Some(no_constraint));
+        assert_eq!(data.resolved_default_type, Some(no_constraint));
+        for (constraint, default_type) in [(None, Some(no_constraint)), (Some(no_constraint), None)]
+        {
+            assert!(store.set_type_parameter_resolution(
+                parameter,
+                constraint,
+                None,
+                None,
+                default_type
+            ));
+            let before = vector_cache_graph_counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_call_signature_shape(
+                        store,
+                        callable.owner,
+                        &callable,
+                        targets
+                    )
+                    .map(|_| ()),
+                    Err(GenericCallVectorError::Invariant(
+                        GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature)
+                    ))
+                );
+                assert_eq!(vector_cache_graph_counts(store), before);
+            }
+            assert!(store.set_type_parameter_resolution(
+                parameter,
+                Some(no_constraint),
+                None,
+                None,
+                Some(no_constraint),
+            ));
+            assert!(
+                validate_generic_call_signature_shape(store, callable.owner, &callable, targets)
+                    .is_ok()
+            );
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

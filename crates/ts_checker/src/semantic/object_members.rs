@@ -2824,6 +2824,14 @@ pub(super) struct PlannedInterfaceMethodTypeParameter {
     pub default_type: Option<NodeRef>,
 }
 
+/// A method parameter keeps source absence separate from an unresolved annotation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DeclaredMethodTypeParameterView {
+    pub type_parameter: TypeId,
+    pub constraint: Option<TypeId>,
+    pub default_type: Option<TypeId>,
+}
+
 /// One named method on an interface or type literal.
 ///
 /// Ordinary overloads share a canonical symbol. Computed overloads keep separate
@@ -20122,6 +20130,80 @@ fn resolved_interface_method_type_parameters(
     method: &PlannedInterfaceMethod,
 ) -> Option<Vec<TypeId>> {
     resolved_declared_signature_type_parameters(store, method.declaration, &method.type_parameters)
+}
+
+/// Replays the original parameter order and written annotation roles without a type query.
+pub(super) fn declared_method_type_parameter_view(
+    store: &CanonicalTypeMapperStore,
+    signature: &super::signatures::Signature,
+    declaration: NodeRef,
+) -> Option<Vec<DeclaredMethodTypeParameterView>> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+        return None;
+    }
+    let mut declarations = store.source_direct_children(declaration)?;
+    declarations.retain(|parameter| {
+        parameter.node < declaration.node
+            && store.source_node_kind(*parameter) == Some(SyntaxKind::TypeParameter)
+    });
+    if declarations.len() != signature.type_parameters().len() {
+        return None;
+    }
+    let mut resolved = Vec::with_capacity(declarations.len());
+    let mut symbols = HashSet::with_capacity(declarations.len());
+    let mut default_seen = false;
+    for (&type_parameter, declaration_parameter) in
+        signature.type_parameters().iter().zip(declarations)
+    {
+        let symbol = cached_ordinary_type_parameter_owner(store, type_parameter)?;
+        let record = store.symbol(symbol)?;
+        let [parameter] = record.declarations()? else {
+            return None;
+        };
+        let TypeData::TypeParameter(data) = store.type_payload(type_parameter)?.data() else {
+            return None;
+        };
+        let annotations = store.source_type_parameter_annotations(*parameter)?;
+        let exact_annotation = |annotation| {
+            let type_ = ConstructorAnnotationMode::SourceResolvedFull.cached(store, annotation)?;
+            store.type_payload(type_).is_some().then_some(type_)
+        };
+        let constraint = match annotations.constraint {
+            Some(annotation) => Some(exact_annotation(annotation)?),
+            None => None,
+        };
+        let default_type = match annotations.default_type {
+            Some(annotation) => Some(exact_annotation(annotation)?),
+            None => None,
+        };
+        if !symbols.insert(symbol)
+            || record.flags() != SymbolFlags::TYPE_PARAMETER
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || *parameter != declaration_parameter
+            || store.source_node_parent(*parameter) != Some(SourceNodeParent::Parent(declaration))
+            || data.is_this_type
+            || data.target.is_some()
+            || data.mapper.is_some()
+            || data.constraint != constraint
+            || data.resolved_default_type != default_type
+            || default_seen && annotations.default_type.is_none()
+        {
+            return None;
+        }
+        default_seen |= annotations.default_type.is_some();
+        resolved.push(DeclaredMethodTypeParameterView {
+            type_parameter,
+            constraint,
+            default_type,
+        });
+    }
+    Some(resolved)
 }
 
 pub(super) fn resolved_declared_signature_type_parameters(

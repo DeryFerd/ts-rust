@@ -20,11 +20,11 @@ use super::{
         GenericCallArgumentRelation, GenericCallVectorApplicability, GenericCallVectorCandidate,
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
         check_generic_call_candidate_with_session, finish_generic_call_candidate_with_session,
-        generic_method_signature_callee, validate_generic_call_vector_request,
+        generic_method_signature_callee, generic_method_type_argument_bounds,
+        validate_generic_call_vector_request,
     },
     instantiate::InstantiationSession,
     relation::RelationKind,
-    type_records::{TypeData, TypeRecord},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,34 +127,6 @@ impl CheckedMethodCandidate {
         matches!(self, Self::Generic(candidate) if matches!(candidate.applicability(),
             GenericCallVectorApplicability::ExplicitTypeArgumentConstraint { .. }))
     }
-}
-
-/// The default cache has already been authenticated by the method provider.
-fn type_argument_bounds(
-    store: &CanonicalTypeMapperStore,
-    callable: &ValidatedSingleCallable,
-) -> Result<(usize, usize), GenericMethodCallError> {
-    let signature = store
-        .signature(callable.signature)
-        .ok_or(GenericMethodCallError::Invalid(callable.owner))?;
-    let no_constraint = store
-        .intrinsic_bootstrap()
-        .ok_or(GenericMethodCallError::Invalid(callable.owner))?
-        .no_constraint_type;
-    let mut minimum = 0;
-    for (index, parameter) in signature.type_parameters().iter().enumerate() {
-        let Some(TypeData::TypeParameter(parameter)) =
-            store.type_payload(*parameter).map(TypeRecord::data)
-        else {
-            return Err(GenericMethodCallError::Invalid(callable.owner));
-        };
-        match parameter.resolved_default_type {
-            Some(default) if default != no_constraint => {}
-            Some(_) => minimum = index + 1,
-            None => return Err(GenericMethodCallError::Invalid(callable.owner)),
-        }
-    }
-    Ok((minimum, signature.type_parameters().len()))
 }
 
 fn has_type_argument_arity(bounds: (usize, usize), explicit: Option<&[TypeId]>) -> bool {
@@ -356,7 +328,7 @@ pub(super) fn resolve_generic_method_call(
         reorder_direct_call_candidates(store, request.callee, &projection.call_signatures)?;
     let bounds = ordered
         .iter()
-        .map(|candidate| type_argument_bounds(store, candidate))
+        .map(|candidate| generic_method_type_argument_bounds(store, candidate, array_targets))
         .collect::<Result<Vec<_>, _>>()?;
     let passes = [
         GenericCallArgumentRelation::Subtype {
@@ -434,7 +406,7 @@ pub(super) fn resolve_generic_method_call(
         let mut eligible = Vec::new();
         for candidate in &projection.call_signatures {
             if has_type_argument_arity(
-                type_argument_bounds(store, candidate)?,
+                generic_method_type_argument_bounds(store, candidate, array_targets)?,
                 request.explicit_type_arguments,
             ) {
                 eligible.push(candidate);
@@ -577,6 +549,7 @@ mod tests {
         structured_members::{
             InterfaceHeritageMembersValidation, validate_interface_heritage_members,
         },
+        type_records::TypeData,
         types::ObjectFlags,
     };
 
