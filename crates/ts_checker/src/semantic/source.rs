@@ -42532,7 +42532,7 @@ pub(super) fn source_call_effects_target_type(
                     .with_type_reference_alias_targets(
                         capabilities
                             .get(&annotation)
-                            .map_or(&[], Vec::as_slice)
+                            .map_or(&[][..], Vec::as_slice)
                             .iter()
                             .copied(),
                     )?

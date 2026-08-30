@@ -8353,6 +8353,8 @@ mod tests {
             logical_statements: Vec::new(),
             class_body: None,
             property_assignments: HashMap::new(),
+            region: None,
+            updates: HashMap::new(),
         };
         let without_payload = FlowNode::new(FlowFlags::START);
         assert_eq!(validate_start_node(&plan, start, &without_payload), Ok(()));
