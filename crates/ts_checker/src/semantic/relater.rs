@@ -22505,7 +22505,7 @@ mod tests {
         assert!(target_data.members.nodes.iter().any(|&member| {
             matches!(
                 &source.arena.get(member).unwrap().data,
-                NodeData::PropertySignatureDeclaration(property) if property.type_ == function.node
+                NodeData::PropertyDeclaration(property) if property.type_ == Some(function.node)
             )
         }));
         let NodeData::FunctionTypeNode(function_data) =
