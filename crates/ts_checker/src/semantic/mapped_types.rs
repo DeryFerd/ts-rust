@@ -7868,10 +7868,10 @@ mod tests {
             );
             let parsed = parse_source_file(&source);
             let (mut context, projection, source) = selection_call_fixture(&parsed);
-            let indexed = alias_type(&parsed, &context, "IndexedInput");
+            let dictionary = alias_type(&parsed, &context, "IndexedInput");
             let store = context.store_mut_for_test();
             let (template, conditional) = conditional_template_snapshot(store, projection.type_);
-            for argument in [source, indexed] {
+            for argument in [source, dictionary] {
                 let arguments = [argument];
                 let result = instantiate_supported_mapped_alias_instance(
                     store,
