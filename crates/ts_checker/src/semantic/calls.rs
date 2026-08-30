@@ -344,8 +344,23 @@ pub(super) fn resolve_direct_call(
     {
         return Err(DirectCallUnsupported::NotExactSingleCallable(request.callee).into());
     }
-    let callables =
-        reorder_direct_call_candidates(store, request.callee, &projection.call_signatures)?;
+    resolve_direct_call_candidates(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        &projection.call_signatures,
+    )
+}
+
+fn resolve_direct_call_candidates(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    callables: &[ValidatedSingleCallable],
+) -> Result<DirectCallResolution, DirectCallError> {
+    let callables = reorder_direct_call_candidates(store, request.callee, callables)?;
     let candidate_count = callables.len();
     let mut candidates = Vec::with_capacity(candidate_count);
     for callable in callables {
@@ -430,6 +445,27 @@ pub(super) fn resolve_class_body_invocation(
     }
     validate_direct_invocation_options(request)?;
     validate_argument_types(store, request.arguments)?;
+    if let Some(overloads) = target.overloads() {
+        if target.kind() != SignatureKind::Call
+            || request.callee != target.callable().owner
+            || target.pending_return_body().is_some()
+            || super::classes::source_class_method_overloads(store, request.callee)
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(overloads)
+        {
+            return Err(DirectCallInvariant::MalformedCallable(request.callee).into());
+        }
+        return resolve_direct_call_candidates(
+            store,
+            global_types,
+            strict_function_types,
+            request,
+            &overloads.signatures,
+        )
+        .map(ClassBodyInvocationResolution::Resolved);
+    }
     let callable = target.callable();
     let invalid = || DirectCallInvariant::MalformedCallable(callable.owner);
     let owner = store.type_payload(callable.owner).ok_or_else(invalid)?;
@@ -607,7 +643,7 @@ fn choose_applicable_overload(
     Ok(None)
 }
 
-/// Class implementations can add diagnostic notes that this recovery cannot reproduce.
+/// Source classes retain the implementation needed for exact recovery notes.
 fn recover_direct_call_overload(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -626,7 +662,13 @@ fn recover_direct_call_overload(
                     .and_then(|owner| store.symbol(owner))
                     .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS))
         });
-    if request.form != DirectCallForm::Call || class_method {
+    if request.form != DirectCallForm::Call
+        || class_method
+            && super::classes::source_class_method_overloads(store, request.callee)
+                .ok()
+                .flatten()
+                .is_none()
+    {
         return Ok(None);
     }
     if let Some(candidate) = recover_uniform_overload_arity_error(candidates) {
@@ -1464,6 +1506,25 @@ fn check_validated_class_call_arguments(
         )?;
     }
     Ok(arguments)
+}
+
+/// Checks the real implementation only to explain an overload argument error.
+pub(super) fn class_overload_implementation_accepts_arguments(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    request: DirectCallRequest<'_>,
+    implementation: &ValidatedSingleCallable,
+) -> Result<bool, DirectCallError> {
+    Ok(check_validated_class_call_arguments(
+        store,
+        globals,
+        strict_function_types,
+        request,
+        implementation,
+    )?
+    .applicability
+        == DirectCallApplicability::Applicable)
 }
 
 fn non_array_rest_target(
