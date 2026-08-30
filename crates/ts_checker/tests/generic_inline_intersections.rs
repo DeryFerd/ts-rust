@@ -105,17 +105,20 @@ fn annotation(source: &ParseResult, name: &str) -> NodeRef {
     NodeRef::new(node.arena, node.file, variable.type_.unwrap())
 }
 
-fn object<'a>(context: &'a CanonicalCheckerContext<'_>, type_: TypeId) -> &'a ObjectTypeData {
+fn object<'store>(
+    context: &'store CanonicalCheckerContext<'_>,
+    type_: TypeId,
+) -> &'store ObjectTypeData {
     let TypeData::Object(object) = context.store().type_payload(type_).unwrap().data() else {
         panic!("expected a source object")
     };
     object
 }
 
-fn intersection<'a>(
-    context: &'a CanonicalCheckerContext<'_>,
+fn intersection<'store>(
+    context: &'store CanonicalCheckerContext<'_>,
     type_: TypeId,
-) -> &'a IntersectionTypeData {
+) -> &'store IntersectionTypeData {
     let TypeData::Intersection(intersection) = context.store().type_payload(type_).unwrap().data()
     else {
         panic!("expected the original intersection")

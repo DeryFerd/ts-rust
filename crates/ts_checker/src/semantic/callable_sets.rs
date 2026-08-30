@@ -84,6 +84,15 @@ pub(super) fn validate_stored_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredCallableSetValidation {
+    validate_stored_callable_set_with_array_targets(store, type_, None)
+}
+
+/// Retains the caller's array targets when validating intersection providers.
+pub(super) fn validate_stored_callable_set_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> StoredCallableSetValidation {
     if let Some(validation) = validate_stored_recovered_method_callable_set(store, type_) {
         return validation;
     }
@@ -240,7 +249,7 @@ pub(super) fn validate_stored_callable_set(
         return validation;
     }
 
-    validate_stored_intersection_callable_set(store, type_)
+    validate_stored_intersection_callable_set(store, type_, array_targets)
 }
 
 #[derive(Clone, Copy)]
@@ -2385,6 +2394,7 @@ fn validate_stored_class_method_callable_set(
 fn validate_stored_intersection_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> StoredCallableSetValidation {
     let family = CallableFamily::DeclaredCallSignatures;
     let Some(record) = store.type_payload(type_) else {
@@ -2395,7 +2405,9 @@ fn validate_stored_intersection_callable_set(
     {
         return StoredCallableSetValidation::NotCallable;
     }
-    let Ok(intersection) = store.validate_intersection_type(type_) else {
+    let Ok(intersection) =
+        store.validate_intersection_type_with_array_targets(type_, array_targets)
+    else {
         return StoredCallableSetValidation::Malformed { family };
     };
     let Some(structured) = store
@@ -2418,7 +2430,7 @@ fn validate_stored_intersection_callable_set(
     let mut edges = Vec::new();
     for constituent in intersection.types {
         edges.push(constituent);
-        match validate_stored_callable_set(store, constituent) {
+        match validate_stored_callable_set_with_array_targets(store, constituent, array_targets) {
             StoredCallableSetValidation::NotCallable => {}
             StoredCallableSetValidation::Pending { family } => {
                 return StoredCallableSetValidation::Pending { family };
@@ -5073,5 +5085,259 @@ mod tests {
             validate_stored_callable_set(store, intersection),
             StoredCallableSetValidation::Malformed { .. }
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check both signature states through damage and restore on the same source types.
+    fn inline_intersection_callable_readers_keep_array_targets_and_reject_cache_poison() {
+        use crate::semantic::{
+            CanonicalCheckerDiagnostics, DeclaredTypeHost,
+            callables::validate_stored_single_callable_with_array_targets,
+            instantiate::{InstantiationLimits, InstantiationSession},
+            intersection_types::demand_source_intersection_members,
+        };
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "type Tail<T> = { tail: T }; ",
+            "type Packet<T> = { items: T[] } & Tail<T>; ",
+            "type Callback = (value: string) => void; ",
+            "declare const packet: Packet<string>; declare const callback: Callback;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_412);
+        let mut context =
+            source_callable_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+        let annotation = |name: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name)
+                        .then(|| NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap()))
+                })
+                .unwrap()
+        };
+        let packet = context
+            .get_type_from_type_node(annotation("packet"))
+            .unwrap();
+        let callback = context
+            .get_type_from_type_node(annotation("callback"))
+            .unwrap();
+        let signature = context
+            .store()
+            .type_payload(callback)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first().copied())
+            .unwrap();
+        context.get_return_type_of_signature(signature).unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let foreign = source_callable_context(
+            &parsed,
+            FileId::new(4_413),
+            CanonicalSourceLanguage::TypeScript,
+        );
+        let foreign_targets = Some(CanonicalArrayTargets::from_global_types(
+            foreign.global_types(),
+        ));
+        assert_ne!(targets, foreign_targets);
+        let options = context.options();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            demand_source_intersection_members(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+                packet,
+            ),
+            Ok(packet)
+        );
+        let packet_types = store
+            .validate_intersection_type_with_array_targets(packet, targets)
+            .unwrap()
+            .types;
+        let callable_intersection = store
+            .canonical_intersection_type_with_array_targets(&[callback, packet], None, targets)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { edges, .. } =
+            validate_stored_callable_set(store, callback)
+        else {
+            panic!("the original callback must remain callable")
+        };
+        let mut expected_edges = vec![callback];
+        expected_edges.extend(edges);
+        expected_edges.extend(packet_types);
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                [
+                    store.type_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.type_alias_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.intersection_types.len(),
+                store.intersection_keys_by_type.len(),
+            )
+        };
+        let before = snapshot(store);
+
+        for type_ in [packet, callable_intersection] {
+            let expected = validate_stored_callable_set_with_array_targets(store, type_, targets);
+            if type_ == packet {
+                assert_eq!(expected, StoredCallableSetValidation::NotCallable);
+                assert_eq!(
+                    validate_stored_single_callable_with_array_targets(store, type_, targets),
+                    StoredSingleCallableValidation::NotCallable
+                );
+            } else {
+                let StoredCallableSetValidation::Valid {
+                    projection, edges, ..
+                } = &expected
+                else {
+                    panic!("the array-bearing intersection must retain its callback")
+                };
+                assert_eq!(projection.owner, type_);
+                assert!(projection.construct_signatures.is_empty());
+                let [callable] = projection.call_signatures.as_ref() else {
+                    panic!("the intersection must retain one callback")
+                };
+                assert_eq!(callable.owner, type_);
+                assert_eq!(callable.signature, signature);
+                assert_eq!(edges, &expected_edges);
+                assert!(matches!(
+                    validate_stored_single_callable_with_array_targets(store, type_, targets),
+                    StoredSingleCallableValidation::Valid { callable, .. }
+                        if callable.owner == type_ && callable.signature == signature
+                ));
+            }
+            let malformed = StoredCallableSetValidation::Malformed {
+                family: CallableFamily::DeclaredCallSignatures,
+            };
+            let malformed_single = StoredSingleCallableValidation::Malformed {
+                family: CallableFamily::DeclaredCallSignatures,
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_stored_callable_set_with_array_targets(store, type_, targets),
+                    expected
+                );
+                assert_eq!(validate_stored_callable_set(store, type_), malformed);
+                assert_eq!(
+                    validate_stored_single_callable(store, type_),
+                    malformed_single
+                );
+                for missing_or_foreign in [None, foreign_targets] {
+                    assert_eq!(
+                        validate_stored_callable_set_with_array_targets(
+                            store,
+                            type_,
+                            missing_or_foreign
+                        ),
+                        malformed
+                    );
+                    assert_eq!(
+                        validate_stored_single_callable_with_array_targets(
+                            store,
+                            type_,
+                            missing_or_foreign
+                        ),
+                        malformed_single
+                    );
+                }
+                assert_eq!(snapshot(store), before);
+            }
+
+            let key = store.intersection_keys_by_type.get(&type_).unwrap().clone();
+            let mut wrong_key = key.clone();
+            wrong_key.types.reverse();
+            assert_ne!(wrong_key, key);
+            assert_eq!(
+                store.intersection_keys_by_type.insert(type_, wrong_key),
+                Some(key.clone())
+            );
+            assert_eq!(
+                validate_stored_callable_set_with_array_targets(store, type_, targets),
+                malformed
+            );
+            assert_eq!(
+                validate_stored_single_callable_with_array_targets(store, type_, targets),
+                malformed_single
+            );
+            assert_eq!(snapshot(store), before);
+            store.intersection_keys_by_type.insert(type_, key.clone());
+            assert_eq!(
+                validate_stored_callable_set_with_array_targets(store, type_, targets),
+                expected
+            );
+
+            let structured = store
+                .type_payload(type_)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .clone();
+            let wrong_signatures = (type_ == packet).then_some(vec![signature]);
+            assert!(store.set_structured_type_members(
+                type_,
+                structured.members,
+                structured.properties.clone(),
+                wrong_signatures,
+                None,
+                structured.index_infos.clone(),
+            ));
+            assert_eq!(
+                validate_stored_callable_set_with_array_targets(store, type_, targets),
+                malformed
+            );
+            assert_eq!(
+                validate_stored_single_callable_with_array_targets(store, type_, targets),
+                malformed_single
+            );
+            assert_eq!(snapshot(store), before);
+            assert!(store.set_structured_type_members(
+                type_,
+                structured.members,
+                structured.properties.clone(),
+                structured.signatures.clone(),
+                None,
+                structured.index_infos.clone(),
+            ));
+            assert_eq!(
+                validate_stored_callable_set_with_array_targets(store, type_, targets),
+                expected
+            );
+            assert_eq!(
+                store.type_payload(type_).unwrap().data().structured(),
+                Some(&structured)
+            );
+            assert_eq!(store.intersection_keys_by_type.get(&type_), Some(&key));
+            assert_eq!(store.intersection_types.get(&key), Some(&type_));
+            assert_eq!(snapshot(store), before);
+        }
+        assert!(diagnostics.is_empty());
     }
 }

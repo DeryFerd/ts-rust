@@ -616,6 +616,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_alias_callables: HashMap<TypeId, InstantiatedPropertyAliasCallable>,
     published_interface_method_recoveries: HashMap<TypeId, PublishedInterfaceMethodRecovery>,
+    instantiated_property_alias_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
     instantiated_index_recoveries: HashMap<IndexInfoId, InstantiatedIndexRecovery>,
     property_object_alias_recoveries: HashMap<TypeId, PropertyObjectAliasRecovery>,
@@ -791,6 +792,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             declared_value_provenance: HashMap::new(),
             instantiated_property_alias_callables: HashMap::new(),
             published_interface_method_recoveries: HashMap::new(),
+            instantiated_property_alias_callable_types_by_signature: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
             instantiated_index_recoveries: HashMap::new(),
             property_object_alias_recoveries: HashMap::new(),
@@ -9748,6 +9750,10 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         self.instantiated_property_alias_callables
             .try_reserve(1)
             .is_ok()
+            && self
+                .instantiated_property_alias_callable_types_by_signature
+                .try_reserve(1)
+                .is_ok()
     }
 
     /// A copied callable keeps its original mapping capability without granting it to a reader.
@@ -9757,7 +9763,23 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     ) -> Option<InstantiatedPropertyAliasCallable> {
         self.observe_relation_type_read(type_);
         let origin = *self.instantiated_property_alias_callables.get(&type_)?;
-        (origin.type_() == type_ && origin.matches_current_type(self)).then_some(origin)
+        (origin.type_() == type_
+            && self.instantiated_property_alias_callable_type_for_signature(origin.signature())
+                == Some(type_)
+            && origin.matches_current_type(self))
+        .then_some(origin)
+    }
+
+    /// Returns the recorded owner even when its forward proof is damaged.
+    /// The signature reader must validate that proof before returning a value.
+    pub(super) fn instantiated_property_alias_callable_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.instantiated_property_alias_callable_types_by_signature
+            .get(&signature)
+            .copied()
     }
 
     /// Only the property-function producer can construct this immutable record.
@@ -9769,12 +9791,17 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         if self
             .instantiated_property_alias_callables
             .contains_key(&type_)
+            || self
+                .instantiated_property_alias_callable_types_by_signature
+                .contains_key(&origin.signature())
             || !origin.matches_current_type(self)
         {
             return false;
         }
         self.instantiated_property_alias_callables
             .insert(type_, origin);
+        self.instantiated_property_alias_callable_types_by_signature
+            .insert(origin.signature(), type_);
         self.mark_relation_inputs_dirty();
         self.mark_union_cache_validation_dirty();
         true
@@ -9783,6 +9810,31 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     #[cfg(test)]
     pub(super) fn instantiated_property_alias_callable_len(&self) -> usize {
         self.instantiated_property_alias_callables.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn instantiated_property_alias_callable_signature_len(&self) -> usize {
+        self.instantiated_property_alias_callable_types_by_signature
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_instantiated_property_alias_callable_type_for_signature_for_test(
+        &mut self,
+        signature: SignatureId,
+        owner: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let previous = match owner {
+            Some(owner) => self
+                .instantiated_property_alias_callable_types_by_signature
+                .insert(signature, owner),
+            None => self
+                .instantiated_property_alias_callable_types_by_signature
+                .remove(&signature),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
     }
 
     #[cfg(test)]
@@ -13080,7 +13132,7 @@ mod tests {
 
         let flags = store.type_payload(result).unwrap().object_flags();
         for changed in [
-            flags | ObjectFlags::CLASS,
+            flags | ObjectFlags::OBJECT_LITERAL,
             flags
                 | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
                 | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,

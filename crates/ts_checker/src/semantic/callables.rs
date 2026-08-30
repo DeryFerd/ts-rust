@@ -10,7 +10,7 @@
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     array_types::CanonicalArrayTargets,
-    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set_with_array_targets},
     functions::{
         FunctionTypeDisplayError, StoredFunctionTypeValidation, function_type_display_projection,
         validate_stored_function_type,
@@ -140,7 +140,16 @@ pub(super) fn validate_stored_single_callable(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> StoredSingleCallableValidation {
-    match validate_stored_callable_set(store, type_) {
+    validate_stored_single_callable_with_array_targets(store, type_, None)
+}
+
+/// Keeps the caller's array targets while selecting an exact stored callable.
+pub(super) fn validate_stored_single_callable_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> StoredSingleCallableValidation {
+    match validate_stored_callable_set_with_array_targets(store, type_, array_targets) {
         StoredCallableSetValidation::NotCallable => StoredSingleCallableValidation::NotCallable,
         StoredCallableSetValidation::Pending { family } => {
             StoredSingleCallableValidation::Pending { family }

@@ -2987,6 +2987,7 @@ impl OrdinaryIntersectionAliasRequestRecovery {
         (self.symbol, self.key)
     }
 
+    #[cfg(test)]
     pub(super) const fn result(&self) -> TypeId {
         self.result
     }
@@ -26721,10 +26722,36 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &mut self,
         signature: SignatureId,
     ) -> Result<TypeId, DeclaredTypeError> {
-        if !self.pending_function_parameters.is_empty() {
+        if !self.pending_function_parameters.is_empty()
+            || self.resolving_instantiated_signatures.contains(&signature)
+        {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
             ));
+        }
+        if let Some(return_type) =
+            super::instantiated_members::instantiated_property_function_signature_return_type(
+                self.store,
+                signature,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+            )
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+            })?
+        {
+            let declaration = self
+                .store
+                .signature(signature)
+                .and_then(Signature::target)
+                .and_then(|target| self.store.signature(target))
+                .and_then(Signature::declaration)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                })?;
+            self.require_type_reference_alias_root_capability(declaration)?;
+            return Ok(return_type);
         }
         if let Some(type_) = self
             .store
@@ -42573,6 +42600,133 @@ mod tests {
             assert!(query.store.type_node_links(property.type_node).is_none());
             assert!(query.store.value_symbol_links(property.symbol).is_none());
         }
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A ready copied return still rejects an unrelated admitted import root.
+    fn inline_property_function_signature_return_keeps_its_import_root_boundary() {
+        let mut fixture = global_array_fixture(concat!(
+            "import type { Remote as Local } from 'pkg'; type Remote = string; ",
+            "type Observer<T> = { next: (value: T) => void }; ",
+            "declare const observer: Observer<string>; declare const unrelated: Local;",
+        ));
+        let globals = initialize_fixture_global_types(&mut fixture);
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let binding = named_node(&fixture, SyntaxKind::ImportSpecifier, "Local");
+        let alias = node_symbol(&fixture, binding);
+        let target = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Remote");
+        assert!(fixture.store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(target),
+                alias_target: crate::semantic::AliasTargetState::Resolved(target),
+                referenced: false,
+                type_only_declaration: Some(binding),
+            },
+        ));
+        let unrelated = variable_type_node(&fixture, "unrelated");
+        let capability = CanonicalTypeReferenceAliasTarget::new(
+            unrelated, unrelated, binding, alias, target, target,
+        );
+        let observer = variable_type_node(&fixture, "observer");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let options = CanonicalCheckerOptions::default();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut fixture.store,
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let receiver = query.get_type_from_type_node(observer).unwrap();
+        let members = super::super::instantiated_members::resolve_property_object_alias_members_with_array_targets(
+            query.store, receiver, targets,
+        )
+        .unwrap();
+        let value = super::super::instantiated_members::demand_property_object_alias_property(
+            query.store,
+            query.host,
+            &globals,
+            options,
+            query.instantiation_session.as_deref_mut().unwrap(),
+            query.diagnostics,
+            receiver,
+            members.properties[0],
+        )
+        .unwrap();
+        let signature = query
+            .store
+            .instantiated_property_alias_callable(value)
+            .unwrap()
+            .signature();
+        let void = query.store.intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(void));
+        let mut query = query
+            .with_type_reference_alias_targets([capability])
+            .unwrap();
+        let before = (
+            function_store_state(query.store),
+            query.store.instantiated_property_alias_callable_len(),
+            query
+                .store
+                .instantiated_property_alias_callable_signature_len(),
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        let work = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_return_type_of_signature(signature),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::ImportAliasCapabilityUnsupported(unrelated)
+                ))
+            );
+            assert_eq!(
+                (
+                    function_store_state(query.store),
+                    query.store.instantiated_property_alias_callable_len(),
+                    query
+                        .store
+                        .instantiated_property_alias_callable_signature_len(),
+                ),
+                before
+            );
+        }
+        assert_eq!(
+            query.type_reference_alias_targets.remove(&unrelated),
+            Some(capability)
+        );
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(void));
+        assert_eq!(
+            (
+                function_store_state(query.store),
+                query.store.instantiated_property_alias_callable_len(),
+                query
+                    .store
+                    .instantiated_property_alias_callable_signature_len(),
+            ),
+            before
+        );
+        let session = query.instantiation_session.as_deref().unwrap();
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            work
+        );
         assert!(query.diagnostics.is_empty());
     }
 

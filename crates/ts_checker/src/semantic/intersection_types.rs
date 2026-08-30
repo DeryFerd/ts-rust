@@ -298,6 +298,7 @@ impl CanonicalTypeMapperStore {
     }
 
     /// Interns an authenticated intersection without resolving constituent members.
+    #[cfg(test)]
     pub(super) fn canonical_deferred_intersection_type(
         &mut self,
         input: &[TypeId],

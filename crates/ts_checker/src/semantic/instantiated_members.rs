@@ -147,6 +147,7 @@ pub(super) struct PropertyObjectAliasMembers {
 pub(super) struct InstantiatedPropertyAliasCallable {
     type_: TypeId,
     source: TypeId,
+    signature: SignatureId,
     mapper: TypeMapperId,
     array_targets: Option<CanonicalArrayTargets>,
 }
@@ -154,6 +155,10 @@ pub(super) struct InstantiatedPropertyAliasCallable {
 impl InstantiatedPropertyAliasCallable {
     pub(super) const fn type_(self) -> TypeId {
         self.type_
+    }
+
+    pub(super) const fn signature(self) -> SignatureId {
+        self.signature
     }
 
     pub(super) fn matches_current_type(self, store: &CanonicalTypeMapperStore) -> bool {
@@ -179,6 +184,9 @@ impl InstantiatedPropertyAliasCallable {
         let Some([copied_id]) = object.structured.signatures.as_deref() else {
             return false;
         };
+        if *copied_id != self.signature {
+            return false;
+        }
         let Some(original) = store.signature(signature.source) else {
             return false;
         };
@@ -2423,6 +2431,7 @@ fn property_object_alias_member_table(
 }
 
 /// Creates only member names and proxies. Original annotations remain lazy.
+#[cfg(test)]
 pub(super) fn resolve_property_object_alias_members(
     store: &mut CanonicalTypeMapperStore,
     receiver: TypeId,
@@ -5222,6 +5231,7 @@ fn instantiate_function_member_type(
             InstantiatedPropertyAliasCallable {
                 type_: callable,
                 source,
+                signature,
                 mapper,
                 array_targets,
             },
@@ -5842,6 +5852,74 @@ pub(super) fn instantiated_function_member_signature_return(
         }
         callable.return_type.ok_or_else(invalid)
     })())
+}
+
+/// Reads a ready copied property signature through its immutable producer identity.
+/// Neither retained array targets nor a cached return grant authority to this caller.
+pub(super) fn instantiated_property_function_signature_return_type(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, RelationUnavailable> {
+    let Some(type_) = store.instantiated_property_alias_callable_type_for_signature(signature)
+    else {
+        return Ok(None);
+    };
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_);
+    let origin = store
+        .instantiated_property_alias_callable(type_)
+        .ok_or_else(invalid)?;
+    if origin.signature != signature {
+        return Err(invalid());
+    }
+    let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+        validate_instantiated_function_member_callable(store, type_)
+    else {
+        return Err(invalid());
+    };
+    let [recorded] = projection.call_signatures.as_ref() else {
+        return Err(invalid());
+    };
+    if projection.owner != type_
+        || !projection.construct_signatures.is_empty()
+        || recorded.signature != signature
+    {
+        return Err(invalid());
+    }
+    let receiver = instantiated_function_property_owner(store, origin.source, origin.mapper)
+        .ok_or_else(invalid)?;
+    let recovery = match instantiated_function_property_recovery(
+        store,
+        origin.source,
+        type_,
+        origin.mapper,
+        receiver,
+    )
+    .ok_or_else(invalid)?
+    {
+        FunctionPropertyRecovery::Normal => None,
+        FunctionPropertyRecovery::Recovered(identity) => {
+            Some(InstantiatedFunctionRecovery::Property(identity))
+        }
+    };
+    let current = instantiated_function_member_projection(
+        store,
+        origin.source,
+        type_,
+        origin.mapper,
+        array_targets,
+        recovery,
+    )
+    .ok_or_else(invalid)?;
+    if current.signature != signature || current.return_type != recorded.return_type {
+        return Err(invalid());
+    }
+    for targets in [origin.array_targets, array_targets] {
+        store
+            .validate_cached_array_capability_with_pending_functions(targets, type_, &[])
+            .map_err(|_| invalid())?;
+    }
+    current.return_type.map(Some).ok_or_else(invalid)
 }
 
 /// Uses declaration names and optional markers with mapped parameter values.
@@ -8656,6 +8734,44 @@ mod tests {
         )
     }
 
+    fn query_property_function_return(
+        fixture: &mut PropertyFunctionFixture<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        signature: SignatureId,
+        session: &mut InstantiationSession,
+        with_globals: bool,
+    ) -> Result<TypeId, crate::semantic::DeclaredTypeError> {
+        let globals = fixture.context.global_types().clone();
+        let bound = fixture.context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                fixture.options.name_resolution,
+            ),
+        )
+        .unwrap();
+        let mut query = if with_globals {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                fixture.context.store_mut_for_test(),
+                &host,
+                &globals,
+                fixture.options,
+                session,
+                &mut fixture.diagnostics,
+            )?
+        } else {
+            CanonicalTypeQuery::new_with_session_for_test(
+                fixture.context.store_mut_for_test(),
+                &host,
+                fixture.options,
+                session,
+                &mut fixture.diagnostics,
+            )?
+        };
+        query.get_return_type_of_signature(signature)
+    }
+
     fn property_function_source() -> ParseResult {
         parse_source_file(concat!(
             "interface Array<T> {} interface ReadonlyArray<T> {} ",
@@ -9631,6 +9747,355 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Each stored owner and signature edge must reject damage without publication.
+    fn inline_property_function_signature_owner_records_reject_damage_without_growth() {
+        use crate::semantic::{DeclaredTypeError, TypeNodeUnavailable};
+
+        for mutation in [
+            "forward_missing",
+            "forward_signature",
+            "reverse_missing",
+            "reverse_owner",
+            "reverse_original_signature",
+            "signature_list",
+            "signature_mapper",
+            "signature_return",
+        ] {
+            let parsed = property_function_source();
+            let file = FileId::new(20_208);
+            let mut fixture = property_function_fixture(&parsed, file);
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                fixture.context.global_types(),
+            ));
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let value =
+                demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+            let store = fixture.context.store_mut_for_test();
+            let original = store.instantiated_property_alias_callable(value).unwrap();
+            let signature = original.signature;
+            let (symbol, template) = function_member_signature(store, fixture.source).unwrap();
+            let sibling = instantiate_generic_method_signature(
+                store,
+                template.source,
+                &template.parameter_types,
+                template.return_type,
+                fixture.mapper,
+                targets,
+                &mut session,
+                symbol,
+                fixture.source,
+            )
+            .unwrap();
+            assert_ne!(sibling, signature);
+            assert_eq!(
+                store.signature(sibling).unwrap().target(),
+                Some(fixture.signature)
+            );
+            assert_eq!(
+                store.signature(sibling).unwrap().mapper(),
+                Some(fixture.mapper)
+            );
+            let void = store.intrinsic_bootstrap().unwrap().void_type;
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let wrong_mapper = store
+                .new_simple_type_mapper(fixture.parameter, string)
+                .unwrap();
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    property_recovery_store_counts(store),
+                    store.instantiated_property_alias_callable_len(),
+                    store.instantiated_property_alias_callable_signature_len(),
+                )
+            };
+            let before = snapshot(store);
+            assert_eq!(
+                store.instantiated_property_alias_callable_type_for_signature(signature),
+                Some(value)
+            );
+            assert_eq!(
+                store.instantiated_property_alias_callable_type_for_signature(sibling),
+                None
+            );
+            assert!(!store.publish_instantiated_property_alias_callable(original));
+            let requested = if mutation == "reverse_original_signature" {
+                fixture.signature
+            } else {
+                signature
+            };
+            match mutation {
+                "forward_missing" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_for_test(value, None),
+                    Some(original)
+                ),
+                "forward_signature" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_for_test(
+                        value,
+                        Some(InstantiatedPropertyAliasCallable {
+                            signature: sibling,
+                            ..original
+                        })
+                    ),
+                    Some(original)
+                ),
+                "reverse_missing" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_type_for_signature_for_test(
+                        signature, None,
+                    ),
+                    Some(value)
+                ),
+                "reverse_owner" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_type_for_signature_for_test(
+                        signature,
+                        Some(fixture.source),
+                    ),
+                    Some(value)
+                ),
+                "reverse_original_signature" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_type_for_signature_for_test(
+                        requested,
+                        Some(value),
+                    ),
+                    None
+                ),
+                "signature_list" => assert!(store.set_structured_type_members(
+                    value,
+                    None,
+                    None,
+                    Some(vec![sibling]),
+                    None,
+                    None,
+                )),
+                "signature_mapper" => assert!(store.set_signature_target_and_mapper(
+                    signature,
+                    Some(fixture.signature),
+                    Some(wrong_mapper),
+                )),
+                "signature_return" => {
+                    assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+                }
+                _ => unreachable!(),
+            }
+            let damaged = snapshot(store);
+            // A remaining forward or reverse key must block partial re-publication.
+            assert!(!store.publish_instantiated_property_alias_callable(original));
+            assert_eq!(snapshot(store), damaged);
+            let work = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    query_property_function_return(
+                        &mut fixture,
+                        &parsed,
+                        file,
+                        requested,
+                        &mut session,
+                        true,
+                    ),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(requested)
+                    )),
+                    "{mutation}"
+                );
+                assert_eq!(snapshot(fixture.context.store()), damaged, "{mutation}");
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    work
+                );
+                assert!(fixture.diagnostics.is_empty());
+            }
+            let store = fixture.context.store_mut_for_test();
+            match mutation {
+                "forward_missing" | "forward_signature" => {
+                    let expected = (mutation == "forward_signature").then_some(
+                        InstantiatedPropertyAliasCallable {
+                            signature: sibling,
+                            ..original
+                        },
+                    );
+                    assert_eq!(
+                        store.replace_instantiated_property_alias_callable_for_test(
+                            value,
+                            Some(original),
+                        ),
+                        expected
+                    );
+                }
+                "reverse_missing" | "reverse_owner" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_type_for_signature_for_test(
+                        signature,
+                        Some(value),
+                    ),
+                    (mutation == "reverse_owner").then_some(fixture.source)
+                ),
+                "reverse_original_signature" => assert_eq!(
+                    store.replace_instantiated_property_alias_callable_type_for_signature_for_test(
+                        requested, None,
+                    ),
+                    Some(value)
+                ),
+                "signature_list" => assert!(store.set_structured_type_members(
+                    value,
+                    None,
+                    None,
+                    Some(vec![signature]),
+                    None,
+                    None,
+                )),
+                "signature_mapper" => assert!(store.set_signature_target_and_mapper(
+                    signature,
+                    Some(fixture.signature),
+                    Some(fixture.mapper),
+                )),
+                "signature_return" => {
+                    assert!(store.set_signature_resolved_return_type(signature, Some(void)));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store.instantiated_property_alias_callable(value),
+                Some(original)
+            );
+            assert_eq!(snapshot(store), before);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_property_function_return(
+                        &mut fixture,
+                        &parsed,
+                        file,
+                        signature,
+                        &mut session,
+                        true,
+                    ),
+                    Ok(void),
+                    "{mutation}"
+                );
+                assert_eq!(
+                    query_property_function_return(
+                        &mut fixture,
+                        &parsed,
+                        file,
+                        signature,
+                        &mut session,
+                        false,
+                    ),
+                    Ok(void)
+                );
+                assert_eq!(
+                    query_property_function_return(
+                        &mut fixture,
+                        &parsed,
+                        file,
+                        sibling,
+                        &mut session,
+                        true,
+                    ),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(sibling)
+                    ))
+                );
+                assert_eq!(snapshot(fixture.context.store()), before);
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    work
+                );
+                assert!(fixture.diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn inline_property_function_signature_recovery_keeps_the_existing_receipt_and_budget() {
+        let parsed = property_function_source();
+        let file = FileId::new(20_209);
+        let mut fixture = property_function_fixture(&parsed, file);
+        let error_type = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .error_type;
+        let mut session = InstantiationSession::new_recovering(
+            fixture.context.store(),
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let value = demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+        let signature = property_function_callable(fixture.context.store(), value, error_type);
+        let void = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .void_type;
+        let property = fixture.property;
+        let recovery_snapshot = |store: &CanonicalTypeMapperStore| {
+            let recovery = store.instantiated_property_recovery(property).unwrap();
+            assert!(recovery.checked_identity(store).is_some());
+            (
+                recovery.valid,
+                recovery.method,
+                recovery.symbol,
+                recovery.target,
+                recovery.template,
+                recovery.mapper,
+                recovery.result,
+                recovery.array_targets,
+                recovery.identity.len(),
+            )
+        };
+        let recovery = recovery_snapshot(fixture.context.store());
+        let before = property_recovery_store_counts(fixture.context.store());
+        let work = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        assert!(work.2 > 0);
+        for _ in 0..2 {
+            assert_eq!(
+                query_property_function_return(
+                    &mut fixture,
+                    &parsed,
+                    file,
+                    signature,
+                    &mut session,
+                    true,
+                ),
+                Ok(void)
+            );
+            assert_eq!(
+                property_recovery_store_counts(fixture.context.store()),
+                before
+            );
+            assert_eq!(recovery_snapshot(fixture.context.store()), recovery);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                work
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Each poisoned identity must fail before a warm demand can allocate.
     fn property_alias_function_warm_reads_reject_changed_owners_mappers_and_signatures() {
         for mutation in [
@@ -10005,6 +10470,160 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // The copied return has an actual array edge under both read capabilities.
+    fn inline_property_function_signature_returns_require_both_array_capabilities() {
+        use crate::semantic::{DeclaredTypeError, TypeNodeUnavailable};
+
+        for (annotation, argument) in [("T[]", "string"), ("T", "string[]")] {
+            let parsed = array_property_function_source(annotation, argument);
+            let file = FileId::new(20_210);
+            let mut fixture = property_function_fixture_with_options(
+                &parsed,
+                file,
+                array_property_function_options(),
+                false,
+            );
+            let targets = CanonicalArrayTargets::from_global_types(fixture.context.global_types());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let value =
+                demand_property_function(&mut fixture, &parsed, file, &mut session).unwrap();
+            let store = fixture.context.store();
+            let original = store.instantiated_property_alias_callable(value).unwrap();
+            let signature = original.signature;
+            let expected = store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type()
+                .unwrap();
+            let array = store
+                .canonical_array_reference(fixture.context.global_types(), expected)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                array.element_type,
+                store.intrinsic_bootstrap().unwrap().string_type
+            );
+            let mut foreign = CanonicalTypeMapperStore::new();
+            let foreign_type = foreign
+                .alloc_intrinsic_type(TypeFlags::ANY, "foreign")
+                .unwrap();
+            let foreign_targets = CanonicalArrayTargets::for_test(foreign_type, foreign_type);
+            let wrong_targets =
+                CanonicalArrayTargets::for_single_target_validation(targets.readonly_array_type());
+            let snapshot = |store: &CanonicalTypeMapperStore| {
+                (
+                    property_recovery_store_counts(store),
+                    store.instantiated_property_alias_callable_len(),
+                    store.instantiated_property_alias_callable_signature_len(),
+                )
+            };
+            let before = snapshot(store);
+            let work = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            for current in [None, Some(wrong_targets), Some(foreign_targets)] {
+                for _ in 0..2 {
+                    assert_eq!(
+                        instantiated_property_function_signature_return_type(
+                            fixture.context.store(),
+                            signature,
+                            current,
+                        ),
+                        Err(RelationUnavailable::InvalidStructuredMembers(value))
+                    );
+                    assert_eq!(snapshot(fixture.context.store()), before);
+                }
+            }
+            assert_eq!(
+                query_property_function_return(
+                    &mut fixture,
+                    &parsed,
+                    file,
+                    signature,
+                    &mut session,
+                    false,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature)
+                ))
+            );
+            for recorded in [None, Some(wrong_targets), Some(foreign_targets)] {
+                let damaged = InstantiatedPropertyAliasCallable {
+                    array_targets: recorded,
+                    ..original
+                };
+                assert_eq!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .replace_instantiated_property_alias_callable_for_test(
+                            value,
+                            Some(damaged)
+                        ),
+                    Some(original)
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        query_property_function_return(
+                            &mut fixture,
+                            &parsed,
+                            file,
+                            signature,
+                            &mut session,
+                            true,
+                        ),
+                        Err(DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::InvalidFunctionSignature(signature)
+                        ))
+                    );
+                    assert_eq!(snapshot(fixture.context.store()), before);
+                    assert_eq!(
+                        (
+                            session.query_count(),
+                            session.total_count(),
+                            session.limit_event_count()
+                        ),
+                        work
+                    );
+                }
+                assert_eq!(
+                    fixture
+                        .context
+                        .store_mut_for_test()
+                        .replace_instantiated_property_alias_callable_for_test(
+                            value,
+                            Some(original)
+                        ),
+                    Some(damaged)
+                );
+                assert_eq!(
+                    query_property_function_return(
+                        &mut fixture,
+                        &parsed,
+                        file,
+                        signature,
+                        &mut session,
+                        true,
+                    ),
+                    Ok(expected)
+                );
+                assert_eq!(snapshot(fixture.context.store()), before);
+            }
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                work
+            );
+            assert!(fixture.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn property_alias_function_outer_parameter_union_is_an_atomic_source_boundary() {
         use crate::semantic::{DeclaredTypeError, TypeNodeUnavailable};
 
@@ -10182,6 +10801,15 @@ mod tests {
                 InstantiatedPropertyAliasCallable {
                     type_: value,
                     source: fixture.source,
+                    signature: store
+                        .type_payload(value)
+                        .unwrap()
+                        .data()
+                        .structured()
+                        .unwrap()
+                        .signatures
+                        .as_ref()
+                        .unwrap()[0],
                     mapper: fixture.mapper,
                     array_targets: Some(targets),
                 }

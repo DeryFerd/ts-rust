@@ -25,11 +25,12 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     callable_sets::{
         StoredCallableSetValidation, validate_stored_callable_set,
+        validate_stored_callable_set_with_array_targets,
         validate_stored_declared_method_callable_set,
     },
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
-        validate_stored_single_callable,
+        validate_stored_single_callable, validate_stored_single_callable_with_array_targets,
     },
     calls::{
         DirectCallError, DirectCallInvariant,
@@ -2790,11 +2791,19 @@ impl<'store> RelaterSession<'store> {
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
         let source_callable = matches!(
-            validate_stored_single_callable(self.store, source),
+            validate_stored_single_callable_with_array_targets(
+                self.store,
+                source,
+                self.global_types.map(|globals| globals.array_targets),
+            ),
             StoredSingleCallableValidation::Valid { .. }
         );
         let target_callable = matches!(
-            validate_stored_single_callable(self.store, target),
+            validate_stored_single_callable_with_array_targets(
+                self.store,
+                target,
+                self.global_types.map(|globals| globals.array_targets),
+            ),
             StoredSingleCallableValidation::Valid { .. }
         );
         if !source_callable && !target_callable {
@@ -6693,9 +6702,11 @@ impl<'store> RelaterSession<'store> {
         type_id: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<(), RelationUnavailable> {
-        let is_function = self
-            .store
-            .admit_callable_relation_type(type_id, self.strict_function_types)?;
+        let is_function = self.store.admit_callable_relation_type_with_array_targets(
+            type_id,
+            self.strict_function_types,
+            self.global_types.map(|globals| globals.array_targets),
+        )?;
         if is_function {
             self.ensure_supported_object_kind(type_id, allow_fresh_literal)
                 .map_err(|_| RelationUnavailable::MalformedFunctionType(type_id))?;
@@ -7050,7 +7061,11 @@ impl<'store> RelaterSession<'store> {
         &mut self,
         type_: TypeId,
     ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
-        let callable = match validate_stored_single_callable(self.store, type_) {
+        let callable = match validate_stored_single_callable_with_array_targets(
+            self.store,
+            type_,
+            self.global_types.map(|globals| globals.array_targets),
+        ) {
             StoredSingleCallableValidation::NotCallable => {
                 let Some(symbol) = self.store.type_payload(type_).and_then(TypeRecord::symbol)
                 else {
@@ -7101,10 +7116,11 @@ impl<'store> RelaterSession<'store> {
         type_: TypeId,
         allow_fresh_literal: bool,
     ) -> Result<ResolvedObjectMembers, RelationUnavailable> {
-        if self
-            .store
-            .admit_callable_relation_type(type_, self.strict_function_types)?
-        {
+        if self.store.admit_callable_relation_type_with_array_targets(
+            type_,
+            self.strict_function_types,
+            self.global_types.map(|globals| globals.array_targets),
+        )? {
             self.ensure_supported_object_kind(type_, allow_fresh_literal)
                 .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
             return Ok(ResolvedObjectMembers {
@@ -7306,9 +7322,11 @@ impl<'store> RelaterSession<'store> {
                 exact_callable: false,
             });
         }
-        let is_function = self
-            .store
-            .admit_callable_relation_type(type_id, self.strict_function_types)?;
+        let is_function = self.store.admit_callable_relation_type_with_array_targets(
+            type_id,
+            self.strict_function_types,
+            self.global_types.map(|globals| globals.array_targets),
+        )?;
         self.ensure_supported_object_kind(type_id, allow_fresh_literal)
             .map_err(|error| {
                 if is_function {
@@ -8015,7 +8033,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         strict_function_types: bool,
     ) -> Result<Option<(usize, usize)>, RelationUnavailable> {
         for type_ in [source, target] {
-            match validate_stored_callable_set(self, type_) {
+            match validate_stored_callable_set_with_array_targets(
+                self,
+                type_,
+                Some(CanonicalArrayTargets::from_global_types(global_types)),
+            ) {
                 StoredCallableSetValidation::Valid { projection, .. }
                     if !projection.construct_signatures.is_empty() => {}
                 StoredCallableSetValidation::NotCallable
@@ -8100,12 +8122,22 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         )))
     }
 
+    #[cfg(test)]
     fn admit_callable_relation_type(
         &self,
         type_: TypeId,
         strict_function_types: Option<bool>,
     ) -> Result<bool, RelationUnavailable> {
-        match validate_stored_single_callable(self, type_) {
+        self.admit_callable_relation_type_with_array_targets(type_, strict_function_types, None)
+    }
+
+    fn admit_callable_relation_type_with_array_targets(
+        &self,
+        type_: TypeId,
+        strict_function_types: Option<bool>,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> Result<bool, RelationUnavailable> {
+        match validate_stored_single_callable_with_array_targets(self, type_, array_targets) {
             StoredSingleCallableValidation::NotCallable => Ok(false),
             StoredSingleCallableValidation::Pending { .. } => {
                 Err(if strict_function_types.is_some() {
@@ -9193,9 +9225,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 global_types.map(|globals| globals.array_targets),
             )?;
         }
-        self.admit_callable_relation_type(source, strict_function_types)?;
+        self.admit_callable_relation_type_with_array_targets(
+            source,
+            strict_function_types,
+            global_types.map(|globals| globals.array_targets),
+        )?;
         if target != source {
-            self.admit_callable_relation_type(target, strict_function_types)?;
+            self.admit_callable_relation_type_with_array_targets(
+                target,
+                strict_function_types,
+                global_types.map(|globals| globals.array_targets),
+            )?;
         }
         if source == target {
             return Ok(true);
@@ -11786,7 +11826,7 @@ mod tests {
         );
         assert_eq!(
             super::validated_intersection_relation_projection(context.store(), receiver, None),
-            Err(malformed)
+            Err(expected)
         );
         let mut session = super::InstantiationSession::new(super::InstantiationLimits::default());
         assert_eq!(
@@ -11926,6 +11966,214 @@ mod tests {
             Some(&receiver)
         );
         assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Follow one ready source intersection through each callable admission reader.
+    fn ready_inline_intersection_relation_keeps_array_targets_through_callable_admission() {
+        use crate::semantic::intersection_types::demand_source_intersection_members;
+
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "type Tail<T> = { tail: T }; type Packet<T> = { items: T[] } & Tail<T>; ",
+            "declare const input: Packet<string>;",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        let file = FileId::new(99_157);
+        let options = CanonicalCheckerOptions::default();
+        let mut context = source_relation_context(&library, &source, file, options);
+        let annotation = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|node| NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let receiver = context.get_type_from_type_node(annotation).unwrap();
+        let globals = context.global_types().clone();
+        let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+        let foreign = source_relation_context(&library, &source, FileId::new(99_158), options);
+        let foreign_targets = Some(CanonicalArrayTargets::from_global_types(
+            foreign.global_types(),
+        ));
+        assert_ne!(targets, foreign_targets);
+        let bound = context.file(file).unwrap().1.clone();
+        let library_bound = context.file(FileId::new(96_450)).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut instantiations =
+            super::InstantiationSession::new(super::InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let store = context.store_mut_for_test();
+        assert_eq!(
+            demand_source_intersection_members(
+                store,
+                &host,
+                &globals,
+                options,
+                &mut instantiations,
+                &mut diagnostics,
+                receiver,
+            ),
+            Ok(receiver)
+        );
+        let ready =
+            super::validated_intersection_relation_projection(store, receiver, targets).unwrap();
+        assert_eq!(ready.properties.len(), 2);
+        let items = ready
+            .properties
+            .iter()
+            .copied()
+            .find(|property| store.symbol(*property).unwrap().name().as_utf8() == Some("items"))
+            .unwrap();
+        let items_type = store
+            .value_symbol_links(items)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            store.canonical_array_element_type(&globals, items_type),
+            Ok(Some(store.intrinsic_bootstrap().unwrap().string_type))
+        );
+        assert_eq!(
+            store.claim_strict_function_types(options.strict_function_types),
+            Ok(())
+        );
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                [
+                    store.type_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.type_alias_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.intersection_types.len(),
+                store.intersection_keys_by_type.len(),
+            )
+        };
+        let before = snapshot(store);
+        let work = (
+            instantiations.query_count(),
+            instantiations.total_count(),
+            instantiations.limit_event_count(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                store.admit_callable_relation_type_with_array_targets(
+                    receiver,
+                    Some(options.strict_function_types),
+                    targets
+                ),
+                Ok(false)
+            );
+            assert_eq!(
+                store.admit_callable_relation_type_with_array_targets(receiver, None, targets),
+                Ok(false)
+            );
+            for missing_or_foreign in [None, foreign_targets] {
+                assert_eq!(
+                    store.admit_callable_relation_type_with_array_targets(
+                        receiver,
+                        Some(options.strict_function_types),
+                        missing_or_foreign
+                    ),
+                    Err(RelationUnavailable::MalformedFunctionType(receiver))
+                );
+            }
+            assert_eq!(
+                store.admit_callable_relation_type(receiver, Some(options.strict_function_types)),
+                Err(RelationUnavailable::MalformedFunctionType(receiver))
+            );
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    receiver,
+                    receiver,
+                    Some(&globals),
+                    Some(options.strict_function_types),
+                    &mut instantiations
+                ),
+                Ok(true)
+            );
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    receiver,
+                    receiver,
+                    None,
+                    Some(options.strict_function_types),
+                    &mut instantiations
+                ),
+                Err(RelationUnavailable::MalformedIntersection(receiver))
+            );
+            assert_eq!(
+                store.constructor_arity_mismatch(
+                    receiver,
+                    receiver,
+                    &globals,
+                    options.strict_function_types
+                ),
+                Ok(None)
+            );
+            let property = store
+                .resolved_own_property_by_key_with_optional_context(
+                    receiver,
+                    ts_binder::EscapedNameRef::source("items"),
+                    Some(&globals),
+                    Some(&mut instantiations),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(property.symbol, items);
+            assert_eq!(property.type_, items_type);
+            {
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                let mut relation = super::RelaterSession::new_with_global_types_and_options(
+                    store,
+                    RelationKind::Assignable,
+                    bootstrap,
+                    Some(RelationGlobalTypes::from_global_types(&globals)),
+                    Some(options.strict_function_types),
+                );
+                assert_eq!(
+                    relation.ensure_callable_relation_admission(receiver, false),
+                    Ok(())
+                );
+                assert_eq!(
+                    relation.project_exact_callable_signature(receiver),
+                    Ok(None)
+                );
+                assert_eq!(
+                    relation.callable_tuple_relation(receiver, receiver),
+                    Ok(false)
+                );
+                let members = relation
+                    .resolved_object_property_surface(receiver, false)
+                    .unwrap();
+                assert_eq!(members.properties, ready.properties);
+                assert!(!members.exact_callable);
+            }
+            assert_eq!(snapshot(store), before);
+            assert_eq!(
+                (
+                    instantiations.query_count(),
+                    instantiations.total_count(),
+                    instantiations.limit_event_count()
+                ),
+                work
+            );
+        }
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
