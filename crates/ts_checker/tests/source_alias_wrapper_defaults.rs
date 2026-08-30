@@ -380,6 +380,35 @@ fn assert_cold_property(context: &CanonicalCheckerContext<'_>, property: Propert
     assert_eq!(node_type(context, property.annotation), None);
 }
 
+fn assert_parameter_property(
+    context: &CanonicalCheckerContext<'_>,
+    property: Property,
+    declaration: NodeRef,
+) {
+    let type_ = parameter(context, declaration);
+    assert_eq!(
+        context.store().type_payload(type_).unwrap().flags(),
+        TypeFlags::TYPE_PARAMETER
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(symbol(context, property.declaration)),
+        Some(&ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+    );
+    assert_eq!(node_type(context, property.annotation), Some(type_));
+    assert_eq!(
+        context
+            .store()
+            .symbol_node_links(property.annotation)
+            .and_then(|links| links.resolved_symbol),
+        Some(symbol(context, declaration))
+    );
+}
+
 fn assert_unchecked(context: &CanonicalCheckerContext<'_>, file: FileId) {
     assert!(
         context
@@ -648,6 +677,8 @@ fn closed_alias_defaults_keep_visible_identity_and_lazy_properties() {
     let spare = property(&provider, &box_, "spare");
     for query_first in [false, true] {
         let mut context = local_context(&provider, &source);
+        assert_cold_property(&context, value);
+        assert_cold_property(&context, spare);
         if !query_first {
             context.check_source_file(SOURCE).unwrap();
         }
@@ -676,7 +707,11 @@ fn closed_alias_defaults_keep_visible_identity_and_lazy_properties() {
                 )),
             None
         );
-        assert_cold_property(&context, value);
+        if query_first {
+            assert_cold_property(&context, value);
+        } else {
+            assert_parameter_property(&context, value, box_.parameters[0]);
+        }
         assert_cold_property(&context, spare);
         assert_unchecked(&context, PROVIDER);
         if query_first {
@@ -707,7 +742,7 @@ fn closed_alias_defaults_keep_visible_identity_and_lazy_properties() {
                 None
             );
         }
-        assert_cold_property(&context, value);
+        assert_parameter_property(&context, value, box_.parameters[0]);
         assert_cold_property(&context, spare);
         replay(
             &mut context,
@@ -719,6 +754,8 @@ fn closed_alias_defaults_keep_visible_identity_and_lazy_properties() {
             &[(first, string), (second, string)],
         );
         assert_unchecked(&context, PROVIDER);
+        assert_parameter_property(&context, value, box_.parameters[0]);
+        assert_cold_property(&context, spare);
     }
 }
 
@@ -736,6 +773,9 @@ fn partial_alias_defaults_keep_supplied_keys_and_effective_arguments() {
     let annotations = ["wrapped", "omitted", "explicit"].map(|name| variable(&source, name).0);
     for query_first in [false, true] {
         let mut context = local_context(&provider, &source);
+        for name in ["left", "right"] {
+            assert_cold_property(&context, property(&provider, &pair, name));
+        }
         if !query_first {
             context.check_source_file(SOURCE).unwrap();
         }
@@ -812,8 +852,14 @@ fn partial_alias_defaults_keep_supplied_keys_and_effective_arguments() {
             None
         );
         assert_request(&context, &wrapped, &[string], None, wrapped_type);
-        assert_cold_property(&context, property(&provider, &pair, "left"));
-        assert_cold_property(&context, property(&provider, &pair, "right"));
+        for (name, parameter) in ["left", "right"].into_iter().zip(&pair.parameters) {
+            let property = property(&provider, &pair, name);
+            if query_first {
+                assert_cold_property(&context, property);
+            } else {
+                assert_parameter_property(&context, property, *parameter);
+            }
+        }
         if query_first {
             assert_unchecked(&context, SOURCE);
         }
@@ -836,6 +882,9 @@ fn partial_alias_defaults_keep_supplied_keys_and_effective_arguments() {
             property(&provider, &pair, "right"),
             number,
         );
+        for (name, parameter) in ["left", "right"].into_iter().zip(&pair.parameters) {
+            assert_parameter_property(&context, property(&provider, &pair, name), *parameter);
+        }
         replay(
             &mut context,
             &[(&wrapped, declared)],
@@ -847,8 +896,9 @@ fn partial_alias_defaults_keep_supplied_keys_and_effective_arguments() {
             &[(left, string), (right, number)],
         );
         assert_unchecked(&context, PROVIDER);
-        assert_cold_property(&context, property(&provider, &pair, "left"));
-        assert_cold_property(&context, property(&provider, &pair, "right"));
+        for (name, parameter) in ["left", "right"].into_iter().zip(&pair.parameters) {
+            assert_parameter_property(&context, property(&provider, &pair, name), *parameter);
+        }
     }
 }
 
@@ -878,8 +928,10 @@ fn alias_wrapper_defaults_preserve_constraint_diagnostics_and_recovery() {
     let bound = alias(&provider, PROVIDER, "Bound");
     let aliases = ["Defaulted", "Explicit", "Rejected"].map(|name| alias(&source, SOURCE, name));
     let bad_argument = reference_argument(&source, aliases[2].body);
+    let value = property(&provider, &bound, "value");
     for query_first in [false, true] {
         let mut context = local_context(&provider, &source);
+        assert_cold_property(&context, value);
         if !query_first {
             context.check_source_file(SOURCE).unwrap();
         }
@@ -901,19 +953,13 @@ fn alias_wrapper_defaults_preserve_constraint_diagnostics_and_recovery() {
         };
         assert_eq!(data.constraint, Some(string));
         if query_first {
+            assert_cold_property(&context, value);
             assert_unchecked(&context, SOURCE);
         }
         context.check_source_file(SOURCE).unwrap();
         assert_constraint_diagnostic(&context, bad_argument);
-        let read = assert_read(
-            &mut context,
-            &source,
-            "read",
-            types[2],
-            property(&provider, &bound, "value"),
-            number,
-        );
-        assert_cold_property(&context, property(&provider, &bound, "value"));
+        let read = assert_read(&mut context, &source, "read", types[2], value, number);
+        assert_parameter_property(&context, value, bound.parameters[0]);
         let alias_queries = aliases.iter().zip(types).collect::<Vec<_>>();
         replay(
             &mut context,
@@ -922,6 +968,7 @@ fn alias_wrapper_defaults_preserve_constraint_diagnostics_and_recovery() {
             &[(read, number)],
         );
         assert_unchecked(&context, PROVIDER);
+        assert_parameter_property(&context, value, bound.parameters[0]);
     }
 }
 

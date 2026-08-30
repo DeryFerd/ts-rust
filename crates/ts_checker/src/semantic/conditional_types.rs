@@ -3651,6 +3651,36 @@ fn contains_type_parameter(
     visit(store, type_, excluded, &mut HashSet::new())
 }
 
+/// Reuses the conditional engine's deferred-operand proof for a simple source tuple.
+pub(super) fn simple_tuple_operand_is_deferred(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    element_infos: &[TupleElementInfo],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, ConditionalTypeError> {
+    if element_infos.is_empty()
+        || element_infos
+            .iter()
+            .any(|info| info.flags() != ElementFlags::REQUIRED)
+    {
+        return Ok(false);
+    }
+    let Some(shape) = store.canonical_tuple_shape(type_)? else {
+        return Ok(false);
+    };
+    if shape.element_infos() != element_infos || shape.is_readonly() {
+        return Err(ConditionalTypeError::InvalidType(type_));
+    }
+    match array_targets {
+        Some(targets) => {
+            store.validate_cached_array_capability_with_array_targets(targets, type_)?;
+        }
+        None => store.validate_cached_array_capability(type_)?,
+    }
+    validate_conditional_operand(store, type_, &mut HashSet::new())?;
+    contains_type_parameter(store, type_, &HashSet::new())
+}
+
 #[derive(Clone, Copy)]
 struct ConditionalInferenceContext<'a> {
     infer_parameters: &'a [TypeId],
