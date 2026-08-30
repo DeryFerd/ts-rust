@@ -6709,8 +6709,9 @@ mod tests {
         supported_mapped_alias_projection, unresolved_mapped_structure_is_valid,
     };
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
-        DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData, TypeId,
+        CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+        CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IntrinsicBootstrapOptions,
+        TypeData, TypeId,
         constraints::get_base_constraint_of_type,
         declared::{execute_type_parameter, type_list_key},
         instantiate::{
@@ -6722,8 +6723,9 @@ mod tests {
         },
         links::TypeAliasLinks,
         object_members,
+        production::GlobalMergeCompletion,
         signatures::IndexFlags,
-        type_nodes::type_alias_instantiation_cache_key,
+        type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, type_alias_instantiation_cache_key},
         type_records::{LiteralValue, StructuredTypeData, TypeCacheState},
         types::{AccessFlags, ObjectFlags},
     };
@@ -7215,8 +7217,14 @@ mod tests {
         );
     }
 
-    fn mapped_constraint_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+    fn mapped_constraint_context<'arena>(
+        parsed: &'arena ParseResult,
+        callable: &'arena ParseResult,
+        default_library: bool,
+    ) -> CanonicalCheckerContext<'arena> {
+        assert!(callable.diagnostics.is_empty());
         let file = FileId::new(0);
+        let callable_file = FileId::new(1);
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -7224,10 +7232,14 @@ mod tests {
                 parsed.source_file,
                 file,
                 CanonicalSourceFileFacts::new_with_default_library(
-                    EscapedName::source("\"/project/mapped-constraint-unit.d.ts\""),
+                    EscapedName::source(if default_library {
+                        "\"/project/mapped-constraint-unit.d.ts\""
+                    } else {
+                        "\"/project/mapped-unit.ts\""
+                    }),
                     CanonicalSourceLanguage::TypeScript,
-                    true,
-                    true,
+                    default_library,
+                    default_library,
                     CanonicalModuleState::Script,
                 ),
             )
@@ -7235,9 +7247,25 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &callable.arena,
+                callable.source_file,
+                callable_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/mapped-constraint-callable.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&callable.arena, callable_file)
+            .unwrap();
         CanonicalCheckerContext::new(
             binder.finish(),
-            vec![(file, &parsed.arena)],
+            vec![(file, &parsed.arena), (callable_file, &callable.arena)],
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
@@ -7269,6 +7297,101 @@ mod tests {
             context.file(file).unwrap().1.symbol(declaration).unwrap(),
             body,
         )
+    }
+
+    fn assert_mapped_constraint_probe_is_unsupported(
+        parsed: &ParseResult,
+        context: &mut CanonicalCheckerContext<'_>,
+    ) {
+        let (alias, _) = mapped_constraint_alias_parts(parsed, context, "Probe");
+        let declaration = context
+            .store()
+            .symbol(alias)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let NodeData::TypeAliasDeclaration(probe) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!();
+        };
+        let parameter = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            probe.type_parameters.as_ref().unwrap().nodes[0],
+        );
+        let before = cache_state(context.store());
+        let links = context.store().type_alias_links(alias).cloned();
+        assert!(matches!(
+            context.get_declared_type_of_symbol(alias),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                    alias: rejected_alias,
+                    parameter: rejected_parameter,
+                }
+            )) if rejected_alias == alias && rejected_parameter == parameter
+        ));
+        assert_eq!(context.store().type_alias_links(alias), links.as_ref());
+        assert_eq!(cache_state(context.store()), before);
+        assert!(context.store().type_resolution_is_empty());
+    }
+
+    fn mapped_constraint_function_parameter(
+        parsed: &ParseResult,
+        callable: &ParseResult,
+        context: &mut CanonicalCheckerContext<'_>,
+    ) -> TypeId {
+        let file = FileId::new(0);
+        let callable_file = FileId::new(1);
+        let bound = context.file(file).unwrap().1.clone();
+        let callable_bound = context.file(callable_file).unwrap().1.clone();
+        let declaration = callable
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    callable.arena.id(),
+                    callable_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = callable_bound.symbol(declaration).unwrap();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound), (&callable.arena, &callable_bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        let signature = context
+            .store()
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        let [parameter] = context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the source function must keep its declared type parameter");
+        };
+        *parameter
     }
 
     fn record_mapped_fixture(
@@ -7591,7 +7714,9 @@ mod tests {
             "type Probe<Value extends Mapped> = Value;",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let mut context = checker_context(&parsed);
+        let callable =
+            parse_source_file("declare function bound<Value extends Mapped>(value: Value): Value;");
+        let mut context = mapped_constraint_context(&parsed, &callable, false);
         let (mapped_alias, _) = mapped_constraint_alias_parts(&parsed, &context, "Mapped");
         let mapped = context.get_declared_type_of_symbol(mapped_alias).unwrap();
         let TypeData::Mapped(data) = context.store().type_payload(mapped).unwrap().data() else {
@@ -7604,8 +7729,8 @@ mod tests {
             &data.object.structured,
         ));
 
-        let (probe_alias, _) = mapped_constraint_alias_parts(&parsed, &context, "Probe");
-        let parameter = context.get_declared_type_of_symbol(probe_alias).unwrap();
+        assert_mapped_constraint_probe_is_unsupported(&parsed, &mut context);
+        let parameter = mapped_constraint_function_parameter(&parsed, &callable, &mut context);
         assert_eq!(
             get_base_constraint_of_type(context.store_mut_for_test(), parameter),
             Ok(Some(mapped)),
@@ -7718,7 +7843,10 @@ mod tests {
                 arguments = arguments,
             ));
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-            let mut context = mapped_constraint_context(&parsed);
+            let callable = parse_source_file(
+                "declare function bound<Value extends Result>(value: Value): Value;",
+            );
+            let mut context = mapped_constraint_context(&parsed, &callable, true);
             let (result_alias, request) =
                 mapped_constraint_alias_parts(&parsed, &context, "Result");
             let result = context.get_declared_type_of_symbol(result_alias).unwrap();
@@ -7803,8 +7931,8 @@ mod tests {
             );
             assert_eq!(snapshot(context.store()), cold);
 
-            let (probe_alias, _) = mapped_constraint_alias_parts(&parsed, &context, "Probe");
-            let parameter = context.get_declared_type_of_symbol(probe_alias).unwrap();
+            assert_mapped_constraint_probe_is_unsupported(&parsed, &mut context);
+            let parameter = mapped_constraint_function_parameter(&parsed, &callable, &mut context);
             assert_eq!(
                 get_base_constraint_of_type(context.store_mut_for_test(), parameter),
                 Ok(Some(result)),
