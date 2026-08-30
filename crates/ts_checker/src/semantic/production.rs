@@ -1186,6 +1186,43 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .get_type_of_interface_method(symbol)
     }
 
+    pub(super) fn checked_source_method_artifact_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<Option<TypeId>, SourceCheckError> {
+        let Some((arena, _)) = self.files.snapshot(node.file) else {
+            return Err(SourceCheckError::Property(node));
+        };
+        let Some(record) = arena.get(node.node) else {
+            return Err(SourceCheckError::Property(node));
+        };
+        let property = matches!(record.data, NodeData::PropertyAccessExpression(_))
+            || matches!(record.data, NodeData::Identifier(_))
+                && record.parent.and_then(|parent| arena.get(parent)).is_some_and(|parent| {
+                    matches!(&parent.data, NodeData::PropertyAccessExpression(access) if access.name == node.node)
+                });
+        if !property {
+            return Ok(None);
+        }
+        self.instantiation_session.reset_query();
+        let host = DeclaredTypeHost::from_registry(
+            &self.store,
+            &self.files,
+            GlobalMergeCompletion::new(self.options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?
+        .with_module_resolutions(&self.module_resolutions);
+        super::source::checked_source_method_property_type(
+            &mut self.store,
+            &host,
+            &self.global_types,
+            self.options,
+            &mut self.instantiation_session,
+            &mut self.diagnostics,
+            node,
+        )
+    }
+
     pub(super) fn artifact_literal_type(
         &mut self,
         value: super::EvaluatorValue,
