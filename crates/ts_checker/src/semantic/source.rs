@@ -22641,8 +22641,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     Err(VariablePlanError::Unsupported(
                         VariableUnsupported::NonVariableSymbol { symbol, flags, .. },
                     )) if flags.contains(SymbolFlags::FUNCTION) => {
-                        if plan_default_library_source_callable(store, host, expression, symbol)?
-                            .is_some()
+                        if plan_default_library_source_callable(
+                            store,
+                            host,
+                            expression,
+                            symbol,
+                            self.array_targets,
+                        )?
+                        .is_some()
                         {
                             PlannedExpressionKind::Identifier(PlannedIdentifierRead {
                                 resolved_symbol: symbol,
@@ -26814,6 +26820,7 @@ fn plan_default_library_source_callable(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
     symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<SourceCallablePlan>, SourceCheckError> {
     let invalid = || SourceCheckError::Function(SourceFunctionInvariant::Callable(node));
     let owner = store.symbol(symbol).ok_or_else(invalid)?;
@@ -26872,7 +26879,7 @@ fn plan_default_library_source_callable(
     if resolved != Some(symbol) {
         return Err(invalid());
     }
-    let callable = plan_source_callable(store, host, declaration, symbol, None)
+    let callable = plan_source_callable(store, host, declaration, symbol, array_targets)
         .map_err(SourcePlanner::callable_plan_error)?;
     if callable.body_mode != SourceCallableBodyMode::AmbientDeclaration
         || callable.return_type.is_inferred()
@@ -31522,6 +31529,7 @@ fn check_expression_type_with_capture_context(
                 host,
                 expression.node,
                 read.value_symbol,
+                Some(CanonicalArrayTargets::from_global_types(global_types)),
             )?
             .ok_or(SourceCheckError::Function(
                 SourceFunctionInvariant::MissingCallableType(read.value_symbol),
@@ -76498,6 +76506,121 @@ mod tests {
             assert!(context.diagnostics().is_empty());
             let warm = observable_state(&context, file);
             context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real library owner and cold/warm target proofs together.
+    fn default_library_source_callables_keep_exact_caller_targets_on_replay() {
+        use crate::semantic::source_callables::{SourceCallableState, source_callable_state};
+
+        let library = parsed(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let source = parsed("const first = parseInt('12'); const second = parseInt('13', 10);");
+        let library_file = FileId::new(19_860);
+        let file = FileId::new(19_861);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                name_resolution: CanonicalNameResolverOptions {
+                    emit_target: ts_options::ScriptTarget::Es2015,
+                    ..CanonicalNameResolverOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let declaration = function_declaration(&library, library_file, "parseInt");
+        let owner = function_symbol(&context, &library, library_file, "parseInt");
+        let reads = identifier_expressions(&source, file, "parseInt");
+        assert_eq!(reads.len(), 2);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let plan_with_targets = |context: &CanonicalCheckerContext<'_>, array_targets| {
+            plan_default_library_source_callable(
+                context.store(),
+                &host,
+                reads[0],
+                owner,
+                array_targets,
+            )
+        };
+        let cold = observable_state(&context, file);
+        let plan = plan_with_targets(&context, Some(targets)).unwrap().unwrap();
+        assert_eq!(plan.declaration, declaration);
+        assert_eq!(plan.owner_symbol, owner);
+        assert_eq!(plan.array_targets, Some(targets));
+        assert_eq!(
+            source_callable_state(context.store(), &plan, true).unwrap(),
+            SourceCallableState::Cold
+        );
+        assert_eq!(observable_state(&context, file), cold);
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for name in ["first", "second"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), number);
+        }
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert_eq!(provenance.declaration, declaration);
+        assert_eq!(provenance.owner_symbol, owner);
+        assert_eq!(provenance.array_targets, Some(targets));
+        for &read in &reads {
+            assert_eq!(resolved_node_type(&context, read), callable);
+        }
+        let warm = observable_state(&context, file);
+        let globals = context.global_types();
+        assert_ne!(globals.array_type, globals.readonly_array_type);
+        let swapped =
+            CanonicalArrayTargets::for_test(globals.readonly_array_type, globals.array_type);
+        for wrong in [None, Some(swapped)] {
+            assert_eq!(
+                plan_with_targets(&context, wrong),
+                Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(declaration)
+                ))
+            );
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(
+                context.store().source_callable_provenance(callable),
+                Some(provenance)
+            );
+        }
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                plan_with_targets(&context, Some(targets)).unwrap(),
+                Some(plan.clone())
+            );
+            assert_eq!(
+                source_callable_state(context.store(), &plan, false).unwrap(),
+                SourceCallableState::Resolved {
+                    type_: callable,
+                    signature: provenance.signature,
+                }
+            );
             assert_eq!(observable_state(&context, file), warm);
         }
     }

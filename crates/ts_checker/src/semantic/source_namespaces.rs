@@ -9197,6 +9197,135 @@ fn deferred_ambient_class_heritage(
     Ok(())
 }
 
+/// Reuses the ambient class binding proof without resolving namespace or class types.
+#[allow(clippy::too_many_lines)] // Prove the namespace ancestry before checking the selected class.
+pub(super) fn validate_ambient_namespace_class_for_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let invalid = || SourceCheckError::Class(declaration);
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let record = owned_node(arena, bound, store, declaration)?;
+    let block = child(declaration, record.parent.ok_or_else(invalid)?);
+    let block_record = owned_node(arena, bound, store, block)?;
+    let NodeData::ModuleBlock(body) = &block_record.data else {
+        return Err(invalid());
+    };
+    if block_record.kind != SyntaxKind::ModuleBlock
+        || body.facts != 0
+        || body.statements.has_trailing_comma
+        || body
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
+    let namespace = child(block, block_record.parent.ok_or_else(invalid)?);
+    let namespace_symbol = declaration_symbol(bound, store, namespace, SymbolFlags::MODULE)?;
+    let mut ambient = bound
+        .source_facts()
+        .ok_or_else(invalid)?
+        .is_declaration_file();
+    let mut current = namespace;
+    let mut current_body = block;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current) {
+            return Err(invalid());
+        }
+        let node = owned_node(arena, bound, store, current)?;
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            return Err(invalid());
+        };
+        if module.body != Some(current_body.node)
+            || !matches!(
+                module.keyword,
+                SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword
+            )
+            || !matches!(
+                owned_node(arena, bound, store, child(current, module.name))?.data,
+                NodeData::Identifier(_)
+            )
+        {
+            return Err(invalid());
+        }
+        let owner = declaration_symbol(bound, store, current, SymbolFlags::MODULE)?;
+        plan_module_value(store, host, owner)?;
+        let (_, declared) =
+            modifier_flags(arena, bound, store, current, module.modifiers.as_ref())?;
+        ambient |= declared;
+        let parent = child(current, node.parent.ok_or_else(invalid)?);
+        let parent_record = owned_node(arena, bound, store, parent)?;
+        match &parent_record.data {
+            NodeData::SourceFile(source)
+                if parent == bound.source_file()
+                    && parent_record.kind == SyntaxKind::SourceFile
+                    && parent_record.parent.is_none()
+                    && source
+                        .statements
+                        .nodes
+                        .iter()
+                        .filter(|node| **node == current.node)
+                        .count()
+                        == 1 =>
+            {
+                break;
+            }
+            NodeData::ModuleBlock(body)
+                if parent_record.kind == SyntaxKind::ModuleBlock
+                    && body.facts == 0
+                    && !body.statements.has_trailing_comma
+                    && body
+                        .statements
+                        .nodes
+                        .iter()
+                        .filter(|node| **node == current.node)
+                        .count()
+                        == 1 =>
+            {
+                current = child(parent, parent_record.parent.ok_or_else(invalid)?);
+                current_body = parent;
+            }
+            NodeData::ModuleDeclaration(_)
+                if parent_record.kind == SyntaxKind::ModuleDeclaration =>
+            {
+                current_body = current;
+                current = parent;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    if !ambient {
+        return Err(invalid());
+    }
+    let plan = plan_deferred_ambient_class(
+        arena,
+        bound,
+        store,
+        (namespace, namespace_symbol),
+        declaration,
+    )?;
+    if !matches!(plan,
+        SourceNamespaceMemberPlan::DeferredAmbientClass {
+            declaration: planned_declaration,
+            symbol: planned_symbol,
+            ref type_parameters,
+            ..
+        } if planned_declaration == declaration
+            && planned_symbol == symbol
+            && type_parameters.is_empty())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // Ambient classes retain all member and heritage declarations.
 fn plan_deferred_ambient_class(
     arena: &NodeArena,

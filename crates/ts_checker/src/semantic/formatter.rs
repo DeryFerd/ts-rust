@@ -56,7 +56,8 @@ use super::{
     reference_types::validate_direct_generic_reference,
     signatures::{ElementFlags, IndexFlags, SignatureFlags, TypePredicateKind},
     source_callables::{
-        SourceCallableDisplayError, SourceCallableUnsupported, StoredSourceCallableValidation,
+        SourceCallableDisplayError, SourceCallableState, SourceCallableUnsupported,
+        StoredSourceCallableValidation, plan_source_callable, source_callable_state,
         validate_stored_source_callable,
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
@@ -1301,21 +1302,6 @@ fn display_object_type(
     }
 
     if let Some(host) = host
-        && let Some(projection) = validated_declared_method_display(store, type_id, record)?
-    {
-        return display_declared_method_signatures(
-            store,
-            host,
-            global_types,
-            &projection,
-            DeclaredMethodDisplayStyle::Function,
-            flags,
-            state,
-            visiting,
-        );
-    }
-
-    if let Some(host) = host
         && let Some(overloads) =
             validated_source_class_method_display(store, host, global_types, type_id)?
     {
@@ -1325,6 +1311,21 @@ fn display_object_type(
             global_types,
             type_id,
             &overloads,
+            flags,
+            state,
+            visiting,
+        );
+    }
+
+    if let Some(host) = host
+        && let Some(projection) = validated_declared_method_display(store, type_id, record)?
+    {
+        return display_declared_method_signatures(
+            store,
+            host,
+            global_types,
+            &projection,
+            DeclaredMethodDisplayStyle::Function,
             flags,
             state,
             visiting,
@@ -1926,12 +1927,27 @@ fn validated_declared_method_display(
     let Some(owner) = method
         .parent()
         .and_then(|owner| store.get_merged_symbol(owner))
-        .and_then(|owner| store.symbol(owner))
     else {
         return Ok(None);
     };
-    if owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
-        && owner.flags() != SymbolFlags::TYPE_LITERAL
+    let Some(owner_record) = store.symbol(owner) else {
+        return Ok(None);
+    };
+    // Cold selected methods and private names retain their separate display proof.
+    let completed_class_method = owner_record.flags().contains(SymbolFlags::CLASS)
+        && !method.name().is_private_identifier()
+        && !method.name().is_reserved_member_name()
+        && !method.name().is_late_bound()
+        && store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .is_some_and(|instance| {
+                validate_class_heritage_members(store, instance)
+                    == ClassHeritageMembersValidation::Valid
+            });
+    if !completed_class_method
+        && owner_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        && owner_record.flags() != SymbolFlags::TYPE_LITERAL
     {
         return Ok(None);
     }
@@ -1985,14 +2001,21 @@ fn display_declared_method_signatures(
             if !host.symbol_matches(store, declaration, owner) {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
-            let Some(NodeData::MethodSignatureDeclaration(method)) =
-                host.node(declaration).map(|node| &node.data)
-            else {
-                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            let parameters = match host.node(declaration).map(|node| &node.data) {
+                Some(NodeData::MethodSignatureDeclaration(method)) => &method.parameters.nodes,
+                Some(NodeData::MethodDeclaration(method))
+                    if method.type_parameters.is_none()
+                        && signature.type_parameters().is_empty()
+                        && signature.target().is_none()
+                        && signature.mapper().is_none() =>
+                {
+                    &method.parameters.nodes
+                }
+                _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
             };
             if signature.this_parameter().is_some()
                 || signature.resolved_type_predicate().is_some()
-                || method.parameters.nodes.len() != signature.parameters().len()
+                || parameters.len() != signature.parameters().len()
             {
                 return Err(TypeDisplayUnavailable::MalformedType(type_id));
             }
@@ -2078,15 +2101,14 @@ fn append_declared_method_type_parameters(
     let declaration = signature_record
         .declaration()
         .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
-    let Some(NodeData::MethodSignatureDeclaration(method)) =
-        host.node(declaration).map(|node| &node.data)
-    else {
-        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    let declarations = match host.node(declaration).map(|node| &node.data) {
+        Some(NodeData::MethodSignatureDeclaration(method)) => method
+            .type_parameters
+            .as_ref()
+            .map_or(&[][..], |parameters| parameters.nodes.as_slice()),
+        Some(NodeData::MethodDeclaration(method)) if method.type_parameters.is_none() => &[],
+        _ => return Err(TypeDisplayUnavailable::MalformedType(owner)),
     };
-    let declarations = method
-        .type_parameters
-        .as_ref()
-        .map_or(&[][..], |parameters| parameters.nodes.as_slice());
     let original = signature_record
         .target()
         .and_then(|target| store.signature(target))
@@ -2268,11 +2290,18 @@ fn display_validated_module_namespace(
         .source_callable_provenance(type_id)
         .is_some_and(|provenance| provenance.family == SourceCallableFamily::FunctionDeclaration);
     let Some(owner) = record.symbol() else {
-        return if source_function {
-            Err(TypeDisplayUnavailable::MalformedType(type_id))
-        } else {
-            Ok(None)
+        if source_function {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        let Some(owner) =
+            super::source_imports::validated_synthetic_namespace_type_owner(store, host, type_id)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        else {
+            return Ok(None);
         };
+        let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
+        state.add(7);
+        return Ok(Some(format!("typeof {name}")));
     };
     let owner_record = store
         .symbol(owner)
@@ -2287,7 +2316,11 @@ fn display_validated_module_namespace(
     };
     if source_function {
         // The retained origin survives removal of namespace flags and declarations.
-        validate_source_function_namespace_origin(store, host, type_id, owner, owner_record)?;
+        if validate_source_function_namespace_origin(store, host, type_id, owner, owner_record)? {
+            let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
+            state.add(7);
+            return Ok(Some(format!("typeof {name}")));
+        }
         if !module_owner
             || owner_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
         {
@@ -2482,13 +2515,15 @@ fn display_validated_module_namespace(
     display_source_file_module_name(store, host, type_id, owner, state).map(Some)
 }
 
+/// Returns whether the original function has a supported value namespace.
+#[allow(clippy::too_many_lines)] // Source identity and the complete direct export table form one proof.
 fn validate_source_function_namespace_origin(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
     owner: SemanticSymbolId,
     owner_record: &ts_binder::semantic::Symbol,
-) -> Result<(), TypeDisplayUnavailable> {
+) -> Result<bool, TypeDisplayUnavailable> {
     let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
     let provenance = store
         .source_callable_provenance(type_id)
@@ -2496,8 +2531,6 @@ fn validate_source_function_namespace_origin(
     let (_, bound) = host.source(provenance.declaration).ok_or_else(invalid)?;
     let source_owner = bound.symbol(provenance.declaration).ok_or_else(invalid)?;
 
-    // Function merges mark runtime and const-enum namespaces in this retained set.
-    // Changing semantic flags or export tables cannot erase that binder record.
     if provenance.owner_symbol != owner
         || owner_record.value_declaration() != Some(provenance.declaration)
         || !bound.declaration_slice_bound()
@@ -2505,7 +2538,6 @@ fn validate_source_function_namespace_origin(
             .node(provenance.declaration)
             .is_none_or(|node| node.kind != SyntaxKind::FunctionDeclaration)
         || store.get_merged_symbol(source_owner) != Some(owner)
-        || bound.is_not_const_enum_only_module(source_owner)
         || owner_record.declarations().is_none_or(|declarations| {
             declarations
                 .iter()
@@ -2514,7 +2546,101 @@ fn validate_source_function_namespace_origin(
     {
         return Err(invalid());
     }
-    Ok(())
+    // Function merges retain this marker even if live flags or exports are removed.
+    if !bound.is_not_const_enum_only_module(source_owner) {
+        return Ok(false);
+    }
+    if owner_record.flags() != SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        || source_owner != owner
+        || !store.source_symbol_declarations_match(owner)
+        || store.source_symbol_flags(owner) != Some(owner_record.flags())
+        || !store.source_symbol_export_table_matches(owner)
+        || store.module_symbol_links(owner).is_some_and(|links| {
+            links
+                .resolved_exports
+                .is_some_and(|exports| Some(exports) != owner_record.exports())
+        })
+    {
+        return Err(invalid());
+    }
+    let mut namespaces = Vec::new();
+    for &declaration in owner_record.declarations().ok_or_else(invalid)? {
+        if declaration == provenance.declaration {
+            continue;
+        }
+        let record = host.node(declaration).ok_or_else(invalid)?;
+        let NodeData::ModuleDeclaration(namespace) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, namespace.name);
+        if !matches!(
+            namespace.keyword,
+            SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword
+        ) || !host.node(name).is_some_and(|record| {
+            matches!(&record.data, NodeData::Identifier(name)
+                    if owner_record.name().as_utf8() == Some(name.text.as_str()))
+        }) || !namespace.body.is_some_and(|body| {
+            host.node(NodeRef::new(declaration.arena, declaration.file, body))
+                .is_some_and(|record| {
+                    record.kind == SyntaxKind::ModuleBlock
+                        && record.parent == Some(declaration.node)
+                })
+        }) {
+            return Err(invalid());
+        }
+        namespaces.push(declaration);
+    }
+    if namespaces.is_empty() {
+        return Err(invalid());
+    }
+    super::source_namespaces::validate_module_export_table(
+        store,
+        host,
+        owner,
+        &namespaces,
+        owner_record.exports(),
+    )
+    .map_err(|_| invalid())?;
+    let exports = owner_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let mut has_runtime_export = false;
+    for (_, symbol) in exports.iter() {
+        let record = store.symbol(symbol).ok_or_else(invalid)?;
+        if !store.source_symbol_declarations_match(symbol)
+            || store.source_symbol_flags(symbol) != Some(record.flags())
+        {
+            return Err(invalid());
+        }
+        has_runtime_export |= record
+            .flags()
+            .intersects(SymbolFlags::VALUE.without(SymbolFlags::CONST_ENUM))
+            && !record.flags().contains(SymbolFlags::CONST_ENUM_ONLY_MODULE);
+    }
+    // Const-enum-only namespace merges keep their existing display boundary.
+    if !has_runtime_export {
+        return Err(invalid());
+    }
+    let plan = plan_source_callable(
+        store,
+        host,
+        provenance.declaration,
+        owner,
+        provenance.array_targets,
+    )
+    .map_err(|_| invalid())?;
+    if !matches!(
+        source_callable_state(store, &plan, false),
+        Ok(SourceCallableState::Resolved { type_, signature })
+            if type_ == type_id && signature == provenance.signature
+    ) || !matches!(
+        validate_stored_source_callable(store, type_id),
+        StoredSourceCallableValidation::Valid(_)
+    ) {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_lines)] // Keep cold and completed class ownership checks together.
@@ -2594,23 +2720,6 @@ fn display_validated_class_type(
     let NodeData::ClassDeclaration(class) = &declaration_node.data else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
-    if cold_instance
-        && (owner.flags() != SymbolFlags::CLASS
-            || owner.check_flags() != CheckFlags::NONE
-            || owner.parent().is_some()
-            || owner.export_symbol().is_some()
-            || owner.value_declaration() != Some(declaration)
-            || store.get_merged_symbol(symbol) != Some(symbol)
-            || class
-                .type_parameters
-                .as_ref()
-                .is_some_and(|parameters| !parameters.nodes.is_empty())
-            || host
-                .bound_file(declaration)
-                .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node)))
-    {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    }
     let name = class
         .name
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
@@ -10814,7 +10923,42 @@ mod tests {
             context.store().symbol(owner).unwrap().flags(),
             SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
         );
-        assert_malformed_display_without_writes(&context, callable);
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let before = (
+            format!("{:?}", context.store()),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(callable)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_callable_type_for_signature(signature),
+                Some(callable)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .and_then(|links| links.resolved_type),
+                Some(callable)
+            );
+            assert_eq!(
+                (
+                    format!("{:?}", context.store()),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                before
+            );
+        }
         assert!(
             context
                 .file(file)
@@ -10824,6 +10968,198 @@ mod tests {
         );
         hide_namespace_value_exports(&mut context, owner);
         assert_malformed_display_without_writes(&context, callable);
+    }
+
+    #[test]
+    fn runtime_namespace_display_rejects_replaced_binder_export_tables() {
+        for warm in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "declare function callable(): void; ",
+                "declare namespace callable { export const value: string; }",
+            ));
+            let file = FileId::new(202_851);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let (declaration, owner, callable) =
+                namespace_function_display_parts(&context, &parsed, file);
+            if warm {
+                assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+            }
+            let symbol = context.store().symbol(owner).unwrap();
+            let (members, exports, parent, export_symbol) = (
+                symbol.members(),
+                symbol.exports().unwrap(),
+                symbol.parent(),
+                symbol.export_symbol(),
+            );
+            let replacement = context
+                .store_mut_for_test()
+                .clone_symbol_table(exports)
+                .unwrap();
+            assert_ne!(replacement, exports);
+            assert_eq!(
+                context.store().symbol_table(replacement),
+                context.store().symbol_table(exports)
+            );
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                owner,
+                members,
+                Some(replacement),
+                parent,
+                export_symbol,
+            ));
+            assert!(matches!(
+                validate_stored_source_callable(context.store(), callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            let damaged = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_malformed_display_without_writes(&context, callable);
+                assert_eq!(
+                    context.type_to_string_at_location_with_flags(
+                        callable,
+                        declaration,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    ),
+                    Err(TypeDisplayUnavailable::MalformedType(callable))
+                );
+                assert_eq!(format!("{:?}", context.store()), damaged);
+            }
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                owner,
+                members,
+                Some(exports),
+                parent,
+                export_symbol,
+            ));
+            let restored = format!("{:?}", context.store());
+            assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+            assert_eq!(format!("{:?}", context.store()), restored);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation starts from the same bound source and tests both display orders.
+    fn runtime_namespace_display_rejects_changed_exports_declarations_and_signatures() {
+        #[derive(Clone, Copy)]
+        enum Damage {
+            ExportFlags,
+            ExportMember,
+            DeclarationOrder,
+            ReturnType,
+        }
+        for warm in [false, true] {
+            for damage in [
+                Damage::ExportFlags,
+                Damage::ExportMember,
+                Damage::DeclarationOrder,
+                Damage::ReturnType,
+            ] {
+                let parsed = parse_source_file(concat!(
+                    "declare function callable(): void; ",
+                    "declare namespace callable { export const value: string; } ",
+                    "declare namespace callable { export const count: number; } ",
+                    "declare namespace Other { export const value: string; }",
+                ));
+                let file = FileId::new(202_852);
+                let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+                context.check_source_file(file).unwrap();
+                let (declaration, owner, callable) =
+                    namespace_function_display_parts(&context, &parsed, file);
+                if warm {
+                    assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+                }
+                let exports = context.store().symbol(owner).unwrap().exports().unwrap();
+                let value = context
+                    .store()
+                    .symbol_table(exports)
+                    .unwrap()
+                    .get_source("value")
+                    .unwrap();
+                match damage {
+                    Damage::ExportFlags => {
+                        assert_eq!(
+                            context.store().symbol(value).unwrap().flags(),
+                            SymbolFlags::BLOCK_SCOPED_VARIABLE
+                        );
+                        assert!(context.store_mut_for_test().set_symbol_flags(
+                            value,
+                            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                            CheckFlags::NONE,
+                        ));
+                    }
+                    Damage::ExportMember => {
+                        let other = context
+                            .file(file)
+                            .unwrap()
+                            .1
+                            .locals(context.file(file).unwrap().1.source_file())
+                            .and_then(|locals| context.store().symbol_table(locals))
+                            .and_then(|locals| locals.get_source("Other"))
+                            .unwrap();
+                        let other_value = context
+                            .store()
+                            .symbol(other)
+                            .and_then(ts_binder::semantic::Symbol::exports)
+                            .and_then(|exports| context.store().symbol_table(exports))
+                            .and_then(|exports| exports.get_source("value"))
+                            .unwrap();
+                        assert_eq!(
+                            context.store_mut_for_test().insert_symbol(
+                                exports,
+                                EscapedName::source("value"),
+                                other_value,
+                            ),
+                            Some(Some(value))
+                        );
+                    }
+                    Damage::DeclarationOrder => {
+                        let mut declarations = context
+                            .store()
+                            .symbol(owner)
+                            .unwrap()
+                            .declarations()
+                            .unwrap()
+                            .to_vec();
+                        assert_eq!(declarations.len(), 3);
+                        declarations.swap(1, 2);
+                        assert!(context.store_mut_for_test().set_symbol_declarations(
+                            owner,
+                            Some(declarations),
+                            Some(declaration),
+                        ));
+                    }
+                    Damage::ReturnType => {
+                        let signature = context
+                            .store()
+                            .source_callable_provenance(callable)
+                            .unwrap()
+                            .signature;
+                        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_signature_resolved_return_type(signature, Some(number),)
+                        );
+                    }
+                }
+                let damaged = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    assert_malformed_display_without_writes(&context, callable);
+                    assert_eq!(
+                        context.type_to_string_at_location_with_flags(
+                            callable,
+                            declaration,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION,
+                        ),
+                        Err(TypeDisplayUnavailable::MalformedType(callable))
+                    );
+                    assert_eq!(format!("{:?}", context.store()), damaged);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -13361,6 +13697,453 @@ mod tests {
         assert_eq!(context.type_to_string(instance).unwrap(), "Box<T>");
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct ColdAmbientClassDisplaySnapshot {
+        id: TypeId,
+        flags: TypeFlags,
+        object_flags: ObjectFlags,
+        symbol: Option<SemanticSymbolId>,
+        alias: Option<TypeAliasId>,
+        interface: crate::semantic::type_records::InterfaceTypeData,
+    }
+
+    fn cold_ambient_class_display_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+        instance: TypeId,
+    ) -> ColdAmbientClassDisplaySnapshot {
+        let record = context.store().type_payload(instance).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("the declared class keeps its interface record")
+        };
+        ColdAmbientClassDisplaySnapshot {
+            id: record.id(),
+            flags: record.flags(),
+            object_flags: record.object_flags(),
+            symbol: record.symbol(),
+            alias: record.alias(),
+            interface: interface.clone(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restore each real namespace/class binding.
+    fn cold_ambient_namespace_class_display_rejects_binding_damage() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace Models { ",
+            "class Model { value: string; method(): number; static count: number; } ",
+            "class Other { value: string; method(): number; static count: number; } ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_520);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [model_declaration, other_declaration] = declarations.as_slice() else {
+            panic!("the source has two classes")
+        };
+        let bound = context.file(file).unwrap().1;
+        let model = bound.symbol(*model_declaration).unwrap();
+        let other = bound.symbol(*other_declaration).unwrap();
+        let model_local = bound.local_symbol(*model_declaration).unwrap();
+        let namespace = context.store().symbol(model).unwrap().parent().unwrap();
+        let namespace_declaration = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let locals = bound.locals(namespace_declaration).unwrap();
+        let namespace_exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let model_exports = context.store().symbol(model).unwrap().exports().unwrap();
+        let other_exports = context.store().symbol(other).unwrap().exports().unwrap();
+        let model_members = context.store().symbol(model).unwrap().members().unwrap();
+        let other_members = context.store().symbol(other).unwrap().members().unwrap();
+        let instance = context.get_declared_type_of_symbol(model).unwrap();
+        let retained = cold_ambient_class_display_snapshot(&context, instance);
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+
+        for (table, name, donor, donor_name) in [
+            (namespace_exports, "Model", namespace_exports, "Other"),
+            (locals, "Model", locals, "Other"),
+            (model_exports, "prototype", other_exports, "prototype"),
+            (model_exports, "count", other_exports, "count"),
+            (model_members, "value", other_members, "value"),
+            (model_members, "method", other_members, "method"),
+        ] {
+            let original = context
+                .store()
+                .symbol_table(table)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            let foreign = context
+                .store()
+                .symbol_table(donor)
+                .unwrap()
+                .get_source(donor_name)
+                .unwrap();
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    table,
+                    EscapedName::source(name),
+                    foreign
+                ),
+                Some(Some(original)),
+            );
+            assert_malformed_display_without_writes(&context, instance);
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    table,
+                    EscapedName::source(name),
+                    original
+                ),
+                Some(Some(foreign)),
+            );
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        }
+
+        assert_eq!(
+            context.store().symbol(model_local).unwrap().flags(),
+            SymbolFlags::EXPORT_VALUE
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model_local,
+            None,
+            None,
+            None,
+            Some(other),
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model_local,
+            None,
+            None,
+            None,
+            Some(model),
+        ));
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model,
+            Some(model_members),
+            Some(model_exports),
+            Some(other),
+            None,
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model,
+            Some(model_members),
+            Some(model_exports),
+            Some(namespace),
+            None,
+        ));
+        let prototype = context
+            .store()
+            .symbol_table(model_exports)
+            .unwrap()
+            .get_source("prototype")
+            .unwrap();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            prototype,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            prototype,
+            SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        assert_eq!(context.get_declared_type_of_symbol(model), Ok(instance));
+        assert_eq!(
+            cold_ambient_class_display_snapshot(&context, instance),
+            retained
+        );
+        assert!(context.store().value_symbol_links(model).is_none());
+        assert!(context.store().declared_type_links(other).is_none());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retain each damaged cache and its exact restored identity.
+    fn cold_ambient_namespace_class_display_rejects_type_cache_damage() {
+        let parsed =
+            parse_source_file("declare namespace Models { class Model {} class Other {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_521);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owners = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::ClassDeclaration)
+            .map(|(node, _)| {
+                context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [model, other] = owners.as_slice() else {
+            panic!("the source has two class owners")
+        };
+        let (model, other) = (*model, *other);
+        let instance = context.get_declared_type_of_symbol(model).unwrap();
+        let other_type = context.get_declared_type_of_symbol(other).unwrap();
+        let retained = cold_ambient_class_display_snapshot(&context, instance);
+        let this = retained.interface.this_type.unwrap();
+        let declared = context.store().declared_type_links(model).unwrap().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+
+        let mut wrong_declared = declared.clone();
+        wrong_declared.declared_type = Some(other_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(model, wrong_declared)
+        );
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(model, declared.clone())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(instance, true, None, None)
+        );
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(instance, false, None, None)
+        );
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            this,
+            Some(instance),
+            None,
+            None,
+            Some(number),
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            this,
+            Some(instance),
+            None,
+            None,
+            None,
+        ));
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            model,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(model, ValueSymbolLinks::default())
+        );
+
+        let restored = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+            assert_eq!(context.get_declared_type_of_symbol(model), Ok(instance));
+            assert_eq!(
+                cold_ambient_class_display_snapshot(&context, instance),
+                retained
+            );
+            assert_eq!(context.store().declared_type_links(model), Some(&declared));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                restored,
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn cold_ambient_namespace_class_display_does_not_admit_runtime_namespaces() {
+        let parsed = parse_source_file("namespace Models { export class Model {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_522);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store().value_symbol_links(symbol).is_none());
+    }
+
+    #[test]
+    fn cold_ambient_namespace_class_display_keeps_nested_namespace_identity() {
+        let parsed =
+            parse_source_file("declare namespace Models { namespace Inner { class Model {} } }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_523);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+            cold_ambient_class_display_snapshot(&context, instance),
+        );
+        let outside = context.source_file(file).unwrap().node_ref();
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+            assert_eq!(
+                context
+                    .type_to_string_at_location(instance, declaration)
+                    .unwrap(),
+                "Model"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location(instance, outside)
+                    .unwrap(),
+                "Models.Inner.Model"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    cold_ambient_class_display_snapshot(&context, instance),
+                ),
+                before,
+            );
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn cold_ambient_namespace_class_display_rejects_generic_owner_proof() {
+        let parsed = parse_source_file("declare namespace Models { class Model<T> {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_524);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        let host = DeclaredTypeHost::new([context.file(file).unwrap()]).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            validate_cold_class_instance_for_display(context.store(), &host, symbol, instance),
+            Err(crate::semantic::classes::ClassError::Invariant(
+                crate::semantic::classes::ClassInvariant::InvalidOwnerSymbol(symbol),
+            )),
+        );
+        assert_eq!(
+            crate::semantic::source_namespaces::validate_ambient_namespace_class_for_display(
+                context.store(),
+                &host,
+                symbol,
+                declaration,
+            ),
+            Err(crate::semantic::SourceCheckError::Class(declaration)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.store().value_symbol_links(symbol).is_none());
+    }
+
     #[test]
     fn cold_class_names_do_not_resolve_heritage_or_generic_member_types() {
         for (index, (source, expected)) in [
@@ -14967,6 +15750,217 @@ mod tests {
         assert_eq!(
             context.type_to_string(callable),
             Err(TypeDisplayUnavailable::MalformedType(callable))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check each damaged cache on the same real method shape.
+    fn class_method_display_rejects_changed_parameter_and_signature_caches() {
+        let parsed =
+            parse_source_file("class Model { run(value: number): string { return 'done'; } }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_301);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the method keeps its original declaration")
+        };
+        let parameter_declaration =
+            NodeRef::new(parsed.arena.id(), file, method.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(parameter) =
+            &parsed.arena.get(parameter_declaration.node).unwrap().data
+        else {
+            panic!("the method keeps its original parameter")
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, parameter.type_.unwrap());
+
+        for changed in [
+            "parameter_value",
+            "parameter_annotation",
+            "paired_parameter_type",
+            "parameter_declaration",
+            "signature_link",
+            "pending_return",
+            "return_type",
+            "signature_target",
+        ] {
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let signature = context
+                .store()
+                .signature_links(declaration)
+                .unwrap()
+                .resolved_signature
+                .signature()
+                .unwrap();
+            let record = context.store().signature(signature).unwrap();
+            let [parameter] = *record.parameters() else {
+                panic!("the required parameter must remain in the signature")
+            };
+            assert_eq!(record.min_argument_count(), 1);
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(record.resolved_return_type(), Some(string));
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declaration,
+                Ok("(value: number) => string"),
+            );
+
+            match changed {
+                "parameter_value" | "paired_parameter_type" => {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        parameter,
+                        ValueSymbolLinks {
+                            resolved_type: Some(string),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                "parameter_annotation" => {}
+                "parameter_declaration" => {
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        parameter,
+                        Some(vec![declaration]),
+                        Some(declaration),
+                    ));
+                }
+                "signature_link" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_links(declaration, SignatureLinks::default())
+                    );
+                }
+                "pending_return" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, None)
+                    );
+                }
+                "return_type" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, Some(number))
+                    );
+                }
+                "signature_target" => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_target_and_mapper(signature, Some(signature), None,)
+                    );
+                }
+                _ => unreachable!("each cache change is listed above"),
+            }
+            if matches!(changed, "parameter_annotation" | "paired_parameter_type") {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            assert_source_class_display_without_writes(
+                &mut context,
+                callable,
+                declaration,
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+        }
+    }
+
+    #[test]
+    fn selected_class_method_display_preserves_cold_member_queries() {
+        let parsed =
+            parse_source_file("declare class Model { selected(): number; pending: string; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(148_302);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let symbol = bound.symbol(declaration).unwrap();
+        let owner = context.store().symbol(symbol).unwrap().parent().unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        let callable = crate::semantic::classes::ClassValueQuery {
+            store: context.store_mut_for_test(),
+            host: &host,
+            global_types: &globals,
+            options,
+            session: &mut session,
+            diagnostics: &mut diagnostics,
+        }
+        .member_type(symbol)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        assert!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok("() => number"),
+        );
+
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type,
+            Some(callable),
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok("() => number"),
         );
     }
 

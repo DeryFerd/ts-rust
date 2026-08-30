@@ -159,6 +159,7 @@ struct SourceSymbolDeclarations {
     flags: SymbolFlags,
     declarations: Box<[NodeRef]>,
     value_declaration: Option<NodeRef>,
+    exports: Option<SymbolTableId>,
 }
 
 #[derive(Clone, Debug)]
@@ -812,6 +813,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     flags: record.flags(),
                     declarations: declarations.into(),
                     value_declaration: record.value_declaration(),
+                    exports: record.exports(),
                 },
             );
         }
@@ -1147,6 +1149,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.source_declaration_belongs_to_symbol(*declaration, symbol)
                 })
         })
+    }
+
+    /// Checks the export table identity adopted from the binder.
+    #[must_use]
+    pub(super) fn source_symbol_export_table_matches(&self, symbol: SemanticSymbolId) -> bool {
+        self.source_symbol_declarations
+            .get(&symbol)
+            .zip(self.symbol(symbol))
+            .is_some_and(|(source, record)| source.exports == record.exports())
     }
 
     /// Reads original binder flags after canonical symbol merges.
