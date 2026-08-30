@@ -12,7 +12,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use super::{
     CanonicalGlobalTypes, ConditionalRootId, RelationUnavailable, SemanticSymbolId, SignatureId,
-    TypeAliasId, TypeId, TypeMapperId,
+    SourceFileRef, TypeAliasId, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     constraints::{self, ConstraintError},
@@ -595,7 +595,129 @@ pub(super) fn conditional_remap_projection(
         projection.arguments(),
         projection.alias(),
     )?;
+    validate_remap_capture_source(store, &projection)?;
     Ok(projection)
+}
+
+fn validate_remap_capture_source(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+) -> Result<(), ConditionalTypeError> {
+    let unsupported = || {
+        ConditionalTypeError::Instantiation(InstantiationError::UnsupportedType(
+            projection.type_id(),
+        ))
+    };
+    let invalid = || ConditionalTypeError::InvalidConditional(projection.type_id());
+    let definition = &projection.production.definition;
+    let alias = definition.alias.as_ref().ok_or_else(unsupported)?;
+    let invalid_owner = || ConditionalTypeError::InvalidAliasSymbol(alias.symbol);
+    let [declaration] = store
+        .symbol(alias.symbol)
+        .and_then(|symbol| symbol.declarations())
+        .ok_or_else(invalid_owner)?
+    else {
+        return Err(invalid_owner());
+    };
+    if declaration.arena != definition.node.arena || declaration.file != definition.node.file {
+        return Err(invalid_owner());
+    }
+    if !remap_alias_scope_is_supported(store, *declaration, alias.symbol)? {
+        return Err(unsupported());
+    }
+    // This source-only header proves every own parameter and excludes enclosing
+    // generic scopes. Inline roots do not yet retain a complete capture proof.
+    let header =
+        super::object_aliases::property_object_alias_identity_source_header(store, alias.symbol)
+            .map_err(|_| invalid_owner())?;
+    let mut node = store
+        .source_direct_type_annotation(header.alias_declaration)
+        .ok_or_else(invalid)?;
+    let mut visited = HashSet::new();
+    while node != definition.node {
+        if !visited.insert(node)
+            || store.source_node_kind(node) != Some(SyntaxKind::ParenthesizedType)
+        {
+            return Err(invalid());
+        }
+        let children = store.source_direct_children(node).ok_or_else(invalid)?;
+        let [child] = children.as_slice() else {
+            return Err(invalid());
+        };
+        if child.arena != node.arena
+            || child.file != node.file
+            || store.source_node_parent(*child) != Some(SourceNodeParent::Parent(node))
+        {
+            return Err(invalid());
+        }
+        node = *child;
+    }
+    if header.alias_symbol != alias.symbol
+        || definition.outer_type_parameters != alias.type_arguments
+        || header.parameters.len() != definition.outer_type_parameters.len()
+        || header
+            .parameters
+            .iter()
+            .zip(&definition.outer_type_parameters)
+            .any(|((_, symbol), parameter)| {
+                cached_ordinary_type_parameter_owner(store, *parameter) != Some(*symbol)
+            })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn remap_alias_scope_is_supported(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    alias: SemanticSymbolId,
+) -> Result<bool, ConditionalTypeError> {
+    let invalid = || ConditionalTypeError::InvalidAliasSymbol(alias);
+    let mut node = declaration;
+    let mut visited = HashSet::from([node]);
+    let mut unsupported_capture =
+        store.source_node_kind(node).ok_or_else(invalid)? != SyntaxKind::TypeAliasDeclaration;
+    loop {
+        match store.source_node_parent(node).ok_or_else(invalid)? {
+            SourceNodeParent::Root => {
+                if store.source_node_kind(node) != Some(SyntaxKind::SourceFile)
+                    || !store.contains_source_file(SourceFileRef::new(store.id(), node))
+                {
+                    return Err(invalid());
+                }
+                return Ok(!unsupported_capture);
+            }
+            SourceNodeParent::Parent(parent) => {
+                if parent.arena != declaration.arena
+                    || parent.file != declaration.file
+                    || !visited.insert(parent)
+                {
+                    return Err(invalid());
+                }
+                let kind = store.source_node_kind(parent).ok_or_else(invalid)?;
+                let children = store.source_direct_children(parent).ok_or_else(invalid)?;
+                if children.iter().filter(|&&child| child == node).count() != 1
+                    || children.iter().any(|child| {
+                        child.arena != declaration.arena
+                            || child.file != declaration.file
+                            || store.source_node_kind(*child).is_none()
+                            || store.source_node_parent(*child)
+                                != Some(SourceNodeParent::Parent(parent))
+                    })
+                {
+                    return Err(invalid());
+                }
+                unsupported_capture |= !matches!(
+                    kind,
+                    SyntaxKind::SourceFile
+                        | SyntaxKind::ModuleBlock
+                        | SyntaxKind::ModuleDeclaration
+                );
+                node = parent;
+            }
+        }
+    }
 }
 
 fn validate_remap_source_alias_links(
@@ -6683,6 +6805,329 @@ mod tests {
             store.mapper_len(),
             store.conditional_production_lengths(),
         )
+    }
+
+    fn assert_uncaptured_conditional_remap_is_unsupported(
+        fixture: &mut Fixture,
+        source: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+    ) {
+        let original = conditional_snapshot(&fixture.store, source).unwrap();
+        assert!(original.resolved_true_type.is_none());
+        assert!(original.resolved_false_type.is_none());
+        assert!(original.resolved_inferred_true_type.is_none());
+        let cache = fixture
+            .store
+            .conditional_root(original.root)
+            .unwrap()
+            .instantiations()
+            .clone();
+        let nodes = fixture
+            .parsed
+            .arena
+            .iter()
+            .map(|(node, _)| NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            .collect::<Vec<_>>();
+        let links = |store: &CanonicalTypeMapperStore| {
+            nodes
+                .iter()
+                .map(|node| {
+                    (
+                        store.type_node_links(*node).cloned(),
+                        store.symbol_node_links(*node).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = conditional_allocation_counts(&fixture.store);
+        let original_links = links(&fixture.store);
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits::default(),
+            error_type,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                conditional_remap_projection(&fixture.store, source),
+                Err(ConditionalTypeError::Instantiation(
+                    InstantiationError::UnsupportedType(source)
+                ))
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &fixture.store,
+                    source,
+                    parameters,
+                    arguments,
+                    None,
+                    None,
+                ),
+                Err(InstantiationError::UnsupportedType(source))
+            );
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    &mut fixture.store,
+                    source,
+                    parameters,
+                    arguments,
+                    None,
+                    &mut session,
+                ),
+                Err(InstantiationError::UnsupportedType(source))
+            );
+            assert_eq!(session.query_count(), 0);
+            assert_eq!(session.limit_event_count(), 0);
+            assert_eq!(conditional_allocation_counts(&fixture.store), before);
+            assert_eq!(
+                conditional_snapshot(&fixture.store, source).unwrap(),
+                original
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .conditional_root(original.root)
+                    .unwrap()
+                    .instantiations(),
+                &cache
+            );
+            assert_eq!(links(&fixture.store), original_links);
+        }
+    }
+
+    #[test]
+    fn deferred_conditional_remap_rejects_uncaptured_inline_mapped_parameters() {
+        let mut fixture = Fixture::new(concat!(
+            "interface Validator<Value> {} ",
+            "type IsOptional<Value> = Value extends undefined ? true : false; ",
+            "type RequiredKeys<Value> = { ",
+            "[Key in keyof Value]: Value[Key] extends Validator<infer Item> ",
+            "? IsOptional<Item> extends true ? never : Key : never ",
+            "}[keyof Value];",
+        ));
+        let declared = fixture.declared_alias("RequiredKeys");
+        let node = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ConditionalTypeNode(conditional) = &record.data else {
+                    return None;
+                };
+                (fixture.parsed.arena.get(conditional.check_type)?.kind
+                    == SyntaxKind::IndexedAccessType)
+                    .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            })
+            .unwrap();
+        let source = fixture
+            .store
+            .type_node_links(node)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let proof = validated_conditional_production(&fixture.store, source).unwrap();
+        assert_eq!(proof.definition.node, node);
+        assert!(proof.definition.alias.is_none());
+        assert!(proof.definition.outer_type_parameters.is_empty());
+        let TypeData::IndexedAccess(indexed) = fixture
+            .store
+            .type_payload(proof.definition.check_type)
+            .unwrap()
+            .data()
+        else {
+            unreachable!()
+        };
+        let parameters = [indexed.object_type, indexed.index_type];
+        let target = fixture.type_parameter("Value");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_ne!(parameters[0], target);
+        assert_ne!(parameters[1], string);
+        assert_uncaptured_conditional_remap_is_unsupported(
+            &mut fixture,
+            source,
+            &parameters,
+            &[target, string],
+        );
+        let warm = conditional_allocation_counts(&fixture.store);
+        assert_eq!(fixture.declared_alias("RequiredKeys"), declared);
+        assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+    }
+
+    #[test]
+    fn deferred_conditional_remap_rejects_uncaptured_enclosing_parameters() {
+        let mut fixture = Fixture::new(concat!(
+            "function outer<Outer>() { ",
+            "type Select<Own> = Own extends string ? Outer : boolean; ",
+            "}",
+        ));
+        let source = fixture.declared_alias("Select");
+        let own = fixture.type_parameter("Own");
+        let outer = fixture.type_parameter("Outer");
+        let proof = validated_conditional_production(&fixture.store, source).unwrap();
+        assert_eq!(proof.definition.outer_type_parameters, [own]);
+        assert_eq!(
+            proof.definition.alias.as_ref().unwrap().type_arguments,
+            [own]
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_uncaptured_conditional_remap_is_unsupported(
+            &mut fixture,
+            source,
+            &[outer],
+            &[number],
+        );
+        let warm = conditional_allocation_counts(&fixture.store);
+        assert_eq!(fixture.declared_alias("Select"), source);
+        assert_eq!(conditional_allocation_counts(&fixture.store), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check both formal-node caches against one real warm remap and restore it.
+    fn deferred_conditional_remap_keeps_parameter_node_cache_errors_typed() {
+        use crate::semantic::instantiate::instantiate_type_with_vector;
+
+        for corrupt_symbol in [false, true] {
+            let mut fixture = Fixture::new(concat!(
+                "type Select<Value> = Value extends string ? number : boolean; ",
+                "type Next<Other> = Other;",
+            ));
+            let source = fixture.declared_alias("Select");
+            let owner = fixture.alias_symbol("Select");
+            let other_owner = fixture.alias_symbol("Next");
+            let parameter = fixture.type_parameter("Value");
+            let argument = fixture.type_parameter("Other");
+            let parameter_owner =
+                cached_ordinary_type_parameter_owner(&fixture.store, parameter).unwrap();
+            let parameter_node = fixture
+                .store
+                .symbol(parameter_owner)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            assert!(fixture.store.ensure_type_node_links(parameter_node));
+            assert!(fixture.store.ensure_symbol_node_links(parameter_node));
+            let original_types = fixture
+                .store
+                .type_node_links(parameter_node)
+                .unwrap()
+                .clone();
+            let original_symbols = fixture
+                .store
+                .symbol_node_links(parameter_node)
+                .unwrap()
+                .clone();
+            let result =
+                instantiate_type_with_vector(&mut fixture.store, source, &[parameter], &[argument])
+                    .unwrap();
+            let original = conditional_snapshot(&fixture.store, source).unwrap();
+            let mapped = conditional_snapshot(&fixture.store, result).unwrap();
+            let cache = fixture
+                .store
+                .conditional_root(original.root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            let mut types = original_types.clone();
+            let mut symbols = original_symbols.clone();
+            if corrupt_symbol {
+                symbols.resolved_symbol = Some(other_owner);
+            } else {
+                types.resolved_type =
+                    Some(fixture.store.intrinsic_bootstrap().unwrap().number_type);
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(parameter_node, types.clone())
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_node_links(parameter_node, symbols.clone())
+            );
+            let before = conditional_allocation_counts(&fixture.store);
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            for _ in 0..2 {
+                assert_eq!(
+                    conditional_remap_projection(&fixture.store, source),
+                    Err(ConditionalTypeError::InvalidAliasSymbol(owner))
+                );
+                assert_eq!(
+                    cached_instantiation_with_vector(
+                        &fixture.store,
+                        source,
+                        &[parameter],
+                        &[argument],
+                        None,
+                        None,
+                    ),
+                    Err(InstantiationError::InvalidType(source))
+                );
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        &mut fixture.store,
+                        source,
+                        &[parameter],
+                        &[argument],
+                        None,
+                        &mut session,
+                    ),
+                    Err(InstantiationError::InvalidType(source))
+                );
+                assert_eq!(session.query_count(), 0);
+                assert_eq!(session.limit_event_count(), 0);
+                assert_eq!(conditional_allocation_counts(&fixture.store), before);
+                assert_eq!(fixture.store.type_node_links(parameter_node), Some(&types));
+                assert_eq!(
+                    fixture.store.symbol_node_links(parameter_node),
+                    Some(&symbols)
+                );
+                assert_eq!(
+                    conditional_snapshot(&fixture.store, source).unwrap(),
+                    original
+                );
+                assert_eq!(
+                    conditional_snapshot(&fixture.store, result).unwrap(),
+                    mapped
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .conditional_root(original.root)
+                        .unwrap()
+                        .instantiations(),
+                    &cache
+                );
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(parameter_node, original_types)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_node_links(parameter_node, original_symbols)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    &fixture.store,
+                    source,
+                    &[parameter],
+                    &[argument],
+                    None,
+                    None,
+                ),
+                Ok(Some(result))
+            );
+            assert_eq!(
+                instantiate_type_with_vector(&mut fixture.store, source, &[parameter], &[argument]),
+                Ok(result)
+            );
+            assert_eq!(conditional_allocation_counts(&fixture.store), before);
+        }
     }
 
     #[test]
