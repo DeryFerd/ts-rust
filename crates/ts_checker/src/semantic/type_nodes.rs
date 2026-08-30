@@ -3735,6 +3735,7 @@ struct PlannedIntersectionType {
     alias_symbol: Option<SemanticSymbolId>,
     deferred: bool,
     ordinary_properties: bool,
+    numeric_parameter: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12314,6 +12315,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             mapped_constituents.is_some_and(|mapped| mapped.into_iter().any(|mapped| mapped));
         let known_deferred =
             react_alias.is_some() || non_nullable_alias.is_some() || infer_props_alias.is_some();
+        let numeric_parameter = self.planned_numeric_parameter_intersection(&types)?;
         let ordinary = if known_deferred || mapped_deferred {
             None
         } else {
@@ -12332,6 +12334,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !known_deferred
             && !mapped_deferred
             && !ordinary_properties
+            && !numeric_parameter
             && alias_symbol.is_some_and(|alias| {
                 self.plan
                     .aliases
@@ -12371,7 +12374,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
                 ));
             }
-        } else if !mapped_deferred && !ordinary_properties {
+        } else if !mapped_deferred && !ordinary_properties && !numeric_parameter {
             if let Some(literal) = types.iter().copied().find(|constituent| {
                 matches!(
                     self.plan.literals.get(constituent),
@@ -12401,11 +12404,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
             ));
         }
-        let derived_alias = if known_deferred || mapped_deferred || ordinary_properties {
-            alias_symbol
-        } else {
-            self.direct_union_alias(node)?
-        };
+        let derived_alias =
+            if known_deferred || mapped_deferred || ordinary_properties || numeric_parameter {
+                alias_symbol
+            } else {
+                self.direct_union_alias(node)?
+            };
         if alias_symbol.is_some() && derived_alias != alias_symbol {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidIntersectionType(node),
@@ -12414,8 +12418,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let planned = PlannedIntersectionType {
             types,
             alias_symbol: alias_symbol.or(derived_alias),
-            deferred: known_deferred || mapped_deferred || ordinary_properties,
+            deferred: known_deferred || mapped_deferred || ordinary_properties || numeric_parameter,
             ordinary_properties,
+            numeric_parameter,
         };
         if let Some(existing) = self.plan.intersections.insert(node, planned.clone())
             && existing != planned
@@ -12424,7 +12429,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::InvalidIntersectionType(node),
             ));
         }
-        if ordinary_properties
+        if (ordinary_properties || numeric_parameter)
             && let Some(cached) = self
                 .store
                 .type_node_links(node)
@@ -12455,6 +12460,101 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             }
         }
         Ok(())
+    }
+
+    fn planned_numeric_parameter_intersection(
+        &self,
+        types: &[NodeRef],
+    ) -> Result<bool, DeclaredTypeError> {
+        let [left, right] = types else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            (
+                self.planned_numeric_parameter_intersection_operand(*left)?,
+                self.planned_numeric_parameter_intersection_operand(*right)?,
+            ),
+            (Some(true), Some(false)) | (Some(false), Some(true))
+        ))
+    }
+
+    /// `true` is a written numeric literal. `false` is a real alias parameter.
+    fn planned_numeric_parameter_intersection_operand(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<bool>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        if let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data {
+            return self.planned_numeric_parameter_intersection_operand(NodeRef::new(
+                node.arena,
+                node.file,
+                parenthesized.type_,
+            ));
+        }
+        if matches!(
+            self.plan.literals.get(&node),
+            Some(PlannedLiteralType::Number { .. })
+        ) {
+            return Ok(Some(true));
+        }
+        let Some(reference) = self.plan.references.get(&node) else {
+            return Ok(None);
+        };
+        let owner = self.store.symbol(reference.symbol).ok_or_else(invalid)?;
+        if owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || reference.arity != PlannedTypeReferenceArity::Valid
+            || !reference.type_arguments.is_empty()
+            || reference.import_alias.is_some()
+            || reference.global_array_target.is_some()
+            || reference.direct_generic
+        {
+            return Ok(None);
+        }
+        let Some([declaration]) = owner.declarations() else {
+            return Err(invalid());
+        };
+        let declaration_record = preflight_node(self.store, self.host, *declaration)?;
+        let NodeData::TypeParameterDeclaration(parameter) = &declaration_record.data else {
+            return Err(invalid());
+        };
+        let Some(annotations) = self
+            .store
+            .source_alias_type_parameter_annotations(*declaration)
+        else {
+            return Ok(None);
+        };
+        if !self
+            .host
+            .symbol_matches(self.store, *declaration, reference.symbol)
+            || !self
+                .store
+                .source_declaration_belongs_to_symbol(*declaration, reference.symbol)
+            || annotations.constraint.map(|node| node.node) != parameter.constraint
+            || annotations.default_type.map(|node| node.node) != parameter.default_type
+        {
+            return Err(invalid());
+        }
+        if annotations.constraint.is_none()
+            && let Some(type_) = self
+                .store
+                .declared_type_links(reference.symbol)
+                .and_then(|links| links.declared_type)
+        {
+            let Some(TypeData::TypeParameter(parameter)) =
+                self.store.type_payload(type_).map(TypeRecord::data)
+            else {
+                return Err(invalid());
+            };
+            if parameter.constraint.is_some_and(|constraint| {
+                self.store
+                    .intrinsic_bootstrap()
+                    .is_none_or(|bootstrap| constraint != bootstrap.no_constraint_type)
+            }) {
+                return Err(invalid());
+            }
+        }
+        Ok(annotations.constraint.is_none().then_some(false))
     }
 
     /// Each lazy operand keeps its own object producer and parameter owner.
@@ -13470,6 +13570,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                         ));
                     }
+                    let numeric_source = self.cached_numeric_parameter_intersection_source(
+                        intersection,
+                        declared_type,
+                    )?;
+                    if numeric_source == Some(false) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
                     if matches!(declared_data, Some(TypeData::Intersection(_))) {
                         let deferred =
                             self.store
@@ -13503,7 +13612,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                         declared_type,
                                     )
                                     .then_some(intersection)
-                                });
+                                })
+                                .or_else(|| (numeric_source == Some(true)).then_some(intersection));
                             let Some(authenticated_intersection) = authenticated_intersection
                             else {
                                 return Err(type_node_unavailable(
@@ -14140,6 +14250,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 .is_some_and(|instantiation| *instantiation == declared_type)
                         };
                         if is_cached_instantiation {
+                            if self.validate_cached_numeric_alias_reference(
+                                root_symbol,
+                                reference,
+                                canonical,
+                                declared_type,
+                            )? {
+                                return Ok(());
+                            }
                             if let Some(proof) =
                                 self.authenticated_react_detailed_html_props_alias(canonical)
                             {
@@ -14431,6 +14549,313 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .store
                 .validate_deferred_intersection_type_with_array_targets(result, self.array_targets)
                 .is_ok()
+    }
+
+    /// A symbolic source pair cannot borrow a reduced scalar cache entry.
+    fn cached_numeric_parameter_intersection_source(
+        &self,
+        node: NodeRef,
+        result: TypeId,
+    ) -> Result<Option<bool>, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IntersectionTypeNode(intersection) = &record.data else {
+            return Err(invalid());
+        };
+        if intersection.types.nodes.len() != 2 {
+            return Ok(None);
+        }
+        if record.kind != SyntaxKind::IntersectionType
+            || intersection.types.has_trailing_comma
+            || intersection.types.range != record.range
+        {
+            return Err(invalid());
+        }
+        let mut planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.array_targets,
+            self.strict_builtin_iterator_return,
+            self.type_reference_alias_targets,
+        );
+        let mut children = Vec::new();
+        let mut previous_end = record.range.start;
+        for &child in &intersection.types.nodes {
+            let child = NodeRef::new(node.arena, node.file, child);
+            let child_record = preflight_node(self.store, self.host, child)?;
+            if child_record.parent != Some(node.node)
+                || child_record.range.start < previous_end
+                || child_record.range.end > record.range.end
+                || children.contains(&child)
+            {
+                return Err(invalid());
+            }
+            let mut leaf = child;
+            let mut visited = HashSet::new();
+            loop {
+                if !visited.insert(leaf) {
+                    return Err(invalid());
+                }
+                let leaf_record = preflight_node(self.store, self.host, leaf)?;
+                if let NodeData::ParenthesizedTypeNode(parenthesized) = &leaf_record.data {
+                    leaf = NodeRef::new(node.arena, node.file, parenthesized.type_);
+                    continue;
+                }
+                if matches!(leaf_record.data, NodeData::LiteralTypeNode(_)) {
+                    planner.plan_literal_type(leaf)?;
+                    if !matches!(
+                        planner.plan.literals.get(&leaf),
+                        Some(PlannedLiteralType::Number { .. })
+                    ) {
+                        return Ok(None);
+                    }
+                } else if matches!(leaf_record.data, NodeData::TypeReferenceNode(_)) {
+                    let symbol = self.resolve_uncached_type_reference_symbol(leaf)?;
+                    if self
+                        .store
+                        .symbol(symbol)
+                        .is_none_or(|symbol| symbol.flags() != SymbolFlags::TYPE_PARAMETER)
+                    {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+                break;
+            }
+            planner.plan_type_node_in_context(child, None, false)?;
+            previous_end = child_record.range.end;
+            children.push(child);
+        }
+        if !planner.planned_numeric_parameter_intersection(&children)? {
+            return Ok(None);
+        }
+        let Some(owner) = self.direct_type_alias_owner(node)? else {
+            return Ok(Some(false));
+        };
+        let Ok(Some(projection)) = self.store.numeric_parameter_intersection_projection(result)
+        else {
+            return Ok(Some(false));
+        };
+        let Some(parameters) = cached_alias_parameter_symbols(self.store, self.host, owner)? else {
+            return Ok(Some(false));
+        };
+        let valid = projection.alias_symbol == Some(owner)
+            && projection.alias_arguments.len() == parameters.len()
+            && parameters
+                .iter()
+                .zip(&projection.alias_arguments)
+                .all(|(&symbol, &type_)| {
+                    cached_ordinary_type_parameter_owner(self.store, type_) == Some(symbol)
+                })
+            && self.store.type_node_links(node).is_some_and(|links| {
+                links.resolved_type == Some(result) && links.outer_type_parameters.is_none()
+            })
+            && children
+                .iter()
+                .zip(&projection.types)
+                .all(|(&child, &type_)| {
+                    planner
+                        .validate_cached_react_alias_argument(owner, child, type_)
+                        .is_ok()
+                });
+        Ok(Some(valid))
+    }
+
+    /// Proves forwarding requests against the numeric source, not alias-cache agreement alone.
+    fn validate_cached_numeric_alias_reference(
+        &self,
+        root: SemanticSymbolId,
+        reference: NodeRef,
+        target: SemanticSymbolId,
+        result: TypeId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root));
+        let source_symbol = |node: NodeRef| -> Result<SemanticSymbolId, DeclaredTypeError> {
+            let record = preflight_node(self.store, self.host, node)?;
+            let NodeData::TypeReferenceNode(reference) = &record.data else {
+                return Err(invalid());
+            };
+            let name = NodeRef::new(node.arena, node.file, reference.type_name);
+            if preflight_node(self.store, self.host, name)?.kind == SyntaxKind::Identifier
+                && let Some(imported) =
+                    source_imports::plan_source_alias_body_type_import(self.store, self.host, node)
+                        .map_err(|error| property_type_import_error(node, error))?
+            {
+                imported
+                    .validate_retained(self.store)
+                    .map_err(|error| property_type_import_error(node, error))?;
+                if imported.reference() != node
+                    || imported.arguments() != self.type_reference_argument_nodes(node)?
+                    || self
+                        .type_reference_alias_targets
+                        .get(&node)
+                        .is_some_and(|capability| !imported.matches_capability(capability))
+                {
+                    return Err(invalid());
+                }
+                return Ok(imported.target_symbol());
+            }
+            self.resolve_uncached_type_reference_symbol(node)
+        };
+        let mut chain = Vec::new();
+        let mut symbol = target;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(symbol) {
+                return Ok(false);
+            }
+            let Some(declaration) = self
+                .store
+                .symbol(symbol)
+                .and_then(|owner| owner.declarations())
+                .and_then(|declarations| declarations.first())
+                .copied()
+            else {
+                return Err(invalid());
+            };
+            if self.host.source(declaration).is_none() {
+                return Ok(false);
+            }
+            let cached = cached_type_alias(
+                self.store,
+                self.host,
+                symbol,
+                self.strict_builtin_iterator_return,
+            )?
+            .ok_or_else(invalid)?;
+            match self.cached_type_alias_rhs(symbol)? {
+                CachedTypeAliasRhs::DirectIntersection(node) => {
+                    match self
+                        .cached_numeric_parameter_intersection_source(node, cached.declared_type)?
+                    {
+                        None => return Ok(false),
+                        Some(false) => return Err(invalid()),
+                        Some(true) => {}
+                    }
+                    chain.push((symbol, cached, None));
+                    break;
+                }
+                CachedTypeAliasRhs::TypeReference(node) => {
+                    let next = source_symbol(node)?;
+                    if self
+                        .store
+                        .symbol(next)
+                        .is_none_or(|owner| !owner.flags().contains(SymbolFlags::TYPE_ALIAS))
+                    {
+                        return Ok(false);
+                    }
+                    chain.push((symbol, cached, Some(node)));
+                    symbol = next;
+                }
+                _ => return Ok(false),
+            }
+        }
+        let mut node = reference;
+        let mut expected_result = result;
+        for (symbol, cached, next) in chain {
+            if source_symbol(node)? != symbol
+                || self
+                    .store
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol)
+                    != Some(symbol)
+                || self.cached_type_node_identity(root, node)? != expected_result
+            {
+                return Err(invalid());
+            }
+            let links = self.store.type_alias_links(symbol).ok_or_else(invalid)?;
+            let parameters = links.type_parameters.as_deref().ok_or_else(invalid)?;
+            let owners = cached_alias_parameter_symbols(self.store, self.host, symbol)?
+                .ok_or_else(invalid)?;
+            if parameters.len() != owners.len()
+                || parameters.iter().zip(&owners).any(|(&type_, &owner)| {
+                    cached_ordinary_type_parameter_owner(self.store, type_) != Some(owner)
+                })
+            {
+                return Err(invalid());
+            }
+            let argument_nodes = self.type_reference_argument_nodes(node)?;
+            let mut arguments = Vec::with_capacity(parameters.len());
+            for argument_node in argument_nodes {
+                let argument = self.cached_type_node_identity(root, argument_node)?;
+                self.validate_cached_react_alias_argument(root, argument_node, argument)?;
+                arguments.push(argument);
+            }
+            if arguments.len() > parameters.len() {
+                return Err(invalid());
+            }
+            let identity = self.cached_react_alias_override(node, symbol)?;
+            let alias_key = identity
+                .as_ref()
+                .map(|(owner, arguments)| {
+                    self.store
+                        .symbol_store()
+                        .assigned_global_symbol_id(*owner)
+                        .map(|global| (global, arguments.as_slice()))
+                        .ok_or_else(invalid)
+                })
+                .transpose()?;
+            let key = type_alias_instantiation_cache_key(&arguments, alias_key);
+            if links
+                .instantiations
+                .as_ref()
+                .and_then(|entries| entries.get(&key))
+                != Some(&expected_result)
+            {
+                return Err(invalid());
+            }
+            for &parameter in parameters.iter().skip(arguments.len()) {
+                let owner = cached_ordinary_type_parameter_owner(self.store, parameter)
+                    .ok_or_else(invalid)?;
+                let Some([declaration]) = self
+                    .store
+                    .symbol(owner)
+                    .and_then(|owner| owner.declarations())
+                else {
+                    return Err(invalid());
+                };
+                let default = self
+                    .store
+                    .source_alias_type_parameter_annotations(*declaration)
+                    .and_then(|annotations| annotations.default_type)
+                    .ok_or_else(invalid)?;
+                let default_type = self.cached_type_node_identity(root, default)?;
+                self.validate_cached_react_alias_argument(root, default, default_type)?;
+                let argument = super::instantiate::cached_instantiation_with_vector(
+                    self.store,
+                    default_type,
+                    &parameters[..arguments.len()],
+                    &arguments,
+                    self.array_targets,
+                    None,
+                )
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?;
+                arguments.push(argument);
+            }
+            if super::instantiate::cached_instantiation_with_vector(
+                self.store,
+                cached.declared_type,
+                parameters,
+                &arguments,
+                self.array_targets,
+                identity
+                    .as_ref()
+                    .map(|(owner, arguments)| (*owner, arguments.as_slice())),
+            )
+            .map_err(|_| invalid())?
+                != Some(expected_result)
+            {
+                return Err(invalid());
+            }
+            if let Some(next) = next {
+                node = next;
+                expected_result = cached.declared_type;
+            }
+        }
+        Ok(true)
     }
 
     fn cached_mapped_intersection_source_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
@@ -17445,6 +17870,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .transpose()?
             .flatten()
             == Some(true);
+        let numeric_intersection = self
+            .store
+            .numeric_parameter_intersection_projection(declared)
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            })?
+            .is_some();
         let mapped_lookup = source_mapped_lookup_alias_body(self.store, symbol).is_some()
             && !self.plan.prop_types_key_aliases.contains_key(&symbol);
         // Alias results can be cached before the source callable is published.
@@ -17454,6 +17888,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 || react_alias.is_some()
                 || property_alias
                 || ordinary_intersection
+                || numeric_intersection
                 || mapped_lookup
                 || self.plan.prop_types_key_aliases.contains_key(&symbol) =>
             {
@@ -17462,7 +17897,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             _ => return Ok(()),
         };
         if parameters.len() < argument_nodes.len()
-            || !property_alias && !ordinary_intersection && parameters.len() != argument_nodes.len()
+            || !property_alias
+                && !ordinary_intersection
+                && !numeric_intersection
+                && parameters.len() != argument_nodes.len()
             || !self.source_callable_alias_planning
                 && union.is_some_and(|union| {
                     union.union.types.iter().any(|type_| {
@@ -17508,14 +17946,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .collect::<Result<Vec<_>, _>>()
         else {
             return if reference_result.is_some()
-                && (property_alias || ordinary_intersection || mapped_lookup)
+                && (property_alias
+                    || ordinary_intersection
+                    || numeric_intersection
+                    || mapped_lookup)
             {
                 Err(invalid())
             } else {
                 Ok(())
             };
         };
-        if ordinary_intersection || property_alias && self.intersection_planning_depth != 0 {
+        if ordinary_intersection
+            || numeric_intersection
+            || property_alias && self.intersection_planning_depth != 0
+        {
             for (&node, &argument) in argument_nodes.iter().zip(&arguments) {
                 if self.cached_array_element_identity(node)?.is_some() {
                     self.validate_cached_react_alias_argument(symbol, node, argument)?;
@@ -17555,7 +17999,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let Some(cached) = instantiations.get(&key).copied() else {
             if retained_request.is_some()
                 || retained_intersection_request.is_some()
-                || (ordinary_intersection || mapped_lookup) && reference_result.is_some()
+                || (ordinary_intersection || numeric_intersection || mapped_lookup)
+                    && reference_result.is_some()
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
@@ -17590,7 +18035,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let supplied_arguments = arguments.clone();
         if parameters.len() != arguments.len() {
-            if !property_alias && !ordinary_intersection {
+            if !property_alias && !ordinary_intersection && !numeric_intersection {
                 return Ok(());
             }
             let alias = self.plan.aliases.get(&symbol).ok_or_else(&invalid)?;
@@ -17600,7 +18045,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             for parameter in alias.type_parameters.iter().skip(arguments.len()) {
                 let default_node = parameter.default_type.ok_or_else(&invalid)?;
                 let default = self.cached_type_node_identity(symbol, default_node)?;
-                if ordinary_intersection {
+                if ordinary_intersection || numeric_intersection {
                     self.validate_cached_react_alias_argument(symbol, default_node, default)?;
                 }
                 let argument = super::instantiate::cached_instantiation_with_vector(
@@ -26758,7 +27203,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         };
         let direct_property_intersection_alias = direct_alias.filter(|alias| {
             plan.aliases.get(alias).is_some_and(|alias| {
-                self.direct_ordinary_intersection_plan_node(alias.type_node, &plan)
+                self.direct_deferred_intersection_plan_node(alias.type_node, &plan)
                     .is_some()
             })
         });
@@ -31611,7 +32056,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .or_else(|| self.direct_keyof_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_tuple_type_plan_node(alias.type_node, plan))
                     .or_else(|| self.direct_conditional_type_plan_node(alias.type_node, plan))
-                    .or_else(|| self.direct_ordinary_intersection_plan_node(alias.type_node, plan))
+                    .or_else(|| self.direct_deferred_intersection_plan_node(alias.type_node, plan))
                 && !self
                     .pending_function_parameters
                     .iter()
@@ -34078,17 +34523,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
     }
 
-    fn direct_ordinary_intersection_plan_node(
+    fn direct_deferred_intersection_plan_node(
         &self,
         mut node: NodeRef,
         plan: &TypeQueryPlan,
     ) -> Option<NodeRef> {
         loop {
-            if plan
-                .intersections
-                .get(&node)
-                .is_some_and(|intersection| intersection.ordinary_properties)
-            {
+            if plan.intersections.get(&node).is_some_and(|intersection| {
+                intersection.ordinary_properties || intersection.numeric_parameter
+            }) {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
@@ -34109,6 +34552,33 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .intersections
                 .get(&node)
                 .is_some_and(|intersection| intersection.ordinary_properties)
+            {
+                return Some(node);
+            }
+            if let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data {
+                node = NodeRef::new(node.arena, node.file, parenthesized.type_);
+            } else {
+                let reference = plan.references.get(&node)?;
+                if reference.arity != PlannedTypeReferenceArity::Valid {
+                    return None;
+                }
+                node = plan.aliases.get(&reference.symbol)?.type_node;
+            }
+        }
+        None
+    }
+
+    fn numeric_parameter_intersection_alias_plan_node(
+        &self,
+        mut node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Option<NodeRef> {
+        let mut visited = HashSet::new();
+        while visited.insert(node) {
+            if plan
+                .intersections
+                .get(&node)
+                .is_some_and(|intersection| intersection.numeric_parameter)
             {
                 return Some(node);
             }
@@ -34917,6 +35387,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 mapped_lookup
                     || self
                         .ordinary_intersection_alias_plan_node(alias.type_node, plan)
+                        .is_some()
+                    || self
+                        .numeric_parameter_intersection_alias_plan_node(alias.type_node, plan)
                         .is_some()
             })
             .and_then(|_| {
@@ -36331,13 +36804,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         ) && self
             .ordinary_intersection_alias_plan_node(metadata.type_node, plan)
             .is_some();
-        let property_limit_mark = if property_object_alias || ordinary_intersection {
-            self.instantiation_session
-                .as_deref()
-                .map(InstantiationSession::limit_event_mark)
-        } else {
-            None
-        };
+        let numeric_intersection = self
+            .store
+            .numeric_parameter_intersection_projection(declared_type)
+            .map_err(|error| intersection_type_error(error, metadata.type_node))?
+            .is_some();
+        let property_limit_mark =
+            if property_object_alias || ordinary_intersection || numeric_intersection {
+                self.instantiation_session
+                    .as_deref()
+                    .map(InstantiationSession::limit_event_mark)
+            } else {
+                None
+            };
 
         let alias_identity = if let Some(owner) = reference.alias_owner {
             let owner_plan = plan.aliases.get(&owner).ok_or_else(|| {
@@ -36631,6 +37110,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         }
         if (property_object_alias
             || ordinary_intersection
+            || numeric_intersection
             || matches!(
                 self.store.type_payload(declared_type).map(TypeRecord::data),
                 Some(TypeData::Union(_))
@@ -37054,6 +37534,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             )?;
             intersection_receipt = receipt;
             result
+        } else if numeric_intersection {
+            self.instantiate_dependent_alias_type(
+                symbol,
+                declared_type,
+                &type_parameters,
+                &type_arguments,
+                alias_identity
+                    .as_ref()
+                    .map(|(owner, arguments)| (*owner, arguments.as_slice())),
+            )?
         } else if plan.react_detailed_html_props_aliases.contains_key(&symbol)
             || plan
                 .default_library_non_nullable_aliases
@@ -37107,7 +37597,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         self.report_property_alias_instantiation_limit(node, property_limit_mark);
         if (literal_method_alias
             || property_object_alias
-            || ordinary_intersection
+            || (ordinary_intersection || numeric_intersection)
                 && property_limit_mark.is_some_and(|mark| {
                     self.instantiation_session
                         .as_deref()
@@ -38915,6 +39405,24 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 type_,
                 mapped_parameters,
                 type_arguments,
+            );
+        }
+        if self
+            .store
+            .numeric_parameter_intersection_projection(type_)
+            .map_err(|_| {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            })?
+            .is_some()
+        {
+            return self.instantiate_dependent_alias_type(
+                symbol,
+                type_,
+                mapped_parameters,
+                type_arguments,
+                None,
             );
         }
         self.validate_direct_alias_type(symbol, type_, mapped_parameters)?;
@@ -52307,6 +52815,647 @@ mod tests {
                 .get(&type_list_key(parameters)),
             Some(&declared)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The real numeric pair and parameter declaration must survive each poison and restore.
+    fn numeric_intersection_mapping_checks_literal_pairs_and_parameter_owners() {
+        let mut fixture = fixture("type Cut<T> = 1 & T; type Other<U> = U; type Two = 2;");
+        let cut = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Cut");
+        let other = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Other");
+        let two_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Two");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = query_declared(
+            &mut fixture,
+            cut,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        query_declared(
+            &mut fixture,
+            other,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let two = query_declared(
+            &mut fixture,
+            two_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let projection = fixture
+            .store
+            .numeric_parameter_intersection_projection(declared)
+            .unwrap()
+            .unwrap();
+        let [one, parameter] = projection.types.as_slice() else {
+            panic!("Cut keeps its two source operands")
+        };
+        let (one, parameter) = (*one, *parameter);
+        let fresh = |store: &CanonicalTypeMapperStore, type_| match store
+            .type_payload(type_)
+            .unwrap()
+            .data()
+        {
+            TypeData::Literal(literal) => literal.fresh_type.unwrap(),
+            _ => panic!("the source produces a numeric literal pair"),
+        };
+        let fresh_one = fresh(&fixture.store, one);
+        let fresh_two = fresh(&fixture.store, two);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (any, never, unknown, number, string, wildcard, error) = (
+            bootstrap.any_type,
+            bootstrap.never_type,
+            bootstrap.unknown_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.wildcard_type,
+            bootstrap.error_type,
+        );
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                union_state(store),
+                store.intersection_types.clone(),
+                store.intersection_keys_by_type.clone(),
+            )
+        };
+        let before = snapshot(&fixture.store);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        for (argument, expected) in [
+            (fresh_one, one),
+            (fresh_two, never),
+            (unknown, one),
+            (number, one),
+            (string, never),
+            (any, any),
+            (never, never),
+            (wildcard, wildcard),
+            (error, error),
+        ] {
+            assert_eq!(
+                super::super::instantiate::cached_instantiation_with_vector(
+                    &fixture.store,
+                    declared,
+                    &[parameter],
+                    &[argument],
+                    None,
+                    None,
+                ),
+                Ok(Some(expected)),
+            );
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    &mut fixture.store,
+                    declared,
+                    &[parameter],
+                    &[argument],
+                    None,
+                    &mut session,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(snapshot(&fixture.store), before);
+        }
+
+        assert!(fixture.store.set_literal_links(fresh_one, None, one));
+        let poisoned = snapshot(&fixture.store);
+        assert_eq!(
+            fixture
+                .store
+                .reduce_numeric_literal_intersection(&[one, any]),
+            Err(IntersectionTypeError::MalformedConstituent(one))
+        );
+        assert_eq!(
+            super::super::instantiate::cached_instantiation_with_vector(
+                &fixture.store,
+                declared,
+                &[parameter],
+                &[any],
+                None,
+                None,
+            ),
+            Err(super::super::instantiate::InstantiationError::InvalidType(
+                declared
+            )),
+        );
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                &mut fixture.store,
+                declared,
+                &[parameter],
+                &[any],
+                None,
+                &mut session,
+            ),
+            Err(super::super::instantiate::InstantiationError::InvalidType(
+                declared
+            )),
+        );
+        assert_eq!(snapshot(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_literal_links(fresh_one, Some(fresh_one), one)
+        );
+
+        let owner = cached_ordinary_type_parameter_owner(&fixture.store, parameter).unwrap();
+        let original = fixture
+            .store
+            .symbol(owner)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let foreign = named_node(&fixture, SyntaxKind::TypeParameter, "U");
+        assert!(
+            !fixture
+                .store
+                .source_declaration_belongs_to_symbol(foreign, owner)
+        );
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(owner, Some(vec![foreign]), None)
+        );
+        let poisoned = snapshot(&fixture.store);
+        assert_eq!(
+            fixture
+                .store
+                .reduce_numeric_literal_intersection(&[one, parameter]),
+            Err(IntersectionTypeError::MalformedConstituent(parameter))
+        );
+        assert_eq!(
+            fixture.store.validate_deferred_intersection_type(declared),
+            Err(IntersectionTypeError::InvalidCachedIntersection(declared))
+        );
+        assert!(
+            super::super::instantiate::cached_instantiation_with_vector(
+                &fixture.store,
+                declared,
+                &[parameter],
+                &[unknown],
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            query_declared(
+                &mut fixture,
+                cut,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(owner, Some(original), None)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                cut,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            ),
+            Ok(declared)
+        );
+        assert_regular_literal(&fixture.store, one, &LiteralValue::Number(Number::new(1.0)));
+        assert_eq!(snapshot(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A coherent wrong cache must fail for templates, scalar requests, and symbolic forwarding.
+    fn numeric_intersection_alias_readers_reject_coherent_scalar_cache_poison() {
+        for changed in ["Cut", "Result", "Rebound"] {
+            let mut fixture = fixture(concat!(
+                "type Cut<T> = 1 & T; type Rebound<U> = Cut<U>; ",
+                "type Result = Cut<unknown>; type Fixed<V> = Cut<number>; type Through = Fixed<string>;",
+            ));
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut results = Vec::new();
+            for name in ["Cut", "Rebound", "Result", "Fixed", "Through"] {
+                let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+                let result = query_declared(
+                    &mut fixture,
+                    owner,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+                results.push((owner, result));
+            }
+            assert_eq!(results[2].1, results[3].1);
+            assert_eq!(results[3].1, results[4].1);
+            let cut = results[0].0;
+            let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, changed);
+            let body = alias_parts(&fixture, changed).2;
+            let cut_links = fixture.store.type_alias_links(cut).cloned().unwrap();
+            let owner_links = fixture.store.type_alias_links(owner).cloned().unwrap();
+            let body_links = fixture.store.type_node_links(body).cloned().unwrap();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let mut changed_cut = cut_links.clone();
+            let key = if owner == cut {
+                type_list_key(cut_links.type_parameters.as_deref().unwrap())
+            } else {
+                let arguments = if changed == "Result" {
+                    vec![fixture.store.intrinsic_bootstrap().unwrap().unknown_type]
+                } else {
+                    owner_links.type_parameters.clone().unwrap()
+                };
+                let global = fixture
+                    .store
+                    .symbol_store()
+                    .assigned_global_symbol_id(owner)
+                    .unwrap();
+                alias_instantiation_key(
+                    &arguments,
+                    Some((
+                        global,
+                        owner_links.type_parameters.as_deref().unwrap_or_default(),
+                    )),
+                )
+            };
+            assert_eq!(
+                changed_cut
+                    .instantiations
+                    .as_mut()
+                    .unwrap()
+                    .insert(key, wrong),
+                owner_links.declared_type
+            );
+            let mut changed_owner = if owner == cut {
+                changed_cut.clone()
+            } else {
+                owner_links.clone()
+            };
+            changed_owner.declared_type = Some(wrong);
+            if let Some(parameters) = &changed_owner.type_parameters {
+                assert_eq!(
+                    changed_owner
+                        .instantiations
+                        .as_mut()
+                        .unwrap()
+                        .insert(type_list_key(parameters), wrong),
+                    Some(if owner == cut {
+                        wrong
+                    } else {
+                        owner_links.declared_type.unwrap()
+                    })
+                );
+            }
+            assert!(fixture.store.set_type_alias_links(cut, changed_cut));
+            assert!(
+                fixture
+                    .store
+                    .set_type_alias_links(owner, changed_owner.clone())
+            );
+            assert!(fixture.store.set_type_node_links(
+                body,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..body_links.clone()
+                }
+            ));
+            let before = (
+                union_state(&fixture.store),
+                fixture.store.intersection_types.clone(),
+                fixture.store.intersection_keys_by_type.clone(),
+            );
+            for declared_query in [true, false] {
+                let result = if declared_query {
+                    query_declared(
+                        &mut fixture,
+                        owner,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                } else {
+                    query_node(&mut fixture, body, &mut diagnostics)
+                };
+                assert_eq!(
+                    result,
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(owner)
+                    )),
+                    "{changed} must not accept the coherent scalar cache",
+                );
+                assert_eq!(fixture.store.type_alias_links(owner), Some(&changed_owner));
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.intersection_types.clone(),
+                        fixture.store.intersection_keys_by_type.clone()
+                    ),
+                    before
+                );
+            }
+            assert!(fixture.store.set_type_alias_links(cut, cut_links));
+            assert!(fixture.store.set_type_alias_links(owner, owner_links));
+            assert!(fixture.store.set_type_node_links(body, body_links));
+            for (owner, expected) in results {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        owner,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics
+                    ),
+                    Ok(expected)
+                );
+            }
+            assert_eq!(
+                (
+                    union_state(&fixture.store),
+                    fixture.store.intersection_types.clone(),
+                    fixture.store.intersection_keys_by_type.clone()
+                ),
+                before
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn numeric_intersection_caller_limits_leave_requests_unpublished() {
+        for limits in [
+            InstantiationLimits {
+                max_depth: 0,
+                max_count: 100,
+            },
+            InstantiationLimits {
+                max_depth: 100,
+                max_count: 0,
+            },
+        ] {
+            let mut fixture = fixture(
+                "type Cut<T> = 1 & T; type Rebound<U> = Cut<U>; declare const value: Rebound<unknown>;",
+            );
+            let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Rebound");
+            let node = variable_type_node(&fixture, "value");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let links = fixture.store.type_alias_links(owner).cloned().unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let error = bootstrap.error_type;
+            let one = bootstrap
+                .cached_number_literal_type(Number::new(1.0))
+                .unwrap();
+            let before = (
+                union_state(&fixture.store),
+                fixture.store.intersection_types.clone(),
+                fixture.store.intersection_keys_by_type.clone(),
+            );
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut session =
+                InstantiationSession::new_recovering(&fixture.store, limits, error).unwrap();
+            for _ in 0..2 {
+                let mark = session.limit_event_mark();
+                assert_eq!(
+                    CanonicalTypeQuery::new_with_session_for_test(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut session,
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_type_from_type_node(node),
+                    Ok(error)
+                );
+                assert!(session.limit_event_occurred_since(mark));
+                assert_eq!(fixture.store.type_alias_links(owner), Some(&links));
+                assert!(fixture.store.type_node_links(node).is_none());
+                assert!(fixture.store.symbol_node_links(node).is_none());
+                assert_eq!(
+                    (
+                        union_state(&fixture.store),
+                        fixture.store.intersection_types.clone(),
+                        fixture.store.intersection_keys_by_type.clone()
+                    ),
+                    before
+                );
+                assert_eq!(diagnostics.as_slice().len(), 1);
+                assert_eq!(diagnostics.as_slice()[0].node, Some(node));
+                assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2589);
+            }
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(node),
+                Ok(one)
+            );
+            let warm = union_state(&fixture.store);
+            let mut no_budget = InstantiationSession::new_recovering(
+                &fixture.store,
+                InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            assert_eq!(
+                CanonicalTypeQuery::new_with_session_for_test(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut no_budget,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(node),
+                Ok(one)
+            );
+            assert_eq!(no_budget.total_count(), 0);
+            assert_eq!(no_budget.limit_event_count(), 0);
+            assert_eq!(union_state(&fixture.store), warm);
+            assert_eq!(diagnostics.as_slice().len(), 1);
+        }
+    }
+
+    #[test]
+    fn numeric_parameter_intersections_keep_other_source_and_union_forms_unavailable() {
+        for source in [
+            "type Cut<T extends number> = 1 & T;",
+            "type Cut<T> = number & T;",
+            "type Cut<T> = 'x' & T;",
+            "type Cut<T> = 1 & T & {};",
+        ] {
+            let mut fixture = fixture(source);
+            let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Cut");
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    owner,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(_)
+                ))
+            ));
+            assert_eq!(union_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+        let mut fixture = fixture("type Cut<T> = 1 & T; type Choice = 1 | 2;");
+        let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Cut");
+        let choice_alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Choice");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let choice = query_declared(
+            &mut fixture,
+            choice_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let parameter = fixture
+            .store
+            .type_alias_links(owner)
+            .unwrap()
+            .type_parameters
+            .as_ref()
+            .unwrap()[0];
+        let one = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_number_literal_type(Number::new(1.0))
+            .unwrap();
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            fixture
+                .store
+                .reduce_numeric_literal_intersection(&[one, choice]),
+            Err(IntersectionTypeError::UnsupportedConstituent(choice))
+        );
+        assert_eq!(
+            super::super::instantiate::cached_instantiation_with_vector(
+                &fixture.store,
+                declared,
+                &[parameter],
+                &[choice],
+                None,
+                None,
+            ),
+            Err(super::super::instantiate::InstantiationError::UnsupportedType(declared)),
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn numeric_intersection_preflight_rejects_a_constraint_absent_from_source() {
+        let mut fixture = fixture("type Cut<T> = 1 & T;");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Cut");
+        let parameter_symbol = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let body = alias_parts(&fixture, "Cut").2;
+        let NodeData::IntersectionTypeNode(intersection) =
+            &fixture.parsed.arena.get(body.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let reference = NodeRef::new(body.arena, body.file, intersection.types.nodes[1]);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let parameter = query_declared(
+            &mut fixture,
+            parameter_symbol,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_number_literal_type(Number::new(1.0))
+                .is_none()
+        );
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameter,
+            Some(number),
+            None,
+            None,
+            None
+        ));
+        let before = union_state(&fixture.store);
+        let aliases = fixture.store.type_alias_links(alias).cloned();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidIntersectionType(reference)
+            )),
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert_eq!(fixture.store.type_alias_links(alias), aliases.as_ref());
+        assert!(fixture.store.type_node_links(body).is_none());
+        assert!(fixture.store.type_node_links(reference).is_none());
+        assert!(
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_number_literal_type(Number::new(1.0))
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_parameter_resolution(parameter, None, None, None, None)
+        );
+        let result = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let projection = fixture
+            .store
+            .numeric_parameter_intersection_projection(result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.types[1], parameter);
+        assert_eq!(projection.alias_symbol, Some(alias));
+        assert_eq!(projection.alias_arguments, [parameter]);
         assert!(diagnostics.is_empty());
     }
 
