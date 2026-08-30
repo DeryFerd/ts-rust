@@ -2983,8 +2983,7 @@ fn plan_source_callable_with_owner_shape(
     let bound = host
         .bound_file(declaration)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
-    let javascript_jsdoc_generic_arrow = view.family == SourceCallableFamily::ArrowFunction
-        && !type_parameters.is_empty()
+    let javascript_jsdoc_generic_callable = !type_parameters.is_empty()
         && bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
@@ -3445,7 +3444,7 @@ fn plan_source_callable_with_owner_shape(
                 let type_node = NodeRef::new(declaration.arena, declaration.file, type_id);
                 let type_record = preflight_node(store, host, type_node)?;
                 let reparsed_jsdoc =
-                    javascript_jsdoc_generic_arrow && type_record.flags == NodeFlags::REPARSED;
+                    javascript_jsdoc_generic_callable && type_record.flags == NodeFlags::REPARSED;
                 if type_record.parent != Some(parameter.node)
                     || !reparsed_jsdoc
                         && (type_record.range.start < name_record.range.end
@@ -3646,7 +3645,7 @@ fn plan_source_callable_with_owner_shape(
         let type_node = NodeRef::new(declaration.arena, declaration.file, return_id);
         let return_record = preflight_node(store, host, type_node)?;
         let reparsed_jsdoc =
-            javascript_jsdoc_generic_arrow && return_record.flags == NodeFlags::REPARSED;
+            javascript_jsdoc_generic_callable && return_record.flags == NodeFlags::REPARSED;
         if return_record.parent != Some(declaration.node)
             || !reparsed_jsdoc
                 && (return_record.range.start < view.parameters.range.end
@@ -6227,15 +6226,15 @@ fn plan_exact_source_type_parameters(
         return Ok(Vec::new());
     };
     let declaration_record = preflight_node(store, host, declaration)?;
-    let jsdoc_arrow = family == SourceCallableFamily::ArrowFunction
-        && is_reparsed_jsdoc_generic_arrow(store, host, declaration, type_parameters)?;
+    let jsdoc_callable =
+        is_reparsed_jsdoc_generic_callable(store, host, declaration, type_parameters)?;
     let queried_arrow = family == SourceCallableFamily::ArrowFunction
         && query_annotations
         && store.source_arrow_has_ordinary_type_parameters(declaration);
-    if family != SourceCallableFamily::FunctionDeclaration && !jsdoc_arrow && !queried_arrow
+    if family != SourceCallableFamily::FunctionDeclaration && !jsdoc_callable && !queried_arrow
         || type_parameters.nodes.is_empty()
-        || !jsdoc_arrow && type_parameters.range.start < declaration_record.range.start
-        || jsdoc_arrow && type_parameters.range.end >= declaration_record.range.start
+        || !jsdoc_callable && type_parameters.range.start < declaration_record.range.start
+        || jsdoc_callable && type_parameters.range.end >= declaration_record.range.start
         || type_parameters.range.end > parameters.range.start
         || type_parameters.range.start >= type_parameters.range.end
     {
@@ -6380,7 +6379,8 @@ fn plan_exact_source_type_parameters(
     Ok(result)
 }
 
-pub(super) fn is_reparsed_jsdoc_generic_arrow(
+#[allow(clippy::too_many_lines)] // Check the actual JSDoc ranges and every bound signature node.
+pub(super) fn is_reparsed_jsdoc_generic_callable(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -6392,7 +6392,10 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
     if bound
         .source_facts()
         .is_none_or(|facts| !facts.is_javascript_file())
-        || store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || !matches!(
+            store.source_node_kind(declaration),
+            Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration)
+        )
         || parameters.nodes.is_empty()
     {
         return Ok(false);
@@ -6403,22 +6406,37 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
         return Ok(false);
     };
     let declaration_record = preflight_node(store, host, declaration)?;
-    let NodeData::ArrowFunction(function) = &declaration_record.data else {
-        return Ok(false);
+    let (function_parameters, function_return_type, named_function) = match &declaration_record.data
+    {
+        NodeData::ArrowFunction(function) => (&function.parameters, function.type_, false),
+        NodeData::FunctionDeclaration(function) if function.body.is_some() => {
+            (&function.parameters, function.type_, true)
+        }
+        _ => return Ok(false),
     };
+    if named_function
+        && (jsdoc.template_parameters().len() != 1
+            || jsdoc.template_parameters().iter().any(|template| {
+                template.constraint().is_some() || template.default_type().is_some()
+            })
+            || jsdoc.type_().is_some()
+            || jsdoc.this_type().is_some()
+            || jsdoc.satisfies().is_some())
+    {
+        return Ok(false);
+    }
     let Some(return_type) = jsdoc.return_type() else {
         return Ok(false);
     };
-    let Some(return_node) = function
-        .type_
-        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    let Some(return_node) =
+        function_return_type.map(|node| NodeRef::new(declaration.arena, declaration.file, node))
     else {
         return Ok(false);
     };
     let return_record = preflight_node(store, host, return_node)?;
     if jsdoc.template_parameters().len() != parameters.nodes.len()
-        || jsdoc.parameters().len() != function.parameters.nodes.len()
-        || jsdoc.parameters().is_empty()
+        || jsdoc.parameters().len() != function_parameters.nodes.len()
+        || !named_function && jsdoc.parameters().is_empty()
         || return_record.flags != NodeFlags::REPARSED
         || return_record.parent != Some(declaration.node)
         || return_record.range != return_type.range()
@@ -6446,7 +6464,7 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
             return Ok(false);
         }
     }
-    for (node, documented) in function.parameters.nodes.iter().zip(jsdoc.parameters()) {
+    for (node, documented) in function_parameters.nodes.iter().zip(jsdoc.parameters()) {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *node);
         let parameter_record = preflight_node(store, host, parameter)?;
         let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
@@ -6467,6 +6485,11 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
         if parameter_record.kind != SyntaxKind::Parameter
             || parameter_record.parent != Some(declaration.node)
             || identifier.text != documented.name()
+            || named_function
+                && (documented.is_optional()
+                    || data.question_token.is_some()
+                    || data.dot_dot_dot_token.is_some()
+                    || data.initializer.is_some())
             || annotation_record.flags != NodeFlags::REPARSED
             || annotation_record.parent != Some(parameter.node)
             || documented

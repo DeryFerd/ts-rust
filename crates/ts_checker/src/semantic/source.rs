@@ -18836,6 +18836,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Verify the callable, parameter, and comment range together.
     fn is_reparsed_jsdoc_signature_range(
         &self,
         node: NodeRef,
@@ -18860,55 +18861,79 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Some(parent_record) = self.arena.get(parent) else {
             return false;
         };
-        let arrow = match &parent_record.data {
-            NodeData::ArrowFunction(function)
-                if parent_record.kind == SyntaxKind::ArrowFunction
-                    && (function.type_ == Some(node.node)
-                        || function
-                            .type_parameters
-                            .as_ref()
-                            .is_some_and(|parameters| parameters.nodes.contains(&node.node))) =>
-            {
-                parent
-            }
-            NodeData::ParameterDeclaration(parameter)
-                if parent_record.kind == SyntaxKind::Parameter
-                    && parameter.type_ == Some(node.node) =>
-            {
-                let Some(arrow) = parent_record.parent else {
-                    return false;
-                };
-                let Some(NodeData::ArrowFunction(function)) =
-                    self.arena.get(arrow).map(|record| &record.data)
+        let callable =
+            match &parent_record.data {
+                NodeData::ArrowFunction(function)
+                    if parent_record.kind == SyntaxKind::ArrowFunction
+                        && (function.type_ == Some(node.node)
+                            || function.type_parameters.as_ref().is_some_and(|parameters| {
+                                parameters.nodes.contains(&node.node)
+                            })) =>
+                {
+                    parent
+                }
+                NodeData::FunctionDeclaration(function)
+                    if parent_record.kind == SyntaxKind::FunctionDeclaration
+                        && (function.type_ == Some(node.node)
+                            || function.type_parameters.as_ref().is_some_and(|parameters| {
+                                parameters.nodes.contains(&node.node)
+                            })) =>
+                {
+                    parent
+                }
+                NodeData::ParameterDeclaration(parameter)
+                    if parent_record.kind == SyntaxKind::Parameter
+                        && parameter.type_ == Some(node.node) =>
+                {
+                    let Some(callable) = parent_record.parent else {
+                        return false;
+                    };
+                    let parameters = match self.arena.get(callable).map(|record| &record.data) {
+                        Some(NodeData::ArrowFunction(function)) => &function.parameters,
+                        Some(NodeData::FunctionDeclaration(function)) => &function.parameters,
+                        _ => return false,
+                    };
+                    if !parameters.nodes.contains(&parent) {
+                        return false;
+                    }
+                    callable
+                }
+                _ => return false,
+            };
+        let statement = match self.arena.get(callable).map(|record| &record.data) {
+            Some(NodeData::FunctionDeclaration(_)) => callable,
+            Some(NodeData::ArrowFunction(_)) => {
+                let Some(variable) = self.arena.get(callable).and_then(|record| record.parent)
                 else {
                     return false;
                 };
-                if !function.parameters.nodes.contains(&parent) {
+                let Some(NodeData::VariableDeclaration(declaration)) =
+                    self.arena.get(variable).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                if declaration.initializer != Some(callable) {
                     return false;
                 }
-                arrow
+                let Some(statement) = self
+                    .arena
+                    .get(variable)
+                    .and_then(|record| record.parent)
+                    .and_then(|list| self.arena.get(list))
+                    .and_then(|list| list.parent)
+                else {
+                    return false;
+                };
+                if self
+                    .arena
+                    .get(statement)
+                    .is_none_or(|record| record.kind != SyntaxKind::VariableStatement)
+                {
+                    return false;
+                }
+                statement
             }
             _ => return false,
-        };
-        let Some(variable) = self.arena.get(arrow).and_then(|record| record.parent) else {
-            return false;
-        };
-        let Some(NodeData::VariableDeclaration(declaration)) =
-            self.arena.get(variable).map(|record| &record.data)
-        else {
-            return false;
-        };
-        if declaration.initializer != Some(arrow) {
-            return false;
-        }
-        let Some(statement) = self
-            .arena
-            .get(variable)
-            .and_then(|record| record.parent)
-            .and_then(|list| self.arena.get(list))
-            .and_then(|list| list.parent)
-        else {
-            return false;
         };
         let statement = self.reference(statement);
         let Some(statement_record) = self.arena.get(statement.node) else {
@@ -18917,8 +18942,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let Ok(Some(comment)) = leading_jsdoc_comment(self.arena, statement) else {
             return false;
         };
-        statement_record.kind == SyntaxKind::VariableStatement
-            && comment.range().start <= record.range.start
+        comment.range().start <= record.range.start
             && record.range.end <= comment.range().end
             && record.range.end <= statement_record.range.start
     }
@@ -38222,7 +38246,7 @@ fn check_planned_assignment_with_capture_context(
     )
 }
 
-fn is_unconstrained_jsdoc_arrow_type_parameter(
+fn is_unconstrained_jsdoc_callable_type_parameter(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     target: TypeId,
@@ -38250,27 +38274,31 @@ fn is_unconstrained_jsdoc_arrow_type_parameter(
     let Some(record) = host.node(*declaration) else {
         return false;
     };
-    let Some(arrow) = record
+    let Some(callable) = record
         .parent
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
     else {
         return false;
     };
-    let Some(arrow_record) = host.node(arrow) else {
+    let Some(callable_record) = host.node(callable) else {
         return false;
     };
-    let NodeData::ArrowFunction(function) = &arrow_record.data else {
-        return false;
+    let parameters = match &callable_record.data {
+        NodeData::ArrowFunction(function) if callable_record.kind == SyntaxKind::ArrowFunction => {
+            function.type_parameters.as_ref()
+        }
+        NodeData::FunctionDeclaration(function)
+            if callable_record.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            function.type_parameters.as_ref()
+        }
+        _ => return false,
     };
     record.kind == SyntaxKind::TypeParameter
         && record.flags == NodeFlags::REPARSED
-        && arrow_record.kind == SyntaxKind::ArrowFunction
-        && function
-            .type_parameters
-            .as_ref()
-            .is_some_and(|parameters| parameters.nodes.contains(&declaration.node))
+        && parameters.is_some_and(|parameters| parameters.nodes.contains(&declaration.node))
         && host
-            .bound_file(arrow)
+            .bound_file(callable)
             .and_then(BoundFile::source_facts)
             .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
 }
@@ -38508,7 +38536,7 @@ fn check_assignment_with_expression_type(
             options,
         )?;
         let unconstrained_jsdoc_type_parameter =
-            is_unconstrained_jsdoc_arrow_type_parameter(store, host, target);
+            is_unconstrained_jsdoc_callable_type_parameter(store, host, target);
         for mut diagnostic in staged {
             if class_assignment
                 && diagnostic.node == Some(fallback_node)
@@ -39219,7 +39247,7 @@ fn source_type_is_assignable_to(
                 ..
             }) if actual_source == source
                 && actual_target == target
-                && is_unconstrained_jsdoc_arrow_type_parameter(store, host, target) =>
+                && is_unconstrained_jsdoc_callable_type_parameter(store, host, target) =>
             {
                 return Ok(false);
             }
@@ -39818,6 +39846,62 @@ fn check_source_jsdoc_arrow_satisfies(
         break;
     }
     Ok(())
+}
+
+fn bind_source_jsdoc_type_parameters(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &mut CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+    declaration: &PlannedJavaScriptDeclaration,
+) -> Result<Vec<(String, TypeId)>, SourceCheckError> {
+    if declaration.template_parameters().len() != callable.type_parameters.len() {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::JsDoc(declaration.node()),
+        ));
+    }
+    let missing = callable
+        .type_parameters
+        .iter()
+        .filter(|parameter| {
+            store
+                .declared_type_links(parameter.symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
+        })
+        .count();
+    if !store.try_reserve_types(missing) || !store.try_reserve_declared_type_links(missing) {
+        return Err(callable_parameter_execution_error(
+            callable,
+            callable.declaration,
+        ));
+    }
+    let mut bindings = Vec::with_capacity(declaration.template_parameters().len());
+    for (template, parameter) in declaration
+        .template_parameters()
+        .iter()
+        .zip(&callable.type_parameters)
+    {
+        if bound.symbol(parameter.declaration) != Some(parameter.symbol)
+            || arena
+                .get(parameter.declaration.node)
+                .is_none_or(|record| record.range != template.range())
+            || store
+                .symbol(parameter.symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                != Some(template.name())
+        {
+            return Err(callable_parameter_execution_error(
+                callable,
+                parameter.declaration,
+            ));
+        }
+        bindings.push((
+            template.name().to_owned(),
+            execute_type_parameter(store, parameter.symbol),
+        ));
+    }
+    Ok(bindings)
 }
 
 fn bind_jsdoc_arrow_expression_types(
@@ -60103,6 +60187,32 @@ pub(super) fn check_source_file(
         collect_source_capture_assignments(store, host, &statements, &identifier_reads)?;
     let mut jsdoc_template_bindings = HashMap::<NodeRef, Vec<(String, TypeId)>>::new();
     if let Some(jsdoc) = &javascript_jsdoc {
+        for function in &functions {
+            let Some(declaration) = jsdoc.declaration(function.callable.declaration) else {
+                continue;
+            };
+            if declaration.template_parameters().is_empty()
+                || function.callable.type_parameters.is_empty()
+            {
+                continue;
+            }
+            let bindings = bind_source_jsdoc_type_parameters(
+                arena,
+                bound,
+                store,
+                &function.callable,
+                declaration,
+            )?;
+            if jsdoc_template_bindings
+                .insert(declaration.node(), bindings)
+                .is_some()
+            {
+                return Err(callable_parameter_execution_error(
+                    &function.callable,
+                    function.callable.declaration,
+                ));
+            }
+        }
         for arrow in &mut arrows {
             let Some(declaration) = jsdoc.declaration(arrow.source.variable_declaration) else {
                 continue;
@@ -60110,51 +60220,13 @@ pub(super) fn check_source_file(
             if declaration.template_parameters().is_empty() {
                 continue;
             }
-            if declaration.template_parameters().len()
-                != arrow.source.callable.type_parameters.len()
-            {
-                return Err(SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::JsDoc(declaration.node()),
-                ));
-            }
-            let missing = arrow
-                .source
-                .callable
-                .type_parameters
-                .iter()
-                .filter(|parameter| {
-                    store
-                        .declared_type_links(parameter.symbol)
-                        .and_then(|links| links.declared_type)
-                        .is_none()
-                })
-                .count();
-            if !store.try_reserve_types(missing) || !store.try_reserve_declared_type_links(missing)
-            {
-                return Err(SourceCheckError::Arrow(arrow.source.callable.declaration));
-            }
-            let mut bindings = Vec::with_capacity(declaration.template_parameters().len());
-            for (template, parameter) in declaration
-                .template_parameters()
-                .iter()
-                .zip(&arrow.source.callable.type_parameters)
-            {
-                if bound.symbol(parameter.declaration) != Some(parameter.symbol)
-                    || arena
-                        .get(parameter.declaration.node)
-                        .is_none_or(|record| record.range != template.range())
-                    || store
-                        .symbol(parameter.symbol)
-                        .and_then(|symbol| symbol.name().as_utf8())
-                        != Some(template.name())
-                {
-                    return Err(SourceCheckError::Arrow(parameter.declaration));
-                }
-                bindings.push((
-                    template.name().to_owned(),
-                    execute_type_parameter(store, parameter.symbol),
-                ));
-            }
+            let bindings = bind_source_jsdoc_type_parameters(
+                arena,
+                bound,
+                store,
+                &arrow.source.callable,
+                declaration,
+            )?;
             if let PlannedArrowBody::Return { expression, .. } = &mut arrow.body {
                 bind_jsdoc_arrow_expression_types(store, expression, &bindings)?;
             }

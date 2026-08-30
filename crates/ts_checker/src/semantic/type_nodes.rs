@@ -9432,8 +9432,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Ok(false);
         }
-        source_callables::is_reparsed_jsdoc_generic_arrow(self.store, self.host, arrow, templates)
-            .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))
+        source_callables::is_reparsed_jsdoc_generic_callable(
+            self.store, self.host, arrow, templates,
+        )
+        .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))
     }
 
     /// Authenticates `RefObject<T>.current: T | null` in the React namespace.
