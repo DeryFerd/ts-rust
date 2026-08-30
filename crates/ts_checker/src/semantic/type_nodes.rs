@@ -57934,7 +57934,7 @@ mod tests {
                         .set_conditional_root_instantiations(conditional.root, root_cache)
                 ),
                 "request result" | "request key" => {
-                    assert!(query.store.set_type_alias_links(capture, links))
+                    assert!(query.store.set_type_alias_links(capture, links));
                 }
                 _ => unreachable!(),
             }
