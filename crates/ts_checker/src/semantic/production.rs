@@ -1578,6 +1578,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             diagnostics,
             ..
         } = self;
+        instantiation_session.reset_query();
         let host = DeclaredTypeHost::from_registry(
             store,
             files,
