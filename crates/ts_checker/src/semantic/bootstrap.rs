@@ -2641,6 +2641,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(record) = self.type_payload(type_) else {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
+        if let Some(targets) = super::classes::source_class_annotation_scope_targets(self, type_) {
+            return if array_validation.targets() == Some(targets) {
+                Ok(())
+            } else {
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+            };
+        }
+        if let Some(edges) = super::classes::class_instance_type_edges(self, type_)
+            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+        {
+            for edge in edges {
+                self.validate_cached_array_capability_worker(
+                    edge,
+                    array_validation,
+                    visited,
+                    allowed_pending,
+                )?;
+            }
+            return Ok(());
+        }
         if let Some(source_interfaces) = visited.source_interfaces
             && let Some(edges) = source_interfaces(type_)?
         {
@@ -4953,6 +4973,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             });
         }
         self.validate_union_class_declarations(type_, record)?;
+        if let Some(targets) = super::classes::source_class_annotation_scope_targets(self, type_) {
+            return if array_validation.targets() == Some(targets) {
+                Ok(())
+            } else {
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+            };
+        }
         match record.data() {
             TypeData::Intrinsic(data) => {
                 self.validate_supported_intrinsic(type_, record, &data.intrinsic_name)

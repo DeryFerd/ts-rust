@@ -23,7 +23,10 @@ use super::{
     alias_provider::SourceFileNamespaceWrapper,
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
-    classes::{ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassProvenance},
+    classes::{
+        ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassAnnotationScope,
+        SourceClassProvenance,
+    },
     conditional_types::{
         ConditionalQueryKey, ConditionalQueryProduction, ConditionalTypeProduction,
     },
@@ -663,6 +666,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     mapped_property_recoveries: HashMap<SemanticSymbolId, MappedPropertyRecovery>,
     mapped_index_recoveries: HashMap<IndexInfoId, MappedIndexRecovery>,
     source_class_provenance: HashMap<TypeId, SourceClassProvenance>,
+    source_class_annotation_scopes: HashMap<TypeId, SourceClassAnnotationScope>,
     source_classes_by_symbol: HashMap<SemanticSymbolId, TypeId>,
     class_instance_super_views: HashMap<TypeId, ClassInstanceSuperView>,
     class_instance_super_views_by_instance: HashMap<TypeId, TypeId>,
@@ -843,6 +847,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             mapped_property_recoveries: HashMap::new(),
             mapped_index_recoveries: HashMap::new(),
             source_class_provenance: HashMap::new(),
+            source_class_annotation_scopes: HashMap::new(),
             source_classes_by_symbol: HashMap::new(),
             class_instance_super_views: HashMap::new(),
             class_instance_super_views_by_instance: HashMap::new(),
@@ -10953,6 +10958,43 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .source_classes_by_symbol
                 .try_reserve(additional)
                 .is_ok()
+    }
+
+    pub(super) fn begin_source_class_annotation_scope(
+        &mut self,
+        instance: TypeId,
+        scope: SourceClassAnnotationScope,
+    ) -> bool {
+        if self.source_class_annotation_scopes.contains_key(&instance)
+            || self.source_class_annotation_scopes.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        self.source_class_annotation_scopes.insert(instance, scope);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    pub(super) fn source_class_annotation_scope(
+        &self,
+        instance: TypeId,
+    ) -> Option<&SourceClassAnnotationScope> {
+        self.observe_relation_type_read(instance);
+        self.source_class_annotation_scopes.get(&instance)
+    }
+
+    pub(super) fn end_source_class_annotation_scope(&mut self, instance: TypeId) -> bool {
+        if self
+            .source_class_annotation_scopes
+            .remove(&instance)
+            .is_none()
+        {
+            return false;
+        }
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
     }
 
     pub(super) fn source_class_provenance(

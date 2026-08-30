@@ -1611,7 +1611,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             }
         };
         if let Some(plan) = overload_plan {
-            super::classes::prepare_source_class_members_with_type_queries(
+            super::classes::prepare_source_class_constructor_header(
                 store,
                 &host,
                 global_types,
@@ -1622,6 +1622,27 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             )?;
             return super::classes::source_class_constructor_overloads(store, &host, symbol)?
                 .map(|overloads| overloads.members)
+                .ok_or(super::classes::ClassError::Invariant(
+                    super::classes::ClassInvariant::InvalidConstructSignature(symbol),
+                ));
+        }
+        if let Some(plan) = super::classes::plan_source_single_constructor_class(
+            store,
+            &host,
+            symbol,
+            Some(&type_context),
+        )? {
+            super::classes::prepare_source_class_constructor_header(
+                store,
+                &host,
+                global_types,
+                *options,
+                instantiation_session,
+                diagnostics,
+                &plan,
+            )?;
+            return super::classes::source_class_single_constructor(store, &host, symbol)?
+                .map(|constructor| constructor.members)
                 .ok_or(super::classes::ClassError::Invariant(
                     super::classes::ClassInvariant::InvalidConstructSignature(symbol),
                 ));
