@@ -9084,16 +9084,16 @@ mod tests {
                 )
             }
             .unwrap();
-            let mapped = conditional_remap_projection(store, result).unwrap();
-            assert_eq!(mapped.arguments()[0], argument);
-            assert_ne!(mapped.arguments()[1], original_array);
+            let result_projection = conditional_remap_projection(store, result).unwrap();
+            assert_eq!(result_projection.arguments()[0], argument);
+            assert_ne!(result_projection.arguments()[1], original_array);
             let mapped_array = store
-                .canonical_array_reference_with_targets(targets, mapped.arguments()[1])
+                .canonical_array_reference_with_targets(targets, result_projection.arguments()[1])
                 .unwrap()
                 .unwrap();
             assert_eq!(mapped_array.element_type, argument);
             assert_eq!(
-                mapped.alias(),
+                result_projection.alias(),
                 Some(ConditionalAliasIdentity {
                     symbol: projection.alias().unwrap().symbol,
                     type_arguments: &[argument],
@@ -9146,7 +9146,7 @@ mod tests {
                     store,
                     fixture.argument,
                     &[parameter],
-                    &[mapped.arguments()[1]],
+                    &[result_projection.arguments()[1]],
                     Some(targets),
                     &mut session,
                 ),

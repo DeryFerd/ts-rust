@@ -7441,7 +7441,7 @@ mod tests {
                 2 => {
                     assert!(fixture.store.set_conditional_resolution(
                         result, None, None, None, None, None, None, None,
-                    ))
+                    ));
                 }
                 3 => assert!(
                     fixture
