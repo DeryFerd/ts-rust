@@ -26711,7 +26711,12 @@ fn checked_typeof_switch_method_property(
     }
     let method = super::object_members::plan_selected_interface_method(store, host, selected)
         .map_err(|_| invalid())?;
-    if method.symbol != owner || method.methods.iter().any(|method| method.optional) {
+    if method.symbol != owner
+        || method
+            .methods
+            .iter()
+            .any(|method| store.declared_method_optional_flag(method.symbol) != Some(false))
+    {
         return Err(invalid());
     }
     let method_type = super::object_members::interface_method_value_state(store, &method)
@@ -77213,7 +77218,7 @@ mod tests {
         else {
             panic!("the outer element must have its real opening tag")
         };
-        let tag = child_ref(view, opening.tag_name);
+        let tag = NodeRef::new(view.arena, view.file, opening.tag_name);
         let NodeData::PropertyAccessExpression(access) = &source.arena.get(tag.node).unwrap().data
         else {
             panic!("the outer tag must be the written property access")
@@ -77236,11 +77241,11 @@ mod tests {
             panic!("Foo must retain its bound declaration")
         };
         [
-            child_ref(object, *method),
-            child_ref(tag, access.expression),
-            child_ref(tag, access.name),
-            child_ref(view, inner_opening.tag_name),
-            child_ref(declaration, variable.name),
+            NodeRef::new(object.arena, object.file, *method),
+            NodeRef::new(tag.arena, tag.file, access.expression),
+            NodeRef::new(tag.arena, tag.file, access.name),
+            NodeRef::new(view.arena, view.file, inner_opening.tag_name),
+            NodeRef::new(declaration.arena, declaration.file, variable.name),
         ]
     }
 
