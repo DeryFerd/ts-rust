@@ -416,7 +416,7 @@ pub(super) enum SourceMappedLookupProducer {
     OptionalKeys(Box<SourceMappedLookupOptionalProducer>),
 }
 
-/// OptionalKeys supplies the concrete argument for its real RequiredKeys<V> child.
+/// `OptionalKeys` supplies the concrete argument for its real `RequiredKeys<V>` child.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceMappedLookupOptionalProducer {
     pub(super) reference: NodeRef,

@@ -9472,7 +9472,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .host
                 .bound_file(callable.declaration)
                 .and_then(ts_binder::BoundFile::source_facts)
-                .is_none_or(|facts| facts.is_javascript_file())
+                .is_none_or(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
         {
             return Ok(false);
         }
@@ -96327,7 +96327,6 @@ mod tests {
                             node,
                             SymbolNodeLinks {
                                 resolved_symbol: Some(other_callable.type_parameters[index].symbol),
-                                ..original_symbols[index].clone()
                             }
                         ));
                     }
