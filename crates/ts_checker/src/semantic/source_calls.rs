@@ -7784,7 +7784,7 @@ pub(super) fn source_effects_symbol_is_explicit(
     Ok(match &declaration.data {
         NodeData::VariableDeclaration(variable) => variable.type_.is_some(),
         NodeData::PropertyDeclaration(property) => property.type_.is_some(),
-        NodeData::PropertySignatureDeclaration(property) => property.type_.is_some(),
+        NodeData::PropertySignatureDeclaration(_) => true,
         NodeData::ParameterDeclaration(parameter) => parameter.type_.is_some(),
         _ => false,
     })
