@@ -6,7 +6,8 @@
 //! retains a single dependency graph and resolution stack. Call and construct
 //! signatures retain authenticated generic parameters, overload order, and
 //! supported rest parameters. Interfaces may also contain authenticated
-//! properties, methods, and index signatures. Callable type literals may retain
+//! properties, methods, and index signatures. Plain properties on top-level
+//! nongeneric interfaces may omit their type. Callable type literals may retain
 //! ordinary properties, optional `any` parameters, implicit `any` returns, and
 //! trailing implicit `any[]` rest parameters. Interface constructors may retain
 //! implicit `any` returns. Nongeneric constructor interfaces retain optional
@@ -10105,6 +10106,83 @@ fn implicit_any_augmentation_interface_property(
             .is_some()
 }
 
+/// Admits an unannotated identifier on a single top-level nongeneric interface.
+fn implicit_any_source_interface_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    interface: NodeRef,
+    property: NodeRef,
+) -> bool {
+    let Some(bound) = host.bound_file(interface) else {
+        return false;
+    };
+    let Some(interface_record) = host.node(interface) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(declaration) = &interface_record.data else {
+        return false;
+    };
+    let Some(owner) = bound_symbol(store, host, interface).and_then(|owner| store.symbol(owner))
+    else {
+        return false;
+    };
+    let source = bound.source_file();
+    let Some(source_record) = host.node(source) else {
+        return false;
+    };
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return false;
+    };
+    let Some(property_record) = host.node(property) else {
+        return false;
+    };
+    let NodeData::PropertyDeclaration(member) = &property_record.data else {
+        return false;
+    };
+    let property_name = NodeRef::new(property.arena, property.file, member.name);
+
+    interface_record.kind == SyntaxKind::InterfaceDeclaration
+        && interface_record.flags.0 == 0
+        && interface_record.parent == Some(source.node)
+        && source_record.kind == SyntaxKind::SourceFile
+        && source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == interface.node)
+            .count()
+            == 1
+        && bound
+            .source_facts()
+            .is_some_and(|facts| !facts.is_javascript_file() && !facts.is_default_library())
+        && declaration.type_parameters.is_none()
+        && declaration.heritage_clauses.is_none()
+        && owner.flags() == SymbolFlags::INTERFACE
+        && owner.declarations() == Some(&[interface])
+        && owner.value_declaration().is_none()
+        && property.is_for(interface.arena, interface.file)
+        && property_record.kind == SyntaxKind::PropertyDeclaration
+        && property_record.flags.0 == 0
+        && property_record.parent == Some(interface.node)
+        && member.type_.is_none()
+        && member.initializer.is_none()
+        && member.postfix_token.is_none()
+        && member.modifiers.is_none()
+        && member.symbol.is_none()
+        && member.facts == 0
+        && host.node(property_name).is_some_and(|name| {
+            matches!(
+                &name.data,
+                NodeData::Identifier(identifier)
+                    if name.kind == SyntaxKind::Identifier
+                        && name.flags.0 == 0
+                        && name.parent == Some(property.node)
+                        && identifier.flow_node.is_none()
+                        && !identifier.text.is_empty()
+            )
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_members(
     store: &CanonicalTypeMapperStore,
@@ -10568,12 +10646,17 @@ fn plan_members(
                 {
                     let implicit_any = kind == PropertyObjectKind::Interface
                         && property.type_.is_none()
-                        && implicit_any_augmentation_interface_property(
+                        && (implicit_any_augmentation_interface_property(
                             store,
                             host,
                             member_owner,
                             member,
-                        );
+                        ) || implicit_any_source_interface_property(
+                            store,
+                            host,
+                            member_owner,
+                            member,
+                        ));
                     (
                         property.name,
                         property
@@ -25409,6 +25492,329 @@ mod generic_publication_tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    fn query_implicit_interface(
+        fixture: &mut Fixture,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, crate::semantic::DeclaredTypeError> {
+        let host = host(&fixture.parsed, &fixture.bound);
+        CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+    }
+
+    fn implicit_property_state(
+        store: &CanonicalTypeMapperStore,
+        plan: &PropertyObjectPlan,
+        type_: TypeId,
+    ) -> (GenericPublicationState, [usize; 6]) {
+        (
+            state(store, plan, type_),
+            [
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.type_alias_len(),
+            ],
+        )
+    }
+
+    #[test]
+    fn ordinary_interface_implicit_properties_keep_real_name_markers() {
+        for (source, module) in [
+            (
+                "interface Loose { value; typed: string; }",
+                CanonicalModuleState::Script,
+            ),
+            (
+                "export interface Loose { value; typed: string; }",
+                CanonicalModuleState::External,
+            ),
+        ] {
+            let mut fixture = interface_fixture_with_module_state(source, 148_261, module);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+            let [implicit, typed] = plan.properties.as_slice() else {
+                panic!("the interface must retain both source properties");
+            };
+            assert_eq!(implicit.type_node, implicit.name_node);
+            assert_ne!(typed.type_node, typed.name_node);
+            assert_eq!(
+                plan.property_type_nodes().collect::<Vec<_>>(),
+                [typed.type_node]
+            );
+            assert_eq!(
+                fixture.bound.symbol(implicit.declaration),
+                Some(implicit.symbol),
+            );
+            assert!(fixture.store.type_node_links(implicit.name_node).is_none());
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let type_ = query_implicit_interface(&mut fixture, &mut diagnostics).unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let expected_types = [bootstrap.any_type, bootstrap.string_type];
+            assert_eq!(
+                validate_resolved_property_types(&fixture.store, &plan, &expected_types),
+                Ok(()),
+            );
+            let warm = implicit_property_state(&fixture.store, &plan, type_);
+            for _ in 0..3 {
+                assert_eq!(
+                    query_implicit_interface(&mut fixture, &mut diagnostics),
+                    Ok(type_)
+                );
+                assert_eq!(implicit_property_state(&fixture.store, &plan, type_), warm);
+                assert!(fixture.store.type_node_links(implicit.name_node).is_none());
+                assert!(diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_interface_implicit_properties_reject_changed_value_caches() {
+        use crate::semantic::{DeclaredTypeError, DeclaredTypeUnavailable};
+
+        let mut fixture = interface_fixture("interface Loose { value; typed: string; }", 148_262);
+        let plan = plan_interface(
+            &fixture.store,
+            &host(&fixture.parsed, &fixture.bound),
+            fixture.symbol,
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = query_implicit_interface(&mut fixture, &mut diagnostics).unwrap();
+        let property = plan.properties[0].symbol;
+        let original = fixture.store.value_symbol_links(property).cloned().unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let warm = implicit_property_state(&fixture.store, &plan, type_);
+        let expected =
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol: fixture.symbol,
+                declared_type: type_,
+            });
+        for damaged in [
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                write_type: Some(number),
+                ..original.clone()
+            },
+            ValueSymbolLinks {
+                target: Some(property),
+                ..original.clone()
+            },
+        ] {
+            assert!(fixture.store.set_value_symbol_links(property, damaged));
+            let poisoned = implicit_property_state(&fixture.store, &plan, type_);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_implicit_interface(&mut fixture, &mut diagnostics),
+                    Err(expected),
+                );
+                assert_eq!(
+                    implicit_property_state(&fixture.store, &plan, type_),
+                    poisoned
+                );
+                assert!(diagnostics.is_empty());
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(property, original.clone())
+            );
+            assert_eq!(
+                query_implicit_interface(&mut fixture, &mut diagnostics),
+                Ok(type_)
+            );
+            assert_eq!(implicit_property_state(&fixture.store, &plan, type_), warm);
+        }
+    }
+
+    #[test]
+    fn ordinary_interface_implicit_properties_reject_changed_member_ownership() {
+        let mut fixture = interface_fixture("interface Loose { value; typed: string; }", 148_263);
+        let plan = plan_interface(
+            &fixture.store,
+            &host(&fixture.parsed, &fixture.bound),
+            fixture.symbol,
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = query_implicit_interface(&mut fixture, &mut diagnostics).unwrap();
+        let property = plan.properties[0].symbol;
+        let annotated = plan.properties[1].symbol;
+        let table = plan.members.unwrap();
+        let warm = implicit_property_state(&fixture.store, &plan, type_);
+        for change_parent in [true, false] {
+            if change_parent {
+                assert!(fixture.store.set_symbol_relationships(
+                    property,
+                    None,
+                    None,
+                    Some(property),
+                    None,
+                ));
+            } else {
+                assert_eq!(
+                    fixture
+                        .store
+                        .insert_symbol(table, EscapedName::source("value"), annotated),
+                    Some(Some(property)),
+                );
+            }
+            let poisoned = implicit_property_state(&fixture.store, &plan, type_);
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_interface(
+                        &fixture.store,
+                        &host(&fixture.parsed, &fixture.bound),
+                        fixture.symbol,
+                    ),
+                    Err(PropertyObjectError::InvalidInterface {
+                        declaration: plan.node,
+                        symbol: fixture.symbol,
+                    }),
+                );
+                assert_eq!(
+                    implicit_property_state(&fixture.store, &plan, type_),
+                    poisoned
+                );
+            }
+            if change_parent {
+                assert!(fixture.store.set_symbol_relationships(
+                    property,
+                    None,
+                    None,
+                    Some(fixture.symbol),
+                    None,
+                ));
+            } else {
+                assert_eq!(
+                    fixture
+                        .store
+                        .insert_symbol(table, EscapedName::source("value"), property),
+                    Some(Some(annotated)),
+                );
+            }
+            assert_eq!(
+                query_implicit_interface(&mut fixture, &mut diagnostics),
+                Ok(type_)
+            );
+            assert_eq!(implicit_property_state(&fixture.store, &plan, type_), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn ordinary_interface_implicit_properties_keep_other_missing_annotations_closed() {
+        for source in [
+            "interface Loose<T> { value; }",
+            "interface Loose { value?; }",
+            "interface Loose { readonly value; }",
+            "interface Loose { 'value'; }",
+            "interface Loose { 0; }",
+            "namespace Scope { export interface Loose { value; } }",
+        ] {
+            let fixture = interface_fixture(source, 148_264);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let declaration = fixture
+                .store
+                .symbol(fixture.symbol)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let NodeData::InterfaceDeclaration(interface) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!();
+            };
+            let property = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                interface.members.nodes[0],
+            );
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert!(
+                !implicit_any_source_interface_property(
+                    &fixture.store,
+                    &host,
+                    declaration,
+                    property,
+                ),
+                "{source}"
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_interface_implicit_properties_do_not_admit_class_or_literal_members() {
+        let fixture = interface_fixture(
+            "interface Loose {} class Box { value; initialized = 1; } type Shape = { field; };",
+            148_265,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let members = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::PropertyDeclaration(_) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        record.parent.unwrap(),
+                    ),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 3);
+        for (owner, property) in members {
+            assert!(!implicit_any_source_interface_property(
+                &fixture.store,
+                &host,
+                owner,
+                property,
+            ));
+        }
     }
 
     #[test]
