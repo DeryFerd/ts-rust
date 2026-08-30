@@ -23360,7 +23360,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let condition = self.plan_expression(condition)?;
         let condition_target = condition.unparenthesized();
-        let constant_condition = matches!(condition_target.kind, PlannedExpressionKind::Boolean(_));
+        let constant_condition = matches!(
+            condition_target.kind,
+            PlannedExpressionKind::Boolean(_) | PlannedExpressionKind::Null
+        );
         match &condition_target.kind {
             PlannedExpressionKind::Identifier(condition_read)
                 if !contextual
@@ -23368,7 +23371,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         condition_read.kind,
                         PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
                     ) => {}
-            PlannedExpressionKind::Boolean(_) => {}
+            PlannedExpressionKind::Boolean(_) | PlannedExpressionKind::Null => {}
             PlannedExpressionKind::Call(_)
                 if !contextual
                     && (direct_return
@@ -113610,6 +113613,285 @@ class Foo2 {
             variable_value_type(&context, &source, file, "present"),
             context.store().intrinsic_bootstrap().unwrap().string_type,
         );
+    }
+
+    #[test]
+    fn constant_null_conditionals_report_exact_diagnostics_and_replay() {
+        for (text, expected_span) in [
+            ("const selected = null ? 1 : 2;", "null"),
+            ("const selected = (null) ? 1 : 2;", "(null)"),
+        ] {
+            let source = parsed(text);
+            let file = FileId::new(148_270);
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let initializer = variable_initializer(&source, file, "selected");
+            let NodeData::ConditionalExpression(data) =
+                &source.arena.get(initializer.node).unwrap().data
+            else {
+                panic!("selected must keep its conditional initializer");
+            };
+            let children = [data.condition, data.when_true, data.when_false]
+                .map(|node| NodeRef::new(source.arena.id(), file, node));
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("the null condition must report exactly one diagnostic");
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2873);
+            assert_eq!(diagnostic.node, Some(children[0]));
+            assert_eq!(node_text(&source, children[0]), expected_span);
+            assert!(diagnostic.range_override.is_none());
+            assert!(diagnostic.related_information.is_empty());
+            assert!(diagnostic.diagnostic.arguments.is_empty());
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "This kind of expression is always falsy.",
+            );
+            let raw = resolved_node_type(&context, initializer);
+            let declared = variable_value_type(&context, &source, file, "selected");
+            assert_eq!(context.type_to_string(raw).unwrap(), "1 | 2");
+            assert_eq!(context.type_to_string(declared).unwrap(), "1 | 2");
+            for child in children {
+                assert!(context.store().type_node_links(child).is_none());
+            }
+            let diagnostics = context.diagnostics().as_slice().to_vec();
+            let warm = observable_state(&context, file);
+            for _ in 0..3 {
+                context.check_source_file(file).unwrap();
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm);
+                assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+                assert_eq!(resolved_node_type(&context, initializer), raw);
+                assert_eq!(
+                    variable_value_type(&context, &source, file, "selected"),
+                    declared,
+                );
+                for child in children {
+                    assert!(context.store().type_node_links(child).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constant_null_conditionals_check_both_missing_branches() {
+        let source = parsed("const selected = null ? missingTrue : missingFalse;");
+        let file = FileId::new(148_271);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let initializer = variable_initializer(&source, file, "selected");
+
+        context.check_source_file(file).unwrap();
+
+        let expected = [
+            (2873, "null"),
+            (2304, "missingTrue"),
+            (2304, "missingFalse"),
+        ];
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), expected.len());
+        for (diagnostic, (code, spelling)) in diagnostics.iter().zip(expected) {
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), spelling);
+            if code == 2304 {
+                assert_eq!(diagnostic.diagnostic.arguments, [spelling]);
+            } else {
+                assert!(diagnostic.diagnostic.arguments.is_empty());
+            }
+        }
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(resolved_node_type(&context, initializer), error_type);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "selected"),
+            error_type,
+        );
+        for name in ["missingTrue", "missingFalse"] {
+            let reads = identifier_expressions(&source, file, name);
+            let [read] = reads.as_slice() else {
+                panic!("each branch must retain its own missing identifier");
+            };
+            assert_eq!(resolved_node_type(&context, *read), error_type);
+        }
+        let diagnostics = context.diagnostics().as_slice().to_vec();
+        let warm = observable_state(&context, file);
+        for _ in 0..3 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+            assert_eq!(resolved_node_type(&context, initializer), error_type);
+        }
+    }
+
+    #[test]
+    fn constant_null_conditionals_keep_named_interface_results() {
+        let source = parsed(concat!(
+            "interface Contextual { dummy; p?: number; }\n",
+            "interface Ellement { dummy; p: any; }\n",
+            "declare var e: Ellement;\n",
+            "var selected: Contextual = null ? e : e;\n",
+        ));
+        let file = FileId::new(148_272);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let initializer = variable_initializer(&source, file, "selected");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the named interface assignment must report only TS2873");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2873);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "null");
+        let raw = resolved_node_type(&context, initializer);
+        let source_type = variable_value_type(&context, &source, file, "e");
+        let target = variable_value_type(&context, &source, file, "selected");
+        assert_eq!(raw, source_type);
+        assert_ne!(raw, target);
+        assert_eq!(context.type_to_string(raw).unwrap(), "Ellement");
+        assert_eq!(context.type_to_string(target).unwrap(), "Contextual");
+        let diagnostics = context.diagnostics().as_slice().to_vec();
+        let warm = observable_state(&context, file);
+        for _ in 0..3 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+            assert_eq!(resolved_node_type(&context, initializer), raw);
+            assert_eq!(
+                variable_value_type(&context, &source, file, "e"),
+                source_type
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "selected"),
+                target,
+            );
+        }
+    }
+
+    #[test]
+    fn constant_null_conditionals_contextualize_both_object_branches() {
+        let source = parsed(concat!(
+            "interface Expected { kind: \"left\" | \"right\"; count: number; }\n",
+            "const selected: Expected = null\n",
+            "    ? { kind: \"left\", count: 1 }\n",
+            "    : { kind: \"right\", count: 2 };\n",
+        ));
+        let file = FileId::new(148_273);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let initializer = variable_initializer(&source, file, "selected");
+        let NodeData::ConditionalExpression(data) =
+            &source.arena.get(initializer.node).unwrap().data
+        else {
+            panic!("selected must keep both conditional object branches");
+        };
+        let branches = [data.when_true, data.when_false]
+            .map(|node| NodeRef::new(source.arena.id(), file, node));
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("both contextual object branches must leave only TS2873");
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2873);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "null");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (branch, spelling) in branches.into_iter().zip(["left", "right"]) {
+            let regular = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_string_literal_type(spelling)
+                .unwrap();
+            assert_eq!(object_property_type(&context, branch, "kind"), regular);
+            assert_eq!(object_property_type(&context, branch, "count"), number);
+        }
+        let branch_types = branches.map(|branch| resolved_node_type(&context, branch));
+        let raw = resolved_node_type(&context, initializer);
+        let Some(TypeData::Union(union)) = context.store().type_payload(raw).map(TypeRecord::data)
+        else {
+            panic!("the conditional must retain both object branch types");
+        };
+        assert_eq!(union.union.types.len(), 2);
+        for constituent in branch_types {
+            assert!(union.union.types.contains(&constituent));
+        }
+        let target = variable_value_type(&context, &source, file, "selected");
+        assert_eq!(context.type_to_string(target).unwrap(), "Expected");
+        let diagnostics = context.diagnostics().as_slice().to_vec();
+        let warm = observable_state(&context, file);
+        for _ in 0..3 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+            assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+            assert_eq!(resolved_node_type(&context, initializer), raw);
+            assert_eq!(
+                branches.map(|branch| resolved_node_type(&context, branch)),
+                branch_types,
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "selected"),
+                target,
+            );
+        }
+    }
+
+    #[test]
+    fn constant_null_conditionals_preserve_strict_and_loose_null_types() {
+        let source = parsed(concat!(
+            "declare const first: boolean; declare const second: boolean;\n",
+            "const truth = null ? first : second;\n",
+            "var numeric = null ? 1 : null;\n",
+            "var missing = null ? undefined : 0;\n",
+        ));
+        let file = FileId::new(148_274);
+        for strict_null_checks in [false, true] {
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                variable_value_type(&context, &source, file, "truth"),
+                bootstrap.boolean_type,
+            );
+            for (name, nullable) in [
+                ("numeric", bootstrap.null_type),
+                ("missing", bootstrap.undefined_type),
+            ] {
+                let resolved = variable_value_type(&context, &source, file, name);
+                if strict_null_checks {
+                    let Some(TypeData::Union(union)) =
+                        context.store().type_payload(resolved).map(TypeRecord::data)
+                    else {
+                        panic!("{name} must retain its nullable branch type");
+                    };
+                    assert_eq!(union.union.types.len(), 2);
+                    assert!(union.union.types.contains(&bootstrap.number_type));
+                    assert!(union.union.types.contains(&nullable));
+                } else {
+                    assert_eq!(resolved, bootstrap.number_type);
+                }
+            }
+            let diagnostics = context.diagnostics().as_slice().to_vec();
+            assert_eq!(diagnostics.len(), 3);
+            for diagnostic in &diagnostics {
+                assert_eq!(diagnostic.diagnostic.code(), 2873);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), "null");
+            }
+            let warm = observable_state(&context, file);
+            for _ in 0..3 {
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(observable_state(&context, file), warm);
+                assert_eq!(context.diagnostics().as_slice(), diagnostics.as_slice());
+            }
+        }
     }
 
     #[test]
