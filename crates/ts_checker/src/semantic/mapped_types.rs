@@ -20,7 +20,10 @@ use super::{
     TypeMapperId, TypeResolutionTarget, TypeSystemPropertyName,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
-    conditional_types::{conditional_alias_projection, validate_conditional_reference_result},
+    conditional_types::{
+        conditional_alias_projection, conditional_query_alias,
+        validate_conditional_reference_result,
+    },
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
         type_list_key,
@@ -43,6 +46,9 @@ use super::{
     },
     links::{MappedSymbolLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperApplication,
+    object_aliases::{
+        property_object_alias_identity_source_header, validate_property_object_alias_arguments,
+    },
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
     },
@@ -360,6 +366,756 @@ pub(super) struct SupportedMappedAliasProjection {
     pub(super) arguments: Vec<TypeId>,
     pub(super) identity_symbol: SemanticSymbolId,
     pub(super) identity_arguments: Vec<TypeId>,
+}
+
+/// The mapped child of an alias-owned lookup. The alias cache owns the whole
+/// lookup, not the unaliased mapped child returned to the instantiator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceMappedLookupProjection {
+    pub(super) type_: TypeId,
+    pub(super) target: TypeId,
+    pub(super) alias: SemanticSymbolId,
+    pub(super) declared_lookup: TypeId,
+    pub(super) lookup: TypeId,
+    pub(super) type_parameters: Vec<TypeId>,
+    pub(super) arguments: Vec<TypeId>,
+    origin: SourceMappedLookupOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceMappedLookupOrigin {
+    declaration: NodeRef,
+    target: TypeId,
+    alias: SemanticSymbolId,
+    declared_lookup: TypeId,
+    source: TypeId,
+    key: TypeId,
+    key_symbol: SemanticSymbolId,
+    template: TypeId,
+}
+
+/// Accepts either the mapped child or its whole source lookup. It reads only
+/// the exact plain alias key. Forwarding keys need a separate source proof.
+pub(super) fn source_mapped_lookup_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SourceMappedLookupProjection>, MappedTypeError> {
+    let Some((projection, warm)) =
+        source_mapped_lookup_projection_worker(store, type_, array_targets)?
+    else {
+        return Ok(None);
+    };
+    if warm {
+        return Err(MappedTypeError::UnsupportedTemplate(
+            projection.origin.template,
+        ));
+    }
+    Ok(Some(projection))
+}
+
+/// Retained callable evidence checks identity before query readiness. This
+/// reader cannot authorize instantiation or mapped member demand.
+pub(super) fn source_mapped_lookup_identity_projection(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<SourceMappedLookupProjection>, MappedTypeError> {
+    source_mapped_lookup_projection_worker(store, type_, array_targets)
+        .map(|projection| projection.map(|(projection, _)| projection))
+}
+
+fn source_mapped_lookup_projection_worker(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<(SourceMappedLookupProjection, bool)>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let (mapped_type, requested_lookup) = match record.data() {
+        TypeData::Mapped(_) => (type_, None),
+        TypeData::IndexedAccess(indexed)
+            if matches!(
+                store
+                    .type_payload(indexed.object_type)
+                    .map(TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            ) =>
+        {
+            (indexed.object_type, Some(type_))
+        }
+        _ => return Ok(None),
+    };
+    let Some(origin) = source_mapped_lookup_origin(store, mapped_type)? else {
+        return Ok(None);
+    };
+    let TypeData::Mapped(mapped) = store.type_payload(mapped_type).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let argument = if mapped_type == origin.target {
+        origin.source
+    } else {
+        let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+        let Some(TypeMapperApplication::Composite { second, .. }) =
+            store.mapper_application(mapper, origin.key)
+        else {
+            return Err(invalid());
+        };
+        store.map_type(second, origin.source).ok_or_else(invalid)?
+    };
+    validate_source_mapped_lookup_argument(store, origin, argument, array_targets)?;
+    let key = type_alias_instantiation_cache_key(&[argument], None);
+    let cached = store
+        .type_alias_links(origin.alias)
+        .and_then(|links| links.instantiations.as_ref())
+        .and_then(|entries| entries.get(&key))
+        .copied();
+    let lookup = if argument == origin.source {
+        if cached.is_some_and(|cached| cached != origin.declared_lookup) {
+            return Err(invalid());
+        }
+        origin.declared_lookup
+    } else {
+        cached.ok_or_else(invalid)?
+    };
+    if requested_lookup.is_some_and(|requested| requested != lookup)
+        || validate_source_mapped_lookup_instance(store, origin, argument, lookup, array_targets)?
+            != mapped_type
+    {
+        return Err(invalid());
+    }
+    let warm = source_mapped_lookup_state_is_warm(store, origin, mapped_type)?;
+    Ok(Some((
+        SourceMappedLookupProjection {
+            type_: mapped_type,
+            target: origin.target,
+            alias: origin.alias,
+            declared_lookup: origin.declared_lookup,
+            lookup,
+            type_parameters: vec![origin.source],
+            arguments: vec![argument],
+            origin,
+        },
+        warm,
+    )))
+}
+
+fn source_mapped_lookup_origin(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<Option<SourceMappedLookupOrigin>, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Ok(None);
+    };
+    let source_record = store
+        .type_payload(mapped.object.target.unwrap_or(type_))
+        .ok_or_else(invalid)?;
+    let TypeData::Mapped(source_mapped) = source_record.data() else {
+        return Err(invalid());
+    };
+    let declaration = source_mapped.declaration.ok_or_else(invalid)?;
+    let Some(SourceNodeParent::Parent(lookup_node)) = store.source_node_parent(declaration) else {
+        return Ok(None);
+    };
+    if store.source_node_kind(lookup_node) != Some(SyntaxKind::IndexedAccessType) {
+        return Ok(None);
+    }
+    let Some(SourceNodeParent::Parent(alias_declaration)) = store.source_node_parent(lookup_node)
+    else {
+        return Ok(None);
+    };
+    if store.source_node_kind(alias_declaration) != Some(SyntaxKind::TypeAliasDeclaration) {
+        return Ok(None);
+    }
+    // The first lookup family has no captured enclosing type parameters.
+    let mut parent = alias_declaration;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(parent) {
+            return Err(invalid());
+        }
+        match store.source_node_parent(parent).ok_or_else(invalid)? {
+            SourceNodeParent::Root => break,
+            SourceNodeParent::Parent(ancestor) => {
+                if !matches!(
+                    store.source_node_kind(ancestor),
+                    Some(
+                        SyntaxKind::SourceFile
+                            | SyntaxKind::ModuleBlock
+                            | SyntaxKind::ModuleDeclaration
+                    )
+                ) {
+                    return Ok(None);
+                }
+                parent = ancestor;
+            }
+        }
+    }
+    let operands = store
+        .source_mapped_type_operands(declaration)
+        .ok_or_else(invalid)?;
+    if operands.name_type.is_some()
+        || store.source_mapped_type_modifiers(declaration) != Some(MappedTypeModifiers::NONE)
+        || operands
+            .template
+            .and_then(|node| store.source_node_kind(node))
+            != Some(SyntaxKind::ConditionalType)
+        || store.source_type_operator(operands.constraint) != Some(SyntaxKind::KeyOfKeyword)
+    {
+        return Ok(None);
+    }
+    let lookup_children = store
+        .source_direct_children(lookup_node)
+        .ok_or_else(invalid)?;
+    let [object_node, index_node] = lookup_children.as_slice() else {
+        return Err(invalid());
+    };
+    if *object_node != declaration
+        || store.source_type_operator(*index_node) != Some(SyntaxKind::KeyOfKeyword)
+    {
+        return Ok(None);
+    }
+    let alias = store
+        .source_declaration_symbol(alias_declaration)
+        .ok_or_else(invalid)?;
+    let header =
+        property_object_alias_identity_source_header(store, alias).map_err(|_| invalid())?;
+    let [(source_declaration, source_symbol)] = header.parameters.as_slice() else {
+        return Ok(None);
+    };
+    let source_children = store
+        .source_direct_children(*source_declaration)
+        .ok_or_else(invalid)?;
+    if !matches!(source_children.as_slice(), [name] if store.source_node_kind(*name) == Some(SyntaxKind::Identifier))
+    {
+        return Ok(None);
+    }
+    let links = store.type_alias_links(alias).ok_or_else(invalid)?;
+    let declared_lookup = links.declared_type.ok_or_else(invalid)?;
+    let Some([source]) = links.type_parameters.as_deref() else {
+        return Err(invalid());
+    };
+    let source = *source;
+    let declared_record = store.type_payload(declared_lookup).ok_or_else(invalid)?;
+    let TypeData::IndexedAccess(declared) = declared_record.data() else {
+        return Err(invalid());
+    };
+    let target = declared.object_type;
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Mapped(original) = target_record.data() else {
+        return Err(invalid());
+    };
+    let constraint = original.constraint_type.ok_or_else(invalid)?;
+    let template = original.template_type.ok_or_else(invalid)?;
+    let key = original.type_parameter.ok_or_else(invalid)?;
+    let key_symbol = cached_ordinary_type_parameter_owner(store, key).ok_or_else(invalid)?;
+    let source_name = source_type_parameter_name(store, *source_declaration).ok_or_else(invalid)?;
+    let key_name =
+        source_type_parameter_name(store, operands.type_parameter).ok_or_else(invalid)?;
+    let constraint_target = store
+        .source_direct_type_annotation(operands.constraint)
+        .ok_or_else(invalid)?;
+    let index_target = store
+        .source_direct_type_annotation(*index_node)
+        .ok_or_else(invalid)?;
+    let template_node = operands.template.ok_or_else(invalid)?;
+    let conditional_children = store
+        .source_direct_children(template_node)
+        .ok_or_else(invalid)?;
+    let [check_node, extends_node, _, _] = conditional_children.as_slice() else {
+        return Err(invalid());
+    };
+    if store.source_node_kind(*check_node) != Some(SyntaxKind::IndexedAccessType) {
+        return Ok(None);
+    }
+    let check_children = store
+        .source_direct_children(*check_node)
+        .ok_or_else(invalid)?;
+    let [check_source, check_key] = check_children.as_slice() else {
+        return Err(invalid());
+    };
+    if !source_type_parameter_reference(store, constraint_target, source_name)
+        || !source_type_parameter_reference(store, index_target, source_name)
+        || !source_type_parameter_reference(store, *check_source, source_name)
+        || !source_type_parameter_reference(store, *check_key, key_name)
+    {
+        return Ok(None);
+    }
+    validate_source_mapped_relation_identity(store, target, false)?;
+    let template_record = store.type_payload(template).ok_or_else(invalid)?;
+    let TypeData::Conditional(conditional) = template_record.data() else {
+        return Err(invalid());
+    };
+    let TypeData::IndexedAccess(check) = store
+        .type_payload(conditional.check_type)
+        .ok_or_else(invalid)?
+        .data()
+    else {
+        return Err(invalid());
+    };
+    if header.alias_declaration != alias_declaration
+        || store.source_direct_type_annotation(alias_declaration) != Some(lookup_node)
+        || links.is_constructor_declared_property
+        || cached_ordinary_type_parameter_owner(store, source) != Some(*source_symbol)
+        || links
+            .instantiations
+            .as_ref()
+            .and_then(|entries| entries.get(&type_list_key(&[source])))
+            != Some(&declared_lookup)
+        || !store.source_direct_type_annotation_is_exact(lookup_node, declared_lookup)
+        || !store.source_direct_type_annotation_is_exact(*index_node, constraint)
+        || !store.source_direct_type_annotation_is_exact(constraint_target, source)
+        || !store.source_direct_type_annotation_is_exact(index_target, source)
+        || !store.source_direct_type_annotation_is_exact(*check_node, conditional.check_type)
+        || !store.source_direct_type_annotation_is_exact(*check_source, source)
+        || !store.source_direct_type_annotation_is_exact(*check_key, key)
+        || !store.source_direct_type_annotation_is_exact(*extends_node, conditional.extends_type)
+        || store
+            .symbol(key_symbol)
+            .and_then(|symbol| symbol.declarations())
+            != Some(&[operands.type_parameter][..])
+        || original.declaration != Some(declaration)
+        || original.modifiers_type != Some(source)
+        || validate_generic_keyof_index_type(store, constraint).map_err(|_| invalid())? != source
+        || declared.index_type != constraint
+        || validate_source_mapped_lookup_index(store, declared_lookup, target, constraint).is_err()
+        || check.object_type != source
+        || check.index_type != key
+        || validate_source_mapped_lookup_index(store, conditional.check_type, source, key).is_err()
+        || conditional.mapper.is_some()
+        || conditional.combined_mapper.is_some()
+        || template_record.object_flags() != ObjectFlags::NONE
+        || store
+            .conditional_root(conditional.root)
+            .is_none_or(|root| root.node() != template_node)
+        || conditional_alias_projection(store, template)
+            .map_err(|_| invalid())?
+            .is_some()
+        || conditional_query_alias(store, template_node)
+            .map_err(|_| invalid())?
+            .is_some()
+        || !unresolved_mapped_structure_is_valid(store, target, &original.object.structured)
+        || target_record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(SourceMappedLookupOrigin {
+        declaration,
+        target,
+        alias,
+        declared_lookup,
+        source,
+        key,
+        key_symbol,
+        template,
+    }))
+}
+
+fn source_mapped_lookup_conditional_is_cold(
+    conditional: &super::type_records::ConditionalTypeData,
+) -> bool {
+    conditional.constrained == ConstrainedTypeData::default()
+        && conditional.resolved_true_type.is_none()
+        && conditional.resolved_false_type.is_none()
+        && conditional.resolved_inferred_true_type.is_none()
+        && conditional.resolved_default_constraint.is_none()
+        && conditional.resolved_constraint_of_distributive.is_none()
+}
+
+fn source_mapped_lookup_conditional_is_warm(
+    store: &CanonicalTypeMapperStore,
+    origin: SourceMappedLookupOrigin,
+    template: TypeId,
+) -> Result<bool, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(template);
+    let TypeData::Conditional(conditional) =
+        store.type_payload(template).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    for cached in [
+        conditional.constrained.resolved_base_constraint,
+        conditional.resolved_true_type,
+        conditional.resolved_false_type,
+        conditional.resolved_inferred_true_type,
+        conditional.resolved_default_constraint,
+        conditional.resolved_constraint_of_distributive,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if store.type_payload(cached).is_none() {
+            return Err(invalid());
+        }
+    }
+    let node = store
+        .source_mapped_type_operands(origin.declaration)
+        .and_then(|operands| operands.template)
+        .ok_or_else(invalid)?;
+    let children = store.source_direct_children(node).ok_or_else(invalid)?;
+    let [_, _, true_node, false_node] = children.as_slice() else {
+        return Err(invalid());
+    };
+    for (branch, cached) in [
+        (*true_node, conditional.resolved_true_type),
+        (*false_node, conditional.resolved_false_type),
+        (*true_node, conditional.resolved_inferred_true_type),
+    ] {
+        let Some(cached) = cached else { continue };
+        // Keyword branches are invariant under the mapper. An original source
+        // branch can also have its own published identity. Missing branch
+        // queries remain missing, even when a caller filled a branch cache.
+        let known = store
+            .source_node_kind(branch)
+            .is_some_and(SyntaxKind::is_keyword_type)
+            || conditional.mapper.is_none()
+                && store
+                    .type_node_links(branch)
+                    .is_some_and(|links| links.resolved_type.is_some());
+        if known && !store.source_direct_type_annotation_is_exact(branch, cached) {
+            return Err(invalid());
+        }
+    }
+    if conditional.combined_mapper.is_none()
+        && conditional
+            .resolved_inferred_true_type
+            .is_some_and(|inferred| conditional.resolved_true_type != Some(inferred))
+    {
+        return Err(invalid());
+    }
+    Ok(!source_mapped_lookup_conditional_is_cold(conditional))
+}
+
+fn source_mapped_lookup_state_is_warm(
+    store: &CanonicalTypeMapperStore,
+    origin: SourceMappedLookupOrigin,
+    mapped_type: TypeId,
+) -> Result<bool, MappedTypeError> {
+    let Some(TypeData::Mapped(mapped)) = store.type_payload(mapped_type).map(TypeRecord::data)
+    else {
+        return Err(MappedTypeError::InvalidMappedType(mapped_type));
+    };
+    let template = mapped
+        .template_type
+        .ok_or(MappedTypeError::InvalidMappedType(mapped_type))?;
+    let original_warm = source_mapped_lookup_conditional_is_warm(store, origin, origin.template)?;
+    let instance_warm = template != origin.template
+        && source_mapped_lookup_conditional_is_warm(store, origin, template)?;
+    Ok(original_warm || instance_warm)
+}
+
+fn validate_source_mapped_lookup_cold_state(
+    store: &CanonicalTypeMapperStore,
+    origin: SourceMappedLookupOrigin,
+    mapped_type: TypeId,
+) -> Result<(), MappedTypeError> {
+    if source_mapped_lookup_state_is_warm(store, origin, mapped_type)? {
+        return Err(MappedTypeError::UnsupportedTemplate(origin.template));
+    }
+    Ok(())
+}
+
+fn validate_source_mapped_lookup_index(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    object: TypeId,
+    index: TypeId,
+) -> Result<(), MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(type_);
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::IndexedAccess(indexed) = record.data() else {
+        return Err(invalid());
+    };
+    let variable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+    if record.flags() != TypeFlags::INDEXED_ACCESS
+        || record.object_flags() != ObjectFlags::NONE && record.object_flags() != variable_flags
+        || record.alias().is_some()
+        || record.symbol().is_some()
+        || indexed.object_type != object
+        || indexed.index_type != index
+        || indexed.access_flags != AccessFlags::NONE
+        || indexed.constrained != ConstrainedTypeData::default()
+        || cached_deferred_indexed_access_type(store, object, index, AccessFlags::NONE)
+            != Ok(Some(type_))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_source_mapped_lookup_argument(
+    store: &CanonicalTypeMapperStore,
+    origin: SourceMappedLookupOrigin,
+    argument: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<(), MappedTypeError> {
+    validate_supported_mapped_alias_source(store, argument, array_targets)?;
+    if cached_ordinary_type_parameter_owner(store, argument).is_none() {
+        return Err(MappedTypeError::UnsupportedTemplate(origin.template));
+    }
+    validate_property_object_alias_arguments(store, &[argument])
+        .map_err(|_| MappedTypeError::InvalidSource(argument))?;
+    Ok(())
+}
+
+fn validate_source_mapped_lookup_instance(
+    store: &CanonicalTypeMapperStore,
+    origin: SourceMappedLookupOrigin,
+    argument: TypeId,
+    lookup: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(lookup);
+    validate_source_mapped_lookup_argument(store, origin, argument, array_targets)?;
+    if argument == origin.source {
+        return if lookup == origin.declared_lookup {
+            Ok(origin.target)
+        } else {
+            Err(invalid())
+        };
+    }
+    let key_plan = plan_nongeneric_keyof_type_with_array_targets(store, argument, array_targets)
+        .map_err(|error| mapped_keyof_error(argument, error))?;
+    let constraint = cached_nongeneric_keyof_type(store, &key_plan)
+        .map_err(|error| mapped_keyof_error(argument, error))?
+        .ok_or_else(invalid)?;
+    let TypeData::IndexedAccess(indexed) = store.type_payload(lookup).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let mapped_type = indexed.object_type;
+    validate_source_mapped_lookup_index(store, lookup, mapped_type, constraint)?;
+    let record = store.type_payload(mapped_type).ok_or_else(invalid)?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Err(invalid());
+    };
+    let parameter = mapped.type_parameter.ok_or_else(invalid)?;
+    let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+    let Some(TypeMapperApplication::Composite { first, second }) =
+        store.mapper_application(mapper, origin.key)
+    else {
+        return Err(invalid());
+    };
+    let allowed = ObjectFlags::INSTANTIATED_MAPPED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::PROPAGATING_FLAGS;
+    if record.flags() != TypeFlags::OBJECT
+        || !record
+            .object_flags()
+            .contains(ObjectFlags::INSTANTIATED_MAPPED)
+        || !(record.object_flags() & !allowed).is_empty()
+        || record.alias().is_some()
+        || record.symbol()
+            != store
+                .type_payload(origin.target)
+                .and_then(TypeRecord::symbol)
+        || mapped.declaration != Some(origin.declaration)
+        || mapped.object.target != Some(origin.target)
+        || mapped.object.instantiations != TypeCacheState::Unallocated
+        || mapped.constraint_type != Some(constraint)
+        || mapped.modifiers_type != Some(argument)
+        || mapped.name_type.is_some()
+        || mapped.contains_error
+        || parameter == origin.key
+        || mapped_type_parameter_owner(store, mapped_type, parameter) != Some(origin.key_symbol)
+        || store.type_mapper_has_exact_endpoints(first, &[origin.key], &[parameter]) != Some(true)
+        || store.type_mapper_has_exact_endpoints(second, &[origin.source], &[argument])
+            != Some(true)
+        || !unresolved_mapped_structure_is_valid(store, mapped_type, &mapped.object.structured)
+    {
+        return Err(invalid());
+    }
+    let template = mapped.template_type.ok_or_else(invalid)?;
+    if template != origin.template {
+        // Existing source queries produced this exact closed child before the
+        // generic instantiator could retain the original template. This proof
+        // does not admit the raw child to general conditional instantiation.
+        let template_record = store.type_payload(template).ok_or_else(invalid)?;
+        let TypeData::Conditional(conditional) = template_record.data() else {
+            return Err(invalid());
+        };
+        let TypeData::Conditional(original) = store
+            .type_payload(origin.template)
+            .ok_or_else(invalid)?
+            .data()
+        else {
+            return Err(invalid());
+        };
+        if template_record.flags() != TypeFlags::CONDITIONAL
+            || template_record.object_flags() != ObjectFlags::NONE
+            || template_record.alias().is_some()
+            || template_record.symbol().is_some()
+            || conditional.root != original.root
+            || conditional.extends_type != original.extends_type
+            || conditional.mapper != Some(mapper)
+            || conditional.combined_mapper.is_some()
+        {
+            return Err(invalid());
+        }
+        validate_source_mapped_lookup_index(store, conditional.check_type, argument, parameter)?;
+    }
+    Ok(mapped_type)
+}
+
+fn validate_source_mapped_lookup_instance_request(
+    store: &CanonicalTypeMapperStore,
+    projection: &SourceMappedLookupProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, MappedTypeError> {
+    if source_mapped_lookup_projection(store, projection.type_, array_targets)?.as_ref()
+        != Some(projection)
+    {
+        return Err(MappedTypeError::InvalidMappedType(projection.type_));
+    }
+    let [argument] = arguments else {
+        return Err(MappedTypeError::InvalidMappedType(projection.type_));
+    };
+    validate_source_mapped_lookup_argument(store, projection.origin, *argument, array_targets)?;
+    Ok(*argument)
+}
+
+/// Reads the complete lookup entry without creating its mapped child or keys.
+pub(super) fn cached_source_mapped_lookup_instance(
+    store: &CanonicalTypeMapperStore,
+    projection: &SourceMappedLookupProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let argument = validate_source_mapped_lookup_instance_request(
+        store,
+        projection,
+        arguments,
+        array_targets,
+    )?;
+    let key = type_alias_instantiation_cache_key(arguments, None);
+    let cached = store
+        .type_alias_links(projection.alias)
+        .and_then(|links| links.instantiations.as_ref())
+        .and_then(|entries| entries.get(&key))
+        .copied();
+    if argument == projection.origin.source && cached.is_none() {
+        return Ok(Some(projection.target));
+    }
+    cached
+        .map(|lookup| {
+            let mapped = validate_source_mapped_lookup_instance(
+                store,
+                projection.origin,
+                argument,
+                lookup,
+                array_targets,
+            )?;
+            validate_source_mapped_lookup_cold_state(store, projection.origin, mapped)?;
+            Ok(mapped)
+        })
+        .transpose()
+}
+
+/// Argument mapping and limit recovery stay in the caller's normal frame.
+/// This producer publishes one whole plain-key lookup with a cold template.
+pub(super) fn instantiate_source_mapped_lookup_instance(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &SourceMappedLookupProjection,
+    arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<TypeId, MappedTypeError> {
+    if let Some(cached) =
+        cached_source_mapped_lookup_instance(store, projection, arguments, array_targets)?
+    {
+        return Ok(cached);
+    }
+    let origin = projection.origin;
+    let argument = arguments[0];
+    let key_plan = plan_nongeneric_keyof_type_with_array_targets(store, argument, array_targets)
+        .map_err(|error| mapped_keyof_error(argument, error))?;
+    cached_nongeneric_keyof_type(store, &key_plan)
+        .map_err(|error| mapped_keyof_error(argument, error))?;
+    let mut links = store
+        .type_alias_links(origin.alias)
+        .cloned()
+        .ok_or(MappedTypeError::InvalidSymbol(origin.alias))?;
+    links
+        .instantiations
+        .as_mut()
+        .ok_or(MappedTypeError::InvalidSymbol(origin.alias))?
+        .try_reserve(1)
+        .map_err(|_| MappedTypeError::Capacity)?;
+    if !store.try_reserve_types(3) || !store.try_reserve_mappers(3) {
+        return Err(MappedTypeError::Capacity);
+    }
+    let constraint = resolve_nongeneric_keyof_type(store, &key_plan)
+        .map_err(|error| mapped_keyof_error(argument, error))?;
+    let outer_mapper = store
+        .new_type_mapper(vec![origin.source], vec![argument])
+        .ok_or(MappedTypeError::InvalidMappedType(origin.target))?;
+    let parameter = store
+        .alloc_type_parameter(Some(origin.key_symbol))
+        .ok_or(MappedTypeError::Capacity)?;
+    let key_mapper = store
+        .new_simple_type_mapper(origin.key, parameter)
+        .ok_or(MappedTypeError::InvalidTypeParameter(origin.key))?;
+    let mapper = store
+        .combine_type_mappers(Some(key_mapper), outer_mapper)
+        .ok_or(MappedTypeError::InvalidMappedType(origin.target))?;
+    if !store.set_type_parameter_resolution(
+        parameter,
+        Some(constraint),
+        Some(origin.key),
+        Some(mapper),
+        None,
+    ) {
+        return Err(MappedTypeError::InvalidTypeParameter(parameter));
+    }
+    let symbol = store
+        .type_payload(origin.target)
+        .and_then(TypeRecord::symbol)
+        .ok_or(MappedTypeError::InvalidMappedType(origin.target))?;
+    let mapped = store
+        .alloc_mapped_type(
+            ObjectFlags::INSTANTIATED_MAPPED,
+            Some(symbol),
+            Some(origin.declaration),
+        )
+        .ok_or(MappedTypeError::Capacity)?;
+    if !store.set_object_target_and_mapper(mapped, Some(origin.target), Some(mapper))
+        || !store.set_mapped_type_resolution(
+            mapped,
+            Some(origin.declaration),
+            Some(parameter),
+            Some(constraint),
+            None,
+            Some(origin.template),
+            Some(argument),
+            None,
+            false,
+        )
+    {
+        return Err(MappedTypeError::InvalidMappedType(mapped));
+    }
+    let lookup = store
+        .alloc_indexed_access_type(mapped, constraint, AccessFlags::NONE)
+        .ok_or(MappedTypeError::Capacity)?;
+    validate_source_mapped_lookup_instance(store, origin, argument, lookup, array_targets)?;
+    validate_source_mapped_lookup_cold_state(store, origin, mapped)?;
+    if links
+        .instantiations
+        .as_mut()
+        .ok_or(MappedTypeError::InvalidSymbol(origin.alias))?
+        .insert(type_alias_instantiation_cache_key(arguments, None), lookup)
+        .is_some()
+        || !store.set_type_alias_links(origin.alias, links)
+    {
+        return Err(MappedTypeError::InvalidMappedType(mapped));
+    }
+    Ok(mapped)
 }
 
 /// Reuses the installed selection and homomorphic alias producers.
@@ -2862,6 +3618,27 @@ impl CanonicalTypeMapperStore {
                 Err(MappedTypeError::InvalidMappedType(instantiated))
             };
         }
+        let retained_template = match self.type_payload(instantiated).map(TypeRecord::data) {
+            Some(TypeData::IndexedAccess(indexed)) => self
+                .type_payload(indexed.object_type)
+                .is_some_and(|record| {
+                    matches!(record.data(), TypeData::Mapped(mapped)
+                    if mapped.template_type == Some(shape.conditional))
+                }),
+            _ => false,
+        };
+        if retained_template {
+            let origin = source_mapped_lookup_origin(self, shape.mapped)?
+                .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
+            let mapped = validate_source_mapped_lookup_instance(
+                self,
+                origin,
+                shape.source_argument,
+                instantiated,
+                None,
+            )?;
+            return validate_source_mapped_lookup_cold_state(self, origin, mapped);
+        }
         let key_plan = plan_nongeneric_keyof_type(self, shape.source_argument)
             .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
         let constraint = cached_nongeneric_keyof_type(self, &key_plan)
@@ -3058,6 +3835,9 @@ impl CanonicalTypeMapperStore {
         &self,
         type_: TypeId,
     ) -> Result<Option<ResolvedMappedTypeMembers>, MappedTypeError> {
+        if source_mapped_lookup_origin(self, type_)?.is_some() {
+            reject_deferred_conditional_mapped_demand(self, type_)?;
+        }
         validate_mapped_relation_identity(self, type_)?;
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
         if let Some(source) = mapped_member_dependency(self, type_)
@@ -3754,6 +4534,10 @@ fn deferred_conditional_mapped_template(
     type_: TypeId,
 ) -> Result<Option<TypeId>, MappedTypeError> {
     let invalid = || MappedTypeError::InvalidMappedType(type_);
+    if let Some(origin) = source_mapped_lookup_origin(store, type_)? {
+        source_mapped_lookup_projection(store, type_, None)?.ok_or_else(invalid)?;
+        return Ok(Some(origin.template));
+    }
     let Some(TypeData::Mapped(mapped)) = store.type_payload(type_).map(TypeRecord::data) else {
         return Err(invalid());
     };
@@ -7066,20 +7850,24 @@ mod tests {
 
     use super::{
         MAX_TEMPLATE_UNION_SIZE, MappedTypeError, MappedTypeKey, MappedTypeKeys,
-        MappedTypeModifiers, SupportedMappedAliasKind, SupportedMappedAliasProjection,
-        cached_supported_mapped_alias_instance, instantiate_supported_mapped_alias_instance,
-        plan_mapped_type_declaration, plan_mapped_type_keys, selection_alias_source_constraint,
+        MappedTypeModifiers, SourceMappedLookupProjection, SupportedMappedAliasKind,
+        SupportedMappedAliasProjection, cached_source_mapped_lookup_instance,
+        cached_supported_mapped_alias_instance, instantiate_source_mapped_lookup_instance,
+        instantiate_supported_mapped_alias_instance, plan_mapped_type_declaration,
+        plan_mapped_type_keys, selection_alias_source_constraint,
+        source_mapped_lookup_identity_projection, source_mapped_lookup_projection,
         supported_mapped_alias_projection, unresolved_mapped_structure_is_valid,
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
         CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IntrinsicBootstrapOptions,
         TypeData, TypeId,
+        conditional_types::{ConditionalTypeBranches, get_false_type_from_conditional_type},
         constraints::get_base_constraint_of_type,
         declared::{execute_type_parameter, type_list_key},
         instantiate::{
             InstantiationError, InstantiationLimits, InstantiationSession,
-            instantiate_type_with_vector_and_session,
+            cached_instantiation_with_vector, instantiate_type_with_vector_and_session,
         },
         keyof_types::{
             NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
@@ -7243,6 +8031,468 @@ mod tests {
              declare function convert<T>(value: T): {alias}<T>;\n\
              const input = {{ a: 'a', b: 1 }};\n",
         )
+    }
+
+    fn nested_lookup_source(alias: &str) -> String {
+        format!(
+            "interface Cell<Value> {{}}\n\
+             type {alias}<Source> = {{ [Key in keyof Source]:\n\
+               Source[Key] extends Cell<infer Item> ? Key : never\
+             }}[keyof Source];\n\
+             type Incoming<P> = P;\n\
+             type Later<Q> = Q;\n\
+             type Concrete = {{ value: string }};\n",
+        )
+    }
+
+    fn nested_lookup_fixture<'a>(
+        parsed: &'a ParseResult,
+        alias_name: &str,
+    ) -> (
+        CanonicalCheckerContext<'a>,
+        SourceMappedLookupProjection,
+        TypeId,
+        TypeId,
+    ) {
+        assert!(parsed.diagnostics.is_empty());
+        let mut context = checker_context(parsed);
+        let (alias, _) = mapped_constraint_alias_parts(parsed, &context, alias_name);
+        let (incoming, _) = mapped_constraint_alias_parts(parsed, &context, "Incoming");
+        let (later, _) = mapped_constraint_alias_parts(parsed, &context, "Later");
+        let lookup = context.get_declared_type_of_symbol(alias).unwrap();
+        let incoming = context.get_declared_type_of_symbol(incoming).unwrap();
+        let later = context.get_declared_type_of_symbol(later).unwrap();
+        let projection = source_mapped_lookup_projection(context.store(), lookup, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.alias, alias);
+        assert_eq!(projection.lookup, projection.declared_lookup);
+        assert_eq!(projection.type_, projection.target);
+        assert_ne!(projection.type_, projection.lookup);
+        assert!(context.diagnostics().is_empty());
+        (context, projection, incoming, later)
+    }
+
+    #[test]
+    fn nested_mapped_lookups_keep_the_parent_cache_and_original_template() {
+        for name in ["ChosenKeys", "AcceptedNames"] {
+            let parsed = parse_source_file(&nested_lookup_source(name));
+            let (mut context, projection, incoming, later) = nested_lookup_fixture(&parsed, name);
+            let store = context.store_mut_for_test();
+            let (template, conditional) = conditional_template_snapshot(store, projection.type_);
+            let parameters = projection.type_parameters.clone();
+            let arguments = [incoming];
+            let cold = cache_state(store);
+            assert_eq!(
+                source_mapped_lookup_identity_projection(store, projection.lookup, None),
+                Ok(Some(projection.clone()))
+            );
+            assert_eq!(
+                cached_source_mapped_lookup_instance(store, &projection, &arguments, None),
+                Ok(None)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    projection.lookup,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None
+                ),
+                Ok(None)
+            );
+            assert_eq!(cache_state(store), cold);
+
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let lookup = instantiate_type_with_vector_and_session(
+                store,
+                projection.lookup,
+                &parameters,
+                &arguments,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let current = source_mapped_lookup_projection(store, lookup, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.arguments, arguments);
+            assert_eq!(current.target, projection.target);
+            assert_eq!(current.declared_lookup, projection.lookup);
+            assert_ne!(current.type_, projection.type_);
+            assert_eq!(
+                store
+                    .type_alias_links(projection.alias)
+                    .unwrap()
+                    .instantiations
+                    .as_ref()
+                    .unwrap()
+                    .get(&type_alias_instantiation_cache_key(&arguments, None)),
+                Some(&lookup)
+            );
+            assert_cold_conditional_mapped_type(store, current.type_, template);
+            let warm = cache_state(store);
+            let counts = (session.query_count(), session.total_count());
+            assert_eq!(counts, (4, 4));
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    projection.lookup,
+                    &parameters,
+                    &arguments,
+                    None,
+                    &mut session,
+                ),
+                Ok(lookup)
+            );
+            assert_eq!(
+                cached_instantiation_with_vector(
+                    store,
+                    projection.lookup,
+                    &parameters,
+                    &arguments,
+                    None,
+                    None
+                ),
+                Ok(Some(lookup))
+            );
+            assert_eq!(cache_state(store), warm);
+            assert_eq!((session.query_count(), session.total_count()), (8, 8));
+
+            let next = instantiate_type_with_vector_and_session(
+                store,
+                lookup,
+                &arguments,
+                &[later],
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let next = source_mapped_lookup_projection(store, next, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.arguments, [later]);
+            assert_eq!(next.target, projection.target);
+            assert_eq!(next.declared_lookup, projection.declared_lookup);
+            assert_cold_conditional_mapped_type(store, next.type_, template);
+            assert_eq!(
+                store.type_payload(template).unwrap().data(),
+                &TypeData::Conditional(conditional)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_mapped_lookups_reject_damaged_owners_mappers_and_templates() {
+        let parsed = parse_source_file(&nested_lookup_source("ChosenKeys"));
+        let (mut context, projection, incoming, later) =
+            nested_lookup_fixture(&parsed, "ChosenKeys");
+        let foreign_parsed = parse_source_file("");
+        let foreign_context = checker_context(&foreign_parsed);
+        let foreign = foreign_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        let store = context.store_mut_for_test();
+        let mapped =
+            instantiate_source_mapped_lookup_instance(store, &projection, &[incoming], None)
+                .unwrap();
+        let current = source_mapped_lookup_projection(store, mapped, None)
+            .unwrap()
+            .unwrap();
+        let TypeData::Mapped(mapped_data) = store.type_payload(mapped).unwrap().data() else {
+            unreachable!()
+        };
+        let mapped_data = mapped_data.clone();
+        let (template, conditional) = conditional_template_snapshot(store, mapped);
+        let wrong_mapper = store
+            .new_simple_type_mapper(projection.type_parameters[0], later)
+            .unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let flags = store.type_payload(mapped).unwrap().object_flags();
+        let links = store.type_alias_links(projection.alias).unwrap().clone();
+
+        for damage in 0..4 {
+            match damage {
+                0 => assert!(store.set_object_target_and_mapper(
+                    mapped,
+                    Some(later),
+                    mapped_data.object.mapper
+                )),
+                1 => assert!(store.set_object_target_and_mapper(
+                    mapped,
+                    mapped_data.object.target,
+                    Some(wrong_mapper)
+                )),
+                2 => assert!(store.add_type_object_flags(mapped, ObjectFlags::MEMBERS_RESOLVED)),
+                3 => assert!(store.set_conditional_resolution(
+                    template,
+                    None,
+                    Some(number),
+                    None,
+                    None,
+                    None,
+                    conditional.mapper,
+                    conditional.combined_mapper
+                )),
+                _ => unreachable!(),
+            }
+            let damaged = cache_state(store);
+            for _ in 0..2 {
+                assert!(matches!(
+                    source_mapped_lookup_projection(store, mapped, None),
+                    Err(MappedTypeError::InvalidMappedType(_))
+                ));
+                assert!(matches!(
+                    source_mapped_lookup_identity_projection(store, mapped, None),
+                    Err(MappedTypeError::InvalidMappedType(_))
+                ));
+                assert!(matches!(
+                    cached_source_mapped_lookup_instance(store, &projection, &[incoming], None),
+                    Err(MappedTypeError::InvalidMappedType(_))
+                ));
+                assert!(matches!(
+                    instantiate_source_mapped_lookup_instance(
+                        store,
+                        &projection,
+                        &[incoming],
+                        None
+                    ),
+                    Err(MappedTypeError::InvalidMappedType(_))
+                ));
+                assert_eq!(cache_state(store), damaged);
+                assert_eq!(store.type_alias_links(projection.alias), Some(&links));
+            }
+            assert!(store.set_object_target_and_mapper(
+                mapped,
+                mapped_data.object.target,
+                mapped_data.object.mapper
+            ));
+            assert!(store.set_type_object_flags(mapped, flags));
+            assert!(store.set_conditional_resolution(
+                template,
+                None,
+                None,
+                None,
+                None,
+                None,
+                conditional.mapper,
+                conditional.combined_mapper
+            ));
+            assert_eq!(
+                source_mapped_lookup_projection(store, mapped, None),
+                Ok(Some(current.clone()))
+            );
+            assert_eq!(
+                cached_source_mapped_lookup_instance(store, &projection, &[incoming], None),
+                Ok(Some(mapped))
+            );
+        }
+        let before = cache_state(store);
+        assert!(!store.set_conditional_resolution(
+            template,
+            None,
+            Some(foreign),
+            None,
+            None,
+            None,
+            conditional.mapper,
+            conditional.combined_mapper
+        ));
+        assert_eq!(
+            source_mapped_lookup_projection(store, foreign, None),
+            Err(MappedTypeError::InvalidMappedType(foreign))
+        );
+        assert_eq!(
+            source_mapped_lookup_identity_projection(store, foreign, None),
+            Err(MappedTypeError::InvalidMappedType(foreign))
+        );
+        assert_eq!(
+            cached_source_mapped_lookup_instance(store, &projection, &[foreign], None),
+            Err(MappedTypeError::InvalidSource(foreign))
+        );
+        assert_eq!(
+            instantiate_source_mapped_lookup_instance(store, &projection, &[foreign], None),
+            Err(MappedTypeError::InvalidSource(foreign))
+        );
+        assert_eq!(cache_state(store), before);
+        assert_eq!(store.type_alias_links(projection.alias), Some(&links));
+        let mut forged = current.clone();
+        forged.arguments = vec![later];
+        let before = cache_state(store);
+        assert_eq!(
+            instantiate_source_mapped_lookup_instance(store, &forged, &[incoming], None),
+            Err(MappedTypeError::InvalidMappedType(mapped))
+        );
+        assert_eq!(cache_state(store), before);
+        assert_eq!(
+            store.type_payload(template).unwrap().data(),
+            &TypeData::Conditional(conditional)
+        );
+    }
+
+    #[test]
+    fn nested_mapped_lookups_keep_valid_warm_branches_as_unsupported() {
+        let parsed = parse_source_file(&nested_lookup_source("ChosenKeys"));
+        let (mut context, projection, incoming, later) =
+            nested_lookup_fixture(&parsed, "ChosenKeys");
+        let store = context.store_mut_for_test();
+        let mapped =
+            instantiate_source_mapped_lookup_instance(store, &projection, &[incoming], None)
+                .unwrap();
+        let current = source_mapped_lookup_projection(store, mapped, None)
+            .unwrap()
+            .unwrap();
+        let (template, _) = conditional_template_snapshot(store, mapped);
+        let never = store.intrinsic_bootstrap().unwrap().never_type;
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            get_false_type_from_conditional_type(
+                store,
+                template,
+                ConditionalTypeBranches {
+                    true_type: projection.origin.key,
+                    false_type: never
+                },
+                None,
+                Some(&mut session),
+            ),
+            Ok(never)
+        );
+        let TypeData::Conditional(warm) = store.type_payload(template).unwrap().data() else {
+            unreachable!()
+        };
+        let warm = warm.clone();
+        assert_eq!(warm.resolved_false_type, Some(never));
+        assert_eq!(warm.resolved_true_type, None);
+        let before = (
+            cache_state(store),
+            store.type_alias_len_internal(),
+            store.type_resolution_internal_state(),
+        );
+        let links = store.type_alias_links(projection.alias).unwrap().clone();
+        for _ in 0..2 {
+            let identity = source_mapped_lookup_identity_projection(store, mapped, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity, current);
+            assert_eq!(
+                source_mapped_lookup_projection(store, mapped, None),
+                Err(MappedTypeError::UnsupportedTemplate(template))
+            );
+            assert_eq!(
+                cached_source_mapped_lookup_instance(store, &projection, &[incoming], None),
+                Err(MappedTypeError::UnsupportedTemplate(template))
+            );
+            assert_eq!(
+                instantiate_source_mapped_lookup_instance(store, &projection, &[later], None),
+                Err(MappedTypeError::UnsupportedTemplate(template))
+            );
+            assert_eq!(
+                instantiate_source_mapped_lookup_instance(store, &identity, &[later], None),
+                Err(MappedTypeError::UnsupportedTemplate(template))
+            );
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    current.lookup,
+                    &[incoming],
+                    &[later],
+                    None,
+                    &mut session
+                ),
+                Err(InstantiationError::UnsupportedType(mapped))
+            );
+            assert_eq!(
+                (
+                    cache_state(store),
+                    store.type_alias_len_internal(),
+                    store.type_resolution_internal_state()
+                ),
+                before
+            );
+            assert_eq!(store.type_alias_links(projection.alias), Some(&links));
+            assert_eq!(
+                store.type_payload(template).unwrap().data(),
+                &TypeData::Conditional(warm.clone())
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_mapped_lookups_reject_concrete_and_member_demand_without_publication() {
+        let parsed = parse_source_file(&nested_lookup_source("ChosenKeys"));
+        let (mut context, projection, incoming, _) = nested_lookup_fixture(&parsed, "ChosenKeys");
+        let (concrete, _) = mapped_constraint_alias_parts(&parsed, &context, "Concrete");
+        let concrete = context.get_declared_type_of_symbol(concrete).unwrap();
+        let store = context.store_mut_for_test();
+        let mapped =
+            instantiate_source_mapped_lookup_instance(store, &projection, &[incoming], None)
+                .unwrap();
+        let (template, conditional) = conditional_template_snapshot(store, mapped);
+        let key = store.regular_string_literal_type("value".into()).unwrap();
+        let indexed = crate::semantic::indexed_access_types::get_instantiated_indexed_access_type(
+            store,
+            mapped,
+            key,
+            AccessFlags::NONE,
+        )
+        .unwrap();
+        let before = cache_state(store);
+        let links = store.type_alias_links(projection.alias).unwrap().clone();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        for _ in 0..2 {
+            assert_eq!(
+                instantiate_source_mapped_lookup_instance(store, &projection, &[concrete], None),
+                Err(MappedTypeError::UnsupportedTemplate(template))
+            );
+            for type_ in [projection.type_, mapped] {
+                assert_eq!(
+                    store.resolve_mapped_type_members_with_session(
+                        type_,
+                        MappedTypeModifiers::NONE,
+                        &mut session
+                    ),
+                    Err(MappedTypeError::UnsupportedTemplate(template))
+                );
+                assert_eq!(
+                    store.resolve_mapped_type_property(type_, "value", MappedTypeModifiers::NONE),
+                    Err(MappedTypeError::UnsupportedTemplate(template))
+                );
+                assert_eq!(
+                    store.validate_mapped_type_relation_endpoint(type_),
+                    Err(MappedTypeError::UnsupportedTemplate(template))
+                );
+            }
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    store,
+                    indexed,
+                    &[incoming],
+                    &[incoming],
+                    None,
+                    &mut session
+                ),
+                Err(InstantiationError::UnsupportedType(mapped))
+            );
+            assert_eq!(cache_state(store), before);
+            assert_eq!(store.type_alias_links(projection.alias), Some(&links));
+            assert_cold_conditional_mapped_type(store, mapped, template);
+        }
+        assert_eq!(
+            store.type_payload(template).unwrap().data(),
+            &TypeData::Conditional(conditional)
+        );
     }
 
     fn conditional_template_snapshot(

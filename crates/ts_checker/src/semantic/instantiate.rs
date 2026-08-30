@@ -40,8 +40,10 @@ use super::{
     },
     mapped_types::{
         MappedTypeError, MappedTypeModifiers, SupportedMappedAliasProjection,
-        cached_supported_mapped_alias_instance, escaped_property_name_from_type,
-        instantiate_supported_mapped_alias_instance, supported_mapped_alias_projection,
+        cached_source_mapped_lookup_instance, cached_supported_mapped_alias_instance,
+        escaped_property_name_from_type, instantiate_source_mapped_lookup_instance,
+        instantiate_supported_mapped_alias_instance, source_mapped_lookup_projection,
+        supported_mapped_alias_projection,
     },
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     object_aliases::{
@@ -1931,22 +1933,39 @@ fn could_contain_installed_type_variables_worker(
             could_contain_installed_type_variables_worker(store, target, array_targets, seen)
         }
         TypeData::Mapped(_) => {
-            let projection = supported_mapped_alias_projection(store, type_, array_targets)
+            if let Some(projection) = source_mapped_lookup_projection(store, type_, array_targets)
                 .map_err(|error| mapped_indexed_access_error(type_, error))?
-                .ok_or(InstantiationError::UnsupportedType(type_))?;
-            projection
-                .arguments
-                .iter()
-                .chain(&projection.identity_arguments)
-                .try_fold(false, |contains, argument| {
-                    Ok(contains
-                        | could_contain_installed_type_variables_worker(
-                            store,
-                            *argument,
-                            array_targets,
-                            seen,
-                        )?)
-                })
+            {
+                projection
+                    .arguments
+                    .iter()
+                    .try_fold(false, |contains, argument| {
+                        Ok(contains
+                            | could_contain_installed_type_variables_worker(
+                                store,
+                                *argument,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            } else {
+                let projection = supported_mapped_alias_projection(store, type_, array_targets)
+                    .map_err(|error| mapped_indexed_access_error(type_, error))?
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                projection
+                    .arguments
+                    .iter()
+                    .chain(&projection.identity_arguments)
+                    .try_fold(false, |contains, argument| {
+                        Ok(contains
+                            | could_contain_installed_type_variables_worker(
+                                store,
+                                *argument,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            }
         }
         TypeData::Conditional(_) => conditional_remap_projection(store, type_)
             .map(|_| true)
@@ -2781,6 +2800,37 @@ fn cached_instantiated_type_worker(
                 .map_err(|error| instantiated_keyof_error(template, error))
         }
         TypeData::Mapped(_) => {
+            if let Some(projection) =
+                source_mapped_lookup_projection(store, template, array_targets)
+                    .map_err(|error| mapped_indexed_access_error(template, error))?
+            {
+                if let Some((symbol, arguments)) = alias_override {
+                    validate_borrowed_alias_input(store, template, symbol, arguments)?;
+                    return Err(InstantiationError::UnsupportedType(template));
+                }
+                let mut arguments = Vec::with_capacity(projection.arguments.len());
+                for argument in &projection.arguments {
+                    let Some(mapped) = cached_instantiated_type_worker(
+                        store,
+                        *argument,
+                        mapping,
+                        array_targets,
+                        None,
+                        active,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    arguments.push(mapped);
+                }
+                return cached_source_mapped_lookup_instance(
+                    store,
+                    &projection,
+                    &arguments,
+                    array_targets,
+                )
+                .map_err(|error| mapped_indexed_access_error(template, error));
+            }
             let projection = supported_mapped_alias_projection(store, template, array_targets)
                 .map_err(|error| mapped_indexed_access_error(template, error))?
                 .ok_or(InstantiationError::UnsupportedType(template))?;
@@ -3978,11 +4028,47 @@ fn instantiate_type_worker(
                 target: validate_generic_keyof_index_type(store, type_)
                     .map_err(|error| instantiated_keyof_error(type_, error))?,
             },
-            TypeData::Mapped(_) => InstantiationWork::SupportedMappedAlias(
-                supported_mapped_alias_projection(store, type_, array_targets)
-                    .map_err(|error| mapped_indexed_access_error(type_, error))?
-                    .ok_or(InstantiationError::UnsupportedType(type_))?,
-            ),
+            TypeData::Mapped(_) => {
+                if let Some(projection) =
+                    source_mapped_lookup_projection(store, type_, array_targets)
+                        .map_err(|error| mapped_indexed_access_error(type_, error))?
+                {
+                    if let Some((symbol, arguments)) = alias {
+                        validate_borrowed_alias_input(store, type_, symbol, arguments)?;
+                        return Err(InstantiationError::UnsupportedType(type_));
+                    }
+                    let mut arguments = Vec::with_capacity(projection.arguments.len());
+                    for argument in &projection.arguments {
+                        let mark = session.limit_event_mark();
+                        let mapped = instantiate_type_with_alias(
+                            store,
+                            *argument,
+                            mapping,
+                            array_targets,
+                            None,
+                            session,
+                        )?;
+                        if session.limit_event_occurred_since(mark)
+                            && let Some(error) = session.recovery_error_type()
+                        {
+                            return Ok(error);
+                        }
+                        arguments.push(mapped);
+                    }
+                    return instantiate_source_mapped_lookup_instance(
+                        store,
+                        &projection,
+                        &arguments,
+                        array_targets,
+                    )
+                    .map_err(|error| mapped_indexed_access_error(type_, error));
+                }
+                InstantiationWork::SupportedMappedAlias(
+                    supported_mapped_alias_projection(store, type_, array_targets)
+                        .map_err(|error| mapped_indexed_access_error(type_, error))?
+                        .ok_or(InstantiationError::UnsupportedType(type_))?,
+                )
+            }
             TypeData::Conditional(_) => InstantiationWork::DeferredConditional(Box::new(
                 conditional_remap_projection(store, type_)
                     .map_err(|error| conditional_remap_error(type_, error))?,
