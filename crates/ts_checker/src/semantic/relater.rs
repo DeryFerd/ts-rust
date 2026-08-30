@@ -444,6 +444,22 @@ fn authenticated_nullish_object_nonmatch(
         }
         return Ok(true);
     }
+    // Canonical arrays do not need ordinary interface member tables.
+    if let Some(targets) = array_targets
+        && matches!(
+            store.type_payload(target).map(TypeRecord::data),
+            Some(TypeData::TypeReference(reference))
+                if reference.object.target == Some(targets.array_type())
+                    || reference.object.target == Some(targets.readonly_array_type())
+        )
+    {
+        for endpoint in [source, target] {
+            store
+                .validate_union_constituent_with_array_targets(targets, endpoint)
+                .map_err(|error| union_validation_unavailable(endpoint, error))?;
+        }
+        return Ok(true);
+    }
     store
         .validate_union_constituent(source)
         .map_err(|error| union_validation_unavailable(source, error))?;
@@ -16374,6 +16390,584 @@ mod tests {
             }
             assert_eq!((session.query_count(), session.total_count()), (0, 0));
             assert!(!session.limit_event_occurred_since(mark));
+        }
+    }
+
+    fn nullish_array_relation_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        strict_null_checks: bool,
+        readonly: bool,
+    ) -> (CanonicalCheckerContext<'arena>, TypeId, NodeRef) {
+        let file = FileId::new(96_453);
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty());
+        let mut context = source_relation_context(
+            library,
+            source,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types: false,
+                },
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (declaration, annotation) = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::TypeAliasDeclaration(alias) => Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    NodeRef::new(source.arena.id(), file, alias.type_),
+                )),
+                _ => None,
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let store = context.store();
+        let target = store
+            .type_alias_links(owner)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        assert_eq!(
+            store.symbol(owner).unwrap().declarations(),
+            Some([declaration].as_slice()),
+        );
+        assert_eq!(
+            store.type_node_links(annotation).unwrap().resolved_type,
+            Some(target),
+        );
+        let globals = context.global_types();
+        let projection = store
+            .canonical_array_reference(globals, target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.base_type, target);
+        assert_eq!(
+            projection.element_type,
+            store.intrinsic_bootstrap().unwrap().number_type
+        );
+        assert_eq!(projection.readonly, readonly);
+        assert!(!projection.array_literal);
+        for (name, target) in [
+            ("Array", globals.array_type),
+            ("ReadonlyArray", globals.readonly_array_type),
+        ] {
+            let symbol = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            let record = store.type_payload(target).unwrap();
+            assert_eq!(record.symbol(), Some(symbol));
+            assert_eq!(
+                store.declared_type_links(symbol).unwrap().declared_type,
+                Some(target)
+            );
+            let [declaration] = store.symbol(symbol).unwrap().declarations().unwrap() else {
+                panic!("the global Array target must keep its real declaration");
+            };
+            assert_eq!(declaration.arena, library.arena.id());
+            assert_eq!(
+                context
+                    .file(declaration.file)
+                    .unwrap()
+                    .1
+                    .symbol(*declaration),
+                Some(symbol),
+            );
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("the global Array target must remain an interface");
+            };
+            assert!(!interface.base_types_resolved);
+            assert!(!interface.declared_members_resolved);
+            assert!(
+                !record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert!(interface.reference.object.structured.members.is_none());
+        }
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .claim_strict_function_types(true),
+            Ok(())
+        );
+        (context, target, annotation)
+    }
+
+    fn assert_nullish_array_relation_entries(
+        store: &mut TestStore,
+        endpoints: (TypeId, TypeId),
+        globals: &CanonicalGlobalTypes,
+        capability: Option<&CanonicalGlobalTypes>,
+        session: &mut super::InstantiationSession,
+        expected: [Result<bool, RelationUnavailable>; 2],
+    ) {
+        let snapshot = |store: &TestStore| {
+            let targets = [globals.array_type, globals.readonly_array_type].map(|target| {
+                let record = store.type_payload(target).unwrap();
+                let TypeData::Interface(interface) = record.data() else {
+                    panic!("the Array target must retain its interface data");
+                };
+                let owner = record.symbol().unwrap();
+                (
+                    record.flags(),
+                    record.object_flags(),
+                    record.symbol(),
+                    record.alias(),
+                    interface.clone(),
+                    store.declared_type_links(owner).cloned(),
+                    store.members_and_exports_links(owner).cloned(),
+                )
+            });
+            let record = store.type_payload(endpoints.1).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("the written array must retain its reference data");
+            };
+            (
+                [
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                ],
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                targets,
+                (
+                    record.flags(),
+                    record.object_flags(),
+                    record.symbol(),
+                    record.alias(),
+                    reference.clone(),
+                ),
+            )
+        };
+        let before = snapshot(store);
+        let counts = (
+            session.query_count(),
+            session.total_count(),
+            session.limit_event_count(),
+        );
+        let recovery = session.recovery_error_type();
+        let mark = session.limit_event_mark();
+        for kind in [RelationKind::Assignable, RelationKind::Comparable] {
+            assert_eq!(
+                store.is_type_related_to_with_session(
+                    endpoints.0,
+                    endpoints.1,
+                    kind,
+                    capability,
+                    Some(true),
+                    session,
+                ),
+                expected[0],
+            );
+            {
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                let mut relation = super::RelaterSession::new_with_global_types_options_and_session(
+                    store,
+                    kind,
+                    bootstrap,
+                    capability.map(RelationGlobalTypes::from_global_types),
+                    Some(true),
+                    Some(&mut *session),
+                );
+                assert_eq!(
+                    relation.is_related_to_ex(
+                        endpoints.0,
+                        endpoints.1,
+                        super::RecursionFlags::BOTH,
+                        super::IntersectionState::NONE,
+                    ),
+                    expected[1].map(|related| if related {
+                        Ternary::True
+                    } else {
+                        Ternary::False
+                    }),
+                );
+            }
+            assert_eq!(snapshot(store), before);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                counts,
+            );
+            assert_eq!(session.recovery_error_type(), recovery);
+            assert!(!session.limit_event_occurred_since(mark));
+        }
+    }
+
+    #[test]
+    fn nullish_canonical_arrays_keep_cold_targets_and_spent_caller_sessions() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        for (text, readonly) in [
+            ("type Target = number[];", false),
+            ("type Target = readonly number[];", true),
+        ] {
+            let source = parse_source_file(text);
+            for strict in [false, true] {
+                let (mut context, target, annotation) =
+                    nullish_array_relation_context(&library, &source, strict, readonly);
+                let globals = context.global_types().clone();
+                let targets = CanonicalArrayTargets::from_global_types(&globals);
+                let store = context.store_mut_for_test();
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let (null, undefined, number, error) = (
+                    bootstrap.null_type,
+                    bootstrap.undefined_type,
+                    bootstrap.number_type,
+                    bootstrap.error_type,
+                );
+                let parameter = validate_direct_generic_reference(store, globals.array_type)
+                    .unwrap()
+                    .type_arguments[0];
+                let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+                let mut session = super::InstantiationSession::new_recovering(
+                    store,
+                    super::InstantiationLimits {
+                        max_depth: 100,
+                        max_count: 1,
+                    },
+                    error,
+                )
+                .unwrap();
+                assert_eq!(
+                    crate::semantic::instantiate::instantiate_type_with_session(
+                        store,
+                        parameter,
+                        mapper,
+                        Some(targets),
+                        &mut session,
+                    ),
+                    Ok(number),
+                );
+                assert_eq!((session.query_count(), session.total_count()), (1, 1));
+                for _ in 0..2 {
+                    for source in [null, undefined] {
+                        assert_nullish_array_relation_entries(
+                            store,
+                            (source, target),
+                            &globals,
+                            Some(&globals),
+                            &mut session,
+                            [Ok(!strict); 2],
+                        );
+                    }
+                }
+                assert_eq!((session.query_count(), session.total_count()), (1, 1));
+                assert_eq!(session.limit_event_count(), 0);
+                assert_eq!(session.recovery_error_type(), Some(error));
+                let before = (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                context.check_source_file(annotation.file).unwrap();
+                assert!(context.diagnostics().is_empty());
+                assert_eq!(context.get_type_at_location(annotation).unwrap(), target);
+                let store = context.store();
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.checker_link_allocated_lengths()
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nullish_canonical_arrays_reject_missing_and_wrong_authority() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        for (text, readonly) in [
+            ("type Target = number[];", false),
+            ("type Target = readonly number[];", true),
+        ] {
+            let source = parse_source_file(text);
+            let (mut context, target, _) =
+                nullish_array_relation_context(&library, &source, true, readonly);
+            let globals = context.global_types().clone();
+            let (foreign_context, _, _) =
+                nullish_array_relation_context(&library, &source, true, readonly);
+            let foreign = foreign_context.global_types().clone();
+            let mut foreign_companion = globals.clone();
+            let foreign_target = if readonly {
+                foreign_companion.array_type = foreign.array_type;
+                foreign.array_type
+            } else {
+                foreign_companion.readonly_array_type = foreign.readonly_array_type;
+                foreign.readonly_array_type
+            };
+            let store = context.store_mut_for_test();
+            assert!(store.type_payload(foreign.array_type).is_none());
+            assert!(store.type_payload(foreign.readonly_array_type).is_none());
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (null, undefined, number, error) = (
+                bootstrap.null_type,
+                bootstrap.undefined_type,
+                bootstrap.number_type,
+                bootstrap.error_type,
+            );
+            let mut wrong = globals.clone();
+            if readonly {
+                wrong.readonly_array_type = number;
+            } else {
+                wrong.array_type = number;
+            }
+            let mut damaged = globals.clone();
+            if readonly {
+                damaged.array_type = number;
+            } else {
+                damaged.readonly_array_type = number;
+            }
+            let damaged_error = super::union_validation_unavailable(
+                target,
+                store
+                    .validate_union_constituent_with_array_targets(
+                        CanonicalArrayTargets::from_global_types(&damaged),
+                        target,
+                    )
+                    .unwrap_err(),
+            );
+            let mut session = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            for source in [null, undefined] {
+                for _ in 0..2 {
+                    for (capability, expected) in [
+                        (Some(&globals), [Ok(false); 2]),
+                        (
+                            None,
+                            [Err(RelationUnavailable::InvalidStructuredMembers(target)); 2],
+                        ),
+                        (
+                            Some(&wrong),
+                            [Err(RelationUnavailable::InvalidStructuredMembers(target)); 2],
+                        ),
+                        (
+                            Some(&foreign),
+                            [Err(RelationUnavailable::InvalidStructuredMembers(target)); 2],
+                        ),
+                        (
+                            Some(&foreign_companion),
+                            [Err(RelationUnavailable::CanonicalGlobalType(
+                                CanonicalGlobalTypeInitializationError::InvalidType(foreign_target),
+                            )); 2],
+                        ),
+                        (Some(&damaged), [Err(damaged_error); 2]),
+                        (Some(&globals), [Ok(false); 2]),
+                    ] {
+                        assert_nullish_array_relation_entries(
+                            store,
+                            (source, target),
+                            &globals,
+                            capability,
+                            &mut session,
+                            expected,
+                        );
+                    }
+                }
+            }
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert_eq!(session.limit_event_count(), 0);
+        }
+    }
+
+    #[test]
+    fn nullish_canonical_arrays_reject_changed_reference_and_element_proofs() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        for (text, readonly) in [
+            ("type Target = number[];", false),
+            ("type Target = readonly number[];", true),
+        ] {
+            let source = parse_source_file(text);
+            let (mut context, target, _) =
+                nullish_array_relation_context(&library, &source, true, readonly);
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (null, number, string, error) = (
+                bootstrap.null_type,
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.error_type,
+            );
+            let reference = match store.type_payload(target).unwrap().data() {
+                TypeData::TypeReference(reference) => reference.clone(),
+                _ => panic!("the written array must keep its reference"),
+            };
+            let owner = store.type_payload(target).unwrap().symbol().unwrap();
+            let mut session = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [Ok(false); 2],
+            );
+
+            assert!(store.set_type_reference_resolution(
+                target,
+                reference.node,
+                Some(vec![string])
+            ));
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [
+                    Err(RelationUnavailable::CanonicalGlobalType(
+                        CanonicalGlobalTypeInitializationError::InvalidInstantiationCache(
+                            reference.object.target.unwrap(),
+                        ),
+                    )),
+                    Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                        target,
+                    )),
+                ],
+            );
+            assert!(store.set_type_reference_resolution(
+                target,
+                reference.node,
+                reference.resolved_type_arguments.clone()
+            ));
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [Ok(false); 2],
+            );
+
+            assert!(store.set_object_target_and_mapper(target, None, None));
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [Err(RelationUnavailable::InvalidStructuredMembers(target)); 2],
+            );
+            assert!(store.set_object_target_and_mapper(
+                target,
+                reference.object.target,
+                reference.object.mapper
+            ));
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [Ok(false); 2],
+            );
+
+            let array_target = reference.object.target.unwrap();
+            assert_eq!(
+                store.type_payload(array_target).unwrap().symbol(),
+                Some(owner)
+            );
+            let other_target = if readonly {
+                globals.array_type
+            } else {
+                globals.readonly_array_type
+            };
+            let other_owner = store.type_payload(other_target).unwrap().symbol().unwrap();
+            assert_ne!(owner, other_owner);
+            assert!(store.set_type_symbol(array_target, Some(other_owner)));
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [Err(RelationUnavailable::CanonicalGlobalType(
+                    CanonicalGlobalTypeInitializationError::InvalidGenericTarget(array_target),
+                )); 2],
+            );
+            assert!(store.set_type_symbol(array_target, Some(owner)));
+            assert_nullish_array_relation_entries(
+                store,
+                (null, target),
+                &globals,
+                Some(&globals),
+                &mut session,
+                [Ok(false); 2],
+            );
+
+            for endpoint in [number, null] {
+                assert!(store.type_payload(endpoint).unwrap().symbol().is_none());
+                assert!(store.set_type_symbol(endpoint, Some(owner)));
+                let expected = if endpoint == null {
+                    RelationUnavailable::UnsupportedUnionConstituent(null)
+                } else {
+                    super::union_validation_unavailable(
+                        target,
+                        store
+                            .validate_union_constituent_with_array_targets(
+                                CanonicalArrayTargets::from_global_types(&globals),
+                                target,
+                            )
+                            .unwrap_err(),
+                    )
+                };
+                assert_nullish_array_relation_entries(
+                    store,
+                    (null, target),
+                    &globals,
+                    Some(&globals),
+                    &mut session,
+                    [Err(expected); 2],
+                );
+                assert!(store.set_type_symbol(endpoint, None));
+                assert_nullish_array_relation_entries(
+                    store,
+                    (null, target),
+                    &globals,
+                    Some(&globals),
+                    &mut session,
+                    [Ok(false); 2],
+                );
+            }
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert_eq!(session.limit_event_count(), 0);
         }
     }
 
