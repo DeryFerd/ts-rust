@@ -6879,7 +6879,6 @@ fn inferred_query_constraint_name_is_missing(
                 false,
             );
     match resolved {
-        Ok(Some(_)) => Ok(false),
         Ok(None) => {
             if [constraint, name].into_iter().any(|node| {
                 store
@@ -6900,7 +6899,8 @@ fn inferred_query_constraint_name_is_missing(
             Ok(true)
         }
         // Import capabilities are checked by the complete input-query plan.
-        Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => Ok(false),
+        Ok(Some(_))
+        | Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => Ok(false),
         Err(error) => Err(DeclaredTypeError::from(error).into()),
     }
 }
