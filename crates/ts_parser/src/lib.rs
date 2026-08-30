@@ -1728,7 +1728,8 @@ impl<'a> Parser<'a> {
         self.arena
             .get_mut(node)
             .expect("the reparsed type was allocated")
-            .flags |= NodeFlags::REPARSED;
+            .flags
+            .0 |= NodeFlags::REPARSED.0;
     }
 
     fn parse_javascript_jsdoc_type(
