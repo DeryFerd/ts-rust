@@ -4,7 +4,8 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, ElementFlags, SignatureId, TypeData, TypeId,
+    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
+    signatures::ElementFlags,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
