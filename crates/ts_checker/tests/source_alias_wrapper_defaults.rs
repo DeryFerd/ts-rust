@@ -1111,17 +1111,20 @@ fn imported_bound_defaults_require_imported_alias_body_integration() {
             assert_eq!(object(&context, type_).structured.members, None);
             assert_eq!(object(&context, type_).structured.properties, None);
         }
-        for type_ in [types[1], types[2]] {
-            let TypeData::Conditional(data) = context.store().type_payload(type_).unwrap().data()
-            else {
-                panic!("the retained conditional aliases keep their actual type family");
-            };
-            assert_eq!(data.resolved_true_type, None);
-            assert_eq!(data.resolved_false_type, None);
-            assert_eq!(data.resolved_inferred_true_type, None);
-            assert_eq!(data.resolved_default_constraint, None);
-            assert_eq!(data.resolved_constraint_of_distributive, None);
-        }
+        assert_eq!(types[1], parameter(&context, aliases[1].parameters[0]));
+        assert!(matches!(
+            context.store().type_payload(types[1]).unwrap().data(),
+            TypeData::TypeParameter(_)
+        ));
+        let TypeData::Conditional(data) = context.store().type_payload(types[2]).unwrap().data()
+        else {
+            panic!("the retained conditional aliases keep their actual type family");
+        };
+        assert_eq!(data.resolved_true_type, None);
+        assert_eq!(data.resolved_false_type, None);
+        assert_eq!(data.resolved_inferred_true_type, None);
+        assert_eq!(data.resolved_default_constraint, None);
+        assert_eq!(data.resolved_constraint_of_distributive, None);
         assert_import(&context, &source, "Box", &provider_box);
         assert_import(&context, &source, "Bound", &provider_bound);
         assert_cold_property(&context, property(&provider, &provider_box, "value"));

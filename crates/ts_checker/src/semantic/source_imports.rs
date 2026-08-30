@@ -15027,8 +15027,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)] // The saved effective default must stay separate from the recovered slot.
-    fn defaulted_import_wrapper_recovery_keeps_effective_arguments() {
+    #[allow(clippy::too_many_lines)] // Keep both normal cache rows and the unchanged caller budget together.
+    fn defaulted_import_wrapper_keeps_direct_default_without_recovery() {
         let mut fixture = fixture(
             &[
                 "import type { Box } from './types'; export type Defaulted = Box;",
@@ -15085,30 +15085,65 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(projection.identity_symbol, plan.owner());
-        assert_eq!(projection.arguments, [error]);
+        assert_eq!(projection.alias_symbol, plan.target_symbol());
+        assert_ne!(plan.owner(), plan.target_symbol());
+        assert_eq!(projection.arguments, [string]);
         assert!(projection.identity_arguments.is_empty());
-        let key = super::super::type_nodes::type_alias_instantiation_cache_key(
-            &[],
-            Some((
-                store
-                    .symbol_store()
-                    .assigned_global_symbol_id(plan.owner())
-                    .unwrap(),
-                &[],
-            )),
-        );
-        let request = store
-            .property_object_alias_request_recovery(plan.target_symbol(), key)
+        assert!(projection.mapper.is_some());
+        let identity = store.type_payload(result).unwrap().alias().unwrap();
+        let identity = store.type_alias(identity).unwrap();
+        assert_eq!(identity.symbol(), Some(plan.owner()));
+        assert_eq!(identity.type_arguments(), None);
+        assert_eq!(identity.imported_body(), Some(&plan));
+        let global_owner = store
+            .symbol_store()
+            .assigned_global_symbol_id(plan.owner())
             .unwrap();
-        assert_eq!(request.result(), result);
-        assert_eq!(request.effective_arguments(), [string]);
-        assert!(request.matches_current_row(store));
-        assert_eq!(session.limit_event_count(), 1);
-        let [diagnostic] = diagnostics.as_slice() else {
-            panic!("the one mapping limit must retain its diagnostic")
+        let request_key = super::super::type_nodes::type_alias_instantiation_cache_key(
+            &[],
+            Some((global_owner, &[])),
+        );
+        let instance_key = super::super::type_nodes::type_alias_instantiation_cache_key(
+            &[string],
+            Some((global_owner, &[])),
+        );
+        assert_ne!(request_key, instance_key);
+        let request_links = store
+            .type_alias_links(plan.target_symbol())
+            .unwrap()
+            .clone();
+        assert_eq!(request_links.declared_type, Some(projection.target));
+        assert_eq!(
+            request_links.type_parameters.as_deref(),
+            Some(projection.parameters.as_slice())
+        );
+        assert_eq!(
+            request_links
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&request_key),
+            Some(&result)
+        );
+        let TypeData::Object(target) = store.type_payload(projection.target).unwrap().data() else {
+            panic!("Box keeps its original object target")
         };
-        assert_eq!(diagnostic.node, Some(reference));
-        assert_eq!(diagnostic.diagnostic.code(), 2589);
+        let instance_cache = target.instantiations.clone();
+        let super::super::type_records::TypeCacheState::Allocated(instances) = &instance_cache
+        else {
+            panic!("the object target records the physical instance")
+        };
+        assert_eq!(instances.get(&instance_key), Some(&result));
+        assert!(store.property_object_alias_recovery(result).is_none());
+        assert!(
+            store
+                .property_object_alias_request_recovery(plan.target_symbol(), request_key)
+                .is_none()
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(session.total_count(), 1);
+        assert_eq!(session.limit_event_count(), 0);
+        assert!(diagnostics.is_empty());
         let warm = (
             store_state(store),
             session.query_count(),
@@ -15122,6 +15157,25 @@ mod tests {
                 Ok(Some(plan.clone()))
             );
             assert_eq!(query(store, &mut session, &mut diagnostics), Ok(result));
+            assert_eq!(
+                super::super::object_aliases::property_object_alias_projection(store, result),
+                Ok(Some(projection.clone()))
+            );
+            assert_eq!(
+                store.type_alias_links(plan.target_symbol()),
+                Some(&request_links)
+            );
+            let TypeData::Object(target) = store.type_payload(projection.target).unwrap().data()
+            else {
+                panic!("the original object target remains unchanged")
+            };
+            assert_eq!(target.instantiations, instance_cache);
+            assert!(store.property_object_alias_recovery(result).is_none());
+            assert!(
+                store
+                    .property_object_alias_request_recovery(plan.target_symbol(), request_key)
+                    .is_none()
+            );
             assert_eq!(
                 (
                     store_state(store),

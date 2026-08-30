@@ -42676,14 +42676,23 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Each case reaches an existing same-query plan cache before the import.
     fn alias_body_type_import_replays_preplanned_argument_dependencies() {
-        for local in [
-            "type Local = unknown extends unknown ? string : never;",
-            "type Local = { value: string };",
-            "type Local = { value: string }['value'];",
-            "type Local = { [Key in 'value']: string };",
-            "interface Local { value: string }",
-            "interface Base<T> { value: T; tag: string } interface Local extends Base<number> {}",
-            "interface Base<T> { value: T } interface Base<T> { tag: string } interface Local extends Base<number> {}",
+        for (local, rejects_as_indexed_access) in [
+            (
+                "type Local = unknown extends unknown ? string : never;",
+                false,
+            ),
+            ("type Local = { value: string };", false),
+            ("type Local = { value: string }['value'];", true),
+            ("type Local = { [Key in 'value']: string };", false),
+            ("interface Local { value: string }", false),
+            (
+                "interface Base<T> { value: T; tag: string } interface Local extends Base<number> {}",
+                false,
+            ),
+            (
+                "interface Base<T> { value: T } interface Base<T> { tag: string } interface Local extends Base<number> {}",
+                false,
+            ),
         ] {
             let source = parse_source_file(&format!(
                 "import type {{ Identity }} from '../types'; {local} \
@@ -42801,9 +42810,11 @@ mod tests {
             let before = function_store_state(query.store);
             assert_eq!(
                 query.get_type_from_type_node(body),
-                Err(type_node_unavailable(
+                Err(type_node_unavailable(if rejects_as_indexed_access {
+                    TypeNodeUnavailable::InvalidIndexedAccessType(poison)
+                } else {
                     TypeNodeUnavailable::InvalidTypeReference(poison)
-                )),
+                })),
                 "source: {local}",
             );
             assert_eq!(function_store_state(query.store), before, "source: {local}");
