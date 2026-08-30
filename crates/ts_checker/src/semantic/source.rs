@@ -33371,6 +33371,17 @@ fn check_planned_source_class(
     if class.bodies.len() != class.source.bodies().len() {
         return Err(SourceCheckError::Class(declaration));
     }
+    for annotation in class.source.tuple_parameter_annotations() {
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_type_node(annotation)?;
+    }
     let prepared = prepare_source_class_members(store, host, &class.source)
         .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
     let value_type = store

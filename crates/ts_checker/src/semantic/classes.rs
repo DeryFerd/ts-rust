@@ -75,10 +75,11 @@
 //! diagnostics without replacing binder-owned property symbols.
 //! Direct inherited field calls through `super` retain their exact TS2855 span.
 //! Source-body plans also retain required class-reference constructor parameters,
-//! function-typed fields, and field initializers. The source executor checks
-//! each initializer before publishing its inferred field type.
+//! fixed keyword tuple method parameters, and function-typed fields.
+//! Tuple annotations use the ordinary type-node query before method publication.
+//! The source executor checks field initializers before publishing their inferred types.
 //! Other nonempty executable bodies, general heritage, and non-primitive
-//! field and method annotations remain later class stages.
+//! field and return annotations remain later class stages.
 
 use std::collections::{HashMap, HashSet};
 
@@ -142,7 +143,8 @@ use super::{
     store::{DirectClassHeritageProvenance, SourceNodeParent},
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeQueryOptions, ConstructorAnnotationProof,
-        TypeNodeUnavailable, preflight_type_annotation,
+        TypeNodeUnavailable, cached_fixed_keyword_tuple_annotation,
+        preflight_fixed_keyword_tuple_annotation, preflight_type_annotation,
     },
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -203,6 +205,7 @@ pub(super) struct ClassBodyParameterPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClassBodyParameterType {
     Known(TypeId),
+    Tuple(NodeRef),
     ClassReference {
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -213,6 +216,9 @@ impl ClassBodyParameterType {
     pub(super) fn resolved(self, store: &CanonicalTypeMapperStore) -> Result<TypeId, ClassError> {
         match self {
             Self::Known(type_) => Ok(type_),
+            Self::Tuple(node) => {
+                cached_fixed_keyword_tuple_annotation(store, node).map_err(ClassError::DeclaredType)
+            }
             Self::ClassReference { node, symbol } => {
                 let type_ = store
                     .declared_type_links(symbol)
@@ -241,7 +247,7 @@ impl ClassBodyParameterType {
         host: &DeclaredTypeHost<'_>,
     ) -> Result<TypeId, ClassError> {
         match self {
-            Self::Known(type_) => Ok(type_),
+            Self::Known(_) | Self::Tuple(_) => self.resolved(store),
             Self::ClassReference { node, symbol } => {
                 let type_ = store.get_declared_type_of_symbol(host, symbol)?;
                 if !store.try_reserve_type_node_links(1) || !store.try_reserve_symbol_node_links(1)
@@ -371,7 +377,7 @@ fn capture_source_class_bindings(
         symbols.extend(constructor.parameters.iter().filter_map(
             |parameter| match parameter.type_ {
                 ClassBodyParameterType::ClassReference { symbol, .. } => Some(symbol),
-                ClassBodyParameterType::Known(_) => None,
+                ClassBodyParameterType::Known(_) | ClassBodyParameterType::Tuple(_) => None,
             },
         ));
     }
@@ -411,6 +417,17 @@ impl SourceClassPlan {
 
     pub(super) fn bodies(&self) -> &[ClassBodyPlan] {
         &self.bodies
+    }
+
+    pub(super) fn tuple_parameter_annotations(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.methods
+            .iter()
+            .flat_map(|method| &method.method.parameters)
+            .filter_map(|parameter| match parameter.type_ {
+                ClassBodyParameterType::Tuple(node) => Some(node),
+                ClassBodyParameterType::Known(_)
+                | ClassBodyParameterType::ClassReference { .. } => None,
+            })
     }
 }
 
@@ -684,7 +701,8 @@ fn source_constructor_parameter(
                 })
             })?,
         ),
-        reference @ ClassBodyParameterType::ClassReference { .. } => reference,
+        reference @ (ClassBodyParameterType::ClassReference { .. }
+        | ClassBodyParameterType::Tuple(_)) => reference,
     };
     Ok(ClassBodyParameterPlan {
         declaration: parameter.declaration,
@@ -1104,9 +1122,13 @@ pub(super) fn plan_source_class_members_with_array_targets(
                             property_symbol: None,
                             annotation: parameter.type_node,
                             initializer: None,
-                            type_: ClassBodyParameterType::Known(class_method_parameter_type(
-                                store, *parameter,
-                            )?),
+                            type_: if parameter.optional {
+                                ClassBodyParameterType::Known(class_method_parameter_type(
+                                    store, *parameter,
+                                )?)
+                            } else {
+                                parameter.type_
+                            },
                             optional: parameter.optional,
                         });
                     }
@@ -1536,7 +1558,7 @@ fn class_method_parameter_type(
 ) -> Result<TypeId, ClassError> {
     optional_constructor_parameter_type(
         store,
-        parameter.type_,
+        parameter.type_.resolved(store)?,
         parameter.optional,
         parameter.declaration,
     )?
@@ -1990,6 +2012,7 @@ fn validate_source_class_stored_layout(
             return Err(reject());
         }
         for parameter in &method.method.parameters {
+            let annotation_type = parameter.type_.resolved(store)?;
             let parameter_type = class_method_parameter_type(store, *parameter)?;
             if store.value_symbol_links(parameter.symbol)
                 != Some(&ValueSymbolLinks {
@@ -1999,7 +2022,7 @@ fn validate_source_class_stored_layout(
                 || parameter.type_node.is_some_and(|node| {
                     store.type_node_links(node)
                         != Some(&TypeNodeLinks {
-                            resolved_type: Some(parameter.type_),
+                            resolved_type: Some(annotation_type),
                             ..TypeNodeLinks::default()
                         })
                 })
@@ -2011,13 +2034,13 @@ fn validate_source_class_stored_layout(
                 .is_some_and(|node| store.source_node_kind(node) == Some(SyntaxKind::ArrayType))
                 && plan.array_targets.is_none_or(|targets| {
                     store
-                        .canonical_array_reference_with_targets(targets, parameter.type_)
+                        .canonical_array_reference_with_targets(targets, annotation_type)
                         .ok()
                         .flatten()
                         .is_none_or(|reference| {
                             reference.readonly
                                 || reference.array_literal
-                                || reference.base_type != parameter.type_
+                                || reference.base_type != annotation_type
                         })
                 })
             {
@@ -2054,6 +2077,11 @@ pub(super) fn prepare_source_class_members(
         != *plan
     {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    for method in &plan.methods {
+        for parameter in &method.method.parameters {
+            class_method_parameter_type(store, *parameter)?;
+        }
     }
     let instance = store
         .declared_type_links(plan.symbol())
@@ -2465,12 +2493,13 @@ pub(super) fn prepare_source_class_members(
             )
             .expect("source method signature capacity was reserved");
         for parameter in &method.method.parameters {
+            let annotation_type = parameter.type_.resolved(store)?;
             let parameter_type = class_method_parameter_type(store, *parameter)?;
             if let Some(type_node) = parameter.type_node {
                 assert!(store.set_type_node_links(
                     type_node,
                     TypeNodeLinks {
-                        resolved_type: Some(parameter.type_),
+                        resolved_type: Some(annotation_type),
                         ..TypeNodeLinks::default()
                     }
                 ));
@@ -5290,7 +5319,7 @@ struct ClassMethodParameterPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     type_node: Option<NodeRef>,
-    type_: TypeId,
+    type_: ClassBodyParameterType,
     optional: bool,
 }
 
@@ -9117,7 +9146,7 @@ fn plan_class_method_parameter_with_body_mode(
         }
     }
 
-    let (type_node, type_) = if let Some(type_node) = data.type_ {
+    let (type_node, type_, cached_type) = if let Some(type_node) = data.type_ {
         let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
         let type_record = preflight_node(store, host, type_node)?;
         if type_record.flags.0 != 0
@@ -9127,7 +9156,7 @@ fn plan_class_method_parameter_with_body_mode(
         {
             return Err(reject());
         }
-        let type_ = if let NodeData::ArrayTypeNode(array) = &type_record.data {
+        if let NodeData::ArrayTypeNode(array) = &type_record.data {
             if !source_body || data.question_token.is_some() {
                 return Err(reject());
             }
@@ -9167,26 +9196,53 @@ fn plan_class_method_parameter_with_body_mode(
                 )));
             }
             validate_index_type_cache(store, element, element_type)?;
-            type_
+            validate_index_type_cache(store, type_node, type_)?;
+            (
+                Some(type_node),
+                ClassBodyParameterType::Known(type_),
+                Some(type_),
+            )
         } else if matches!(type_record.data, NodeData::KeywordTypeNode(_)) {
-            primitive_keyword_type(store, type_node, type_record.kind).map_err(|error| {
-                if matches!(error, ClassError::Unsupported(_)) {
-                    reject()
-                } else {
-                    error
-                }
-            })?
+            let type_ =
+                primitive_keyword_type(store, type_node, type_record.kind).map_err(|error| {
+                    if matches!(error, ClassError::Unsupported(_)) {
+                        reject()
+                    } else {
+                        error
+                    }
+                })?;
+            validate_index_type_cache(store, type_node, type_)?;
+            (
+                Some(type_node),
+                ClassBodyParameterType::Known(type_),
+                Some(type_),
+            )
+        } else if source_body
+            && data.question_token.is_none()
+            && matches!(type_record.data, NodeData::TupleTypeNode(_))
+        {
+            let cached = preflight_fixed_keyword_tuple_annotation(store, host, type_node).map_err(
+                |error| match error {
+                    DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax { .. },
+                    ) => reject(),
+                    error => ClassError::DeclaredType(error),
+                },
+            )?;
+            (
+                Some(type_node),
+                ClassBodyParameterType::Tuple(type_node),
+                cached,
+            )
         } else {
             return Err(reject());
-        };
-        validate_index_type_cache(store, type_node, type_)?;
-        (Some(type_node), type_)
+        }
     } else if javascript && name_record.range.end == record.range.end {
         let any = store
             .intrinsic_bootstrap()
             .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(parameter)))?
             .any_type;
-        (None, any)
+        (None, ClassBodyParameterType::Known(any), Some(any))
     } else {
         return Err(reject());
     };
@@ -9209,13 +9265,18 @@ fn plan_class_method_parameter_with_body_mode(
             return Err(reject());
         }
     }
-    let value_type = optional_constructor_parameter_type(store, type_, optional, parameter)?
-        .ok_or_else(|| {
-            unsupported(ClassUnsupported::PropertyType {
-                node: type_node.unwrap_or(parameter),
-                kind: SyntaxKind::Parameter,
-            })
-        })?;
+    let value_type = cached_type
+        .map(|type_| {
+            optional_constructor_parameter_type(store, type_, optional, parameter)?.ok_or_else(
+                || {
+                    unsupported(ClassUnsupported::PropertyType {
+                        node: type_node.unwrap_or(parameter),
+                        kind: SyntaxKind::Parameter,
+                    })
+                },
+            )
+        })
+        .transpose()?;
 
     let symbol = bound_symbol(store, host, parameter)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
@@ -9245,11 +9306,13 @@ fn plan_class_method_parameter_with_body_mode(
     }
     if store.value_symbol_links(symbol).is_some_and(|links| {
         links != &ValueSymbolLinks::default()
-            && links
-                != &(ValueSymbolLinks {
-                    resolved_type: Some(value_type),
-                    ..ValueSymbolLinks::default()
-                })
+            && value_type.is_none_or(|type_| {
+                links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+            })
     }) {
         return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
     }
@@ -15338,6 +15401,9 @@ fn exact_method_value(
                 && signature_record.parameters().len() == parameters.len()
                 && signature_record.parameters().iter().zip(parameters).all(
                     |(symbol, parameter)| {
+                        let Ok(type_) = parameter.type_.resolved(store) else {
+                            return false;
+                        };
                         *symbol == parameter.symbol
                             && store.source_node_kind(parameter.declaration)
                                 == Some(SyntaxKind::Parameter)
@@ -15348,13 +15414,13 @@ fn exact_method_value(
                             && parameter.type_node.is_none_or(|node| {
                                 store.type_node_links(node)
                                     == Some(&TypeNodeLinks {
-                                        resolved_type: Some(parameter.type_),
+                                        resolved_type: Some(type_),
                                         ..TypeNodeLinks::default()
                                     })
                             })
                             && store.value_symbol_links(parameter.symbol)
                                 == Some(&ValueSymbolLinks {
-                                    resolved_type: Some(parameter.type_),
+                                    resolved_type: Some(type_),
                                     ..ValueSymbolLinks::default()
                                 })
                     },
@@ -15363,10 +15429,9 @@ fn exact_method_value(
                     .callable_signature_parameter_types(*signature)
                     .is_none_or(|cached| {
                         cached.len() == parameters.len()
-                            && cached
-                                .iter()
-                                .zip(parameters)
-                                .all(|(cached, parameter)| *cached == parameter.type_)
+                            && cached.iter().zip(parameters).all(|(cached, parameter)| {
+                                parameter.type_.resolved(store).ok() == Some(*cached)
+                            })
                     })
         }
         Some(parameter) => {
@@ -15585,8 +15650,9 @@ fn validate_method_cache_state(
         }
     }
     for parameter in &method.parameters {
+        let type_ = parameter.type_.resolved(store)?;
         if let Some(type_node) = parameter.type_node {
-            validate_index_type_cache(store, type_node, parameter.type_)?;
+            validate_index_type_cache(store, type_node, type_)?;
         }
         if store
             .value_symbol_links(parameter.symbol)
@@ -15594,7 +15660,7 @@ fn validate_method_cache_state(
                 links != &ValueSymbolLinks::default()
                     && links
                         != &(ValueSymbolLinks {
-                            resolved_type: Some(parameter.type_),
+                            resolved_type: Some(type_),
                             ..ValueSymbolLinks::default()
                         })
             })
@@ -24902,11 +24968,15 @@ fn publish_class_method_callable(
         ));
     }
     for parameter in &method.parameters {
+        let type_ = parameter
+            .type_
+            .resolved(store)
+            .expect("the class method plan retained its parameter types");
         if let Some(type_node) = parameter.type_node {
             assert!(store.set_type_node_links(
                 type_node,
                 TypeNodeLinks {
-                    resolved_type: Some(parameter.type_),
+                    resolved_type: Some(type_),
                     ..TypeNodeLinks::default()
                 },
             ));
@@ -24914,7 +24984,7 @@ fn publish_class_method_callable(
         assert!(store.set_value_symbol_links(
             parameter.symbol,
             ValueSymbolLinks {
-                resolved_type: Some(parameter.type_),
+                resolved_type: Some(type_),
                 ..ValueSymbolLinks::default()
             },
         ));
@@ -28676,7 +28746,7 @@ fn exact_stored_ambient_class_method_parameters(
             declaration: parameter,
             symbol,
             type_node: Some(type_node),
-            type_,
+            type_: ClassBodyParameterType::Known(type_),
             optional: false,
         });
     }
