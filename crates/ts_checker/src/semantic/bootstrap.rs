@@ -8515,10 +8515,18 @@ mod tests {
                 .value_declaration()
                 .and_then(|declaration| store.source_direct_type_annotation(declaration))
                 .unwrap();
-            let annotation_links = store
-                .type_node_links(annotation)
-                .cloned()
-                .unwrap_or_default();
+            assert_eq!(store.type_node_links(annotation), None);
+            // A default record is not the original absent keyword cache.
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(property_type),
+                    outer_type_parameters: None,
+                }
+            ));
+            assert!(store.source_direct_type_annotation_is_exact(annotation, property_type));
+            assert_native_heritage_result(store, root, type_, targets, Ok(()));
+            let annotation_links = store.type_node_links(annotation).cloned().unwrap();
             assert!(store.set_type_node_links(
                 annotation,
                 TypeNodeLinks {
