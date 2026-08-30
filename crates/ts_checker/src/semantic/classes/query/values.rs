@@ -1,6 +1,8 @@
 //! Class value queries compose the existing annotation and expression kernels.
 
-use super::super::{completed_source_class_property_type, emit_standard_class_fields};
+use super::super::{
+    completed_source_class_property_type, emit_standard_class_fields, validate_index_type_cache,
+};
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, CanonicalTypeQuery, CheckFlags, ClassError, ClassInvariant,
@@ -1164,6 +1166,79 @@ impl ClassValueQuery<'_, '_, '_> {
         Ok(Some(value))
     }
 
+    fn method_parameter_name_type(
+        &mut self,
+        node: NodeRef,
+        class: &ClassQueryPlan,
+        member: NodeRef,
+    ) -> Result<Option<TypeId>, ClassError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        if record.kind != SyntaxKind::Identifier {
+            return Ok(None);
+        }
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, parent);
+        let record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::ParameterDeclaration(parameter) = &record.data else {
+            return Ok(None);
+        };
+        if parameter.name != node.node {
+            return Ok(None);
+        }
+        let invalid = || invariant(ClassInvariant::InvalidDeclaration(declaration));
+        let owner = record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or_else(invalid)?;
+        if preflight_node(self.store, self.host, owner)?.kind != SyntaxKind::MethodDeclaration {
+            return Ok(None);
+        }
+        if owner != member || declaration.arena != member.arena || declaration.file != member.file {
+            return Err(invalid());
+        }
+        let symbol = bound_symbol(self.store, self.host, member).ok_or_else(invalid)?;
+        let plan = plan_selected_class_member(self.store, self.host, symbol)?;
+        let SelectedMember::Method(method) = &plan.member else {
+            return Err(invalid());
+        };
+        if plan.class != *class || method.declaration != member {
+            return Err(invalid());
+        }
+        let (parameter_symbol, type_) = method
+            .parameters
+            .iter()
+            .find(|parameter| parameter.declaration == declaration)
+            .map(|parameter| (parameter.symbol, parameter.type_))
+            .or_else(|| {
+                method
+                    .rest_parameter
+                    .filter(|parameter| parameter.declaration == declaration)
+                    .map(|parameter| (parameter.symbol, parameter.array_type))
+            })
+            .ok_or_else(invalid)?;
+        if bound_symbol(self.store, self.host, declaration) != Some(parameter_symbol) {
+            return Err(invalid());
+        }
+        validate_query_reference_cache(self.store, node, parameter_symbol)?;
+        validate_index_type_cache(self.store, node, type_)?;
+        execute_selected_class_member(self.store, self.host, &plan)?;
+        if exact_method_value(
+            self.store,
+            symbol,
+            member,
+            plan.type_,
+            &method.parameters,
+            method.rest_parameter,
+        )
+        .is_none()
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+        Ok(Some(type_))
+    }
+
     pub(in crate::semantic) fn type_at_location(
         &mut self,
         node: NodeRef,
@@ -1200,6 +1275,11 @@ impl ClassValueQuery<'_, '_, '_> {
             return Ok(None);
         };
         let class_member = context.member();
+        if let Some((class, member)) = class_member
+            && let Some(type_) = self.method_parameter_name_type(node, class, member)?
+        {
+            return Ok(Some(type_));
+        }
         if let Some((_, member)) = class_member {
             let member_record = preflight_node(self.store, self.host, member)?;
             let name = match &member_record.data {
@@ -1243,6 +1323,374 @@ impl ClassValueQuery<'_, '_, '_> {
                 .expression_type(node, class_member, &mut HashSet::new())
                 .map(Some),
             _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod parameter_name_tests {
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, links::SymbolNodeLinks, type_nodes::TypeNodeUnavailable,
+    };
+
+    const FILE: FileId = FileId::new(19_860);
+    const SOURCE: &str = concat!(
+        "abstract class Model { ",
+        "abstract run(first: number, second: string): void; ",
+        "abstract other(other: boolean): void; }",
+    );
+
+    fn context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        assert!(parsed.diagnostics.is_empty());
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/method-parameters.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, FILE)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(FILE, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    struct Parameter {
+        name: NodeRef,
+        declaration: NodeRef,
+        annotation: NodeRef,
+        method: NodeRef,
+        symbol: SemanticSymbolId,
+    }
+
+    fn parameters(context: &CanonicalCheckerContext<'_>, parsed: &ParseResult) -> Vec<Parameter> {
+        let node = |id| NodeRef::new(parsed.arena.id(), FILE, id);
+        let bound = context.file(FILE).unwrap().1;
+        let mut result = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, record)| {
+                let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                let declaration = node(id);
+                Some(Parameter {
+                    name: node(parameter.name),
+                    declaration,
+                    annotation: node(parameter.type_.unwrap()),
+                    method: node(record.parent.unwrap()),
+                    symbol: bound.symbol(declaration).unwrap(),
+                })
+            })
+            .collect::<Vec<_>>();
+        result.sort_by_key(|parameter| {
+            parsed
+                .arena
+                .get(parameter.declaration.node)
+                .unwrap()
+                .range
+                .start
+        });
+        assert_eq!(result.len(), 3);
+        result
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct Snapshot {
+        counts: [usize; 4],
+        links: [usize; 26],
+        values: Vec<Option<ValueSymbolLinks>>,
+        types: Vec<Option<TypeNodeLinks>>,
+        symbols: Vec<Option<SymbolNodeLinks>>,
+        signatures: Vec<Option<SignatureLinks>>,
+    }
+
+    fn snapshot(context: &CanonicalCheckerContext<'_>, parameters: &[Parameter]) -> Snapshot {
+        let store = context.store();
+        Snapshot {
+            counts: [
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+            ],
+            links: store.checker_link_allocated_lengths(),
+            values: parameters
+                .iter()
+                .map(|parameter| store.value_symbol_links(parameter.symbol).cloned())
+                .collect(),
+            types: parameters
+                .iter()
+                .flat_map(|parameter| [parameter.name, parameter.annotation])
+                .map(|node| store.type_node_links(node).cloned())
+                .collect(),
+            symbols: parameters
+                .iter()
+                .map(|parameter| store.symbol_node_links(parameter.name).cloned())
+                .collect(),
+            signatures: parameters
+                .iter()
+                .map(|parameter| store.signature_links(parameter.method).cloned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn class_method_parameter_names_keep_cold_and_warm_identity() {
+        let parsed = parse_source_file(SOURCE);
+        for source_first in [false, true] {
+            let mut context = context(&parsed);
+            let parameters = parameters(&context, &parsed);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let expected = [
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.boolean_type,
+            ];
+            if source_first {
+                context.check_source_file(FILE).unwrap();
+            }
+            assert_eq!(
+                context.get_class_query_type_at_location(parameters[0].name),
+                Ok(Some(expected[0]))
+            );
+            if !source_first {
+                assert!(
+                    context
+                        .store()
+                        .signature_links(parameters[2].method)
+                        .is_none()
+                );
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(parameters[2].symbol)
+                        .is_none()
+                );
+            }
+            for (parameter, expected) in parameters.iter().zip(expected) {
+                assert_eq!(context.get_type_at_location(parameter.name), Ok(expected));
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(parameter.symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(expected)
+                );
+            }
+            let warm = snapshot(&context, &parameters);
+            for _ in 0..2 {
+                for (parameter, expected) in parameters.iter().zip(expected) {
+                    assert_eq!(
+                        context.get_class_query_type_at_location(parameter.name),
+                        Ok(Some(expected))
+                    );
+                    assert_eq!(context.get_type_at_location(parameter.name), Ok(expected));
+                }
+                assert_eq!(snapshot(&context, &parameters), warm);
+            }
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn class_method_parameter_names_reject_foreign_name_caches_before_publication() {
+        let parsed = parse_source_file(SOURCE);
+        for symbol_poison in [false, true] {
+            let mut context = context(&parsed);
+            let parameters = parameters(&context, &parsed);
+            let parameter = parameters[0];
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let expected = bootstrap.number_type;
+            let wrong = bootstrap.string_type;
+            if symbol_poison {
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    parameter.name,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(parameters[2].symbol)
+                    }
+                ));
+            } else {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    parameter.name,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+            }
+            let poisoned = snapshot(&context, &parameters);
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.get_class_query_type_at_location(parameter.name),
+                    Err(ClassError::Invariant(_))
+                ));
+                assert_eq!(snapshot(&context, &parameters), poisoned);
+                assert!(context.store().signature_links(parameter.method).is_none());
+            }
+            if symbol_poison {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(parameter.name, SymbolNodeLinks::default())
+                );
+            } else {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(parameter.name, TypeNodeLinks::default())
+                );
+            }
+            assert_eq!(
+                context.get_class_query_type_at_location(parameter.name),
+                Ok(Some(expected))
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn class_method_parameter_names_reject_damaged_owner_signature_and_value_caches() {
+        let parsed = parse_source_file(SOURCE);
+        for poison in ["annotation", "value", "signature"] {
+            let mut context = context(&parsed);
+            let parameters = parameters(&context, &parsed);
+            for parameter in &parameters {
+                context
+                    .get_class_query_type_at_location(parameter.name)
+                    .unwrap();
+            }
+            let parameter = parameters[0];
+            let annotation = context
+                .store()
+                .type_node_links(parameter.annotation)
+                .unwrap()
+                .clone();
+            let value = context
+                .store()
+                .value_symbol_links(parameter.symbol)
+                .unwrap()
+                .clone();
+            let signature = context
+                .store()
+                .signature_links(parameter.method)
+                .unwrap()
+                .clone();
+            let other_signature = context
+                .store()
+                .signature_links(parameters[2].method)
+                .unwrap()
+                .clone();
+            assert_ne!(signature, other_signature);
+            let expected = value.resolved_type.unwrap();
+            let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+            match poison {
+                "annotation" => assert!(context.store_mut_for_test().set_type_node_links(
+                    parameter.annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                "value" => assert!(context.store_mut_for_test().set_value_symbol_links(
+                    parameter.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    }
+                )),
+                "signature" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_links(parameter.method, other_signature)
+                ),
+                _ => unreachable!(),
+            }
+            let poisoned = snapshot(&context, &parameters);
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.get_class_query_type_at_location(parameter.name),
+                    Err(ClassError::Invariant(_))
+                ));
+                assert_eq!(snapshot(&context, &parameters), poisoned);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(parameter.annotation, annotation)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(parameter.symbol, value)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_links(parameter.method, signature)
+            );
+            assert_eq!(
+                context.get_class_query_type_at_location(parameter.name),
+                Ok(Some(expected))
+            );
+            assert_eq!(snapshot(&context, &parameters).counts, poisoned.counts);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn class_method_parameter_names_leave_nested_arrow_parameters_on_their_existing_route() {
+        for source in [
+            "class Model { field = (parameter: number) => parameter; }",
+            "class Model { method() { return (parameter: number) => parameter; } }",
+        ] {
+            let parsed = parse_source_file(source);
+            let mut context = context(&parsed);
+            let (declaration, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(id, record)| {
+                    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                        return None;
+                    };
+                    Some((
+                        NodeRef::new(parsed.arena.id(), FILE, id),
+                        NodeRef::new(parsed.arena.id(), FILE, parameter.name),
+                    ))
+                })
+                .unwrap();
+            let before = snapshot(&context, &[]);
+            for _ in 0..2 {
+                assert!(matches!(
+                    context.get_class_query_type_at_location(name),
+                    Err(ClassError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax { node, kind: SyntaxKind::Parameter }
+                    ))) if node == declaration
+                ));
+                assert_eq!(snapshot(&context, &[]), before);
+            }
         }
     }
 }

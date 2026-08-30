@@ -1,7 +1,7 @@
 use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions, CanonicalSourceFileFacts,
-    CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
+    CanonicalSourceLanguage, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
@@ -330,18 +330,18 @@ fn assert_callable(
 
 fn assert_display(
     context: &mut CanonicalCheckerContext<'_>,
-    callable: TypeId,
+    type_: TypeId,
     unqualified: &str,
     locations: &[(NodeRef, &str)],
 ) {
     let before = snapshot(context);
     for _ in 0..2 {
-        assert_eq!(context.type_to_string(callable).unwrap(), unqualified);
+        assert_eq!(context.type_to_string(type_).unwrap(), unqualified);
         for &(location, expected) in locations {
             assert_eq!(
                 context
                     .type_to_string_at_location_with_flags(
-                        callable,
+                        type_,
                         location,
                         CanonicalTypeFormatFlags::NO_TRUNCATION
                             | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
@@ -352,6 +352,144 @@ fn assert_display(
         }
         assert_eq!(snapshot(context), before);
     }
+}
+
+#[allow(clippy::too_many_lines)] // Check the import owner, original callable, and both module properties together.
+fn assert_import_namespace(
+    context: &mut CanonicalCheckerContext<'_>,
+    provider: (&ParseResult, FileId),
+    importer: (&ParseResult, FileId),
+    callable: TypeId,
+) -> (SemanticSymbolId, TypeId) {
+    let original = owner(
+        context,
+        node(provider.0, provider.1, SyntaxKind::FunctionDeclaration),
+    );
+    let import = node(importer.0, importer.1, SyntaxKind::ImportDeclaration);
+    let binding = node(importer.0, importer.1, SyntaxKind::NamespaceImport);
+    let name = declaration_name(importer.0, binding);
+    let alias = owner(context, binding);
+    let AliasTargetState::Resolved(module) = context.resolve_alias(alias).unwrap().target else {
+        panic!("the namespace import resolves to its own module");
+    };
+    let module_type = context.get_type_at_location(name).unwrap();
+    assert_eq!(context.get_symbol_at_location(name), Ok(Some(alias)));
+    assert_ne!(alias, original);
+    assert_ne!(module, original);
+    assert_ne!(module, alias);
+    assert_ne!(module_type, callable);
+    assert_eq!(value_type(context, original), callable);
+    assert_eq!(value_type(context, alias), module_type);
+    assert_eq!(value_type(context, module), module_type);
+
+    let item_declaration = node(provider.0, provider.1, SyntaxKind::VariableDeclaration);
+    let item_name = declaration_name(provider.0, item_declaration);
+    let item_symbol = owner(context, item_declaration);
+    let item_type = context.get_type_at_location(item_name).unwrap();
+    assert_eq!(
+        context.get_symbol_at_location(item_name),
+        Ok(Some(item_symbol))
+    );
+    let store = context.store();
+    let alias_record = store.symbol(alias).unwrap();
+    let NodeData::Identifier(identifier) = &importer.0.arena.get(name.node).unwrap().data else {
+        unreachable!()
+    };
+    assert_eq!(alias_record.flags(), SymbolFlags::ALIAS);
+    assert_eq!(
+        alias_record.name().as_utf8(),
+        Some(identifier.text.as_str())
+    );
+    assert_eq!(alias_record.declarations(), Some([binding].as_slice()));
+    let alias_links = store.alias_symbol_links(alias).unwrap();
+    assert_eq!(alias_links.immediate_target, Some(module));
+    assert_eq!(alias_links.alias_target, AliasTargetState::Resolved(module));
+    assert!(alias_links.type_only_declaration.is_none());
+    let origin = store.export_type_links(module).unwrap();
+    assert_eq!(origin.target, Some(original));
+    assert_eq!(origin.originating_import, Some(import));
+
+    let original_record = store.symbol(original).unwrap();
+    let module_record = store.symbol(module).unwrap();
+    assert_eq!(module_record.flags(), original_record.flags());
+    assert_eq!(module_record.name(), original_record.name());
+    assert_eq!(module_record.declarations(), original_record.declarations());
+    assert_eq!(
+        module_record.value_declaration(),
+        original_record.value_declaration()
+    );
+    let exports = store
+        .symbol_table(module_record.exports().unwrap())
+        .unwrap();
+    assert_eq!(exports.len(), 2);
+    assert_eq!(exports.get_source("items"), Some(item_symbol));
+    assert_eq!(
+        store
+            .symbol_table(original_record.exports().unwrap())
+            .unwrap()
+            .get_source("items"),
+        Some(item_symbol),
+    );
+    let item_record = store.symbol(item_symbol).unwrap();
+    assert_eq!(item_record.parent(), Some(original));
+    assert_eq!(
+        item_record.declarations(),
+        Some([item_declaration].as_slice())
+    );
+    assert_eq!(item_record.value_declaration(), Some(item_declaration));
+    let default_alias = exports.get(InternalSymbolName::Default.as_ref()).unwrap();
+    let default_record = store.symbol(default_alias).unwrap();
+    assert_eq!(default_record.flags(), SymbolFlags::ALIAS);
+    assert_eq!(
+        default_record.parent(),
+        context
+            .file(provider.1)
+            .unwrap()
+            .1
+            .symbol(context.source_file(provider.1).unwrap().node_ref()),
+    );
+    let default_links = store.alias_symbol_links(default_alias).unwrap();
+    assert_eq!(default_links.immediate_target, Some(original));
+    assert_eq!(
+        default_links.alias_target,
+        AliasTargetState::Resolved(original)
+    );
+    assert!(default_links.type_only_declaration.is_none());
+
+    let record = store.type_payload(module_type).unwrap();
+    let TypeData::Object(object) = record.data() else {
+        panic!("the namespace import retains its module object");
+    };
+    assert!(record.symbol().is_none());
+    assert_eq!(object.structured.call_signature_count, 0);
+    assert!(object.structured.signatures.is_none());
+    let properties = object.structured.properties.as_deref().unwrap();
+    let members = store
+        .symbol_table(object.structured.members.unwrap())
+        .unwrap();
+    assert_eq!(properties.len(), 2);
+    assert_eq!(members.len(), 2);
+    for (key, expected) in [("default", callable), ("items", item_type)] {
+        let property = members.get_source(key).unwrap();
+        assert!(properties.contains(&property));
+        assert_eq!(
+            store.symbol(property).unwrap().flags(),
+            SymbolFlags::PROPERTY
+        );
+        assert_eq!(value_type(context, property), expected);
+    }
+    let TypeData::TypeReference(reference) = store.type_payload(item_type).unwrap().data() else {
+        panic!("the imported items retain their Array instance");
+    };
+    assert_eq!(
+        reference.object.target,
+        Some(context.global_types().array_type)
+    );
+    assert_eq!(
+        reference.resolved_type_arguments.as_deref(),
+        Some([store.intrinsic_bootstrap().unwrap().string_type].as_slice()),
+    );
+    (module, module_type)
 }
 
 #[test]
@@ -492,28 +630,29 @@ fn runtime_namespace_display_uses_each_importers_value_scope() {
             ],
         );
         let declaration = node(&provider, provider_file, SyntaxKind::FunctionDeclaration);
+        let namespace = node(&provider, provider_file, SyntaxKind::ModuleDeclaration);
+        let export = node(&provider, provider_file, SyntaxKind::ExportAssignment);
         let original = owner(&context, declaration);
-        let alias_symbols = aliases.map(|alias| owner(&context, alias));
         assert!(context.store().value_symbol_links(original).is_none());
         let cold = query_first.then(|| context.get_type_at_location(names[0]).unwrap());
         for file in [provider_file, files[0], files[1]] {
             context.check_source_file(file).unwrap();
         }
         let callable = value_type(&context, original);
+        let namespaces = [0, 1].map(|index| {
+            assert_import_namespace(
+                &mut context,
+                (&provider, provider_file),
+                (importers[index], files[index]),
+                callable,
+            )
+        });
+        assert_ne!(namespaces[0].0, namespaces[1].0);
+        assert_ne!(namespaces[0].1, namespaces[1].1);
         if let Some(cold) = cold {
-            assert_eq!(cold, callable);
+            assert_eq!(cold, namespaces[0].1);
         }
         assert_callable(&context, &provider, provider_file, callable, "items");
-        for (name, alias) in names.into_iter().zip(alias_symbols) {
-            assert_ne!(alias, original);
-            assert_eq!(
-                context.resolve_alias(alias).unwrap().target,
-                AliasTargetState::Resolved(original)
-            );
-            assert_eq!(value_type(&context, alias), callable);
-            assert_eq!(context.get_type_at_location(name), Ok(callable));
-            assert_eq!(context.get_symbol_at_location(name), Ok(Some(alias)));
-        }
         let warm = snapshot(&context);
         for _ in 0..2 {
             assert_display(
@@ -521,16 +660,49 @@ fn runtime_namespace_display_uses_each_importers_value_scope() {
                 callable,
                 "typeof foo",
                 &[
+                    (declaration, "typeof foo"),
+                    (namespace, "typeof foo"),
+                    (export, "typeof foo"),
+                ],
+            );
+            // Each wrapper uses its own alias. A hidden alias leaves the provider name.
+            assert_display(
+                &mut context,
+                namespaces[0].1,
+                "typeof foo",
+                &[
                     (aliases[0], "typeof renamed"),
-                    (aliases[1], "typeof other"),
                     (type_only_body, "typeof renamed"),
-                    (hidden_body, "typeof import(\"foo\")"),
+                    (hidden_body, "typeof foo"),
+                    (aliases[1], "typeof foo"),
+                    (declaration, "typeof foo"),
+                ],
+            );
+            assert_display(
+                &mut context,
+                namespaces[1].1,
+                "typeof foo",
+                &[
+                    (aliases[1], "typeof other"),
+                    (aliases[0], "typeof foo"),
+                    (declaration, "typeof foo"),
                 ],
             );
             for file in [files[1], provider_file, files[0]] {
                 context.recheck_source_file(file).unwrap();
             }
             assert_callable(&context, &provider, provider_file, callable, "items");
+            for index in [0, 1] {
+                assert_eq!(
+                    assert_import_namespace(
+                        &mut context,
+                        (&provider, provider_file),
+                        (importers[index], files[index]),
+                        callable,
+                    ),
+                    namespaces[index],
+                );
+            }
             assert_eq!(snapshot(&context), warm);
         }
         assert!(context.diagnostics().is_empty());
@@ -649,8 +821,14 @@ fn original_array_augmentation_fixture_keeps_namespace_display_and_both_diagnost
             context.check_source_file(file).unwrap();
         }
         let callable = value_type(&context, original);
+        let imported = assert_import_namespace(
+            &mut context,
+            (&parsed[0], files[0]),
+            (&parsed[4], files[4]),
+            callable,
+        );
         if let Some(cold) = cold {
-            assert_eq!(cold, callable);
+            assert_eq!(cold, imported.1);
         }
         assert_callable(&context, &parsed[0], files[0], callable, "items");
         assert_duplicate_diagnostics(&context, (&parsed[1], files[1]), (&parsed[2], files[2]));
@@ -669,7 +847,6 @@ fn original_array_augmentation_fixture_keeps_namespace_display_and_both_diagnost
             declaration_name(&parsed[0], declaration),
             declaration_name(&parsed[0], namespace),
             exported,
-            import_name,
         ];
         for name in names {
             assert_eq!(context.get_type_at_location(name), Ok(callable));
@@ -719,14 +896,29 @@ fn original_array_augmentation_fixture_keeps_namespace_display_and_both_diagnost
                 &[
                     (declaration, "typeof foo"),
                     (namespace, "typeof foo"),
-                    (import, "typeof foo"),
+                    (exported, "typeof foo"),
                 ],
+            );
+            assert_display(
+                &mut context,
+                imported.1,
+                "typeof foo",
+                &[(import, "typeof foo"), (declaration, "typeof foo")],
             );
             for file in files {
                 context.recheck_source_file(file).unwrap();
             }
             assert_duplicate_diagnostics(&context, (&parsed[1], files[1]), (&parsed[2], files[2]));
             assert_callable(&context, &parsed[0], files[0], callable, "items");
+            assert_eq!(
+                assert_import_namespace(
+                    &mut context,
+                    (&parsed[0], files[0]),
+                    (&parsed[4], files[4]),
+                    callable,
+                ),
+                imported,
+            );
             assert_eq!(snapshot(&context), warm);
         }
     }

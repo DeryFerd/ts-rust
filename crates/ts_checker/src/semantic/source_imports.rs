@@ -7296,6 +7296,13 @@ fn authenticate_synthetic_import_namespace_identity(
     let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
         return Err(invalid());
     };
+    let import_name = store
+        .source_child_with_kind(binding, SyntaxKind::Identifier)
+        .ok_or_else(invalid)?;
+    let import_name_text = store
+        .source_identifier_text(import_name)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(invalid)?;
 
     if record.flags() != expected_flags
         || record.check_flags() != CheckFlags::NONE
@@ -7350,7 +7357,10 @@ fn authenticate_synthetic_import_namespace_identity(
         || store.source_node_parent(clause) != Some(SourceNodeParent::Parent(originating_import))
         || store.source_node_kind(originating_import) != Some(SyntaxKind::ImportDeclaration)
         || alias_record.flags() != SymbolFlags::ALIAS
-        || alias_record.name() != owner.name()
+        || alias_record.check_flags() != CheckFlags::NONE
+        || store.source_declaration_symbol(binding) != Some(alias)
+        || !store.source_symbol_declarations_match(alias)
+        || alias_record.name().as_utf8() != Some(import_name_text)
         || store.alias_symbol_links(alias).is_none_or(|alias_links| {
             alias_links.immediate_target != Some(synthetic)
                 || alias_links.alias_target != AliasTargetState::Resolved(synthetic)
@@ -7462,10 +7472,317 @@ pub(super) fn synthetic_source_import_origin(
     Some(authenticated.originating_import)
 }
 
+fn is_namespace_import_binding(store: &CanonicalTypeMapperStore, symbol: SemanticSymbolId) -> bool {
+    store.symbol(symbol).is_some_and(|record| {
+        record.declarations().is_some_and(|declarations| {
+            declarations.iter().any(|declaration| {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::NamespaceImport)
+            })
+        })
+    })
+}
+
+/// Validates a completed synthetic namespace without resolving its provider.
+#[allow(clippy::too_many_lines)] // Keep the import, callable and projected member checks together.
+pub(super) fn validated_synthetic_namespace_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<TypeId>, SourceImportError> {
+    if store
+        .source_file_namespace_wrapper_for_module(symbol)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let export_links = store.export_type_links(symbol);
+    // Canonical module merges have source owners but no direct binder snapshot.
+    if export_links.is_none()
+        && (store.source_symbol_declarations_match(symbol)
+            || store.symbol(symbol).is_some_and(|record| {
+                record.flags().contains(SymbolFlags::TRANSIENT)
+                    && record.flags().intersects(SymbolFlags::MODULE)
+                    && store.source_merged_symbol_declarations_match(symbol)
+            }))
+    {
+        return Ok(None);
+    }
+    if export_links.is_none()
+        && !store.symbol_store().symbols().any(|(alias, _)| {
+            is_namespace_import_binding(store, alias)
+                && store.alias_symbol_links(alias).is_some_and(|links| {
+                    links.immediate_target == Some(symbol)
+                        || links.alias_target.symbol() == Some(symbol)
+                })
+        })
+    {
+        return Ok(None);
+    }
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(symbol));
+    let origin = export_links
+        .and_then(|links| links.originating_import)
+        .ok_or_else(invalid)?;
+    let import = host.node(origin).ok_or_else(invalid)?;
+    let NodeData::ImportDeclaration(import) = &import.data else {
+        return Err(invalid());
+    };
+    let clause = NodeRef::new(
+        origin.arena,
+        origin.file,
+        import.import_clause.ok_or_else(invalid)?,
+    );
+    let Some(NodeData::ImportClause(clause)) = host.node(clause).map(|node| &node.data) else {
+        return Err(invalid());
+    };
+    let binding = NodeRef::new(
+        origin.arena,
+        origin.file,
+        clause.named_bindings.ok_or_else(invalid)?,
+    );
+    let alias = host
+        .bound_file(binding)
+        .and_then(|bound| bound.symbol(binding))
+        .ok_or_else(invalid)?;
+    let authenticated = authenticate_synthetic_import_namespace_identity(store, alias, symbol)?;
+    if store.symbol_store().symbols().any(|(other, _)| {
+        other != alias
+            && is_namespace_import_binding(store, other)
+            && store.alias_symbol_links(other).is_some_and(|links| {
+                links.immediate_target == Some(symbol)
+                    || links.alias_target.symbol() == Some(symbol)
+            })
+    }) {
+        return Err(invalid());
+    }
+    let callable = store
+        .source_callable_type_for_owner(authenticated.original)
+        .ok_or_else(invalid)?;
+    let provenance = store
+        .source_callable_provenance(callable)
+        .ok_or_else(invalid)?;
+    if provenance.owner_symbol != authenticated.original
+        || provenance.declaration != authenticated.function
+        || provenance.family != SourceCallableFamily::FunctionDeclaration
+        || !matches!(
+            validate_stored_source_callable(store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        )
+    {
+        return Err(invalid());
+    }
+    let array_targets = provenance.array_targets;
+    let PlannedSourceImportValueTarget::ModuleNamespace {
+        declaration,
+        members,
+    } = plan_synthetic_import_namespace_with_array_targets(
+        store,
+        host,
+        array_targets,
+        alias,
+        symbol,
+    )?
+    else {
+        return Err(invalid());
+    };
+    let type_ = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    let expected_links = ValueSymbolLinks {
+        resolved_type: Some(type_),
+        ..ValueSymbolLinks::default()
+    };
+    if store.value_symbol_links(symbol) != Some(&expected_links)
+        || store.value_symbol_links(alias) != Some(&expected_links)
+        || store.symbol_store().symbols().any(|(other, _)| {
+            other != symbol
+                && other != alias
+                && (store.export_type_links(other).is_some()
+                    || is_namespace_import_binding(store, other))
+                && store
+                    .value_symbol_links(other)
+                    .and_then(|links| links.resolved_type)
+                    == Some(type_)
+        })
+    {
+        return Err(invalid());
+    }
+    let record = store.type_payload(type_).ok_or_else(invalid)?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid());
+    };
+    let structured = &object.structured;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != super::type_records::TypeCacheState::Unallocated
+        || structured.constrained != super::type_records::ConstrainedTypeData::default()
+        || structured.index_infos.is_some()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return Err(invalid());
+    }
+    let properties = structured.properties.as_deref().ok_or_else(invalid)?;
+    let table = structured
+        .members
+        .and_then(|table| store.symbol_table(table))
+        .ok_or_else(invalid)?;
+    if properties.len() != members.len() || table.len() != members.len() {
+        return Err(invalid());
+    }
+    let mut prepared = Vec::with_capacity(members.len());
+    for (member, &property) in members.into_iter().zip(properties) {
+        if table.get(member.name.as_ref()) != Some(property) {
+            return Err(invalid());
+        }
+        let property_type = store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        match &member.target {
+            PlannedSourceImportValueTarget::AnnotatedFunction(plan) => {
+                let SourceCallableState::Resolved {
+                    type_: current,
+                    signature,
+                } = source_callable_state(store, plan, false).map_err(|_| invalid())?
+                else {
+                    return Err(invalid());
+                };
+                if current != callable
+                    || property_type != callable
+                    || store
+                        .signature(signature)
+                        .and_then(super::signatures::Signature::resolved_return_type)
+                        != store
+                            .intrinsic_bootstrap()
+                            .map(|bootstrap| bootstrap.void_type)
+                {
+                    return Err(invalid());
+                }
+            }
+            PlannedSourceImportValueTarget::AnnotatedConst { type_node, .. } => {
+                if !store.source_direct_type_annotation_is_exact(*type_node, property_type) {
+                    return Err(invalid());
+                }
+                super::type_nodes::validate_cached_merged_global_value_annotation(
+                    store,
+                    host,
+                    array_targets,
+                    *type_node,
+                )
+                .map_err(|_| invalid())?;
+                match array_targets {
+                    Some(targets) => {
+                        store.validate_union_constituent_with_array_targets(targets, property_type)
+                    }
+                    None => store.validate_union_constituent(property_type),
+                }
+                .map_err(|_| invalid())?;
+            }
+            _ => return Err(invalid()),
+        }
+        prepared.push(PreparedSourceImportModuleProperty {
+            name: member.name,
+            symbol: property,
+            target_symbol: member.symbol,
+            value_symbol: member.value_symbol,
+            type_: property_type,
+            namespace: None,
+            recursive_const: None,
+            namespace_const: None,
+        });
+    }
+    if !valid_prepared_imported_namespace(store, Some(alias), symbol, declaration, type_, &prepared)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(type_))
+}
+
+/// Finds one exact namespace owner through existing import and target value links.
+pub(super) fn validated_synthetic_namespace_type_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+) -> Result<Option<SemanticSymbolId>, SourceImportError> {
+    let Some(record) = store.type_payload(type_) else {
+        return Ok(None);
+    };
+    if record.symbol().is_some() || !matches!(record.data(), TypeData::Object(_)) {
+        return Ok(None);
+    }
+    let mut owner = None;
+    for (symbol, _) in store.symbol_store().symbols() {
+        if store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            != Some(type_)
+        {
+            continue;
+        }
+        let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(symbol));
+        let target = if store.export_type_links(symbol).is_some() {
+            symbol
+        } else if is_namespace_import_binding(store, symbol) {
+            let links = store.alias_symbol_links(symbol).ok_or_else(invalid)?;
+            let target = links.alias_target.symbol().ok_or_else(invalid)?;
+            if store
+                .source_file_namespace_wrapper_for_module(target)
+                .is_some()
+                || store.source_file_namespace_identity(target).is_some()
+            {
+                continue;
+            }
+            if store.export_type_links(target).is_none()
+                && store.source_symbol_declarations_match(target)
+                && store
+                    .symbol(target)
+                    .is_none_or(|record| !record.flags().intersects(SymbolFlags::FUNCTION))
+            {
+                continue;
+            }
+            authenticate_synthetic_import_namespace_identity(store, symbol, target)?;
+            target
+        } else {
+            continue;
+        };
+        if owner.is_some_and(|owner| owner != target)
+            || validated_synthetic_namespace_symbol(store, host, target)? != Some(type_)
+        {
+            return Err(invalid());
+        }
+        owner = Some(target);
+    }
+    Ok(owner)
+}
+
 fn plan_synthetic_import_namespace(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
+    alias: SemanticSymbolId,
+    synthetic: SemanticSymbolId,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    plan_synthetic_import_namespace_with_array_targets(
+        store,
+        host,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        alias,
+        synthetic,
+    )
+}
+
+fn plan_synthetic_import_namespace_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
     alias: SemanticSymbolId,
     synthetic: SemanticSymbolId,
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
@@ -7698,7 +8015,14 @@ fn plan_synthetic_import_namespace(
         || binding_data.local_symbol.is_some()
         || binding_data.symbol.is_some()
         || import_bound.symbol(binding) != Some(alias)
-        || imported_name_text != function_name_text
+        || import_bound
+            .locals(import_bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&imported_name_text))
+            != Some(alias)
+        || store
+            .symbol(alias)
+            .is_none_or(|record| record.name().as_utf8() != Some(imported_name_text.as_str()))
     {
         return Err(invalid());
     }
@@ -7710,7 +8034,7 @@ fn plan_synthetic_import_namespace(
         host,
         authenticated.function,
         authenticated.original,
-        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        array_targets,
     )?;
     if callable.family != SourceCallableFamily::FunctionDeclaration
         || callable.declaration != authenticated.function
@@ -18419,6 +18743,585 @@ export default <T>(): Subject<T> => {
         );
     }
 
+    fn synthetic_namespace_display_fixture() -> (Fixture, Vec<PreparedSourceImportValue>) {
+        let mut fixture = fixture_with_module_states_and_wrapper_flags(
+            &[
+                "import * as renamed from './foo'; const value = renamed;",
+                "import * as renamed from './foo'; const value = renamed;",
+                concat!(
+                    "declare function foo(): void; ",
+                    "declare namespace foo { export const items: string[]; } ",
+                    "export = foo;",
+                ),
+                "interface Array<T> {}",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(2),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+            ],
+            &[
+                CanonicalModuleState::External,
+                CanonicalModuleState::External,
+                CanonicalModuleState::External,
+                CanonicalModuleState::Script,
+            ],
+            None,
+            &[2],
+        );
+        let mut values = Vec::new();
+        for index in 0..2 {
+            let plan = fixture.plan_import(index, 0);
+            let file = &fixture.files[index];
+            let read = plan_source_import_identifier_read(
+                &file.parsed.arena,
+                fixture.bound.get(&file.file).unwrap(),
+                &fixture.store,
+                &plan.bindings[0],
+                identifier_initializer(&fixture, index, "renamed"),
+                "renamed",
+                plan.bindings[0].alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+            resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
+            let value = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+            publish_for_test(&mut fixture.store, std::slice::from_ref(&value));
+            values.push(value);
+        }
+        (fixture, values)
+    }
+
+    fn synthetic_namespace_display_state(
+        fixture: &Fixture,
+    ) -> impl std::fmt::Debug + PartialEq + use<> {
+        (
+            store_state(&fixture.store),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture
+                .store
+                .symbol_store()
+                .symbols()
+                .map(|(symbol, record)| {
+                    (
+                        symbol,
+                        record.declarations().map(<[NodeRef]>::to_vec),
+                        fixture.store.value_symbol_links(symbol).cloned(),
+                        fixture.store.alias_symbol_links(symbol).cloned(),
+                        fixture.store.export_type_links(symbol).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            fixture
+                .files
+                .iter()
+                .flat_map(|file| {
+                    file.parsed.arena.iter().map(move |(node, _)| {
+                        let node = NodeRef::new(file.parsed.arena.id(), file.file, node);
+                        (
+                            node,
+                            fixture.store.type_node_links(node).cloned(),
+                            fixture.store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each merged-owner change with its exact restoration.
+    fn synthetic_namespace_display_requires_complete_merged_source_modules() {
+        let mut fixture = fixture_with_module_states_and_wrapper_flags(
+            &[
+                "declare module 'shared' { export const first: number; }",
+                "declare module 'shared' { export const second: string; }",
+                "import * as ns from 'shared';",
+            ],
+            &[Route {
+                source: 2,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[
+                CanonicalModuleState::Script,
+                CanonicalModuleState::Script,
+                CanonicalModuleState::External,
+            ],
+            None,
+            &[0, 1],
+        );
+        let declarations = [0, 1].map(|index| {
+            let file = &fixture.files[index];
+            file.parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                        file.parsed.arena.id(),
+                        file.file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        });
+        let raw = declarations.map(|declaration| {
+            fixture
+                .bound
+                .get(&declaration.file)
+                .unwrap()
+                .symbol(declaration)
+                .unwrap()
+        });
+        let module = fixture.store.get_merged_symbol(raw[0]).unwrap();
+        for symbol in raw {
+            assert_ne!(symbol, module);
+            assert_eq!(fixture.store.get_merged_symbol(symbol), Some(module));
+        }
+        let record = fixture.store.symbol(module).unwrap();
+        assert_eq!(record.declarations(), Some(declarations.as_slice()));
+        let flags = record.flags();
+        let check_flags = record.check_flags();
+        let value_declaration = record.value_declaration();
+        assert_eq!(flags, SymbolFlags::VALUE_MODULE | SymbolFlags::TRANSIENT);
+        assert!(!fixture.store.source_symbol_declarations_match(module));
+        assert!(
+            fixture
+                .store
+                .source_merged_symbol_declarations_match(module)
+        );
+        let plan = fixture.plan_import(2, 0);
+        let alias = plan.bindings[0].alias_symbol;
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(resolved[0].immediate_target_symbol, module);
+        assert_eq!(resolved[0].target_symbol, module);
+        for symbol in raw.into_iter().chain([module, alias]) {
+            assert!(fixture.store.export_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+        }
+        let read = |fixture: &Fixture| {
+            let host =
+                property_type_import_host(&fixture.files, &fixture.bound, Some(&fixture.manifest));
+            validated_synthetic_namespace_symbol(&fixture.store, &host, module)
+        };
+        let before = format!("{:?}", fixture.store);
+        assert_eq!(read(&fixture), Ok(None));
+        assert_eq!(format!("{:?}", fixture.store), before);
+
+        for damage in ["declarations", "flags"] {
+            match damage {
+                "declarations" => assert!(fixture.store.set_symbol_declarations(
+                    module,
+                    Some(vec![declarations[0]]),
+                    value_declaration,
+                )),
+                "flags" => assert!(fixture.store.set_symbol_flags(
+                    module,
+                    flags | SymbolFlags::FUNCTION,
+                    check_flags,
+                )),
+                _ => unreachable!(),
+            }
+            assert!(
+                !fixture
+                    .store
+                    .source_merged_symbol_declarations_match(module)
+            );
+            let damaged = format!("{:?}", fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    read(&fixture),
+                    Err(invariant(SourceImportInvariant::InvalidTargetLinks(module))),
+                    "{damage}",
+                );
+                assert_eq!(format!("{:?}", fixture.store), damaged);
+            }
+            assert!(fixture.store.set_symbol_declarations(
+                module,
+                Some(declarations.to_vec()),
+                value_declaration,
+            ));
+            assert!(fixture.store.set_symbol_flags(module, flags, check_flags));
+            assert!(
+                fixture
+                    .store
+                    .source_merged_symbol_declarations_match(module)
+            );
+            let restored = format!("{:?}", fixture.store);
+            for _ in 0..2 {
+                assert_eq!(read(&fixture), Ok(None));
+                assert_eq!(format!("{:?}", fixture.store), restored);
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_namespace_display_rejects_unowned_module_copies_without_export_links() {
+        let (mut fixture, values) = synthetic_namespace_display_fixture();
+        let value = &values[0];
+        let alias = value.binding.alias_symbol;
+        let alias_links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+        let record = fixture.store.symbol(value.target_symbol).unwrap();
+        let data = SymbolData::new(
+            record.flags() | SymbolFlags::TRANSIENT,
+            record.name().to_owned(),
+        );
+        let declarations = record.declarations().map(<[NodeRef]>::to_vec);
+        let value_declaration = record.value_declaration();
+        let copied = fixture.store.alloc_symbol(data).unwrap();
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(copied, declarations, value_declaration)
+        );
+        assert!(fixture.store.export_type_links(copied).is_none());
+        assert!(!fixture.store.source_symbol_declarations_match(copied));
+        assert!(
+            !fixture
+                .store
+                .source_merged_symbol_declarations_match(copied)
+        );
+        let mut wrong_links = alias_links.clone();
+        wrong_links.immediate_target = Some(copied);
+        wrong_links.alias_target = AliasTargetState::Resolved(copied);
+        assert!(fixture.store.set_alias_symbol_links(alias, wrong_links));
+        let host =
+            property_type_import_host(&fixture.files, &fixture.bound, Some(&fixture.manifest));
+        let before = synthetic_namespace_display_state(&fixture);
+        for _ in 0..2 {
+            assert_eq!(
+                validated_synthetic_namespace_symbol(&fixture.store, &host, copied),
+                Err(invariant(SourceImportInvariant::InvalidTargetLinks(copied))),
+            );
+            assert_eq!(synthetic_namespace_display_state(&fixture), before);
+        }
+        assert!(fixture.store.set_alias_symbol_links(alias, alias_links));
+        let restored = synthetic_namespace_display_state(&fixture);
+        for _ in 0..2 {
+            assert_eq!(
+                validated_synthetic_namespace_symbol(&fixture.store, &host, value.target_symbol),
+                Ok(Some(value.type_)),
+            );
+            assert_eq!(display_type(&fixture, value.type_), "typeof foo");
+            assert_eq!(synthetic_namespace_display_state(&fixture), restored);
+        }
+    }
+
+    #[test]
+    fn synthetic_namespace_display_keeps_distinct_wrappers_and_cold_member_values() {
+        let (fixture, values) = synthetic_namespace_display_fixture();
+        assert_ne!(values[0].type_, values[1].type_);
+        assert_ne!(values[0].target_symbol, values[1].target_symbol);
+        let before = synthetic_namespace_display_state(&fixture);
+        let host =
+            property_type_import_host(&fixture.files, &fixture.bound, Some(&fixture.manifest));
+        for _ in 0..2 {
+            for value in &values {
+                let original = fixture
+                    .store
+                    .export_type_links(value.target_symbol)
+                    .unwrap()
+                    .target
+                    .unwrap();
+                let callable = fixture
+                    .store
+                    .source_callable_type_for_owner(original)
+                    .unwrap();
+                assert_ne!(value.type_, callable);
+                assert_eq!(
+                    validated_synthetic_namespace_symbol(
+                        &fixture.store,
+                        &host,
+                        value.target_symbol
+                    ),
+                    Ok(Some(value.type_))
+                );
+                assert_eq!(
+                    validated_synthetic_namespace_type_owner(&fixture.store, &host, value.type_),
+                    Ok(Some(value.target_symbol))
+                );
+                assert_eq!(display_type(&fixture, value.type_), "typeof foo");
+                assert_eq!(
+                    validated_synthetic_namespace_symbol(&fixture.store, &host, original),
+                    Ok(None)
+                );
+                let PreparedSourceImportTarget::ModuleNamespace { properties } = &value.target
+                else {
+                    unreachable!()
+                };
+                let items = properties
+                    .iter()
+                    .find(|property| property.name.as_utf8() == Some("items"))
+                    .unwrap();
+                assert!(
+                    fixture
+                        .store
+                        .value_symbol_links(items.value_symbol)
+                        .is_none()
+                );
+                assert_eq!(display_type(&fixture, items.type_), "string[]");
+            }
+            assert_eq!(synthetic_namespace_display_state(&fixture), before);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each import-link poison paired with its exact restoration.
+    fn synthetic_namespace_display_rejects_partial_import_damage_without_repair() {
+        for damage in [
+            "origin",
+            "alias_target",
+            "alias_value",
+            "target_value",
+            "declaration",
+            "locals",
+            "other_alias",
+        ] {
+            let (mut fixture, values) = synthetic_namespace_display_fixture();
+            let first = &values[0];
+            let alias = first.binding.alias_symbol;
+            let other_alias = values[1].binding.alias_symbol;
+            let target = first.target_symbol;
+            let export_links = fixture.store.export_type_links(target).unwrap().clone();
+            let alias_links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+            let other_links = fixture
+                .store
+                .alias_symbol_links(other_alias)
+                .unwrap()
+                .clone();
+            let alias_value = fixture.store.value_symbol_links(alias).unwrap().clone();
+            let target_value = fixture.store.value_symbol_links(target).unwrap().clone();
+            let declarations = fixture
+                .store
+                .symbol(alias)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let foreign_declarations = fixture
+                .store
+                .symbol(other_alias)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let locals = bound.locals(bound.source_file()).unwrap();
+            match damage {
+                "origin" => {
+                    let mut links = export_links.clone();
+                    links.originating_import = None;
+                    assert!(fixture.store.set_export_type_links(target, links));
+                }
+                "alias_target" => {
+                    let mut links = alias_links.clone();
+                    links.alias_target = AliasTargetState::Resolved(values[1].target_symbol);
+                    assert!(fixture.store.set_alias_symbol_links(alias, links));
+                }
+                "alias_value" => assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(alias, ValueSymbolLinks::default())
+                ),
+                "target_value" => assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(target, ValueSymbolLinks::default())
+                ),
+                "declaration" => assert!(fixture.store.set_symbol_declarations(
+                    alias,
+                    Some(foreign_declarations),
+                    None
+                )),
+                "locals" => assert_eq!(
+                    fixture.store.insert_symbol(
+                        locals,
+                        EscapedName::source("renamed"),
+                        other_alias
+                    ),
+                    Some(Some(alias))
+                ),
+                "other_alias" => {
+                    let mut links = other_links.clone();
+                    links.immediate_target = Some(target);
+                    links.alias_target = AliasTargetState::Resolved(target);
+                    assert!(fixture.store.set_alias_symbol_links(other_alias, links));
+                }
+                _ => unreachable!(),
+            }
+            let before = synthetic_namespace_display_state(&fixture);
+            let host =
+                property_type_import_host(&fixture.files, &fixture.bound, Some(&fixture.manifest));
+            for _ in 0..2 {
+                assert!(
+                    validated_synthetic_namespace_symbol(&fixture.store, &host, target).is_err(),
+                    "{damage}"
+                );
+                assert!(
+                    validated_synthetic_namespace_type_owner(&fixture.store, &host, first.type_)
+                        .is_err(),
+                    "{damage}"
+                );
+                assert!(
+                    type_to_string_with_host_global_types_and_flags(
+                        &fixture.store,
+                        &host,
+                        &fixture.global_types,
+                        first.type_,
+                        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT
+                    )
+                    .is_err(),
+                    "{damage}"
+                );
+                assert_eq!(synthetic_namespace_display_state(&fixture), before);
+            }
+            assert!(fixture.store.set_export_type_links(target, export_links));
+            assert!(fixture.store.set_alias_symbol_links(alias, alias_links));
+            assert!(
+                fixture
+                    .store
+                    .set_alias_symbol_links(other_alias, other_links)
+            );
+            assert!(fixture.store.set_value_symbol_links(alias, alias_value));
+            assert!(fixture.store.set_value_symbol_links(target, target_value));
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_declarations(alias, Some(declarations), None)
+            );
+            assert!(
+                fixture
+                    .store
+                    .insert_symbol(locals, EscapedName::source("renamed"), alias)
+                    .is_some()
+            );
+            assert_eq!(display_type(&fixture, first.type_), "typeof foo");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep each member cache failure and restoration in one control.
+    fn synthetic_namespace_display_rejects_projected_member_and_annotation_damage() {
+        for damage in ["default", "items", "annotation", "source_value"] {
+            let (mut fixture, values) = synthetic_namespace_display_fixture();
+            let value = &values[0];
+            let PreparedSourceImportTarget::ModuleNamespace { properties } = &value.target else {
+                unreachable!()
+            };
+            let default = properties
+                .iter()
+                .find(|property| property.name.as_ref() == InternalSymbolName::Default.as_ref())
+                .unwrap();
+            let items = properties
+                .iter()
+                .find(|property| property.name.as_utf8() == Some("items"))
+                .unwrap();
+            let declaration = fixture
+                .store
+                .symbol(items.value_symbol)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let annotation = fixture
+                .store
+                .source_direct_type_annotation(declaration)
+                .unwrap();
+            let annotation_links = fixture.store.type_node_links(annotation).unwrap().clone();
+            let default_links = fixture
+                .store
+                .value_symbol_links(default.symbol)
+                .unwrap()
+                .clone();
+            let items_links = fixture
+                .store
+                .value_symbol_links(items.symbol)
+                .unwrap()
+                .clone();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            let wrong_links = ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            };
+            match damage {
+                "default" => assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(default.symbol, wrong_links)
+                ),
+                "items" => assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(items.symbol, wrong_links)
+                ),
+                "source_value" => assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(items.value_symbol, wrong_links)
+                ),
+                "annotation" => assert!(fixture.store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            let before = synthetic_namespace_display_state(&fixture);
+            let host =
+                property_type_import_host(&fixture.files, &fixture.bound, Some(&fixture.manifest));
+            for _ in 0..2 {
+                assert!(
+                    validated_synthetic_namespace_type_owner(&fixture.store, &host, value.type_)
+                        .is_err(),
+                    "{damage}"
+                );
+                assert!(
+                    type_to_string_with_host_global_types_and_flags(
+                        &fixture.store,
+                        &host,
+                        &fixture.global_types,
+                        value.type_,
+                        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT
+                    )
+                    .is_err(),
+                    "{damage}"
+                );
+                assert_eq!(synthetic_namespace_display_state(&fixture), before);
+            }
+            assert!(
+                fixture
+                    .store
+                    .set_type_node_links(annotation, annotation_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(default.symbol, default_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(items.symbol, items_links)
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_value_symbol_links(items.value_symbol, ValueSymbolLinks::default())
+            );
+            assert_eq!(display_type(&fixture, value.type_), "typeof foo");
+        }
+    }
+
     #[test]
     fn namespace_import_preserves_merged_ambient_callable_const_members() {
         let mut fixture = fixture_with_module_states_and_wrapper_flags(
@@ -18521,6 +19424,171 @@ export default <T>(): Subject<T> => {
                 .and_then(|links| links.resolved_type),
             Some(callable),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold and warm ownership damage with exact recovery.
+    fn renamed_synthetic_namespace_imports_reject_cross_import_proofs_and_recover() {
+        for warm in [false, true] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    "import * as renamed from './foo'; const imported = renamed;",
+                    "import * as renamed from './foo'; const imported = renamed;",
+                    concat!(
+                        "declare function foo(): void; ",
+                        "declare namespace foo { export const items: number; } ",
+                        "export = foo;",
+                    ),
+                ],
+                &[
+                    Route {
+                        source: 0,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                    Route {
+                        source: 1,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                ],
+                &[2],
+            );
+            let plans = [fixture.plan_import(0, 0), fixture.plan_import(1, 0)];
+            let reads: [_; 2] = std::array::from_fn(|index| {
+                let file = &fixture.files[index];
+                plan_source_import_identifier_read(
+                    &file.parsed.arena,
+                    fixture.bound.get(&file.file).unwrap(),
+                    &fixture.store,
+                    &plans[index].bindings[0],
+                    identifier_initializer(&fixture, index, "renamed"),
+                    "renamed",
+                    plans[index].bindings[0].alias_symbol,
+                )
+                .unwrap()
+            });
+            let resolved: [_; 2] = std::array::from_fn(|index| {
+                resolve_all(&mut fixture, &plans[index].bindings)
+                    .unwrap()
+                    .remove(0)
+            });
+            let aliases = plans.each_ref().map(|plan| plan.bindings[0].alias_symbol);
+            let wrappers = resolved.each_ref().map(|value| value.target_symbol);
+            assert_ne!(aliases[0], aliases[1]);
+            assert_ne!(wrappers[0], wrappers[1]);
+            for value in &resolved {
+                resolve_namespace_exports(&mut fixture, value).unwrap();
+            }
+            let published = warm.then(|| {
+                let values: [_; 2] = std::array::from_fn(|index| {
+                    prepare_one(&mut fixture, &resolved[index], &reads[index]).unwrap()
+                });
+                assert_ne!(values[0].type_, values[1].type_);
+                publish_for_test(&mut fixture.store, &values);
+                values
+            });
+            let original_links = fixture
+                .store
+                .export_type_links(wrappers[0])
+                .unwrap()
+                .clone();
+            let other_links = fixture
+                .store
+                .export_type_links(wrappers[1])
+                .unwrap()
+                .clone();
+            assert_eq!(original_links.target, other_links.target);
+            assert_ne!(
+                original_links.originating_import,
+                other_links.originating_import
+            );
+            assert_eq!(
+                fixture.store.symbol(aliases[0]).unwrap().name(),
+                fixture.store.symbol(aliases[1]).unwrap().name(),
+            );
+
+            // A matching spelling and forged origin must not replace the real binder owner.
+            assert!(fixture.store.set_symbol_declarations(
+                aliases[0],
+                Some(vec![plans[1].bindings[0].declaration]),
+                None,
+            ));
+            assert!(
+                fixture
+                    .store
+                    .set_export_type_links(wrappers[0], other_links)
+            );
+            let damaged = store_state(&fixture.store);
+            assert!(matches!(
+                authenticate_synthetic_import_namespace_identity(&fixture.store, aliases[0], wrappers[0]),
+                Err(SourceImportError::Invariant(SourceImportInvariant::InvalidTargetLinks(target)))
+                    if target == wrappers[0]
+            ));
+            assert_eq!(
+                resolve_namespace_exports(&mut fixture, &resolved[0]),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::InvalidTargetLinks(wrappers[0])
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), damaged);
+            assert!(fixture.store.set_symbol_declarations(
+                aliases[0],
+                Some(vec![plans[0].bindings[0].declaration]),
+                None,
+            ));
+            assert!(
+                fixture
+                    .store
+                    .set_export_type_links(wrappers[0], original_links.clone())
+            );
+
+            let first_bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let locals = first_bound.locals(first_bound.source_file()).unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(locals, EscapedName::source("renamed"), aliases[1]),
+                Some(Some(aliases[0])),
+            );
+            let damaged = store_state(&fixture.store);
+            let host = property_type_import_host(&fixture.files, &fixture.bound, None);
+            assert!(matches!(
+                plan_synthetic_import_namespace(
+                    &fixture.store, &host, &fixture.global_types, aliases[0], wrappers[0],
+                ),
+                Err(SourceImportError::Invariant(SourceImportInvariant::InvalidTargetLinks(target)))
+                    if target == wrappers[0]
+            ));
+            assert_eq!(store_state(&fixture.store), damaged);
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(locals, EscapedName::source("renamed"), aliases[0]),
+                Some(Some(aliases[1])),
+            );
+            let restored: [_; 2] = std::array::from_fn(|index| {
+                resolve_namespace_exports(&mut fixture, &resolved[index]).unwrap();
+                prepare_one(&mut fixture, &resolved[index], &reads[index]).unwrap()
+            });
+            assert_ne!(restored[0].type_, restored[1].type_);
+            if let Some(published) = published {
+                assert_eq!(restored, published);
+            }
+            assert_eq!(
+                fixture.store.export_type_links(wrappers[0]),
+                Some(&original_links)
+            );
+            publish_for_test(&mut fixture.store, &restored);
+            let replay = store_state(&fixture.store);
+            for index in 0..2 {
+                assert_eq!(
+                    prepare_one(&mut fixture, &resolved[index], &reads[index]).unwrap(),
+                    restored[index],
+                );
+            }
+            assert_eq!(store_state(&fixture.store), replay);
+        }
     }
 
     #[test]
