@@ -578,9 +578,15 @@ fn source_mapped_lookup_origin(
     {
         return Ok(None);
     }
-    let alias = store
-        .source_declaration_symbol(alias_declaration)
-        .ok_or_else(invalid)?;
+    let alias = match store
+        .symbol_store()
+        .source_binding_symbols(alias_declaration)
+    {
+        Some([Some(symbol), _]) => store.get_merged_symbol(symbol),
+        Some([None, _]) => None,
+        None => store.source_declaration_symbol(alias_declaration),
+    }
+    .ok_or_else(invalid)?;
     let header =
         property_object_alias_identity_source_header(store, alias).map_err(|_| invalid())?;
     let [(source_declaration, source_symbol)] = header.parameters.as_slice() else {

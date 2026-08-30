@@ -55325,7 +55325,14 @@ mod tests {
                 )
             )
         );
-        assert_eq!((limited.query_count(), limited.total_count()), (0, 0));
+        assert_eq!(
+            (
+                limited.query_count(),
+                limited.total_count(),
+                limited.limit_event_count(),
+            ),
+            (1, 1, 0)
+        );
         assert_eq!(
             query_global_node(&mut fixture, &globals, first_reference, &mut diagnostics),
             Ok(first_lookup)
