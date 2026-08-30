@@ -35964,7 +35964,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     parameter: parameter.declaration,
                 })
             })?;
-            self.diagnostics.add(
+            self.diagnostics.lookup_or_issue(
                 Some(node),
                 Diagnostic::with_arguments(
                     message_by_code(2344).expect("TS2344 is in the diagnostic catalog"),
