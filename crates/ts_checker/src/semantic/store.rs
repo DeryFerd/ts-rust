@@ -13556,7 +13556,7 @@ mod tests {
 
     use super::{
         AstScope, CachedSignatureLookup, PlainInterfaceBaseFacts, PlainInterfaceHeritageFacts,
-        SemanticStore, type_list_key,
+        SemanticStore, SourceTypeParameterAnnotations, type_list_key,
     };
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
