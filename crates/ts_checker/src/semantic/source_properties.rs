@@ -764,10 +764,10 @@ pub(super) fn validate_own_class_property_write_target(
             resolved_type: Some(receiver_type),
             ..TypeNodeLinks::default()
         })
-        || store.symbol_node_links(assignment.receiver)
-            != Some(&SymbolNodeLinks {
-                resolved_symbol: Some(assignment.receiver_symbol),
-            })
+        || store
+            .symbol_node_links(assignment.receiver)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|symbol| symbol != assignment.receiver_symbol)
         || classes::class_member_source(store, host, plan.member.symbol).map_err(|_| invalid())?
             != plan.member
     {
@@ -6642,6 +6642,129 @@ mod tests {
                 plan_own_class_property_write(context.store(), host, &assignment).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep source admission, cold-cache replay, and damage restoration together.
+    fn own_class_property_writes_resolve_unpublished_receiver_symbols_and_reject_foreign_caches() {
+        let parsed = parsed(concat!(
+            "class Model { value = 0; } ",
+            "const model = new Model(); const other = new Model(); ",
+            "model.value = 1; other.value = 2;",
+        ));
+        let file = FileId::new(202_622);
+        let mut context = class_body_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let cold = class_property_cache_state(&context, &parsed, file);
+        let plans = own_class_write_plans(&context, &parsed, &host, file);
+        assert_eq!(plans.len(), 2);
+        assert_ne!(
+            plans[0].assignment().receiver_symbol,
+            plans[1].assignment().receiver_symbol
+        );
+        for plan in &plans {
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(plan.assignment().receiver)
+                    .is_none()
+            );
+        }
+        assert_eq!(class_property_cache_state(&context, &parsed, file), cold);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let options = context.options();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (index, plan) in plans.iter().enumerate() {
+            let assignment = plan.assignment();
+            let original = context
+                .store()
+                .symbol_node_links(assignment.receiver)
+                .unwrap()
+                .clone();
+            assert_eq!(original.resolved_symbol, Some(assignment.receiver_symbol));
+            let receiver_type = context
+                .store()
+                .type_node_links(assignment.receiver)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(assignment.receiver, SymbolNodeLinks::default(),)
+            );
+            let unpublished = class_property_cache_state(&context, &parsed, file);
+            let relations = context.store().relation_state_snapshot();
+            for _ in 0..2 {
+                let checked = validate_own_class_property_write_target(
+                    context.store(),
+                    &host,
+                    options,
+                    plan,
+                    receiver_type,
+                )
+                .unwrap();
+                assert_eq!(checked.type_, number);
+                assert!(checked.diagnostic.is_none());
+                assert_eq!(
+                    class_property_cache_state(&context, &parsed, file),
+                    unpublished
+                );
+                assert_eq!(context.store().relation_state_snapshot(), relations);
+            }
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                assignment.receiver,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(plans[1 - index].assignment().receiver_symbol)
+                },
+            ));
+            let poisoned = class_property_cache_state(&context, &parsed, file);
+            for _ in 0..2 {
+                assert!(matches!(
+                    validate_own_class_property_write_target(context.store(), &host, options, plan, receiver_type),
+                    Err(SourcePropertyError::InvalidCache(node)) if node == assignment.left
+                ));
+                assert_eq!(
+                    class_property_cache_state(&context, &parsed, file),
+                    poisoned
+                );
+                assert_eq!(context.store().relation_state_snapshot(), relations);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(assignment.receiver, original)
+            );
+            let restored = class_property_cache_state(&context, &parsed, file);
+            assert_eq!(
+                validate_own_class_property_write_target(
+                    context.store(),
+                    &host,
+                    options,
+                    plan,
+                    receiver_type,
+                )
+                .unwrap()
+                .type_,
+                number
+            );
+            assert_eq!(
+                class_property_cache_state(&context, &parsed, file),
+                restored
+            );
+        }
+        let warm = class_property_cache_state(&context, &parsed, file);
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(class_property_cache_state(&context, &parsed, file), warm);
     }
 
     #[test]

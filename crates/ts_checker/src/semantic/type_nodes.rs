@@ -2138,18 +2138,42 @@ impl TypeQueryPlan {
                 expected
             } else {
                 let symbol = store.symbol(reference.symbol).ok_or_else(&invalid)?;
-                if preflight_class_or_interface_reference(
-                    store,
-                    host,
-                    reference.symbol,
-                    symbol.flags(),
-                )? != 0
+                if symbol
+                    .flags()
+                    .intersects(SymbolFlags::ENUM | SymbolFlags::ENUM_MEMBER)
                 {
-                    return Err(invalid());
+                    let owner = if symbol.flags() == SymbolFlags::ENUM_MEMBER {
+                        symbol.parent().ok_or_else(&invalid)?
+                    } else {
+                        reference.symbol
+                    };
+                    enums::preflight_enum(store, host, owner)?;
+                    if let Some(type_) = store
+                        .declared_type_links(reference.symbol)
+                        .and_then(|links| links.declared_type)
+                    {
+                        let record = store.type_payload(type_).ok_or_else(&invalid)?;
+                        Some(match record.data() {
+                            TypeData::Literal(literal) => literal.regular_type,
+                            _ => type_,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    if preflight_class_or_interface_reference(
+                        store,
+                        host,
+                        reference.symbol,
+                        symbol.flags(),
+                    )? != 0
+                    {
+                        return Err(invalid());
+                    }
+                    store
+                        .declared_type_links(reference.symbol)
+                        .and_then(|links| links.declared_type)
                 }
-                store
-                    .declared_type_links(reference.symbol)
-                    .and_then(|links| links.declared_type)
             }
         } else if let Some(array) = self.arrays.get(&node) {
             if let Some(fallback) = array.fallback {
@@ -2431,6 +2455,17 @@ fn planned_constructor_annotation_shape(
                                     source_method,
                                 )
                         })
+                    } else if source_class
+                        && symbol
+                            .flags()
+                            .intersects(SymbolFlags::ENUM | SymbolFlags::ENUM_MEMBER)
+                    {
+                        let owner = if symbol.flags() == SymbolFlags::ENUM_MEMBER {
+                            symbol.parent()
+                        } else {
+                            Some(reference.symbol)
+                        };
+                        owner.is_some_and(|owner| enums::preflight_enum(store, host, owner).is_ok())
                     } else {
                         (symbol.flags() & SymbolFlags::TYPE == SymbolFlags::INTERFACE
                             || source_class && symbol.flags() == SymbolFlags::CLASS)
@@ -82061,6 +82096,662 @@ mod tests {
         );
         assert_eq!(function_store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    const SOURCE_CLASS_ENUM_FILE: FileId = FileId::new(202_794);
+    const SOURCE_CLASS_ENUM_INPUT: &str = concat!(
+        "declare function computed(value: number): number; ",
+        "enum E { A = computed(0), B = computed(1) } ",
+        "enum Shared { A = 1, B = 1 } ",
+        "class C { selected: E.B = E.B; whole: E = E.B; shared: Shared.B = Shared.B; }",
+    );
+
+    fn source_class_enum_context(source: &ParseResult) -> CanonicalCheckerContext<'_> {
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                SOURCE_CLASS_ENUM_FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/source-class-enums.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, SOURCE_CLASS_ENUM_FILE)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(SOURCE_CLASS_ENUM_FILE, &source.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_bind_call_apply: true,
+                strict_builtin_iterator_return: true,
+                strict_function_types: true,
+                strict_property_initialization: true,
+                use_unknown_in_catch_variables: true,
+                no_implicit_any: true,
+                no_implicit_this: true,
+                name_resolution: CanonicalNameResolverOptions {
+                    emit_target: ts_options::ScriptTarget::Es2015,
+                    ..CanonicalNameResolverOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn source_class_enum_field(
+        source: &ParseResult,
+        bound: &BoundFile,
+        name: &str,
+    ) -> (SemanticSymbolId, NodeRef, SemanticSymbolId) {
+        source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                if identifier_text(&source.arena, property.name) != Some(name) {
+                    return None;
+                }
+                let reference =
+                    |node| NodeRef::new(source.arena.id(), SOURCE_CLASS_ENUM_FILE, node);
+                Some((
+                    bound.symbol(reference(node)).unwrap(),
+                    reference(property.type_.unwrap()),
+                    bound.symbol(reference(record.parent.unwrap())).unwrap(),
+                ))
+            })
+            .unwrap()
+    }
+
+    fn query_source_class_enum_annotation(
+        context: &mut CanonicalCheckerContext<'_>,
+        host: &DeclaredTypeHost<'_>,
+        annotation: NodeRef,
+        owner: SemanticSymbolId,
+        session: &mut InstantiationSession,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let globals = context.global_types().clone();
+        let options = context.options();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            host,
+            &globals,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_source_class_annotation(annotation, owner)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source keeps the requested member, shared pair, and completed class together.
+    fn source_class_enum_annotations_keep_cold_warm_and_shared_regular_identity() {
+        let source = parse_source_file(SOURCE_CLASS_ENUM_INPUT);
+        let mut context = source_class_enum_context(&source);
+        let bound = context.file(SOURCE_CLASS_ENUM_FILE).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let fields = ["selected", "whole", "shared"]
+            .map(|name| source_class_enum_field(&source, &bound, name));
+        let owner = fields[0].2;
+        let state = |context: &CanonicalCheckerContext<'_>| {
+            (
+                function_store_state(context.store()),
+                context.store().relation_state_snapshot(),
+                context.diagnostics().clone(),
+            )
+        };
+        let cold = state(&context);
+        let proofs = fields.map(|(_, annotation, field_owner)| {
+            assert_eq!(field_owner, owner);
+            let proof = preflight_source_class_annotation(
+                context.store(),
+                &host,
+                &globals,
+                options.into(),
+                annotation,
+                owner,
+            )
+            .unwrap();
+            assert_eq!(
+                proof.cached_type(context.store(), &host, Some(&globals)),
+                Ok(None)
+            );
+            proof
+        });
+        assert_eq!(state(&context), cold);
+        assert!(
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .is_none()
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let results = fields.map(|(_, annotation, owner)| {
+            query_source_class_enum_annotation(
+                &mut context,
+                &host,
+                annotation,
+                owner,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+        });
+        let [selected, whole, shared] = results;
+        let bindings = proofs[0].bindings().collect::<Vec<_>>();
+        let [(_, member)] = bindings.as_slice() else {
+            panic!("the qualified annotation binds its actual enum member")
+        };
+        let member = *member;
+        let enum_owner = context.store().symbol(member).unwrap().parent().unwrap();
+        let fresh = context
+            .store()
+            .declared_type_links(member)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Literal(literal) = context.store().type_payload(fresh).unwrap().data() else {
+            panic!("the computed member retains its fresh and regular pair")
+        };
+        assert_eq!(literal.value, LiteralValue::ComputedEnum);
+        assert_eq!(selected, literal.regular_type);
+        assert_ne!(selected, fresh);
+        assert_eq!(
+            context
+                .store()
+                .declared_type_links(enum_owner)
+                .unwrap()
+                .declared_type,
+            Some(whole)
+        );
+        let shared_member = context
+            .store()
+            .symbol_node_links(fields[2].1)
+            .unwrap()
+            .resolved_symbol
+            .unwrap();
+        let shared_owner = context
+            .store()
+            .symbol(shared_member)
+            .unwrap()
+            .parent()
+            .unwrap();
+        let shared_first = context
+            .store()
+            .symbol_table(
+                context
+                    .store()
+                    .symbol(shared_owner)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap()
+            .get_source("A")
+            .unwrap();
+        assert_ne!(shared_member, shared_first);
+        assert_eq!(
+            context.store().declared_type_links(shared_member),
+            context.store().declared_type_links(shared_first)
+        );
+        assert_eq!(
+            context.store().type_payload(shared).unwrap().symbol(),
+            Some(shared_first)
+        );
+        for ((_, annotation, _), (proof, expected)) in fields.iter().zip(proofs.iter().zip(results))
+        {
+            assert_eq!(
+                proof.cached_type(context.store(), &host, Some(&globals)),
+                Ok(Some(expected))
+            );
+            assert_eq!(
+                context.store().type_node_links(*annotation),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                })
+            );
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
+        assert!(diagnostics.is_empty());
+
+        context.check_source_file(SOURCE_CLASS_ENUM_FILE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let provenance = context
+            .store()
+            .source_class_provenance_for_symbol(owner)
+            .unwrap();
+        assert!(super::super::classes::completed_class_symbol(
+            context.store(),
+            owner
+        ));
+        assert!(
+            context
+                .store()
+                .source_class_annotation_scope(provenance.instance_type())
+                .is_none()
+        );
+        for ((property, _, _), expected) in fields.iter().zip(results) {
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(*property)
+                    .unwrap()
+                    .resolved_type,
+                Some(expected)
+            );
+        }
+        let warm = state(&context);
+        for _ in 0..2 {
+            for ((_, annotation, owner), expected) in fields.iter().zip(results) {
+                assert_eq!(
+                    query_source_class_enum_annotation(
+                        &mut context,
+                        &host,
+                        *annotation,
+                        *owner,
+                        &mut session,
+                        &mut diagnostics,
+                    ),
+                    Ok(expected)
+                );
+            }
+            context.recheck_source_file(SOURCE_CLASS_ENUM_FILE).unwrap();
+            assert_eq!(state(&context), warm);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold partial state and coherent warm damage must both use the real enum proof.
+    fn source_class_enum_annotation_proofs_reject_changed_slots_and_restore() {
+        let source = parse_source_file(SOURCE_CLASS_ENUM_INPUT);
+        let mut context = source_class_enum_context(&source);
+        let bound = context.file(SOURCE_CLASS_ENUM_FILE).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let (_, annotation, owner) = source_class_enum_field(&source, &bound, "selected");
+        let cold_proof = preflight_source_class_annotation(
+            context.store(),
+            &host,
+            &globals,
+            options.into(),
+            annotation,
+            owner,
+        )
+        .unwrap();
+        let bindings = cold_proof.bindings().collect::<Vec<_>>();
+        let [(_, member)] = bindings.as_slice() else {
+            panic!("the written E.B annotation has one enum-member binding")
+        };
+        let member = *member;
+        let enum_owner = context.store().symbol(member).unwrap().parent().unwrap();
+        let original_cold = context
+            .store()
+            .declared_type_links(member)
+            .cloned()
+            .unwrap_or_default();
+        let wrong_cold = DeclaredTypeLinks {
+            declared_type: Some(context.store().intrinsic_bootstrap().unwrap().number_type),
+            ..original_cold.clone()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(member, wrong_cold.clone())
+        );
+        let invalid_enum = DeclaredTypeError::Enum(enums::EnumTypeError::Invariant(
+            enums::EnumTypeInvariant::InvalidCache(enum_owner),
+        ));
+        let damaged = function_store_state(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                cold_proof.cached_type(context.store(), &host, Some(&globals)),
+                Err(invalid_enum)
+            );
+            assert!(matches!(
+                preflight_source_class_annotation(context.store(), &host, &globals, options.into(), annotation, owner),
+                Err(error) if error == invalid_enum
+            ));
+            assert_eq!(function_store_state(context.store()), damaged);
+            assert_eq!(
+                context.store().declared_type_links(member),
+                Some(&wrong_cold)
+            );
+        }
+        // Restoring a cold default can retain an empty link row, but preflight must not publish a type.
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(member, original_cold)
+        );
+        let restored = function_store_state(context.store());
+        assert_eq!(
+            cold_proof.cached_type(context.store(), &host, Some(&globals)),
+            Ok(None)
+        );
+        assert_eq!(function_store_state(context.store()), restored);
+
+        context.check_source_file(SOURCE_CLASS_ENUM_FILE).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let proof = preflight_source_class_annotation(
+            context.store(),
+            &host,
+            &globals,
+            options.into(),
+            annotation,
+            owner,
+        )
+        .unwrap();
+        let original_node = context
+            .store()
+            .type_node_links(annotation)
+            .cloned()
+            .unwrap();
+        let original_symbol = context
+            .store()
+            .symbol_node_links(annotation)
+            .cloned()
+            .unwrap();
+        let original_declared = context
+            .store()
+            .declared_type_links(member)
+            .cloned()
+            .unwrap();
+        let original_value = context.store().value_symbol_links(member).cloned().unwrap();
+        let regular = original_node.resolved_type.unwrap();
+        let fresh = original_declared.declared_type.unwrap();
+        let sibling = context
+            .store()
+            .symbol_table(
+                context
+                    .store()
+                    .symbol(enum_owner)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap()
+            .get_source("A")
+            .unwrap();
+        let sibling_fresh = context
+            .store()
+            .declared_type_links(sibling)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Literal(sibling_data) =
+            context.store().type_payload(sibling_fresh).unwrap().data()
+        else {
+            panic!("the other computed member has its own literal pair")
+        };
+        let sibling_regular = sibling_data.regular_type;
+        let (_, other_annotation, _) = source_class_enum_field(&source, &bound, "shared");
+        let foreign = context
+            .store()
+            .type_node_links(other_annotation)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let invalid_reference =
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(annotation));
+        for wrong in [sibling_regular, fresh, foreign] {
+            assert_ne!(wrong, regular);
+            let wrong_node = TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..original_node.clone()
+            };
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, wrong_node.clone())
+            );
+            let damaged = function_store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    proof.cached_type(context.store(), &host, Some(&globals)),
+                    Err(invalid_reference)
+                );
+                assert_eq!(function_store_state(context.store()), damaged);
+                assert_eq!(
+                    context.store().type_node_links(annotation),
+                    Some(&wrong_node)
+                );
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, original_node.clone())
+            );
+        }
+        assert!(context.store_mut_for_test().set_symbol_node_links(
+            annotation,
+            SymbolNodeLinks {
+                resolved_symbol: Some(sibling),
+            }
+        ));
+        let damaged = function_store_state(context.store());
+        assert_eq!(
+            proof.cached_type(context.store(), &host, Some(&globals)),
+            Err(invalid_reference)
+        );
+        assert_eq!(function_store_state(context.store()), damaged);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_node_links(annotation, original_symbol)
+        );
+
+        assert!(context.store_mut_for_test().set_declared_type_links(
+            member,
+            DeclaredTypeLinks {
+                declared_type: Some(sibling_fresh),
+                ..original_declared.clone()
+            }
+        ));
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            member,
+            ValueSymbolLinks {
+                resolved_type: Some(sibling_fresh),
+                ..original_value.clone()
+            }
+        ));
+        assert!(context.store_mut_for_test().set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(sibling_regular),
+                ..original_node.clone()
+            }
+        ));
+        let damaged = function_store_state(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                proof.cached_type(context.store(), &host, Some(&globals)),
+                Err(invalid_enum)
+            );
+            assert_eq!(function_store_state(context.store()), damaged);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(member, original_declared)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(member, original_value)
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, original_node)
+        );
+        let warm = (
+            function_store_state(context.store()),
+            context.store().relation_state_snapshot(),
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for _ in 0..2 {
+            assert_eq!(
+                proof.cached_type(context.store(), &host, Some(&globals)),
+                Ok(Some(regular))
+            );
+            assert_eq!(
+                query_source_class_enum_annotation(
+                    &mut context,
+                    &host,
+                    annotation,
+                    owner,
+                    &mut session,
+                    &mut diagnostics,
+                ),
+                Ok(regular)
+            );
+            context.recheck_source_file(SOURCE_CLASS_ENUM_FILE).unwrap();
+            assert_eq!(
+                (
+                    function_store_state(context.store()),
+                    context.store().relation_state_snapshot()
+                ),
+                warm
+            );
+            assert!(context.diagnostics().is_empty());
+            assert!(diagnostics.is_empty());
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn source_class_enum_annotations_keep_constructor_owner_and_arity_boundaries() {
+        let source = parse_source_file(concat!(
+            "enum E { A, B } ",
+            "class C { selected: E.B = E.B; generic: E.B<number> = E.B; } ",
+            "class Other { selectedOther: E.B = E.B; }",
+        ));
+        let mut context = source_class_enum_context(&source);
+        let bound = context.file(SOURCE_CLASS_ENUM_FILE).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let (_, annotation, owner) = source_class_enum_field(&source, &bound, "selected");
+        let (_, generic, _) = source_class_enum_field(&source, &bound, "generic");
+        let (_, _, other_owner) = source_class_enum_field(&source, &bound, "selectedOther");
+        assert_ne!(owner, other_owner);
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        for warm in [false, true] {
+            if warm {
+                query_source_class_enum_annotation(
+                    &mut context,
+                    &host,
+                    annotation,
+                    owner,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+            }
+            let before = function_store_state(context.store());
+            for _ in 0..2 {
+                assert!(matches!(
+                    preflight_type_annotation(context.store(), &host, Some(&globals), options.into(), annotation, None),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                        node, kind: SyntaxKind::TypeReference,
+                    })) if node == annotation
+                ));
+                assert!(matches!(
+                    preflight_source_class_annotation(context.store(), &host, &globals, options.into(), annotation, other_owner),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidTypeReference(node)))
+                        if node == annotation
+                ));
+                assert!(matches!(
+                    preflight_source_class_annotation(context.store(), &host, &globals, options.into(), generic, owner),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                        node, kind: SyntaxKind::TypeReference,
+                    })) if node == generic
+                ));
+                assert_eq!(function_store_state(context.store()), before);
+                assert!(context.store().type_node_links(generic).is_none());
+                assert!(context.store().symbol_node_links(generic).is_none());
+                assert!(
+                    context
+                        .store()
+                        .source_class_provenance_for_symbol(owner)
+                        .is_none()
+                );
+                assert!(diagnostics.is_empty());
+                assert_eq!(
+                    (
+                        session.query_count(),
+                        session.total_count(),
+                        session.limit_event_count()
+                    ),
+                    (0, 0, 0)
+                );
+            }
+        }
     }
 
     #[test]
