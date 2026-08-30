@@ -490,14 +490,14 @@ fn contextual_object_method_keeps_a_mismatched_literal_return() {
         panic!("the source must retain its object method");
     };
     let name = NodeRef::new(parsed.arena.id(), FILE, data.name);
-    let target_name = parsed
+    let target_declaration = parsed
         .arena
         .iter()
-        .find_map(|(_, record)| {
-            let NodeData::MethodSignatureDeclaration(data) = &record.data else {
+        .find_map(|(node, record)| {
+            let NodeData::MethodSignatureDeclaration(_) = &record.data else {
                 return None;
             };
-            Some(NodeRef::new(parsed.arena.id(), FILE, data.name))
+            Some(NodeRef::new(parsed.arena.id(), FILE, node))
         })
         .unwrap();
     let call = initializer(&parsed, "result");
@@ -531,7 +531,8 @@ fn contextual_object_method_keeps_a_mismatched_literal_return() {
             panic!("the mismatch must retain the target method declaration");
         };
         assert_eq!(related.diagnostic.code(), 6500);
-        assert_eq!(related.node, Some(target_name));
+        assert_eq!(related.node, Some(target_declaration));
+        assert_eq!(node_text(source, &parsed, target_declaration), "run(): 1;");
         assert_eq!(related.diagnostic.arguments, ["run", "Shape"]);
         assert_replay(&mut checker, &parsed, &[declaration], &[call]);
     }

@@ -2598,9 +2598,24 @@ fn append_expected_property_related(
         target_type,
         flags,
     )?;
+    let name_node = declared_property_name_node(host, target_type, property)?;
+    // For TS6500, Go points to the full method signature.
+    let related_node = if host.node(property.declaration).is_some_and(|node| {
+        matches!(
+            (node.kind, &node.data),
+            (
+                SyntaxKind::MethodSignature,
+                NodeData::MethodSignatureDeclaration(_)
+            )
+        )
+    }) {
+        property.declaration
+    } else {
+        name_node
+    };
     diagnostic.related_information.push(related(
         6500,
-        declared_property_name_node(host, target_type, property)?,
+        related_node,
         vec![property_name, target_display],
     )?);
     Ok(())
