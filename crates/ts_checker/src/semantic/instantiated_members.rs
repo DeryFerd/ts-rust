@@ -51,6 +51,7 @@ use super::{
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
     },
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
+    mapper::TypeMapperApplication,
     object_aliases::{
         SourcePropertyObjectProjection, cached_property_object_alias_physical_arguments,
         closed_declared_property_object_is_mapping_invariant, closed_type_alias_source_header,
@@ -4620,8 +4621,24 @@ fn proxy_interface_method_signature_return(
         return Err(invalid());
     };
     let signature_mapper = copied.mapper().ok_or_else(invalid)?;
+    let this_type = interface.this_type.ok_or_else(invalid)?;
+    let owner_mapper = if original.type_parameters().is_empty() {
+        signature_mapper
+    } else {
+        let Some(TypeMapperApplication::Composite { second, .. }) =
+            store.mapper_application(signature_mapper, this_type)
+        else {
+            return Err(invalid());
+        };
+        second
+    };
+    if validated_instantiated_method_mapper(store, original, copied, owner_mapper, array_targets)
+        != Some(signature_mapper)
+    {
+        return Err(invalid());
+    }
     let receiver = store
-        .map_type(signature_mapper, interface.this_type.ok_or_else(invalid)?)
+        .map_type(owner_mapper, this_type)
         .ok_or_else(invalid)?;
     let members =
         validate_generic_interface_members(store, receiver, array_targets)?.ok_or_else(invalid)?;
@@ -4640,6 +4657,7 @@ fn proxy_interface_method_signature_return(
         .contains(SymbolFlags::METHOD | SymbolFlags::TRANSIENT)
         || !proxy.check_flags().contains(CheckFlags::INSTANTIATED)
         || links.target != Some(method)
+        || links.mapper != Some(owner_mapper)
         || members.target() != target
     {
         return Err(invalid());

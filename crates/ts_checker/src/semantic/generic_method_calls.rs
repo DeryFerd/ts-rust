@@ -1,4 +1,4 @@
-//! Overload selection for published, uninstantiated method signatures.
+//! Overload selection for published method signatures and their receiver copies.
 //!
 //! The ordinary and generic call engines check each real candidate. This module
 //! owns declaration-group order, the two relation passes, and failure selection.
@@ -20,7 +20,7 @@ use super::{
         GenericCallArgumentRelation, GenericCallVectorApplicability, GenericCallVectorCandidate,
         GenericCallVectorError, GenericCallVectorRequest, GenericCallVectorResolution,
         check_generic_call_candidate_with_session, finish_generic_call_candidate_with_session,
-        validate_generic_call_vector_request,
+        generic_method_signature_callee, validate_generic_call_vector_request,
     },
     instantiate::InstantiationSession,
     relation::RelationKind,
@@ -327,32 +327,31 @@ pub(super) fn resolve_generic_method_call(
                 .signature(*signature)
                 .is_some_and(|signature| !signature.type_parameters().is_empty())
         })
-        || signatures.iter().any(|signature| {
-            store
-                .interface_method_linked_type(*signature)
-                .or_else(|| store.type_literal_method_linked_type(*signature))
-                != Some(request.callee)
-        })
     {
         return Ok(None);
     }
-    validate_generic_call_vector_request(store, request)?;
-    let projection = match validate_stored_callable_set_with_array_targets(
-        store,
-        request.callee,
-        Some(CanonicalArrayTargets::from_global_types(globals)),
-    ) {
-        StoredCallableSetValidation::Valid { projection, .. }
-            if projection.construct_signatures.is_empty()
-                && !projection.call_signatures.is_empty() =>
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(globals));
+    for &signature in signatures {
+        if generic_method_signature_callee(store, signature, array_targets)? != Some(request.callee)
         {
-            projection
+            return Ok(None);
         }
-        StoredCallableSetValidation::Malformed { .. } => {
-            return Err(GenericMethodCallError::Invalid(request.callee));
-        }
-        _ => return Err(GenericMethodCallError::Unsupported(request.callee)),
-    };
+    }
+    validate_generic_call_vector_request(store, request)?;
+    let projection =
+        match validate_stored_callable_set_with_array_targets(store, request.callee, array_targets)
+        {
+            StoredCallableSetValidation::Valid { projection, .. }
+                if projection.construct_signatures.is_empty()
+                    && !projection.call_signatures.is_empty() =>
+            {
+                projection
+            }
+            StoredCallableSetValidation::Malformed { .. } => {
+                return Err(GenericMethodCallError::Invalid(request.callee));
+            }
+            _ => return Err(GenericMethodCallError::Unsupported(request.callee)),
+        };
     let ordered =
         reorder_direct_call_candidates(store, request.callee, &projection.call_signatures)?;
     let bounds = ordered

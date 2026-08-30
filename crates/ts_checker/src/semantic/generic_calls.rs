@@ -11,6 +11,7 @@
 //! exact checked-instantiation cache publication. Recovery signatures remain a
 //! separate call-node concern and never enter the global signature cache. The
 //! overload consumer checks each signature before it selects a recovery shell.
+//! Receiver methods retain their producer's source signature and composed mapper.
 //! The original exact `<T>(value: T): T` entry points remain available for
 //! compatibility with the installed identity-call source path, but now share
 //! the same lazy shell, demand, recovery, and cache protocol.
@@ -49,6 +50,7 @@ use super::{
         cached_instantiation_with_vector, instantiate_type_with_session,
         instantiate_type_with_vector_and_session,
     },
+    instantiated_members::instantiated_interface_method_signature_return,
     keyof_types::{
         NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         validate_generic_keyof_index_type,
@@ -383,12 +385,20 @@ pub(super) struct SourceGenericConstraint {
 #[derive(Clone, Debug)]
 struct GenericCallSignatureShape {
     signature: SignatureId,
+    instantiated_method: Option<GenericCallInstantiatedMethod>,
     type_parameters: Vec<GenericCallTypeParameter>,
     parameter_templates: Vec<TypeId>,
     rest_element_template: Option<TypeId>,
     minimum_argument_count: usize,
     return_type: TypeId,
     array_targets: Option<CanonicalArrayTargets>,
+}
+
+/// The receiver provider has checked the original method and its composed mapper.
+#[derive(Clone, Copy, Debug)]
+struct GenericCallInstantiatedMethod {
+    source: SignatureId,
+    mapper: TypeMapperId,
 }
 
 /// An attempted overload retains its checked shell, but has no recovery shell.
@@ -643,6 +653,20 @@ fn declared_method_signature_callee(
         .or_else(|| store.type_literal_method_linked_type(signature))
 }
 
+/// Finds the actual method owner. The candidate provider still validates its graph.
+pub(super) fn generic_method_signature_callee(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericCallVectorError> {
+    if let Some(callee) = declared_method_signature_callee(store, signature) {
+        return Ok(Some(callee));
+    }
+    instantiated_interface_method_signature_return(store, signature, array_targets)
+        .map(|method| method.map(|method| method.owner))
+        .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature).into())
+}
+
 fn generic_call_signature_candidate(
     store: &CanonicalTypeMapperStore,
     callee: TypeId,
@@ -669,7 +693,8 @@ fn generic_call_signature_candidate(
             }
             if !projection.construct_signatures.is_empty()
                 || projection.call_signatures.len() != 1
-                    && declared_method_signature_callee(store, signature) != Some(callee)
+                    && generic_method_signature_callee(store, signature, array_targets)?
+                        != Some(callee)
             {
                 return Err(GenericCallVectorUnsupported::NotExactSingleCallable(callee).into());
             }
@@ -688,10 +713,12 @@ fn generic_call_signature_candidate(
 fn generic_call_signature_callee(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
-) -> Option<TypeId> {
-    store
-        .source_callable_type_for_signature(signature)
-        .or_else(|| declared_method_signature_callee(store, signature))
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, GenericCallVectorError> {
+    if let Some(callee) = store.source_callable_type_for_signature(signature) {
+        return Ok(Some(callee));
+    }
+    generic_method_signature_callee(store, signature, array_targets)
 }
 
 /// Methods use the shared omitted-void rule without changing their stored arity.
@@ -700,7 +727,7 @@ pub(super) fn generic_call_signature_minimum_argument_count(
     signature: SignatureId,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<usize, GenericCallVectorError> {
-    if let Some(callee) = declared_method_signature_callee(store, signature) {
+    if let Some(callee) = generic_method_signature_callee(store, signature, array_targets)? {
         let callable = generic_call_signature_candidate(store, callee, signature, array_targets)?;
         return get_min_argument_count_with_array_targets(
             store,
@@ -1006,13 +1033,10 @@ pub(super) fn preflight_generic_call_signature_return_target(
     let mapper = instantiated
         .mapper()
         .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
-    let callee = generic_call_signature_callee(store, target)
+    let callee = generic_call_signature_callee(store, target, array_targets)?
         .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
     let callable = generic_call_signature_candidate(store, callee, target, array_targets)?;
     if callable.signature != target
-        || store
-            .signature(target)
-            .is_none_or(|target| target.target().is_some() || target.mapper().is_some())
         || callable.return_type.is_none() && instantiated.resolved_return_type().is_some()
     {
         return Err(
@@ -1090,7 +1114,7 @@ pub(super) fn demand_generic_call_signature_return_with_session(
     let mapper = instantiated
         .mapper()
         .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
-    let callee = generic_call_signature_callee(store, target)
+    let callee = generic_call_signature_callee(store, target, array_targets)?
         .ok_or(GenericCallVectorInvariant::InvalidCachedInstantiation { target, signature })?;
     let callable = generic_call_signature_candidate(store, callee, target, array_targets)?;
     if callable.signature != target {
@@ -1576,6 +1600,32 @@ fn validate_generic_call_signature_shape(
     )
 }
 
+fn validate_generic_call_instantiated_method(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<GenericCallInstantiatedMethod>, GenericCallVectorError> {
+    let invalid = || GenericCallVectorInvariant::CallableSignatureMismatch(signature);
+    let Some(method) =
+        instantiated_interface_method_signature_return(store, signature, array_targets)
+            .map_err(|_| invalid())?
+    else {
+        return Ok(None);
+    };
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    if method.owner != callee
+        || record.target() != Some(method.source)
+        || store.source_node_kind(method.declaration) != Some(SyntaxKind::MethodSignature)
+    {
+        return Err(invalid().into());
+    }
+    Ok(Some(GenericCallInstantiatedMethod {
+        source: method.source,
+        mapper: record.mapper().ok_or_else(invalid)?,
+    }))
+}
+
 fn validate_generic_call_signature_shape_with_unresolved_return(
     store: &CanonicalTypeMapperStore,
     callee: TypeId,
@@ -1602,14 +1652,20 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
         );
     }
     let has_rest_parameter = signature.has_rest_parameter();
-    let declared_method =
-        declared_method_signature_callee(store, callable.signature) == Some(callee);
+    let instantiated_method = validate_generic_call_instantiated_method(
+        store,
+        callee,
+        callable.signature,
+        array_targets,
+    )?;
+    let method = instantiated_method.is_some()
+        || declared_method_signature_callee(store, callable.signature) == Some(callee);
     let mut expected_flags = if has_rest_parameter {
         SignatureFlags::HAS_REST_PARAMETER
     } else {
         SignatureFlags::NONE
     };
-    if declared_method
+    if method
         && signature
             .flags()
             .contains(SignatureFlags::HAS_LITERAL_TYPES)
@@ -1633,15 +1689,25 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
         );
     }
+    if instantiated_method.is_some() {
+        if has_rest_parameter {
+            return Err(GenericCallVectorUnsupported::RestSignature(callable.signature).into());
+        }
+        if minimum_argument_count != fixed_parameter_count {
+            return Err(
+                GenericCallVectorUnsupported::NonRequiredParameter(callable.signature).into(),
+            );
+        }
+    }
     if has_rest_parameter != callable.rest_parameter.is_some()
         || fixed_parameter_count + usize::from(has_rest_parameter) != parameter_count
         || signature.resolved_min_argument_count() != -1
         || signature.resolved_type_predicate().is_some()
-        || signature.target().is_some()
-        || signature.mapper().is_some()
+        || instantiated_method.is_none()
+            && (signature.target().is_some() || signature.mapper().is_some())
         || signature.isolated_signature_type().is_some()
         || signature.composite().is_some()
-        || callable.strict_variance_exempt && !declared_method
+        || callable.strict_variance_exempt && !method
     {
         return Err(
             GenericCallVectorInvariant::CallableSignatureMismatch(callable.signature).into(),
@@ -1686,6 +1752,7 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             &type_parameters,
             no_constraint,
             query_evidence,
+            instantiated_method,
         )?;
         type_parameters.push(GenericCallTypeParameter {
             type_: type_parameter,
@@ -1759,14 +1826,22 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
             }
             .into());
         }
-        let valid_symbol = store.symbol(symbol).is_some_and(|record| {
-            record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
-                && record.check_flags() == CheckFlags::NONE
-        }) && store.value_symbol_links(symbol)
-            == Some(&ValueSymbolLinks {
-                resolved_type: Some(projected),
-                ..ValueSymbolLinks::default()
-            });
+        let valid_symbol = if instantiated_method.is_some() {
+            // The receiver provider has checked the exact source symbol and mapper links.
+            store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                == Some(projected)
+        } else {
+            store.symbol(symbol).is_some_and(|record| {
+                record.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    && record.check_flags() == CheckFlags::NONE
+            }) && store.value_symbol_links(symbol)
+                == Some(&ValueSymbolLinks {
+                    resolved_type: Some(projected),
+                    ..ValueSymbolLinks::default()
+                })
+        };
         if !valid_symbol {
             return Err(GenericCallVectorInvariant::InvalidParameterSymbol {
                 signature: callable.signature,
@@ -1788,6 +1863,7 @@ fn validate_generic_call_signature_shape_with_unresolved_return(
     }
     Ok(GenericCallSignatureShape {
         signature: callable.signature,
+        instantiated_method,
         type_parameters,
         parameter_templates,
         rest_element_template,
@@ -2212,6 +2288,7 @@ pub(super) fn source_generic_type_parameter_constraint(
             &parameters,
             no_constraint,
             Some(evidence),
+            None,
         )?;
         if parameter == type_parameter {
             selected = Some(SourceGenericConstraint {
@@ -2304,6 +2381,7 @@ fn validate_generic_call_type_parameter(
     earlier: &[GenericCallTypeParameter],
     no_constraint: TypeId,
     query_evidence: Option<&SourceCallableTypeQueryEvidence>,
+    instantiated_method: Option<GenericCallInstantiatedMethod>,
 ) -> Result<(Option<TypeId>, Option<TypeId>, TypeId), GenericCallVectorError> {
     let record = store.type_payload(type_parameter).ok_or(
         GenericCallVectorInvariant::InvalidTypeParameter(type_parameter),
@@ -2322,14 +2400,37 @@ fn validate_generic_call_type_parameter(
         symbol_record.flags() == SymbolFlags::TYPE_PARAMETER
             && symbol_record.check_flags() == CheckFlags::NONE
     });
+    let source_parameter = match instantiated_method {
+        Some(method) => {
+            let source = store
+                .signature(method.source)
+                .and_then(|signature| signature.type_parameters().get(earlier.len()))
+                .copied()
+                .ok_or(GenericCallVectorInvariant::InvalidTypeParameter(
+                    type_parameter,
+                ))?;
+            if data.target != Some(source) || data.mapper != Some(method.mapper) {
+                return Err(
+                    GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into(),
+                );
+            }
+            source
+        }
+        None => {
+            if data.target.is_some() || data.mapper.is_some() {
+                return Err(
+                    GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into(),
+                );
+            }
+            type_parameter
+        }
+    };
     if record.flags() != TypeFlags::TYPE_PARAMETER
         || (record.object_flags() != ObjectFlags::NONE && record.object_flags() != computed)
         || record.alias().is_some()
         || !valid_symbol
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || cached_ordinary_type_parameter_owner(store, type_parameter) != Some(symbol)
-        || data.target.is_some()
-        || data.mapper.is_some()
+        || cached_ordinary_type_parameter_owner(store, source_parameter) != Some(symbol)
         || data.is_this_type
     {
         return Err(GenericCallVectorInvariant::InvalidTypeParameter(type_parameter).into());
@@ -3767,8 +3868,9 @@ fn get_or_create_checked_generic_call_vector_shell(
         type_arguments,
         lookup,
         |store, parameter_count| {
-            store.try_reserve_mappers(1)
-                && store.try_reserve_checker_symbol_allocations(parameter_count, 0)
+            store.try_reserve_mappers(
+                1 + usize::from(shape.instantiated_method.is_some()) * parameter_count,
+            ) && store.try_reserve_checker_symbol_allocations(parameter_count, 0)
                 && store.try_reserve_value_symbol_links(parameter_count)
                 && store.try_reserve_signatures(1)
                 && store.try_reserve_cached_signatures(1)
@@ -3833,7 +3935,8 @@ fn get_or_create_generic_call_vector_recovery_shell(
 
     let plan = prepare_generic_call_vector_signature(store, shape, sources, type_arguments)?;
     let parameter_count = shape.parameter_templates.len();
-    if !store.try_reserve_mappers(1)
+    if !store
+        .try_reserve_mappers(1 + usize::from(shape.instantiated_method.is_some()) * parameter_count)
         || !store.try_reserve_checker_symbol_allocations(parameter_count, 0)
         || !store.try_reserve_value_symbol_links(parameter_count)
         || !store.try_reserve_signatures(1)
@@ -3912,7 +4015,11 @@ fn prepare_generic_call_vector_signature(
             .ok_or(GenericCallVectorInvariant::InvalidSignature(
                 shape.signature,
             ))?;
-    let original_parameters = original.parameters().to_vec();
+    let original_parameters = if shape.instantiated_method.is_some() {
+        &[]
+    } else {
+        original.parameters()
+    };
     let flags = original.flags() & SignatureFlags::PROPAGATING_FLAGS;
     let declaration = original.declaration();
     let min_argument_count = original.min_argument_count();
@@ -3972,35 +4079,48 @@ fn publish_prepared_generic_call_vector_signature(
     let mapper = store
         .new_type_mapper(mapper_sources, mapper_targets)
         .expect("prevalidated mapper endpoints must remain owned");
-    for parameter in parameter_plans {
-        let instantiated = store
-            .alloc_symbol(parameter.data)
-            .expect("reserved transient parameter allocation must succeed");
-        assert!(store.set_value_symbol_links(
-            instantiated,
-            ValueSymbolLinks {
-                resolved_type: None,
-                target: Some(parameter.target),
-                mapper: Some(mapper),
-                name_type: parameter.name_type,
-                ..ValueSymbolLinks::default()
-            },
+    let signature = if shape.instantiated_method.is_some() {
+        // Keep the receiver signature as the target. The shared symbol instantiator
+        // reuses fixed parameters and composes existing parameter mappers.
+        store
+            .instantiate_signature_ex(shape.signature, mapper, true)
+            .expect("the validated receiver signature has reserved symbol and mapper storage")
+    } else {
+        for parameter in parameter_plans {
+            let instantiated = store
+                .alloc_symbol(parameter.data)
+                .expect("reserved transient parameter allocation must succeed");
+            assert!(store.set_value_symbol_links(
+                instantiated,
+                ValueSymbolLinks {
+                    resolved_type: None,
+                    target: Some(parameter.target),
+                    mapper: Some(mapper),
+                    name_type: parameter.name_type,
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            instantiated_parameters.push(instantiated);
+        }
+        let signature = store
+            .alloc_signature(
+                flags,
+                declaration,
+                Vec::new(),
+                None,
+                instantiated_parameters,
+                None,
+                None,
+                min_argument_count,
+            )
+            .expect("reserved instantiated signature allocation must succeed");
+        assert!(store.set_signature_target_and_mapper(
+            signature,
+            Some(shape.signature),
+            Some(mapper),
         ));
-        instantiated_parameters.push(instantiated);
-    }
-    let signature = store
-        .alloc_signature(
-            flags,
-            declaration,
-            Vec::new(),
-            None,
-            instantiated_parameters,
-            None,
-            None,
-            min_argument_count,
-        )
-        .expect("reserved instantiated signature allocation must succeed");
-    assert!(store.set_signature_target_and_mapper(signature, Some(shape.signature), Some(mapper),));
+        signature
+    };
     assert_eq!(
         valid_generic_call_vector_signature_shell(
             store,
@@ -4850,16 +4970,33 @@ fn valid_generic_call_vector_signature_shell(
             .zip(original.parameters().iter().copied())
             .zip(shape.parameter_templates.iter().copied())
             .any(|((parameter, target), template)| {
-                !cached_instantiated_parameter_shell(
-                    store,
-                    parameter,
-                    target,
-                    mapper,
-                    template,
-                    sources,
-                    type_arguments,
-                    shape.array_targets,
-                )
+                if shape.instantiated_method.is_some() {
+                    !store.instantiated_signature_symbol_matches(target, parameter, mapper)
+                        || store.value_symbol_links(parameter).is_none_or(|links| {
+                            links.resolved_type.is_some_and(|resolved| {
+                                !generic_call_type_instantiation_matches(
+                                    store,
+                                    shape.array_targets,
+                                    template,
+                                    resolved,
+                                    sources,
+                                    type_arguments,
+                                    &mut Vec::new(),
+                                )
+                            })
+                        })
+                } else {
+                    !cached_instantiated_parameter_shell(
+                        store,
+                        parameter,
+                        target,
+                        mapper,
+                        template,
+                        sources,
+                        type_arguments,
+                        shape.array_targets,
+                    )
+                }
             })
     {
         return None;
@@ -4984,12 +5121,27 @@ fn demand_generic_call_vector_parameter(
     if let Some(resolved) = links.resolved_type {
         return Ok(resolved);
     }
-    let template = shape.parameter_templates.get(index).copied().ok_or(
-        GenericCallVectorInvariant::InvalidCachedInstantiation {
-            target: shape.signature,
-            signature,
-        },
-    )?;
+    let invalid = || GenericCallVectorInvariant::InvalidCachedInstantiation {
+        target: shape.signature,
+        signature,
+    };
+    let (template, mapper) = if shape.instantiated_method.is_some() {
+        let target = links.target.ok_or_else(invalid)?;
+        let template = store
+            .value_symbol_links(target)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(invalid)?;
+        (template, links.mapper.ok_or_else(invalid)?)
+    } else {
+        (
+            shape
+                .parameter_templates
+                .get(index)
+                .copied()
+                .ok_or_else(invalid)?,
+            mapper,
+        )
+    };
     let resolved = if valid_fixed_generic_source_parameter_type(store, template) {
         template
     } else if constrained_string_rest_tuple_parameter(store, template, sources).is_some() {
@@ -5778,6 +5930,7 @@ fn identity_generic_call_vector_shape(
         .ok_or(GenericCallVectorInvariant::MissingBootstrap)?;
     Ok(GenericCallSignatureShape {
         signature: shape.signature,
+        instantiated_method: None,
         type_parameters: vec![GenericCallTypeParameter {
             type_: shape.type_parameter,
             constraint: None,
@@ -6182,8 +6335,14 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalGlobalTypeInitializationError,
         DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, SourceCheckError,
         SourceFunctionUnsupported, UnsupportedSourceSyntax, VarianceLinks,
-        bootstrap::UnionReduction, instantiate::InstantiationLimits, mapper::TypeMapper,
-        type_records::TypeRecord, types::ObjectFlags,
+        bootstrap::UnionReduction,
+        generic_method_calls::{
+            GenericMethodCallError, GenericMethodCallSelection, resolve_generic_method_call,
+        },
+        instantiate::InstantiationLimits,
+        mapper::{TypeMapper, TypeMapperApplication},
+        type_records::TypeRecord,
+        types::ObjectFlags,
     };
 
     const EXACT_SOURCE: IdentityTypeParameterCacheProvenance =
@@ -6983,6 +7142,251 @@ mod tests {
             StoredSingleCallableValidation::Valid { callable, .. } => callable,
             other => panic!("expected a source generic callable: {other:?}"),
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check producer receipts and both levels of symbol mapping.
+    fn generic_receiver_method_calls_reject_changed_receipts_and_composed_parameter_links() {
+        for mutation in 0..6 {
+            let parsed = parse_source_file(concat!(
+                "interface Choice<T> { select<U>(outer: T, value: U): U; } ",
+                "declare const choice: Choice<string>; ",
+                "const selected = choice.select<number>('x', 1);",
+            ));
+            let file = FileId::new(96_530);
+            let mut context = property_alias_call_context(&[(file, &parsed)]);
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let call = property_alias_variable_nodes(&parsed, file, "selected")
+                .1
+                .unwrap();
+            let state = property_alias_call_state(context.store(), call);
+            let targets = Some(CanonicalArrayTargets::from_global_types(
+                context.global_types(),
+            ));
+            let store = context.store_mut_for_test();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let selected = store.signature(state.0).unwrap();
+            let receiver = selected.target().unwrap();
+            let call_mapper = selected.mapper().unwrap();
+            let inner = selected.parameters()[1];
+            let receiver_record = store.signature(receiver).unwrap();
+            let declared = receiver_record.target().unwrap();
+            let receiver_mapper = receiver_record.mapper().unwrap();
+            let fresh = receiver_record.type_parameters()[0];
+            let intermediate_inner = receiver_record.parameters()[1];
+            assert_eq!(selected.parameters()[0], receiver_record.parameters()[0]);
+            let raw_inner = store.signature(declared).unwrap().parameters()[1];
+            let inner_links = store.value_symbol_links(inner).unwrap().clone();
+            assert_eq!(inner_links.target, Some(raw_inner));
+            assert_eq!(inner_links.resolved_type, Some(number));
+            assert_eq!(
+                store.mapper_application(inner_links.mapper.unwrap(), fresh),
+                Some(TypeMapperApplication::Composite {
+                    first: receiver_mapper,
+                    second: call_mapper,
+                }),
+            );
+            let callee = store
+                .published_interface_method_type_for_signature(receiver)
+                .unwrap();
+            match mutation {
+                0 => {
+                    assert!(store.set_value_symbol_links(
+                        inner,
+                        ValueSymbolLinks {
+                            mapper: Some(call_mapper),
+                            ..inner_links
+                        }
+                    ));
+                }
+                1 => {
+                    assert!(store.set_value_symbol_links(
+                        inner,
+                        ValueSymbolLinks {
+                            target: Some(intermediate_inner),
+                            ..inner_links
+                        }
+                    ));
+                }
+                2 => {
+                    assert!(store.set_signature_target_and_mapper(
+                        state.0,
+                        Some(declared),
+                        Some(call_mapper)
+                    ));
+                }
+                3 => {
+                    assert_eq!(
+                        store.replace_published_interface_method_type_for_signature_for_test(
+                            receiver, None
+                        ),
+                        Some(callee)
+                    );
+                }
+                4 => {
+                    assert!(
+                        store
+                            .replace_published_interface_method_origin_for_test(callee, None)
+                            .is_some()
+                    );
+                }
+                5 => {
+                    let TypeData::TypeParameter(parameter) =
+                        store.type_payload(fresh).unwrap().data()
+                    else {
+                        unreachable!("the receiver retains a fresh method parameter")
+                    };
+                    let (constraint, target, default) = (
+                        parameter.constraint,
+                        parameter.target,
+                        parameter.resolved_default_type,
+                    );
+                    assert!(store.set_type_parameter_resolution(
+                        fresh,
+                        constraint,
+                        target,
+                        Some(call_mapper),
+                        default
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let expected = match mutation {
+                0..=2 => GenericCallVectorInvariant::InvalidCachedInstantiation {
+                    target: receiver,
+                    signature: state.0,
+                },
+                3 | 4 => GenericCallVectorInvariant::CallableSignatureMismatch(receiver),
+                5 => GenericCallVectorInvariant::MalformedCallable(callee),
+                _ => unreachable!(),
+            };
+            let before = vector_cache_graph_counts(store);
+            for _ in 0..2 {
+                let result = generic_call_signature_candidate(store, callee, receiver, targets)
+                    .and_then(|callable| {
+                        validate_generic_call_signature_shape(store, callee, &callable, targets)
+                    })
+                    .and_then(|shape| {
+                        validate_generic_call_vector_shell(
+                            store,
+                            &shape,
+                            &[fresh],
+                            &[number],
+                            state.0,
+                        )
+                    });
+                assert_eq!(result, Err(GenericCallVectorError::Invariant(expected)));
+                assert_eq!(property_alias_call_state(store, call), state);
+                assert_eq!(vector_cache_graph_counts(store), before);
+            }
+            assert!(context.get_return_type_of_signature(state.0).is_err());
+            assert_eq!(vector_cache_graph_counts(context.store()), before);
+            assert_eq!(property_alias_call_state(context.store(), call), state);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the checked shell cold across parameter and return limits.
+    fn generic_receiver_method_calls_keep_the_callers_instantiation_limits() {
+        let parsed = parse_source_file(concat!(
+            "interface Choice<T> { select<U>(outer: T, value: U): U; } ",
+            "declare const choice: Choice<string>; ",
+            "const selected = choice.select<number>('x', 1);",
+        ));
+        let file = FileId::new(96_531);
+        let mut context = property_alias_call_context(&[(file, &parsed)]);
+        context.check_source_file(file).unwrap();
+        let call = property_alias_variable_nodes(&parsed, file, "selected")
+            .1
+            .unwrap();
+        let state = property_alias_call_state(context.store(), call);
+        let globals = context.global_types().clone();
+        let strict = context.options().strict_function_types;
+        let store = context.store_mut_for_test();
+        let receiver = store.signature(state.0).unwrap().target().unwrap();
+        let callee = store
+            .published_interface_method_type_for_signature(receiver)
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, boolean) = (bootstrap.string_type, bootstrap.boolean_type);
+        let arguments = [string, boolean];
+        let explicit = [boolean];
+        let request = vector_request(callee, Some(&explicit), &arguments);
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 0,
+        });
+        let expected = GenericMethodCallError::Generic(GenericCallVectorError::Instantiation(
+            InstantiationError::CountLimit { count: 0, limit: 0 },
+        ));
+        assert_eq!(
+            resolve_generic_method_call(store, &globals, strict, request, None, &mut limited),
+            Err(expected)
+        );
+        let CachedSignatureLookup::Hit(checked) =
+            store.cached_signature(receiver, type_list_key(&explicit), &explicit)
+        else {
+            panic!("the checked signature is cached before argument type demand")
+        };
+        let inner = store.signature(checked).unwrap().parameters()[1];
+        assert_eq!(store.value_symbol_links(inner).unwrap().resolved_type, None);
+        assert_eq!(
+            store.signature(checked).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(property_alias_call_state(store, call), state);
+        let after_limit = vector_cache_graph_counts(store);
+        assert_eq!(
+            resolve_generic_method_call(store, &globals, strict, request, None, &mut limited),
+            Err(GenericMethodCallError::Generic(
+                GenericCallVectorError::Instantiation(InstantiationError::CountLimit {
+                    count: 0,
+                    limit: 0
+                },)
+            ))
+        );
+        assert_eq!(limited.query_count(), 0);
+        assert_eq!(vector_cache_graph_counts(store), after_limit);
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let resolution =
+            resolve_generic_method_call(store, &globals, strict, request, None, &mut session)
+                .unwrap()
+                .unwrap();
+        assert!(resolution.diagnostic.is_none());
+        let GenericMethodCallSelection::Generic(resolution) = resolution.selected else {
+            panic!("the real receiver method remains a generic candidate")
+        };
+        assert_eq!(resolution.projection.instantiation.signature, checked);
+        assert_eq!(
+            store.value_symbol_links(inner).unwrap().resolved_type,
+            Some(boolean)
+        );
+        assert_eq!(
+            store.signature(checked).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(
+            demand_generic_call_vector_selected_return(store, &resolution, &mut limited),
+            Err(GenericCallVectorError::Instantiation(
+                InstantiationError::CountLimit { count: 0, limit: 0 }
+            ))
+        );
+        assert_eq!(
+            store.signature(checked).unwrap().resolved_return_type(),
+            None
+        );
+        assert_eq!(
+            demand_generic_call_vector_selected_return(store, &resolution, &mut session),
+            Ok((boolean, DirectCallReturnKind::Value))
+        );
+        assert_eq!(property_alias_call_state(store, call), state);
+        assert_eq!(
+            context.get_return_type_of_signature(checked).unwrap(),
+            boolean
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     fn source_generic_callable_named(

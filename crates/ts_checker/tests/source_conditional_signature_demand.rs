@@ -6,9 +6,9 @@ use ts_binder::{
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalImportCallMode, ConditionalRootId,
     DeclaredTypeError, DeclaredTypeLinks, IntrinsicBootstrapOptions, NodeLinks, SignatureId,
-    SignatureLinks, SourceCheckError, SourceFileLinks, SymbolNodeLinks, TypeData, TypeId,
-    TypeNodeLinks, TypeNodeUnavailable, UnsupportedSourceSyntax, ValueSymbolLinks,
-    signatures::TypePredicateKind, type_records::TypeCacheState, types::TypeFlags,
+    SignatureLinks, SourceFileLinks, SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks,
+    TypeNodeUnavailable, ValueSymbolLinks, signatures::TypePredicateKind,
+    type_records::TypeCacheState, types::TypeFlags,
 };
 use ts_options::{CompilerOptions, ScriptTarget};
 use ts_parser::{ParseResult, parse_source_file};
@@ -668,8 +668,8 @@ fn ari_any_property_read_demands_inline_conditional_method_returns() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // Keep real return demand separate from the unsupported generic call.
-fn explicit_generic_receiver_calls_stop_after_inline_conditional_return_demand() {
+#[allow(clippy::too_many_lines)] // Keep the real proxy, conditional return, and call identities together.
+fn explicit_generic_receiver_calls_keep_inline_conditional_returns_and_exact_errors() {
     let fixture = Fixture::new(concat!(
         "interface Choice<T> { select<S>(value: S): T extends any ? Choice<any> : Choice<S>; }\n",
         "declare const anys: Choice<any>;\n",
@@ -683,10 +683,34 @@ fn explicit_generic_receiver_calls_stop_after_inline_conditional_return_demand()
         fixture.initializer("selected"),
         fixture.initializer("wrong"),
     ];
+    let NodeData::CallExpression(first) = &fixture.source.arena.get(calls[0].node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let property = fixture.node(first.expression);
     for source_first in [false, true] {
         let mut context = fixture.context();
         if !source_first {
             conditional_source(&mut context, &fixture, conditional);
+            let receiver = context
+                .get_type_from_type_node(fixture.variable_annotation("anys"))
+                .unwrap();
+            let callable = context.get_type_at_location(property).unwrap();
+            let [mapped] = context
+                .store()
+                .type_payload(callable)
+                .unwrap()
+                .data()
+                .structured()
+                .unwrap()
+                .signatures
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("select must retain one mapped method signature")
+            };
+            let mapped = *mapped;
+            assert_eq!(context.get_return_type_of_signature(mapped), Ok(receiver));
         }
         let result = context.check_source_file(SOURCE_FILE);
         let (template, root, parameters) = conditional_source(&mut context, &fixture, conditional);
@@ -738,25 +762,23 @@ fn explicit_generic_receiver_calls_stop_after_inline_conditional_return_demand()
         assert!(mapped_record.mapper().is_some());
         assert_eq!(mapped_record.resolved_return_type(), Some(receiver));
         let [fresh] = mapped_record.type_parameters() else {
-            panic!("the mapped method must remain generic before the unsupported call")
+            panic!("the mapped method must retain its own generic parameter")
         };
         assert_ne!(*fresh, parameters[1]);
-        let TypeData::TypeParameter(data) = context.store().type_payload(*fresh).unwrap().data()
+        let fresh = *fresh;
+        let receiver_mapper = mapped_record.mapper().unwrap();
+        let receiver_parameter = mapped_record.parameters()[0];
+        let TypeData::TypeParameter(data) = context.store().type_payload(fresh).unwrap().data()
         else {
             unreachable!()
         };
         assert_eq!(data.target, Some(parameters[1]));
+        assert_eq!(data.mapper, Some(receiver_mapper));
         assert_eq!(context.get_return_type_of_signature(mapped), Ok(receiver));
         assert_eq!(
             context.get_return_type_of_signature(source_signature),
             Ok(template)
         );
-        let NodeData::CallExpression(first) =
-            &fixture.source.arena.get(calls[0].node).unwrap().data
-        else {
-            unreachable!()
-        };
-        let property = fixture.node(first.expression);
         assert_eq!(checked_type(&context, property), callable);
         assert_eq!(
             context
@@ -766,20 +788,114 @@ fn explicit_generic_receiver_calls_stop_after_inline_conditional_return_demand()
             Some(proxy)
         );
 
-        let unsupported = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(calls[0]));
-        assert_eq!(result, Err(unsupported));
-        for call in calls {
-            assert!(context.store().type_node_links(call).is_none());
-            assert!(context.store().signature_links(call).is_none());
+        assert_eq!(result, Ok(()));
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let source_parameter = context
+            .store()
+            .signature(source_signature)
+            .unwrap()
+            .parameters()[0];
+        let selected = calls.map(|call| signature(&context, call));
+        assert_ne!(selected[0], selected[1]);
+        for (index, call) in calls.into_iter().enumerate() {
+            assert_eq!(checked_type(&context, call), receiver);
+            assert_eq!(context.get_type_at_location(call), Ok(receiver));
+            assert_eq!(
+                context.get_return_type_of_signature(selected[index]),
+                Ok(receiver)
+            );
+            let store = context.store();
+            let record = store.signature(selected[index]).unwrap();
+            assert_ne!(selected[index], mapped);
+            assert_eq!(record.target(), Some(mapped));
+            assert_eq!(record.declaration(), Some(method));
+            assert!(record.type_parameters().is_empty());
+            assert_eq!(record.resolved_return_type(), Some(receiver));
+            let mapper = record.mapper().unwrap();
+            assert_eq!(
+                store.mapper_kind(mapper),
+                Some(ts_checker::semantic::TypeMapperKind::Simple)
+            );
+            assert_eq!(store.map_type(mapper, fresh), Some(string));
+            assert_eq!(store.map_type(mapper, parameters[1]), Some(parameters[1]));
+            assert_eq!(store.map_type(mapper, parameters[0]), Some(parameters[0]));
+            let [parameter] = record.parameters() else {
+                panic!("select must keep one value parameter")
+            };
+            assert_ne!(*parameter, source_parameter);
+            assert_ne!(*parameter, receiver_parameter);
+            let links = store.value_symbol_links(*parameter).unwrap();
+            assert_eq!(links.target, Some(source_parameter));
+            let composed = links.mapper.unwrap();
+            assert_ne!(composed, mapper);
+            assert_ne!(composed, receiver_mapper);
+            assert_eq!(
+                store.mapper_kind(composed),
+                Some(ts_checker::semantic::TypeMapperKind::Unknown)
+            );
+            assert_eq!(links.resolved_type, (index == 0).then_some(string));
+            let NodeData::CallExpression(call_data) =
+                &fixture.source.arena.get(call.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                context.get_type_at_location(fixture.node(call_data.expression)),
+                Ok(callable)
+            );
         }
         assert!(
-            !context
+            context
                 .store()
                 .source_file_links(context.source_file(SOURCE_FILE).unwrap())
                 .is_some_and(|links| links.type_checked)
         );
-        assert!(context.diagnostics().is_empty());
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the wrong argument must report one error")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(diagnostic.diagnostic.arguments, ["number", "string"]);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'number' is not assignable to parameter of type 'string'."
+        );
+        let NodeData::CallExpression(wrong) =
+            &fixture.source.arena.get(calls[1].node).unwrap().data
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            diagnostic.node,
+            Some(fixture.node(wrong.arguments.nodes[0]))
+        );
+        assert!(diagnostic.range_override.is_none());
+        assert!(diagnostic.related_information.is_empty());
+        let selected_state = |context: &CanonicalCheckerContext<'_>| {
+            calls.map(|call| {
+                let selected = signature(context, call);
+                let record = context.store().signature(selected).unwrap();
+                (
+                    selected,
+                    record.target(),
+                    record.mapper(),
+                    record.resolved_return_type(),
+                    record.type_parameters().to_vec(),
+                    record
+                        .parameters()
+                        .iter()
+                        .map(|&parameter| {
+                            (
+                                parameter,
+                                context.store().value_symbol_links(parameter).cloned(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
         let warm = publication(&context, &fixture);
+        let warm_selected = selected_state(&context);
+        let diagnostics = context.diagnostics().clone();
         let root_cache = context
             .store()
             .conditional_root(root)
@@ -787,9 +903,23 @@ fn explicit_generic_receiver_calls_stop_after_inline_conditional_return_demand()
             .instantiations()
             .clone();
         for _ in 0..2 {
+            for (index, call) in calls.into_iter().enumerate().rev() {
+                assert_eq!(
+                    context.get_return_type_of_signature(selected[index]),
+                    Ok(receiver)
+                );
+                assert_eq!(context.get_type_at_location(call), Ok(receiver));
+            }
+            assert_eq!(context.get_type_at_location(property), Ok(callable));
             assert_eq!(context.get_return_type_of_signature(mapped), Ok(receiver));
-            assert_eq!(context.check_source_file(SOURCE_FILE), Err(unsupported));
+            assert_eq!(
+                context.get_return_type_of_signature(source_signature),
+                Ok(template)
+            );
+            assert_eq!(context.check_source_file(SOURCE_FILE), Ok(()));
+            assert_eq!(context.recheck_source_file(SOURCE_FILE), Ok(()));
             assert_eq!(publication(&context, &fixture), warm);
+            assert_eq!(selected_state(&context), warm_selected);
             assert_eq!(
                 context
                     .store()
@@ -798,7 +928,7 @@ fn explicit_generic_receiver_calls_stop_after_inline_conditional_return_demand()
                     .instantiations(),
                 &root_cache
             );
-            assert!(context.diagnostics().is_empty());
+            assert_eq!(context.diagnostics(), &diagnostics);
         }
     }
 }
