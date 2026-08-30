@@ -41,6 +41,7 @@ use super::{
         class_body_super_constructor_callable, class_member_source,
         validate_class_instance_super_view,
     },
+    contextual::source_keyof_contextual_type_parameter,
     declared::{cached_ordinary_type_parameter_owner, execute_type_parameter, type_list_key},
     formatter::{
         FunctionTypeDisplayUnavailable,
@@ -2719,7 +2720,8 @@ fn shared_array_callback_context(
 ///
 /// Array and object arguments can retain a shared indexed context when
 /// overload parameter identities differ. Generic signatures provide context
-/// for authenticated fixed parameters, array callbacks, and constrained templates.
+/// for authenticated fixed parameters, array callbacks, constrained templates,
+/// and arrays of source-owned parameters with a direct `keyof` constraint.
 /// Unary callbacks ignore incompatible overloads and prefer informative returns.
 pub(super) fn source_call_argument_contextual_type(
     store: &mut CanonicalTypeMapperStore,
@@ -2956,6 +2958,12 @@ fn contextual_overload_parameter_types(
 ) -> Result<Option<Vec<TypeId>>, SourceCheckError> {
     let implicit_arguments = usize::from(plan.form == DirectCallForm::TaggedTemplate);
     let parameter_index = argument_index + implicit_arguments;
+    let array_argument = plan.arguments.get(argument_index).is_some_and(|argument| {
+        matches!(
+            argument.unparenthesized().kind,
+            PlannedExpressionKind::Array(_)
+        )
+    });
     let mut parameter_types = Vec::with_capacity(callables.len());
     for callable in callables {
         if callback
@@ -2983,15 +2991,49 @@ fn contextual_overload_parameter_types(
         let Some(parameter_type) = parameter_type else {
             return Ok(None);
         };
-        if !signature.type_parameters().is_empty()
-            && !array_callback
-            && !valid_fixed_generic_source_parameter_type(store, parameter_type)
+        if !(signature.type_parameters().is_empty()
+            || array_callback
+            || valid_fixed_generic_source_parameter_type(store, parameter_type)
+            || array_argument
+                && source_keyof_array_parameter_context(
+                    store,
+                    global_types,
+                    plan.node,
+                    callable,
+                    parameter_type,
+                )?)
         {
             return Ok(None);
         }
         parameter_types.push(parameter_type);
     }
     Ok(Some(parameter_types))
+}
+
+/// Keeps the declared array identity after proving its element's source owner.
+fn source_keyof_array_parameter_context(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    call: NodeRef,
+    callable: &ValidatedSingleCallable,
+    parameter_type: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let Some(array) = store.canonical_array_reference(global_types, parameter_type)? else {
+        return Ok(false);
+    };
+    if array.readonly || array.array_literal {
+        return Ok(false);
+    }
+    let Some(proof) = source_keyof_contextual_type_parameter(store, array.element_type)? else {
+        return Ok(false);
+    };
+    if proof.callee != callable.owner
+        || proof.signature != callable.signature
+        || proof.type_parameter != array.element_type
+    {
+        return Err(SourceCheckError::Call(call));
+    }
+    Ok(true)
 }
 
 /// Uses only authenticated arity and already-checked literal argument identities.
@@ -8012,8 +8054,8 @@ fn publish_call_links(
 mod tests {
     use ts_ast::FileId;
     use ts_binder::{
-        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName, SemanticSymbolId,
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SemanticSymbolId,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
@@ -8021,6 +8063,9 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, DeclaredTypeError, IntrinsicBootstrapOptions, SourceFileLinks,
         bootstrap::UnionReduction,
+        contextual::{
+            LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
+        },
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
             CanonicalModuleResolutionMode, CanonicalResolvedModuleInput,
@@ -8028,6 +8073,7 @@ mod tests {
         object_members::{
             DeclaredPropertyTypeGraphValidation, validate_resolved_declared_property_type_graph,
         },
+        production::GlobalMergeCompletion,
         reference_types::validate_direct_generic_reference,
         source::{PlannedIdentifierRead, PlannedIdentifierReadKind, SourceSyntaxRole},
         type_nodes::TypeNodeUnavailable,
@@ -12907,6 +12953,160 @@ mod tests {
             cold,
         );
         assert_eq!(context.store().checker_link_allocated_lengths(), cold_links);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One query proves array context and source identity.
+    fn keyof_array_argument_context_keeps_source_identity_and_rejects_foreign_owner() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "declare function select<O, K extends keyof O>(keys: K[], obj?: O): K; ",
+            "select(['b'], {});",
+        ));
+        let library_file = FileId::new(4_946);
+        let source_file = FileId::new(4_947);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let globals = context.global_types().clone();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = source_bound.symbol(declaration).unwrap();
+        let store = context.store_mut_for_test();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callee = CanonicalTypeQuery::new_with_global_types(
+            store,
+            &host,
+            &globals,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        let call = calls(&source, source_file)[0];
+        let syntax = plan_direct_source_call_syntax(&source.arena, store, call).unwrap();
+        let [array_node, object_node] = syntax.arguments() else {
+            panic!("the call must retain the array and object arguments")
+        };
+        let NodeData::ArrayLiteralExpression(array) =
+            &source.arena.get(array_node.node).unwrap().data
+        else {
+            panic!("the first argument must be an array literal")
+        };
+        let [element] = array.elements.nodes.as_slice() else {
+            panic!("the array must contain one key literal")
+        };
+        let array = PlannedExpression::new(
+            *array_node,
+            PlannedExpressionKind::Array(vec![PlannedExpression::new(
+                NodeRef::new(source.arena.id(), source_file, *element),
+                PlannedExpressionKind::String("b".into()),
+            )]),
+        );
+        let object = PlannedExpression::new(
+            *object_node,
+            PlannedExpressionKind::Object {
+                plan: super::super::object_members::plan_object_literal(store, &host, *object_node)
+                    .unwrap(),
+                properties: Vec::new(),
+            },
+        );
+        let plan = finish_direct_source_call_plan(
+            &syntax,
+            identifier_plan(syntax.callee(), owner),
+            vec![array, object],
+        )
+        .unwrap();
+        let StoredSingleCallableValidation::Valid { callable, .. } =
+            validate_stored_single_callable(store, callee)
+        else {
+            panic!("the queried source callable must be complete")
+        };
+        let parameter_type = callable.parameters[0];
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.cached_signature_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                source_call_argument_contextual_type(store, &globals, &plan, callee, 0),
+                Ok(Some(parameter_type)),
+            );
+            assert_eq!(
+                source_call_argument_contextual_type(store, &globals, &plan, callee, 1),
+                Ok(None),
+                "the naked object parameter must not gain a contextual type",
+            );
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &std::collections::HashMap::new(),
+                    &plan.arguments[0],
+                    parameter_type,
+                ),
+                Ok(PreparedExpression::Array(vec![
+                    PreparedExpression::Literal(LiteralTreatment::Regular),
+                ])),
+            );
+            let mut foreign = callable.clone();
+            foreign.owner = globals.array_type;
+            assert_eq!(
+                source_keyof_array_parameter_context(
+                    store,
+                    &globals,
+                    call,
+                    &foreign,
+                    parameter_type,
+                ),
+                Err(SourceCheckError::Call(call)),
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.cached_signature_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                ),
+                before,
+            );
+            assert!(store.type_node_links(*array_node).is_none());
+            assert!(store.type_node_links(*object_node).is_none());
+            assert!(store.type_node_links(call).is_none());
+            assert!(store.signature_links(call).is_none());
+        }
     }
 
     #[test]

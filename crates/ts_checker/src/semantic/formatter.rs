@@ -978,9 +978,12 @@ fn display_index_type(
         || record.symbol().is_some()
         || record.alias().is_some()
         || data.index_flags != IndexFlags::NONE
-        || !target.flags().intersects(TypeFlags::OBJECT)
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if !target.flags().intersects(TypeFlags::OBJECT) {
+        keyof_types::validate_generic_keyof_index_type(store, type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
     }
     if !visiting.insert(type_id) {
         return Err(TypeDisplayUnavailable::CyclicType(type_id));
@@ -2788,13 +2791,74 @@ fn append_source_signature_parameters(
     let parameter_types = store
         .callable_signature_parameter_types(signature)
         .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    // Source display can reuse an optional annotation without changing the value type.
+    let display_parameters = if state.location.is_some()
+        && let Some(provenance) = store.source_callable_provenance(owner)
+        && provenance.signature == signature
+        && let Some(evidence) = store.source_callable_type_query(signature)
+        && let Some(record) = store.signature(signature)
+        && record.target().is_none()
+        && record.mapper().is_none()
+        && !record.type_parameters().is_empty()
+    {
+        let plan = evidence.callable();
+        if !evidence.is_exact(store)
+            || store.source_callable_type_for_signature(signature) != Some(owner)
+            || plan.declaration != provenance.declaration
+            || plan.owner_symbol != provenance.owner_symbol
+            || record.declaration() != Some(plan.declaration)
+            || plan.parameters.len() != parameter_types.len()
+            || !plan
+                .parameters
+                .iter()
+                .map(|parameter| parameter.symbol)
+                .eq(record.parameters().iter().copied())
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        }
+        Some(
+            plan.parameters
+                .iter()
+                .zip(parameter_types)
+                .map(|(parameter, value_type)| {
+                    if !parameter.optional || parameter.initializer.is_some() || parameter.rest {
+                        return Ok(*value_type);
+                    }
+                    let Some(NodeData::ParameterDeclaration(data)) =
+                        host.node(parameter.declaration).map(|node| &node.data)
+                    else {
+                        return Err(TypeDisplayUnavailable::MalformedType(owner));
+                    };
+                    let Some(annotation) = data.type_ else {
+                        return Ok(*value_type);
+                    };
+                    let annotation = NodeRef::new(
+                        parameter.declaration.arena,
+                        parameter.declaration.file,
+                        annotation,
+                    );
+                    if data.question_token.is_none()
+                        || parameter.explicit_type_node() != Some(annotation)
+                        || !host.symbol_matches(store, parameter.declaration, parameter.symbol)
+                    {
+                        return Err(TypeDisplayUnavailable::MalformedType(owner));
+                    }
+                    evidence
+                        .annotation_type(annotation)
+                        .ok_or(TypeDisplayUnavailable::MalformedType(owner))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    } else {
+        None
+    };
     append_validated_signature_parameters(
         store,
         host,
         global_types,
         owner,
         signature,
-        parameter_types,
+        display_parameters.as_deref().unwrap_or(parameter_types),
         flags,
         state,
         visiting,
@@ -9586,6 +9650,326 @@ mod tests {
             context.type_to_string(type_).unwrap(),
             "{ (value: string): number; (value: number, count?: boolean | undefined): string; }"
         );
+    }
+
+    const GENERIC_KEYOF_DISPLAY_SOURCE: &str =
+        "declare function choose<Model, Key extends keyof Model>(key: Key): Key;";
+
+    fn generic_keyof_display_node(parsed: &ParseResult, file: FileId) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeOperator).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("the source function has one keyof constraint")
+    }
+
+    #[test]
+    fn generic_keyof_display_preserves_source_signature_and_warm_identity() {
+        let parsed = parse_source_file(GENERIC_KEYOF_DISPLAY_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(254);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (declaration, _, callable) = namespace_function_display_parts(&context, &parsed, file);
+        let node = generic_keyof_display_node(&parsed, file);
+        let index = context.get_type_from_type_node(node).unwrap();
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+        let expected = "<Model, Key extends keyof Model>(key: Key) => Key";
+
+        for _ in 0..2 {
+            assert_eq!(context.get_type_from_type_node(node).unwrap(), index);
+            assert_eq!(
+                namespace_function_display_parts(&context, &parsed, file).2,
+                callable
+            );
+            let before = format!("{:?}", context.store());
+            assert_eq!(context.type_to_string(index).unwrap(), "keyof Model");
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(index, node, flags)
+                    .unwrap(),
+                "keyof Model"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(callable, declaration, flags)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn generic_keyof_display_rejects_changed_base_constraints_without_writes() {
+        let parsed = parse_source_file(GENERIC_KEYOF_DISPLAY_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(255);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let (declaration, _, callable) = namespace_function_display_parts(&context, &parsed, file);
+        let node = generic_keyof_display_node(&parsed, file);
+        let index = context.get_type_from_type_node(node).unwrap();
+        let TypeData::Index(data) = context.store().type_payload(index).unwrap().data() else {
+            panic!("the source constraint must retain its generic Index");
+        };
+        let original = data.constrained.resolved_base_constraint;
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let property_keys = bootstrap.string_number_symbol_type;
+        let wrong = bootstrap.string_type;
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+        let expected = "<Model, Key extends keyof Model>(key: Key) => Key";
+
+        for valid in [None, Some(property_keys)] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_resolved_base_constraint(index, valid)
+            );
+            let valid_state = format!("{:?}", context.store());
+            assert_eq!(context.type_to_string(index).unwrap(), "keyof Model");
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+            assert_eq!(format!("{:?}", context.store()), valid_state);
+
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_resolved_base_constraint(index, Some(wrong))
+            );
+            let poisoned = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context.type_to_string(index),
+                    Err(TypeDisplayUnavailable::MalformedType(index))
+                );
+                assert_eq!(
+                    context.type_to_string_at_location_with_flags(index, node, flags),
+                    Err(TypeDisplayUnavailable::MalformedType(index))
+                );
+                assert_eq!(format!("{:?}", context.store()), poisoned);
+                assert!(context.diagnostics().is_empty());
+            }
+
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_resolved_base_constraint(index, valid)
+            );
+            assert_eq!(format!("{:?}", context.store()), valid_state);
+            assert_eq!(context.type_to_string(index).unwrap(), "keyof Model");
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(callable, declaration, flags)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(format!("{:?}", context.store()), valid_state);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_resolved_base_constraint(index, original)
+        );
+        assert_eq!(context.type_to_string(index).unwrap(), "keyof Model");
+        assert!(context.diagnostics().is_empty());
+    }
+
+    const GENERIC_OPTIONAL_DISPLAY_SOURCE: &str =
+        "declare function choose<Model>(obj?: Model): void;";
+
+    fn generic_optional_display_parameter(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (NodeRef, NodeRef) {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, parameter.name),
+                    NodeRef::new(parsed.arena.id(), file, parameter.type_.unwrap()),
+                ))
+            })
+            .expect("the generic source function has one annotated parameter")
+    }
+
+    fn assert_generic_optional_parameter_display(
+        source: &str,
+        options: IntrinsicBootstrapOptions,
+        located_display: &str,
+        context_free_display: &str,
+        parameter_display: &str,
+    ) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(256);
+        let mut context = parsed_context(&parsed, file, options);
+        context.check_source_file(file).unwrap();
+        let (declaration, _, callable) = namespace_function_display_parts(&context, &parsed, file);
+        let (parameter, annotation) = generic_optional_display_parameter(&parsed, file);
+        let value_type = context.get_type_at_location(parameter).unwrap();
+        let annotation_type = context.get_type_from_type_node(annotation).unwrap();
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+
+        for _ in 0..2 {
+            let before = format!("{:?}", context.store());
+            assert_eq!(
+                context.type_to_string(value_type).unwrap(),
+                parameter_display
+            );
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                context_free_display
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(callable, declaration, flags)
+                    .unwrap(),
+                located_display
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert_eq!(context.get_type_at_location(parameter).unwrap(), value_type);
+            assert_eq!(
+                context.get_type_from_type_node(annotation).unwrap(),
+                annotation_type
+            );
+            assert_eq!(
+                namespace_function_display_parts(&context, &parsed, file).2,
+                callable
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn generic_optional_parameter_display_keeps_semantic_unions() {
+        for (strict_null_checks, exact_optional_property_types) in
+            [(true, false), (true, true), (false, false)]
+        {
+            let parameter_display = if strict_null_checks {
+                "Model | undefined"
+            } else {
+                "Model"
+            };
+            assert_generic_optional_parameter_display(
+                GENERIC_OPTIONAL_DISPLAY_SOURCE,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types,
+                },
+                "<Model>(obj?: Model) => void",
+                &format!("<Model>(obj?: {parameter_display}) => void"),
+                parameter_display,
+            );
+        }
+    }
+
+    #[test]
+    fn generic_optional_parameter_display_keeps_written_undefined() {
+        for (source, expected) in [
+            (
+                "declare function choose<Model>(obj?: Model | undefined): void;",
+                "<Model>(obj?: Model | undefined) => void",
+            ),
+            (
+                "declare function choose<Model>(obj: Model | undefined): void;",
+                "<Model>(obj: Model | undefined) => void",
+            ),
+        ] {
+            assert_generic_optional_parameter_display(
+                source,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                expected,
+                expected,
+                "Model | undefined",
+            );
+        }
+    }
+
+    #[test]
+    fn generic_optional_parameter_display_rejects_changed_annotation_without_writes() {
+        let parsed = parse_source_file(GENERIC_OPTIONAL_DISPLAY_SOURCE);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(257);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        context.check_source_file(file).unwrap();
+        let (declaration, _, callable) = namespace_function_display_parts(&context, &parsed, file);
+        let (parameter, annotation) = generic_optional_display_parameter(&parsed, file);
+        let value_type = context.get_type_at_location(parameter).unwrap();
+        let original = context.store().type_node_links(annotation).unwrap().clone();
+        let mut changed = original.clone();
+        changed.resolved_type = Some(context.store().intrinsic_bootstrap().unwrap().number_type);
+        let flags = CanonicalTypeFormatFlags::NO_TRUNCATION
+            | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, changed.clone())
+        );
+
+        for _ in 0..2 {
+            let poisoned = format!("{:?}", context.store());
+            assert_eq!(
+                context.type_to_string_at_location_with_flags(callable, declaration, flags),
+                Err(TypeDisplayUnavailable::MalformedType(callable))
+            );
+            assert_eq!(
+                context.type_to_string(callable),
+                Err(TypeDisplayUnavailable::MalformedType(callable))
+            );
+            assert_eq!(context.store().type_node_links(annotation), Some(&changed));
+            assert_eq!(format!("{:?}", context.store()), poisoned);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, original.clone())
+        );
+        let restored = format!("{:?}", context.store());
+        assert_eq!(context.store().type_node_links(annotation), Some(&original));
+        assert_eq!(
+            context
+                .type_to_string_at_location_with_flags(callable, declaration, flags)
+                .unwrap(),
+            "<Model>(obj?: Model) => void"
+        );
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "<Model>(obj?: Model | undefined) => void"
+        );
+        assert_eq!(format!("{:?}", context.store()), restored);
+        assert_eq!(context.get_type_at_location(parameter).unwrap(), value_type);
+        assert_eq!(
+            context.type_to_string(value_type).unwrap(),
+            "Model | undefined"
+        );
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

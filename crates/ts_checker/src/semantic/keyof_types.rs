@@ -2,9 +2,10 @@
 //!
 //! This leaf implements the dependency-independent prefix of pinned
 //! `getIndexType` and `getLiteralTypeFromProperties`. It accepts authenticated
-//! ordinary type parameters and fully resolved, source-owned interfaces and
-//! type literals. Ordinary type parameters reuse one normalized `IndexType`
-//! identity. Named properties become canonical regular string-literal types,
+//! ordinary type parameters and fully resolved, source-owned interfaces,
+//! type literals, and fresh or derived object literals. Ordinary type
+//! parameters reuse one normalized `IndexType` identity. Named properties
+//! become canonical regular string-literal types,
 //! a number index contributes `number`, and a string index contributes
 //! `string | number`. The latter absorbs every explicit property and number
 //! index in the result.
@@ -29,9 +30,11 @@ use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalTypeMapperStore, TypeId,
+    array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     declared::cached_ordinary_type_parameter_owner,
-    links::ValueSymbolLinks,
+    derived_types::DerivedObjectLiteralValidation,
+    links::{TypeNodeLinks, ValueSymbolLinks},
     mapped_types::{MappedTypeError, MappedTypeKey, MappedTypeKeys, plan_mapped_type_keys},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
@@ -55,12 +58,34 @@ use super::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct NongenericKeyofPlan {
     target: TypeId,
-    proof: DeclaredPropertyObjectProof,
+    proof: NongenericKeyofProof,
+    source_properties: Vec<(SemanticSymbolId, ValueSymbolLinks)>,
+    array_targets: Option<CanonicalArrayTargets>,
     property_names: Vec<String>,
     has_string_index: bool,
     has_number_index: bool,
     preserves_origin: bool,
     composition: Option<KeyofComposition>,
+}
+
+/// The source proof used to obtain the property names in a key plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NongenericKeyofProof {
+    Declared(DeclaredPropertyObjectProof),
+    FreshObjectLiteral {
+        owner: SemanticSymbolId,
+    },
+    DerivedObjectLiteral {
+        owner: SemanticSymbolId,
+        source: TypeId,
+    },
+    Composition,
+}
+
+impl PartialEq<DeclaredPropertyObjectProof> for NongenericKeyofProof {
+    fn eq(&self, other: &DeclaredPropertyObjectProof) -> bool {
+        matches!(self, Self::Declared(proof) if proof == other)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,7 +103,7 @@ impl NongenericKeyofPlan {
         self.target
     }
 
-    pub(super) const fn proof(&self) -> DeclaredPropertyObjectProof {
+    pub(super) const fn proof(&self) -> NongenericKeyofProof {
         self.proof
     }
 
@@ -182,13 +207,23 @@ impl std::error::Error for NongenericKeyofError {
     }
 }
 
-/// Extracts one exact resolved interface/type-literal key surface.
+/// Extracts the exact keys of a resolved source-owned object or type parameter.
 ///
 /// The function is read-only. In particular, it does not resolve members,
 /// instantiate references, or populate literal/union caches.
 pub(super) fn plan_nongeneric_keyof_type(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    plan_nongeneric_keyof_type_with_array_targets(store, target, None)
+}
+
+/// Retains the caller's array identities for derived object-literal checks.
+/// The plan carries them through both cold execution and warm validation.
+pub(super) fn plan_nongeneric_keyof_type_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
     let record = store
         .type_payload(target)
@@ -208,7 +243,7 @@ pub(super) fn plan_nongeneric_keyof_type(
         } else {
             bootstrap.string_number_symbol_type
         };
-        return Ok(intrinsic_keyof_plan(target, result));
+        return Ok(intrinsic_keyof_plan(target, result, array_targets));
     }
 
     match record.data() {
@@ -218,7 +253,9 @@ pub(super) fn plan_nongeneric_keyof_type(
             }
             return Ok(NongenericKeyofPlan {
                 target,
-                proof: DeclaredPropertyObjectProof::TypeLiteral,
+                proof: NongenericKeyofProof::Composition,
+                source_properties: Vec::new(),
+                array_targets,
                 property_names: Vec::new(),
                 has_string_index: false,
                 has_number_index: false,
@@ -227,7 +264,13 @@ pub(super) fn plan_nongeneric_keyof_type(
             });
         }
         TypeData::Union(union) => {
-            return plan_composite_keyof_type(store, target, &union.union.types, true);
+            return plan_composite_keyof_type(
+                store,
+                target,
+                &union.union.types,
+                true,
+                array_targets,
+            );
         }
         TypeData::Intersection(_) => {
             let projection = store
@@ -238,25 +281,34 @@ pub(super) fn plan_nongeneric_keyof_type(
                     .intrinsic_bootstrap()
                     .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
                     .string_number_symbol_type;
-                return Ok(intrinsic_keyof_plan(target, result));
+                return Ok(intrinsic_keyof_plan(target, result, array_targets));
             }
-            return plan_composite_keyof_type(store, target, &projection.types, false);
+            return plan_composite_keyof_type(
+                store,
+                target,
+                &projection.types,
+                false,
+                array_targets,
+            );
         }
-        TypeData::Mapped(_) => return plan_mapped_keyof_type(store, target),
+        TypeData::Mapped(_) => return plan_mapped_keyof_type(store, target, array_targets),
         _ => {}
     }
 
-    let proof = match validate_resolved_declared_property_object(store, target) {
-        DeclaredPropertyObjectValidation::Valid(proof) => proof,
-        DeclaredPropertyObjectValidation::Malformed => {
-            return Err(NongenericKeyofError::MalformedObject(target));
-        }
-        DeclaredPropertyObjectValidation::NotDeclared => {
-            match validate_resolved_indexed_declared_object(store, target, record)? {
-                Some(proof) => proof,
-                None => return Err(NongenericKeyofError::UnsupportedObject(target)),
+    let proof = match source_object_literal_proof(store, target, array_targets)? {
+        Some(proof) => proof,
+        None => match validate_resolved_declared_property_object(store, target) {
+            DeclaredPropertyObjectValidation::Valid(proof) => NongenericKeyofProof::Declared(proof),
+            DeclaredPropertyObjectValidation::Malformed => {
+                return Err(NongenericKeyofError::MalformedObject(target));
             }
-        }
+            DeclaredPropertyObjectValidation::NotDeclared => {
+                match validate_resolved_indexed_declared_object(store, target, record)? {
+                    Some(proof) => NongenericKeyofProof::Declared(proof),
+                    None => return Err(NongenericKeyofError::UnsupportedObject(target)),
+                }
+            }
+        },
     };
     let structured = record
         .data()
@@ -270,6 +322,27 @@ pub(super) fn plan_nongeneric_keyof_type(
     })?;
     let (has_string_index, has_number_index) = exact_index_kinds(store, structured)
         .ok_or(NongenericKeyofError::MalformedObject(target))?;
+    let source_properties = if matches!(
+        proof,
+        NongenericKeyofProof::FreshObjectLiteral { .. }
+            | NongenericKeyofProof::DerivedObjectLiteral { .. }
+    ) {
+        structured
+            .properties
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|property| {
+                store
+                    .value_symbol_links(*property)
+                    .cloned()
+                    .map(|links| (*property, links))
+                    .ok_or(NongenericKeyofError::MalformedObject(target))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let preserves_origin = proof == DeclaredPropertyObjectProof::Interface
         || record
             .object_flags()
@@ -278,6 +351,8 @@ pub(super) fn plan_nongeneric_keyof_type(
     Ok(NongenericKeyofPlan {
         target,
         proof,
+        source_properties,
+        array_targets,
         property_names,
         has_string_index,
         has_number_index,
@@ -286,16 +361,212 @@ pub(super) fn plan_nongeneric_keyof_type(
     })
 }
 
+fn source_object_literal_proof(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<NongenericKeyofProof>, NongenericKeyofError> {
+    let record = store
+        .type_payload(target)
+        .ok_or(NongenericKeyofError::InvalidType(target))?;
+    if !matches!(record.data(), TypeData::Object(_)) {
+        return Ok(None);
+    }
+    let derived = match array_targets {
+        Some(targets) => store.validate_derived_object_literal_with_array_targets(target, targets),
+        None => store.validate_derived_object_literal_for_relation(target),
+    };
+    match derived {
+        DerivedObjectLiteralValidation::Valid { owner, source } => {
+            let Some(fresh) = source_object_literal_owner(store, target, owner)? else {
+                return Ok(None);
+            };
+            let mut current = source;
+            let mut seen = HashSet::new();
+            while current != fresh {
+                if !seen.insert(current) {
+                    return Err(NongenericKeyofError::MalformedObject(target));
+                }
+                let validation = match array_targets {
+                    Some(targets) => {
+                        store.validate_derived_object_literal_with_array_targets(current, targets)
+                    }
+                    None => store.validate_derived_object_literal_for_relation(current),
+                };
+                let DerivedObjectLiteralValidation::Valid {
+                    owner: current_owner,
+                    source: next,
+                } = validation
+                else {
+                    return Err(NongenericKeyofError::MalformedObject(target));
+                };
+                if current_owner != owner {
+                    return Err(NongenericKeyofError::MalformedObject(target));
+                }
+                current = next;
+            }
+            Ok(Some(NongenericKeyofProof::DerivedObjectLiteral {
+                owner,
+                source,
+            }))
+        }
+        DerivedObjectLiteralValidation::Invalid => {
+            Err(NongenericKeyofError::MalformedObject(target))
+        }
+        DerivedObjectLiteralValidation::NotDerived => {
+            let claims_literal = record
+                .object_flags()
+                .intersects(ObjectFlags::OBJECT_LITERAL | ObjectFlags::FRESH_LITERAL)
+                || record.symbol().is_some_and(|owner| {
+                    store.symbol(owner).is_some_and(|symbol| {
+                        // Assignment-owned expandos have exports and no literal flags.
+                        symbol.exports().is_none()
+                            && (symbol.flags().intersects(SymbolFlags::OBJECT_LITERAL)
+                                || store.source_symbol_flags(owner).is_some_and(|flags| {
+                                    flags.intersects(SymbolFlags::OBJECT_LITERAL)
+                                }))
+                    })
+                });
+            if !claims_literal {
+                return Ok(None);
+            }
+            let owner = record
+                .symbol()
+                .ok_or(NongenericKeyofError::MalformedObject(target))?;
+            let Some(fresh) = source_object_literal_owner(store, target, owner)? else {
+                return Ok(None);
+            };
+            if fresh != target || !store.validate_fresh_object_literal_for_relation(target) {
+                return Err(NongenericKeyofError::MalformedObject(target));
+            }
+            Ok(Some(NongenericKeyofProof::FreshObjectLiteral { owner }))
+        }
+    }
+}
+
+/// Proves a source object identity without imposing property-key spelling rules.
+/// A claimed source or derived cache that fails its proof is an error.
+pub(super) fn validate_source_object_literal_for_keyof(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, NongenericKeyofError> {
+    source_object_literal_proof(store, target, array_targets).map(|proof| proof.is_some())
+}
+
+fn source_object_literal_owner(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+    owner: SemanticSymbolId,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    let invalid = || NongenericKeyofError::MalformedObject(target);
+    let symbol = store.symbol(owner).ok_or_else(invalid)?;
+    let Some([declaration]) = symbol.declarations() else {
+        return Err(invalid());
+    };
+    if symbol.flags() != SymbolFlags::OBJECT_LITERAL
+        || symbol.check_flags() != CheckFlags::NONE
+        || symbol.value_declaration() != Some(*declaration)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::ObjectLiteralExpression)
+        || store.source_symbol_flags(owner) != Some(SymbolFlags::OBJECT_LITERAL)
+        || !store.source_symbol_declarations_match(owner)
+        || store.source_declaration_symbol(*declaration) != Some(owner)
+        || !store.source_declaration_belongs_to_symbol(*declaration, owner)
+    {
+        return Err(invalid());
+    }
+    let children = store
+        .source_direct_children(*declaration)
+        .ok_or_else(invalid)?;
+    if children.iter().any(|child| {
+        !matches!(
+            store.source_node_kind(*child),
+            Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+        )
+    }) {
+        return Ok(None);
+    }
+    let members = symbol
+        .members()
+        .map(|members| store.symbol_table(members).ok_or_else(invalid))
+        .transpose()?;
+    if members.map_or(0, ts_binder::semantic::SymbolTable::len) != children.len() {
+        return Err(invalid());
+    }
+    let mut seen = HashSet::new();
+    if let Some(members) = members {
+        for (_, property) in members.iter() {
+            let property_record = store.symbol(property).ok_or_else(invalid)?;
+            let Some([property_declaration]) = property_record.declarations() else {
+                return Err(invalid());
+            };
+            if property_record.flags() != SymbolFlags::PROPERTY
+                || property_record.parent() != Some(owner)
+                || property_record.value_declaration() != Some(*property_declaration)
+                || store.source_symbol_flags(property) != Some(SymbolFlags::PROPERTY)
+                || !store.source_symbol_declarations_match(property)
+                || store.source_declaration_symbol(*property_declaration) != Some(property)
+                || !store.source_declaration_belongs_to_symbol(*property_declaration, property)
+                || store.source_node_parent(*property_declaration)
+                    != Some(SourceNodeParent::Parent(*declaration))
+                || !children.contains(property_declaration)
+                || !seen.insert(*property_declaration)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    let fresh = store
+        .type_node_links(*declaration)
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(invalid)?;
+    if store.type_node_links(*declaration)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(fresh),
+            outer_type_parameters: None,
+        })
+        || store.type_payload(fresh).and_then(TypeRecord::symbol) != Some(owner)
+        || !store.validate_fresh_object_literal_for_relation(fresh)
+    {
+        return Err(invalid());
+    }
+    let properties = store
+        .type_payload(fresh)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(invalid)?
+        .properties
+        .as_deref()
+        .unwrap_or_default();
+    for property in properties {
+        let origin = store
+            .object_literal_property_clone_origin(*property)
+            .ok_or_else(invalid)?;
+        if origin.symbol() != *property
+            || origin.owner() != *declaration
+            || store
+                .value_symbol_links(*property)
+                .and_then(|links| links.target)
+                != Some(origin.source())
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(fresh))
+}
+
 fn plan_mapped_keyof_type(
     store: &CanonicalTypeMapperStore,
     target: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
     let keys = match plan_mapped_type_keys(store, target) {
         Ok(keys) => keys,
         Err(MappedTypeError::CrossProductTooLarge { size, limit }) => {
             return Ok(NongenericKeyofPlan {
                 target,
-                proof: DeclaredPropertyObjectProof::TypeLiteral,
+                proof: NongenericKeyofProof::Composition,
+                source_properties: Vec::new(),
+                array_targets,
                 property_names: Vec::new(),
                 has_string_index: false,
                 has_number_index: false,
@@ -323,7 +594,9 @@ fn plan_mapped_keyof_type(
         }
     };
     match keys {
-        MappedTypeKeys::Constraint(constraint) => Ok(intrinsic_keyof_plan(target, constraint)),
+        MappedTypeKeys::Constraint(constraint) => {
+            Ok(intrinsic_keyof_plan(target, constraint, array_targets))
+        }
         MappedTypeKeys::Remapped(keys) => {
             let mut property_names = Vec::new();
             for key in &keys {
@@ -336,7 +609,9 @@ fn plan_mapped_keyof_type(
             }
             Ok(NongenericKeyofPlan {
                 target,
-                proof: DeclaredPropertyObjectProof::TypeLiteral,
+                proof: NongenericKeyofProof::Composition,
+                source_properties: Vec::new(),
+                array_targets,
                 property_names,
                 has_string_index: false,
                 has_number_index: false,
@@ -347,10 +622,16 @@ fn plan_mapped_keyof_type(
     }
 }
 
-fn intrinsic_keyof_plan(target: TypeId, result: TypeId) -> NongenericKeyofPlan {
+fn intrinsic_keyof_plan(
+    target: TypeId,
+    result: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> NongenericKeyofPlan {
     NongenericKeyofPlan {
         target,
-        proof: DeclaredPropertyObjectProof::TypeLiteral,
+        proof: NongenericKeyofProof::Composition,
+        source_properties: Vec::new(),
+        array_targets,
         property_names: Vec::new(),
         has_string_index: false,
         has_number_index: false,
@@ -364,6 +645,7 @@ fn plan_composite_keyof_type(
     target: TypeId,
     types: &[TypeId],
     is_union: bool,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
     if types.len() < 2 {
         return Err(NongenericKeyofError::MalformedObject(target));
@@ -372,12 +654,14 @@ fn plan_composite_keyof_type(
     let mut constituents = Vec::with_capacity(types.len());
     for type_ in types {
         let constituent =
-            plan_nongeneric_keyof_type(store, *type_).map_err(|error| match error {
-                NongenericKeyofError::UnsupportedObject(_) => {
-                    NongenericKeyofError::UnsupportedObject(target)
-                }
-                other => other,
-            })?;
+            plan_nongeneric_keyof_type_with_array_targets(store, *type_, array_targets).map_err(
+                |error| match error {
+                    NongenericKeyofError::UnsupportedObject(_) => {
+                        NongenericKeyofError::UnsupportedObject(target)
+                    }
+                    other => other,
+                },
+            )?;
         if matches!(
             constituent.composition,
             Some(
@@ -392,9 +676,11 @@ fn plan_composite_keyof_type(
     }
 
     if is_union {
-        store
-            .validate_union_constituent(target)
-            .map_err(|_| NongenericKeyofError::MalformedObject(target))?;
+        let validation = match array_targets {
+            Some(targets) => store.validate_union_constituent_with_array_targets(targets, target),
+            None => store.validate_union_constituent(target),
+        };
+        validation.map_err(|_| NongenericKeyofError::MalformedObject(target))?;
     }
 
     let mut property_names = Vec::new();
@@ -432,7 +718,9 @@ fn plan_composite_keyof_type(
 
     Ok(NongenericKeyofPlan {
         target,
-        proof: DeclaredPropertyObjectProof::TypeLiteral,
+        proof: NongenericKeyofProof::Composition,
+        source_properties: Vec::new(),
+        array_targets,
         property_names,
         has_string_index,
         has_number_index,
@@ -653,12 +941,80 @@ fn cached_generic_keyof_index_type(
             || record.object_flags() != ObjectFlags::NONE
             || record.symbol().is_some()
             || record.alias().is_some()
+            || !generic_keyof_base_constraint_is_exact(
+                store,
+                index.constrained.resolved_base_constraint,
+            )
             || cached.replace(type_).is_some()
         {
             return Err(NongenericKeyofError::InvalidCachedResult(type_));
         }
     }
     Ok(cached)
+}
+
+/// Proves the normalized Index identity for one source-owned type parameter.
+/// Named-object Index origins are outside this generic substitution contract.
+pub(super) fn validate_generic_keyof_index_type(
+    store: &CanonicalTypeMapperStore,
+    index_type: TypeId,
+) -> Result<TypeId, NongenericKeyofError> {
+    let record = store
+        .type_payload(index_type)
+        .ok_or(NongenericKeyofError::InvalidType(index_type))?;
+    let TypeData::Index(index) = record.data() else {
+        return Err(NongenericKeyofError::UnsupportedObject(index_type));
+    };
+    if record.flags() != TypeFlags::INDEX
+        || record.object_flags() != ObjectFlags::NONE
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || index.index_flags != IndexFlags::NONE
+        || !generic_keyof_base_constraint_is_exact(
+            store,
+            index.constrained.resolved_base_constraint,
+        )
+    {
+        return Err(NongenericKeyofError::InvalidCachedResult(index_type));
+    }
+    let owner = cached_ordinary_type_parameter_owner(store, index.target)
+        .ok_or(NongenericKeyofError::MalformedObject(index.target))?;
+    let symbol = store
+        .symbol(owner)
+        .ok_or(NongenericKeyofError::MalformedObject(index.target))?;
+    let Some([declaration]) = symbol.declarations() else {
+        return Err(NongenericKeyofError::MalformedObject(index.target));
+    };
+    if symbol.flags() != SymbolFlags::TYPE_PARAMETER
+        || symbol.check_flags() != CheckFlags::NONE
+        || symbol.value_declaration().is_some()
+        || symbol.members().is_some()
+        || symbol.exports().is_some()
+        || symbol.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.source_symbol_flags(owner) != Some(SymbolFlags::TYPE_PARAMETER)
+        || !store.source_symbol_declarations_match(owner)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+        || !store.source_declaration_belongs_to_symbol(*declaration, owner)
+        || store.source_declaration_symbol(*declaration) != Some(owner)
+    {
+        return Err(NongenericKeyofError::MalformedObject(index.target));
+    }
+    if cached_generic_keyof_index_type(store, index.target)? != Some(index_type) {
+        return Err(NongenericKeyofError::InvalidCachedResult(index_type));
+    }
+    Ok(index.target)
+}
+
+fn generic_keyof_base_constraint_is_exact(
+    store: &CanonicalTypeMapperStore,
+    constraint: Option<TypeId>,
+) -> bool {
+    constraint.is_none_or(|constraint| {
+        store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| constraint == bootstrap.string_number_symbol_type)
+    })
 }
 
 fn resolve_mapped_keyof_type(
@@ -1114,7 +1470,28 @@ fn validate_plan_against_store(
     store: &CanonicalTypeMapperStore,
     plan: &NongenericKeyofPlan,
 ) -> Result<(), NongenericKeyofError> {
-    let current = plan_nongeneric_keyof_type(store, plan.target)?;
+    if let Some(
+        KeyofComposition::Union(constituents) | KeyofComposition::Intersection(constituents),
+    ) = &plan.composition
+    {
+        for constituent in constituents {
+            validate_plan_against_store(store, constituent)?;
+        }
+    }
+    let current =
+        plan_nongeneric_keyof_type_with_array_targets(store, plan.target, plan.array_targets)
+            .map_err(|error| {
+                if matches!(
+                    plan.proof,
+                    NongenericKeyofProof::FreshObjectLiteral { .. }
+                        | NongenericKeyofProof::DerivedObjectLiteral { .. }
+                ) && matches!(error, NongenericKeyofError::UnsupportedObject(_))
+                {
+                    NongenericKeyofError::MalformedObject(plan.target)
+                } else {
+                    error
+                }
+            })?;
     if current == *plan {
         Ok(())
     } else {
@@ -1510,20 +1887,27 @@ fn validate_indexed_member_table(
 mod tests {
     use std::collections::BTreeMap;
 
-    use ts_ast::{FileId, NodeRef, SyntaxKind};
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts,
-        CanonicalSourceLanguage, EscapedName, SemanticSymbolId,
+        CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::{
-        IndexFlags, NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
-        resolve_nongeneric_keyof_leaf, resolve_nongeneric_keyof_type,
+        IndexFlags, NongenericKeyofError, NongenericKeyofPlan, NongenericKeyofProof,
+        cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
+        plan_nongeneric_keyof_type_with_array_targets, resolve_nongeneric_keyof_leaf,
+        resolve_nongeneric_keyof_type, validate_cached_nongeneric_keyof_result,
+        validate_generic_keyof_index_type, validate_source_object_literal_for_keyof,
     };
     use crate::semantic::{
-        CanonicalTypeMapperStore, DeclaredTypeHost, IntrinsicBootstrapOptions, TypeAliasLinks,
-        TypeId, object_members,
+        CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
+        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, RelationStateSnapshot,
+        TypeAliasLinks, TypeId,
+        array_types::CanonicalArrayTargets,
+        links::ValueSymbolLinks,
+        object_members,
         type_records::TypeData,
         types::{ObjectFlags, TypeFlags},
     };
@@ -1572,6 +1956,52 @@ mod tests {
             files,
             store,
         }
+    }
+
+    fn checked_context(
+        parsed: &ParseResult,
+        file: FileId,
+        language: CanonicalSourceLanguage,
+    ) -> CanonicalCheckerContext<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        let path = match language {
+            CanonicalSourceLanguage::TypeScript => "\"/keyof-source.ts\"",
+            CanonicalSourceLanguage::JavaScript => "\"/keyof-source.js\"",
+        };
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(path),
+                    language,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        match language {
+            CanonicalSourceLanguage::TypeScript => {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            CanonicalSourceLanguage::JavaScript => {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        context
     }
 
     fn node_of_kind(fixture: &Fixture, kind: SyntaxKind) -> NodeRef {
@@ -1700,6 +2130,43 @@ mod tests {
         .unwrap()
     }
 
+    fn resolve_object_literal(fixture: &mut Fixture, property_types: &[TypeId]) -> TypeId {
+        let declaration = node_of_kind(fixture, SyntaxKind::ObjectLiteralExpression);
+        let host = DeclaredTypeHost::new([(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        )])
+        .unwrap();
+        let plan = object_members::plan_object_literal(&fixture.store, &host, declaration).unwrap();
+        object_members::publish_object_literal(&mut fixture.store, &plan, property_types).unwrap()
+    }
+
+    fn object_literal_forms(fixture: &mut Fixture) -> [TypeId; 3] {
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let property_types = [bootstrap.string_type, bootstrap.undefined_widening_type];
+        let fresh = resolve_object_literal(fixture, &property_types);
+        let regular = fixture
+            .store
+            .get_regular_type_of_object_literal(fresh)
+            .unwrap();
+        let widened = fixture.store.get_widened_type(regular).unwrap();
+        assert_ne!(fresh, regular);
+        assert_ne!(regular, widened);
+        [fresh, regular, widened]
+    }
+
+    fn property_symbols(store: &CanonicalTypeMapperStore, object: TypeId) -> Vec<SemanticSymbolId> {
+        store
+            .type_payload(object)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .properties
+            .clone()
+            .unwrap_or_default()
+    }
+
     fn resolve_type_parameter(fixture: &mut Fixture) -> TypeId {
         let declaration = node_of_kind(fixture, SyntaxKind::TypeParameter);
         let symbol = bound_symbol(fixture, declaration);
@@ -1729,6 +2196,48 @@ mod tests {
             bootstrap.union_cache_len(),
             store.properties_type_cache_len(),
         )
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct KeyofQueryState {
+        arenas: [usize; 9],
+        caches: (usize, usize, usize, usize),
+        links: [usize; 26],
+        resolution: (usize, usize, usize, u64),
+        relations: RelationStateSnapshot,
+    }
+
+    fn query_state(store: &CanonicalTypeMapperStore) -> KeyofQueryState {
+        KeyofQueryState {
+            arenas: [
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.type_predicate_len(),
+                store.index_info_len(),
+                store.type_alias_len(),
+                store.conditional_root_len(),
+                store.entity_name_len(),
+                store.symbol_len(),
+            ],
+            caches: cache_state(store),
+            links: store.checker_link_allocated_lengths(),
+            resolution: store.type_resolution_internal_state(),
+            relations: store.relation_state_snapshot(),
+        }
+    }
+
+    fn assert_literal_plans_reject_without_writes(
+        store: &mut CanonicalTypeMapperStore,
+        plans: &[NongenericKeyofPlan],
+    ) {
+        let before = query_state(store);
+        for plan in plans {
+            let error = NongenericKeyofError::MalformedObject(plan.target());
+            assert_eq!(cached_nongeneric_keyof_type(store, plan), Err(error));
+            assert_eq!(resolve_nongeneric_keyof_type(store, plan), Err(error));
+            assert_eq!(query_state(store), before);
+        }
     }
 
     #[test]
@@ -1818,6 +2327,862 @@ mod tests {
             cached_nongeneric_keyof_type(&duplicate.store, &plan),
             Err(NongenericKeyofError::InvalidCachedResult(duplicate_index))
         );
+    }
+
+    #[test]
+    fn generic_index_proof_keeps_exact_base_constraint_state() {
+        let mut fixture = fixture("type Keys<T> = keyof T;");
+        let parameter = resolve_type_parameter(&mut fixture);
+        let plan = plan_nongeneric_keyof_type(&fixture.store, parameter).unwrap();
+        let index = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Ok(parameter)
+        );
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let keys = bootstrap.string_number_symbol_type;
+        let wrong_constraints = [bootstrap.string_type, bootstrap.unknown_type];
+
+        assert!(
+            fixture
+                .store
+                .set_resolved_base_constraint(index, Some(keys))
+        );
+        let warm = query_state(&fixture.store);
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Ok(parameter)
+        );
+        assert_eq!(
+            cached_nongeneric_keyof_type(&fixture.store, &plan),
+            Ok(Some(index))
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+            Ok(index)
+        );
+        assert_eq!(query_state(&fixture.store), warm);
+
+        for wrong in wrong_constraints {
+            assert!(
+                fixture
+                    .store
+                    .set_resolved_base_constraint(index, Some(wrong))
+            );
+            let poisoned = query_state(&fixture.store);
+            let error = NongenericKeyofError::InvalidCachedResult(index);
+            assert_eq!(
+                validate_generic_keyof_index_type(&fixture.store, index),
+                Err(error)
+            );
+            assert_eq!(
+                cached_nongeneric_keyof_type(&fixture.store, &plan),
+                Err(error)
+            );
+            assert_eq!(
+                resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+                Err(error)
+            );
+            assert_eq!(query_state(&fixture.store), poisoned);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(index)
+                    .unwrap()
+                    .data()
+                    .constrained()
+                    .unwrap()
+                    .resolved_base_constraint,
+                Some(wrong),
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_resolved_base_constraint(index, Some(keys))
+            );
+            assert_eq!(
+                validate_generic_keyof_index_type(&fixture.store, index),
+                Ok(parameter)
+            );
+            assert_eq!(
+                resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+                Ok(index)
+            );
+        }
+
+        let owner = fixture
+            .store
+            .type_payload(parameter)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        assert!(fixture.store.set_type_symbol(index, Some(owner)));
+        let poisoned = query_state(&fixture.store);
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Err(NongenericKeyofError::InvalidCachedResult(index)),
+        );
+        assert_eq!(query_state(&fixture.store), poisoned);
+        assert!(fixture.store.set_type_symbol(index, None));
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Ok(parameter)
+        );
+
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let wrong_target = fixture
+            .store
+            .alloc_index_type(string, IndexFlags::NONE)
+            .unwrap();
+        let wrong_flags = fixture
+            .store
+            .alloc_index_type(parameter, IndexFlags::STRINGS_ONLY)
+            .unwrap();
+        let before = query_state(&fixture.store);
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, wrong_target),
+            Err(NongenericKeyofError::MalformedObject(string)),
+        );
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, wrong_flags),
+            Err(NongenericKeyofError::InvalidCachedResult(wrong_flags)),
+        );
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Ok(parameter)
+        );
+        assert_eq!(query_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn generic_index_proof_requires_retained_source_parameter_ownership() {
+        let mut fixture = fixture("type Keys<T, Other> = keyof T;");
+        let parameter = resolve_type_parameter(&mut fixture);
+        let plan = plan_nongeneric_keyof_type(&fixture.store, parameter).unwrap();
+        let index = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
+        let owner = fixture
+            .store
+            .type_payload(parameter)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let original = fixture
+            .store
+            .symbol(owner)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let other = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                (record.kind == SyntaxKind::TypeParameter && !original.contains(&declaration))
+                    .then_some(declaration)
+            })
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(owner, Some(vec![other]), None)
+        );
+        let poisoned = query_state(&fixture.store);
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Err(NongenericKeyofError::MalformedObject(parameter)),
+        );
+        assert_eq!(query_state(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(owner, Some(original.clone()), None)
+        );
+        let restored = query_state(&fixture.store);
+        assert_eq!(
+            validate_generic_keyof_index_type(&fixture.store, index),
+            Ok(parameter)
+        );
+        assert_eq!(query_state(&fixture.store), restored);
+
+        let detached_owner = fixture
+            .store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("Detached"),
+            ))
+            .unwrap();
+        let detached = fixture
+            .store
+            .alloc_type_parameter(Some(detached_owner))
+            .unwrap();
+        assert!(fixture.store.set_declared_type_links(
+            detached_owner,
+            DeclaredTypeLinks {
+                declared_type: Some(detached),
+                ..DeclaredTypeLinks::default()
+            }
+        ));
+        let detached_plan = plan_nongeneric_keyof_type(&fixture.store, detached).unwrap();
+        let detached_index =
+            resolve_nongeneric_keyof_type(&mut fixture.store, &detached_plan).unwrap();
+        for declarations in [None, Some(original)] {
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_declarations(detached_owner, declarations, None)
+            );
+            let before = query_state(&fixture.store);
+            assert_eq!(
+                validate_generic_keyof_index_type(&fixture.store, detached_index),
+                Err(NongenericKeyofError::MalformedObject(detached)),
+            );
+            assert_eq!(
+                cached_nongeneric_keyof_type(&fixture.store, &detached_plan),
+                Ok(Some(detached_index))
+            );
+            assert_eq!(query_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn object_literal_keys_keep_fresh_regular_and_widened_source_proofs() {
+        let mut fixture = fixture("const value = { a: 'a', b: undefined };");
+        let [fresh, regular, widened] = object_literal_forms(&mut fixture);
+        let owner = fixture.store.type_payload(fresh).unwrap().symbol().unwrap();
+        let proofs = [
+            NongenericKeyofProof::FreshObjectLiteral { owner },
+            NongenericKeyofProof::DerivedObjectLiteral {
+                owner,
+                source: fresh,
+            },
+            NongenericKeyofProof::DerivedObjectLiteral {
+                owner,
+                source: regular,
+            },
+        ];
+        let mut expected = None;
+        for (object, proof) in [fresh, regular, widened].into_iter().zip(proofs) {
+            let before = query_state(&fixture.store);
+            let plan = plan_nongeneric_keyof_type(&fixture.store, object).unwrap();
+            assert_eq!(plan.proof(), proof);
+            assert_eq!(
+                validate_source_object_literal_for_keyof(&fixture.store, object, None),
+                Ok(true)
+            );
+            assert_ne!(
+                plan.proof(),
+                object_members::DeclaredPropertyObjectProof::TypeLiteral
+            );
+            assert_eq!(plan.property_names(), ["a", "b"]);
+            assert!(!plan.preserves_origin());
+            assert!(!plan.retains_index_origin());
+            assert_eq!(
+                cached_nongeneric_keyof_type(&fixture.store, &plan),
+                Ok(None)
+            );
+            assert_eq!(query_state(&fixture.store), before);
+
+            let result = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
+            assert_eq!(*expected.get_or_insert(result), result);
+            let TypeData::Union(union) = fixture.store.type_payload(result).unwrap().data() else {
+                panic!("the two object properties must produce a key union");
+            };
+            assert_eq!(union.origin, None);
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let mut keys = vec![
+                bootstrap.cached_string_literal_type("a").unwrap(),
+                bootstrap.cached_string_literal_type("b").unwrap(),
+            ];
+            keys.sort_unstable();
+            assert_eq!(union.union.types, keys);
+
+            let warm = query_state(&fixture.store);
+            assert_eq!(
+                cached_nongeneric_keyof_type(&fixture.store, &plan),
+                Ok(Some(result))
+            );
+            assert_eq!(
+                resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+                Ok(result)
+            );
+            assert_eq!(plan_nongeneric_keyof_type(&fixture.store, object), Ok(plan));
+            assert_eq!(query_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn object_literal_key_plans_reject_changed_property_links_and_owners() {
+        for warm in [false, true] {
+            let mut fixture = fixture("const value = { a: 'a', b: undefined };");
+            let objects = object_literal_forms(&mut fixture);
+            let plans =
+                objects.map(|object| plan_nongeneric_keyof_type(&fixture.store, object).unwrap());
+            let expected = if warm {
+                Some(resolve_nongeneric_keyof_type(&mut fixture.store, &plans[0]).unwrap())
+            } else {
+                None
+            };
+            if warm {
+                for plan in &plans[1..] {
+                    assert_eq!(
+                        resolve_nongeneric_keyof_type(&mut fixture.store, plan),
+                        Ok(expected.unwrap())
+                    );
+                }
+            }
+            let properties = property_symbols(&fixture.store, objects[0]);
+            let property = properties[0];
+            let original = fixture.store.value_symbol_links(property).unwrap().clone();
+            let other_source = fixture
+                .store
+                .value_symbol_links(properties[1])
+                .unwrap()
+                .target;
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            for poisoned in [
+                ValueSymbolLinks {
+                    target: other_source,
+                    ..original.clone()
+                },
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..original.clone()
+                },
+            ] {
+                assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(property, poisoned.clone())
+                );
+                assert_literal_plans_reject_without_writes(&mut fixture.store, &plans);
+                assert_eq!(fixture.store.value_symbol_links(property), Some(&poisoned));
+                assert!(
+                    fixture
+                        .store
+                        .set_value_symbol_links(property, original.clone())
+                );
+                let restored = query_state(&fixture.store);
+                for plan in &plans {
+                    assert_eq!(
+                        cached_nongeneric_keyof_type(&fixture.store, plan),
+                        Ok(expected)
+                    );
+                }
+                assert_eq!(query_state(&fixture.store), restored);
+            }
+
+            let owner = fixture.store.symbol(property).unwrap().parent();
+            assert!(fixture.store.set_symbol_relationships(
+                property,
+                None,
+                None,
+                Some(properties[1]),
+                None
+            ));
+            assert_literal_plans_reject_without_writes(&mut fixture.store, &plans);
+            assert_eq!(
+                fixture.store.symbol(property).unwrap().parent(),
+                Some(properties[1])
+            );
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_relationships(property, None, None, owner, None)
+            );
+
+            let object_owner = fixture
+                .store
+                .type_payload(objects[0])
+                .unwrap()
+                .symbol()
+                .unwrap();
+            let members = fixture.store.symbol(object_owner).unwrap().members();
+            assert!(fixture.store.set_symbol_relationships(
+                object_owner,
+                members,
+                members,
+                None,
+                None
+            ));
+            let poisoned = query_state(&fixture.store);
+            for object in objects {
+                assert_eq!(
+                    validate_source_object_literal_for_keyof(&fixture.store, object, None),
+                    Err(NongenericKeyofError::MalformedObject(object)),
+                );
+            }
+            assert_literal_plans_reject_without_writes(&mut fixture.store, &plans);
+            assert_eq!(query_state(&fixture.store), poisoned);
+            assert!(fixture.store.set_symbol_relationships(
+                object_owner,
+                members,
+                None,
+                None,
+                None
+            ));
+
+            for plan in &plans {
+                let result = resolve_nongeneric_keyof_type(&mut fixture.store, plan).unwrap();
+                let restored = query_state(&fixture.store);
+                assert_eq!(
+                    cached_nongeneric_keyof_type(&fixture.store, plan),
+                    Ok(Some(result))
+                );
+                assert_eq!(
+                    resolve_nongeneric_keyof_type(&mut fixture.store, plan),
+                    Ok(result)
+                );
+                assert_eq!(query_state(&fixture.store), restored);
+            }
+        }
+    }
+
+    #[test]
+    fn object_literal_key_cache_rejects_changed_results_and_foreign_origins() {
+        let mut fixture = fixture(concat!(
+            "interface Named { a: string; b: string } ",
+            "const value = { a: 'a', b: undefined };",
+        ));
+        let [fresh, _, _] = object_literal_forms(&mut fixture);
+        let plan = plan_nongeneric_keyof_type(&fixture.store, fresh).unwrap();
+        let result = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
+        let named = resolve_interface(&mut fixture);
+        let named_plan = plan_nongeneric_keyof_type(&fixture.store, named).unwrap();
+        let named_result = resolve_nongeneric_keyof_type(&mut fixture.store, &named_plan).unwrap();
+        assert_ne!(named_result, result);
+        assert_eq!(
+            union_constituents(&fixture.store, named_result),
+            union_constituents(&fixture.store, result)
+        );
+        let one_key = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_string_literal_type("a")
+            .unwrap();
+        let before = query_state(&fixture.store);
+        for wrong in [named_result, one_key] {
+            assert_eq!(
+                validate_cached_nongeneric_keyof_result(&fixture.store, &plan, wrong),
+                Err(NongenericKeyofError::InvalidCachedResult(wrong)),
+            );
+            assert_eq!(query_state(&fixture.store), before);
+        }
+
+        let owner = fixture.store.type_payload(fresh).unwrap().symbol();
+        assert!(fixture.store.set_type_symbol(result, owner));
+        let poisoned = query_state(&fixture.store);
+        assert_eq!(
+            cached_nongeneric_keyof_type(&fixture.store, &plan),
+            Err(NongenericKeyofError::InvalidCachedResult(result))
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+            Err(NongenericKeyofError::InvalidCachedResult(result))
+        );
+        assert_eq!(query_state(&fixture.store), poisoned);
+        assert_eq!(fixture.store.type_payload(result).unwrap().symbol(), owner);
+        assert!(fixture.store.set_type_symbol(result, None));
+        let restored = query_state(&fixture.store);
+        assert_eq!(
+            cached_nongeneric_keyof_type(&fixture.store, &plan),
+            Ok(Some(result))
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+            Ok(result)
+        );
+        assert_eq!(query_state(&fixture.store), restored);
+    }
+
+    #[test]
+    fn object_literal_key_proofs_reject_changed_retained_declarations() {
+        for warm in [false, true] {
+            let mut fixture = fixture(concat!(
+                "const value = { a: 'a', b: undefined }; ",
+                "const other = { a: 'a', b: undefined };",
+            ));
+            let objects = object_literal_forms(&mut fixture);
+            let union = fixture
+                .store
+                .literal_union_type(&objects[..2], None)
+                .unwrap();
+            let plans = objects
+                .into_iter()
+                .chain([union])
+                .map(|object| plan_nongeneric_keyof_type(&fixture.store, object).unwrap())
+                .collect::<Vec<_>>();
+            if warm {
+                for plan in &plans {
+                    resolve_nongeneric_keyof_type(&mut fixture.store, plan).unwrap();
+                }
+            }
+            let owner = fixture
+                .store
+                .type_payload(objects[0])
+                .unwrap()
+                .symbol()
+                .unwrap();
+            let original = fixture.store.symbol(owner).unwrap().declarations().unwrap()[0];
+            let other = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                    (record.kind == SyntaxKind::ObjectLiteralExpression && declaration != original)
+                        .then_some(declaration)
+                })
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .set_symbol_declarations(owner, Some(vec![other]), Some(other))
+            );
+            let poisoned = query_state(&fixture.store);
+            for object in objects {
+                assert_eq!(
+                    validate_source_object_literal_for_keyof(&fixture.store, object, None),
+                    Err(NongenericKeyofError::MalformedObject(object)),
+                );
+            }
+            for plan in &plans {
+                let target = if plan.target() == union {
+                    objects[0]
+                } else {
+                    plan.target()
+                };
+                let error = NongenericKeyofError::MalformedObject(target);
+                assert_eq!(
+                    cached_nongeneric_keyof_type(&fixture.store, plan),
+                    Err(error)
+                );
+                assert_eq!(
+                    resolve_nongeneric_keyof_type(&mut fixture.store, plan),
+                    Err(error)
+                );
+            }
+            assert_eq!(query_state(&fixture.store), poisoned);
+            assert!(fixture.store.set_symbol_declarations(
+                owner,
+                Some(vec![original]),
+                Some(original)
+            ));
+
+            let fresh_property = property_symbols(&fixture.store, objects[0])[0];
+            let raw_property = fixture
+                .store
+                .value_symbol_links(fresh_property)
+                .unwrap()
+                .target
+                .unwrap();
+            let original_property = fixture
+                .store
+                .symbol(raw_property)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let other_property = fixture
+                .store
+                .source_direct_children(other)
+                .unwrap()
+                .into_iter()
+                .find(|node| {
+                    fixture.store.source_node_kind(*node) == Some(SyntaxKind::PropertyAssignment)
+                })
+                .unwrap();
+            for property in [raw_property, fresh_property] {
+                assert!(fixture.store.set_symbol_declarations(
+                    property,
+                    Some(vec![other_property]),
+                    Some(other_property)
+                ));
+            }
+            let poisoned = query_state(&fixture.store);
+            for object in objects {
+                assert_eq!(
+                    validate_source_object_literal_for_keyof(&fixture.store, object, None),
+                    Err(NongenericKeyofError::MalformedObject(object)),
+                );
+            }
+            for plan in &plans {
+                let target = if plan.target() == union {
+                    objects[0]
+                } else {
+                    plan.target()
+                };
+                let error = NongenericKeyofError::MalformedObject(target);
+                assert_eq!(
+                    cached_nongeneric_keyof_type(&fixture.store, plan),
+                    Err(error)
+                );
+                assert_eq!(
+                    resolve_nongeneric_keyof_type(&mut fixture.store, plan),
+                    Err(error)
+                );
+            }
+            assert_eq!(query_state(&fixture.store), poisoned);
+            for property in [raw_property, fresh_property] {
+                assert!(fixture.store.set_symbol_declarations(
+                    property,
+                    Some(vec![original_property]),
+                    Some(original_property)
+                ));
+            }
+            let original_links = fixture.store.type_node_links(original).unwrap().clone();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+            assert!(fixture.store.set_type_node_links(
+                original,
+                super::TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..original_links.clone()
+                }
+            ));
+            let poisoned = query_state(&fixture.store);
+            for object in objects {
+                assert_eq!(
+                    validate_source_object_literal_for_keyof(&fixture.store, object, None),
+                    Err(NongenericKeyofError::MalformedObject(object)),
+                );
+            }
+            for plan in &plans {
+                let target = if plan.target() == union {
+                    objects[0]
+                } else {
+                    plan.target()
+                };
+                let error = NongenericKeyofError::MalformedObject(target);
+                assert_eq!(
+                    cached_nongeneric_keyof_type(&fixture.store, plan),
+                    Err(error)
+                );
+                assert_eq!(
+                    resolve_nongeneric_keyof_type(&mut fixture.store, plan),
+                    Err(error)
+                );
+            }
+            assert_eq!(query_state(&fixture.store), poisoned);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(original)
+                    .unwrap()
+                    .resolved_type,
+                Some(wrong)
+            );
+            assert!(fixture.store.set_type_node_links(original, original_links));
+            for plan in &plans {
+                let result = resolve_nongeneric_keyof_type(&mut fixture.store, plan).unwrap();
+                let restored = query_state(&fixture.store);
+                assert_eq!(
+                    cached_nongeneric_keyof_type(&fixture.store, plan),
+                    Ok(Some(result))
+                );
+                assert_eq!(query_state(&fixture.store), restored);
+            }
+        }
+    }
+
+    #[test]
+    fn source_object_identity_does_not_require_identifier_keys() {
+        let mut fixture = fixture("const value = { '0': 1 };");
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let object = resolve_object_literal(&mut fixture, &[number]);
+        let property = property_symbols(&fixture.store, object)[0];
+        let before = query_state(&fixture.store);
+        assert_eq!(
+            validate_source_object_literal_for_keyof(&fixture.store, object, None),
+            Ok(true)
+        );
+        assert_eq!(
+            validate_source_object_literal_for_keyof(&fixture.store, number, None),
+            Ok(false)
+        );
+        assert_eq!(
+            plan_nongeneric_keyof_type(&fixture.store, object),
+            Err(NongenericKeyofError::UnsupportedPropertyName {
+                target: object,
+                property
+            }),
+        );
+        assert_eq!(query_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn javascript_expando_object_is_not_a_fresh_literal_key_candidate() {
+        let parsed = parse_javascript_source_file("var object = {}; object['if'] = 1;");
+        let file = FileId::new(75_003);
+        let context = checked_context(&parsed, file, CanonicalSourceLanguage::JavaScript);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let object = context
+            .store()
+            .type_node_links(declaration)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let record = context.store().type_payload(object).unwrap();
+        let owner = context.store().symbol(record.symbol().unwrap()).unwrap();
+        assert!(owner.exports().is_some());
+        assert_eq!(
+            record.object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        );
+        let before = query_state(context.store());
+        assert_eq!(
+            validate_source_object_literal_for_keyof(context.store(), object, None),
+            Ok(false)
+        );
+        assert_eq!(
+            plan_nongeneric_keyof_type(context.store(), object),
+            Err(NongenericKeyofError::UnsupportedObject(object))
+        );
+        assert_eq!(query_state(context.store()), before);
+    }
+
+    #[test]
+    fn object_literal_key_plan_retains_array_targets_for_cold_and_warm_queries() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "const value: any = { items: [{ missing: undefined }], a: 'a' };",
+        ));
+        let file = FileId::new(75_002);
+        let mut context = checked_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+        let initializer = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .initializer
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let fresh = context
+            .store()
+            .type_node_links(initializer)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let source_array = context
+            .store()
+            .value_symbol_links(property_symbols(context.store(), fresh)[0])
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let global_types = context.global_types().clone();
+        let array = context
+            .store()
+            .canonical_array_reference(&global_types, source_array)
+            .unwrap()
+            .unwrap();
+        assert!(array.array_literal);
+        let regular = context
+            .store_mut_for_test()
+            .get_regular_type_of_object_literal(fresh)
+            .unwrap();
+        let widened = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(regular, &global_types)
+            .unwrap();
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let before = query_state(context.store());
+        assert_eq!(
+            plan_nongeneric_keyof_type(context.store(), widened),
+            Err(NongenericKeyofError::MalformedObject(widened)),
+        );
+        let plan =
+            plan_nongeneric_keyof_type_with_array_targets(context.store(), widened, Some(targets))
+                .unwrap();
+        assert_eq!(plan.array_targets, Some(targets));
+        assert_eq!(plan.property_names(), ["items", "a"]);
+        assert_eq!(
+            cached_nongeneric_keyof_type(context.store(), &plan),
+            Ok(None)
+        );
+        assert_eq!(query_state(context.store()), before);
+
+        let result = resolve_nongeneric_keyof_type(context.store_mut_for_test(), &plan).unwrap();
+        let warm = query_state(context.store());
+        assert_eq!(
+            cached_nongeneric_keyof_type(context.store(), &plan),
+            Ok(Some(result))
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(context.store_mut_for_test(), &plan),
+            Ok(result)
+        );
+        assert_eq!(query_state(context.store()), warm);
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let wrong_targets = CanonicalArrayTargets::for_test(wrong, targets.readonly_array_type());
+        assert_eq!(
+            plan_nongeneric_keyof_type_with_array_targets(
+                context.store(),
+                widened,
+                Some(wrong_targets)
+            ),
+            Err(NongenericKeyofError::MalformedObject(widened)),
+        );
+        assert_eq!(query_state(context.store()), warm);
+
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .array_literal_types
+                .insert(array.base_type, wrong),
+            Some(source_array),
+        );
+        let poisoned = query_state(context.store());
+        let error = NongenericKeyofError::MalformedObject(widened);
+        assert_eq!(
+            cached_nongeneric_keyof_type(context.store(), &plan),
+            Err(error)
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(context.store_mut_for_test(), &plan),
+            Err(error)
+        );
+        assert_eq!(query_state(context.store()), poisoned);
+        assert_eq!(
+            context
+                .store()
+                .derived_types
+                .array_literal_types
+                .get(&array.base_type),
+            Some(&wrong)
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .array_literal_types
+                .insert(array.base_type, source_array),
+            Some(wrong),
+        );
+        let restored = query_state(context.store());
+        assert_eq!(
+            cached_nongeneric_keyof_type(context.store(), &plan),
+            Ok(Some(result))
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(context.store_mut_for_test(), &plan),
+            Ok(result)
+        );
+        assert_eq!(query_state(context.store()), restored);
     }
 
     #[test]
