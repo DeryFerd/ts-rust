@@ -5242,18 +5242,22 @@ fn resolve_source_call_once(
         Ok(Some(resolution)) => return Ok(ResolvedSourceCall::Method(Box::new(resolution))),
         Ok(None) => {}
         Err(
-            GenericMethodCallError::Direct(DirectCallError::Unsupported(
-                DirectCallUnsupported::UnresolvedReturnType(signature),
-            ))
-            | GenericMethodCallError::Generic(GenericCallVectorError::Unsupported(
-                GenericCallVectorUnsupported::UnresolvedReturnType(signature),
-            ))
-            | GenericMethodCallError::Direct(DirectCallError::Relation(
-                RelationUnavailable::UnresolvedSignatureReturn(signature),
-            ))
-            | GenericMethodCallError::Generic(GenericCallVectorError::Relation(
-                RelationUnavailable::UnresolvedSignatureReturn(signature),
-            ))
+            GenericMethodCallError::Direct(
+                DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
+                    signature,
+                ))
+                | DirectCallError::Relation(RelationUnavailable::UnresolvedSignatureReturn(
+                    signature,
+                )),
+            )
+            | GenericMethodCallError::Generic(
+                GenericCallVectorError::Unsupported(
+                    GenericCallVectorUnsupported::UnresolvedReturnType(signature),
+                )
+                | GenericCallVectorError::Relation(RelationUnavailable::UnresolvedSignatureReturn(
+                    signature,
+                )),
+            )
             | GenericMethodCallError::Relation(RelationUnavailable::UnresolvedSignatureReturn(
                 signature,
             )),
