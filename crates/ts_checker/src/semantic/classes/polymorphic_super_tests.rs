@@ -61,6 +61,26 @@ fn host<'a>(parsed: &'a ParseResult, bound: &'a ts_binder::BoundFile) -> Declare
     .unwrap()
 }
 
+fn mapped_super_identity(
+    store: &CanonicalTypeMapperStore,
+    view: ClassInstanceSuperView,
+) -> (TypeId, TypeMapperId) {
+    let base_this =
+        exact_class_instance_identity(store, view.origin.base_symbol, view.origin.base_instance)
+            .expect("the fixture retains its real base class")
+            .this_type
+            .expect("the base class retains its polymorphic this type");
+    assert_eq!(view.origin.base_this, Some(base_this));
+    let mapper = view
+        .mapper
+        .expect("the class super view retains its mapper");
+    assert_eq!(
+        store.type_mapper_has_exact_endpoints(mapper, &[base_this], &[view.origin.this_type]),
+        Some(true),
+    );
+    (base_this, mapper)
+}
+
 #[test]
 fn class_polymorphic_super_pending_header_and_completed_class_share_the_reference() {
     let parsed =
@@ -130,6 +150,7 @@ fn class_polymorphic_super_pending_header_and_completed_class_share_the_referenc
     .unwrap();
     assert_eq!(view.origin.base_instance, prepared_base.instance_type);
     assert_eq!(view.origin.instance_type, prepared.instance_type);
+    let (base_this, mapper) = mapped_super_identity(context.store(), view);
     let undefined = context
         .store()
         .intrinsic_bootstrap()
@@ -139,7 +160,7 @@ fn class_polymorphic_super_pending_header_and_completed_class_share_the_referenc
         .store_mut_for_test()
         .expression_union_type_with_global_types(
             &globals,
-            &[view.origin.base_this, undefined],
+            &[base_this, undefined],
             UnionReduction::Literal,
         )
         .unwrap();
@@ -147,7 +168,7 @@ fn class_polymorphic_super_pending_header_and_completed_class_share_the_referenc
     let mapped_union = instantiate_type_with_vector_and_session(
         context.store_mut_for_test(),
         base_union,
-        &[view.origin.base_this],
+        &[base_this],
         &[this_type],
         targets,
         &mut InstantiationSession::new(InstantiationLimits::default()),
@@ -159,13 +180,13 @@ fn class_polymorphic_super_pending_header_and_completed_class_share_the_referenc
     assert_eq!(mapped.union.types.len(), 2);
     assert!(mapped.union.types.contains(&this_type));
     assert!(mapped.union.types.contains(&undefined));
-    assert!(!mapped.union.types.contains(&view.origin.base_this));
+    assert!(!mapped.union.types.contains(&base_this));
     assert_eq!(
         instantiated_member_type_matches(
             context.store(),
             base_union,
             mapped_union,
-            view.mapper,
+            mapper,
             targets,
         ),
         Ok(true),
@@ -262,6 +283,7 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
             .store()
             .class_instance_super_view_for_instance(instance)
             .unwrap();
+        let (base_this, _) = mapped_super_identity(context.store(), view);
         let member = context
             .store()
             .symbol(view.origin.base_symbol)
@@ -293,7 +315,7 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
             Poison::ThisArgument => assert!(store.set_type_reference_resolution(
                 view.reference,
                 None,
-                Some(vec![view.origin.base_this])
+                Some(vec![base_this])
             )),
             Poison::ReceiverFlags => assert!(store.set_type_object_flags(
                 view.reference,
@@ -306,7 +328,7 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
             )),
             Poison::MethodMapper => {
                 let mapper = store
-                    .new_type_mapper(vec![view.origin.base_this], vec![view.origin.base_this])
+                    .new_type_mapper(vec![base_this], vec![base_this])
                     .unwrap();
                 assert!(store.set_object_target_and_mapper(
                     retained.type_,
@@ -321,7 +343,7 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
             )),
             Poison::SignatureMapper => {
                 let mapper = store
-                    .new_type_mapper(vec![view.origin.base_this], vec![view.origin.base_this])
+                    .new_type_mapper(vec![base_this], vec![base_this])
                     .unwrap();
                 assert!(store.set_signature_target_and_mapper(
                     instantiated_signature,
@@ -329,10 +351,9 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
                     Some(mapper)
                 ));
             }
-            Poison::SignatureReturn => assert!(store.set_signature_resolved_return_type(
-                instantiated_signature,
-                Some(view.origin.base_this)
-            )),
+            Poison::SignatureReturn => assert!(
+                store.set_signature_resolved_return_type(instantiated_signature, Some(base_this))
+            ),
             Poison::ThisParameterDefault => assert!(store.set_type_parameter_resolution(
                 view.origin.this_type,
                 Some(instance),
@@ -357,12 +378,12 @@ fn class_polymorphic_super_rejects_changed_view_and_signature_provenance() {
                 assert!(store.set_type_reference_resolution(
                     unbranded,
                     None,
-                    Some(vec![view.origin.base_this]),
+                    Some(vec![base_this]),
                 ));
                 assert_eq!(
                     store.insert_object_instantiation(
                         view.origin.base_instance,
-                        type_list_key(&[view.origin.base_this]),
+                        type_list_key(&[base_this]),
                         unbranded,
                     ),
                     Some(unbranded),
@@ -516,6 +537,7 @@ fn class_polymorphic_super_does_not_preserve_an_object_with_mapped_this() {
     let globals = context.global_types().clone();
     let store = context.store_mut_for_test();
     let view = prepare_class_instance_super_view(store, &host, derived, None).unwrap();
+    let (base_this, _) = mapped_super_identity(store, view);
     let template = class_super_member_template(store, &host, view, member).unwrap();
     let returned = template.callable.as_ref().unwrap().return_type.unwrap();
     assert!(
@@ -526,7 +548,7 @@ fn class_polymorphic_super_does_not_preserve_an_object_with_mapped_this() {
     assert!(!class_super_member_type_is_unchanged(
         store,
         returned,
-        view.origin.base_this,
+        base_this,
         Some(CanonicalArrayTargets::from_global_types(&globals)),
     ));
     let snapshot = |store: &CanonicalTypeMapperStore| {
@@ -572,6 +594,7 @@ fn class_polymorphic_super_rejects_a_changed_object_return() {
     let globals = context.global_types().clone();
     let store = context.store_mut_for_test();
     let view = prepare_class_instance_super_view(store, &host, derived, None).unwrap();
+    let (base_this, _) = mapped_super_identity(store, view);
     let member = store
         .symbol(view.origin.base_symbol)
         .unwrap()
@@ -587,7 +610,7 @@ fn class_polymorphic_super_rejects_a_changed_object_return() {
     };
     let property = object.structured.properties.as_ref().unwrap()[0];
     let mut links = store.value_symbol_links(property).unwrap().clone();
-    links.resolved_type = Some(view.origin.base_this);
+    links.resolved_type = Some(base_this);
     assert!(store.set_value_symbol_links(property, links));
     let snapshot = |store: &CanonicalTypeMapperStore| {
         (
