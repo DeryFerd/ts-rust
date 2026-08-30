@@ -59438,6 +59438,54 @@ fn prepare_source_class_parameter(
     Ok(true)
 }
 
+// A header query can leave valid self annotations before source bodies are checked.
+// Reopen only those real same-source owners for the existing preparation query.
+// Every owned scope closes before execution or an error returns to the caller.
+#[allow(clippy::too_many_arguments)] // Retains the existing source and query context.
+fn with_retained_class_annotation_scopes<T>(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    source: SourceFileRef,
+    owners: impl IntoIterator<Item = (NodeRef, SemanticSymbolId)>,
+    query: impl FnOnce(&mut CanonicalTypeMapperStore) -> Result<T, SourceCheckError>,
+) -> Result<T, SourceCheckError> {
+    let context = ClassTypeQueryContext::new(global_types, options);
+    let mut scopes = Vec::new();
+    let result = (|| {
+        for (node, symbol) in owners {
+            let Some(declaration) = store
+                .symbol(symbol)
+                .and_then(|owner| owner.value_declaration())
+            else {
+                continue;
+            };
+            if !declaration.is_for(source.node_ref().arena, source.file()) {
+                continue;
+            }
+            scopes
+                .try_reserve(1)
+                .map_err(|_| SourceCheckError::Class(node))?;
+            if let Some(instance) = super::classes::begin_retained_source_class_annotations(
+                store, host, &context, symbol,
+            )
+            .map_err(|error| SourcePlanner::class_plan_error(node, error))?
+            {
+                scopes.push((node, instance));
+            }
+        }
+        query(store)
+    })();
+    let mut cleanup_error = None;
+    for (node, instance) in scopes.into_iter().rev() {
+        if !store.end_source_class_annotation_scope(instance) {
+            cleanup_error.get_or_insert(SourceCheckError::Class(node));
+        }
+    }
+    cleanup_error.map_or(result, Err)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -59466,41 +59514,64 @@ pub(super) fn check_source_file(
     }
 
     let mut prepared_class_parameters = HashSet::new();
-    let plan = loop {
-        match SourcePlanner::new_semantic_with_global_types(
-            arena,
-            bound,
-            source,
-            store,
-            host,
-            global_types,
-            options,
-        )
-        .finish()
-        {
-            Ok(plan) => break plan,
-            Err(error) => {
-                if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
-                    error
-                    && !prepared_class_parameters.insert(annotation)
-                {
-                    return Err(error);
-                }
-                if !prepare_source_class_parameter(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    error,
-                )? {
-                    return Err(error);
+    let class_header_owners = host
+        .node(source.node_ref())
+        .and_then(|record| match &record.data {
+            NodeData::SourceFile(data) => Some(&data.statements.nodes),
+            _ => None,
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|&node| {
+            let declaration = NodeRef::new(source.node_ref().arena, source.file(), node);
+            host.node(declaration)
+                .filter(|record| record.kind == SyntaxKind::ClassDeclaration)
+                .and_then(|_| bound.symbol(declaration))
+                .map(|symbol| (declaration, symbol))
+        });
+    let plan = with_retained_class_annotation_scopes(
+        store,
+        host,
+        global_types,
+        options,
+        source,
+        class_header_owners,
+        |store| loop {
+            match SourcePlanner::new_semantic_with_global_types(
+                arena,
+                bound,
+                source,
+                store,
+                host,
+                global_types,
+                options,
+            )
+            .finish()
+            {
+                Ok(plan) => break Ok(plan),
+                Err(error) => {
+                    if let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(annotation)) =
+                        error
+                        && !prepared_class_parameters.insert(annotation)
+                    {
+                        return Err(error);
+                    }
+                    if !prepare_source_class_parameter(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        error,
+                    )? {
+                        return Err(error);
+                    }
                 }
             }
-        }
-    };
+        },
+    )?;
     let SourceCheckPlan {
         statements,
         value_imports,
@@ -60360,36 +60431,47 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::SourceClass(class) => {
-                for annotation in class_source_annotation_nodes(class)? {
-                    if class.source.annotation_nodes().contains(&annotation) {
-                        super::type_nodes::preflight_source_class_annotation(
-                            store,
-                            host,
-                            global_types,
-                            options.into(),
-                            annotation,
-                            class.source.symbol(),
-                        )?;
-                        continue;
-                    }
-                    session.reset_query();
-                    CanonicalTypeQuery::new_with_global_types_and_session(
-                        store,
-                        host,
-                        global_types,
-                        options,
-                        session,
-                        &mut type_import_preflight_diagnostics,
-                    )?
-                    .with_type_reference_alias_targets(
-                        type_import_capabilities
-                            .get(&annotation)
-                            .map_or([].as_slice(), Vec::as_slice)
-                            .iter()
-                            .copied(),
-                    )?
-                    .preflight_type_from_type_node(annotation)?;
-                }
+                with_retained_class_annotation_scopes(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    source,
+                    [(class.source.declaration(), class.source.symbol())],
+                    |store| {
+                        for annotation in class_source_annotation_nodes(class)? {
+                            if class.source.annotation_nodes().contains(&annotation) {
+                                super::type_nodes::preflight_source_class_annotation(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options.into(),
+                                    annotation,
+                                    class.source.symbol(),
+                                )?;
+                                continue;
+                            }
+                            session.reset_query();
+                            CanonicalTypeQuery::new_with_global_types_and_session(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                &mut type_import_preflight_diagnostics,
+                            )?
+                            .with_type_reference_alias_targets(
+                                type_import_capabilities
+                                    .get(&annotation)
+                                    .map_or([].as_slice(), Vec::as_slice)
+                                    .iter()
+                                    .copied(),
+                            )?
+                            .preflight_type_from_type_node(annotation)?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             PlannedStatement::GenericInterface(interface) => {
                 for annotation in interface.property_type_nodes().chain(
@@ -61127,16 +61209,28 @@ pub(super) fn check_source_file(
         .filter(|construction| construction.requires_early_preparation())
         .cloned()
         .collect::<Vec<_>>();
-    prepare_direct_default_news(
+    with_retained_class_annotation_scopes(
         store,
         host,
         global_types,
         options,
-        session,
-        diagnostics,
-        &early_default_news,
-    )
-    .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
+        source,
+        early_default_news
+            .iter()
+            .map(|construction| (construction.node(), construction.resolved_symbol())),
+        |store| {
+            prepare_direct_default_news(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &early_default_news,
+            )
+            .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))
+        },
+    )?;
 
     let materialized_overloads = materialize_source_overloads(
         store,
@@ -61852,16 +61946,28 @@ pub(super) fn check_source_file(
         inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
-    prepare_direct_default_news(
+    with_retained_class_annotation_scopes(
         store,
         host,
         global_types,
         options,
-        session,
-        diagnostics,
-        &default_news,
-    )
-    .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
+        source,
+        default_news
+            .iter()
+            .map(|construction| (construction.node(), construction.resolved_symbol())),
+        |store| {
+            prepare_direct_default_news(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &default_news,
+            )
+            .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))
+        },
+    )?;
     for statement in statements {
         session.reset_query();
         match statement {
@@ -68597,6 +68703,168 @@ mod tests {
             options,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn source_class_header_retry_closes_prior_scope_when_later_header_is_damaged() {
+        let source = parsed(concat!(
+            "class First { next: First | null = null; constructor(value: First | null) {} }\n",
+            "class Second { next: Second | null = null; constructor(value: Second | null) {} }\n",
+        ));
+        let file = FileId::new(202_482);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], options);
+        let bound = context.file(file).unwrap().1.clone();
+        let declarations = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = declarations.as_slice() else {
+            unreachable!()
+        };
+        let owners = [
+            bound.symbol(*first).unwrap(),
+            bound.symbol(*second).unwrap(),
+        ];
+        let first_members = context.get_nongeneric_class_members(owners[0]).unwrap();
+        let second_members = context.get_nongeneric_class_members(owners[1]).unwrap();
+        let instances = [
+            first_members.shells().instance_type(),
+            second_members.shells().instance_type(),
+        ];
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let source_file = context.source_file(file).unwrap();
+        let before = observable_state(&context, file);
+        let mut entered = false;
+        with_retained_class_annotation_scopes(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            source_file,
+            [(*first, owners[0])],
+            |store| {
+                entered = true;
+                assert_eq!(
+                    super::super::classes::source_class_annotation_scope_targets(
+                        store,
+                        instances[0]
+                    ),
+                    Some(CanonicalArrayTargets::from_global_types(&globals))
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(entered);
+        assert_eq!(observable_state(&context, file), before);
+        let property = context
+            .store()
+            .symbol_table(second_members.instance_members().unwrap())
+            .unwrap()
+            .get_source("next")
+            .unwrap();
+        let declaration = context
+            .store()
+            .symbol(property)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::PropertyDeclaration(property) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, property.type_.unwrap());
+        let original = context.store().type_node_links(annotation).unwrap().clone();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let damaged = TypeNodeLinks {
+            resolved_type: Some(wrong),
+            ..TypeNodeLinks::default()
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, damaged.clone())
+        );
+        let retained = owners.map(|owner| {
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .unwrap()
+                .clone()
+        });
+        let poisoned = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Class(*second))
+            );
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert_eq!(context.store().type_node_links(annotation), Some(&damaged));
+            for (owner, instance, provenance) in [
+                (owners[0], instances[0], &retained[0]),
+                (owners[1], instances[1], &retained[1]),
+            ] {
+                assert!(
+                    context
+                        .store()
+                        .source_class_annotation_scope(instance)
+                        .is_none()
+                );
+                assert_eq!(
+                    context.store().source_class_provenance_for_symbol(owner),
+                    Some(provenance)
+                );
+            }
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(annotation, original)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        assert_eq!(
+            context.get_nongeneric_class_members(owners[0]).unwrap(),
+            first_members
+        );
+        assert_eq!(
+            context.get_nongeneric_class_members(owners[1]).unwrap(),
+            second_members
+        );
+        let completed = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), completed);
+        for instance in instances {
+            assert!(
+                context
+                    .store()
+                    .source_class_annotation_scope(instance)
+                    .is_none()
+            );
+        }
     }
 
     fn context_with_declaration_facts(

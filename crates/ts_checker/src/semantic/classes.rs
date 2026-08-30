@@ -89,9 +89,9 @@ use std::collections::{HashMap, HashSet};
 mod annotations;
 mod query;
 pub(super) use annotations::{
-    SourceClassAnnotationScope, begin_source_class_annotations, class_instance_type_edges,
-    completed_class_symbol, source_class_annotation_is_owned,
-    source_class_annotation_scope_targets,
+    SourceClassAnnotationScope, begin_retained_source_class_annotations,
+    begin_source_class_annotations, class_instance_type_edges, completed_class_symbol,
+    source_class_annotation_is_owned, source_class_annotation_scope_targets,
 };
 pub(super) use query::{
     ClassValueQuery, class_query_reference_symbol, selected_class_method_return_type,
@@ -2725,7 +2725,7 @@ pub(super) fn prepare_source_class_constructor_header(
     session: &mut super::instantiate::InstantiationSession,
     diagnostics: &mut super::CanonicalCheckerDiagnostics,
     plan: &SourceClassPlan,
-) -> Result<PreparedSourceClass, ClassError> {
+) -> Result<ClassMembers, ClassError> {
     let scope = begin_source_class_annotations(store, host, globals, plan)?;
     let result = (|| {
         for &annotation in plan.annotation_nodes() {
@@ -2747,7 +2747,17 @@ pub(super) fn prepare_source_class_constructor_header(
             session,
             diagnostics,
             plan,
-        )
+        )?;
+        // Constructor projection also replays the source annotations. Keep it
+        // inside the owner scope while initialized fields are still pending.
+        if plan.has_constructor_overloads() {
+            source_class_constructor_overloads(store, host, plan.symbol())?
+                .map(|constructors| constructors.members)
+        } else {
+            source_class_single_constructor(store, host, plan.symbol())?
+                .map(|constructor| constructor.members)
+        }
+        .ok_or_else(|| invariant(ClassInvariant::InvalidConstructSignature(plan.symbol())))
     })();
     if let Some(instance) = scope
         && !store.end_source_class_annotation_scope(instance)
