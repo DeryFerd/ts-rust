@@ -1,4 +1,4 @@
-//! Lazy members for generic-interface references and property-object aliases.
+//! Lazy members for generic references and property-object aliases.
 //!
 //! This is the declared-member prefix of pinned `resolveTypeReferenceMembers`,
 //! `resolveObjectTypeMembers`, `instantiateSymbolTable`, and
@@ -32,6 +32,10 @@ use super::{
     callables::{
         CallableFamily, ValidatedSingleCallParameterDisplay, ValidatedSingleCallSignatureDisplay,
         ValidatedSingleCallable,
+    },
+    classes::{
+        ClassConstructorVisibility, ClassHeritageMembersValidation, class_member_visibility,
+        validate_class_heritage_members,
     },
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     declared_values::{SelectedDeclaredProperty, selected_source_property_object_property},
@@ -1650,8 +1654,8 @@ impl CanonicalTypeMapperStore {
         )
     }
 
-    /// Resolves the declared member surface of one direct generic interface
-    /// reference, including the canonical target identity.
+    /// Resolves declared members of one direct generic interface or public
+    /// class-field reference, including the canonical target identity.
     ///
     /// The target must already own a fully resolved declared member surface.
     /// This store-level adapter intentionally does not parse or publish that
@@ -1660,7 +1664,7 @@ impl CanonicalTypeMapperStore {
     /// # Errors
     ///
     /// Returns [`GenericInterfaceMemberError`] for a foreign identity,
-    /// malformed or poisoned cache, nonlocal/merged/class target, unsupported
+    /// malformed or poisoned cache, an unsupported target, unsupported
     /// member or property type, or capacity failure. A rejected cold query
     /// publishes no transient property symbol, table, or structured-member
     /// cache. Failed instantiation can retain type and mapper identities.
@@ -6750,6 +6754,9 @@ fn validate_shape(
         }
     }
     let direct = validate_direct_generic_reference(store, reference)?;
+    let class_target = store
+        .type_payload(direct.target)
+        .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS));
     let mut active = Vec::new();
     let mut validated = HashSet::new();
     let (_, source_parameters, _, properties, index_infos) = validate_declared_target(
@@ -6785,13 +6792,19 @@ fn validate_shape(
         inherited_index_infos: Vec::new(),
         inherited_members_ready: false,
     };
+    if class_target && reference == shape.target {
+        // The class producer already published the original field symbols.
+        for property in &mut shape.properties {
+            property.requires_proxy = false;
+        }
+    }
     if let Some((properties, indexes)) = cached_inherited_properties(store, &shape, array_targets)?
     {
         shape.inherited_properties = properties;
         shape.inherited_index_infos = indexes;
         shape.inherited_members_ready = true;
     }
-    if reference != shape.target {
+    if reference != shape.target && !class_target {
         let mut target_shape = GenericInterfaceShape {
             reference: shape.target,
             target: shape.target,
@@ -6824,12 +6837,6 @@ fn validate_declared_target(
     heritage_start: usize,
     validated: &mut HashSet<TypeId>,
 ) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
-    if store
-        .type_payload(target)
-        .is_some_and(|record| record.object_flags().contains(ObjectFlags::CLASS))
-    {
-        return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
-    }
     if validated.contains(&target) {
         return declared_target_header(store, target);
     }
@@ -6847,9 +6854,10 @@ fn validate_declared_target(
     else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
-    if declarations
-        .iter()
-        .any(|declaration| !valid_generic_interface_declaration_owner(store, owner, *declaration))
+    if !owner_record.flags().contains(SymbolFlags::CLASS)
+        && declarations.iter().any(|declaration| {
+            !valid_generic_interface_declaration_owner(store, owner, *declaration)
+        })
     {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     }
@@ -7192,6 +7200,9 @@ fn declared_target_header(
     let record = store
         .type_payload(target)
         .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    if record.object_flags().contains(ObjectFlags::CLASS) {
+        return declared_class_field_target_header(store, target);
+    }
     let TypeData::Interface(interface) = record.data() else {
         return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
     };
@@ -7586,6 +7597,165 @@ fn declared_target_header(
         declared_members,
         properties,
         index_infos,
+    ))
+}
+
+/// Selects a real class reference without treating malformed class caches as another family.
+pub(super) fn class_reference_field_target(
+    store: &CanonicalTypeMapperStore,
+    reference: TypeId,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    let record = store
+        .type_payload(reference)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference))?;
+    let TypeData::TypeReference(data) = record.data() else {
+        return Ok(None);
+    };
+    let class_owner = record
+        .symbol()
+        .and_then(|owner| store.symbol(owner))
+        .is_some_and(|owner| owner.flags().contains(SymbolFlags::CLASS));
+    let class_target = data
+        .object
+        .target
+        .and_then(|target| store.type_payload(target))
+        .is_some_and(|target| target.object_flags().contains(ObjectFlags::CLASS));
+    if !class_owner && !class_target {
+        return Ok(None);
+    }
+    let direct = validate_direct_generic_reference(store, reference)?;
+    declared_class_field_target_header(store, direct.target)?;
+    Ok(Some(direct.target))
+}
+
+#[allow(clippy::too_many_lines)] // Source order and completed class identity are one target proof.
+fn declared_class_field_target_header(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+) -> Result<DeclaredTargetHeader, GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidTarget(target);
+    let unsupported = || GenericInterfaceMemberError::UnsupportedTarget(target);
+    let direct = validate_direct_generic_reference(store, target)?;
+    if direct.target != target {
+        return Err(invalid());
+    }
+    let record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    let owner = record.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if owner_record.flags() != SymbolFlags::CLASS {
+        return Err(unsupported());
+    }
+    let [declaration] = owner_record.declarations().ok_or_else(invalid)? else {
+        return Err(invalid());
+    };
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Err(
+            if !interface.declared_members_resolved
+                && !interface.base_types_resolved
+                && interface.declared_members.is_none()
+                && interface.declared_call_signatures.is_none()
+                && interface.declared_construct_signatures.is_none()
+                && interface.declared_index_infos.is_none()
+                && interface.resolved_base_types.is_none()
+                && interface.reference.object.structured == StructuredTypeData::default()
+            {
+                unsupported()
+            } else {
+                invalid()
+            },
+        );
+    }
+    if validate_class_heritage_members(store, target) != ClassHeritageMembersValidation::Valid {
+        return Err(invalid());
+    }
+    if interface.resolved_base_types.is_some()
+        || interface.declared_index_infos.is_some()
+        || store.direct_class_heritage_provenance(target).is_some()
+    {
+        return Err(unsupported());
+    }
+    let mut parameter_nodes = Vec::new();
+    for child in store
+        .source_direct_children(*declaration)
+        .ok_or_else(invalid)?
+    {
+        match store.source_node_kind(child).ok_or_else(invalid)? {
+            SyntaxKind::HeritageClause => return Err(unsupported()),
+            SyntaxKind::TypeParameter => parameter_nodes.push(child),
+            _ => {}
+        }
+    }
+    parameter_nodes.sort_unstable_by_key(|node| store.source_node_start(*node));
+    if parameter_nodes.len() != direct.type_arguments.len() {
+        return Err(invalid());
+    }
+    for (&parameter, &type_) in parameter_nodes.iter().zip(&direct.type_arguments) {
+        let symbol = store
+            .source_declaration_symbol(parameter)
+            .ok_or_else(invalid)?;
+        if cached_ordinary_type_parameter_owner(store, type_) != Some(symbol)
+            || store.get_parent_of_symbol(symbol) != Some(owner)
+            || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(*declaration))
+        {
+            return Err(invalid());
+        }
+    }
+    let declared_members = interface.declared_members;
+    let mut properties = Vec::new();
+    for &symbol in interface
+        .reference
+        .object
+        .structured
+        .properties
+        .as_deref()
+        .unwrap_or_default()
+    {
+        let property = store.symbol(symbol).ok_or_else(invalid)?;
+        let property_declaration = property.value_declaration().ok_or_else(invalid)?;
+        if property
+            .flags()
+            .without(SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+            != SymbolFlags::NONE
+            || !property.flags().contains(SymbolFlags::PROPERTY)
+            || property.name().is_private_identifier()
+            || property.name().is_reserved_member_name()
+            || property.name().is_late_bound()
+            || store.source_node_kind(property_declaration) != Some(SyntaxKind::PropertyDeclaration)
+            || class_member_visibility(store, property_declaration)
+                != ClassConstructorVisibility::Public
+        {
+            return Err(GenericInterfaceMemberError::UnsupportedMember(symbol));
+        }
+        if property.parent() != Some(owner)
+            || store.source_node_parent(property_declaration)
+                != Some(SourceNodeParent::Parent(*declaration))
+        {
+            return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+        }
+        let type_ = store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
+        properties.push(DeclaredProperty {
+            symbol,
+            name: property.name().to_owned(),
+            type_,
+            requires_proxy: false,
+            method: false,
+        });
+    }
+    Ok((
+        owner,
+        direct.type_arguments,
+        declared_members,
+        properties,
+        Vec::new(),
     ))
 }
 
@@ -8913,6 +9083,549 @@ mod tests {
             .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
             .unwrap();
         context.get_type_from_type_node(annotation).unwrap()
+    }
+
+    fn class_field_owner(
+        parsed: &ParseResult,
+        file: FileId,
+        context: &CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(class.name?)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let raw = context.file(file).unwrap().1.symbol(node).unwrap();
+        context.store().get_merged_symbol(raw).unwrap()
+    }
+
+    #[test]
+    fn class_reference_fields_require_the_class_producer_and_keep_values_lazy() {
+        let parsed = parse_source_file("class Box<T> { value!: T; fixed!: number; }");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(202_501);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let cold = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_members_with_array_targets_and_session(
+                    context.store_mut_for_test(),
+                    reference,
+                    None,
+                    &mut session
+                ),
+                Err(GenericInterfaceMemberError::UnsupportedTarget(target))
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), cold);
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&StructuredTypeData::default())
+            );
+        }
+        let class = context.get_nongeneric_class_members(owner).unwrap();
+        assert_eq!(class.shells().instance_type(), target);
+        let source = class.instance_properties()[0];
+        let fixed = class.instance_properties()[1];
+        let TypeData::Interface(origin) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the class owns the real generic origin")
+        };
+        let origin = origin.clone();
+        let parameter = origin.reference.resolved_type_arguments.as_deref().unwrap()[0];
+        let this = origin.this_type.unwrap();
+        let origin_links = context.store().value_symbol_links(source).cloned().unwrap();
+        assert_eq!(origin_links.resolved_type, Some(parameter));
+        let members = resolve_members_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            reference,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        let proxy = members.properties()[0];
+        assert_ne!(proxy, source);
+        assert_eq!(members.properties()[1], fixed);
+        let mapper = members.mapper().unwrap();
+        assert_eq!(
+            context.store().type_mapper_has_exact_endpoints(
+                mapper,
+                &[parameter, this],
+                &[string, reference]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            context.store().value_symbol_links(proxy),
+            Some(&ValueSymbolLinks {
+                target: Some(source),
+                mapper: Some(mapper),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                reference,
+                proxy,
+                None,
+                &mut session
+            ),
+            Ok(string)
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                reference,
+                fixed,
+                None,
+                &mut session
+            ),
+            Ok(number)
+        );
+        assert_eq!(session.query_count(), 1);
+        assert_eq!(
+            context.store().value_symbol_links(source),
+            Some(&origin_links)
+        );
+        assert!(
+            matches!(context.store().type_payload(target).unwrap().data(), TypeData::Interface(actual) if actual == &origin)
+        );
+        let warm = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_members_with_array_targets_and_session(
+                    context.store_mut_for_test(),
+                    reference,
+                    None,
+                    &mut session
+                ),
+                Ok(members.clone())
+            );
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), warm);
+            assert_eq!(session.query_count(), 1);
+        }
+        let own = resolve_members_with_array_targets_and_session(
+            context.store_mut_for_test(),
+            target,
+            None,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(own.properties(), class.instance_properties());
+        assert_eq!(own.mapper(), None);
+        assert_eq!(property_recovery_store_counts(context.store()), warm);
+    }
+
+    #[test]
+    fn class_reference_fields_reject_and_restore_source_proxy_and_mapper_caches() {
+        for poison in 0..4 {
+            let parsed = parse_source_file("class Box<T> { value!: T; fixed!: number; }");
+            let file = FileId::new(202_502);
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let owner = class_field_owner(&parsed, file, &context, "Box");
+            let class = context.get_nongeneric_class_members(owner).unwrap();
+            let target = class.shells().instance_type();
+            let source = class.instance_properties()[0];
+            let fixed = class.instance_properties()[1];
+            let annotation = context
+                .store()
+                .symbol(source)
+                .unwrap()
+                .value_declaration()
+                .and_then(|node| context.store().source_direct_type_annotation(node))
+                .unwrap();
+            let original_annotation = context
+                .store()
+                .type_node_links(annotation)
+                .cloned()
+                .unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let reference = context
+                .store_mut_for_test()
+                .create_direct_generic_reference_type(target, &[string])
+                .unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let members = resolve_members_with_array_targets_and_session(
+                context.store_mut_for_test(),
+                reference,
+                None,
+                &mut session,
+            )
+            .unwrap();
+            let proxy = members.properties()[0];
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            let original_links = context.store().value_symbol_links(proxy).cloned().unwrap();
+            let mut links = original_links.clone();
+            let expected = match poison {
+                0 => {
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                    GenericInterfaceMemberError::InvalidTarget(target)
+                }
+                1 => {
+                    let TypeData::Interface(origin) =
+                        context.store().type_payload(target).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let sources = origin.all_type_parameters.clone().unwrap();
+                    links.mapper = context
+                        .store_mut_for_test()
+                        .new_type_mapper(sources, vec![number, reference]);
+                    assert!(links.mapper.is_some());
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(proxy, links)
+                    );
+                    GenericInterfaceMemberError::InvalidCachedMembers(reference)
+                }
+                2 => {
+                    links.target = Some(fixed);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(proxy, links)
+                    );
+                    GenericInterfaceMemberError::InvalidCachedProperty(proxy)
+                }
+                3 => {
+                    links.resolved_type = Some(number);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(proxy, links)
+                    );
+                    GenericInterfaceMemberError::InvalidCachedProperty(proxy)
+                }
+                _ => unreachable!(),
+            };
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().relation_state_snapshot(),
+                    context.store().type_node_links(annotation).cloned(),
+                    context.store().value_symbol_links(proxy).cloned(),
+                    context.store().value_symbol_links(source).cloned(),
+                )
+            };
+            let poisoned = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_interface_members(context.store(), reference, None),
+                    Err(expected.clone())
+                );
+                assert_eq!(
+                    demand_instantiated_property_type(
+                        context.store_mut_for_test(),
+                        reference,
+                        proxy,
+                        None,
+                        &mut session
+                    ),
+                    Err(expected.clone())
+                );
+                assert_eq!(snapshot(&context), poisoned);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(annotation, original_annotation)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(proxy, original_links)
+            );
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            assert_eq!(
+                validate_generic_interface_members(context.store(), reference, None),
+                Ok(Some(members))
+            );
+            let restored = snapshot(&context);
+            assert_eq!(
+                demand_instantiated_property_type(
+                    context.store_mut_for_test(),
+                    reference,
+                    proxy,
+                    None,
+                    &mut session
+                ),
+                Ok(string)
+            );
+            assert_eq!(snapshot(&context), restored);
+        }
+    }
+
+    #[test]
+    fn class_reference_fields_compare_substituted_members_and_replay() {
+        let parsed = parse_source_file(concat!(
+            "class Box<T> { value!: T; fixed!: number; } ",
+            "declare const text: Box<string>; declare const count: Box<number>;",
+        ));
+        let file = FileId::new(202_506);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let text = property_object_alias_variable_type(&parsed, file, &mut context, "text");
+        let count = property_object_alias_variable_type(&parsed, file, &mut context, "count");
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let source = context
+            .get_nongeneric_class_members(owner)
+            .unwrap()
+            .instance_properties()[0];
+        let source_links = context.store().value_symbol_links(source).cloned().unwrap();
+        assert_eq!(context.is_type_assignable_to(text, count), Ok(false));
+        assert_eq!(context.is_type_assignable_to(count, text), Ok(false));
+        assert_eq!(context.is_type_assignable_to(text, text), Ok(true));
+        assert_eq!(context.is_type_assignable_to(count, count), Ok(true));
+        let warm = (
+            property_recovery_store_counts(context.store()),
+            context.store().relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.is_type_assignable_to(text, count), Ok(false));
+            assert_eq!(context.is_type_assignable_to(count, text), Ok(false));
+            assert_eq!(context.is_type_assignable_to(text, text), Ok(true));
+            assert_eq!(context.is_type_assignable_to(count, count), Ok(true));
+            assert_eq!(
+                context.store().value_symbol_links(source),
+                Some(&source_links)
+            );
+            assert_eq!(
+                (
+                    property_recovery_store_counts(context.store()),
+                    context.store().relation_state_snapshot()
+                ),
+                warm
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn class_reference_fields_keep_the_callers_instantiation_budget() {
+        let parsed = parse_source_file("class Box<T> { value!: T; }");
+        let file = FileId::new(202_503);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = class_field_owner(&parsed, file, &context, "Box");
+        let class = context.get_nongeneric_class_members(owner).unwrap();
+        let target = class.shells().instance_type();
+        let source = class.instance_properties()[0];
+        let template = context
+            .store()
+            .value_symbol_links(source)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (string, number, error) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.error_type,
+        );
+        let store = context.store_mut_for_test();
+        let first = store
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let second = store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 1,
+                ..InstantiationLimits::default()
+            },
+            error,
+        )
+        .unwrap();
+        let first_members =
+            resolve_members_with_array_targets_and_session(store, first, None, &mut session)
+                .unwrap();
+        let second_members =
+            resolve_members_with_array_targets_and_session(store, second, None, &mut session)
+                .unwrap();
+        assert_eq!(session.query_count(), 0);
+        assert_eq!(
+            demand_instantiated_property_type(
+                store,
+                first,
+                first_members.properties()[0],
+                None,
+                &mut session
+            ),
+            Ok(string)
+        );
+        assert_eq!(session.query_count(), 1);
+        let mark = session.limit_event_mark();
+        let proxy = second_members.properties()[0];
+        assert_eq!(
+            demand_instantiated_property_type(store, second, proxy, None, &mut session),
+            Ok(error)
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert!(store.instantiated_property_recovery(proxy).is_some());
+        assert_eq!(
+            store.value_symbol_links(source).unwrap().resolved_type,
+            Some(template)
+        );
+        let warm = property_recovery_store_counts(store);
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            demand_instantiated_property_type(store, second, proxy, None, &mut session),
+            Ok(error)
+        );
+        assert!(!session.limit_event_occurred_since(mark));
+        assert_eq!((session.query_count(), session.total_count()), (1, 1));
+        assert_eq!(property_recovery_store_counts(store), warm);
+    }
+
+    #[test]
+    fn class_reference_fields_keep_methods_private_fields_and_heritage_unsupported() {
+        for source in [
+            "class Box<T> { value!: T; method(): void {} }",
+            "class Box<T> { private value!: T; }",
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(202_504);
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            let owner = class_field_owner(&parsed, file, &context, "Box");
+            let class = context.get_nongeneric_class_members(owner).unwrap();
+            let target = class.shells().instance_type();
+            let rejected = *class.instance_properties().last().unwrap();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let reference = context
+                .store_mut_for_test()
+                .create_direct_generic_reference_type(target, &[string])
+                .unwrap();
+            let cold = property_recovery_store_counts(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    context
+                        .store_mut_for_test()
+                        .resolve_generic_interface_members(reference, None),
+                    Err(GenericInterfaceMemberError::UnsupportedMember(rejected))
+                );
+                assert_eq!(property_recovery_store_counts(context.store()), cold);
+                assert_eq!(
+                    context
+                        .store()
+                        .type_payload(reference)
+                        .unwrap()
+                        .data()
+                        .structured(),
+                    Some(&StructuredTypeData::default())
+                );
+            }
+        }
+        let parsed =
+            parse_source_file("class Base<T> { value!: T; } class Derived<U> extends Base<U> {}");
+        let file = FileId::new(202_505);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let base = class_field_owner(&parsed, file, &context, "Base");
+        let derived = class_field_owner(&parsed, file, &context, "Derived");
+        context.get_nongeneric_class_members(base).unwrap();
+        let target = context.get_declared_type_of_symbol(derived).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let heritage = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, base.expression))
+            })
+            .unwrap();
+        let cold = property_recovery_store_counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_nongeneric_class_members(derived),
+                Err(crate::semantic::ClassError::Unsupported(
+                    crate::semantic::ClassUnsupported::Heritage(heritage)
+                ))
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_members(reference, None),
+                Err(GenericInterfaceMemberError::UnsupportedTarget(target))
+            );
+            assert_eq!(property_recovery_store_counts(context.store()), cold);
+            assert_eq!(
+                context
+                    .store()
+                    .type_payload(reference)
+                    .unwrap()
+                    .data()
+                    .structured(),
+                Some(&StructuredTypeData::default())
+            );
+        }
     }
 
     #[test]

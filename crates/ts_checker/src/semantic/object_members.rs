@@ -211,7 +211,8 @@ pub(super) fn resolve_object_property_by_key(
             .filter(|target| {
                 store.type_payload(*target).is_some_and(|target| {
                     matches!(target.data(), TypeData::Interface(_))
-                        && !target.object_flags().contains(ObjectFlags::CLASS)
+                        && (!target.object_flags().contains(ObjectFlags::CLASS)
+                            || matches!(record.data(), TypeData::TypeReference(_)))
                 })
             })
             .map(|_| receiver)

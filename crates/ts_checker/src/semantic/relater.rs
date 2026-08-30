@@ -55,8 +55,9 @@ use super::{
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiate::{InstantiationLimits, InstantiationSession},
     instantiated_members::{
-        GenericInterfaceMemberError, demand_instantiated_property_type,
-        resolve_members_with_array_targets_and_session, validate_generic_interface_members,
+        GenericInterfaceMemberError, class_reference_field_target,
+        demand_instantiated_property_type, resolve_members_with_array_targets_and_session,
+        validate_generic_interface_members,
         validate_property_object_alias_members_with_array_targets,
     },
     intersection_types::IntersectionTypeProjection,
@@ -6170,6 +6171,31 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::Symbol(global_object))
     }
 
+    fn class_field_reference_target(
+        &self,
+        type_id: TypeId,
+    ) -> Result<Option<TypeId>, RelationUnavailable> {
+        class_reference_field_target(self.store, type_id).map_err(|error| match error {
+            GenericInterfaceMemberError::UnsupportedTarget(_)
+            | GenericInterfaceMemberError::UnsupportedPropertyType(_) => {
+                RelationUnavailable::UnsupportedStructuredType(type_id)
+            }
+            GenericInterfaceMemberError::UnsupportedMember(symbol) => {
+                RelationUnavailable::UnsupportedProperty(symbol)
+            }
+            GenericInterfaceMemberError::Capacity(_) => {
+                RelationUnavailable::UnionValidationCapacity(type_id)
+            }
+            GenericInterfaceMemberError::Reference(_)
+            | GenericInterfaceMemberError::InvalidTarget(_)
+            | GenericInterfaceMemberError::InvalidMember(_)
+            | GenericInterfaceMemberError::InvalidCachedMembers(_)
+            | GenericInterfaceMemberError::InvalidCachedProperty(_) => {
+                RelationUnavailable::InvalidStructuredMembers(type_id)
+            }
+        })
+    }
+
     fn property_origin_for_symbol(
         &self,
         symbol: SemanticSymbolId,
@@ -6425,6 +6451,11 @@ impl<'store> RelaterSession<'store> {
                 .ok_or(RelationUnavailable::Symbol(parent))?;
             let allowed_parent_flags = match origin {
                 ObjectPropertyOrigin::ValidatedClass => SymbolFlags::CLASS,
+                ObjectPropertyOrigin::GenericReference(reference)
+                    if self.class_field_reference_target(reference)?.is_some() =>
+                {
+                    SymbolFlags::CLASS
+                }
                 ObjectPropertyOrigin::Declared
                 | ObjectPropertyOrigin::InterfaceHeritage(_)
                 | ObjectPropertyOrigin::GenericReference(_) => {
@@ -6779,6 +6810,7 @@ impl<'store> RelaterSession<'store> {
             return Ok(());
         }
         if record.object_flags().intersects(ObjectFlags::REFERENCE) {
+            let class_reference = self.class_field_reference_target(type_id)?.is_some();
             let reference_target = match record.data() {
                 TypeData::TypeReference(reference) => reference.object.target,
                 TypeData::Interface(interface) => interface.reference.object.target,
@@ -6798,19 +6830,20 @@ impl<'store> RelaterSession<'store> {
                             .and_then(|owner| self.store.symbol(owner))
                             .is_some_and(|owner| owner.flags() == SymbolFlags::INTERFACE)
                 });
-            if !configured_array && interface_target {
-                let source_declared_target = reference_target
-                    .and_then(|target| self.store.type_payload(target))
-                    .and_then(TypeRecord::symbol)
-                    .and_then(|owner| self.store.symbol(owner))
-                    .and_then(ts_binder::semantic::Symbol::declarations)
-                    .is_some_and(|declarations| {
-                        !declarations.is_empty()
-                            && declarations.iter().all(|declaration| {
-                                self.store.source_node_kind(*declaration)
-                                    == Some(SyntaxKind::InterfaceDeclaration)
-                            })
-                    });
+            if !configured_array && (interface_target || class_reference) {
+                let source_declared_target = class_reference
+                    || reference_target
+                        .and_then(|target| self.store.type_payload(target))
+                        .and_then(TypeRecord::symbol)
+                        .and_then(|owner| self.store.symbol(owner))
+                        .and_then(ts_binder::semantic::Symbol::declarations)
+                        .is_some_and(|declarations| {
+                            !declarations.is_empty()
+                                && declarations.iter().all(|declaration| {
+                                    self.store.source_node_kind(*declaration)
+                                        == Some(SyntaxKind::InterfaceDeclaration)
+                                })
+                        });
                 if !source_declared_target {
                     return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
                 }
@@ -7466,6 +7499,7 @@ impl<'store> RelaterSession<'store> {
                 )
             })
             .ok_or(RelationUnavailable::Type(type_id))?;
+        let class_reference = self.class_field_reference_target(type_id)?.is_some();
         let mut property_origin = match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { owner, .. } => {
                 ObjectPropertyOrigin::DerivedObjectLiteral {
@@ -7493,11 +7527,12 @@ impl<'store> RelaterSession<'store> {
                 ObjectPropertyOrigin::InterfaceHeritage(type_id)
             }
             DerivedObjectLiteralValidation::NotDerived
-                if record_object_flags.intersects(ObjectFlags::REFERENCE)
-                    && !record_object_flags.intersects(ObjectFlags::CLASS)
-                    && record_symbol
-                        .and_then(|owner| self.store.symbol(owner))
-                        .is_some_and(|owner| owner.flags() == SymbolFlags::INTERFACE) =>
+                if class_reference
+                    || record_object_flags.intersects(ObjectFlags::REFERENCE)
+                        && !record_object_flags.intersects(ObjectFlags::CLASS)
+                        && record_symbol
+                            .and_then(|owner| self.store.symbol(owner))
+                            .is_some_and(|owner| owner.flags() == SymbolFlags::INTERFACE) =>
             {
                 ObjectPropertyOrigin::GenericReference(type_id)
             }
