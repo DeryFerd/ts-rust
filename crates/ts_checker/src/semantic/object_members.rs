@@ -25571,20 +25571,23 @@ mod generic_publication_tests {
             );
 
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
-            let type_ = query_implicit_interface(&mut fixture, &mut diagnostics).unwrap();
+            let interface_type = query_implicit_interface(&mut fixture, &mut diagnostics).unwrap();
             let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
             let expected_types = [bootstrap.any_type, bootstrap.string_type];
             assert_eq!(
                 validate_resolved_property_types(&fixture.store, &plan, &expected_types),
                 Ok(()),
             );
-            let warm = implicit_property_state(&fixture.store, &plan, type_);
+            let warm = implicit_property_state(&fixture.store, &plan, interface_type);
             for _ in 0..3 {
                 assert_eq!(
                     query_implicit_interface(&mut fixture, &mut diagnostics),
-                    Ok(type_)
+                    Ok(interface_type)
                 );
-                assert_eq!(implicit_property_state(&fixture.store, &plan, type_), warm);
+                assert_eq!(
+                    implicit_property_state(&fixture.store, &plan, interface_type),
+                    warm
+                );
                 assert!(fixture.store.type_node_links(implicit.name_node).is_none());
                 assert!(diagnostics.is_empty());
             }
