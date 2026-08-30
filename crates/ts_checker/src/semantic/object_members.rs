@@ -5838,7 +5838,7 @@ pub(super) fn plan_interface(
                 host,
                 &mut heritage,
                 planned,
-                2,
+                None,
                 preserve_repeated_bases,
             )?;
         }
@@ -5944,9 +5944,7 @@ pub(super) fn plan_interface(
                 kind: SyntaxKind::IndexSignature,
             });
         }
-        if !matches!(heritage.bases.as_slice(), [_] | [_, _])
-            && !super::structured_members::planned_repeated_interface_bases_are_exact(store, &plan)
-        {
+        if !interface_base_sequence_is_supported(store, &plan) {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
@@ -7149,7 +7147,7 @@ fn merge_interface_heritage(
     host: &DeclaredTypeHost<'_>,
     heritage: &mut Option<DirectInterfaceHeritagePlan>,
     planned: DirectInterfaceHeritagePlan,
-    maximum_bases: usize,
+    maximum_bases: Option<usize>,
     preserve_repeated_bases: bool,
 ) -> Result<(), PropertyObjectError> {
     let Some(existing) = heritage.as_mut() else {
@@ -7190,21 +7188,23 @@ fn merge_interface_heritage(
                     && base.type_arguments.is_empty()
                     && base.defaults.is_empty()
             });
-        let has_capacity = if repeated_nongeneric {
-            existing
-                .bases
-                .iter()
-                .any(|previous| previous.symbol == base.symbol)
-                || existing
+        let has_capacity = maximum_bases.is_none_or(|maximum_bases| {
+            if repeated_nongeneric {
+                existing
                     .bases
                     .iter()
-                    .map(|base| base.symbol)
-                    .collect::<HashSet<_>>()
-                    .len()
-                    < maximum_bases
-        } else {
-            existing.bases.len() < maximum_bases
-        };
+                    .any(|previous| previous.symbol == base.symbol)
+                    || existing
+                        .bases
+                        .iter()
+                        .map(|base| base.symbol)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        < maximum_bases
+            } else {
+                existing.bases.len() < maximum_bases
+            }
+        });
         if !has_capacity {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: planned.clause,
@@ -7346,6 +7346,34 @@ fn matching_planned_interface_method_contract(
         })
 }
 
+/// Keeps the same base rules for an interface and every inherited property plan.
+fn interface_base_sequence_is_supported(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> bool {
+    let Some(heritage) = &plan.heritage else {
+        return false;
+    };
+    if matches!(heritage.bases.as_slice(), [_] | [_, _]) {
+        return true;
+    }
+    if heritage.bases.is_empty()
+        || heritage.bases.iter().any(|base| {
+            base.kind != DirectInterfaceBaseKind::Interface
+                || !base.type_arguments.is_empty()
+                || !base.defaults.is_empty()
+        })
+    {
+        return false;
+    }
+    let mut distinct_bases = HashSet::new();
+    !heritage
+        .bases
+        .iter()
+        .any(|base| !distinct_bases.insert(base.symbol))
+        || super::structured_members::planned_repeated_interface_bases_are_exact(store, plan)
+}
+
 fn collect_interface_property_heritage(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -7368,9 +7396,7 @@ fn collect_interface_property_heritage(
     }
 
     if let Some(heritage) = plan.heritage.as_ref() {
-        if !matches!(heritage.bases.as_slice(), [_] | [_, _])
-            && !super::structured_members::planned_repeated_interface_bases_are_exact(store, plan)
-        {
+        if !interface_base_sequence_is_supported(store, plan) {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
@@ -9131,7 +9157,7 @@ pub(super) fn plan_generic_interface_identity(
                     kind: SyntaxKind::HeritageClause,
                 });
             }
-            merge_interface_heritage(store, host, &mut heritage, planned, 2, false)?;
+            merge_interface_heritage(store, host, &mut heritage, planned, Some(2), false)?;
         }
     }
     Ok(GenericInterfaceIdentityPlan {
@@ -9252,7 +9278,7 @@ pub(super) fn plan_generic_interface(
                     kind: SyntaxKind::HeritageClause,
                 });
             }
-            merge_interface_heritage(store, host, &mut heritage, planned, 2, false)?;
+            merge_interface_heritage(store, host, &mut heritage, planned, Some(2), false)?;
         }
 
         let mut current_parameters = Vec::with_capacity(parameters.nodes.len());

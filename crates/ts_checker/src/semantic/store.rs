@@ -10525,9 +10525,9 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     /// Callers stage the edge list and reserve the map slot before mutation.
     /// Every declared-type link is authoritative by the time heritage members
     /// resolve. The first base may be a canonical reference to its declared
-    /// interface. A second distinct base must be a resolved, nongeneric
+    /// interface. Each later distinct base must be a resolved, nongeneric
     /// property-only interface. Repeated bases require the exact nongeneric
-    /// source sequence, with at most two distinct base identities.
+    /// source sequence. More than two edges require nongeneric identities.
     #[allow(clippy::too_many_lines)] // Keep every edge proof before the single publication.
     pub(super) fn publish_direct_interface_heritage_provenance(
         &mut self,
@@ -10562,13 +10562,24 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         if provenance.owner_symbol == first_symbol || !owner_is_exact || !base_is_exact {
             return false;
         }
-        let mut second_base = None;
+        if provenance.bases.len() > 2
+            && std::iter::once(type_)
+                .chain(provenance.bases.iter().map(|(_, base)| *base))
+                .any(|type_| {
+                    !super::structured_members::nongeneric_interface_heritage_type_is_exact(
+                        self, type_,
+                    )
+                })
+        {
+            return false;
+        }
+        let mut distinct_bases = HashMap::from([(first_symbol, first_type)]);
+        let mut distinct_types = HashSet::from([first_type]);
         let mut has_repeated_base = false;
         for &(base_symbol, base_type) in provenance.bases.iter().skip(1) {
-            if (base_symbol, base_type) == (first_symbol, first_type)
-                || second_base == Some((base_symbol, base_type))
-            {
-                if base_type == type_
+            if let Some(previous) = distinct_bases.get(&base_symbol) {
+                if *previous != base_type
+                    || base_type == type_
                     || self
                         .declared_type_links(base_symbol)
                         .is_none_or(|links| links.declared_type != Some(base_type))
@@ -10623,10 +10634,10 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                         && structured.call_signature_count == 0
                         && structured.index_infos.is_none()
                 });
-            if second_base.is_some() || !distinct_base_is_exact {
+            if !distinct_base_is_exact || !distinct_types.insert(base_type) {
                 return false;
             }
-            second_base = Some((base_symbol, base_type));
+            distinct_bases.insert(base_symbol, base_type);
         }
         if has_repeated_base
             && super::structured_members::repeated_nongeneric_interface_base_nodes(

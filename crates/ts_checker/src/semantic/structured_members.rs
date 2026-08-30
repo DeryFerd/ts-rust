@@ -1,6 +1,6 @@
 //! Structured-member publication for direct interface bases.
 //!
-//! One or two distinct bases preserve every repeated source contribution. A
+//! Ordered nongeneric bases preserve every repeated source contribution. A
 //! single base can also provide authenticated index or call signatures.
 //! Shared base properties or methods must have identical types and modifiers.
 //! Compatible derived members replace inherited members; incompatible
@@ -114,6 +114,30 @@ fn planned_base_matches(
     })
 }
 
+/// Checks the existing declared identity without resolving or changing members.
+pub(super) fn nongeneric_interface_heritage_type_is_exact(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return false;
+    };
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    record.flags() == TypeFlags::OBJECT
+        && record.alias().is_none()
+        && store.get_merged_symbol(owner) == Some(owner)
+        && store
+            .declared_type_links(owner)
+            .is_some_and(|links| links.declared_type == Some(type_))
+        && (valid_thisless_interface_identity(interface)
+            || validate_nongeneric_interface_argument_origin(store, type_).is_ok())
+}
+
 /// Retains every repeated nongeneric base edge in global declaration order.
 pub(super) fn repeated_nongeneric_interface_base_nodes(
     store: &CanonicalTypeMapperStore,
@@ -125,7 +149,7 @@ pub(super) fn repeated_nongeneric_interface_base_nodes(
     }
     let expected_count = base_symbols.len();
     let mut nodes = Vec::with_capacity(expected_count);
-    let mut distinct = [None, None];
+    let mut distinct = HashSet::new();
     let mut repeated = false;
     for &declaration in store.symbol(owner)?.declarations()? {
         if store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
@@ -143,19 +167,18 @@ pub(super) fn repeated_nongeneric_interface_base_nodes(
             return None;
         };
         let children = store.source_direct_children(*clause)?;
-        if children.is_empty() || children.len() > 2 {
+        if children.is_empty() {
             return None;
         }
-        let mut previous_base = None;
+        let mut clause_bases = HashSet::new();
         for node in children {
             let base = base_symbols.next()?;
             if owner == base
-                || previous_base == Some(base)
+                || !clause_bases.insert(base)
                 || !authenticated_nongeneric_global_interface_owner(store, base)
             {
                 return None;
             }
-            previous_base = Some(base);
             let base_name = store.symbol(base)?.name().as_utf8()?;
             let expressions = store.source_direct_children(node)?;
             let [expression] = expressions.as_slice() else {
@@ -170,12 +193,8 @@ pub(super) fn repeated_nongeneric_interface_base_nodes(
             {
                 return None;
             }
-            if distinct.contains(&Some(base)) {
+            if !distinct.insert(base) {
                 repeated = true;
-            } else if let Some(slot) = distinct.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(base);
-            } else {
-                return None;
             }
             nodes.push(node);
         }
@@ -233,33 +252,41 @@ fn planned_interface_base_sequence_is_exact(
     if heritage.bases.is_empty() || heritage.bases.len() != base_types.len() {
         return false;
     }
-    let mut distinct: [Option<(SemanticSymbolId, TypeId)>; 2] = [None, None];
+    if base_types.len() > 2
+        && (heritage.bases.iter().any(|base| {
+            base.kind != DirectInterfaceBaseKind::Interface
+                || !base.type_arguments.is_empty()
+                || !base.defaults.is_empty()
+        }) || base_types
+            .iter()
+            .any(|type_| !nongeneric_interface_heritage_type_is_exact(store, *type_)))
+    {
+        return false;
+    }
+    let mut distinct = HashMap::new();
+    let mut distinct_types = HashSet::new();
     let mut repeated = false;
     for (base, &type_) in heritage.bases.iter().zip(base_types) {
         if !planned_base_matches(store, base, type_) {
             return false;
         }
-        let edge = (base.symbol, type_);
-        if let Some(previous) = distinct
-            .iter()
-            .flatten()
-            .find(|(symbol, previous)| *symbol == base.symbol || *previous == type_)
-        {
-            if *previous != edge {
+        if let Some(previous) = distinct.get(&base.symbol) {
+            if *previous != type_ {
                 return false;
             }
             repeated = true;
-        } else if let Some(slot) = distinct.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(edge);
         } else {
-            return false;
+            if !distinct_types.insert(type_) {
+                return false;
+            }
+            distinct.insert(base.symbol, type_);
         }
     }
     !repeated || planned_repeated_interface_bases_are_exact(store, plan)
 }
 
-/// Matches the retained store publication policy for a distinct second base.
-fn distinct_second_interface_base_is_supported(
+/// Matches the retained store publication policy for each later distinct base.
+fn distinct_later_interface_base_is_supported(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,
     type_: TypeId,
@@ -471,7 +498,7 @@ pub(super) fn resolve_direct_interface_members_with_array_targets(
             && planned.symbol != planned_base.symbol
             && (planned.symbol == plan.symbol
                 || base == type_
-                || !distinct_second_interface_base_is_supported(store, planned.symbol, base))
+                || !distinct_later_interface_base_is_supported(store, planned.symbol, base))
         {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: planned.node,
@@ -1377,25 +1404,30 @@ fn validate_property_interface_worker(
         (Some(bases), Some(provenance))
             if !bases.is_empty() && bases.len() == provenance.bases.len() =>
         {
-            let mut distinct: [Option<(SemanticSymbolId, TypeId)>; 2] = [None, None];
+            if bases.len() > 2
+                && bases
+                    .iter()
+                    .any(|base| !nongeneric_interface_heritage_type_is_exact(store, *base))
+            {
+                return None;
+            }
+            let mut distinct = HashMap::new();
+            let mut distinct_types = HashSet::new();
             let mut repeated = false;
             for (&base_type, &(symbol, expected)) in bases.iter().zip(&provenance.bases) {
                 if base_type == type_ || symbol == owner || base_type != expected {
                     return None;
                 }
-                if let Some(previous) = distinct
-                    .iter()
-                    .flatten()
-                    .find(|(previous, type_)| *previous == symbol || *type_ == base_type)
-                {
-                    if *previous != (symbol, base_type) {
+                if let Some(previous) = distinct.get(&symbol) {
+                    if *previous != base_type {
                         return None;
                     }
                     repeated = true;
-                } else if let Some(slot) = distinct.iter_mut().find(|slot| slot.is_none()) {
-                    *slot = Some((symbol, base_type));
                 } else {
-                    return None;
+                    if !distinct_types.insert(base_type) {
+                        return None;
+                    }
+                    distinct.insert(symbol, base_type);
                 }
             }
             if repeated
@@ -7229,6 +7261,329 @@ mod tests {
                     assert_eq!(state(&store), before);
                 }
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Later distinct and repeated edges share one source-owned cache.
+    fn ordered_nongeneric_base_caches_reject_later_edges_and_restore() {
+        let source = concat!(
+            "interface Base { first: number; second: number }\n",
+            "interface Other { other: number }\n",
+            "interface Third { third: number }\n",
+            "interface Fourth { fourth: number }\n",
+            "interface Derived extends Base, Other, Third { own: number }\n",
+            "interface Derived extends Fourth {}\n",
+            "interface Derived extends Third {}\n",
+        );
+        let mut prepared = prepare_fixture(fixture_with_recorded_source(source, 202_830));
+        let later_symbols =
+            ["Third", "Fourth"].map(|name| interface_symbol(&prepared.fixture, name));
+        let mut later_types = Vec::new();
+        {
+            let host = host(
+                &prepared.fixture.parsed.arena,
+                prepared.fixture.files.get(&prepared.fixture.file).unwrap(),
+            );
+            for symbol in later_symbols {
+                let plan =
+                    object_members::plan_interface(&prepared.fixture.store, &host, symbol).unwrap();
+                let flags = prepared.fixture.store.symbol(symbol).unwrap().flags();
+                let type_ = get_declared_class_interface_or_type_parameter(
+                    &mut prepared.fixture.store,
+                    &host,
+                    symbol,
+                    flags,
+                )
+                .unwrap()
+                .unwrap();
+                let state =
+                    object_members::interface_state(&prepared.fixture.store, &plan, type_).unwrap();
+                assert_eq!(state, PropertyObjectState::Shell(type_));
+                object_members::publish_declared_members(
+                    &mut prepared.fixture.store,
+                    &plan,
+                    state,
+                    &[prepared.number_type],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+                later_types.push(type_);
+            }
+        }
+        let plan = &prepared.derived_plan;
+        let own = plan.properties[0].symbol;
+        let base = interface_symbol(&prepared.fixture, "Base");
+        let other = interface_symbol(&prepared.fixture, "Other");
+        let symbols = [
+            base,
+            other,
+            later_symbols[0],
+            later_symbols[1],
+            later_symbols[0],
+        ];
+        let bases = [
+            prepared.base_type,
+            prepared.other_type,
+            later_types[0],
+            later_types[1],
+            later_types[0],
+        ];
+        let expected = DirectInterfaceHeritageProvenance {
+            owner_symbol: plan.symbol,
+            bases: symbols.into_iter().zip(bases).collect(),
+        };
+        assert_eq!(plan.heritage.as_ref().unwrap().bases.len(), 5);
+        assert!(planned_repeated_interface_bases_are_exact(
+            &prepared.fixture.store,
+            plan
+        ));
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                derived_state(store, prepared.derived_type, own),
+                store
+                    .direct_interface_heritage_provenance(prepared.derived_type)
+                    .cloned(),
+                bases.map(|type_| {
+                    let record = store.type_payload(type_).unwrap();
+                    let TypeData::Interface(interface) = record.data() else {
+                        unreachable!()
+                    };
+                    (record.symbol(), record.object_flags(), interface.clone())
+                }),
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let cold = snapshot(&prepared.fixture.store);
+        let mut changed_bases = bases;
+        changed_bases[2] = prepared.number_type;
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &changed_bases,
+            ),
+            Err(invalid(plan, prepared.derived_type))
+        );
+        assert_eq!(snapshot(&prepared.fixture.store), cold);
+
+        let mut reordered_plan = plan.clone();
+        reordered_plan.heritage.as_mut().unwrap().bases.swap(2, 3);
+        let mut reordered_bases = bases;
+        reordered_bases.swap(2, 3);
+        let mut reordered_provenance = expected.clone();
+        reordered_provenance.bases.swap(2, 3);
+        assert!(!planned_repeated_interface_bases_are_exact(
+            &prepared.fixture.store,
+            &reordered_plan
+        ));
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &reordered_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &reordered_bases,
+            ),
+            Err(invalid(plan, prepared.derived_type))
+        );
+        assert!(
+            !prepared
+                .fixture
+                .store
+                .publish_direct_interface_heritage_provenance(
+                    prepared.derived_type,
+                    reordered_provenance,
+                )
+        );
+        assert_eq!(snapshot(&prepared.fixture.store), cold);
+
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &bases,
+            ),
+            Ok(prepared.derived_type)
+        );
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .direct_interface_heritage_provenance(prepared.derived_type),
+            Some(&expected)
+        );
+        let warm = snapshot(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &bases,
+                ),
+                Ok(prepared.derived_type)
+            );
+            assert!(validate_planned_interface_heritage_members(
+                &prepared.fixture.store,
+                plan,
+                prepared.derived_type
+            ));
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Valid
+            );
+            assert_eq!(snapshot(&prepared.fixture.store), warm);
+        }
+        for damaged_bases in [
+            changed_bases.to_vec(),
+            reordered_bases.to_vec(),
+            bases[..4].to_vec(),
+        ] {
+            assert!(prepared.fixture.store.set_interface_base_resolution(
+                prepared.derived_type,
+                true,
+                None,
+                Some(damaged_bases),
+            ));
+            let damaged = snapshot(&prepared.fixture.store);
+            for _ in 0..2 {
+                assert!(!validate_planned_interface_heritage_members(
+                    &prepared.fixture.store,
+                    plan,
+                    prepared.derived_type
+                ));
+                assert_eq!(
+                    validate_interface_heritage_members(
+                        &prepared.fixture.store,
+                        prepared.derived_type
+                    ),
+                    InterfaceHeritageMembersValidation::Malformed
+                );
+                assert_eq!(
+                    resolve_direct_interface_members(
+                        &mut prepared.fixture.store,
+                        plan,
+                        prepared.derived_type,
+                        &[prepared.number_type],
+                        &bases,
+                    ),
+                    Err(invalid(plan, prepared.derived_type))
+                );
+                assert_eq!(
+                    prepared
+                        .fixture
+                        .store
+                        .direct_interface_heritage_provenance(prepared.derived_type),
+                    Some(&expected)
+                );
+                assert_eq!(snapshot(&prepared.fixture.store), damaged);
+            }
+            assert!(prepared.fixture.store.set_interface_base_resolution(
+                prepared.derived_type,
+                true,
+                None,
+                Some(bases.to_vec()),
+            ));
+            assert!(validate_planned_interface_heritage_members(
+                &prepared.fixture.store,
+                plan,
+                prepared.derived_type
+            ));
+            assert_eq!(snapshot(&prepared.fixture.store), warm);
+        }
+        assert!(
+            prepared
+                .fixture
+                .store
+                .set_type_symbol(later_types[0], Some(other))
+        );
+        let damaged = snapshot(&prepared.fixture.store);
+        for _ in 0..2 {
+            assert!(!validate_planned_interface_heritage_members(
+                &prepared.fixture.store,
+                plan,
+                prepared.derived_type
+            ));
+            assert_eq!(
+                validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+                InterfaceHeritageMembersValidation::Malformed
+            );
+            assert_eq!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &bases,
+                ),
+                Err(invalid(plan, prepared.derived_type))
+            );
+            assert_eq!(snapshot(&prepared.fixture.store), damaged);
+        }
+        assert!(
+            prepared
+                .fixture
+                .store
+                .set_type_symbol(later_types[0], Some(later_symbols[0]))
+        );
+        assert!(validate_planned_interface_heritage_members(
+            &prepared.fixture.store,
+            plan,
+            prepared.derived_type
+        ));
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+            InterfaceHeritageMembersValidation::Valid
+        );
+        assert_eq!(snapshot(&prepared.fixture.store), warm);
+    }
+
+    #[test]
+    fn ordered_repeated_base_proof_rejects_a_duplicate_in_one_clause() {
+        let fixture = fixture_with_recorded_source(
+            concat!(
+                "interface Base {} interface Other {} interface Third {}\n",
+                "interface Derived extends Base, Other, Base {}\n",
+                "interface Derived extends Third {}\n",
+            ),
+            202_831,
+        );
+        let owner = interface_symbol(&fixture, "Derived");
+        let base = interface_symbol(&fixture, "Base");
+        let other = interface_symbol(&fixture, "Other");
+        let third = interface_symbol(&fixture, "Third");
+        let snapshot = || {
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            )
+        };
+        let before = snapshot();
+        for _ in 0..2 {
+            assert_eq!(
+                repeated_nongeneric_interface_base_nodes(
+                    &fixture.store,
+                    owner,
+                    [base, other, base, third].into_iter(),
+                ),
+                None
+            );
+            assert_eq!(snapshot(), before);
         }
     }
 

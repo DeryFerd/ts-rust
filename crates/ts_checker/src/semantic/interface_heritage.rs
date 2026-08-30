@@ -1,7 +1,8 @@
 //! Exact syntax and symbol plan for the first interface-heritage slice.
 //!
-//! This module admits one or two interface bases, including merged
-//! declarations, authenticated namespace exports, forwarded generic type
+//! This module admits ordered nongeneric interface bases, including merged
+//! declarations and authenticated namespace exports. Generic heritage keeps
+//! its one-or-two-base limit, forwarded generic type
 //! parameters, concrete generic arguments, trailing defaults, bounded base
 //! chains, and
 //! merged default-library DOM interface/value identities.
@@ -137,11 +138,22 @@ fn plan_direct_interface_heritage_inner(
     {
         return Err(DirectInterfaceHeritageError::Invalid);
     }
-    if clause_data.types.nodes.len() > 2 {
-        return Err(DirectInterfaceHeritageError::Unsupported {
-            node: clause,
-            kind: SyntaxKind::HeritageClause,
-        });
+    let multiple_nongeneric_bases = clause_data.types.nodes.len() > 2;
+    if multiple_nongeneric_bases {
+        let declaration_record = preflight_node(store, host, declaration)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        let owner_record = store
+            .symbol(owner)
+            .ok_or(DirectInterfaceHeritageError::Invalid)?;
+        if !matches!(&declaration_record.data,
+            NodeData::InterfaceDeclaration(interface) if interface.type_parameters.is_none())
+            || owner_record.flags().contains(SymbolFlags::CLASS)
+        {
+            return Err(DirectInterfaceHeritageError::Unsupported {
+                node: clause,
+                kind: SyntaxKind::HeritageClause,
+            });
+        }
     }
 
     let mut bases = Vec::with_capacity(clause_data.types.nodes.len());
@@ -441,6 +453,18 @@ fn plan_direct_interface_heritage_inner(
         });
     }
 
+    if multiple_nongeneric_bases
+        && bases.iter().any(|base| {
+            base.kind != DirectInterfaceBaseKind::Interface
+                || !base.type_arguments.is_empty()
+                || !base.defaults.is_empty()
+        })
+    {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: clause,
+            kind: SyntaxKind::HeritageClause,
+        });
+    }
     Ok(DirectInterfaceHeritagePlan { clause, bases })
 }
 
@@ -5130,6 +5154,82 @@ mod tests {
                 cold,
                 "{index}: rejected concrete heritage published checker state",
             );
+        }
+    }
+
+    #[test]
+    fn ordered_nongeneric_bases_keep_generic_class_and_duplicate_boundaries() {
+        for (index, (source, kind)) in [
+            (
+                concat!(
+                    "interface First {} interface Second {} interface Third {}\n",
+                    "interface Derived<T> extends First, Second, Third {}\n",
+                ),
+                SyntaxKind::HeritageClause,
+            ),
+            (
+                concat!(
+                    "interface First {} interface Second {} interface Third<T> {}\n",
+                    "interface Derived extends First, Second, Third<number> {}\n",
+                ),
+                SyntaxKind::HeritageClause,
+            ),
+            (
+                concat!(
+                    "interface First {} interface Second {} interface Third<T = number> {}\n",
+                    "interface Derived extends First, Second, Third {}\n",
+                ),
+                SyntaxKind::HeritageClause,
+            ),
+            (
+                concat!(
+                    "interface First {} interface Second {} interface Third {}\n",
+                    "class Derived {} interface Derived extends First, Second, Third {}\n",
+                ),
+                SyntaxKind::HeritageClause,
+            ),
+            (
+                concat!(
+                    "interface First {} interface Second {}\n",
+                    "interface Derived extends First, Second, First {}\n",
+                ),
+                SyntaxKind::Identifier,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(202_820 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let snapshot = || {
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                )
+            };
+            let cold = snapshot();
+            let error = heritage_plan(&parsed, file, &context, "Derived").unwrap_err();
+            assert!(
+                matches!(error,
+                DirectInterfaceHeritageError::Unsupported { kind: actual, .. } if actual == kind),
+                "{source}: {error:?}"
+            );
+            assert_eq!(snapshot(), cold, "{source}");
+            assert_eq!(
+                heritage_plan(&parsed, file, &context, "Derived"),
+                Err(error)
+            );
+            assert_eq!(snapshot(), cold, "{source}");
         }
     }
 
