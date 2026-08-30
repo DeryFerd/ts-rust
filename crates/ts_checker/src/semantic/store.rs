@@ -20,7 +20,7 @@ use ts_core::TextRange;
 use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
-    alias_provider::SourceFileNamespaceWrapper,
+    alias_provider::{ProductionAliasSourceRegistry, SourceFileNamespaceWrapper},
     array_types::CanonicalArrayTargets,
     bootstrap::{CanonicalUnionCreationProof, IntrinsicBootstrap},
     classes::{ClassInstanceSuperMember, ClassInstanceSuperView, SourceClassProvenance},
@@ -104,6 +104,7 @@ impl PreparedEntityName {
 struct SourceNodeFacts {
     kind: SyntaxKind,
     ordinary_arrow_type_parameters: bool,
+    global_augmentation: bool,
     parent: Option<NodeId>,
     start: u32,
     identifier_text: Option<Box<str>>,
@@ -172,11 +173,27 @@ impl SourceGlobalBinding {
     }
 }
 
+/// Binder edges for one interface contributed by an actual `declare global` block.
+/// Missing bindings remain missing until a source query checks this contribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGlobalInterfaceAugmentation {
+    owner: SemanticSymbolId,
+    source: NodeRef,
+    block: NodeRef,
+    module: NodeRef,
+    name: NodeRef,
+    registered_augmentation: bool,
+    namespace: Option<SemanticSymbolId>,
+    raw_symbol: Option<SemanticSymbolId>,
+    local_symbol: Option<SemanticSymbolId>,
+}
+
 /// Global bindings retained after all initialization merges finish.
 #[derive(Debug)]
 pub(super) struct SourceGlobalBindings {
     pub(super) table: SymbolTableId,
     entries: HashMap<EscapedName, SourceGlobalBinding>,
+    interface_augmentations: HashMap<NodeRef, SourceGlobalInterfaceAugmentation>,
 }
 
 impl SourceGlobalBindings {
@@ -1138,8 +1155,29 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .reduce(|left, right| left | right)
     }
 
-    /// Saves global identities once, before source checks or artifact queries can run.
+    /// Store-only fixtures have no augmentation authority to retain.
+    #[cfg(test)]
     pub(super) fn record_source_global_bindings(&mut self, table: SymbolTableId) -> bool {
+        self.record_source_global_bindings_worker(table, None)
+    }
+
+    /// Saves global identities and their binder origins before source queries run.
+    pub(super) fn record_source_global_bindings_with_sources(
+        &mut self,
+        table: SymbolTableId,
+        sources: &ProductionAliasSourceRegistry<'_>,
+    ) -> bool {
+        if sources.store_id() != self.id() {
+            return false;
+        }
+        self.record_source_global_bindings_worker(table, Some(sources))
+    }
+
+    fn record_source_global_bindings_worker(
+        &mut self,
+        table: SymbolTableId,
+        sources: Option<&ProductionAliasSourceRegistry<'_>>,
+    ) -> bool {
         if self.source_global_bindings.is_some()
             || self
                 .intrinsic_bootstrap
@@ -1153,6 +1191,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         };
         let mut entries = HashMap::new();
+        let mut interface_augmentations = HashMap::new();
         if entries.try_reserve(globals.len()).is_err() {
             return false;
         }
@@ -1169,6 +1208,20 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     return false;
                 }
                 snapshot.extend_from_slice(declarations);
+                if let Some(sources) = sources {
+                    for &declaration in declarations {
+                        if let Some(origin) = self.source_global_interface_augmentation_origin(
+                            sources,
+                            symbol,
+                            declaration,
+                        ) {
+                            if interface_augmentations.try_reserve(1).is_err() {
+                                return false;
+                            }
+                            interface_augmentations.insert(declaration, origin);
+                        }
+                    }
+                }
                 Some(snapshot.into_boxed_slice())
             } else {
                 None
@@ -1183,8 +1236,229 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
             );
         }
-        self.source_global_bindings = Some(SourceGlobalBindings { table, entries });
+        self.source_global_bindings = Some(SourceGlobalBindings {
+            table,
+            entries,
+            interface_augmentations,
+        });
         true
+    }
+
+    /// Copies source facts only. Unsupported declarations do not fail initialization.
+    fn source_global_interface_augmentation_origin(
+        &self,
+        sources: &ProductionAliasSourceRegistry<'_>,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> Option<SourceGlobalInterfaceAugmentation> {
+        if self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration) {
+            return None;
+        }
+        let SourceNodeParent::Parent(block) = self.source_node_parent(declaration)? else {
+            return None;
+        };
+        let SourceNodeParent::Parent(module) = self.source_node_parent(block)? else {
+            return None;
+        };
+        if self.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+            || !self.source_node_fact(module)?.global_augmentation
+        {
+            return None;
+        }
+        let (arena, bound) = sources.snapshot(declaration.file)?;
+        if !declaration.is_for(arena.id(), bound.file_id()) || !bound.contains(declaration) {
+            return None;
+        }
+        let NodeData::ModuleDeclaration(data) = &arena.get(module.node)?.data else {
+            return None;
+        };
+        let name = NodeRef::new(module.arena, module.file, data.name);
+        Some(SourceGlobalInterfaceAugmentation {
+            owner,
+            source: bound.source_file(),
+            block,
+            module,
+            name,
+            registered_augmentation: bound
+                .module_augmentations()
+                .iter()
+                .any(|augmentation| augmentation.name() == name),
+            namespace: bound.symbol(module),
+            raw_symbol: bound.symbol(declaration),
+            local_symbol: bound.local_symbol(declaration),
+        })
+    }
+
+    /// Rechecks the retained binder edges without reading or publishing a member type.
+    #[allow(clippy::too_many_lines)] // The source, raw owner, local placeholder, and global edges form one proof.
+    pub(super) fn source_global_interface_augmentation_is_exact(
+        &self,
+        owner: SemanticSymbolId,
+        declaration: NodeRef,
+    ) -> bool {
+        let Some(globals) = self.source_global_bindings.as_ref() else {
+            return false;
+        };
+        let Some(origin) = globals.interface_augmentations.get(&declaration) else {
+            return false;
+        };
+        let Some(record) = self.symbol(owner) else {
+            return false;
+        };
+        let Some(original) = globals.get(record.name()) else {
+            return false;
+        };
+        let Some(declarations) = record.declarations() else {
+            return false;
+        };
+        let Some(facts) = self.source_file_facts.get(&declaration.file) else {
+            return false;
+        };
+        let (Some(namespace), Some(raw), Some(local)) =
+            (origin.namespace, origin.raw_symbol, origin.local_symbol)
+        else {
+            return false;
+        };
+        let Some(namespace) = self.get_merged_symbol(namespace) else {
+            return false;
+        };
+        let Some(namespace_record) = self.symbol(namespace) else {
+            return false;
+        };
+        let Some(raw_record) = self.symbol(raw) else {
+            return false;
+        };
+        let Some(raw_source) = self.source_symbol_declarations.get(&raw) else {
+            return false;
+        };
+        let Some(local_record) = self.symbol(local) else {
+            return false;
+        };
+        let Some(local_source) = self.source_symbol_declarations.get(&local) else {
+            return false;
+        };
+        let Some(name) = self.source_child_with_kind(declaration, SyntaxKind::Identifier) else {
+            return false;
+        };
+        if origin.owner != owner
+            || !origin.registered_augmentation
+            || original.symbol != owner
+            || original.flags != record.flags()
+            || original.declarations() != Some(declarations)
+            || !declarations.contains(&declaration)
+            || self.get_merged_symbol(owner) != Some(owner)
+            || !record.flags().contains(SymbolFlags::INTERFACE)
+            || record.flags().without(
+                SymbolFlags::INTERFACE
+                    | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::TRANSIENT,
+            ) != SymbolFlags::NONE
+            || record.check_flags() != CheckFlags::NONE
+            || record.parent().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || !self.source_merged_symbol_declarations_match(owner)
+            || self
+                .intrinsic_bootstrap()
+                .is_none_or(|bootstrap| bootstrap.globals != globals.table)
+            || self.get_merged_symbol(original.table_symbol) != Some(owner)
+            || self
+                .symbol_table(globals.table)
+                .and_then(|table| table.get(record.name()))
+                != Some(original.table_symbol)
+            || facts.is_javascript_file()
+            || !facts.is_external_module()
+            || facts.is_common_js_module()
+            || facts.is_default_library()
+            || self.source_file_rank(declaration.file).is_none()
+            || self
+                .source_files
+                .get(&declaration.file)
+                .map(|source| source.node_ref())
+                != Some(origin.source)
+            || self.source_node_kind(origin.source) != Some(SyntaxKind::SourceFile)
+            || self.source_node_parent(origin.source) != Some(SourceNodeParent::Root)
+            || self.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration)
+            || self.source_node_parent(declaration) != Some(SourceNodeParent::Parent(origin.block))
+            || self.source_node_parent(name) != Some(SourceNodeParent::Parent(declaration))
+            || self.source_identifier_text(name) != record.name().as_utf8()
+            || self.source_node_kind(origin.block) != Some(SyntaxKind::ModuleBlock)
+            || self.source_node_parent(origin.block)
+                != Some(SourceNodeParent::Parent(origin.module))
+            || self.source_node_kind(origin.module) != Some(SyntaxKind::ModuleDeclaration)
+            || self.source_node_parent(origin.module)
+                != Some(SourceNodeParent::Parent(origin.source))
+            || self
+                .source_node_fact(origin.module)
+                .is_none_or(|facts| !facts.global_augmentation)
+            || self.source_child_with_kind(origin.module, SyntaxKind::ModuleBlock)
+                != Some(origin.block)
+            || self.source_child_with_kind(origin.module, SyntaxKind::Identifier)
+                != Some(origin.name)
+            || self.source_identifier_text(origin.name) != Some("global")
+            || self.source_node_parent(origin.name) != Some(SourceNodeParent::Parent(origin.module))
+            || !namespace_record.flags().intersects(SymbolFlags::MODULE)
+            || namespace_record.check_flags() != CheckFlags::NONE
+            || self.source_symbol_flags(namespace)
+                != Some(namespace_record.flags().without(SymbolFlags::TRANSIENT))
+            || namespace_record.name() != InternalSymbolName::Global.as_ref()
+            || !self.source_symbol_declarations_match(namespace)
+            || !self.source_declaration_belongs_to_symbol(origin.module, namespace)
+            || raw == owner
+            || self.get_merged_symbol(raw) != Some(owner)
+            || raw_record.name() != record.name()
+            || raw_record.flags() != raw_source.flags
+            || raw_record.check_flags() != CheckFlags::NONE
+            || raw_record.declarations() != Some(raw_source.declarations.as_ref())
+            || raw_record.value_declaration() != raw_source.value_declaration
+            || !raw_source.declarations.contains(&declaration)
+            || raw_record
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                != Some(namespace)
+            || namespace_record
+                .exports()
+                .and_then(|exports| self.symbol_table(exports))
+                .and_then(|exports| exports.get(record.name()))
+                .and_then(|export| self.get_merged_symbol(export))
+                != Some(owner)
+        {
+            return false;
+        }
+
+        // Only a value in this same local declaration group gives it a value flag.
+        let has_local_value = record.flags().without(SymbolFlags::TRANSIENT)
+            == SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            && local_source.declarations.iter().any(|declaration| {
+                self.source_node_kind(*declaration) == Some(SyntaxKind::VariableDeclaration)
+            });
+        let expected_local_flags = if has_local_value {
+            SymbolFlags::EXPORT_VALUE
+        } else {
+            SymbolFlags::NONE
+        };
+        local != owner
+            && local != raw
+            && self.get_merged_symbol(local) == Some(local)
+            && local_source.flags == expected_local_flags
+            && local_record.flags() == expected_local_flags
+            && local_record.check_flags() == CheckFlags::NONE
+            && local_record.name() == record.name()
+            && local_source.declarations.contains(&declaration)
+            && local_source.declarations.iter().all(|declaration| {
+                declaration.file == origin.source.file
+                    && declaration.arena == origin.source.arena
+                    && declarations.contains(declaration)
+            })
+            && self.source_symbol_declarations_match(local)
+            && local_record.value_declaration().is_none()
+            && local_record.members().is_none()
+            && local_record.exports().is_none()
+            && local_record.parent().is_none()
+            && local_record
+                .export_symbol()
+                .and_then(|export| self.get_merged_symbol(export))
+                == Some(owner)
     }
 
     pub(super) fn source_global_bindings(&self) -> Option<&SourceGlobalBindings> {
@@ -8596,6 +8870,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                             !parameters.nodes.is_empty()
                                 && parameters.range.start >= node.range.start
                         })
+                ),
+                global_augmentation: matches!(
+                    &node.data,
+                    NodeData::ModuleDeclaration(module)
+                        if module.keyword == SyntaxKind::GlobalKeyword
                 ),
                 parent: node.parent,
                 start: node.range.start.get(),
@@ -17353,6 +17632,536 @@ mod tests {
                 .iter()
                 .all(|binding| binding.symbol != unknown)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real two-phase merge and every cold/warm damage-and-restore check together.
+    fn ordered_global_interface_augmentation_proof_rejects_damage_cold_and_warm() {
+        use crate::semantic::{
+            object_members::{
+                PropertyObjectError, authenticated_nongeneric_global_interface_owner,
+                plan_merged_global_interface,
+            },
+            structured_members::validated_interface_property_by_key,
+        };
+
+        #[derive(Clone, Copy, Debug)]
+        enum Damage {
+            DeclarationOrder,
+            DuplicateDeclaration,
+            RawParent,
+            RawDeclarations,
+            LocalExport,
+            AugmentationExport,
+            GlobalEntry,
+            MissingOrigin,
+            MissingAugmentation,
+            GlobalKeyword,
+        }
+
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base { value: string; } ",
+            "interface NativePacket extends Base { method(): number; } ",
+            "declare var NativePacket: { prototype: NativePacket; new(): NativePacket; };",
+        ));
+        let augmentation = parse_source_file(
+            "export {}; declare global { interface NativePacket { added(): string; } }",
+        );
+        let script = parse_source_file(concat!(
+            "interface NativePacket { late: boolean; } ",
+            "declare const packet: NativePacket; ",
+            "const own: number = packet.method(); const added: string = packet.added();",
+        ));
+        let library_file = FileId::new(202_830);
+        let augmentation_file = FileId::new(202_831);
+        let script_file = FileId::new(202_832);
+        let files = [
+            (library_file, &library, true, CanonicalModuleState::Script),
+            (
+                augmentation_file,
+                &augmentation,
+                false,
+                CanonicalModuleState::External,
+            ),
+            (script_file, &script, false, CanonicalModuleState::Script),
+        ];
+        let declaration = node_ref_of_kind(
+            &augmentation.arena,
+            augmentation_file,
+            SyntaxKind::InterfaceDeclaration,
+        );
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            strict_function_types: true,
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        };
+
+        for warm in [false, true] {
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed, default_library, module) in files {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new_with_default_library(
+                            EscapedName::source(format!("\"/ordered-global-{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            file != script_file,
+                            default_library,
+                            module,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                files
+                    .iter()
+                    .map(|(file, parsed, ..)| (*file, &parsed.arena))
+                    .collect(),
+                options,
+            )
+            .unwrap();
+            let globals = context.globals();
+            let [owner, other] = ["NativePacket", "Base"].map(|name| {
+                context
+                    .store()
+                    .symbol_table(globals)
+                    .unwrap()
+                    .get_source(name)
+                    .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                    .unwrap()
+            });
+            let cached_type = warm.then(|| {
+                context.check_source_file(augmentation_file).unwrap();
+                context.check_source_file(script_file).unwrap();
+                assert!(context.diagnostics().is_empty());
+                context.get_declared_type_of_symbol(owner).unwrap()
+            });
+            let bound = files
+                .iter()
+                .map(|(file, ..)| context.file(*file).unwrap().1.clone())
+                .collect::<Vec<_>>();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bound)
+                    .map(|((_, parsed, ..), bound)| (&parsed.arena, bound)),
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let store = context.store_mut_for_test();
+            let owner_record = store.symbol(owner).unwrap();
+            let declarations = owner_record.declarations().unwrap().to_vec();
+            let value = owner_record.value_declaration();
+            assert_eq!(declarations.len(), 4);
+            assert_eq!(declarations[3], declaration);
+            assert_eq!(
+                declarations
+                    .iter()
+                    .map(|node| node.file)
+                    .collect::<Vec<_>>(),
+                [library_file, library_file, script_file, augmentation_file]
+            );
+            assert_eq!(
+                declarations
+                    .iter()
+                    .map(|node| store.source_file_rank(node.file).unwrap())
+                    .collect::<Vec<_>>(),
+                [0, 0, 2, 1]
+            );
+            let expected_interfaces = vec![declarations[0], declarations[2], declarations[3]];
+            let origin = *store
+                .source_global_bindings()
+                .unwrap()
+                .interface_augmentations
+                .get(&declaration)
+                .unwrap();
+            let raw = origin.raw_symbol.unwrap();
+            let local = origin.local_symbol.unwrap();
+            let namespace = store.get_merged_symbol(origin.namespace.unwrap()).unwrap();
+            assert_ne!(raw, owner);
+            assert_ne!(local, owner);
+            assert_eq!(store.symbol(local).unwrap().flags(), SymbolFlags::NONE);
+            let raw_record = store.symbol(raw).unwrap().clone();
+            let local_record = store.symbol(local).unwrap().clone();
+            let exports = store.symbol(namespace).unwrap().exports().unwrap();
+            let export = store
+                .symbol_table(exports)
+                .unwrap()
+                .get_source("NativePacket")
+                .unwrap();
+            let global = store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("NativePacket")
+                .unwrap();
+            let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+            let property = cached_type.map(|type_| {
+                let property = validated_interface_property_by_key(
+                    store,
+                    type_,
+                    EscapedName::source("late").as_ref(),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(property.type_, boolean);
+                property
+            });
+            let lengths = |store: &CanonicalTypeMapperStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                )
+            };
+            let original_lengths = lengths(store);
+            let expected_error = cached_type.map_or(
+                PropertyObjectError::InvalidInterface {
+                    declaration: declarations[0],
+                    symbol: owner,
+                },
+                |type_| PropertyObjectError::InvalidCachedInterface {
+                    symbol: owner,
+                    type_,
+                },
+            );
+            for damage in [
+                Damage::DeclarationOrder,
+                Damage::DuplicateDeclaration,
+                Damage::RawParent,
+                Damage::RawDeclarations,
+                Damage::LocalExport,
+                Damage::AugmentationExport,
+                Damage::GlobalEntry,
+                Damage::MissingOrigin,
+                Damage::MissingAugmentation,
+                Damage::GlobalKeyword,
+            ] {
+                assert!(store.source_global_interface_augmentation_is_exact(owner, declaration));
+                assert!(authenticated_nongeneric_global_interface_owner(
+                    store, owner
+                ));
+                let before = format!("{store:?}");
+                let plan = plan_merged_global_interface(store, &host, owner, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(plan.declarations, expected_interfaces);
+                assert!(plan.has_shared_member_checks);
+                assert_eq!(format!("{store:?}"), before);
+                match damage {
+                    Damage::DeclarationOrder => {
+                        let mut changed = declarations.clone();
+                        changed.swap(2, 3);
+                        assert!(changed.windows(2).all(|pair| {
+                            let position = |node: NodeRef| {
+                                (
+                                    store.source_file_rank(node.file).unwrap(),
+                                    store.source_node_start(node).unwrap(),
+                                )
+                            };
+                            position(pair[0]) < position(pair[1])
+                        }));
+                        assert!(store.set_symbol_declarations(owner, Some(changed), value));
+                        assert!(store.source_merged_symbol_declarations_match(owner));
+                    }
+                    Damage::DuplicateDeclaration => {
+                        let mut changed = declarations.clone();
+                        changed.push(declaration);
+                        assert!(store.set_symbol_declarations(owner, Some(changed), value));
+                        assert!(!store.source_merged_symbol_declarations_match(owner));
+                    }
+                    Damage::RawParent => {
+                        assert!(store.set_symbol_relationships(
+                            raw,
+                            raw_record.members(),
+                            raw_record.exports(),
+                            Some(other),
+                            raw_record.export_symbol()
+                        ));
+                    }
+                    Damage::RawDeclarations => {
+                        assert!(store.set_symbol_declarations(raw, Some(Vec::new()), None));
+                    }
+                    Damage::LocalExport => {
+                        assert!(store.set_symbol_relationships(
+                            local,
+                            local_record.members(),
+                            local_record.exports(),
+                            local_record.parent(),
+                            Some(other)
+                        ));
+                    }
+                    Damage::AugmentationExport => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                exports,
+                                EscapedName::source("NativePacket"),
+                                other
+                            ),
+                            Some(Some(export))
+                        );
+                    }
+                    Damage::GlobalEntry => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                globals,
+                                EscapedName::source("NativePacket"),
+                                other
+                            ),
+                            Some(Some(global))
+                        );
+                    }
+                    Damage::MissingOrigin => {
+                        assert_eq!(
+                            store
+                                .source_global_bindings
+                                .as_mut()
+                                .unwrap()
+                                .interface_augmentations
+                                .remove(&declaration),
+                            Some(origin)
+                        );
+                    }
+                    Damage::MissingAugmentation => {
+                        store
+                            .source_global_bindings
+                            .as_mut()
+                            .unwrap()
+                            .interface_augmentations
+                            .get_mut(&declaration)
+                            .unwrap()
+                            .registered_augmentation = false;
+                    }
+                    Damage::GlobalKeyword => {
+                        store
+                            .source_node_facts
+                            .get_mut(&origin.module.arena)
+                            .unwrap()[origin.module.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .global_augmentation = false;
+                    }
+                }
+                let damaged = format!("{store:?}");
+                assert!(!store.record_source_global_bindings(globals));
+                assert_eq!(format!("{store:?}"), damaged);
+                for _ in 0..2 {
+                    assert!(
+                        !store.source_global_interface_augmentation_is_exact(owner, declaration),
+                        "{damage:?}, warm={warm}"
+                    );
+                    assert!(
+                        !authenticated_nongeneric_global_interface_owner(store, owner),
+                        "{damage:?}, warm={warm}"
+                    );
+                    assert_eq!(
+                        plan_merged_global_interface(store, &host, owner, None).unwrap_err(),
+                        expected_error,
+                        "{damage:?}, warm={warm}"
+                    );
+                    if let Some(type_) = cached_type {
+                        assert_eq!(
+                            validated_interface_property_by_key(
+                                store,
+                                type_,
+                                EscapedName::source("late").as_ref(),
+                                None,
+                            ),
+                            None,
+                            "{damage:?}"
+                        );
+                    }
+                    assert_eq!(format!("{store:?}"), damaged, "{damage:?}");
+                }
+                match damage {
+                    Damage::DeclarationOrder | Damage::DuplicateDeclaration => {
+                        assert!(store.set_symbol_declarations(
+                            owner,
+                            Some(declarations.clone()),
+                            value
+                        ));
+                    }
+                    Damage::RawParent => {
+                        assert!(store.set_symbol_relationships(
+                            raw,
+                            raw_record.members(),
+                            raw_record.exports(),
+                            raw_record.parent(),
+                            raw_record.export_symbol()
+                        ));
+                    }
+                    Damage::RawDeclarations => {
+                        assert!(store.set_symbol_declarations(
+                            raw,
+                            raw_record.declarations().map(<[NodeRef]>::to_vec),
+                            raw_record.value_declaration()
+                        ));
+                    }
+                    Damage::LocalExport => {
+                        assert!(store.set_symbol_relationships(
+                            local,
+                            local_record.members(),
+                            local_record.exports(),
+                            local_record.parent(),
+                            local_record.export_symbol()
+                        ));
+                    }
+                    Damage::AugmentationExport => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                exports,
+                                EscapedName::source("NativePacket"),
+                                export
+                            ),
+                            Some(Some(other))
+                        );
+                    }
+                    Damage::GlobalEntry => {
+                        assert_eq!(
+                            store.insert_symbol(
+                                globals,
+                                EscapedName::source("NativePacket"),
+                                global
+                            ),
+                            Some(Some(other))
+                        );
+                    }
+                    Damage::MissingOrigin | Damage::MissingAugmentation => {
+                        store
+                            .source_global_bindings
+                            .as_mut()
+                            .unwrap()
+                            .interface_augmentations
+                            .insert(declaration, origin);
+                    }
+                    Damage::GlobalKeyword => {
+                        store
+                            .source_node_facts
+                            .get_mut(&origin.module.arena)
+                            .unwrap()[origin.module.node.index()]
+                        .as_mut()
+                        .unwrap()
+                        .global_augmentation = true;
+                    }
+                }
+                assert!(store.source_global_interface_augmentation_is_exact(owner, declaration));
+                assert!(authenticated_nongeneric_global_interface_owner(
+                    store, owner
+                ));
+                assert_eq!(
+                    store
+                        .source_global_bindings()
+                        .unwrap()
+                        .get(store.symbol(owner).unwrap().name())
+                        .unwrap()
+                        .declarations(),
+                    Some(declarations.as_slice())
+                );
+                if let (Some(type_), Some(property)) = (cached_type, property) {
+                    assert_eq!(
+                        store.declared_type_links(owner).unwrap().declared_type,
+                        Some(type_)
+                    );
+                    assert_eq!(
+                        validated_interface_property_by_key(
+                            store,
+                            type_,
+                            EscapedName::source("late").as_ref(),
+                            None,
+                        ),
+                        Some(Some(property))
+                    );
+                }
+                assert_eq!(lengths(store), original_lengths);
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_global_interface_capture_does_not_query_unused_annotations() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface NativePacket { base: string; }",
+        ));
+        let augmentation = parse_source_file(
+            "export {}; declare global { interface NativePacket { unused: MissingType; } }",
+        );
+        let library_file = FileId::new(202_833);
+        let augmentation_file = FileId::new(202_834);
+        let files = [(library_file, &library), (augmentation_file, &augmentation)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let library = file == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/unused-global-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        library,
+                        if library {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .iter()
+                .map(|(file, parsed)| (*file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let store = context.store();
+        let owner = store
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source("NativePacket")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .unwrap();
+        let declaration = node_ref_of_kind(
+            &augmentation.arena,
+            augmentation_file,
+            SyntaxKind::InterfaceDeclaration,
+        );
+        let before = format!("{store:?}");
+        assert!(store.source_global_interface_augmentation_is_exact(owner, declaration));
+        assert_eq!(format!("{store:?}"), before);
+        assert!(store.declared_type_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
+        for (node, _) in augmentation.arena.iter() {
+            let node = NodeRef::new(augmentation.arena.id(), augmentation_file, node);
+            assert!(store.type_node_links(node).is_none());
+            assert!(store.symbol_node_links(node).is_none());
+        }
     }
 
     #[test]

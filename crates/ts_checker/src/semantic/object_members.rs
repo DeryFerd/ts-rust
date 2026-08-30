@@ -5289,6 +5289,7 @@ pub(super) fn plan_merged_global_interface(
             )
     };
     if original.flags != owner.flags()
+        || original.declarations() != Some(declarations)
         || !store.source_merged_symbol_declarations_match(symbol)
         || store
             .intrinsic_bootstrap()
@@ -5330,26 +5331,19 @@ pub(super) fn plan_merged_global_interface(
     let mut interfaces = Vec::new();
     let mut values = Vec::new();
     let mut has_shared_member_checks = false;
-    let mut previous = None;
     for &declaration in declarations {
         let bound = host.bound_file(declaration).ok_or_else(invalid)?;
         let facts = bound.source_facts().ok_or_else(invalid)?;
         let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
-        let position = (
-            store
-                .source_file_rank(declaration.file)
-                .ok_or_else(invalid)?,
-            record.range.start,
-        );
-        if previous.is_some_and(|previous| previous >= position)
-            || !host.symbol_matches(store, declaration, symbol)
+        store
+            .source_file_rank(declaration.file)
+            .ok_or_else(invalid)?;
+        if !host.symbol_matches(store, declaration, symbol)
             || facts.is_javascript_file()
-            || facts.is_external_or_common_js_module()
             || record.flags.0 != 0
         {
             return Err(invalid());
         }
-        previous = Some(position);
         match &record.data {
             NodeData::InterfaceDeclaration(interface)
                 if record.kind == SyntaxKind::InterfaceDeclaration =>
@@ -5359,7 +5353,11 @@ pub(super) fn plan_merged_global_interface(
                 }
                 let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
                 let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
-                if record.parent != Some(bound.source_file().node)
+                let global_augmentation =
+                    store.source_global_interface_augmentation_is_exact(symbol, declaration);
+                if (facts.is_external_or_common_js_module()
+                    || record.parent != Some(bound.source_file().node))
+                    && !global_augmentation
                     || name_record.kind != SyntaxKind::Identifier
                     || name_record.flags.0 != 0
                     || name_record.parent != Some(declaration.node)
@@ -5408,6 +5406,9 @@ pub(super) fn plan_merged_global_interface(
                 interfaces.push(declaration);
             }
             NodeData::VariableDeclaration(_) if record.kind == SyntaxKind::VariableDeclaration => {
+                if facts.is_external_or_common_js_module() {
+                    return Err(invalid());
+                }
                 values.push(declaration);
             }
             _ => return Ok(None),
@@ -6641,6 +6642,7 @@ fn authenticated_source_global_interface_owner(
         && globals.table == bootstrap.globals
         && original.symbol == symbol
         && original.flags == owner.flags()
+        && original.declarations() == owner.declarations()
         && store.get_merged_symbol(original.table_symbol) == Some(symbol)
         && store
             .symbol_table(globals.table)
@@ -6706,22 +6708,20 @@ pub(super) fn authenticated_nongeneric_global_interface_owner(
     let Some(declarations) = owner.declarations() else {
         return false;
     };
-    let mut previous = None;
     let mut has_interface = false;
     let mut value = None;
     for &declaration in declarations {
-        let Some(position) = store
-            .source_file_rank(declaration.file)
-            .zip(store.source_node_start(declaration))
-        else {
-            return false;
-        };
-        if previous.is_some_and(|previous| previous >= position)
-            || !store.source_is_typescript_script(declaration)
+        if store.source_file_rank(declaration.file).is_none()
+            || store.source_node_start(declaration).is_none()
         {
             return false;
         }
-        previous = Some(position);
+        let source_is_script = store.source_is_typescript_script(declaration);
+        let global_augmentation = !source_is_script
+            && store.source_global_interface_augmentation_is_exact(symbol, declaration);
+        if !source_is_script && !global_augmentation {
+            return false;
+        }
         let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration) else {
             return false;
         };
@@ -6737,8 +6737,9 @@ pub(super) fn authenticated_nongeneric_global_interface_owner(
                 let Some(name) = names.next() else {
                     return false;
                 };
-                if store.source_node_kind(parent) != Some(SyntaxKind::SourceFile)
-                    || store.source_node_parent(parent) != Some(SourceNodeParent::Root)
+                if (store.source_node_kind(parent) != Some(SyntaxKind::SourceFile)
+                    || store.source_node_parent(parent) != Some(SourceNodeParent::Root))
+                    && !global_augmentation
                     || store.source_identifier_text(name) != owner.name().as_utf8()
                     || names.next().is_some()
                     || children.iter().any(|child| {
