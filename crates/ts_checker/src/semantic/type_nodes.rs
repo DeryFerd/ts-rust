@@ -28929,6 +28929,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         ))
                     });
             }
+            SyntaxKind::MethodDeclaration => {
+                self.reject_type_reference_alias_capabilities()?;
+                return super::classes::completed_source_class_method_signature_return_type(
+                    self.store,
+                    self.host,
+                    declaration,
+                    signature,
+                    array_targets,
+                    self.options,
+                )
+                .map_err(|_| invalid_method());
+            }
             SyntaxKind::MethodSignature => {
                 return self.get_return_type_of_declared_method_signature(signature, declaration);
             }
@@ -40186,6 +40198,185 @@ mod tests {
         },
         types::{ObjectFlags, TypeFlags},
     };
+
+    #[test]
+    fn completed_source_method_return_queries_keep_the_caller_and_outer_guards() {
+        let parsed = parse_source_file(concat!(
+            "type Seed<T> = T; ",
+            "class Subject { value(): number { return 1; } }",
+        ));
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(8_319);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/method-return-caller.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let options = CanonicalCheckerOptions::default();
+        let mut context =
+            CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options)
+                .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let node = |kind| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap()
+        };
+        let declaration = node(SyntaxKind::MethodDeclaration);
+        let signature = context
+            .store()
+            .signature_links(declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        let parameter_symbol = bound.symbol(node(SyntaxKind::TypeParameter)).unwrap();
+        let parameter = context
+            .get_declared_type_of_symbol(parameter_symbol)
+            .unwrap();
+        let returned = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 100,
+            max_count: 1,
+        });
+        assert_eq!(
+            super::super::instantiate::instantiate_type_with_vector_and_session(
+                context.store_mut_for_test(),
+                parameter,
+                &[parameter],
+                &[returned],
+                None,
+                &mut session,
+            ),
+            Ok(returned),
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (1, 1, 0)
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            context.store_mut_for_test(),
+            &host,
+            options,
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let invalid = |signature| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+        };
+        let snapshot = |query: &CanonicalTypeQuery<'_, '_, '_, '_>| {
+            let session = query.instantiation_session.as_deref().unwrap();
+            (
+                query.store.type_len(),
+                query.store.signature_len(),
+                query.store.mapper_len(),
+                query.store.checker_link_allocated_lengths(),
+                query.store.relation_state_snapshot(),
+                query.store.signature_links(declaration).cloned(),
+                query.store.signature(signature).map(|record| {
+                    (
+                        record.target(),
+                        record.mapper(),
+                        record.resolved_return_type(),
+                    )
+                }),
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count(),
+                ),
+                query.diagnostics.clone(),
+            )
+        };
+        let warm = snapshot(&query);
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+        assert_eq!(snapshot(&query), warm);
+        assert!(query.resolving_instantiated_signatures.insert(signature));
+        assert_eq!(
+            query.get_return_type_of_signature(signature),
+            Err(invalid(signature))
+        );
+        assert_eq!(snapshot(&query), warm);
+        assert!(query.resolving_instantiated_signatures.remove(&signature));
+        assert!(
+            query
+                .store
+                .set_signature_target_and_mapper(signature, Some(signature), None)
+        );
+        let changed = snapshot(&query);
+        assert_eq!(
+            query.get_return_type_of_signature(signature),
+            Err(invalid(signature))
+        );
+        assert_eq!(snapshot(&query), changed);
+        assert!(
+            query
+                .store
+                .set_signature_target_and_mapper(signature, None, None)
+        );
+        let mut foreign = CanonicalTypeMapperStore::new();
+        let foreign_signature = foreign
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let restored = snapshot(&query);
+        assert_eq!(
+            query.get_return_type_of_signature(foreign_signature),
+            Err(invalid(foreign_signature))
+        );
+        assert_eq!(snapshot(&query), restored);
+        assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+        assert_eq!(snapshot(&query), restored);
+        assert_eq!(
+            query.instantiation_session.as_deref().map(|session| (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            )),
+            Some((1, 1, 0))
+        );
+    }
 
     struct Fixture {
         parsed: ParseResult,
