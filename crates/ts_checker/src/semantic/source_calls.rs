@@ -6322,7 +6322,7 @@ fn prepare_legacy_source_call_diagnostic(
         DirectCallApplicability::ArgumentNotAssignable { .. }
     ) && let Some(declaration) = store
         .signature(diagnostic_resolution.signature)
-        .and_then(|signature| signature.declaration())
+        .and_then(super::signatures::Signature::declaration)
         && let Some(symbol) = host
             .bound_file(declaration)
             .and_then(|bound| bound.symbol(declaration))
@@ -6354,7 +6354,7 @@ fn prepare_legacy_source_call_diagnostic(
     {
         let declaration = store
             .signature(overloads.implementation.signature)
-            .and_then(|signature| signature.declaration())
+            .and_then(super::signatures::Signature::declaration)
             .ok_or(SourceCheckError::Call(plan.node))?;
         for diagnostic in &mut result {
             diagnostic

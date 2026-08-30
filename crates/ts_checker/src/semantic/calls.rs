@@ -3100,8 +3100,12 @@ mod tests {
                     Ok(Some(unknown))
                 );
             }
-            let shape = callable_rest_shape(store, Some(globals.array_targets), &fallback_callable)
-                .unwrap();
+            let shape = callable_rest_shape(
+                store,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+                &fallback_callable,
+            )
+            .unwrap();
             assert_eq!(
                 non_array_rest_target(store, Some(&globals), &fallback_callable, shape.as_ref()),
                 Ok(Some((0, fallback)))

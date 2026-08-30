@@ -760,12 +760,12 @@ fn tuple_method_overloads_keep_selected_signatures_on_cold_and_warm_queries() {
             assert_eq!(signature(&context, *call), *signature_id);
             assert_eq!(context.get_type_at_location(*call).unwrap(), expected);
         }
-        let queries = declarations
+        let locations = declarations
             .iter()
             .map(|node| method_name(&parsed, *node))
             .chain(annotations)
             .chain(calls)
             .collect::<Vec<_>>();
-        assert_replay(&mut context, &queries);
+        assert_replay(&mut context, &locations);
     }
 }
