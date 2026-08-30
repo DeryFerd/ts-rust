@@ -733,6 +733,19 @@ struct SourceClassConstructorPlan {
     symbol: SemanticSymbolId,
     visibility: ClassConstructorVisibility,
     parameters: Vec<ClassConstructorParameterPlan<ClassBodyParameterType>>,
+    literal_defaults: Vec<SourceConstructorLiteralDefault>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceConstructorDefaultLiteral {
+    Number(String),
+    String(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceConstructorLiteralDefault {
+    node: NodeRef,
+    literal: SourceConstructorDefaultLiteral,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1129,6 +1142,7 @@ fn plan_source_class_constructor(
     }
     let mut parameters = Vec::new();
     let mut body_parameters = Vec::new();
+    let mut literal_defaults = Vec::new();
     let mut previous_end = data.parameters.range.start;
     let mut names = HashSet::new();
     for &parameter in &data.parameters.nodes {
@@ -1205,6 +1219,17 @@ fn plan_source_class_constructor(
                 kind: SyntaxKind::Parameter,
             }));
         }
+        if matches!(planned.type_, ClassBodyParameterType::Annotation(_))
+            && let Some(initializer) = planned.initializer
+        {
+            literal_defaults.push(plan_source_constructor_literal_default(
+                store,
+                host,
+                planned.declaration,
+                planned.type_node,
+                initializer,
+            )?);
+        }
         body_parameters.push(source_constructor_parameter(store, host, planned)?);
         parameters.push(planned);
     }
@@ -1241,6 +1266,7 @@ fn plan_source_class_constructor(
             symbol,
             visibility,
             parameters,
+            literal_defaults,
         },
         body,
     ))
@@ -2489,6 +2515,18 @@ fn validate_source_class_stored_layout(
             {
                 return Err(reject());
             }
+        }
+        let defaults_complete = plan
+            .bodies
+            .iter()
+            .position(|body| body.declaration == constructor.declaration)
+            .is_some_and(|index| provenance.completed_bodies[index]);
+        for initializer in &constructor.literal_defaults {
+            validate_source_constructor_literal_default_cache(
+                store,
+                initializer,
+                defaults_complete,
+            )?;
         }
     }
     for (property, type_) in &plan.properties {
@@ -8173,7 +8211,14 @@ fn plan_constructor_parameter_with_body_mode(
         && type_context.is_some()
         && !matches!(type_record.data, NodeData::KeywordTypeNode(_))
         && class_reference.is_none()
-        && initializer.is_none()
+        && (initializer.is_none()
+            || property_readonly.is_none()
+                && initializer.is_some_and(|node| {
+                    matches!(
+                        host.node(node).map(|record| record.kind),
+                        Some(SyntaxKind::NumericLiteral | SyntaxKind::StringLiteral)
+                    )
+                }))
         && !optional
         && decorator.is_none();
     let annotated = !matches!(type_record.data, NodeData::KeywordTypeNode(_))
@@ -8206,7 +8251,7 @@ fn plan_constructor_parameter_with_body_mode(
     } else {
         None
     };
-    if let Some(initializer) = initializer.filter(|_| !annotated) {
+    if let Some(initializer) = initializer.filter(|_| !annotated && !source_annotation) {
         if property_readonly.is_none() || decorator.is_some() {
             return Err(reject());
         }
@@ -8382,7 +8427,7 @@ fn plan_constructor_parameter_with_body_mode(
                 type_node,
                 type_: ClassBodyParameterType::Annotation(type_node),
                 optional: false,
-                initializer: None,
+                initializer,
                 decorator: None,
                 property,
             },
@@ -8438,6 +8483,118 @@ fn plan_constructor_parameter_with_body_mode(
             property,
         },
     ))
+}
+
+/// Retains the real default without evaluating it before the constructor body.
+fn plan_source_constructor_literal_default(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    parameter: NodeRef,
+    annotation: NodeRef,
+    initializer: NodeRef,
+) -> Result<SourceConstructorLiteralDefault, ClassError> {
+    let reject = || {
+        unsupported(ClassUnsupported::PropertyType {
+            node: initializer,
+            kind: SyntaxKind::Parameter,
+        })
+    };
+    let declaration = preflight_node(store, host, parameter)?;
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let record = preflight_node(store, host, initializer)?;
+    if record.flags.0 != 0
+        || record.parent != Some(parameter.node)
+        || record.range.start < annotation_record.range.end
+        || record.range.end != declaration.range.end
+    {
+        return Err(reject());
+    }
+    let literal = match &record.data {
+        NodeData::NumericLiteral(literal)
+            if record.kind == SyntaxKind::NumericLiteral
+                && literal.token_flags.0 == 0
+                && !ts_jsnum::from_string(&literal.text).is_nan() =>
+        {
+            SourceConstructorDefaultLiteral::Number(literal.text.clone())
+        }
+        NodeData::StringLiteral(literal)
+            if record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0 =>
+        {
+            SourceConstructorDefaultLiteral::String(literal.text.clone())
+        }
+        _ => return Err(reject()),
+    };
+    if let Some(source) = host
+        .source(initializer)
+        .and_then(|(arena, _)| arena.source_text())
+    {
+        let spelling =
+            source.get(record.range.start.get() as usize..record.range.end.get() as usize);
+        let matches = match &literal {
+            SourceConstructorDefaultLiteral::Number(text) => spelling == Some(text.as_str()),
+            SourceConstructorDefaultLiteral::String(text) => spelling.is_some_and(|spelling| {
+                spelling
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .or_else(|| {
+                        spelling
+                            .strip_prefix('\'')
+                            .and_then(|value| value.strip_suffix('\''))
+                    })
+                    == Some(text.as_str())
+            }),
+        };
+        if !matches {
+            return Err(reject());
+        }
+    }
+    let plan = SourceConstructorLiteralDefault {
+        node: initializer,
+        literal,
+    };
+    validate_source_constructor_literal_default_cache(store, &plan, false)?;
+    Ok(plan)
+}
+
+/// A completed body keeps its fresh default separate from the parameter annotation.
+fn validate_source_constructor_literal_default_cache(
+    store: &CanonicalTypeMapperStore,
+    initializer: &SourceConstructorLiteralDefault,
+    required: bool,
+) -> Result<(), ClassError> {
+    let reject = || invariant(ClassInvariant::InvalidPropertyTypeCache(initializer.node));
+    if store
+        .symbol_node_links(initializer.node)
+        .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return Err(reject());
+    }
+    let Some(links) = store
+        .type_node_links(initializer.node)
+        .filter(|links| *links != &TypeNodeLinks::default())
+    else {
+        return if required { Err(reject()) } else { Ok(()) };
+    };
+    let fresh = links.resolved_type.ok_or_else(reject)?;
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(reject)?;
+    let regular = match &initializer.literal {
+        SourceConstructorDefaultLiteral::Number(text) => {
+            bootstrap.cached_number_literal_type(ts_jsnum::from_string(text))
+        }
+        SourceConstructorDefaultLiteral::String(text) => bootstrap.cached_string_literal_type(text),
+    }
+    .ok_or_else(reject)?;
+    if links
+        != &(TypeNodeLinks {
+            resolved_type: Some(fresh),
+            ..TypeNodeLinks::default()
+        })
+        || store.fresh_type_of_literal_type(regular) != Ok(fresh)
+        || store.validate_union_constituent(fresh).is_err()
+    {
+        return Err(reject());
+    }
+    Ok(())
 }
 
 fn plan_source_class_parameter_reference(
@@ -31595,6 +31752,355 @@ mod query_tests {
             .unwrap();
         let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
         (declaration, symbol)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the cold source plan, poison, and exact restoration together.
+    fn constructor_annotation_literal_defaults_reject_cold_cache_poison_before_publication() {
+        let parsed = parse_source_file(
+            "type Status = 400 | 500; class Reply { constructor(status: Status = 500) {} }",
+        );
+        let file = FileId::new(14_450);
+        let mut context = context(&parsed, file, CanonicalModuleState::Script);
+        let (_, owner) = class(&context, &parsed, file, "Reply");
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(
+                context.options().name_resolution,
+            ),
+        )
+        .unwrap();
+        let query = ClassTypeQueryContext::new(context.global_types(), context.options());
+        let plan = plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&query),
+        )
+        .unwrap();
+        let constructor = plan.constructor.as_ref().unwrap();
+        let [parameter] = constructor.parameters.as_slice() else {
+            panic!("one real parameter")
+        };
+        let [initializer] = constructor.literal_defaults.as_slice() else {
+            panic!("one real default")
+        };
+        assert_eq!(parameter.initializer, Some(initializer.node));
+        assert_eq!(
+            parameter.type_,
+            ClassBodyParameterType::Annotation(parameter.type_node)
+        );
+        assert_eq!(source_class_minimum(&constructor.parameters), Ok(0));
+        assert!(context.store().type_node_links(initializer.node).is_none());
+        assert!(context.store().declared_type_links(owner).is_none());
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            initializer.node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+                context.store().declared_type_links(owner).cloned(),
+                context.store().value_symbol_links(owner).cloned(),
+                context
+                    .store()
+                    .value_symbol_links(parameter.symbol)
+                    .cloned(),
+                context
+                    .store()
+                    .type_node_links(parameter.type_node)
+                    .cloned(),
+                context.store().type_node_links(initializer.node).cloned(),
+                context
+                    .store()
+                    .source_class_provenance_for_symbol(owner)
+                    .cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let poisoned = snapshot(&context);
+        for _ in 0..2 {
+            assert_eq!(
+                plan_source_class_members_with_type_context(
+                    context.store(),
+                    &host,
+                    owner,
+                    Some(&query),
+                ),
+                Err(ClassError::Invariant(
+                    ClassInvariant::InvalidPropertyTypeCache(initializer.node)
+                ))
+            );
+            assert_eq!(snapshot(&context), poisoned);
+        }
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(initializer.node, TypeNodeLinks::default())
+        );
+        assert_eq!(
+            plan_source_class_members_with_type_context(
+                context.store(),
+                &host,
+                owner,
+                Some(&query),
+            ),
+            Ok(plan.clone())
+        );
+        assert!(
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .is_none()
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_ne!(
+            context
+                .store()
+                .type_node_links(initializer.node)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each warm poison restores the same real constructor and default.
+    fn constructor_annotation_literal_defaults_keep_invalid_diagnostics_and_warm_owners() {
+        for (source, expected_codes) in [
+            (
+                "type Status = 400 | 500; class Reply { constructor(status: Status = 500) {} }",
+                &[][..],
+            ),
+            (
+                "type Status = 400 | 500; class Reply { constructor(status: Status = 999) {} }",
+                &[2322][..],
+            ),
+            (
+                "type Status = 'ready' | 'waiting'; class Reply { constructor(status: Status = 'ready') {} }",
+                &[][..],
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(14_451);
+            let mut context = context(&parsed, file, CanonicalModuleState::Script);
+            context.check_source_file(file).unwrap();
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected_codes
+            );
+            let (_, owner) = class(&context, &parsed, file, "Reply");
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    context.options().name_resolution,
+                ),
+            )
+            .unwrap();
+            let provenance = context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .unwrap()
+                .clone();
+            assert!(provenance.complete);
+            let constructor = provenance.prepared.plan.constructor.as_ref().unwrap();
+            let [parameter] = constructor.parameters.as_slice() else {
+                panic!("one real parameter")
+            };
+            let [initializer] = constructor.literal_defaults.as_slice() else {
+                panic!("one real default")
+            };
+            let annotation_links = context
+                .store()
+                .type_node_links(parameter.type_node)
+                .unwrap()
+                .clone();
+            let initializer_links = context
+                .store()
+                .type_node_links(initializer.node)
+                .unwrap()
+                .clone();
+            let value_links = context
+                .store()
+                .value_symbol_links(parameter.symbol)
+                .unwrap()
+                .clone();
+            let annotation = annotation_links.resolved_type.unwrap();
+            let fresh = initializer_links.resolved_type.unwrap();
+            let TypeData::Literal(literal) = context.store().type_payload(fresh).unwrap().data()
+            else {
+                panic!("the real fresh literal")
+            };
+            let regular = literal.regular_type;
+            assert_ne!(fresh, annotation);
+            assert_ne!(fresh, regular);
+            assert_eq!(value_links.resolved_type, Some(annotation));
+            assert_eq!(
+                context
+                    .store()
+                    .signature(provenance.prepared.construct_signature)
+                    .unwrap()
+                    .min_argument_count(),
+                0
+            );
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let wrong_regular = context
+                .store_mut_for_test()
+                .regular_number_literal_type(Number::new(600.0))
+                .unwrap();
+            let wrong_fresh = context
+                .store()
+                .fresh_type_of_literal_type(wrong_regular)
+                .unwrap();
+            let snapshot = |context: &CanonicalCheckerContext<'_>| {
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot(),
+                    context
+                        .store()
+                        .source_class_provenance_for_symbol(owner)
+                        .cloned(),
+                    context
+                        .store()
+                        .type_node_links(parameter.type_node)
+                        .cloned(),
+                    context.store().type_node_links(initializer.node).cloned(),
+                    context.store().symbol_node_links(initializer.node).cloned(),
+                    context
+                        .store()
+                        .value_symbol_links(parameter.symbol)
+                        .cloned(),
+                    context
+                        .store()
+                        .source_file_links(context.source_file(file).unwrap())
+                        .cloned(),
+                    context.diagnostics().clone(),
+                )
+            };
+            for replacement in [
+                TypeNodeLinks {
+                    resolved_type: Some(wrong_fresh),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeLinks {
+                    resolved_type: Some(regular),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeLinks::default(),
+                TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    outer_type_parameters: Some(vec![]),
+                },
+            ] {
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(initializer.node, replacement)
+                );
+                let poisoned = snapshot(&context);
+                for _ in 0..2 {
+                    assert_eq!(
+                        completed_source_class_members(context.store(), &host, owner),
+                        Err(ClassError::Invariant(
+                            ClassInvariant::InvalidPropertyTypeCache(initializer.node)
+                        ))
+                    );
+                    assert_eq!(snapshot(&context), poisoned);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(initializer.node, initializer_links.clone())
+                );
+                assert_eq!(
+                    completed_source_class_members(context.store(), &host, owner),
+                    Ok(Some(provenance.members.clone()))
+                );
+            }
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                initializer.node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(owner)
+                },
+            ));
+            let poisoned = snapshot(&context);
+            assert_eq!(
+                completed_source_class_members(context.store(), &host, owner),
+                Err(ClassError::Invariant(
+                    ClassInvariant::InvalidPropertyTypeCache(initializer.node)
+                )),
+            );
+            assert_eq!(snapshot(&context), poisoned);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(initializer.node, SymbolNodeLinks::default(),)
+            );
+            assert!(context.store_mut_for_test().set_type_node_links(
+                parameter.type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                }
+            ));
+            let poisoned = snapshot(&context);
+            assert!(matches!(
+                completed_source_class_members(context.store(), &host, owner),
+                Err(ClassError::DeclaredType(_))
+            ));
+            assert_eq!(snapshot(&context), poisoned);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(parameter.type_node, annotation_links)
+            );
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(fresh),
+                    ..ValueSymbolLinks::default()
+                }
+            ));
+            let poisoned = snapshot(&context);
+            assert_eq!(
+                completed_source_class_members(context.store(), &host, owner),
+                Err(ClassError::Invariant(
+                    ClassInvariant::InvalidPropertyValueCache(parameter.symbol)
+                ))
+            );
+            assert_eq!(snapshot(&context), poisoned);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(parameter.symbol, value_links)
+            );
+            let restored = snapshot(&context);
+            for _ in 0..2 {
+                assert_eq!(
+                    completed_source_class_members(context.store(), &host, owner),
+                    Ok(Some(provenance.members.clone()))
+                );
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(snapshot(&context), restored);
+            }
+        }
     }
 
     #[test]
