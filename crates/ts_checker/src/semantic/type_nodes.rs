@@ -62,8 +62,9 @@ use super::{
     },
     indexed_access_types::{
         ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, RecursiveIndexedAccessPlan,
-        finish_concrete_indexed_access, get_deferred_indexed_access_type,
-        plan_concrete_indexed_access, plan_recursive_indexed_access,
+        cached_deferred_indexed_access_type, finish_concrete_indexed_access,
+        get_deferred_indexed_access_type, plan_concrete_indexed_access,
+        plan_recursive_indexed_access,
     },
     instantiate::{
         InstantiationLimitEventMark, InstantiationLimits, InstantiationSession,
@@ -708,6 +709,8 @@ impl TypeQueryPlan {
             }
         } else if let Some(target) = self.keyofs.get(&node) {
             children.push(*target);
+        } else if let Some(indexed) = self.source_callable_indexed_return(store, callable, node)? {
+            children.extend([indexed.object, indexed.index]);
         } else if let Some(union) = self.unions.get(&node) {
             children.extend(union.types.iter().copied());
         } else if let Some(intersection) = self.intersections.get(&node) {
@@ -736,6 +739,72 @@ impl TypeQueryPlan {
             );
         }
         Ok((children, alias_body))
+    }
+
+    /// Replays the source owner retained for an ordinary generic indexed return.
+    fn source_callable_indexed_return(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        callable: &SourceCallablePlan,
+        node: NodeRef,
+    ) -> Result<Option<PlannedMappedIndexedAccess>, DeclaredTypeError> {
+        let Some(indexed) = self
+            .mapped_indexed_accesses
+            .get(&node)
+            .filter(|indexed| indexed.source_callable.is_some())
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let object = self.references.get(&indexed.object).ok_or_else(&invalid)?;
+        let index = self.references.get(&indexed.index).ok_or_else(&invalid)?;
+        let key_parameter = callable
+            .type_parameters
+            .iter()
+            .find(|parameter| parameter.symbol == index.symbol)
+            .ok_or_else(&invalid)?;
+        let constraint = key_parameter.constraint.ok_or_else(&invalid)?;
+        let constraint_object = self.keyofs.get(&constraint).copied().ok_or_else(&invalid)?;
+        let constrained = self
+            .references
+            .get(&constraint_object)
+            .ok_or_else(&invalid)?;
+        if indexed.source_callable != Some(callable.declaration)
+            || callable.family != SourceCallableFamily::FunctionDeclaration
+            || callable.is_async
+            || callable.return_type.type_node() != Some(node)
+            || store.source_node_kind(callable.declaration) != Some(SyntaxKind::FunctionDeclaration)
+            || store.source_child_with_kind(callable.declaration, SyntaxKind::IndexedAccessType)
+                != Some(node)
+            || store.source_node_parent(node)
+                != Some(SourceNodeParent::Parent(callable.declaration))
+            || store.source_node_kind(node) != Some(SyntaxKind::IndexedAccessType)
+            || store
+                .source_direct_children(node)
+                .is_none_or(|children| children.as_slice() != [indexed.object, indexed.index])
+            || [indexed.object, indexed.index].iter().any(|operand| {
+                store.source_node_kind(*operand) != Some(SyntaxKind::TypeReference)
+                    || store.source_node_parent(*operand) != Some(SourceNodeParent::Parent(node))
+            })
+            || object.symbol == index.symbol
+            || constrained.symbol != object.symbol
+            || store.source_node_parent(constraint)
+                != Some(SourceNodeParent::Parent(key_parameter.declaration))
+            || store.source_node_parent(constraint_object)
+                != Some(SourceNodeParent::Parent(constraint))
+            || [object, index, constrained].iter().any(|reference| {
+                reference.arity != PlannedTypeReferenceArity::Valid
+                    || !reference.type_arguments.is_empty()
+                    || !callable
+                        .type_parameters
+                        .iter()
+                        .any(|parameter| parameter.symbol == reference.symbol)
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(Some(indexed))
     }
 
     /// Proves intrinsic dispatch without allocating cold alias parameters.
@@ -1443,6 +1512,15 @@ impl TypeQueryPlan {
             if let Some(target) = child(*target, active)? {
                 let plan = plan_nongeneric_keyof_type(store, target).map_err(|_| invalid())?;
                 cached_nongeneric_keyof_type(store, &plan).map_err(|_| invalid())?
+            } else {
+                None
+            }
+        } else if let Some(indexed) = self.source_callable_indexed_return(store, callable, node)? {
+            let object = child(indexed.object, active)?;
+            let index = child(indexed.index, active)?;
+            if let (Some(object), Some(index)) = (object, index) {
+                cached_deferred_indexed_access_type(store, object, index, AccessFlags::NONE)
+                    .map_err(|_| invalid())?
             } else {
                 None
             }
@@ -4182,6 +4260,8 @@ struct PlannedTemplateType {
 struct PlannedMappedIndexedAccess {
     object: NodeRef,
     index: NodeRef,
+    /// Present only for the direct return of an ordinary generic source function.
+    source_callable: Option<NodeRef>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5828,6 +5908,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(None);
         };
         let mut roots = HashSet::new();
+        roots.extend(
+            self.plan
+                .mapped_indexed_accesses
+                .iter()
+                .filter_map(|(node, indexed)| {
+                    (indexed.source_callable == Some(callable.declaration)).then_some(*node)
+                }),
+        );
         for &node in self.plan.unions.keys() {
             if self
                 .plan
@@ -7888,7 +7976,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if !is_mapped_parameter {
             return self.plan_type_node_in_context(node, None, false);
         }
-        let planned = PlannedMappedIndexedAccess { object, index };
+        let planned = PlannedMappedIndexedAccess {
+            object,
+            index,
+            source_callable: None,
+        };
         if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
             && existing != planned
         {
@@ -9324,6 +9416,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if self.plan.mapped_indexed_accesses.contains_key(&node) {
             return Ok(());
         }
+        if alias_owner.is_none() && self.try_plan_source_callable_indexed_return(node)? {
+            return Ok(());
+        }
         if let Some(alias) = alias_owner
             && self
                 .plan
@@ -9360,6 +9455,131 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan.indexed_accesses.insert(node, planned.clone());
         self.plan_type_node_in_context(planned.object(), None, false)?;
         self.plan_type_node_in_context(planned.index(), None, false)
+    }
+
+    /// Keeps a written `Model[Key]` return on the existing deferred producer.
+    fn try_plan_source_callable_indexed_return(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(callable) = self.source_callable_scope.as_deref() else {
+            return Ok(false);
+        };
+        if callable.family != SourceCallableFamily::FunctionDeclaration
+            || callable.is_async
+            || callable.return_type.type_node() != Some(node)
+            || self
+                .host
+                .bound_file(callable.declaration)
+                .and_then(ts_binder::BoundFile::source_facts)
+                .is_none_or(|facts| facts.is_javascript_file())
+        {
+            return Ok(false);
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return Ok(false);
+        };
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node));
+        if !matches!(
+            &preflight_node(self.store, self.host, callable.declaration)?.data,
+            NodeData::FunctionDeclaration(function) if function.type_ == Some(node.node)
+        ) {
+            return Err(invalid());
+        }
+        let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+        let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+        let object_record = preflight_node(self.store, self.host, object)?;
+        let index_record = preflight_node(self.store, self.host, index)?;
+        if record.kind != SyntaxKind::IndexedAccessType
+            || record.flags.0 & NODE_FLAG_JSDOC != 0
+            || record.parent != Some(callable.declaration.node)
+            || object == index
+            || object_record.parent != Some(node.node)
+            || index_record.parent != Some(node.node)
+            || object_record.range.start != record.range.start
+            || object_record.range.end > index_record.range.start
+            || index_record.range.end >= record.range.end
+        {
+            return Err(invalid());
+        }
+        let Some(object_parameter) = self.source_callable_indexed_parameter(object)? else {
+            return Ok(false);
+        };
+        let Some(index_parameter) = self.source_callable_indexed_parameter(index)? else {
+            return Ok(false);
+        };
+        if object_parameter == index_parameter {
+            return Ok(false);
+        }
+        let key_parameter = callable
+            .type_parameters
+            .iter()
+            .find(|parameter| parameter.symbol == index_parameter)
+            .ok_or_else(&invalid)?;
+        let Some(constraint) = key_parameter.constraint else {
+            return Ok(false);
+        };
+        let constraint_record = preflight_node(self.store, self.host, constraint)?;
+        let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
+            return Ok(false);
+        };
+        if constraint_record.kind != SyntaxKind::TypeOperator
+            || operator.operator != SyntaxKind::KeyOfKeyword
+        {
+            return Ok(false);
+        }
+        let target = NodeRef::new(constraint.arena, constraint.file, operator.type_);
+        if constraint_record.parent != Some(key_parameter.declaration.node)
+            || preflight_node(self.store, self.host, target)?.parent != Some(constraint.node)
+        {
+            return Err(invalid());
+        }
+        if self.source_callable_indexed_parameter(target)? != Some(object_parameter) {
+            return Ok(false);
+        }
+        let declaration = callable.declaration;
+        self.plan_type_node(constraint)?;
+        self.plan_type_node_in_context(object, None, false)?;
+        self.plan_type_node_in_context(index, None, false)?;
+        let planned = PlannedMappedIndexedAccess {
+            object,
+            index,
+            source_callable: Some(declaration),
+        };
+        if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
+            && existing != planned
+        {
+            return Err(invalid());
+        }
+        let callable = self.source_callable_scope.as_deref().ok_or_else(&invalid)?;
+        self.plan
+            .cached_source_callable_type(self.store, callable, &[], node)?;
+        Ok(true)
+    }
+
+    fn source_callable_indexed_parameter(
+        &self,
+        node: NodeRef,
+    ) -> Result<Option<SemanticSymbolId>, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            return Ok(None);
+        };
+        let name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let name_record = preflight_node(self.store, self.host, name)?;
+        if record.kind != SyntaxKind::TypeReference
+            || record.flags.0 & NODE_FLAG_JSDOC != 0
+            || reference.type_arguments.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(node.node)
+        {
+            return Ok(None);
+        }
+        let symbol = self.resolve_uncached_type_reference_symbol(node)?;
+        Ok(self
+            .source_callable_owns_type_parameter_reference(node, symbol)?
+            .then_some(symbol))
     }
 
     fn is_authenticated_bivariant_method_indexed_access(
@@ -10912,7 +11132,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         self.plan_type_node_in_context(object, None, false)?;
         self.plan_type_node_in_context(index, None, false)?;
-        let planned = PlannedMappedIndexedAccess { object, index };
+        let planned = PlannedMappedIndexedAccess {
+            object,
+            index,
+            source_callable: None,
+        };
         if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
             && existing != planned
         {
@@ -95847,6 +96071,557 @@ mod tests {
         };
         assert_eq!(diagnostic.diagnostic.code(), 2589);
         assert_eq!(diagnostic.node, Some(default_node));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The three query orders retain the same source and array owners.
+    fn source_callable_indexed_returns_keep_source_and_query_first_identity() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        for order in ["source", "signature", "annotation"] {
+            let source = parse_source_file(
+                "declare function read<Model, Key extends keyof Model = keyof Model>(value: Model, key: Key): Model[Key];",
+            );
+            let (mut context, library_file, file) =
+                symbolic_mapped_return_context(&library, &source);
+            if order == "source" {
+                context.check_source_file(file).unwrap();
+            }
+            let library_bound = context.file(library_file).unwrap().1.clone();
+            let source_bound = context.file(file).unwrap().1.clone();
+            let options = context.options();
+            let globals = context.global_types().clone();
+            let targets = CanonicalArrayTargets::from_global_types(&globals);
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(options.name_resolution),
+            )
+            .unwrap();
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = source_bound.symbol(declaration).unwrap();
+            let callable = source_callables::plan_source_callable(
+                context.store(),
+                &host,
+                declaration,
+                owner,
+                Some(targets),
+            )
+            .unwrap();
+            let annotation = callable.return_type.type_node().unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            {
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                let annotation_first = (order == "annotation")
+                    .then(|| query.get_type_from_type_node(annotation).unwrap());
+                if annotation_first.is_some() {
+                    assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+                }
+                let type_ = query
+                    .get_type_of_source_callable(declaration, owner)
+                    .unwrap();
+                let signature = function_signature(query.store, declaration);
+                let record = query.store.signature(signature).unwrap();
+                let parameters = record.type_parameters().to_vec();
+                assert_eq!(record.declaration(), Some(declaration));
+                assert_eq!(parameters.len(), 2);
+                assert_eq!(record.parameters().len(), 2);
+                assert_eq!(record.min_argument_count(), 2);
+                if order != "source" {
+                    assert_eq!(record.resolved_return_type(), None);
+                    assert_eq!(
+                        query
+                            .store
+                            .source_callable_type_query(signature)
+                            .unwrap()
+                            .annotation_type(annotation),
+                        None
+                    );
+                }
+                for (parameter, planned) in parameters.iter().zip(&callable.type_parameters) {
+                    assert_eq!(
+                        cached_ordinary_type_parameter_owner(query.store, *parameter),
+                        Some(planned.symbol)
+                    );
+                    assert_eq!(
+                        query.store.source_node_parent(planned.declaration),
+                        Some(SourceNodeParent::Parent(declaration))
+                    );
+                }
+                let returned = query.get_return_type_of_signature(signature).unwrap();
+                assert!(annotation_first.is_none_or(|first| first == returned));
+                let record = query.store.type_payload(returned).unwrap();
+                assert_eq!(record.flags(), TypeFlags::INDEXED_ACCESS);
+                assert_eq!(record.alias(), None);
+                let TypeData::IndexedAccess(indexed) = record.data() else {
+                    panic!("the written generic lookup must remain deferred");
+                };
+                assert_eq!(indexed.object_type, parameters[0]);
+                assert_eq!(indexed.index_type, parameters[1]);
+                assert_eq!(indexed.access_flags, AccessFlags::NONE);
+                assert_eq!(
+                    cached_deferred_indexed_access_type(
+                        query.store,
+                        parameters[0],
+                        parameters[1],
+                        AccessFlags::NONE
+                    ),
+                    Ok(Some(returned))
+                );
+                let evidence = query.store.source_callable_type_query(signature).unwrap();
+                assert!(evidence.is_exact(query.store));
+                assert_eq!(evidence.callable.array_targets, Some(targets));
+                assert_eq!(evidence.annotation_type(annotation), Some(returned));
+                assert_eq!(
+                    evidence.plan.mapped_indexed_accesses[&annotation].source_callable,
+                    Some(declaration)
+                );
+                let warm = function_store_state(query.store);
+                let caller = format!("{:?}", query.instantiation_session.as_deref().unwrap());
+                for _ in 0..2 {
+                    query
+                        .preflight_type_of_source_callable(declaration, owner)
+                        .unwrap();
+                    assert_eq!(
+                        query.get_type_of_source_callable(declaration, owner),
+                        Ok(type_)
+                    );
+                    assert_eq!(query.get_type_from_type_node(annotation), Ok(returned));
+                    assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                    assert_eq!(function_store_state(query.store), warm);
+                    assert_eq!(
+                        format!("{:?}", query.instantiation_session.as_deref().unwrap()),
+                        caller
+                    );
+                }
+            }
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cold and warm damage must fail before any return or operand can publish.
+    fn source_callable_indexed_returns_reject_root_and_operand_cache_swaps() {
+        let mut fixture = fixture(concat!(
+            "declare function read<Model, Key extends keyof Model>(): Model[Key]; ",
+            "declare function other<Model, Key extends keyof Model>(): Model[Key]; ",
+            "type Label = string | number;",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "read");
+        let owner = node_symbol(&fixture, declaration);
+        let other = named_node(&fixture, SyntaxKind::FunctionDeclaration, "other");
+        let other_owner = node_symbol(&fixture, other);
+        let label_node = alias_parts(&fixture, "Label").2;
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let other_callable =
+            source_callables::plan_source_callable(&fixture.store, &host, other, other_owner, None)
+                .unwrap();
+        let annotation = callable.return_type.type_node().unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(query.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            }
+        ));
+        let cold = function_store_state(query.store);
+        for _ in 0..2 {
+            assert!(matches!(
+                query.plan_source_callable_type_inputs(&callable),
+                Err(DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidTypeReference(node)))
+                    if node == annotation
+            ));
+            assert!(query.preflight_type_from_type_node(annotation).is_err());
+            assert_eq!(function_store_state(query.store), cold);
+        }
+        assert!(
+            query
+                .store
+                .set_type_node_links(annotation, TypeNodeLinks::default())
+        );
+        query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        let returned = query.get_return_type_of_signature(signature).unwrap();
+        query
+            .get_type_of_source_callable(other, other_owner)
+            .unwrap();
+        let other_signature = function_signature(query.store, other);
+        let other_returned = query.get_return_type_of_signature(other_signature).unwrap();
+        let other_parameters = query
+            .store
+            .signature(other_signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let label = query.get_type_from_type_node(label_node).unwrap();
+        let label_alias = query.store.type_payload(label).unwrap().alias().unwrap();
+        let evidence = query.store.source_callable_type_query(signature).unwrap();
+        let indexed = evidence.plan.mapped_indexed_accesses[&annotation];
+        let nodes = [annotation, indexed.object, indexed.index];
+        let original_nodes = nodes.map(|node| query.store.type_node_links(node).cloned().unwrap());
+        let operands = [indexed.object, indexed.index];
+        let original_symbols =
+            operands.map(|node| query.store.symbol_node_links(node).cloned().unwrap());
+        for damage in 0..4 {
+            match damage {
+                0 => assert!(query.store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(other_returned),
+                        ..original_nodes[0].clone()
+                    }
+                )),
+                1 => {
+                    for (index, node) in operands.iter().copied().enumerate() {
+                        assert!(query.store.set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: Some(other_parameters[index]),
+                                ..original_nodes[index + 1].clone()
+                            }
+                        ));
+                        assert!(query.store.set_symbol_node_links(
+                            node,
+                            SymbolNodeLinks {
+                                resolved_symbol: Some(other_callable.type_parameters[index].symbol),
+                                ..original_symbols[index].clone()
+                            }
+                        ));
+                    }
+                }
+                2 => assert!(query.store.set_type_alias(returned, Some(label_alias))),
+                _ => assert!(query.store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        outer_type_parameters: Some(other_parameters.clone()),
+                        ..original_nodes[0].clone()
+                    }
+                )),
+            }
+            let before = function_store_state(query.store);
+            let caller = format!("{:?}", query.instantiation_session.as_deref().unwrap());
+            for _ in 0..2 {
+                assert!(query.plan_source_callable_type_inputs(&callable).is_err());
+                assert!(query.preflight_type_from_type_node(annotation).is_err());
+                assert!(query.get_type_from_type_node(annotation).is_err());
+                assert!(query.get_return_type_of_signature(signature).is_err());
+                assert_eq!(function_store_state(query.store), before);
+                assert_eq!(
+                    format!("{:?}", query.instantiation_session.as_deref().unwrap()),
+                    caller
+                );
+            }
+            for (node, links) in nodes.into_iter().zip(&original_nodes) {
+                assert!(query.store.set_type_node_links(node, links.clone()));
+            }
+            for (node, links) in operands.into_iter().zip(&original_symbols) {
+                assert!(query.store.set_symbol_node_links(node, links.clone()));
+            }
+            assert!(query.store.set_type_alias(returned, None));
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            assert_eq!(function_store_state(query.store), before);
+        }
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A spent caller must retain the real constraint and default checks.
+    fn source_callable_indexed_returns_validate_defaults_before_warm_answers() {
+        let mut fixture = fixture(
+            "declare function read<Model, Key extends keyof Model = keyof Model>(): Model[Key];",
+        );
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "read");
+        let owner = node_symbol(&fixture, declaration);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let annotation = callable.return_type.type_node().unwrap();
+        let default_node = callable.type_parameters[1].default_type.unwrap();
+        let constraint_node = callable.type_parameters[1].constraint.unwrap();
+        let NodeData::IndexedAccessTypeNode(indexed) = &host.node(annotation).unwrap().data else {
+            unreachable!()
+        };
+        let object_node = NodeRef::new(annotation.arena, annotation.file, indexed.object_type);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 1,
+            ..InstantiationLimits::default()
+        });
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let object = query.get_type_from_type_node(object_node).unwrap();
+        assert_eq!(
+            instantiate_type_with_vector_and_session(
+                query.store,
+                object,
+                &[object],
+                &[string],
+                None,
+                query.instantiation_session.as_deref_mut().unwrap(),
+            ),
+            Ok(string)
+        );
+        let caller = query.instantiation_session.as_deref().unwrap();
+        assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+        let mark = caller.limit_event_mark();
+        let returned = query.get_type_from_type_node(annotation).unwrap();
+        assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+        let key = query
+            .store
+            .declared_type_links(callable.type_parameters[1].symbol)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let constraint = query
+            .store
+            .type_node_links(constraint_node)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let default_type = query
+            .store
+            .type_node_links(default_node)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(default_type, constraint);
+        assert!(
+            matches!(query.store.type_payload(key).map(TypeRecord::data),
+                Some(TypeData::TypeParameter(parameter))
+                    if parameter.constraint == Some(constraint)
+                        && parameter.resolved_default_type == Some(default_type)
+            )
+        );
+        assert!(
+            matches!(query.store.type_payload(constraint).map(TypeRecord::data),
+                Some(TypeData::Index(index)) if index.target == object
+            )
+        );
+        let original = query.store.type_node_links(default_node).cloned().unwrap();
+        assert!(query.store.set_type_node_links(
+            default_node,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            }
+        ));
+        let before = function_store_state(query.store);
+        for _ in 0..2 {
+            assert!(
+                query
+                    .preflight_type_of_source_callable(declaration, owner)
+                    .is_err()
+            );
+            assert!(query.get_type_from_type_node(annotation).is_err());
+            assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+            assert_eq!(function_store_state(query.store), before);
+            let caller = query.instantiation_session.as_deref().unwrap();
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), mark);
+        }
+        assert!(query.store.set_type_node_links(default_node, original));
+        for _ in 0..2 {
+            assert_eq!(query.get_type_from_type_node(annotation), Ok(returned));
+            assert_eq!(query.store.source_callable_type_for_owner(owner), None);
+            assert_eq!(function_store_state(query.store), before);
+            let caller = query.instantiation_session.as_deref().unwrap();
+            assert_eq!((caller.query_count(), caller.total_count()), (1, 1));
+            assert_eq!(caller.limit_event_mark(), mark);
+        }
+        assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Unsupported forms and forged return owners keep their original boundary.
+    fn source_callable_indexed_returns_reject_other_owners_and_shapes() {
+        for (source, arrow) in [
+            ("declare function read<Model, Key>(): Model[Key];", false),
+            (
+                "declare function read<Model, Key extends string>(): Model[Key];",
+                false,
+            ),
+            (
+                "declare function read<Model, Other, Key extends keyof Other>(): Model[Key];",
+                false,
+            ),
+            (
+                "type Model = { item: number }; declare function read<Key extends keyof Model>(): Model[Key];",
+                false,
+            ),
+            (
+                "declare function read<Model, Key extends keyof Model>(value: Model[Key]): Model;",
+                false,
+            ),
+            (
+                "declare function read<Model, Key extends keyof Model>(): Model[Key][];",
+                false,
+            ),
+            (
+                "const read = <Model, Key extends keyof Model>(model: Model, key: Key): Model[Key] => model[key];",
+                true,
+            ),
+        ] {
+            let fixture = fixture(source);
+            let declaration = if arrow {
+                variable_initializer_node(&fixture, "read")
+            } else {
+                named_node(&fixture, SyntaxKind::FunctionDeclaration, "read")
+            };
+            let owner = node_symbol(&fixture, declaration);
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let indexed = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::IndexedAccessType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let aliases = HashMap::new();
+            let mut planner =
+                TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                    .with_source_callable_scope(&callable)
+                    .unwrap();
+            let before = function_store_state(&fixture.store);
+            assert_eq!(
+                planner.try_plan_source_callable_indexed_return(indexed),
+                Ok(false)
+            );
+            assert_eq!(
+                planner.plan_type_node(indexed),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: indexed,
+                        kind: SyntaxKind::IndexedAccessType,
+                    }
+                ))
+            );
+            assert_eq!(function_store_state(&fixture.store), before);
+        }
+
+        let mut fixture = fixture(concat!(
+            "declare function read<Model, Key extends keyof Model>(): Model[Key]; ",
+            "declare function other<Model, Key extends keyof Model>(): Model[Key];",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "read");
+        let owner = node_symbol(&fixture, declaration);
+        let other = named_node(&fixture, SyntaxKind::FunctionDeclaration, "other");
+        let other_owner = node_symbol(&fixture, other);
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let other_callable =
+            source_callables::plan_source_callable(&fixture.store, &host, other, other_owner, None)
+                .unwrap();
+        let annotation = callable.return_type.type_node().unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut plan = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .plan_source_callable_type_inputs(&callable)
+        .unwrap();
+        let before = function_store_state(&fixture.store);
+        plan.mapped_indexed_accesses
+            .get_mut(&annotation)
+            .unwrap()
+            .source_callable = Some(other);
+        let invalid = type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(annotation));
+        assert_eq!(
+            plan.source_callable_indexed_return(&fixture.store, &callable, annotation),
+            Err(invalid)
+        );
+        assert_eq!(function_store_state(&fixture.store), before);
+        let mut changed_owner = callable;
+        changed_owner.return_type = other_callable.return_type;
+        let foreign_return = changed_owner.return_type.type_node().unwrap();
+        let aliases = HashMap::new();
+        let mut planner = TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+            .with_source_callable_scope(&changed_owner)
+            .unwrap();
+        assert_eq!(
+            planner.try_plan_source_callable_indexed_return(foreign_return),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(foreign_return)
+            ))
+        );
+        assert_eq!(function_store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
