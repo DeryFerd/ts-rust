@@ -1194,6 +1194,11 @@ impl TypeQueryPlan {
                                 // The retained conditional request proves this exact result.
                             } else if matches!(
                                 store.type_payload(declared).map(TypeRecord::data),
+                                Some(TypeData::Conditional(_))
+                            ) {
+                                return Err(invalid());
+                            } else if matches!(
+                                store.type_payload(declared).map(TypeRecord::data),
                                 Some(TypeData::Mapped(_))
                             ) {
                                 validate_supported_mapped_alias_instantiation(
@@ -62731,12 +62736,36 @@ mod tests {
             assert_eq!(evidence.annotation_type(reference), Some(returned));
             let parameters = evidence.type_parameters().to_vec();
             let results = evidence.annotation_results.clone();
-            assert!(matches!(
-                super::super::instantiate::cached_instantiation_with_vector(
-                    query.store, declared, &alias_parameters, &expected_arguments, None, None,
+            let cached_replay_state = (
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
                 ),
-                Err(super::super::instantiate::InstantiationError::UnsupportedType(type_)) if type_ == declared
-            ));
+                query.store.conditional_production_lengths(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    super::super::instantiate::cached_instantiation_with_vector(
+                        query.store,
+                        declared,
+                        &alias_parameters,
+                        &expected_arguments,
+                        None,
+                        None,
+                    ),
+                    Ok(Some(returned))
+                );
+                assert_eq!(
+                    (
+                        source_callable_infer_replay_state(
+                            query.store,
+                            query.instantiation_session.as_deref().unwrap()
+                        ),
+                        query.store.conditional_production_lengths(),
+                    ),
+                    cached_replay_state
+                );
+            }
             let number = query.store.intrinsic_bootstrap().unwrap().number_type;
             assert_eq!(
                 instantiate_type_with_vector_and_session(
