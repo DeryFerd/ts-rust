@@ -530,7 +530,7 @@ fn validate_class_call_parameter_types(
 }
 
 /// Keeps specialized overloads first and reverses merged declaration groups.
-fn reorder_direct_call_candidates<'a>(
+pub(super) fn reorder_direct_call_candidates<'a>(
     store: &CanonicalTypeMapperStore,
     callee: TypeId,
     callables: &'a [ValidatedSingleCallable],
@@ -1320,7 +1320,7 @@ fn prepare_direct_call_parameters(
     })
 }
 
-fn project_validated_direct_call(
+pub(super) fn project_validated_direct_call(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     request: DirectCallRequest<'_>,
@@ -1905,7 +1905,7 @@ fn type_contains_void(
     Ok(false)
 }
 
-fn check_argument_applicability(
+pub(super) fn check_argument_applicability(
     projection: &DirectCallProjection,
     is_assignable: impl FnMut(TypeId, TypeId) -> Result<bool, RelationUnavailable>,
 ) -> Result<DirectCallApplicability, RelationUnavailable> {

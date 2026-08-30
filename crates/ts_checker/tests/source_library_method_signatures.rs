@@ -673,11 +673,12 @@ fn split_generic_method_overloads_preserve_inferred_and_explicit_types() {
         "{ id: number; }"
     );
     let mut queries = vec![(original, original_type)];
-    for (&call, result) in calls.iter().zip([original_type, string, number, string]) {
+    for (&call, result) in calls.iter().zip([original_type, string, number, number]) {
         let selected = signature(&context, call);
         assert_eq!(context.get_type_at_location(call), Ok(result));
         assert_eq!(context.get_return_type_of_signature(selected), Ok(result));
-        if call == calls[2] {
+        // Failed overload recovery keeps the first signature with enough parameters.
+        if call == calls[2] || call == calls[3] {
             assert_eq!(selected, concrete);
         } else {
             let record = context.store().signature(selected).unwrap();
