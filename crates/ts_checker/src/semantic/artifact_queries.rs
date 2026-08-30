@@ -327,6 +327,10 @@ impl CanonicalCheckerContext<'_> {
             return Ok(type_);
         }
 
+        if let Some(type_) = self.checked_source_method_artifact_type(node)? {
+            return self.validate_artifact_type(node, type_);
+        }
+
         if supports_type_location(&self.validated_artifact_node(node)?.2.data)
             && let Some(type_) = self.cached_artifact_type(node)?
         {
@@ -4886,6 +4890,602 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    const CHECKED_METHOD_FILE: FileId = FileId::new(6_180);
+    const CHECKED_METHOD_LIBRARY_FILE: FileId = FileId::new(6_181);
+    const CHECKED_METHOD_LIBRARY: &str = concat!(
+        "interface Array<T> {}\n",
+        "interface String { charAt(pos: number): string; }\n",
+        "interface Console { log(...data: any[]): void; count(label?: string): void; }\n",
+        "declare var console: Console;\n",
+    );
+    const CHECKED_CONSOLE_SOURCE: &str = concat!(
+        "function g(str: string) {\n",
+        "  switch (str) {\n",
+        "    case 'a': return; console.log('1'); console.log('2');\n",
+        "    case 'b': console.log('3');\n",
+        "  }\n",
+        "}\n",
+    );
+    const CHECKED_STRING_SOURCE: &str = concat!(
+        "function f(x: string | number) {\n",
+        "  switch (typeof x) {\n",
+        "    case '':\n",
+        "    case 'string': x.charAt(0); break;\n",
+        "  }\n",
+        "}\n",
+    );
+
+    fn checked_method_context<'a>(
+        library: &'a ParseResult,
+        source: &'a ParseResult,
+    ) -> CanonicalCheckerContext<'a> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, name, default_library) in [
+            (library, CHECKED_METHOD_LIBRARY_FILE, "\"/lib.d.ts\"", true),
+            (source, CHECKED_METHOD_FILE, "\"/project.ts\"", false),
+        ] {
+            assert!(parsed.diagnostics.is_empty());
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (CHECKED_METHOD_LIBRARY_FILE, &library.arena),
+                (CHECKED_METHOD_FILE, &source.arena),
+            ],
+            CanonicalCheckerOptions {
+                allow_unreachable_code: Some(false),
+                no_implicit_any: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    struct CheckedMethodLocations {
+        receiver: NodeRef,
+        property: NodeRef,
+        name: NodeRef,
+        call: NodeRef,
+    }
+
+    fn checked_method_locations(source: &ParseResult) -> CheckedMethodLocations {
+        source
+            .arena
+            .iter()
+            .find_map(|(id, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                let reference = |id| NodeRef::new(source.arena.id(), CHECKED_METHOD_FILE, id);
+                Some(CheckedMethodLocations {
+                    receiver: reference(access.expression),
+                    property: reference(id),
+                    name: reference(access.name),
+                    call: reference(record.parent.unwrap()),
+                })
+            })
+            .unwrap()
+    }
+
+    type CheckedMethodNodeState = (
+        NodeRef,
+        Option<TypeNodeLinks>,
+        Option<SymbolNodeLinks>,
+        Option<crate::semantic::SignatureLinks>,
+    );
+    type CheckedMethodValueState = (
+        ts_binder::SemanticSymbolId,
+        Option<DeclaredTypeLinks>,
+        Option<ValueSymbolLinks>,
+    );
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CheckedMethodSnapshot {
+        counts: [usize; 7],
+        links: [usize; 26],
+        nodes: Vec<CheckedMethodNodeState>,
+        values: Vec<CheckedMethodValueState>,
+        source: Option<crate::semantic::SourceFileLinks>,
+        diagnostics: crate::semantic::CanonicalCheckerDiagnostics,
+        relations: crate::semantic::RelationStateSnapshot,
+    }
+
+    fn checked_method_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+        library: &ParseResult,
+        source: &ParseResult,
+    ) -> CheckedMethodSnapshot {
+        let store = context.store();
+        CheckedMethodSnapshot {
+            counts: [
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.index_info_len(),
+                store.type_alias_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
+            links: store.checker_link_allocated_lengths(),
+            nodes: [
+                (library, CHECKED_METHOD_LIBRARY_FILE),
+                (source, CHECKED_METHOD_FILE),
+            ]
+            .into_iter()
+            .flat_map(|(parsed, file)| {
+                parsed.arena.iter().map(move |(id, _)| {
+                    let node = NodeRef::new(parsed.arena.id(), file, id);
+                    (
+                        node,
+                        store.type_node_links(node).cloned(),
+                        store.symbol_node_links(node).cloned(),
+                        store.signature_links(node).cloned(),
+                    )
+                })
+            })
+            .collect(),
+            values: store
+                .symbol_store()
+                .symbols()
+                .map(|(symbol, _)| {
+                    (
+                        symbol,
+                        store.declared_type_links(symbol).cloned(),
+                        store.value_symbol_links(symbol).cloned(),
+                    )
+                })
+                .collect(),
+            source: store
+                .source_file_links(context.source_file(CHECKED_METHOD_FILE).unwrap())
+                .cloned(),
+            diagnostics: context.diagnostics().clone(),
+            relations: store.relation_state_snapshot(),
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_require_source_and_keep_unused_methods_cold() {
+        let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+        let source = parse_source_file(CHECKED_CONSOLE_SOURCE);
+        let locations = checked_method_locations(&source);
+        let mut context = checked_method_context(&library, &source);
+        let cold = checked_method_snapshot(&context, &library, &source);
+        assert_eq!(
+            context.checked_source_method_artifact_type(locations.property),
+            Ok(None)
+        );
+        assert_eq!(checked_method_snapshot(&context, &library, &source), cold);
+        context.check_source_file(CHECKED_METHOD_FILE).unwrap();
+        let method = context
+            .store()
+            .symbol_node_links(locations.property)
+            .unwrap()
+            .resolved_symbol
+            .unwrap();
+        let owner = context.store().get_parent_of_symbol(method).unwrap();
+        assert!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        let diagnostics = context.diagnostics().clone();
+        let method_type = context.get_type_at_location(locations.name).unwrap();
+        assert_eq!(
+            context.get_type_at_location(locations.property),
+            Ok(method_type)
+        );
+        let count = context
+            .store()
+            .symbol(owner)
+            .unwrap()
+            .members()
+            .and_then(|table| context.store().symbol_table(table))
+            .and_then(|table| table.get_source("count"))
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .value_symbol_links(count)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+        assert_eq!(context.diagnostics(), &diagnostics);
+        let warm = checked_method_snapshot(&context, &library, &source);
+        for _ in 0..2 {
+            assert_eq!(
+                context.get_type_at_location(locations.name),
+                Ok(method_type)
+            );
+            context.recheck_source_file(CHECKED_METHOD_FILE).unwrap();
+            assert_eq!(checked_method_snapshot(&context, &library, &source), warm);
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_reject_cold_and_warm_type_cache_damage() {
+        use crate::semantic::{SourceAssertionError, SourceCheckError};
+        for warm in [false, true] {
+            for changed in ["receiver", "property", "name", "call"] {
+                let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+                let source = parse_source_file(CHECKED_CONSOLE_SOURCE);
+                let locations = checked_method_locations(&source);
+                let mut context = checked_method_context(&library, &source);
+                context.check_source_file(CHECKED_METHOD_FILE).unwrap();
+                if warm {
+                    context.get_type_at_location(locations.property).unwrap();
+                }
+                let poisoned = match changed {
+                    "receiver" => locations.receiver,
+                    "property" => locations.property,
+                    "name" => locations.name,
+                    "call" => locations.call,
+                    _ => unreachable!(),
+                };
+                let query = if changed == "name" {
+                    locations.name
+                } else {
+                    locations.property
+                };
+                let saved = context
+                    .store()
+                    .type_node_links(poisoned)
+                    .cloned()
+                    .unwrap_or_default();
+                let expected = if changed == "name" {
+                    context
+                        .store()
+                        .type_node_links(locations.property)
+                        .and_then(|links| links.resolved_type)
+                } else {
+                    saved.resolved_type
+                };
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    poisoned,
+                    TypeNodeLinks {
+                        resolved_type: Some(number),
+                        ..TypeNodeLinks::default()
+                    }
+                ));
+                let error = expected.map_or(SourceCheckError::Property(query), |expected| {
+                    SourceCheckError::Assertion(SourceAssertionError::InvalidExpressionCache {
+                        node: poisoned,
+                        cached: Some(number),
+                        expected,
+                    })
+                });
+                let before = checked_method_snapshot(&context, &library, &source);
+                for _ in 0..2 {
+                    assert_eq!(
+                        context.get_type_at_location(query),
+                        Err(CanonicalArtifactQueryError::SourceCheck(error)),
+                        "{warm} {changed}"
+                    );
+                    assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_node_links(poisoned, saved)
+                );
+                let healthy = context.get_type_at_location(query).unwrap();
+                let restored = checked_method_snapshot(&context, &library, &source);
+                assert_eq!(context.get_type_at_location(query), Ok(healthy));
+                assert_eq!(
+                    checked_method_snapshot(&context, &library, &source),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_reject_changed_method_owner_and_value() {
+        use crate::semantic::SourceCheckError;
+        for text in [CHECKED_CONSOLE_SOURCE, CHECKED_STRING_SOURCE] {
+            for changed in ["flags", "owner", "value"] {
+                let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+                let source = parse_source_file(text);
+                let locations = checked_method_locations(&source);
+                let mut context = checked_method_context(&library, &source);
+                let method_type = context.get_type_at_location(locations.property).unwrap();
+                let method = context
+                    .store()
+                    .symbol_node_links(locations.property)
+                    .unwrap()
+                    .resolved_symbol
+                    .unwrap();
+                let record = context.store().symbol(method).unwrap();
+                let flags = record.flags();
+                let check_flags = record.check_flags();
+                let relationships = (
+                    record.members(),
+                    record.exports(),
+                    record.parent(),
+                    record.export_symbol(),
+                );
+                let value = context.store().value_symbol_links(method).cloned().unwrap();
+                match changed {
+                    "flags" => assert!(context.store_mut_for_test().set_symbol_flags(
+                        method,
+                        SymbolFlags::PROPERTY,
+                        check_flags
+                    )),
+                    "owner" => assert!(context.store_mut_for_test().set_symbol_relationships(
+                        method,
+                        None,
+                        None,
+                        Some(method),
+                        None
+                    )),
+                    "value" => {
+                        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                        assert!(context.store_mut_for_test().set_value_symbol_links(
+                            method,
+                            ValueSymbolLinks {
+                                resolved_type: Some(number),
+                                ..value.clone()
+                            }
+                        ));
+                    }
+                    _ => unreachable!(),
+                }
+                let before = checked_method_snapshot(&context, &library, &source);
+                for _ in 0..2 {
+                    for query in [locations.property, locations.name] {
+                        assert_eq!(
+                            context.get_type_at_location(query),
+                            Err(CanonicalArtifactQueryError::SourceCheck(
+                                SourceCheckError::Property(query)
+                            )),
+                            "{text} {changed}"
+                        );
+                        assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                    }
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_flags(method, flags, check_flags)
+                );
+                assert!(context.store_mut_for_test().set_symbol_relationships(
+                    method,
+                    relationships.0,
+                    relationships.1,
+                    relationships.2,
+                    relationships.3
+                ));
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(method, value)
+                );
+                assert_eq!(
+                    context.get_type_at_location(locations.property),
+                    Ok(method_type)
+                );
+                let restored = checked_method_snapshot(&context, &library, &source);
+                assert_eq!(
+                    context.get_type_at_location(locations.name),
+                    Ok(method_type)
+                );
+                assert_eq!(
+                    checked_method_snapshot(&context, &library, &source),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_reject_changed_source_symbols_before_demand() {
+        for warm in [false, true] {
+            for receiver in [false, true] {
+                let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+                let source = parse_source_file(CHECKED_CONSOLE_SOURCE);
+                let locations = checked_method_locations(&source);
+                let mut context = checked_method_context(&library, &source);
+                context.check_source_file(CHECKED_METHOD_FILE).unwrap();
+                if warm {
+                    context.get_type_at_location(locations.property).unwrap();
+                }
+                let changed = if receiver {
+                    locations.receiver
+                } else {
+                    locations.property
+                };
+                let saved = context.store().symbol_node_links(changed).cloned().unwrap();
+                let expected = saved.resolved_symbol.unwrap();
+                let other = if receiver {
+                    locations.property
+                } else {
+                    locations.receiver
+                };
+                let wrong = context
+                    .store()
+                    .symbol_node_links(other)
+                    .unwrap()
+                    .resolved_symbol
+                    .unwrap();
+                assert_ne!(wrong, expected);
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    changed,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(wrong),
+                    }
+                ));
+                let before = checked_method_snapshot(&context, &library, &source);
+                for _ in 0..2 {
+                    for query in [locations.property, locations.name] {
+                        assert_eq!(
+                            context.get_type_at_location(query),
+                            Err(CanonicalArtifactQueryError::SourceCheck(
+                                crate::semantic::SourceCheckError::Variable(
+                                    crate::semantic::VariableInvariant::InvalidSymbolNodeCache {
+                                        node: changed,
+                                        cached: Some(wrong),
+                                        expected,
+                                    }
+                                ),
+                            ))
+                        );
+                        assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                    }
+                }
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(changed, saved)
+                );
+                let method = context.get_type_at_location(locations.property).unwrap();
+                let restored = checked_method_snapshot(&context, &library, &source);
+                assert_eq!(context.get_type_at_location(locations.name), Ok(method));
+                assert_eq!(
+                    checked_method_snapshot(&context, &library, &source),
+                    restored
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_switch_property_artifacts_keep_the_string_receiver_and_call_signature_exact() {
+        use crate::semantic::SourceCheckError;
+        for changed in ["receiver", "property", "call", "signature", "symbol"] {
+            let library = parse_source_file(CHECKED_METHOD_LIBRARY);
+            let source = parse_source_file(CHECKED_STRING_SOURCE);
+            let locations = checked_method_locations(&source);
+            let mut context = checked_method_context(&library, &source);
+            let method_type = context.get_type_at_location(locations.property).unwrap();
+            let call = context
+                .store()
+                .signature_links(locations.call)
+                .cloned()
+                .unwrap();
+            let signature = call.resolved_signature.signature().unwrap();
+            let declaration = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .declaration()
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(declaration)
+                    .unwrap()
+                    .resolved_signature
+                    .signature(),
+                Some(signature)
+            );
+            let property = context
+                .store()
+                .symbol_node_links(locations.property)
+                .cloned()
+                .unwrap();
+            let type_node = match changed {
+                "receiver" => locations.receiver,
+                "call" => locations.call,
+                _ => locations.property,
+            };
+            let saved = context.store().type_node_links(type_node).cloned().unwrap();
+            match changed {
+                "receiver" | "property" | "call" => {
+                    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                    assert!(context.store_mut_for_test().set_type_node_links(
+                        type_node,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        }
+                    ));
+                }
+                "signature" => assert!(context.store_mut_for_test().set_signature_links(
+                    locations.call,
+                    crate::semantic::SignatureLinks::default()
+                )),
+                "symbol" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(locations.property, SymbolNodeLinks::default())
+                ),
+                _ => unreachable!(),
+            }
+            let before = checked_method_snapshot(&context, &library, &source);
+            for _ in 0..2 {
+                for query in [locations.property, locations.name] {
+                    assert_eq!(
+                        context.get_type_at_location(query),
+                        Err(CanonicalArtifactQueryError::SourceCheck(
+                            SourceCheckError::Property(query)
+                        )),
+                        "{changed}"
+                    );
+                    assert_eq!(checked_method_snapshot(&context, &library, &source), before);
+                }
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(type_node, saved)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_links(locations.call, call)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_symbol_node_links(locations.property, property)
+            );
+            assert_eq!(
+                context.get_type_at_location(locations.property),
+                Ok(method_type)
+            );
+            let restored = checked_method_snapshot(&context, &library, &source);
+            assert_eq!(
+                context.get_type_at_location(locations.name),
+                Ok(method_type)
+            );
+            assert_eq!(
+                checked_method_snapshot(&context, &library, &source),
+                restored
+            );
+        }
     }
 
     #[test]

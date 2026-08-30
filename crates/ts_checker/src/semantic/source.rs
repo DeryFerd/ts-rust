@@ -1691,6 +1691,21 @@ struct PlannedGlobalConsoleCall {
     argument: PlannedExpression,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlannedGlobalConsoleProperty {
+    expression: NodeRef,
+    receiver: NodeRef,
+    property: NodeRef,
+    receiver_symbol: SemanticSymbolId,
+    method_symbol: SemanticSymbolId,
+    argument: NodeRef,
+}
+
+enum CheckedSourceMethodProperty {
+    Deferred(PlannedGlobalConsoleProperty),
+    Resolved(TypeId),
+}
+
 #[derive(Clone, Debug)]
 struct PlannedTypeofSwitchFunctionStatements {
     discriminant: NodeRef,
@@ -14521,8 +14536,32 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         callable: &SourceCallablePlan,
         call: SourceVoidSwitchCallSyntax,
     ) -> Result<Option<PlannedGlobalConsoleCall>, SourceCheckError> {
+        let Some(property) = self.plan_global_console_property(callable, call.expression)? else {
+            return Ok(None);
+        };
+        self.identifier_reads.extend([
+            (property.receiver, property.receiver_symbol),
+            (property.property, property.method_symbol),
+        ]);
+        let argument = self.plan_expression(property.argument)?;
+        Ok(Some(PlannedGlobalConsoleCall {
+            expression: property.expression,
+            receiver: property.receiver,
+            property: property.property,
+            receiver_symbol: property.receiver_symbol,
+            method_symbol: property.method_symbol,
+            argument,
+        }))
+    }
+
+    // Share the checked source selection with lazy property queries. Do not check arguments here.
+    fn plan_global_console_property(
+        &self,
+        callable: &SourceCallablePlan,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedGlobalConsoleProperty>, SourceCheckError> {
         let (property, argument) = {
-            let call_record = self.node(call.expression)?;
+            let call_record = self.node(expression)?;
             let NodeData::CallExpression(call_data) = &call_record.data else {
                 return Ok(None);
             };
@@ -14553,7 +14592,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         if property_record.kind != SyntaxKind::PropertyAccessExpression
             || property_record.flags.0 != 0
-            || property_record.parent != Some(call.expression.node)
+            || property_record.parent != Some(expression.node)
             || access.flow_node.is_some()
             || access.question_dot_token.is_some()
             || access.facts != 0
@@ -14809,13 +14848,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     },
                 ));
             }
-            self.identifier_reads.push((node, expected));
         }
-        preflight_source_expression_cache(store, call.expression, bootstrap.void_type)?;
-        let argument = self.plan_expression(argument)?;
+        preflight_source_expression_cache(store, expression, bootstrap.void_type)?;
 
-        Ok(Some(PlannedGlobalConsoleCall {
-            expression: call.expression,
+        Ok(Some(PlannedGlobalConsoleProperty {
+            expression,
             receiver,
             property,
             receiver_symbol,
@@ -25893,6 +25930,464 @@ pub(super) fn catch_object_rest_artifact_binding(
     let catch = SourcePlanner::new_semantic(arena, bound, source, store, &host)
         .plan_catch_object_rest(statement)?;
     Ok((catch.name, catch.symbol))
+}
+
+/// Reuses the checked switch and its real global method selection without checking the body again.
+fn plan_checked_source_method_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+) -> Result<Option<CheckedSourceMethodProperty>, SourceCheckError> {
+    let invalid = || SourceCheckError::Property(node);
+    let (arena, bound) = host.source(node).ok_or_else(invalid)?;
+    let source = SourceFileRef::new(store.id(), bound.source_file());
+    if bound.source_facts().is_none_or(|facts| {
+        facts.is_declaration_file() || facts.is_default_library() || facts.is_javascript_file()
+    }) || !store
+        .source_file_links(source)
+        .is_some_and(|links| links.type_checked)
+    {
+        return Ok(None);
+    }
+    let planner = SourcePlanner::new_semantic_with_global_types(
+        arena,
+        bound,
+        source,
+        store,
+        host,
+        global_types,
+        options,
+    );
+    let record = planner.node(node)?;
+    let property = match &record.data {
+        NodeData::PropertyAccessExpression(_) => node,
+        NodeData::Identifier(_) => {
+            let Some(parent) = record.parent.map(|parent| planner.reference(parent)) else {
+                return Ok(None);
+            };
+            if !matches!(&planner.node(parent)?.data,
+                NodeData::PropertyAccessExpression(access) if access.name == node.node)
+            {
+                return Ok(None);
+            }
+            parent
+        }
+        _ => return Ok(None),
+    };
+    let Some(call) = planner
+        .node(property)?
+        .parent
+        .map(|parent| planner.reference(parent))
+    else {
+        return Ok(None);
+    };
+    if !matches!(&planner.node(call)?.data,
+        NodeData::CallExpression(data) if data.expression == property.node)
+    {
+        return Ok(None);
+    }
+
+    let mut current = call;
+    let mut seen = HashSet::new();
+    let declaration = loop {
+        if !seen.insert(current) {
+            return Err(invalid());
+        }
+        let record = planner.node(current)?;
+        if record.kind == SyntaxKind::FunctionDeclaration {
+            break current;
+        }
+        if matches!(
+            record.kind,
+            SyntaxKind::SourceFile
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::Constructor
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+        ) {
+            return Ok(None);
+        }
+        let parent = record
+            .parent
+            .map(|parent| planner.reference(parent))
+            .ok_or_else(invalid)?;
+        if store.source_node_parent(current) != Some(super::store::SourceNodeParent::Parent(parent))
+            || store.source_direct_children(parent).is_none_or(|children| {
+                children.iter().filter(|child| **child == current).count() != 1
+            })
+        {
+            return Err(invalid());
+        }
+        current = parent;
+    };
+    let NodeData::FunctionDeclaration(function) = &planner.node(declaration)?.data else {
+        return Err(invalid());
+    };
+    if function.type_.is_some()
+        || function.type_parameters.is_some()
+        || function.parameters.nodes.len() != 1
+    {
+        return Ok(None);
+    }
+    let Some(body) = function.body.map(|body| planner.reference(body)) else {
+        return Ok(None);
+    };
+    let NodeData::Block(block) = &planner.node(body)?.data else {
+        return Ok(None);
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return Ok(None);
+    };
+    if planner.node(planner.reference(*statement))?.kind != SyntaxKind::SwitchStatement {
+        return Ok(None);
+    }
+    let owner = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let callable = match plan_source_callable(
+        store,
+        host,
+        declaration,
+        owner,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    ) {
+        Ok(callable) => callable,
+        Err(SourceCallableError::Unsupported(_)) => return Ok(None),
+        Err(error) => return Err(SourcePlanner::callable_plan_error(error)),
+    };
+    let syntax =
+        match plan_source_void_switch_function_statements_syntax(arena, bound, store, &callable) {
+            Ok(syntax) => syntax,
+            Err(SourceFunctionStatementsError::Unsupported(_)) => {
+                return checked_typeof_switch_method_property(
+                    store,
+                    host,
+                    global_types,
+                    &planner,
+                    &callable,
+                    call,
+                    property,
+                    node,
+                )
+                .map(|type_| type_.map(CheckedSourceMethodProperty::Resolved));
+            }
+            Err(error) => {
+                return Err(SourcePlanner::function_statements_plan_error(
+                    &callable, error,
+                ));
+            }
+        };
+    if syntax
+        .calls
+        .iter()
+        .filter(|candidate| candidate.expression == call)
+        .count()
+        != 1
+    {
+        return Ok(None);
+    }
+    if !matches!(
+        super::source_callables::source_callable_state(store, &callable, false)
+            .map_err(SourcePlanner::callable_plan_error)?,
+        super::source_callables::SourceCallableState::Resolved { .. }
+    ) {
+        return Err(invalid());
+    }
+    let Some(selected) = planner
+        .plan_global_console_property(&callable, call)
+        .map_err(|error| {
+            // This exact source plan already completed. A changed selected declaration is corrupt.
+            match error {
+                SourceCheckError::Unsupported(_) => invalid(),
+                error => error,
+            }
+        })?
+    else {
+        return Ok(None);
+    };
+    if selected.property != property {
+        return Err(invalid());
+    }
+    for (reference, symbol) in [
+        (selected.receiver, selected.receiver_symbol),
+        (selected.property, selected.method_symbol),
+    ] {
+        if store.symbol_node_links(reference)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(symbol),
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    if store.type_node_links(call)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(store.intrinsic_bootstrap().ok_or_else(invalid)?.void_type),
+            ..TypeNodeLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(Some(CheckedSourceMethodProperty::Deferred(selected)))
+}
+
+/// Checks the method cache against the source producer's completed string-narrowing path.
+#[allow(clippy::too_many_arguments)] // The actual source plan and selected call share one proof.
+fn checked_typeof_switch_method_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    planner: &SourcePlanner<'_, '_, '_>,
+    callable: &SourceCallablePlan,
+    call: NodeRef,
+    property: NodeRef,
+    node: NodeRef,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let invalid = || SourceCheckError::Property(node);
+    let syntax = match plan_source_typeof_switch_function_statements_syntax(
+        planner.arena,
+        planner.bound,
+        store,
+        callable,
+    ) {
+        Ok(syntax) => syntax,
+        Err(SourceFunctionStatementsError::Unsupported(_)) => return Ok(None),
+        Err(error) => {
+            return Err(SourcePlanner::function_statements_plan_error(
+                callable, error,
+            ));
+        }
+    };
+    let mut expressions = syntax
+        .expressions
+        .iter()
+        .filter(|expression| expression.expression == call);
+    let Some(expression) = expressions.next() else {
+        return Ok(None);
+    };
+    if expression.tag != SourceTypeofTag::String
+        || expressions.next().is_some()
+        || !matches!(
+            super::source_callables::source_callable_state(store, callable, false)
+                .map_err(SourcePlanner::callable_plan_error)?,
+            super::source_callables::SourceCallableState::Resolved { .. }
+        )
+    {
+        return Err(invalid());
+    }
+    let [parameter] = callable.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    let NodeData::PropertyAccessExpression(access) = &planner.node(property)?.data else {
+        return Err(invalid());
+    };
+    let receiver = planner.reference(access.expression);
+    let name = planner.reference(access.name);
+    let NodeData::Identifier(identifier) = &planner.node(name)?.data else {
+        return Err(invalid());
+    };
+    if !matches!(planner.node(receiver)?.data, NodeData::Identifier(_))
+        || planner.node(receiver)?.parent != Some(property.node)
+        || planner.node(name)?.parent != Some(property.node)
+        || access.question_dot_token.is_some()
+    {
+        return Err(invalid());
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let string = bootstrap.string_type;
+    let number = bootstrap.number_type;
+    // The source checker accepts this branch only after its real flow result is exactly string.
+    if store.type_node_links(receiver)
+        != Some(&TypeNodeLinks {
+            resolved_type: Some(string),
+            ..TypeNodeLinks::default()
+        })
+    {
+        return Err(invalid());
+    }
+    for reference in [receiver, syntax.identifier] {
+        if store.symbol_node_links(reference)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(parameter.symbol),
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    let wrapper = store
+        .type_payload(global_types.string_type)
+        .ok_or_else(invalid)?;
+    let owner = wrapper
+        .symbol()
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let selected = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&identifier.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    if store.symbol_node_links(property)
+        != Some(&SymbolNodeLinks {
+            resolved_symbol: Some(selected),
+        })
+        || store.symbol_node_links(name).is_some_and(|links| {
+            links != &SymbolNodeLinks::default() && links.resolved_symbol != Some(selected)
+        })
+    {
+        return Err(invalid());
+    }
+    let method = super::object_members::plan_selected_interface_method(store, host, selected)
+        .map_err(|_| invalid())?;
+    if method.symbol != owner || method.methods.iter().any(|method| method.optional) {
+        return Err(invalid());
+    }
+    let method_type = super::object_members::interface_method_value_state(store, &method)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let StoredSingleCallableValidation::Valid {
+        callable: selected_call,
+        ..
+    } = validate_stored_single_callable(store, method_type)
+    else {
+        return Err(invalid());
+    };
+    if selected_call.parameters != [number]
+        || selected_call.return_type != Some(string)
+        || selected_call.min_argument_count != 1
+        || selected_call.rest_parameter.is_some()
+        || store.type_node_links(property)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(method_type),
+                ..TypeNodeLinks::default()
+            })
+        || store.type_node_links(call)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            })
+        || store.signature_links(call)
+            != Some(&super::links::SignatureLinks {
+                resolved_signature: super::links::ResolvedSignatureState::Resolved(
+                    selected_call.signature,
+                ),
+                ..super::links::SignatureLinks::default()
+            })
+    {
+        return Err(invalid());
+    }
+    preflight_source_expression_cache(store, node, method_type)?;
+    Ok(Some(method_type))
+}
+
+/// Demands one checked method value. Diagnostics-only source checking leaves it cold.
+#[allow(clippy::too_many_arguments)] // Uses the existing context's source, options, and caller session.
+pub(super) fn checked_source_method_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(selected) =
+        plan_checked_source_method_property(store, host, global_types, options, node)?
+    else {
+        return Ok(None);
+    };
+    let selected = match selected {
+        CheckedSourceMethodProperty::Deferred(selected) => selected,
+        CheckedSourceMethodProperty::Resolved(type_) => return Ok(Some(type_)),
+    };
+    let invalid = || SourceCheckError::Property(node);
+    let value = super::declared_values::plan_declared_value(store, host, selected.receiver_symbol)?;
+    let method =
+        super::object_members::plan_selected_interface_method(store, host, selected.method_symbol)
+            .map_err(|_| invalid())?;
+    let cached_method = super::object_members::interface_method_value_state(store, &method)
+        .map_err(|_| invalid())?;
+    {
+        let query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?;
+        query.preflight_type_of_declared_value(selected.receiver_symbol)?;
+        query.preflight_type_of_interface_method(selected.method_symbol)?;
+    }
+    let cached_receiver = value.cached_type.or_else(|| {
+        store
+            .type_node_links(value.annotation)
+            .and_then(|links| links.resolved_type)
+    });
+    for (reference, expected) in [
+        (selected.receiver, cached_receiver),
+        (selected.property, cached_method),
+        (node, cached_method),
+    ] {
+        if store
+            .type_node_links(reference)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        {
+            preflight_source_expression_cache(store, reference, expected.ok_or_else(invalid)?)?;
+        }
+    }
+    if node != selected.property
+        && store.symbol_node_links(node).is_some_and(|links| {
+            links != &SymbolNodeLinks::default()
+                && links.resolved_symbol != Some(selected.method_symbol)
+        })
+    {
+        return Err(invalid());
+    }
+    if !store.try_reserve_type_node_links(2) {
+        return Err(invalid());
+    }
+    let receiver = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_type_of_declared_value(selected.receiver_symbol)?;
+    if store.type_payload(receiver).and_then(TypeRecord::symbol) != Some(method.symbol)
+        || !matches!(store.type_payload(receiver).map(TypeRecord::data),
+            Some(TypeData::Interface(interface))
+                if interface.all_type_parameters.as_ref().is_none_or(Vec::is_empty))
+        || store
+            .declared_type_links(method.symbol)
+            .and_then(|links| links.declared_type)
+            != Some(receiver)
+    {
+        return Err(invalid());
+    }
+    let method_type = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .get_type_of_interface_method(selected.method_symbol)?;
+    preflight_source_expression_cache(store, selected.receiver, receiver)?;
+    preflight_source_expression_cache(store, selected.property, method_type)?;
+    preflight_source_expression_cache(store, node, method_type)?;
+    publish_expression_type(store, selected.receiver, receiver)?;
+    publish_expression_type(store, selected.property, method_type)?;
+    Ok(Some(method_type))
 }
 
 fn reserved_commonjs_import_equals_diagnostic(
@@ -41269,12 +41764,42 @@ fn check_typeof_switch_string_method_call(
     )? {
         return Err(unsupported());
     }
+    let selected = check_source_selected_method_property(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        property,
+        receiver_type.result,
+    )?
+    .ok_or_else(unsupported)?;
+    let StoredSingleCallableValidation::Valid {
+        callable: selected_call,
+        ..
+    } = validate_stored_single_callable(store, selected.type_)
+    else {
+        return Err(SourceCheckError::Call(value.expression.node));
+    };
+    if selected_call.parameters != [parameter_type]
+        || selected_call.return_type != Some(return_type)
+        || selected_call.min_argument_count != 1
+        || selected_call.rest_parameter.is_some()
+        || store
+            .symbol_node_links(property.node)
+            .and_then(|links| links.resolved_symbol)
+            != Some(method)
+    {
+        return Err(SourceCheckError::Call(value.expression.node));
+    }
     publish_typeof_switch_string_method_call(
         store,
         value.expression.node,
         declaration,
         method_parameter_symbol,
         return_type,
+        selected_call.signature,
     )
 }
 
@@ -41285,7 +41810,27 @@ fn publish_typeof_switch_string_method_call(
     declaration: NodeRef,
     parameter: SemanticSymbolId,
     return_type: TypeId,
+    signature: SignatureId,
 ) -> Result<(), SourceCheckError> {
+    let Some(record) = store.signature(signature) else {
+        return Err(SourceCheckError::Call(node));
+    };
+    if record.flags() != super::signatures::SignatureFlags::NONE
+        || record.declaration() != Some(declaration)
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.parameters() != [parameter]
+        || record.min_argument_count() != 1
+        || record.resolved_min_argument_count() != -1
+        || record.resolved_return_type() != Some(return_type)
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+    {
+        return Err(SourceCheckError::Call(node));
+    }
     let expected_type = TypeNodeLinks {
         resolved_type: Some(return_type),
         ..TypeNodeLinks::default()
@@ -41295,31 +41840,14 @@ fn publish_typeof_switch_string_method_call(
 
     if let (Some(type_links), Some(signature_links)) = (&type_links, &signature_links)
         && type_links == &expected_type
-        && let super::links::ResolvedSignatureState::Resolved(signature) =
+        && let super::links::ResolvedSignatureState::Resolved(cached) =
             signature_links.resolved_signature
     {
         let expected_links = super::links::SignatureLinks {
             resolved_signature: super::links::ResolvedSignatureState::Resolved(signature),
             ..super::links::SignatureLinks::default()
         };
-        let Some(record) = store.signature(signature) else {
-            return Err(SourceCheckError::Call(node));
-        };
-        return if signature_links == &expected_links
-            && record.flags() == super::signatures::SignatureFlags::NONE
-            && record.declaration() == Some(declaration)
-            && record.type_parameters().is_empty()
-            && record.this_parameter().is_none()
-            && record.parameters() == [parameter]
-            && record.min_argument_count() == 1
-            && record.resolved_min_argument_count() == -1
-            && record.resolved_return_type() == Some(return_type)
-            && record.resolved_type_predicate().is_none()
-            && record.target().is_none()
-            && record.mapper().is_none()
-            && record.isolated_signature_type().is_none()
-            && record.composite().is_none()
-        {
+        return if signature_links == &expected_links && cached == signature {
             Ok(())
         } else {
             Err(SourceCheckError::Call(node))
@@ -41328,24 +41856,11 @@ fn publish_typeof_switch_string_method_call(
 
     if type_links.is_some_and(|links| links != TypeNodeLinks::default())
         || signature_links.is_some_and(|links| links != super::links::SignatureLinks::default())
-        || !store.try_reserve_signatures(1)
         || !store.try_reserve_signature_links(usize::from(store.signature_links(node).is_none()))
         || !store.try_reserve_type_node_links(usize::from(store.type_node_links(node).is_none()))
     {
         return Err(SourceCheckError::Call(node));
     }
-    let signature = store
-        .alloc_signature(
-            super::signatures::SignatureFlags::NONE,
-            Some(declaration),
-            Vec::new(),
-            None,
-            vec![parameter],
-            Some(return_type),
-            None,
-            1,
-        )
-        .ok_or(SourceCheckError::Call(node))?;
     let expected_signature = super::links::SignatureLinks {
         resolved_signature: super::links::ResolvedSignatureState::Resolved(signature),
         ..super::links::SignatureLinks::default()
