@@ -12,6 +12,7 @@
 //! Static blocks retain their outer start and receiver-specific property keys.
 //! Field initializers retain their own flow containers. Local destructuring
 //! assignments do not initialize class fields.
+//! Private destructuring leaves use the real field assignment and source property.
 //! Source-file field reads use checked own-field writes and real binder references.
 //! Unknown flow effects and affected computed or binding reads stay unsupported.
 
@@ -43,8 +44,9 @@ use super::{
     source::CheckedClassPropertyAssignment,
     source_properties::{
         ClassAccessContext, OwnClassPropertyWritePlan, SourceClassPropertyWritePlan,
-        SourcePropertyError, plan_class_property_write, validate_class_property_write_access,
-        validate_own_class_property_write_target,
+        SourcePropertyError, class_destructuring_write_assignment,
+        plan_class_destructuring_property_write, plan_class_property_write,
+        validate_class_property_write_access, validate_own_class_property_write_target,
     },
     source_statements::{
         SourceLinearLogicalStatementSyntax, plan_source_linear_logical_statement_syntax,
@@ -3351,10 +3353,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
         if target.access_token() != &self.access
             || store.type_payload(assignment.assigned_type()).is_none()
             || store.type_payload(assignment.flow_type()).is_none()
-            || store
-                .type_node_links(plan.node())
-                .and_then(|links| links.resolved_type)
-                != Some(assignment.assigned_type())
+            || !assignment.source_is_exact(store, host, false)
             || class_member_source(store, host, plan.member()).map_err(|_| invalid())?
                 != *target.member_source()
         {
@@ -3681,10 +3680,7 @@ impl<'plan, 'graph> ClassInitializationFrame<'plan, 'graph> {
                                 .initial
                                 .type_
                                 .is_some_and(|declared| declared != checked.target().read_type())
-                            || store
-                                .type_node_links(assignment.expression)
-                                .and_then(|links| links.resolved_type)
-                                != Some(checked.assigned_type())
+                            || !checked.source_is_exact(store, host, true)
                             || store.type_payload(checked.flow_type()).is_none()
                         {
                             return Err(SourceFlowInvariant::InvalidClassProperty(target).into());
@@ -5838,6 +5834,9 @@ fn plan_outer_class_property_assignment(
 }
 
 fn is_property_assignment_target(host: &DeclaredTypeHost<'_>, target: NodeRef) -> bool {
+    if class_destructuring_write_assignment(host, target).is_some() {
+        return true;
+    }
     let Some(record) = host.node(target) else {
         return false;
     };
@@ -5876,19 +5875,25 @@ fn plan_constructor_property_assignment(
     {
         return Err(invalid().into());
     }
-    let expression = NodeRef::new(
-        target.arena,
-        target.file,
-        host.node(target)
-            .and_then(|record| record.parent)
-            .ok_or_else(invalid)?,
-    );
-    let plan = plan_class_property_write(store, host, expression).map_err(|error| match error {
+    let plan = if class_destructuring_write_assignment(host, target).is_some() {
+        plan_class_destructuring_property_write(store, host, target)
+    } else {
+        let expression = NodeRef::new(
+            target.arena,
+            target.file,
+            host.node(target)
+                .and_then(|record| record.parent)
+                .ok_or_else(invalid)?,
+        );
+        plan_class_property_write(store, host, expression)
+    }
+    .map_err(|error| match error {
         SourcePropertyError::Unsupported(_) => {
             SourceFlowError::Unsupported(SourceFlowUnsupported::PropertyWrite(target))
         }
         _ => invalid().into(),
     })?;
+    let expression = plan.node();
     let node = flow_node(bound.flow_graph(), flow)?;
     if plan.target() != target
         || plan.context().class_symbol() != body.class_symbol

@@ -1227,6 +1227,7 @@ enum PlannedClassStatement {
     Variables(Vec<PlannedVariable>),
     ObjectBinding(Box<PlannedClassObjectBinding>),
     ObjectAssignment(Box<PlannedClassObjectAssignment>),
+    PrivateObjectAssignment(Box<PlannedClassPrivateObjectAssignment>),
     PropertyWrite(Box<PlannedClassPropertyWrite>),
 }
 
@@ -1268,12 +1269,22 @@ struct PlannedClassPropertyWrite {
     value: PlannedExpression,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedClassPrivateObjectAssignment {
+    statement: NodeRef,
+    expression: NodeRef,
+    parentheses: Vec<NodeRef>,
+    source: PlannedExpression,
+    writes: Vec<(SourceClassPropertyWritePlan, PlannedExpression)>,
+}
+
 /// Only the source executor can produce an executed property assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckedClassPropertyAssignment {
     target: CheckedClassPropertyWriteTarget,
     assigned_type: TypeId,
     flow_type: TypeId,
+    source: Option<super::source_properties::CheckedClassDestructuringSource>,
 }
 
 impl CheckedClassPropertyAssignment {
@@ -1287,6 +1298,29 @@ impl CheckedClassPropertyAssignment {
 
     pub(super) const fn flow_type(&self) -> TypeId {
         self.flow_type
+    }
+
+    pub(super) fn source_is_exact(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        require_result: bool,
+    ) -> bool {
+        match &self.source {
+            Some(source) => {
+                source.assigned_type() == self.assigned_type
+                    && source
+                        .validate(store, host, self.target.plan(), require_result)
+                        .is_ok()
+            }
+            None => {
+                self.target.plan().destructuring().is_none()
+                    && store
+                        .type_node_links(self.target.plan().node())
+                        .and_then(|links| links.resolved_type)
+                        == Some(self.assigned_type)
+            }
+        }
     }
 }
 
@@ -9003,6 +9037,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 if record.kind == SyntaxKind::ExpressionStatement && data.flow_node.is_none() =>
             {
                 let expression = self.reference(data.expression);
+                if let Some(assignment) =
+                    self.try_plan_class_private_object_assignment(expression, body)?
+                {
+                    return Ok(PlannedClassStatement::PrivateObjectAssignment(Box::new(
+                        assignment,
+                    )));
+                }
                 if let Some(assignment) = self.try_plan_class_object_assignment(expression, body)? {
                     return Ok(PlannedClassStatement::ObjectAssignment(Box::new(
                         assignment,
@@ -9265,6 +9306,109 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             binding,
             elements,
         })
+    }
+
+    fn try_plan_class_private_object_assignment(
+        &mut self,
+        mut expression: NodeRef,
+        body: &ClassBodyPlan,
+    ) -> Result<Option<PlannedClassPrivateObjectAssignment>, SourceCheckError> {
+        let mut parentheses = Vec::new();
+        while let NodeData::ParenthesizedExpression(parenthesized) = &self.node(expression)?.data {
+            let inner = self.reference(parenthesized.expression);
+            if self.node(expression)?.flags.0 != 0
+                || self.node(inner)?.parent != Some(expression.node)
+            {
+                return Err(SourceCheckError::Class(expression));
+            }
+            parentheses.push(expression);
+            expression = inner;
+        }
+        let NodeData::BinaryExpression(binary) = &self.node(expression)?.data else {
+            return Ok(None);
+        };
+        if self.node(self.reference(binary.operator_token))?.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        let NodeData::ObjectLiteralExpression(object) =
+            &self.node(self.reference(binary.left))?.data
+        else {
+            return Ok(None);
+        };
+        let properties = object.properties.nodes.clone();
+        let source_node = self.reference(binary.right);
+        let private_target = |property| {
+            let NodeData::PropertyAssignment(property) = &self.arena.get(property)?.data else {
+                return None;
+            };
+            let NodeData::PropertyAccessExpression(access) =
+                &self.arena.get(property.initializer)?.data
+            else {
+                return None;
+            };
+            (self.arena.get(access.name)?.kind == SyntaxKind::PrivateIdentifier)
+                .then_some(self.reference(property.initializer))
+        };
+        if !properties
+            .iter()
+            .any(|property| private_target(*property).is_some())
+        {
+            return Ok(None);
+        }
+        // Other RHS forms need the assignment pattern's contextual type.
+        if self.node(source_node)?.kind != SyntaxKind::Identifier {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Class(source_node),
+            ));
+        }
+        let targets = properties
+            .iter()
+            .map(|property| {
+                private_target(*property).ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(self.reference(*property)),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (store, host) = self.semantic.ok_or(SourceCheckError::Class(expression))?;
+        let plans = targets
+            .into_iter()
+            .map(|target| {
+                let plan = super::source_properties::plan_class_destructuring_property_write(
+                    store, host, target,
+                )
+                .map_err(|error| Self::property_plan_error(target, error))?;
+                if plan.node() != expression
+                    || plan.value() != source_node
+                    || plan.context().body_declaration() != body.declaration
+                    || plan.context().class_symbol() != body.class_symbol
+                {
+                    return Err(SourceCheckError::Class(target));
+                }
+                Ok(plan)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let statement = plans
+            .first()
+            .ok_or(SourceCheckError::Class(expression))?
+            .statement();
+        if plans.iter().any(|plan| plan.statement() != statement) {
+            return Err(SourceCheckError::Class(expression));
+        }
+        let source = self.plan_expression(source_node)?;
+        self.preflight_class_body_expression(&source)?;
+        let mut writes = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let receiver = self.plan_expression(plan.receiver())?;
+            self.preflight_class_body_expression(&receiver)?;
+            writes.push((plan, receiver));
+        }
+        Ok(Some(PlannedClassPrivateObjectAssignment {
+            statement,
+            expression,
+            parentheses,
+            source,
+            writes,
+        }))
     }
 
     fn try_plan_class_object_assignment(
@@ -26598,6 +26742,10 @@ fn class_source_annotation_nodes(
                 expressions.push(&assignment.receiver);
                 expressions.extend(assignment.elements.iter().map(|(_, target, _)| target));
             }
+            PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+                expressions.push(&assignment.source);
+                expressions.extend(assignment.writes.iter().map(|(_, receiver)| receiver));
+            }
             PlannedClassStatement::PropertyWrite(write) => {
                 expressions.extend([&write.receiver, &write.value]);
             }
@@ -26722,6 +26870,14 @@ fn collect_class_statement_flow(
                 for (_, target, flow) in &assignment.elements {
                     expressions.push(target);
                     local_assignments.push(*flow);
+                }
+            }
+            PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+                points.push(assignment.statement);
+                expressions.push(&assignment.source);
+                for (plan, receiver) in &assignment.writes {
+                    points.push(plan.target());
+                    expressions.push(receiver);
                 }
             }
         }
@@ -34406,6 +34562,11 @@ fn class_statement_expressions(statement: &PlannedClassStatement) -> Vec<&Planne
                 .chain(assignment.elements.iter().map(|(_, target, _)| target))
                 .collect()
         }
+        PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+            std::iter::once(&assignment.source)
+                .chain(assignment.writes.iter().map(|(_, receiver)| receiver))
+                .collect()
+        }
         PlannedClassStatement::Block(statements) => statements
             .iter()
             .flat_map(class_statement_expressions)
@@ -34937,6 +35098,7 @@ fn check_class_statements(
                     target,
                     assigned_type: assignment.assigned_type,
                     flow_type,
+                    source: None,
                 };
                 context
                     .flow
@@ -35120,6 +35282,21 @@ fn check_class_statements(
                     publish_expression_type(store, *parenthesis, receiver.result)?;
                 }
             }
+            PlannedClassStatement::PrivateObjectAssignment(assignment) => {
+                check_class_private_object_assignment(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    type_import_execution,
+                    deferred,
+                    context,
+                    assignment,
+                )?;
+            }
             PlannedClassStatement::Variables(variables) => {
                 for variable in variables {
                     let PlannedVariableInitializer::Expression(initializer) = &variable.initializer
@@ -35218,6 +35395,205 @@ fn check_class_statements(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_class_private_object_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    type_import_execution: &SourceTypeImportExecution<'_>,
+    deferred: &mut Vec<DeferredAssertion>,
+    context: &mut ClassBodyExecutionContext<'_, '_, '_>,
+    assignment: &PlannedClassPrivateObjectAssignment,
+) -> Result<(), SourceCheckError> {
+    let snapshot = context
+        .flow
+        .snapshot_at(store, global_types, assignment.statement)
+        .map_err(|error| class_body_flow_error(assignment.statement, error))?;
+    let value = check_expression_type_with_class_context(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        snapshot.types(),
+        type_import_execution,
+        &assignment.source,
+        None,
+        deferred,
+        Some(&mut *context),
+    )?;
+    let arrays = CanonicalArrayTargets::from_global_types(global_types);
+    super::source_properties::validate_class_destructuring_source_type(
+        store,
+        assignment.source.node,
+        value.result,
+        arrays,
+    )
+    .map_err(|error| SourcePlanner::property_plan_error(assignment.source.node, error))?;
+    for (plan, receiver) in &assignment.writes {
+        context
+            .flow
+            .preflight_property_assignment(store, host, plan)
+            .map_err(|error| class_body_flow_error(plan.target(), error))?;
+        let projection = plan
+            .destructuring()
+            .ok_or(SourceCheckError::Class(plan.target()))?;
+        if projection.source() != assignment.source.node {
+            return Err(SourceCheckError::Class(plan.target()));
+        }
+        let property = super::object_members::resolve_object_property_by_key_with_source(
+            store,
+            host,
+            global_types,
+            options,
+            value.result,
+            ts_binder::EscapedNameRef::source(projection.name()),
+            session,
+            diagnostics,
+        )?
+        .ok_or_else(|| {
+            SourcePlanner::property_plan_error(
+                projection.property(),
+                SourcePropertyError::Unsupported(SourcePropertyUnsupported::MissingOwnProperty {
+                    node: projection.property(),
+                    receiver_type: value.result,
+                }),
+            )
+        })?;
+        let selected = super::source_properties::CheckedClassDestructuringSource::new(
+            store,
+            host,
+            plan,
+            value.result,
+            property,
+            arrays,
+        )
+        .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
+        let assigned_type = selected.assigned_type();
+        let snapshot = context
+            .flow
+            .snapshot_at(store, global_types, receiver.node)
+            .map_err(|error| class_body_flow_error(receiver.node, error))?;
+        let receiver = check_expression_type_with_class_context(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            snapshot.types(),
+            type_import_execution,
+            receiver,
+            None,
+            deferred,
+            Some(&mut *context),
+        )?;
+        let target = super::source_properties::check_class_property_write_target(
+            store,
+            host,
+            global_types,
+            options,
+            plan,
+            receiver.result,
+            context.flow.access_token(),
+        )
+        .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?;
+        for diagnostic in super::source_properties::class_property_write_diagnostics(
+            store,
+            host,
+            &target,
+            receiver.result,
+        )
+        .map_err(|error| SourcePlanner::property_plan_error(plan.target(), error))?
+        {
+            publish_or_defer_class_property_diagnostic(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+                plan.target(),
+                diagnostic,
+                Some(&mut *context),
+            )?;
+        }
+        let diagnostic_start = diagnostics.len();
+        if !source_type_is_assignable_to(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            assigned_type,
+            target.write_type(),
+        )? {
+            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                assigned_type,
+                target.write_type(),
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )?;
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(plan.target()),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                        [display.source, display.target],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        rewrite_exact_optional_class_write_diagnostic(
+            store,
+            options,
+            &target,
+            assigned_type,
+            diagnostic_start,
+            diagnostics,
+        )?;
+        let flow_type = current_flow_type_after_assignment(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            CheckedAssignment {
+                declared_type: target.read_type(),
+                assigned_type,
+            },
+        )?;
+        let checked = CheckedClassPropertyAssignment {
+            target,
+            assigned_type,
+            flow_type,
+            source: Some(selected),
+        };
+        context
+            .flow
+            .complete_property_assignment(store, host, &checked)
+            .map_err(|error| class_body_flow_error(plan.target(), error))?;
+    }
+    publish_expression_type(store, assignment.expression, value.result)?;
+    for parenthesis in assignment.parentheses.iter().rev() {
+        publish_expression_type(store, *parenthesis, value.result)?;
     }
     Ok(())
 }
@@ -116818,6 +117194,314 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn private_destructuring_rhs_contexts_remain_explicit_boundaries() {
+        for right in [
+            "{ value: 1, extra: 2 }",
+            "({ value: 1, extra: 2 })",
+            "true && { value: 1, extra: 2 }",
+        ] {
+            let source = parsed(&format!(
+                "class Model {{ #state: number = 0; update(): void {{ ({{ value: this.#state }} = {right}); }} }}"
+            ));
+            let file = FileId::new(202_944);
+            let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let bound = context.file(file).unwrap().1;
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&source.arena, bound)],
+                GlobalMergeCompletion::for_test(context.options().name_resolution),
+            )
+            .unwrap();
+            let right_node = source
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::BinaryExpression(binary) = &record.data else {
+                        return None;
+                    };
+                    matches!(
+                        source.arena.get(binary.left).unwrap().data,
+                        NodeData::ObjectLiteralExpression(_)
+                    )
+                    .then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        binary.right,
+                    ))
+                })
+                .unwrap();
+            let before = observable_state(&context, file);
+            for _ in 0..2 {
+                let result = SourcePlanner::new_semantic_with_global_types(
+                    &source.arena,
+                    bound,
+                    context.source_file(file).unwrap(),
+                    context.store(),
+                    &host,
+                    context.global_types(),
+                    context.options(),
+                )
+                .finish();
+                assert!(matches!(
+                    result,
+                    Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(node)))
+                        if node == right_node
+                ));
+                assert_eq!(observable_state(&context, file), before);
+            }
+        }
+    }
+
+    #[test]
+    fn private_destructuring_flow_keeps_projection_completion_and_object_results() {
+        let source = parsed(concat!(
+            "class Model { #state: number; constructor(value: number) { ",
+            "const source = { value }; ({ value: this.#state } = source); } }",
+        ));
+        let file = FileId::new(202_943);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            strict_property_initialization: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&[(file, &source)], options);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let target_node = source
+            .arena
+            .iter()
+            .find_map(|(node, _)| {
+                let node = NodeRef::new(source.arena.id(), file, node);
+                super::super::source_properties::class_destructuring_write_assignment(&host, node)
+                    .map(|_| node)
+            })
+            .unwrap();
+        let write = super::super::source_properties::plan_class_destructuring_property_write(
+            context.store(),
+            &host,
+            target_node,
+        )
+        .unwrap();
+        assert!(bound.flow_at(write.statement()).is_some());
+        assert_eq!(
+            bound.flow_at(write.value()),
+            bound.flow_at(write.statement())
+        );
+        let class = super::super::classes::plan_source_class_members(
+            context.store(),
+            &host,
+            write.context().class_symbol(),
+        )
+        .unwrap();
+        let body = class
+            .bodies()
+            .iter()
+            .find(|body| matches!(body.kind, ClassBodyKind::Constructor))
+            .unwrap();
+        let prepared = super::super::classes::prepare_source_class_members(
+            context.store_mut_for_test(),
+            &host,
+            &class,
+        )
+        .unwrap();
+        let access = prepared.body_access(context.store(), &host, body).unwrap();
+        let source_declaration = variable_declaration(&source, file, "source");
+        let source_symbol = variable_symbol(&context, &source, file, "source");
+        let source_type = variable_value_type(&context, &source, file, "source");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let [parameter] = body.parameters.as_slice() else {
+            panic!("the real constructor has one scalar parameter")
+        };
+        assert_eq!(parameter.type_.resolved(context.store()).unwrap(), number);
+        let flow = SourceFlowPlan::preflight_class_body(
+            &source.arena,
+            &bound,
+            context.store(),
+            &host,
+            body,
+            [
+                variable_name(&source, file, "source"),
+                write.statement(),
+                write.value(),
+                write.target(),
+                write.receiver(),
+            ],
+            [SourceFlowAssignment {
+                declaration: source_declaration,
+                symbol: source_symbol,
+            }],
+            [],
+        )
+        .unwrap();
+        let mut frame = ClassInitializationFrame::new(
+            body,
+            &flow,
+            &bound,
+            access.clone(),
+            HashMap::from([(parameter.symbol, number)]),
+        )
+        .unwrap();
+        frame
+            .complete_assignment(source_declaration, source_symbol, source_type)
+            .unwrap();
+        let globals = context.global_types().clone();
+        let arrays = CanonicalArrayTargets::from_global_types(&globals);
+        let identities =
+            super::super::classes::class_body_identities(context.store(), &host, &access).unwrap();
+        let mut caller = InstantiationSession::new(InstantiationLimits::default());
+        let target = super::super::source_properties::check_class_property_write_target(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &write,
+            identities.this_type,
+            &access,
+        )
+        .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(write.value())
+                .unwrap()
+                .resolved_type,
+            Some(source_type)
+        );
+        let property = super::super::object_members::resolve_object_property_by_key_with_source(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            source_type,
+            ts_binder::EscapedNameRef::source(write.destructuring().unwrap().name()),
+            &mut caller,
+            &mut CanonicalCheckerDiagnostics::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let selected = super::super::source_properties::CheckedClassDestructuringSource::new(
+            context.store(),
+            &host,
+            &write,
+            source_type,
+            property,
+            arrays,
+        )
+        .unwrap();
+        let assigned_type = selected.assigned_type();
+        let flow_type = current_flow_type_after_assignment(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut caller,
+            &mut CanonicalCheckerDiagnostics::default(),
+            CheckedAssignment {
+                declared_type: target.read_type(),
+                assigned_type,
+            },
+        )
+        .unwrap();
+        let checked = CheckedClassPropertyAssignment {
+            target,
+            assigned_type,
+            flow_type,
+            source: Some(selected),
+        };
+        let member = checked.target().member_source().clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_ne!(source_type, assigned_type);
+        assert_eq!(checked.target().write_type(), number);
+        let before = observable_state(&context, file);
+        assert_eq!(
+            frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+            Err(SourceFlowInvariant::PendingAssignment(write.target()).into())
+        );
+        for missing_receipt in [false, true] {
+            let mut changed = checked.clone();
+            if missing_receipt {
+                changed.source = None;
+            } else {
+                changed.assigned_type = string;
+            }
+            assert_eq!(
+                frame.complete_property_assignment(context.store(), &host, &changed),
+                Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+            );
+            assert_eq!(observable_state(&context, file), before);
+        }
+        let result_links = context
+            .store()
+            .type_node_links(write.node())
+            .unwrap()
+            .clone();
+        assert_eq!(result_links.resolved_type, Some(source_type));
+        // Recreate only the absent result cache from this fresh invocation phase.
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(write.node(), TypeNodeLinks::default())
+        );
+        frame
+            .complete_property_assignment(context.store(), &host, &checked)
+            .unwrap();
+        assert_eq!(
+            frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+            Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(write.node(), result_links.clone())
+        );
+        assert_eq!(
+            frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+            Ok(true)
+        );
+        assert_eq!(
+            frame.complete_property_assignment(context.store(), &host, &checked),
+            Err(SourceFlowInvariant::AssignmentAlreadyCompleted(write.target()).into())
+        );
+        for node in [write.value(), write.node()] {
+            let original = context.store().type_node_links(node).unwrap().clone();
+            assert!(context.store_mut_for_test().set_type_node_links(
+                node,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..original.clone()
+                }
+            ));
+            let damaged = observable_state(&context, file);
+            for _ in 0..2 {
+                assert_eq!(
+                    frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+                    Err(SourceFlowInvariant::InvalidClassProperty(write.target()).into())
+                );
+                assert_eq!(observable_state(&context, file), damaged);
+            }
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_type_node_links(node, original)
+            );
+            assert_eq!(
+                frame.property_initialized_at_constructor_exit(context.store(), &host, &member),
+                Ok(true)
+            );
+        }
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(caller.limit_event_count(), 0);
     }
 
     #[test]
