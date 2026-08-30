@@ -682,7 +682,7 @@ fn native_merged_interface_preserves_later_distinct_and_repeated_bases() {
             properties
         };
         let properties = query(&mut checker);
-        let types = std::iter::once(type_).chain(bases).collect::<Vec<_>>();
+        let snapshot_types = std::iter::once(type_).chain(bases).collect::<Vec<_>>();
         let nodes = declarations
             .into_iter()
             .chain(base_nodes.iter().copied())
@@ -694,7 +694,7 @@ fn native_merged_interface_preserves_later_distinct_and_repeated_bases() {
             .copied()
             .chain([owner])
             .collect::<Vec<_>>();
-        let warm = snapshot(&checker, &types, &nodes, &symbols);
+        let warm = snapshot(&checker, &snapshot_types, &nodes, &symbols);
         let diagnostics = checker.diagnostics().clone();
         for _ in 0..2 {
             for file in [FIRST_SOURCE, SECOND_SOURCE, CONSUMER] {
@@ -702,7 +702,7 @@ fn native_merged_interface_preserves_later_distinct_and_repeated_bases() {
             }
             assert_eq!(query(&mut checker), properties);
             assert_eq!(
-                snapshot(&checker, &types, &nodes, &symbols),
+                snapshot(&checker, &snapshot_types, &nodes, &symbols),
                 warm,
                 "query_first={query_first}"
             );

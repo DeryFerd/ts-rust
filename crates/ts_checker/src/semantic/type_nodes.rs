@@ -39551,18 +39551,37 @@ mod tests {
             );
             assert_eq!(
                 planner.plan_property_interface(service),
-                Err(type_node_unavailable(
-                    TypeNodeUnavailable::UnsupportedSyntax {
-                        node: heritage,
-                        kind: SyntaxKind::HeritageClause,
-                    }
-                )),
-                "{methods}",
+                Ok(()),
+                "{methods}"
             );
             assert!(!planner.native_parameter_interface_values);
             assert!(!planner.lazy_interface_values);
             assert!(planner.planning_interfaces.is_empty());
-            assert!(!planner.plan.interfaces.contains_key(&root));
+            let planned_root = planner.plan.interfaces.get(&root).unwrap();
+            assert_eq!(planned_root.symbol, root);
+            let planned_heritage = planned_root.heritage.as_ref().unwrap();
+            assert_eq!(planned_heritage.clause, heritage);
+            let expected_bases = ["Left", "Middle", "Right"]
+                .map(|name| native_global_parameter_symbol(&context, name));
+            assert_eq!(
+                planned_heritage
+                    .bases
+                    .iter()
+                    .map(|base| base.symbol)
+                    .collect::<Vec<_>>(),
+                expected_bases,
+                "{methods}",
+            );
+            for owner in std::iter::once(root).chain(expected_bases) {
+                let expected =
+                    object_members::plan_interface(context.store(), &host, owner).unwrap();
+                assert_eq!(
+                    planner.plan.interfaces.get(&owner),
+                    Some(&expected),
+                    "{methods}"
+                );
+                assert!(context.store().declared_type_links(owner).is_none());
+            }
             assert_eq!(function_store_state(context.store()), before);
             assert!(context.store().declared_type_links(root).is_none());
         }
