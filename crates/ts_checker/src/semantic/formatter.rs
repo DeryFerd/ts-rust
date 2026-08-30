@@ -18701,9 +18701,22 @@ mod tests {
             panic!("the index must retain its source declaration");
         };
         let value_node = NodeRef::new(declaration.arena, declaration.file, index_node.type_);
-        let original = store.type_node_links(value_node).cloned().unwrap();
+        let index_value = store.index_info(index).unwrap().value_type();
         let bootstrap = store.intrinsic_bootstrap().unwrap();
         let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let resolved_value = context.get_type_from_type_node(value_node).unwrap();
+        assert_eq!(resolved_value, index_value);
+        assert_eq!(resolved_value, string);
+        assert!(context.store().type_node_links(value_node).is_none());
+        assert!(context.store_mut_for_test().set_type_node_links(
+            value_node,
+            TypeNodeLinks {
+                resolved_type: Some(resolved_value),
+                outer_type_parameters: None,
+            },
+        ));
+        let store = context.store();
+        let original = store.type_node_links(value_node).cloned().unwrap();
         assert_eq!(original.resolved_type, Some(string));
         let members = store
             .type_payload(type_id)
