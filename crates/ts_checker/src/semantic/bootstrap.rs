@@ -7911,6 +7911,48 @@ mod tests {
             .unwrap()
     }
 
+    fn native_heritage_publish_property(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        property: SemanticSymbolId,
+    ) -> TypeId {
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = crate::semantic::DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            crate::semantic::production::GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        let type_ = crate::semantic::type_nodes::CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_declared_value(property)
+        .unwrap();
+        assert!(diagnostics.as_slice().is_empty());
+        assert_eq!(
+            context.store().value_symbol_links(property),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert!(
+            context
+                .store()
+                .declared_value_provenance(property)
+                .is_some_and(|provenance| provenance.is_current(context.store(), property))
+        );
+        type_
+    }
+
     fn native_heritage_snapshot(
         store: &TestStore,
     ) -> (
@@ -8095,6 +8137,12 @@ mod tests {
             ]
             .map(|(owner, name)| native_heritage_member(context.store(), owner, name));
             let values = queries.map(|(_, name)| context.get_type_at_location(name).unwrap());
+            for ((property, _), expected) in queries[..2].iter().zip(&values[..2]) {
+                assert_eq!(
+                    native_heritage_publish_property(&mut context, &parsed, file, *property),
+                    *expected
+                );
+            }
             let bootstrap = context.store().intrinsic_bootstrap().unwrap();
             let string = bootstrap.string_type;
             let number = bootstrap.number_type;
@@ -8214,7 +8262,16 @@ mod tests {
                 assert!(store.set_symbol_declarations(owner, Some(declarations.clone()), value));
                 assert_native_heritage_result(store, root, type_, targets, Ok(()));
             }
-            assert!(store.set_symbol_flags(owner, flags, CheckFlags::READONLY));
+            let unchanged = (checker_state(store), native_heritage_snapshot(store));
+            assert!(!store.set_symbol_flags(owner, flags, CheckFlags::READONLY));
+            assert_eq!(store.symbol(owner).unwrap().flags(), flags);
+            assert_eq!(store.symbol(owner).unwrap().check_flags(), CheckFlags::NONE);
+            assert_eq!(
+                (checker_state(store), native_heritage_snapshot(store)),
+                unchanged
+            );
+            assert_native_heritage_result(store, root, type_, targets, Ok(()));
+            assert!(store.set_symbol_flags(owner, flags | SymbolFlags::CLASS, CheckFlags::NONE));
             assert_native_heritage_result(store, root, type_, targets, invalid);
             assert!(store.set_symbol_flags(owner, flags, CheckFlags::NONE));
             assert_native_heritage_result(store, root, type_, targets, Ok(()));
@@ -8415,14 +8472,33 @@ mod tests {
                 native_heritage_member(context.store(), owner, property_name);
             let (method, method_node) = native_heritage_member(context.store(), owner, method_name);
             let property_type = context.get_type_at_location(property_node).unwrap();
+            assert_eq!(
+                native_heritage_publish_property(&mut context, &parsed, file, property),
+                property_type
+            );
             let callable = context.get_type_at_location(method_node).unwrap();
             let store = context.store_mut_for_test();
             let string = store.intrinsic_bootstrap().unwrap().string_type;
             let number = store.intrinsic_bootstrap().unwrap().number_type;
             assert_eq!(property_type, string);
+            assert_eq!(
+                store.symbol(property).unwrap().check_flags(),
+                CheckFlags::READONLY
+            );
+            assert!(
+                store
+                    .declared_value_provenance(property)
+                    .is_some_and(|provenance| {
+                        provenance.readonly == Some(true) && provenance.is_current(store, property)
+                    })
+            );
             assert_native_heritage_result(store, root, type_, targets, Ok(()));
             let invalid = Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
             assert!(store.set_source_property_readonly(property, false));
+            assert_eq!(
+                store.symbol(property).unwrap().check_flags(),
+                CheckFlags::NONE
+            );
             assert_native_heritage_result(store, root, type_, targets, invalid);
             assert!(store.set_source_property_readonly(property, true));
             assert_native_heritage_result(store, root, type_, targets, Ok(()));
@@ -8534,6 +8610,10 @@ mod tests {
             );
             for publish_member in [false, true] {
                 if publish_member {
+                    assert_eq!(
+                        native_heritage_publish_property(&mut context, &parsed, file, property),
+                        array
+                    );
                     assert_eq!(context.get_type_at_location(name), Ok(array));
                     assert_eq!(
                         context

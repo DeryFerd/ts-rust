@@ -15487,13 +15487,14 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, child)| {
-                    (child.as_ref()?.parent == Some(parent.node)).then(|| {
-                        NodeRef::new(
-                            parent.arena,
-                            parent.file,
-                            NodeId::new(u32::try_from(index).unwrap()),
-                        )
-                    })
+                    if child.as_ref()?.parent != Some(parent.node) {
+                        return None;
+                    }
+                    Some(NodeRef::new(
+                        parent.arena,
+                        parent.file,
+                        NodeId::new(u32::try_from(index).unwrap()),
+                    ))
                 })
                 .collect::<Vec<_>>();
             assert_eq!(store.source_direct_children(parent), Some(expected));
@@ -16124,7 +16125,7 @@ mod tests {
                     parsed.source_file,
                     file,
                     CanonicalSourceFileFacts::new(
-                        EscapedName::source(&format!("\"/heritage-snapshot-{}.ts\"", file.index())),
+                        EscapedName::source(format!("\"/heritage-snapshot-{}.ts\"", file.index())),
                         CanonicalSourceLanguage::TypeScript,
                         false,
                         CanonicalModuleState::Script,

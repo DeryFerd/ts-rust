@@ -37010,12 +37010,17 @@ mod tests {
                     .callable_signature_parameter_types(signature)
                     .unwrap();
                 assert_eq!(parameters.len(), 5);
-                assert_eq!(
-                    context
-                        .store()
-                        .validate_optional_parameter_type_metadata(annotation_type, parameters[3]),
-                    Ok(()),
-                );
+                if strict_null_checks {
+                    assert_eq!(
+                        context.store().validate_optional_parameter_type_metadata(
+                            annotation_type,
+                            parameters[3]
+                        ),
+                        Ok(()),
+                    );
+                } else {
+                    assert_eq!(parameters[3], annotation_type);
+                }
             }
             let warm = (
                 function_store_state(context.store()),
