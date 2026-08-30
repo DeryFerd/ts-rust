@@ -8711,28 +8711,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     // The legacy single-parameter constructor plan cannot own local declarations.
     fn needs_early_source_constructor_plan(&self, members: &[ts_ast::NodeId]) -> bool {
-        members.iter().any(|member| {
-            let Some(NodeData::ConstructorDeclaration(constructor)) =
-                self.arena.get(*member).map(|record| &record.data)
-            else {
-                return false;
-            };
-            if constructor.parameters.nodes.len() != 1 {
-                return false;
-            }
-            constructor
-                .body
-                .and_then(|body| self.arena.get(body))
-                .is_some_and(|record| {
-                    matches!(&record.data, NodeData::Block(block)
-                    if block.statements.nodes.iter().any(|statement| {
-                        self.arena.get(*statement).is_some_and(|record| {
-                            record.kind == SyntaxKind::VariableStatement
-                                && matches!(record.data, NodeData::VariableStatement(_))
-                        })
-                    }))
-                })
-        })
+        members
+            .iter()
+            .filter(|member| {
+                self.arena
+                    .get(**member)
+                    .is_some_and(|record| record.kind == SyntaxKind::Constructor)
+            })
+            .count()
+            > 1
+            || members.iter().any(|member| {
+                let Some(NodeData::ConstructorDeclaration(constructor)) =
+                    self.arena.get(*member).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                if constructor.parameters.nodes.len() != 1 {
+                    return false;
+                }
+                constructor
+                    .body
+                    .and_then(|body| self.arena.get(body))
+                    .is_some_and(|record| {
+                        matches!(&record.data, NodeData::Block(block)
+                        if block.statements.nodes.iter().any(|statement| {
+                            self.arena.get(*statement).is_some_and(|record| {
+                                record.kind == SyntaxKind::VariableStatement
+                                    && matches!(record.data, NodeData::VariableStatement(_))
+                            })
+                        }))
+                    })
+            })
     }
 
     fn try_plan_source_class(
@@ -8755,11 +8764,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Ok(None);
         }
-        let source = match super::classes::plan_source_class_members_with_array_targets(
+        let source = match super::classes::plan_source_class_members_with_context(
             store,
             host,
             symbol,
             self.array_targets,
+            self.class_type_context.as_ref(),
         ) {
             Ok(source) => source,
             Err(
@@ -9522,6 +9532,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             SourceNewError::Invariant(_) => SourceCheckError::Call(node),
             SourceNewError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
             SourceNewError::Class(error) => Self::class_plan_error(expression, error),
+            SourceNewError::Call { node, error } => match error {
+                super::calls::DirectCallError::Relation(error) => error.into(),
+                super::calls::DirectCallError::Unsupported(_) => {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(node))
+                }
+                super::calls::DirectCallError::Invariant(_) => SourceCheckError::Call(node),
+            },
         }
     }
 
@@ -22632,17 +22649,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .get(parent)
                             .is_some_and(|record| record.kind == SyntaxKind::ThrowStatement)
                     });
-                let mut construction = plan_direct_default_new(
-                    self.arena,
-                    self.bound,
-                    store,
-                    host,
-                    &self.prior_classes,
-                    &self.value_import_bindings,
-                    expression,
-                    early_preparation,
-                )
-                .map_err(|error| Self::new_plan_error(expression, error))?;
+                let mut construction =
+                    super::source_new::plan_direct_default_new_with_type_context(
+                        self.arena,
+                        self.bound,
+                        store,
+                        host,
+                        &self.prior_classes,
+                        &self.value_import_bindings,
+                        expression,
+                        early_preparation,
+                        self.class_type_context.as_ref(),
+                    )
+                    .map_err(|error| Self::new_plan_error(expression, error))?;
                 if let Some(binding) = self
                     .value_import_bindings
                     .get(&construction.resolved_symbol())
@@ -32459,8 +32478,29 @@ fn check_expression_type_with_capture_context(
                     arrow_capture,
                 )?;
             }
-            let checked = check_direct_default_new(store, host, construction)
-                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            let overloaded = super::source_new::check_source_constructor_overload_new(
+                store,
+                host,
+                global_types,
+                options.strict_function_types,
+                construction,
+            )
+            .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
+            let checked = if let Some(overloaded) = overloaded {
+                emit_source_constructor_overload_diagnostic(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    construction,
+                    &overloaded,
+                )?;
+                overloaded.checked
+            } else {
+                check_direct_default_new(store, host, construction)
+                    .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
+            };
             if store
                 .symbol_node_links(construction.constructor())
                 .and_then(|links| links.resolved_symbol)
@@ -33352,6 +33392,119 @@ fn check_expression_type_with_capture_context(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_source_constructor_overload_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    construction: &super::source_new::SourceDefaultNewPlan,
+    overloaded: &super::source_new::CheckedSourceConstructorOverloadNew,
+) -> Result<(), SourceCheckError> {
+    use super::calls::DirectCallApplicability;
+    let resolution = &overloaded.resolution;
+    let projection = &resolution.projection;
+    let mut diagnostic = match resolution.applicability {
+        DirectCallApplicability::Applicable => return Ok(()),
+        DirectCallApplicability::ArgumentNotAssignable {
+            index,
+            argument_type,
+            parameter_type,
+        } => {
+            let argument = construction
+                .argument_nodes()
+                .nth(index)
+                .ok_or(SourceCheckError::Call(construction.node()))?;
+            let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+            if options.no_error_truncation {
+                flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+            }
+            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                argument_type,
+                parameter_type,
+                flags,
+            )?;
+            CanonicalCheckerDiagnostic {
+                node: Some(argument),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2345).ok_or(SourceCheckError::MissingDiagnostic(2345))?,
+                    [display.source, display.target],
+                ),
+                related_information: Vec::new(),
+            }
+        }
+        DirectCallApplicability::TooFewArguments { actual, .. }
+        | DirectCallApplicability::TooManyArguments { actual, .. } => {
+            let expected = if projection.minimum_argument_count == projection.maximum_argument_count
+            {
+                projection.minimum_argument_count.to_string()
+            } else {
+                format!(
+                    "{}-{}",
+                    projection.minimum_argument_count, projection.maximum_argument_count
+                )
+            };
+            let related_information = if actual < projection.minimum_argument_count {
+                super::source_calls::missing_argument_related_information(
+                    store,
+                    host,
+                    construction.node(),
+                    projection.signature,
+                    actual,
+                )?
+                .into_iter()
+                .collect()
+            } else {
+                Vec::new()
+            };
+            CanonicalCheckerDiagnostic {
+                node: Some(construction.node()),
+                range_override: if actual > projection.maximum_argument_count {
+                    Some(super::source_calls::extra_source_argument_diagnostic_range(
+                        host,
+                        construction.node(),
+                        construction.argument_nodes(),
+                        projection.maximum_argument_count,
+                    )?)
+                } else {
+                    None
+                },
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
+                    [expected, actual.to_string()],
+                ),
+                related_information,
+            }
+        }
+        DirectCallApplicability::RestArgumentsNotAssignable { .. } => {
+            return Err(SourceCheckError::Call(construction.node()));
+        }
+    };
+    if let Some(implementation) = overloaded.implementation_note {
+        if !matches!(
+            resolution.applicability,
+            DirectCallApplicability::ArgumentNotAssignable { .. }
+        ) {
+            return Err(SourceCheckError::Call(construction.node()));
+        }
+        diagnostic
+            .related_information
+            .push(CanonicalCheckerRelatedInformation {
+                node: Some(implementation),
+                diagnostic: Diagnostic::new(
+                    message_by_code(2793).ok_or(SourceCheckError::MissingDiagnostic(2793))?,
+                ),
+            });
+    }
+    merge_retry_diagnostic(diagnostics, diagnostic);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_planned_source_class(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -33428,7 +33581,7 @@ fn check_planned_source_class(
     }
     let members = finish_source_class_members(store, host, &class.source, &prepared)
         .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
-    let mut method_overload_diagnostics = super::classes::check_source_class_method_overloads(
+    let mut overload_diagnostics = super::classes::check_source_class_method_overloads(
         store,
         host,
         global_types,
@@ -33438,6 +33591,54 @@ fn check_planned_source_class(
     )?
     .into_iter()
     .collect::<HashMap<_, _>>();
+    if let Some(overloads) =
+        super::classes::source_class_constructor_overloads(store, host, class.source.symbol())
+            .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?
+        && let Some(incompatible) = super::source_overloads::first_incompatible_source_overload(
+            store,
+            global_types,
+            options.strict_function_types,
+            session,
+            &overloads.implementation,
+            &overloads.signatures,
+        )?
+    {
+        let overload = store
+            .signature(incompatible)
+            .and_then(|signature| signature.declaration())
+            .ok_or(SourceCheckError::Class(declaration))?;
+        let implementation = store
+            .signature(overloads.implementation.signature)
+            .and_then(|signature| signature.declaration())
+            .ok_or(SourceCheckError::Class(declaration))?;
+        if !class.source.bodies().iter().any(|body| {
+            body.kind == ClassBodyKind::Constructor && body.declaration == implementation
+        }) {
+            return Err(SourceCheckError::Class(implementation));
+        }
+        if overload_diagnostics
+            .insert(
+                implementation,
+                CanonicalCheckerDiagnostic {
+                    node: Some(overload),
+                    range_override: None,
+                    diagnostic: Diagnostic::new(
+                        message_by_code(2394).ok_or(SourceCheckError::MissingDiagnostic(2394))?,
+                    ),
+                    related_information: vec![CanonicalCheckerRelatedInformation {
+                        node: Some(implementation),
+                        diagnostic: Diagnostic::new(
+                            message_by_code(2750)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2750))?,
+                        ),
+                    }],
+                },
+            )
+            .is_some()
+        {
+            return Err(SourceCheckError::Class(implementation));
+        }
+    }
     check_class_heritage_compatibility(
         store,
         host,
@@ -33458,7 +33659,7 @@ fn check_planned_source_class(
         &members,
     )?;
     for body in class.source.bodies() {
-        if let Some(diagnostic) = method_overload_diagnostics.remove(&body.declaration) {
+        if let Some(diagnostic) = overload_diagnostics.remove(&body.declaration) {
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
         let checked = state
@@ -33493,7 +33694,7 @@ fn check_planned_source_class(
             return Err(SourceCheckError::Class(body.declaration));
         }
     }
-    if !method_overload_diagnostics.is_empty() {
+    if !overload_diagnostics.is_empty() {
         return Err(SourceCheckError::Class(declaration));
     }
     let uninitialized = match state.uninitialized_properties {
@@ -58805,12 +59006,7 @@ fn prepare_source_class_parameter(
     if !matches!(
         constructor_record.data,
         NodeData::ConstructorDeclaration(_) | NodeData::MethodDeclaration(_)
-    ) || parameter_data.question_token.is_none()
-        && !matches!(
-            host.node(annotation).map(|node| &node.data),
-            Some(NodeData::ArrayTypeNode(_))
-        )
-    {
+    ) {
         return Ok(false);
     }
     let Some(declaration) = constructor_record
@@ -58825,7 +59021,45 @@ fn prepare_source_class_parameter(
     else {
         return Ok(false);
     };
-    if !matches!(super::classes::plan_source_class_members_with_array_targets(store, host, symbol, Some(CanonicalArrayTargets::from_global_types(global_types))),
+    let context = ClassTypeQueryContext::new(global_types, options);
+    if matches!(constructor_record.data, NodeData::ConstructorDeclaration(_))
+        && let Err(error) = super::classes::plan_source_constructor_overload_class(
+            store,
+            host,
+            symbol,
+            Some(&context),
+        )
+    {
+        if super::classes::prepare_source_constructor_overload_annotation(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            symbol,
+            error,
+        )
+        .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?
+        {
+            return Ok(true);
+        }
+    }
+    if parameter_data.question_token.is_none()
+        && !matches!(
+            host.node(annotation).map(|node| &node.data),
+            Some(NodeData::ArrayTypeNode(_))
+        )
+    {
+        return Ok(false);
+    }
+    if !matches!(super::classes::plan_source_class_members_with_context(
+        store,
+        host,
+        symbol,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+        Some(&context),
+    ),
         Err(super::classes::ClassError::Unsupported(
             super::classes::ClassUnsupported::PropertyType { node, kind: SyntaxKind::Parameter }
         )) if node == annotation)

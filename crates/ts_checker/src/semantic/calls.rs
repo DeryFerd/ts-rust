@@ -353,13 +353,15 @@ pub(super) fn resolve_direct_call(
     )
 }
 
-fn resolve_direct_call_candidates(
+pub(super) fn resolve_direct_call_candidates(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     strict_function_types: bool,
     request: DirectCallRequest<'_>,
     callables: &[ValidatedSingleCallable],
 ) -> Result<DirectCallResolution, DirectCallError> {
+    validate_direct_invocation_options(request)?;
+    validate_argument_types(store, request.arguments)?;
     let callables = reorder_direct_call_candidates(store, request.callee, callables)?;
     let candidate_count = callables.len();
     let mut candidates = Vec::with_capacity(candidate_count);

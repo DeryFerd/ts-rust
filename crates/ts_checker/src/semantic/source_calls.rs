@@ -5660,24 +5660,29 @@ fn extra_fixed_argument_diagnostic_range(
     plan: SourceCallDiagnosticSite<'_>,
     first_extra: usize,
 ) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
-    let first = plan
-        .arguments
-        .get(first_extra)
-        .ok_or(SourceCheckError::Call(plan.node))?;
-    let last = plan
-        .arguments
-        .last()
-        .ok_or(SourceCheckError::Call(plan.node))?;
-    let first_range = host
-        .node(first.node)
-        .ok_or(SourceCheckError::Call(plan.node))?
-        .range;
-    let last_range = host
-        .node(last.node)
-        .ok_or(SourceCheckError::Call(plan.node))?
-        .range;
-    Ok(CanonicalCheckerDiagnosticRange::new(
+    extra_source_argument_diagnostic_range(
+        host,
         plan.node,
+        plan.arguments.iter().map(|argument| argument.node),
+        first_extra,
+    )
+}
+
+pub(super) fn extra_source_argument_diagnostic_range(
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    arguments: impl IntoIterator<Item = NodeRef>,
+    first_extra: usize,
+) -> Result<CanonicalCheckerDiagnosticRange, SourceCheckError> {
+    let mut arguments = arguments.into_iter();
+    let first = arguments
+        .nth(first_extra)
+        .ok_or(SourceCheckError::Call(node))?;
+    let last = arguments.last().unwrap_or(first);
+    let first_range = host.node(first).ok_or(SourceCheckError::Call(node))?.range;
+    let last_range = host.node(last).ok_or(SourceCheckError::Call(node))?.range;
+    Ok(CanonicalCheckerDiagnosticRange::new(
+        node,
         TextRange::new(first_range.start, last_range.end),
     ))
 }
@@ -5743,7 +5748,7 @@ fn arrow_argument_diagnostic_range(
     )))
 }
 
-fn missing_argument_related_information(
+pub(super) fn missing_argument_related_information(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     call: NodeRef,

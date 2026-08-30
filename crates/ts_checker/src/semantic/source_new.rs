@@ -108,6 +108,10 @@ pub(super) enum SourceNewError {
     Invariant(SourceNewInvariant),
     DeclaredType(DeclaredTypeError),
     Class(ClassError),
+    Call {
+        node: NodeRef,
+        error: super::calls::DirectCallError,
+    },
 }
 
 impl SourceNewError {
@@ -136,6 +140,7 @@ impl SourceNewError {
                 | SourceNewInvariant::InvalidConstructSignature(_) => None,
             },
             Self::Class(error) => error.node(),
+            Self::Call { node, .. } => Some(node),
             Self::DeclaredType(_) => None,
         }
     }
@@ -179,6 +184,7 @@ pub(super) struct SourceDefaultNewPlan {
 #[derive(Clone, Debug)]
 enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
+    ConstructorOverloads(Box<super::classes::SourceClassPlan>),
     ImportedClass(Box<SourceImportBindingPlan>),
     Declared(SourceDeclaredConstructorPlan),
     ClassUnion(SourceClassUnionConstructorPlan),
@@ -405,6 +411,10 @@ impl SourceDefaultNewPlan {
 
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
         self.argument.iter().chain(&self.additional_arguments)
+    }
+
+    pub(super) fn argument_nodes(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.arguments().map(|argument| argument.node)
     }
 
     /// Returns the exact access or abstract-instantiation diagnostic for a class.
@@ -681,6 +691,31 @@ pub(super) fn plan_direct_default_new(
     import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     node: NodeRef,
     early_preparation: bool,
+) -> Result<SourceDefaultNewPlan, SourceNewError> {
+    plan_direct_default_new_with_type_context(
+        arena,
+        bound,
+        store,
+        host,
+        prior_classes,
+        import_bindings,
+        node,
+        early_preparation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_direct_default_new_with_type_context(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_classes: &HashMap<SemanticSymbolId, ClassMemberPlan>,
+    import_bindings: &HashMap<SemanticSymbolId, SourceImportBindingPlan>,
+    node: NodeRef,
+    early_preparation: bool,
+    type_context: Option<&super::classes::ClassTypeQueryContext>,
 ) -> Result<SourceDefaultNewPlan, SourceNewError> {
     let record = arena
         .get(node.node)
@@ -1000,6 +1035,26 @@ pub(super) fn plan_direct_default_new(
         }
         let global = plan_global_promise_constructor(store, host, constructor, symbol, executor)?;
         (SourceNewTarget::GlobalPromise(global), None)
+    } else if symbol_record.flags() == SymbolFlags::CLASS
+        && let Some(class) = super::classes::plan_source_constructor_overload_class(
+            store,
+            host,
+            symbol,
+            type_context,
+        )?
+    {
+        let declaration = class.declaration();
+        if !declaration.is_for(node.arena, node.file)
+            || host
+                .node(declaration)
+                .is_none_or(|declaration| declaration.range.end > record.range.start)
+        {
+            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                node: constructor,
+                symbol,
+            }));
+        }
+        (SourceNewTarget::ConstructorOverloads(Box::new(class)), None)
     } else if symbol_record.flags() == SymbolFlags::CLASS {
         let class = if let Some(class) = prior_classes.get(&symbol) {
             ClassMemberQueryPlan::Direct(class.clone())
@@ -1121,14 +1176,16 @@ pub(super) fn plan_direct_default_new(
             &target,
             SourceNewTarget::Class(class) if class.constructor_minimum_argument_count() == 0
         );
-    if !matches!(&target, SourceNewTarget::ImportedClass(_))
-        && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
-            || argument
-                .as_ref()
-                .zip(parameter)
-                .is_some_and(|(argument, parameter)| {
-                    !argument_matches_parameter(store, argument, parameter)
-                }))
+    if !matches!(
+        &target,
+        SourceNewTarget::ImportedClass(_) | SourceNewTarget::ConstructorOverloads(_)
+    ) && (argument.is_some() != parameter.is_some() && !omitted_defaulted_class_parameter
+        || argument
+            .as_ref()
+            .zip(parameter)
+            .is_some_and(|(argument, parameter)| {
+                !argument_matches_parameter(store, argument, parameter)
+            }))
     {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
@@ -3701,6 +3758,21 @@ pub(super) fn preflight_direct_default_new(
         }
     }
     match &plan.target {
+        SourceNewTarget::ConstructorOverloads(class) => {
+            if super::classes::plan_source_constructor_overload_class(
+                store,
+                host,
+                class.symbol(),
+                class.type_query_context(),
+            )?
+            .as_ref()
+                != Some(class.as_ref())
+            {
+                return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+                    class.declaration(),
+                )));
+            }
+        }
         SourceNewTarget::Class(class) => {
             preflight_nongeneric_class_member_query(store, host, class)?;
             if constructor_parameter(store, host, class)? != plan.parameter {
@@ -3920,6 +3992,9 @@ pub(super) fn prepare_direct_default_news(
 
     for plan in plans {
         match &plan.target {
+            SourceNewTarget::ConstructorOverloads(class) => {
+                super::classes::prepare_source_class_members(store, host, class)?;
+            }
             SourceNewTarget::DeclaredInterface(declared) => {
                 global_error::prepare(
                     store,
@@ -5022,6 +5097,9 @@ pub(super) fn check_direct_default_new(
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, host, plan)?;
     let selected = match &plan.target {
+        SourceNewTarget::ConstructorOverloads(_) => {
+            return Err(unsupported(SourceNewUnsupported::Arguments(plan.node)));
+        }
         SourceNewTarget::Class(class) => {
             let members = execute_nongeneric_class_member_query(store, host, class)?;
             let selected = CheckedSourceDefaultNew {
@@ -5095,13 +5173,121 @@ pub(super) fn check_direct_default_new(
             })?
         }
     };
-    let CheckedSourceDefaultNew {
+    publish_checked_default_new(store, host, plan, selected)
+}
+
+fn publish_checked_default_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    selected: CheckedSourceDefaultNew,
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let argument_types = materialize_new_argument_types(store, plan)?;
+    publish_default_new_links(store, host, plan, selected, &argument_types)
+}
+
+/// A selected public constructor and a note from its checked hidden implementation.
+pub(super) struct CheckedSourceConstructorOverloadNew {
+    pub(super) checked: CheckedSourceDefaultNew,
+    pub(super) resolution: super::calls::DirectCallResolution,
+    pub(super) implementation_note: Option<NodeRef>,
+}
+
+pub(super) fn check_source_constructor_overload_new(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    strict_function_types: bool,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Option<CheckedSourceConstructorOverloadNew>, SourceNewError> {
+    let SourceNewTarget::ConstructorOverloads(class) = &plan.target else {
+        return Ok(None);
+    };
+    preflight_direct_default_new(store, host, plan)?;
+    preflight_prepared_default_new_cache(store, host, plan)?;
+    let group = super::classes::source_class_constructor_overloads(store, host, class.symbol())?
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(class.declaration())))?;
+    let arguments = materialize_new_argument_types(store, plan)?;
+    let value_type = group.members.shells().value_type();
+    let instance_type = group.members.shells().instance_type();
+    if group.signatures.iter().any(|signature| {
+        signature.owner != value_type
+            || signature.return_type != Some(instance_type)
+            || store
+                .signature(signature.signature)
+                .is_none_or(|record| !record.flags().contains(SignatureFlags::CONSTRUCT))
+    }) {
+        return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+            class.declaration(),
+        )));
+    }
+    let request = super::calls::DirectCallRequest {
+        form: super::calls::DirectCallForm::New,
+        callee: value_type,
+        arguments: &arguments,
+        optional_chain: false,
+        type_argument_count: 0,
+        has_spread_argument: false,
+    };
+    let resolution = super::calls::resolve_direct_call_candidates(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        &group.signatures,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })?;
+    if resolution.projection.return_type != instance_type {
+        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+            plan.node,
+        )));
+    }
+    let implementation_note = if matches!(
+        resolution.applicability,
+        super::calls::DirectCallApplicability::ArgumentNotAssignable { .. }
+    ) && super::calls::class_overload_implementation_accepts_arguments(
+        store,
+        global_types,
+        strict_function_types,
+        request,
+        &group.implementation,
+    )
+    .map_err(|error| SourceNewError::Call {
+        node: plan.node,
+        error,
+    })? {
+        Some(
+            store
+                .signature(group.implementation.signature)
+                .and_then(|signature| signature.declaration())
+                .ok_or_else(|| {
+                    invariant(SourceNewInvariant::InvalidClassPlan(class.declaration()))
+                })?,
+        )
+    } else {
+        None
+    };
+    let selected = CheckedSourceDefaultNew {
         value_type,
         instance_type,
-        signature,
-    } = selected;
-    let argument_types = plan
-        .arguments()
+        signature: resolution.projection.signature,
+    };
+    let checked = publish_default_new_links(store, host, plan, selected, &arguments)?;
+    Ok(Some(CheckedSourceConstructorOverloadNew {
+        checked,
+        resolution,
+        implementation_note,
+    }))
+}
+
+fn materialize_new_argument_types(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+) -> Result<Vec<TypeId>, SourceNewError> {
+    plan.arguments()
         .map(|argument| {
             let regular = match &argument.value {
                 SourceNewArgumentValue::String(value) => {
@@ -5139,7 +5325,21 @@ pub(super) fn check_direct_default_new(
                 .fresh_type_of_literal_type(regular)
                 .map_err(|error| literal_cache_error(argument.node, error))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn publish_default_new_links(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    selected: CheckedSourceDefaultNew,
+    argument_types: &[TypeId],
+) -> Result<CheckedSourceDefaultNew, SourceNewError> {
+    let CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature,
+    } = selected;
     preflight_publication_cache(
         store,
         host,
@@ -5147,7 +5347,7 @@ pub(super) fn check_direct_default_new(
         value_type,
         instance_type,
         signature,
-        &argument_types,
+        argument_types,
     )?;
 
     let symbol_links = SymbolNodeLinks {
@@ -5169,7 +5369,7 @@ pub(super) fn check_direct_default_new(
     assert!(store.set_type_node_links(plan.constructor, constructor_links));
     assert!(store.set_signature_links(plan.node, signature_links));
     assert!(store.set_type_node_links(plan.node, expression_links));
-    for (argument, argument_type) in plan.arguments().zip(argument_types) {
+    for (argument, &argument_type) in plan.arguments().zip(argument_types) {
         assert!(store.set_type_node_links(
             argument.node,
             TypeNodeLinks {
@@ -6347,6 +6547,30 @@ fn preflight_default_new_cache(
     }
 
     match &plan.target {
+        SourceNewTarget::ConstructorOverloads(class) => {
+            let group =
+                super::classes::source_class_constructor_overloads(store, host, class.symbol())?;
+            if constructor_type.is_some_and(|type_| {
+                group
+                    .as_ref()
+                    .is_none_or(|group| group.members.shells().value_type() != type_)
+            }) || result_type.is_some_and(|type_| {
+                group
+                    .as_ref()
+                    .is_none_or(|group| group.members.shells().instance_type() != type_)
+            }) || signature.is_some_and(|signature| {
+                group.as_ref().is_none_or(|group| {
+                    !group
+                        .signatures
+                        .iter()
+                        .any(|candidate| candidate.signature == signature)
+                })
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
         SourceNewTarget::Class(class) => {
             let instance = store
                 .declared_type_links(class.symbol())
