@@ -7299,6 +7299,7 @@ mod tests {
             );
             let bound = context.file(FileId::new(0)).unwrap().1.clone();
             let options = context.options();
+            let globals = context.global_types().clone();
             let host = DeclaredTypeHost::new_after_global_merge(
                 [(&parsed.arena, &bound)],
                 GlobalMergeCompletion::for_test(options.name_resolution),
@@ -7328,9 +7329,10 @@ mod tests {
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
             for _ in 0..2 {
                 assert_eq!(
-                    CanonicalTypeQuery::new_with_session_for_test(
+                    CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
                         &host,
+                        &globals,
                         options,
                         &mut zero,
                         &mut diagnostics,
