@@ -15,15 +15,18 @@ use ts_binder::{
 };
 use xxhash_rust::xxh3::Xxh3;
 
+#[cfg(test)]
+use super::conditional_types::cached_source_conditional_instantiation;
+
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     IndexInfoId, TypeId, TypeMapperId, TypeResolutionTarget, TypeSystemPropertyName,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     conditional_types::{
-        ConditionalBranchSource, ConditionalTypeError, cached_source_conditional_instantiation,
-        conditional_alias_projection, conditional_query_alias,
-        validate_conditional_reference_result,
+        ConditionalBranchSource, ConditionalTypeError,
+        cached_source_conditional_instantiation_with_array_targets, conditional_alias_projection,
+        conditional_query_alias, validate_conditional_reference_result,
     },
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
@@ -2031,14 +2034,21 @@ impl MappedPropertyRecovery {
         shape: &MappedShape,
         key_type: TypeId,
         result: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
     ) -> bool {
         self.symbol == symbol
             && self.shape == *shape
             && self.key_type == key_type
             && self.result == result
             && self.matches_published_links(store.value_symbol_links(symbol))
-            && mapped_property_recovery_identity(store, shape, key_type, result)
-                .is_some_and(|identity| identity == self.identity)
+            && mapped_property_recovery_identity_with_array_targets(
+                store,
+                shape,
+                key_type,
+                result,
+                array_targets,
+            )
+            .is_some_and(|identity| identity == self.identity)
     }
 }
 
@@ -2048,11 +2058,23 @@ fn mapped_property_recovery_identity(
     key_type: TypeId,
     result: TypeId,
 ) -> Option<MappedRecoveryIdentity> {
+    mapped_property_recovery_identity_with_array_targets(store, shape, key_type, result, None)
+}
+
+fn mapped_property_recovery_identity_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    shape: &MappedShape,
+    key_type: TypeId,
+    result: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Option<MappedRecoveryIdentity> {
     if source_mapped_lookup_origin(store, shape.type_)
         .ok()?
         .is_some()
     {
-        let demand = source_conditional_mapped_demand(store, shape.type_).ok()?;
+        let demand =
+            source_conditional_mapped_demand_with_array_targets(store, shape.type_, array_targets)
+                .ok()?;
         if source_conditional_mapped_key(store, demand).ok()? != key_type
             || store.intrinsic_bootstrap()?.error_type != result
         {
@@ -2064,7 +2086,7 @@ fn mapped_property_recovery_identity(
         }
         return Some(MappedRecoveryIdentity::SourceConditional {
             demand,
-            inputs: property_recovery_type_identity(store, &roots, None)?,
+            inputs: property_recovery_type_identity(store, &roots, array_targets)?,
         });
     }
     let mut roots = vec![
@@ -2082,7 +2104,7 @@ fn mapped_property_recovery_identity(
     }
     roots.extend(shape.name_type);
     roots.extend(shape.template_parameters.into_iter().flatten());
-    property_recovery_type_identity(store, &roots, None).map(MappedRecoveryIdentity::Types)
+    property_recovery_type_identity(store, &roots, array_targets).map(MappedRecoveryIdentity::Types)
 }
 
 /// Created only when mapped index evaluation observes a caller limit event.
@@ -3855,6 +3877,8 @@ impl CanonicalTypeMapperStore {
         session: &mut InstantiationSession,
         source: Option<&MappedConditionalSource<'_>>,
     ) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
+        let array_targets =
+            source.map(|source| CanonicalArrayTargets::from_global_types(source.globals));
         if !modifiers.valid() {
             return Err(MappedTypeError::InvalidModifiers);
         }
@@ -3873,7 +3897,13 @@ impl CanonicalTypeMapperStore {
                 let shape = validate_mapped_shape(self, type_)?;
                 if direct_mapped_request(self, &shape)? {
                     let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
-                    let _ = validate_warm_mapped_members(self, &shape, &properties, &indexes)?;
+                    let _ = validate_warm_mapped_members_with_array_targets(
+                        self,
+                        &shape,
+                        &properties,
+                        &indexes,
+                        array_targets,
+                    )?;
                 }
             }
             return Err(MappedTypeError::InvalidModifiers);
@@ -3881,7 +3911,8 @@ impl CanonicalTypeMapperStore {
         let modifiers = declared;
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
         if let Some(source) = source {
-            let demand = source_conditional_mapped_demand(self, type_)?;
+            let demand =
+                source_conditional_mapped_demand_with_array_targets(self, type_, array_targets)?;
             source_conditional_mapped_key(self, demand)?;
             source.branches.preflight(self, demand.origin.template)?;
         } else {
@@ -3908,7 +3939,13 @@ impl CanonicalTypeMapperStore {
                 shape.constraint_type,
             ));
         }
-        if let Some(cached) = validate_warm_mapped_members(self, &shape, &properties, &indexes)? {
+        if let Some(cached) = validate_warm_mapped_members_with_array_targets(
+            self,
+            &shape,
+            &properties,
+            &indexes,
+            array_targets,
+        )? {
             return Ok(cached);
         }
         if session.recovery_error_type().is_some_and(|error_type| {
@@ -4202,7 +4239,11 @@ impl CanonicalTypeMapperStore {
         else {
             return Err(MappedTypeError::InvalidMappedType(lookup));
         };
-        let demand = source_conditional_mapped_demand(self, indexed.object_type)?;
+        let demand = source_conditional_mapped_demand_with_array_targets(
+            self,
+            indexed.object_type,
+            Some(CanonicalArrayTargets::from_global_types(globals)),
+        )?;
         if demand.lookup != lookup {
             return Err(MappedTypeError::InvalidMappedType(lookup));
         }
@@ -4245,9 +4286,16 @@ impl CanonicalTypeMapperStore {
         session: &mut InstantiationSession,
         source: Option<&mut MappedConditionalSource<'_>>,
     ) -> Result<TypeId, MappedTypeError> {
+        let array_targets = source
+            .as_ref()
+            .map(|source| CanonicalArrayTargets::from_global_types(source.globals));
         let (containing_type, key_type, cached) = validate_mapped_property_header(self, symbol)?;
         if let Some(source) = source.as_ref() {
-            let demand = source_conditional_mapped_demand(self, containing_type)?;
+            let demand = source_conditional_mapped_demand_with_array_targets(
+                self,
+                containing_type,
+                array_targets,
+            )?;
             if source_conditional_mapped_key(self, demand)? != key_type {
                 return Err(MappedTypeError::InvalidCachedProperty(symbol));
             }
@@ -4259,8 +4307,14 @@ impl CanonicalTypeMapperStore {
             let shape = validate_mapped_shape(self, containing_type)?;
             let modifiers = self.declared_mapped_modifiers(containing_type)?;
             let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
-            let members = validate_warm_mapped_members(self, &shape, &properties, &indexes)?
-                .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
+            let members = validate_warm_mapped_members_with_array_targets(
+                self,
+                &shape,
+                &properties,
+                &indexes,
+                array_targets,
+            )?
+            .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
             if !members.properties.contains(&symbol) {
                 return Err(MappedTypeError::InvalidCachedProperty(symbol));
             }
@@ -4314,8 +4368,14 @@ impl CanonicalTypeMapperStore {
             && session.limit_event_occurred_since(limit_mark)
         {
             let shape = validate_mapped_shape(self, containing_type)?;
-            let identity = mapped_property_recovery_identity(self, &shape, key_type, type_)
-                .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
+            let identity = mapped_property_recovery_identity_with_array_targets(
+                self,
+                &shape,
+                key_type,
+                type_,
+                array_targets,
+            )
+            .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
             if !self.try_reserve_mapped_property_recoveries() {
                 return Err(MappedTypeError::Capacity);
             }
@@ -4755,9 +4815,18 @@ fn reject_deferred_conditional_mapped_demand(
 
 /// The original alias row owns this lookup. This proof does not inspect mapped
 /// property values, so cached value validation cannot recurse through itself.
+#[cfg(test)]
 fn source_conditional_mapped_demand(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
+) -> Result<SourceConditionalMappedDemand, MappedTypeError> {
+    source_conditional_mapped_demand_with_array_targets(store, type_, None)
+}
+
+fn source_conditional_mapped_demand_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<SourceConditionalMappedDemand, MappedTypeError> {
     let invalid = || MappedTypeError::InvalidMappedType(type_);
     let origin = source_mapped_lookup_origin(store, type_)?
@@ -4793,11 +4862,12 @@ fn source_conditional_mapped_demand(
         false,
     )?;
     // Retained source productions prove the complete ordered capture vector.
-    if cached_source_conditional_instantiation(
+    if cached_source_conditional_instantiation_with_array_targets(
         store,
         origin.template,
         &[origin.source, origin.key],
         &[origin.source, origin.key],
+        array_targets,
     )
     .map_err(|_| invalid())?
         != Some(origin.template)
@@ -4805,6 +4875,16 @@ fn source_conditional_mapped_demand(
         return Err(invalid());
     }
     source_mapped_lookup_state_is_warm(store, origin, type_)?;
+    // Recovery can retain a value before the concrete conditional result is cached.
+    // Check the actual input graph even when this read returns no cached result.
+    let _ = cached_source_conditional_instantiation_with_array_targets(
+        store,
+        origin.template,
+        &[origin.source, origin.key],
+        &[argument, indexed.index_type],
+        array_targets,
+    )
+    .map_err(|_| invalid())?;
     Ok(SourceConditionalMappedDemand {
         origin,
         lookup,
@@ -4832,20 +4912,31 @@ fn source_conditional_mapped_key(
     Ok(key)
 }
 
+#[cfg(test)]
 fn cached_source_mapped_template(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
     key: TypeId,
 ) -> Result<Option<TypeId>, MappedTypeError> {
-    let demand = source_conditional_mapped_demand(store, type_)?;
+    cached_source_mapped_template_with_array_targets(store, type_, key, None)
+}
+
+fn cached_source_mapped_template_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    key: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let demand = source_conditional_mapped_demand_with_array_targets(store, type_, array_targets)?;
     if source_conditional_mapped_key(store, demand)? != key {
         return Err(MappedTypeError::InvalidMappedType(type_));
     }
-    cached_source_conditional_instantiation(
+    cached_source_conditional_instantiation_with_array_targets(
         store,
         demand.origin.template,
         &[demand.origin.source, demand.origin.key],
         &[demand.argument, key],
+        array_targets,
     )
     .map_err(|error| match error {
         ConditionalTypeError::Declared(error) => MappedTypeError::Declared(error),
@@ -6983,6 +7074,22 @@ fn validate_warm_mapped_members(
     expected_properties: &[PlannedMappedProperty],
     expected_indexes: &[PlannedMappedIndex],
 ) -> Result<Option<ResolvedMappedTypeMembers>, MappedTypeError> {
+    validate_warm_mapped_members_with_array_targets(
+        store,
+        shape,
+        expected_properties,
+        expected_indexes,
+        None,
+    )
+}
+
+fn validate_warm_mapped_members_with_array_targets(
+    store: &CanonicalTypeMapperStore,
+    shape: &MappedShape,
+    expected_properties: &[PlannedMappedProperty],
+    expected_indexes: &[PlannedMappedIndex],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<ResolvedMappedTypeMembers>, MappedTypeError> {
     let record = store
         .type_payload(shape.type_)
         .ok_or(MappedTypeError::InvalidMappedType(shape.type_))?;
@@ -7089,9 +7196,10 @@ fn validate_warm_mapped_members(
                 .key_type
                 .ok_or(MappedTypeError::InvalidCachedProperty(*symbol))?;
             let matches = if let Some(recovery) = store.mapped_property_recovery(*symbol) {
-                recovery.matches(store, *symbol, shape, key_type, cached)
+                recovery.matches(store, *symbol, shape, key_type, cached, array_targets)
             } else {
-                cached_mapped_property_type(store, shape, expected, key_type)? == Some(cached)
+                cached_mapped_property_type(store, shape, expected, key_type, array_targets)?
+                    == Some(cached)
             };
             if !matches {
                 return Err(MappedTypeError::InvalidCachedProperty(*symbol));
@@ -7414,6 +7522,7 @@ fn cached_mapped_property_type(
     shape: &MappedShape,
     property: &PlannedMappedProperty,
     key_type: TypeId,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<TypeId>, MappedTypeError> {
     let source_conditional = source_mapped_lookup_origin(store, shape.type_)?.is_some();
     if !source_conditional {
@@ -7432,7 +7541,12 @@ fn cached_mapped_property_type(
         .type_payload(template_type)
         .ok_or(MappedTypeError::UnsupportedTemplate(template_type))?;
     let raw = if source_conditional {
-        cached_source_mapped_template(store, shape.type_, key_type)?
+        cached_source_mapped_template_with_array_targets(
+            store,
+            shape.type_,
+            key_type,
+            array_targets,
+        )?
     } else {
         match template.data() {
             TypeData::IndexedAccess(_) if mapped_template_indexes_source(store, shape) => {
@@ -7850,12 +7964,19 @@ fn instantiate_source_mapped_template(
     session: &mut InstantiationSession,
     source: &mut MappedConditionalSource<'_>,
 ) -> Result<TypeId, MappedTypeError> {
-    let demand = source_conditional_mapped_demand(store, shape.type_)?;
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(source.globals));
+    let demand =
+        source_conditional_mapped_demand_with_array_targets(store, shape.type_, array_targets)?;
     if source_conditional_mapped_key(store, demand)? != key_type {
         return Err(MappedTypeError::InvalidMappedType(shape.type_));
     }
     source.branches.preflight(store, demand.origin.template)?;
-    if let Some(cached) = cached_source_mapped_template(store, shape.type_, key_type)? {
+    if let Some(cached) = cached_source_mapped_template_with_array_targets(
+        store,
+        shape.type_,
+        key_type,
+        array_targets,
+    )? {
         return Ok(cached);
     }
     if !store.try_reserve_mappers(2) {
@@ -8538,6 +8659,156 @@ mod tests {
             .unwrap()
             .get_source("value")
             .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Warm the mapped value and its nested callable before direct cache replay.
+    fn source_mapped_conditional_demand_rejects_nested_copied_signature_damage() {
+        use crate::semantic::{
+            array_types::CanonicalArrayTargets,
+            callable_sets::StoredCallableSetValidation,
+            instantiated_members::{
+                resolve_members_with_array_targets, validate_generic_interface_callable,
+            },
+            object_members::{
+                DeclaredPropertyTypeGraphValidation, validate_resolved_declared_property_type_graph,
+            },
+        };
+
+        for source in [
+            SOURCE_CONDITIONAL_DEMAND.to_owned(),
+            SOURCE_CONDITIONAL_DEMAND.replace(
+                "export type Required = RequiredKeys<{ value: Validator<string> }>;",
+                "export interface Inputs { value: Validator<string>; }\nexport type Required = RequiredKeys<Inputs>;",
+            ),
+        ] {
+            for recovering in [false, true] {
+            let parsed = parse_source_file(&source);
+            let (mut context, node, mapped, demand) = source_conditional_demand_fixture(&parsed);
+            let key = super::source_conditional_mapped_key(context.store(), demand).unwrap();
+            let result = if recovering {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let (string, error) = (bootstrap.string_type, bootstrap.error_type);
+                let mut session = InstantiationSession::new_recovering(
+                    context.store(),
+                    InstantiationLimits { max_depth: 100, max_count: 1 },
+                    error,
+                ).unwrap();
+                assert_eq!(
+                    instantiate_type_with_vector_and_session(
+                        context.store_mut_for_test(), demand.origin.source,
+                        &[demand.origin.source], &[string], None, &mut session,
+                    ),
+                    Ok(string),
+                );
+                let mut diagnostics = CanonicalCheckerDiagnostics::default();
+                assert_eq!(
+                    query_source_conditional_demand(&parsed, &mut context, node, &mut session, &mut diagnostics),
+                    Ok(error),
+                );
+                assert_eq!(session.limit_event_count(), 1);
+                let property = source_conditional_value_symbol(context.store(), mapped);
+                assert!(context.store().mapped_property_recovery(property).is_some());
+                assert_eq!(super::cached_source_mapped_template(context.store(), mapped, key), Ok(None));
+                error
+            } else {
+                assert_eq!(context.get_type_from_type_node(node), Ok(key));
+                key
+            };
+        let DeclaredPropertyTypeGraphValidation::Traversable(properties) =
+            validate_resolved_declared_property_type_graph(context.store(), demand.argument)
+        else {
+            panic!("the written object must retain its checked property graph")
+        };
+        let [validator] = properties.as_slice() else {
+            panic!("the source object must retain one Validator property")
+        };
+        let validator = *validator;
+        let globals = context.global_types().clone();
+        let arrays = Some(CanonicalArrayTargets::from_global_types(&globals));
+        resolve_members_with_array_targets(context.store_mut_for_test(), validator, arrays)
+            .unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(context.store(), validator, arrays)
+        else {
+            panic!("the nested Validator must retain its copied call signature")
+        };
+        let signature = projection.call_signatures[0].signature;
+        let bound = context.file(FileId::new(0)).unwrap().1.clone();
+        let options = context.options();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_mapped_property(mapped, EscapedName::source("value").as_ref())
+            .map(|property| property.map(|property| property.type_())),
+            Ok(Some(result)),
+        );
+
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(store.set_signature_resolved_return_type(signature, Some(number)));
+        let before = (cache_state(store), store.signature_len());
+        for _ in 0..2 {
+            assert_eq!(
+                    super::cached_source_mapped_template_with_array_targets(
+                        store, mapped, key, arrays
+                ),
+                Err(MappedTypeError::InvalidMappedType(mapped)),
+            );
+            assert_eq!(
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    &host,
+                    &globals,
+                    options,
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_of_mapped_property(mapped, EscapedName::source("value").as_ref())
+                .map(|property| property.map(|property| property.type_())),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: demand.origin.declaration,
+                        kind: SyntaxKind::MappedType,
+                    }
+                )),
+            );
+            assert_eq!((cache_state(store), store.signature_len()), before);
+            assert_eq!(
+                store.type_node_links(node).unwrap().resolved_type,
+                Some(demand.lookup)
+            );
+            assert!(store.type_resolution_is_empty());
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
+            assert!(diagnostics.is_empty());
+            }
+        }
     }
 
     #[test]

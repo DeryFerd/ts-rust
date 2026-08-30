@@ -13,7 +13,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
-    conditional_types::conditional_alias_projection,
+    conditional_types::conditional_alias_projection_with_array_targets,
     declared::cached_ordinary_type_parameter_owner,
     instantiate::InstantiationSession,
     instantiated_members::{
@@ -576,7 +576,7 @@ impl CanonicalTypeMapperStore {
                 .validate_deferred_mapped_type(type_)
                 .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?,
             TypeData::Conditional(_) => {
-                conditional_alias_projection(self, type_)
+                conditional_alias_projection_with_array_targets(self, type_, array_targets)
                     .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?;
             }
             TypeData::TypeReference(_) | TypeData::Interface(_)

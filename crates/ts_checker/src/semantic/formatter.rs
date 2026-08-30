@@ -40,7 +40,7 @@ use super::{
         ClassHeritageMembersValidation, validate_class_heritage_members,
         validate_cold_class_instance_for_display,
     },
-    conditional_types::conditional_alias_projection,
+    conditional_types::conditional_alias_projection_with_array_targets,
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
@@ -915,12 +915,16 @@ fn display_conditional_type_alias(
     state: &mut DisplayState,
     visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
-    let projection = conditional_alias_projection(store, type_id)
-        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
-        .ok_or(TypeDisplayUnavailable::UnsupportedType {
-            type_id,
-            kind: TypeDataKind::Conditional,
-        })?;
+    let projection = conditional_alias_projection_with_array_targets(
+        store,
+        type_id,
+        global_types.map(CanonicalArrayTargets::from_global_types),
+    )
+    .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+    .ok_or(TypeDisplayUnavailable::UnsupportedType {
+        type_id,
+        kind: TypeDataKind::Conditional,
+    })?;
     let alias = store
         .type_payload(type_id)
         .and_then(TypeRecord::alias)

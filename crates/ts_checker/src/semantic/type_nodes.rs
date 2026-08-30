@@ -27,11 +27,13 @@ use super::{
     conditional_types::{
         ConditionalAliasIdentity, ConditionalBranchKind, ConditionalBranchSource,
         ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
-        conditional_alias_projection, conditional_check_is_assignable,
-        conditional_operands_have_disjoint_primitive_domains, conditional_query_alias,
-        get_conditional_type_instantiation, get_type_from_conditional_type,
-        record_conditional_alias_declaration, validate_conditional_alias_declaration,
-        validate_conditional_reference_result, validate_conditional_source_captures,
+        conditional_alias_projection_with_array_targets, conditional_check_is_assignable,
+        conditional_operands_have_disjoint_primitive_domains,
+        conditional_query_alias_with_array_targets, get_conditional_type_instantiation,
+        get_type_from_conditional_type, record_conditional_alias_declaration,
+        validate_conditional_alias_declaration_with_array_targets,
+        validate_conditional_reference_result_with_array_targets,
+        validate_conditional_source_captures_with_array_targets,
     },
     constraints::{get_base_constraint_of_type, get_constraint_of_type},
     declared::{
@@ -1258,8 +1260,13 @@ impl TypeQueryPlan {
                                 )? {
                                     return Err(invalid());
                                 }
-                            } else if validate_conditional_reference_result(store, node, value)
-                                .map_err(|_| invalid())?
+                            } else if validate_conditional_reference_result_with_array_targets(
+                                store,
+                                node,
+                                value,
+                                callable.array_targets,
+                            )
+                            .map_err(|_| invalid())?
                             {
                                 // The retained conditional request proves this exact result.
                             } else if matches!(
@@ -1593,7 +1600,8 @@ impl TypeQueryPlan {
                 return Err(invalid());
             }
             if self.conditionals.contains_key(&node) {
-                conditional_query_alias(store, node).map_err(|_| invalid())?;
+                conditional_query_alias_with_array_targets(store, node, callable.array_targets)
+                    .map_err(|_| invalid())?;
             }
             if self.mapped_types.contains_key(&node) {
                 store
@@ -4646,6 +4654,7 @@ fn cached_type_alias(
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
     strict_builtin_iterator_return: bool,
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<Option<CachedTypeAlias>, DeclaredTypeError> {
     let Some(links) = store.type_alias_links(symbol) else {
         return Ok(None);
@@ -4667,8 +4676,13 @@ fn cached_type_alias(
         }
         return Ok(None);
     };
-    validate_conditional_alias_declaration(store, symbol, declared_type)
-        .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol)))?;
+    validate_conditional_alias_declaration_with_array_targets(
+        store,
+        symbol,
+        declared_type,
+        array_targets,
+    )
+    .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol)))?;
 
     let expected_parameter_symbols = cached_alias_parameter_symbols(store, host, symbol)?;
     let mut missing_generic_metadata = false;
@@ -6543,8 +6557,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             outer = Some(retained);
         }
         let infer = self.conditional_capture_infer_parameters(node, &mut walk)?;
-        validate_conditional_source_captures(self.store, node, outer.as_deref(), &infer)
-            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
+        validate_conditional_source_captures_with_array_targets(
+            self.store,
+            node,
+            outer.as_deref(),
+            &infer,
+            self.array_targets,
+        )
+        .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
         Ok(PlannedConditionalCaptures { outer, infer })
     }
 
@@ -6635,16 +6655,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(());
         };
         let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
-        let identity = conditional_query_alias(self.store, node)
-            .map_err(|_| invalid())?
-            .map(|alias| {
-                let record = self.store.type_alias(alias).ok_or_else(invalid)?;
-                Ok::<_, DeclaredTypeError>(ConditionalAliasIdentity {
-                    symbol: record.symbol().ok_or_else(invalid)?,
-                    type_arguments: record.type_arguments().unwrap_or_default(),
+        let identity =
+            conditional_query_alias_with_array_targets(self.store, node, self.array_targets)
+                .map_err(|_| invalid())?
+                .map(|alias| {
+                    let record = self.store.type_alias(alias).ok_or_else(invalid)?;
+                    Ok::<_, DeclaredTypeError>(ConditionalAliasIdentity {
+                        symbol: record.symbol().ok_or_else(invalid)?,
+                        type_arguments: record.type_arguments().unwrap_or_default(),
+                    })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
         if identity.map(|identity| identity.symbol) != alias_symbol {
             return Err(invalid());
         }
@@ -13398,7 +13419,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         if matches!(declared_data, Some(TypeData::Conditional(_))) {
-            conditional_alias_projection(self.store, declared_type).map_err(|_| {
+            conditional_alias_projection_with_array_targets(
+                self.store,
+                declared_type,
+                self.array_targets,
+            )
+            .map_err(|_| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
             })?;
         }
@@ -13897,6 +13923,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         self.host,
                         capability.target_symbol,
                         self.strict_builtin_iterator_return,
+                        self.array_targets,
                     )?
                     .ok_or_else(|| {
                         type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
@@ -13930,12 +13957,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     return Ok(());
                 }
                 CachedTypeAliasRhs::TypeReference(reference) => {
-                    validate_conditional_reference_result(self.store, reference, declared_type)
-                        .map_err(|_| {
-                            type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
-                                root_symbol,
-                            ))
-                        })?;
+                    validate_conditional_reference_result_with_array_targets(
+                        self.store,
+                        reference,
+                        declared_type,
+                        self.array_targets,
+                    )
+                    .map_err(|_| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
+                            root_symbol,
+                        ))
+                    })?;
                     if self
                         .store
                         .type_node_links(reference)
@@ -14153,6 +14185,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         self.host,
                         canonical,
                         self.strict_builtin_iterator_return,
+                        self.array_targets,
                     )?
                     else {
                         return Err(type_node_unavailable(
@@ -14659,7 +14692,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let deferred = match record.data() {
             TypeData::TypeParameter(_) => true,
             TypeData::Conditional(_) => {
-                conditional_alias_projection(self.store, argument).map_err(|_| invalid())?;
+                conditional_alias_projection_with_array_targets(
+                    self.store,
+                    argument,
+                    self.array_targets,
+                )
+                .map_err(|_| invalid())?;
                 true
             }
             _ => false,
@@ -15015,6 +15053,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.host,
             owner,
             self.strict_builtin_iterator_return,
+            self.array_targets,
         )?
         .ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol))
@@ -16443,9 +16482,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .type_node_links(node)
             .and_then(|links| links.resolved_type)
         {
-            validate_conditional_reference_result(self.store, node, cached).map_err(|_| {
-                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
-            })?;
+            validate_conditional_reference_result_with_array_targets(
+                self.store,
+                node,
+                cached,
+                self.array_targets,
+            )
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
         }
         let (name_id, arguments, record_heritage) = match &record.data {
             NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => (
@@ -17875,6 +17918,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.host,
             proof.alias,
             self.strict_builtin_iterator_return,
+            self.array_targets,
         )?
         .ok_or_else(&invalid)?;
         let parameters = self
@@ -18088,6 +18132,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     self.host,
                     symbol,
                     self.strict_builtin_iterator_return,
+                    self.array_targets,
                 )?
                 .ok_or_else(&invalid)?;
                 self.validate_cached_type_alias_identity(symbol, cached, false)?;
@@ -18168,8 +18213,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .ok_or_else(&invalid)?;
                         arguments.push(instantiated);
                     }
-                    if validate_conditional_reference_result(self.store, node, argument)
-                        .map_err(|_| invalid())?
+                    if validate_conditional_reference_result_with_array_targets(
+                        self.store,
+                        node,
+                        argument,
+                        self.array_targets,
+                    )
+                    .map_err(|_| invalid())?
                     {
                         // The retained conditional proof owns its mapped result.
                     } else if let Some(proof) = self.authenticated_prop_types_key_alias(symbol) {
@@ -25387,6 +25437,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.host,
             symbol,
             self.strict_builtin_iterator_return,
+            self.array_targets,
         )?;
         // A generic alias cache stores its template. Its instantiated reference
         // is checked separately as the union constituent.
@@ -26291,11 +26342,12 @@ impl ConditionalBranchSource for MappedConditionalBranchSource<'_, '_, '_> {
         }
         planner.plan_type_node(node)?;
         let source = planner.plan.conditionals.get(&node).ok_or_else(invalid)?;
-        validate_conditional_source_captures(
+        validate_conditional_source_captures_with_array_targets(
             store,
             node,
             source.outer_parameters.as_deref(),
             &source.infer_parameters,
+            Some(CanonicalArrayTargets::from_global_types(&self.global_types)),
         )
         .map_err(|_| invalid())?;
         Ok(())
@@ -31905,6 +31957,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.host,
             symbol,
             self.options.strict_builtin_iterator_return,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
         )? {
             if let Some(alias) = plan.aliases.get(&symbol)
                 && let Some(structural_node) = self
@@ -32069,6 +32124,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     result: published,
                     type_parameters: links.type_parameters.clone().unwrap_or_default(),
                 },
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
             )
             .map_err(|_| {
                 type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(symbol))
@@ -32910,7 +32968,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|links| links.resolved_type)
             .is_some()
         {
-            let alias = conditional_query_alias(self.store, node).map_err(|_| invalid())?;
+            let alias = conditional_query_alias_with_array_targets(
+                self.store,
+                node,
+                self.global_types
+                    .as_ref()
+                    .map(CanonicalArrayTargets::from_global_types),
+            )
+            .map_err(|_| invalid())?;
             let identity = alias
                 .map(|alias| self.store.type_alias(alias).ok_or_else(invalid))
                 .transpose()?;
@@ -36388,6 +36453,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             self.host,
             identity.0,
             self.options.strict_builtin_iterator_return,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
         )?;
         if cached_owner.is_some_and(|owner| Some(owner.declared_type) != cached)
             || self
@@ -40313,6 +40381,7 @@ mod tests {
         callables::{
             CallableFamily, StoredSingleCallableValidation, validate_stored_single_callable,
         },
+        conditional_types::{conditional_alias_projection, validate_conditional_reference_result},
         formatter::{FunctionTypeDisplayUnavailable, type_to_string_with_host_and_flags},
         global_types::initialize_global_library_types,
         links::{ResolvedSignatureState, SignatureLinks},

@@ -21,9 +21,9 @@ use super::{
         ConditionalAliasIdentity, ConditionalBranchSource, ConditionalRemapLookup,
         ConditionalRemapProjection, ConditionalRemapResult, ConditionalTypeError,
         cached_conditional_remap_with_source, cached_deferred_conditional_remap,
-        conditional_alias_projection, conditional_remap_projection,
-        conditional_remap_projection_with_source, remap_conditional_with_source,
-        remap_deferred_conditional_with_session,
+        conditional_alias_projection_with_array_targets,
+        conditional_remap_projection_with_array_targets, conditional_remap_projection_with_source,
+        remap_conditional_with_source, remap_deferred_conditional_with_session,
     },
     declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, type_list_key},
     indexed_access_types::{
@@ -1658,7 +1658,7 @@ fn instantiate_type_with_alias_input_and_source(
         )
     });
     let contains = if let Some(source) = conditional_source {
-        conditional_remap_projection_with_source(store, type_, source.branches)
+        conditional_remap_projection_with_source(store, type_, source.branches, array_targets)
             .map_err(|error| conditional_remap_error(type_, error))?;
         true
     } else {
@@ -2079,9 +2079,11 @@ fn could_contain_installed_type_variables_worker(
                     })
             }
         }
-        TypeData::Conditional(_) => conditional_remap_projection(store, type_)
-            .map(|_| true)
-            .map_err(|error| conditional_remap_error(type_, error)),
+        TypeData::Conditional(_) => {
+            conditional_remap_projection_with_array_targets(store, type_, array_targets)
+                .map(|_| true)
+                .map_err(|error| conditional_remap_error(type_, error))
+        }
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
                 Err(TemplateTypeError::InvalidTemplate(type_).into())
@@ -3006,9 +3008,11 @@ fn cached_instantiated_type_with_source_worker(
         TypeData::Conditional(_) => {
             let projection = match source {
                 Some((_, source)) => {
-                    conditional_remap_projection_with_source(store, template, source)
+                    conditional_remap_projection_with_source(store, template, source, array_targets)
                 }
-                None => conditional_remap_projection(store, template),
+                None => {
+                    conditional_remap_projection_with_array_targets(store, template, array_targets)
+                }
             }
             .map_err(|error| conditional_remap_error(template, error))?;
             cached_instantiated_deferred_conditional(
@@ -4268,10 +4272,15 @@ fn instantiate_type_worker(
             }
             TypeData::Conditional(_) => {
                 let projection = match source.as_ref() {
-                    Some(source) => {
-                        conditional_remap_projection_with_source(store, type_, source.branches)
+                    Some(source) => conditional_remap_projection_with_source(
+                        store,
+                        type_,
+                        source.branches,
+                        array_targets,
+                    ),
+                    None => {
+                        conditional_remap_projection_with_array_targets(store, type_, array_targets)
                     }
-                    None => conditional_remap_projection(store, type_),
                 }
                 .map_err(|error| conditional_remap_error(type_, error))?;
                 InstantiationWork::DeferredConditional(Box::new(projection))
@@ -5432,7 +5441,7 @@ fn reduce_default_library_non_nullable_intersection(
         return Ok(None);
     }
     if matches!(record.data(), TypeData::Conditional(_)) {
-        conditional_alias_projection(store, *argument)
+        conditional_alias_projection_with_array_targets(store, *argument, array_targets)
             .map_err(|_| InstantiationError::InvalidType(*argument))?;
         return Ok(None);
     }
@@ -5821,6 +5830,7 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
         DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, SignatureId,
         ValueSymbolLinks,
+        conditional_types::{conditional_alias_projection, conditional_remap_projection},
         declared::{get_declared_class_interface_or_type_parameter, type_list_key},
         links::TypeAliasLinks,
         mapper::TypeMapper,
