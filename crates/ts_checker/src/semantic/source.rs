@@ -75581,13 +75581,13 @@ mod tests {
                     .1
                     .symbol(provider_declaration)
                     .unwrap();
-                let imported =
+                let alias_binding =
                     source_import_alias_symbol(&context, &importer, importer_file, "Local");
                 let number = context.store().intrinsic_bootstrap().unwrap().number_type;
                 assert!(context.store().type_alias_links(local).is_none());
-                assert!(context.store().alias_symbol_links(imported).is_none());
+                assert!(context.store().alias_symbol_links(alias_binding).is_none());
                 context.check_source_file(importer_file).unwrap();
-                assert_eq!(resolved_import_target(&context, imported), provider);
+                assert_eq!(resolved_import_target(&context, alias_binding), provider);
                 assert_eq!(
                     context
                         .store()
@@ -75621,7 +75621,7 @@ mod tests {
                         .resolved_type,
                     Some(number)
                 );
-                assert!(context.store().value_symbol_links(imported).is_none());
+                assert!(context.store().value_symbol_links(alias_binding).is_none());
                 assert!(is_type_checked(&context, importer_file));
                 assert!(!is_type_checked(&context, target_file));
                 assert!(context.diagnostics().is_empty());
@@ -75630,7 +75630,7 @@ mod tests {
                     context.store().type_alias_links(provider).unwrap().clone(),
                     context
                         .store()
-                        .alias_symbol_links(imported)
+                        .alias_symbol_links(alias_binding)
                         .unwrap()
                         .clone(),
                     context.store().type_node_links(reference).unwrap().clone(),
@@ -75652,7 +75652,7 @@ mod tests {
                             context.store().type_alias_links(provider).unwrap().clone(),
                             context
                                 .store()
-                                .alias_symbol_links(imported)
+                                .alias_symbol_links(alias_binding)
                                 .unwrap()
                                 .clone(),
                             context.store().type_node_links(reference).unwrap().clone(),
@@ -75665,7 +75665,7 @@ mod tests {
                         ),
                         links
                     );
-                    assert!(context.store().value_symbol_links(imported).is_none());
+                    assert!(context.store().value_symbol_links(alias_binding).is_none());
                 }
                 continue;
             }

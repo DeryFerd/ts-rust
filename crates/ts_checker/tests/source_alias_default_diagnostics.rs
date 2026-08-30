@@ -49,9 +49,9 @@ struct Alias {
 
 #[derive(Clone, Copy)]
 enum QueryOrder {
-    SourceFirst,
-    AliasFirst,
-    DefaultFirst,
+    Source,
+    Alias,
+    Default,
 }
 
 fn context<'arena>(
@@ -454,22 +454,18 @@ fn alias_defaults_report_declaration_errors_in_source_order_after_lazy_queries()
     let valid = alias(&parsed, LOCAL, "Valid");
     let other = alias(&parsed, LOCAL, "Other");
     let free = alias(&parsed, LOCAL, "Free");
-    for order in [
-        QueryOrder::SourceFirst,
-        QueryOrder::AliasFirst,
-        QueryOrder::DefaultFirst,
-    ] {
+    for order in [QueryOrder::Source, QueryOrder::Alias, QueryOrder::Default] {
         let mut checker = context(
             &[(LOCAL, &parsed, "\"/project/alias-defaults.ts\"")],
             CanonicalModuleState::Script,
         );
         for alias in [&free, &other, &valid, &broken] {
-            if matches!(order, QueryOrder::DefaultFirst) {
+            if matches!(order, QueryOrder::Default) {
                 checker
                     .get_type_from_type_node(alias.parameters[0].default.unwrap())
                     .unwrap();
             }
-            if !matches!(order, QueryOrder::SourceFirst) {
+            if !matches!(order, QueryOrder::Source) {
                 query_alias(&mut checker, alias);
             }
         }

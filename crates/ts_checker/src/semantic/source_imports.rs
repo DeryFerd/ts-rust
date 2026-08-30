@@ -14721,135 +14721,90 @@ mod tests {
             .unwrap();
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
         let mut session = InstantiationSession::new(InstantiationLimits::default());
-        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            &host,
-            global_types,
-            CanonicalCheckerOptions::default(),
-            &mut session,
-            &mut diagnostics,
-        )
-        .unwrap();
-        let result = query.get_type_from_type_node(plan.body).unwrap();
-        let other = query.get_type_from_type_node(second.body).unwrap();
-        let identity = query.store.type_payload(result).unwrap().alias().unwrap();
-        let parameters = query
-            .store
+        let query = |store: &mut CanonicalTypeMapperStore,
+                     session: &mut InstantiationSession,
+                     diagnostics: &mut CanonicalCheckerDiagnostics,
+                     node| {
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                &host,
+                global_types,
+                CanonicalCheckerOptions::default(),
+                session,
+                diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(node)
+        };
+        let result = query(store, &mut session, &mut diagnostics, plan.body).unwrap();
+        let other = query(store, &mut session, &mut diagnostics, second.body).unwrap();
+        let identity = store.type_payload(result).unwrap().alias().unwrap();
+        let parameters = store
             .type_alias(identity)
             .unwrap()
             .type_arguments()
             .unwrap()
             .to_vec();
         assert_eq!(
-            query.store.type_alias(identity).unwrap().symbol(),
+            store.type_alias(identity).unwrap().symbol(),
             Some(plan.owner)
         );
         assert_eq!(
-            query.store.type_alias(identity).unwrap().imported_body(),
+            store.type_alias(identity).unwrap().imported_body(),
             Some(&plan)
         );
         assert_eq!(
-            query
-                .store
-                .type_node_links(reference)
-                .unwrap()
-                .resolved_type,
+            store.type_node_links(reference).unwrap().resolved_type,
             Some(result)
         );
-        let before = (store_state(query.store), query.store.type_alias_len());
+        let before = (store_state(store), store.type_alias_len());
+        assert!(store.retain_type_alias_imported_body(result, std::sync::Arc::new(plan.clone())));
+        assert!(!store.retain_type_alias_imported_body(other, std::sync::Arc::new(plan.clone())));
+        assert_eq!((store_state(store), store.type_alias_len()), before);
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(!store.set_type_alias(number, Some(identity)));
+        assert_eq!((store_state(store), store.type_alias_len()), before);
+        let missing = store.alloc_type_alias(Some(plan.owner)).unwrap();
+        assert!(store.set_type_alias_arguments(missing, Some(parameters.clone())));
+        assert!(store.set_type_alias(result, Some(missing)));
+        let poisoned = (store_state(store), store.type_alias_len());
+        assert!(query(store, &mut session, &mut diagnostics, plan.body).is_err());
         assert!(
-            query
-                .store
-                .retain_type_alias_imported_body(result, std::sync::Arc::new(plan.clone()))
+            super::super::object_aliases::property_object_alias_projection(store, result).is_err()
         );
-        assert!(
-            !query
-                .store
-                .retain_type_alias_imported_body(other, std::sync::Arc::new(plan.clone()))
-        );
-        assert_eq!(
-            (store_state(query.store), query.store.type_alias_len()),
-            before
-        );
-        let number = query.store.intrinsic_bootstrap().unwrap().number_type;
-        assert!(!query.store.set_type_alias(number, Some(identity)));
-        assert_eq!(
-            (store_state(query.store), query.store.type_alias_len()),
-            before
-        );
-        let missing = query.store.alloc_type_alias(Some(plan.owner)).unwrap();
-        assert!(
-            query
-                .store
-                .set_type_alias_arguments(missing, Some(parameters.clone()))
-        );
-        assert!(query.store.set_type_alias(result, Some(missing)));
-        let poisoned = (store_state(query.store), query.store.type_alias_len());
-        assert!(query.get_type_from_type_node(plan.body).is_err());
-        assert!(
-            super::super::object_aliases::property_object_alias_projection(query.store, result)
-                .is_err()
-        );
-        assert_eq!(
-            (store_state(query.store), query.store.type_alias_len()),
-            poisoned
-        );
-        assert!(query.store.set_type_alias(result, Some(identity)));
-        let original_links = query
-            .store
+        assert_eq!((store_state(store), store.type_alias_len()), poisoned);
+        assert!(store.set_type_alias(result, Some(identity)));
+        let original_links = store
             .alias_symbol_links(plan.alias_symbol())
             .unwrap()
             .clone();
         let mut wrong_target = original_links.clone();
         wrong_target.immediate_target = Some(second.target_symbol());
         wrong_target.alias_target = AliasTargetState::Resolved(second.target_symbol());
+        assert!(store.set_alias_symbol_links(plan.alias_symbol(), wrong_target));
+        let poisoned = (store_state(store), store.type_alias_len());
+        assert!(query(store, &mut session, &mut diagnostics, plan.body).is_err());
         assert!(
-            query
-                .store
-                .set_alias_symbol_links(plan.alias_symbol(), wrong_target)
+            super::super::object_aliases::property_object_alias_projection(store, result).is_err()
         );
-        let poisoned = (store_state(query.store), query.store.type_alias_len());
-        assert!(query.get_type_from_type_node(plan.body).is_err());
-        assert!(
-            super::super::object_aliases::property_object_alias_projection(query.store, result)
-                .is_err()
-        );
+        assert_eq!((store_state(store), store.type_alias_len()), poisoned);
+        assert!(store.set_alias_symbol_links(plan.alias_symbol(), original_links));
+        assert!(store.set_type_alias_arguments(identity, Some(vec![number])));
+        let poisoned = (store_state(store), store.type_alias_len());
+        assert!(query(store, &mut session, &mut diagnostics, plan.body).is_err());
+        assert_eq!((store_state(store), store.type_alias_len()), poisoned);
+        assert!(store.set_type_alias_arguments(identity, Some(parameters)));
+        let restored = (store_state(store), store.type_alias_len());
         assert_eq!(
-            (store_state(query.store), query.store.type_alias_len()),
-            poisoned
+            query(store, &mut session, &mut diagnostics, plan.body),
+            Ok(result)
         );
-        assert!(
-            query
-                .store
-                .set_alias_symbol_links(plan.alias_symbol(), original_links)
-        );
-        assert!(
-            query
-                .store
-                .set_type_alias_arguments(identity, Some(vec![number]))
-        );
-        let poisoned = (store_state(query.store), query.store.type_alias_len());
-        assert!(query.get_type_from_type_node(plan.body).is_err());
+        assert_eq!((store_state(store), store.type_alias_len()), restored);
         assert_eq!(
-            (store_state(query.store), query.store.type_alias_len()),
-            poisoned
-        );
-        assert!(
-            query
-                .store
-                .set_type_alias_arguments(identity, Some(parameters))
-        );
-        let restored = (store_state(query.store), query.store.type_alias_len());
-        assert_eq!(query.get_type_from_type_node(plan.body), Ok(result));
-        assert_eq!(
-            (store_state(query.store), query.store.type_alias_len()),
-            restored
-        );
-        assert_eq!(
-            query.store.type_alias(identity).unwrap().imported_body(),
+            store.type_alias(identity).unwrap().imported_body(),
             Some(&plan)
         );
-        assert!(query.diagnostics.is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -14916,46 +14871,50 @@ mod tests {
                     .is_none()
             );
             let mut diagnostics = CanonicalCheckerDiagnostics::default();
-            let mut query = CanonicalTypeQuery::new_with_global_types(
-                store,
-                &host,
-                global_types,
-                CanonicalCheckerOptions::default(),
-                &mut diagnostics,
-            )
-            .unwrap();
-            let result = query.get_type_from_type_node(reference).unwrap();
-            let identity = query.store.type_payload(result).unwrap().alias().unwrap();
+            let query = |store: &mut CanonicalTypeMapperStore,
+                         diagnostics: &mut CanonicalCheckerDiagnostics,
+                         node| {
+                CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    &host,
+                    global_types,
+                    CanonicalCheckerOptions::default(),
+                    diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(node)
+            };
+            let result = query(store, &mut diagnostics, reference).unwrap();
+            let identity = store.type_payload(result).unwrap().alias().unwrap();
             assert!(
-                query
-                    .store
+                store
                     .type_alias(identity)
                     .unwrap()
                     .imported_body()
                     .is_none()
             );
             let projection =
-                super::super::object_aliases::property_object_alias_projection(query.store, result)
+                super::super::object_aliases::property_object_alias_projection(store, result)
                     .unwrap()
                     .unwrap();
             assert_eq!(projection.alias_symbol, local);
-            let original = query.store.symbol_node_links(reference).unwrap().clone();
+            let original = store.symbol_node_links(reference).unwrap().clone();
             assert_eq!(original.resolved_symbol, Some(local));
             let mut wrong = original.clone();
             wrong.resolved_symbol = Some(provider);
-            assert!(query.store.set_symbol_node_links(reference, wrong));
-            let poisoned = store_state(query.store);
-            assert!(query.get_type_from_type_node(reference).is_err());
+            assert!(store.set_symbol_node_links(reference, wrong));
+            let poisoned = store_state(store);
+            assert!(query(store, &mut diagnostics, reference).is_err());
             assert!(
-                super::super::object_aliases::property_object_alias_projection(query.store, result)
+                super::super::object_aliases::property_object_alias_projection(store, result)
                     .is_err()
             );
-            assert_eq!(store_state(query.store), poisoned);
-            assert!(query.store.set_symbol_node_links(reference, original));
-            let warm = store_state(query.store);
-            assert_eq!(query.get_type_from_type_node(reference), Ok(result));
-            assert_eq!(store_state(query.store), warm);
-            assert!(query.diagnostics.is_empty());
+            assert_eq!(store_state(store), poisoned);
+            assert!(store.set_symbol_node_links(reference, original));
+            let warm = store_state(store);
+            assert_eq!(query(store, &mut diagnostics, reference), Ok(result));
+            assert_eq!(store_state(store), warm);
+            assert!(diagnostics.is_empty());
         }
     }
 
