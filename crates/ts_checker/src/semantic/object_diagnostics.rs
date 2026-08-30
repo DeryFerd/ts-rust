@@ -1574,21 +1574,21 @@ pub(super) fn callable_assignability_details(
             if source_callable.min_argument_count == 1
                 && target_callable.min_argument_count == 1 =>
         {
-            let contravariant = store
-                .is_type_assignable_to_with_global_types_and_strict_function_types(
+            let strict_variance =
+                options.strict_function_types && !target_callable.strict_variance_exempt;
+            let parameter_compatible = !strict_variance
+                && store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    source_parameter.value_type,
+                    target_parameter.value_type,
+                    global_types,
+                    options.strict_function_types,
+                )?
+                || store.is_type_assignable_to_with_global_types_and_strict_function_types(
                     target_parameter.value_type,
                     source_parameter.value_type,
                     global_types,
                     options.strict_function_types,
                 )?;
-            let parameter_compatible = contravariant
-                || !options.strict_function_types
-                    && store.is_type_assignable_to_with_global_types_and_strict_function_types(
-                        source_parameter.value_type,
-                        target_parameter.value_type,
-                        global_types,
-                        options.strict_function_types,
-                    )?;
             if !parameter_compatible {
                 let detail = Diagnostic::with_arguments(
                     message_by_code(2328).ok_or(SourceCheckError::MissingDiagnostic(2328))?,

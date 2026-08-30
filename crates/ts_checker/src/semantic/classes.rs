@@ -1220,7 +1220,6 @@ pub(super) fn plan_source_class_members_with_context(
     };
     if class.type_parameters.is_some()
         || !header.namespace_exports.is_empty()
-        || !header.implementations.is_empty()
         || header.null_base.is_some()
         || header
             .base
@@ -4897,6 +4896,57 @@ pub(super) fn check_class_implementation_compatibility(
         {
             return Err(SourceCheckError::Class(implementation.expression));
         }
+        if let Some(method) = &implementation.method {
+            let method_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_of_interface_method(method.symbol)?;
+            let symbol = store
+                .symbol(method.symbol)
+                .ok_or(SourceCheckError::Class(implementation.expression))?;
+            let member = store
+                .symbol(implementation.symbol)
+                .and_then(Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(symbol.name()));
+            if member != Some(method.symbol)
+                || symbol.name().as_utf8() != Some(method.name.as_str())
+                || symbol.parent() != Some(implementation.symbol)
+                || store.type_payload(method_type).and_then(TypeRecord::symbol)
+                    != Some(method.symbol)
+            {
+                return Err(SourceCheckError::Class(implementation.expression));
+            }
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, method_type)
+            else {
+                return Err(SourceCheckError::Class(implementation.expression));
+            };
+            if projection.call_signatures.is_empty() || !projection.construct_signatures.is_empty()
+            {
+                return Err(SourceCheckError::Class(implementation.expression));
+            }
+            for signature in projection
+                .call_signatures
+                .iter()
+                .map(|callable| callable.signature)
+            {
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .get_return_type_of_signature(signature)?;
+            }
+        }
         if store.is_type_assignable_to_with_session(
             source_type,
             target_type,
@@ -6288,7 +6338,6 @@ struct DirectClassImplementationPlan {
 struct ImplementedClassMethodPlan {
     symbol: SemanticSymbolId,
     name: String,
-    array_type: TypeId,
 }
 
 /// The two identities installed by the class shell query.
@@ -12463,66 +12512,26 @@ fn plan_implemented_interface_method(
 ) -> Result<ImplementedClassMethodPlan, ClassError> {
     let reject = || unsupported(ClassUnsupported::Heritage(implementation));
     let plan = super::object_members::plan_interface(store, host, symbol).map_err(|_| reject())?;
-    let [method] = plan.methods.as_slice() else {
-        return Err(reject());
-    };
     let [property] = plan.properties.as_slice() else {
         return Err(reject());
     };
-    let [parameter] = method.parameters.as_slice() else {
-        return Err(reject());
-    };
-    let return_type = preflight_node(store, host, method.return_type)?;
-    let annotation = preflight_node(store, host, parameter.type_node)?;
-    let NodeData::ArrayTypeNode(array) = &annotation.data else {
-        return Err(reject());
-    };
-    let element = NodeRef::new(
-        parameter.type_node.arena,
-        parameter.type_node.file,
-        array.element_type,
-    );
-    let element_record = preflight_node(store, host, element)?;
-    let any = store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.any_type)
-        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(implementation)))?;
-    let array_type = class_method_any_array_type(store, parameter.type_node)?;
     if plan.heritage.is_some()
+        || !plan.accessors.is_empty()
         || !plan.spreads.is_empty()
         || !plan.indexes.is_empty()
         || !plan.call_signatures.is_empty()
-        || property.symbol != method.symbol
-        || method.flags != SignatureFlags::HAS_REST_PARAMETER
-        || return_type.kind != SyntaxKind::VoidKeyword
-        || !matches!(return_type.data, NodeData::KeywordTypeNode(_))
-        || annotation.kind != SyntaxKind::ArrayType
-        || element_record.kind != SyntaxKind::AnyKeyword
-        || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
+        || property.optional
+        || plan.methods.is_empty()
+        || plan
+            .methods
+            .iter()
+            .any(|method| method.symbol != property.symbol)
     {
         return Err(reject());
     }
-    validate_index_type_cache(store, element, any)?;
-    validate_index_type_cache(store, parameter.type_node, array_type)?;
-    if store
-        .value_symbol_links(parameter.symbol)
-        .is_some_and(|links| {
-            links != &ValueSymbolLinks::default()
-                && links
-                    != &(ValueSymbolLinks {
-                        resolved_type: Some(array_type),
-                        ..ValueSymbolLinks::default()
-                    })
-        })
-    {
-        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
-            parameter.symbol,
-        )));
-    }
     Ok(ImplementedClassMethodPlan {
-        symbol: method.symbol,
+        symbol: property.symbol,
         name: property.name.as_utf8().ok_or_else(reject)?.to_owned(),
-        array_type,
     })
 }
 
@@ -14862,39 +14871,6 @@ fn plan_class_declaration(
             node: index.declaration,
             kind: SyntaxKind::IndexSignature,
         }));
-    }
-    for implementation in &implementations {
-        let Some(expected) = implementation.method.as_ref() else {
-            continue;
-        };
-        let Some(method) = instance_methods
-            .iter()
-            .find(|method| method.name == expected.name)
-        else {
-            return Err(unsupported(ClassUnsupported::Heritage(
-                implementation.expression,
-            )));
-        };
-        if method
-            .rest_parameter
-            .is_none_or(|parameter| parameter.array_type != expected.array_type)
-            || store.symbol(expected.symbol).is_none_or(|symbol| {
-                symbol.flags() != SymbolFlags::METHOD
-                    || symbol.name().as_utf8() != Some(expected.name.as_str())
-                    || symbol
-                        .parent()
-                        .and_then(|parent| store.get_merged_symbol(parent))
-                        != Some(implementation.symbol)
-            })
-            || method
-                .return_type_node
-                .and_then(|annotation| host.node(annotation))
-                .is_none_or(|annotation| annotation.kind != SyntaxKind::VoidKeyword)
-        {
-            return Err(unsupported(ClassUnsupported::Heritage(
-                implementation.expression,
-            )));
-        }
     }
     for property in &instance_properties {
         let Some(name) = property.initializer_parameter_name.as_deref() else {
@@ -40644,7 +40620,41 @@ mod tests {
         let parameter = method.rest_parameter.unwrap();
         assert_ne!(required.symbol, method.symbol);
         assert_eq!(required.name, method.name);
-        assert_eq!(required.array_type, parameter.array_type);
+        let required_plan = super::super::object_members::plan_interface(
+            &fixture.store,
+            &host,
+            implementation.symbol,
+        )
+        .unwrap();
+        let [required_method] = required_plan.methods.as_slice() else {
+            panic!("the interface retains one method declaration")
+        };
+        let [required_parameter] = required_method.parameters.as_slice() else {
+            panic!("the interface method retains one rest parameter")
+        };
+        assert_eq!(required_method.symbol, required.symbol);
+        let NodeData::ArrayTypeNode(required_array) = &fixture
+            .parsed
+            .arena
+            .get(required_parameter.type_node.node)
+            .unwrap()
+            .data
+        else {
+            panic!("the unchanged interface annotation must remain an array")
+        };
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(required_array.element_type)
+                .unwrap()
+                .kind,
+            SyntaxKind::AnyKeyword
+        );
+        assert_eq!(
+            class_method_any_array_type(&fixture.store, required_parameter.type_node),
+            Ok(parameter.array_type)
+        );
         assert!(
             fixture
                 .store
@@ -40814,8 +40824,8 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_forward_rest_method_implementations_remain_unsupported() {
-        for source in [
+    fn forward_rest_method_implementations_use_structural_compatibility() {
+        for (index, source) in [
             concat!(
                 "class Model implements Contract { other(...args: any[]): void {} } ",
                 "interface Contract { run(...args: any[]): void; }",
@@ -40828,7 +40838,10 @@ mod tests {
                 "class Model implements Contract { run(): void {} } ",
                 "interface Contract { run(...args: any[]): void; }",
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let fixture = fixture(source);
             let owner = class_symbol(&fixture, "Model");
             let bound = &fixture.files[&fixture.file];
@@ -40839,10 +40852,7 @@ mod tests {
                 fixture.store.checker_link_allocated_lengths(),
             );
 
-            assert!(matches!(
-                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
-                Err(ClassError::Unsupported(ClassUnsupported::Heritage(_)))
-            ));
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
             assert_eq!(
                 (
                     fixture.store.type_len(),
@@ -40853,6 +40863,98 @@ mod tests {
             );
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());
+
+            let file = fixture.file;
+            let parsed = &fixture.parsed;
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/classes.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            if index == 0 {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("the missing method must have one implements diagnostic")
+                };
+                let class = class_node(&fixture, "Model");
+                let NodeData::ClassDeclaration(class) = &parsed.arena.get(class.node).unwrap().data
+                else {
+                    panic!("Model must remain a class declaration")
+                };
+                assert_eq!(
+                    diagnostic.node,
+                    Some(NodeRef::new(parsed.arena.id(), file, class.name.unwrap()))
+                );
+                assert_eq!(diagnostic.range_override, None);
+                assert_eq!(diagnostic.diagnostic.code(), 2420);
+                assert_eq!(diagnostic.diagnostic.arguments, ["Model", "Contract"]);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "Class 'Model' incorrectly implements interface 'Contract'.\n  Property 'run' is missing in type 'Model' but required in type 'Contract'."
+                );
+                let [related] = diagnostic.related_information.as_slice() else {
+                    panic!("the missing method must retain its declaration note")
+                };
+                let required_name = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(_, record)| {
+                        let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+                            return None;
+                        };
+                        Some(NodeRef::new(parsed.arena.id(), file, method.name))
+                    })
+                    .unwrap();
+                assert_eq!(related.node, Some(required_name));
+                assert_eq!(related.diagnostic.code(), 2728);
+                assert_eq!(related.diagnostic.arguments, ["run"]);
+                assert_eq!(
+                    related.diagnostic.render().unwrap(),
+                    "'run' is declared here."
+                );
+            } else {
+                assert!(context.diagnostics().is_empty(), "{source}");
+            }
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+                context.diagnostics().clone(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot(),
+                    context.diagnostics().clone(),
+                ),
+                warm
+            );
         }
     }
 

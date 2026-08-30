@@ -26,8 +26,8 @@ use super::{
     },
     signatures::{ElementFlags, Signature, SignatureFlags, SignatureKind, TupleElementInfo},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
-    type_records::{TypeData, TypeRecord},
-    types::TypeFlags,
+    type_records::{ObjectTypeData, TypeData, TypeRecord},
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// Call-like syntax presented to the direct-call semantic kernel.
@@ -215,6 +215,10 @@ enum RestParameterShape {
         type_: TypeId,
         element: TypeId,
     },
+    MissingGlobalArray {
+        type_: TypeId,
+        indexed_type: TypeId,
+    },
     Tuple {
         type_: TypeId,
         elements: Vec<TypeId>,
@@ -233,6 +237,7 @@ impl RestParameterShape {
     fn type_id(&self) -> TypeId {
         match self {
             Self::Array { type_, .. }
+            | Self::MissingGlobalArray { type_, .. }
             | Self::Tuple { type_, .. }
             | Self::Union { type_, .. }
             | Self::Intrinsic(type_) => *type_,
@@ -942,6 +947,29 @@ fn rest_parameter_shape(
                 element: array.element_type,
             });
         }
+        if let Some(bootstrap) = store.intrinsic_bootstrap()
+            && array_targets
+                .is_some_and(|targets| targets.array_type() == bootstrap.empty_generic_type)
+            && type_ == bootstrap.empty_object_type
+        {
+            if record.flags() != TypeFlags::OBJECT
+                || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                || record.symbol().is_some()
+                || record.alias().is_some()
+                || !matches!(record.data(), TypeData::Object(object) if object == &ObjectTypeData::default())
+            {
+                return Err(invalid());
+            }
+            store
+                .validate_union_constituent(bootstrap.unknown_type)
+                .map_err(|_| invalid())?;
+            // Missing Array declarations produce emptyObjectType upstream. Keep
+            // that non-array rest identity and its unknown indexed read type.
+            return Ok(RestParameterShape::MissingGlobalArray {
+                type_,
+                indexed_type: bootstrap.unknown_type,
+            });
+        }
         if record.flags().intersects(TypeFlags::ANY | TypeFlags::NEVER) {
             store
                 .validate_union_constituent(type_)
@@ -1084,6 +1112,7 @@ fn collect_rest_position_types(
     }
     match rest {
         RestParameterShape::Array { element, .. } => result.push(*element),
+        RestParameterShape::MissingGlobalArray { indexed_type, .. } => result.push(*indexed_type),
         RestParameterShape::Intrinsic(type_) => result.push(*type_),
         RestParameterShape::Union { members, .. } => {
             for member in members {
@@ -1548,9 +1577,9 @@ fn non_array_rest_target(
         {
             Ok(None)
         }
-        RestParameterShape::Intrinsic(type_) | RestParameterShape::Union { type_, .. } => {
-            Ok(Some((prefix, *type_)))
-        }
+        RestParameterShape::Intrinsic(type_)
+        | RestParameterShape::Union { type_, .. }
+        | RestParameterShape::MissingGlobalArray { type_, .. } => Ok(Some((prefix, *type_))),
         RestParameterShape::Tuple {
             elements,
             infos,
@@ -1708,6 +1737,7 @@ fn contextual_rest_position_types(
 ) -> Result<(), DirectCallError> {
     match rest {
         RestParameterShape::Array { element, .. } => result.push(*element),
+        RestParameterShape::MissingGlobalArray { indexed_type, .. } => result.push(*indexed_type),
         RestParameterShape::Intrinsic(type_) => result.push(*type_),
         RestParameterShape::Union { members, .. } => {
             for member in members {
@@ -2351,6 +2381,124 @@ mod tests {
             get_min_argument_count(&store, None, &required_rest, MinArgumentCountFlags::NONE),
             Ok(1)
         );
+    }
+
+    #[test]
+    fn missing_global_array_rest_parameters_keep_fallback_identity() {
+        for (source, missing_array) in [
+            ("interface Empty {}", true),
+            ("interface Array<T> {} interface ReadonlyArray<T> {}", false),
+        ] {
+            let parsed = parse_source_file(source);
+            let mut context = array_context(&parsed);
+            let globals = context.global_types().clone();
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let fallback = bootstrap.empty_object_type;
+            let unknown = bootstrap.unknown_type;
+            let void = bootstrap.void_type;
+            assert_eq!(globals.any_array_type == fallback, missing_array);
+            let store = context.store_mut_for_test();
+            let fallback_callable = callable(
+                store,
+                SignatureFlags::HAS_REST_PARAMETER,
+                &[fallback],
+                0,
+                Some(void),
+            );
+            let before = (store.type_len(), store.signature_len(), store.mapper_len());
+            let unsupported = Err(DirectCallError::Unsupported(
+                DirectCallUnsupported::RestSignature(fallback_callable.signature),
+            ));
+
+            assert_eq!(
+                get_parameter_count(store, None, &fallback_callable),
+                unsupported
+            );
+            if !missing_array {
+                assert_eq!(
+                    get_parameter_count(store, Some(&globals), &fallback_callable),
+                    unsupported
+                );
+                assert_eq!(
+                    (store.type_len(), store.signature_len(), store.mapper_len()),
+                    before
+                );
+                continue;
+            }
+            assert_eq!(
+                get_parameter_count(store, Some(&globals), &fallback_callable),
+                Ok(1)
+            );
+            assert_eq!(
+                has_effective_rest_parameter(store, Some(&globals), &fallback_callable),
+                Ok(true)
+            );
+            assert_eq!(
+                get_min_argument_count(
+                    store,
+                    Some(&globals),
+                    &fallback_callable,
+                    MinArgumentCountFlags::NONE,
+                ),
+                Ok(0)
+            );
+            for index in [0, 4] {
+                assert_eq!(
+                    try_get_type_at_position(store, Some(&globals), &fallback_callable, index),
+                    Ok(Some(unknown))
+                );
+            }
+            let shape = callable_rest_shape(store, Some(globals.array_targets), &fallback_callable)
+                .unwrap();
+            assert_eq!(
+                non_array_rest_target(store, Some(&globals), &fallback_callable, shape.as_ref()),
+                Ok(Some((0, fallback)))
+            );
+            assert_eq!(fallback_callable.rest_parameter, Some(fallback));
+            assert_eq!(
+                (store.type_len(), store.signature_len(), store.mapper_len()),
+                before
+            );
+
+            let ordinary = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+                .unwrap();
+            assert!(store.set_structured_type_members(ordinary, None, None, None, None, None));
+            let ordinary = callable(
+                store,
+                SignatureFlags::HAS_REST_PARAMETER,
+                &[ordinary],
+                0,
+                Some(void),
+            );
+            let before = (store.type_len(), store.signature_len(), store.mapper_len());
+            assert_eq!(
+                get_parameter_count(store, Some(&globals), &ordinary),
+                Err(DirectCallError::Unsupported(
+                    DirectCallUnsupported::RestSignature(ordinary.signature),
+                ))
+            );
+            assert_eq!(
+                (store.type_len(), store.signature_len(), store.mapper_len()),
+                before
+            );
+
+            assert!(store.set_object_target_and_mapper(fallback, Some(fallback), None));
+            let before = (store.type_len(), store.signature_len(), store.mapper_len());
+            assert_eq!(
+                get_parameter_count(store, Some(&globals), &fallback_callable),
+                Err(DirectCallError::Invariant(
+                    DirectCallInvariant::InvalidRestParameterType {
+                        signature: fallback_callable.signature,
+                        type_: fallback,
+                    },
+                ))
+            );
+            assert_eq!(
+                (store.type_len(), store.signature_len(), store.mapper_len()),
+                before
+            );
+        }
     }
 
     #[test]
