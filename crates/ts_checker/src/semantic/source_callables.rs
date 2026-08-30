@@ -12325,7 +12325,12 @@ pub(super) fn source_callable_display_projection(
             return Err(SourceCallableDisplayError::Malformed);
         }
         let mut parameters = Vec::with_capacity(signature.parameters().len());
-        for (parameter, value_type) in signature.parameters().iter().zip(expected_types) {
+        for (index, (parameter, value_type)) in signature
+            .parameters()
+            .iter()
+            .zip(expected_types)
+            .enumerate()
+        {
             let declaration = store
                 .symbol(*parameter)
                 .and_then(ts_binder::semantic::Symbol::value_declaration)
@@ -12346,11 +12351,25 @@ pub(super) fn source_callable_display_projection(
             let name_node = host
                 .node(name)
                 .ok_or(SourceCallableDisplayError::Malformed)?;
-            let NodeData::Identifier(identifier) = &name_node.data else {
-                return Err(SourceCallableDisplayError::Malformed);
+            let name = match &name_node.data {
+                NodeData::Identifier(identifier) => identifier.text.clone(),
+                NodeData::BindingPattern(_)
+                    if name_node.kind == SyntaxKind::ArrayBindingPattern
+                        && provenance.contextual_variable.is_none() =>
+                {
+                    contextual_sort_tuple_parameter_display_name(
+                        store,
+                        host,
+                        provenance.declaration,
+                        index,
+                        *parameter,
+                        *value_type,
+                    )?
+                }
+                _ => return Err(SourceCallableDisplayError::Malformed),
             };
             parameters.push(ValidatedSingleCallParameterDisplay {
-                name: identifier.text.clone(),
+                name,
                 value_type: *value_type,
                 annotation_type: None,
                 optional: parameter_data.question_token.is_some(),
@@ -12533,6 +12552,155 @@ pub(super) fn source_callable_display_projection(
         parameters,
         return_type,
     })
+}
+
+/// Reads tuple-binding names only after proving their published contextual types.
+#[allow(clippy::too_many_lines)] // Keep the source, binder, and tuple-position checks together.
+fn contextual_sort_tuple_parameter_display_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter_index: usize,
+    parameter_symbol: SemanticSymbolId,
+    value_type: TypeId,
+) -> Result<String, SourceCallableDisplayError> {
+    let invalid = || SourceCallableDisplayError::Malformed;
+    if !source_array_sort_argument_arrow_is_exact(store, host, declaration) {
+        return Err(invalid());
+    }
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let arrow_record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::ArrowFunction(arrow) = &arrow_record.data else {
+        return Err(invalid());
+    };
+    let parameter = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        *arrow
+            .parameters
+            .nodes
+            .get(parameter_index)
+            .ok_or_else(invalid)?,
+    );
+    let parameter_record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
+    let NodeData::ParameterDeclaration(syntax) = &parameter_record.data else {
+        return Err(invalid());
+    };
+    let parameter_owner = store.symbol(parameter_symbol).ok_or_else(invalid)?;
+    let name = NodeRef::new(parameter.arena, parameter.file, syntax.name);
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::BindingPattern(pattern) = &name_record.data else {
+        return Err(invalid());
+    };
+    let tuple = store
+        .canonical_tuple_shape(value_type)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .ok_or_else(invalid)?;
+    if arrow_record.kind != SyntaxKind::ArrowFunction
+        || arrow_record.flags.0 != 0
+        || arrow.parameters.nodes.len() != 2
+        || arrow.parameters.has_trailing_comma
+        || arrow.type_parameters.is_some()
+        || arrow.type_.is_some()
+        || arrow.modifiers.is_some()
+        || parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_record.range.start < arrow.parameters.range.start
+        || parameter_record.range.end > arrow.parameters.range.end
+        || syntax.dot_dot_dot_token.is_some()
+        || syntax.modifiers.is_some()
+        || syntax.question_token.is_some()
+        || syntax.type_.is_some()
+        || syntax.initializer.is_some()
+        || syntax.symbol.is_some()
+        || syntax.facts != 0
+        || bound.symbol(parameter) != Some(parameter_symbol)
+        || bound.local_symbol(parameter).is_some()
+        || bound.container(parameter) != Some(declaration)
+        || bound.block_scope_container(parameter) != Some(declaration)
+        || parameter_owner.name().as_utf8() != Some(format!("__{parameter_index}").as_str())
+        || !source_parameter_declarations_are_exact(store, declaration, parameter, parameter_symbol)
+        || name_record.kind != SyntaxKind::ArrayBindingPattern
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(parameter.node)
+        || name_record.range.start < parameter_record.range.start
+        || name_record.range.end > parameter_record.range.end
+        || pattern.elements.range != name_record.range
+        || bound.container(name) != Some(declaration)
+        || bound.block_scope_container(name) != Some(declaration)
+        || bound.symbol(name).is_some()
+        || bound.local_symbol(name).is_some()
+        || !super::source_calls::is_authenticated_sort_tuple_binding(arena, name.node, pattern)
+        || pattern.elements.nodes.len() != tuple.element_types().len()
+    {
+        return Err(invalid());
+    }
+
+    let mut display = String::from("[");
+    for (index, (element, expected)) in pattern
+        .elements
+        .nodes
+        .iter()
+        .zip(tuple.element_types())
+        .enumerate()
+    {
+        let element = NodeRef::new(name.arena, name.file, *element);
+        let element_record = preflight_node(store, host, element).map_err(|_| invalid())?;
+        let NodeData::BindingElement(binding) = &element_record.data else {
+            return Err(invalid());
+        };
+        let binding_name = NodeRef::new(
+            element.arena,
+            element.file,
+            binding.name.ok_or_else(invalid)?,
+        );
+        let binding_record = preflight_node(store, host, binding_name).map_err(|_| invalid())?;
+        let NodeData::Identifier(identifier) = &binding_record.data else {
+            return Err(invalid());
+        };
+        let symbol = bound.symbol(element).ok_or_else(invalid)?;
+        let symbol_record = store.symbol(symbol).ok_or_else(invalid)?;
+        if element_record.range.start < name_record.range.start
+            || element_record.range.end > name_record.range.end
+            || binding_record.range.start < element_record.range.start
+            || binding_record.range.end > element_record.range.end
+            || bound.container(element) != Some(declaration)
+            || bound.block_scope_container(element) != Some(declaration)
+            || bound.local_symbol(element).is_some()
+            || bound.container(binding_name) != Some(declaration)
+            || bound.block_scope_container(binding_name) != Some(declaration)
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || !store.source_symbol_declarations_match(symbol)
+            || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.declarations() != Some(&[element])
+            || symbol_record.value_declaration() != Some(element)
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent().is_some()
+            || symbol_record.export_symbol().is_some()
+            || locals.get_source(&identifier.text) != Some(symbol)
+            || store.value_symbol_links(symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*expected),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(invalid());
+        }
+        if index != 0 {
+            display.push_str(", ");
+        }
+        display.push_str(&identifier.text);
+    }
+    display.push(']');
+    Ok(display)
 }
 
 fn source_object_binding_property_display(
