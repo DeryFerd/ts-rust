@@ -1490,8 +1490,8 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalModuleResolutionEntry,
         CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
         CanonicalResolvedModuleInput, CanonicalUnionPropertyError, IntrinsicBootstrapOptions,
-        ObjectFlags, RelationStateSnapshot, SymbolNodeLinks, TypeData, TypeDisplayUnavailable,
-        TypeId, TypeNodeLinks, ValueSymbolLinks,
+        RelationStateSnapshot, SymbolNodeLinks, TypeData, TypeDisplayUnavailable, TypeId,
+        TypeNodeLinks, ValueSymbolLinks, types::ObjectFlags,
     };
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
