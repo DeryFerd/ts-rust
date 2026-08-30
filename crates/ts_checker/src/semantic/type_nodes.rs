@@ -1069,7 +1069,11 @@ impl TypeQueryPlan {
                                     .ok_or_else(&invalid)?;
                                 arguments.push(substituted);
                             }
-                            if matches!(
+                            if validate_conditional_reference_result(store, node, value)
+                                .map_err(|_| invalid())?
+                            {
+                                // The retained conditional request proves this exact result.
+                            } else if matches!(
                                 store.type_payload(declared).map(TypeRecord::data),
                                 Some(TypeData::Mapped(_))
                             ) {
@@ -57486,6 +57490,689 @@ mod tests {
             );
             assert!(query.diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep lazy publication, default arguments, and both real query orders together.
+    fn source_callable_conditional_alias_replay_keeps_cold_and_warm_source_identity() {
+        for node_first in [false, true] {
+            let mut fixture = fixture(concat!(
+                "interface Box<Element> {} ",
+                "type Capture<Source, Fallback = never> = ",
+                "Source extends Box<infer Item> ? Item : Fallback; ",
+                "declare function inspect<Input>(value: Input): Capture<Input>;",
+            ));
+            let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "inspect");
+            let owner = node_symbol(&fixture, declaration);
+            let capture = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Capture");
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let reference = callable.return_type.type_node().unwrap();
+            assert!(callable.requires_type_query_evidence());
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_session_for_test(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let before = (
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                query.store.conditional_production_lengths(),
+            );
+            let plan = query.plan_source_callable_type_inputs(&callable).unwrap();
+            assert_eq!(plan.references[&reference].symbol, capture);
+            assert_eq!(plan.references[&reference].alias_owner, None);
+            assert_eq!(plan.aliases[&capture].type_parameters.len(), 2);
+            assert_eq!(plan.references[&reference].type_arguments.len(), 1);
+            assert_eq!(
+                plan.cached_source_callable_type(query.store, &callable, &[], reference),
+                Ok(None)
+            );
+            assert_eq!(
+                (
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap()
+                    ),
+                    query.store.conditional_production_lengths(),
+                ),
+                before
+            );
+
+            let type_ = query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = function_signature(query.store, declaration);
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            assert_eq!(evidence.annotation_type(reference), None);
+            assert!(evidence.is_exact(query.store));
+            assert_eq!(query.store.type_node_links(reference), None);
+            let input = query.store.signature(signature).unwrap().type_parameters()[0];
+            let first = node_first.then(|| query.get_type_from_type_node(reference).unwrap());
+            assert_eq!(
+                query
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                None
+            );
+            assert_eq!(
+                query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .annotation_type(reference),
+                None
+            );
+            let returned = query.get_return_type_of_signature(signature).unwrap();
+            assert!(first.is_none_or(|first| first == returned));
+            let never = query.store.intrinsic_bootstrap().unwrap().never_type;
+            let expected_arguments = [input, never];
+            assert_eq!(
+                conditional_alias_projection(query.store, returned),
+                Ok(Some(ConditionalAliasIdentity {
+                    symbol: capture,
+                    type_arguments: &expected_arguments,
+                }))
+            );
+            assert_eq!(
+                validate_conditional_reference_result(query.store, reference, returned),
+                Ok(true)
+            );
+            let links = query.store.type_alias_links(capture).unwrap();
+            let declared = links.declared_type.unwrap();
+            let alias_parameters = links.type_parameters.clone().unwrap();
+            assert_eq!(alias_parameters.len(), 2);
+            assert_ne!(declared, returned);
+            assert_eq!(
+                links
+                    .instantiations
+                    .as_ref()
+                    .unwrap()
+                    .get(&alias_instantiation_key(&[input], None)),
+                Some(&returned)
+            );
+            let TypeData::Conditional(conditional) =
+                query.store.type_payload(returned).unwrap().data()
+            else {
+                panic!("the source query must retain the deferred conditional result")
+            };
+            assert_eq!(conditional.check_type, input);
+            assert!(conditional.mapper.is_some());
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.is_exact(query.store));
+            assert_eq!(evidence.annotation_type(reference), Some(returned));
+            let parameters = evidence.type_parameters().to_vec();
+            let results = evidence.annotation_results.clone();
+            assert!(matches!(
+                super::super::instantiate::cached_instantiation_with_vector(
+                    query.store, declared, &alias_parameters, &expected_arguments, None, None,
+                ),
+                Err(super::super::instantiate::InstantiationError::UnsupportedType(type_)) if type_ == declared
+            ));
+            let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    query.store,
+                    input,
+                    &[input],
+                    &[number],
+                    None,
+                    query.instantiation_session.as_deref_mut().unwrap(),
+                ),
+                Ok(number)
+            );
+            assert!(
+                query
+                    .instantiation_session
+                    .as_deref()
+                    .unwrap()
+                    .query_count()
+                    > 0
+            );
+            let warm = (
+                source_callable_infer_replay_state(
+                    query.store,
+                    query.instantiation_session.as_deref().unwrap(),
+                ),
+                query.store.conditional_production_lengths(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    plan.cached_source_callable_type(
+                        query.store,
+                        &callable,
+                        &parameters,
+                        reference
+                    ),
+                    Ok(Some(returned))
+                );
+                let mut replay = results.clone();
+                query
+                    .capture_source_callable_query_results(
+                        &callable,
+                        &plan,
+                        &parameters,
+                        &mut replay,
+                    )
+                    .unwrap();
+                assert_eq!(replay, results);
+                assert_eq!(
+                    query.get_type_of_source_callable(declaration, owner),
+                    Ok(type_)
+                );
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(
+                    (
+                        source_callable_infer_replay_state(
+                            query.store,
+                            query.instantiation_session.as_deref().unwrap()
+                        ),
+                        query.store.conditional_production_lengths(),
+                    ),
+                    warm
+                );
+            }
+            assert!(query.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each real result and request cache is restored before the same source query.
+    fn source_callable_conditional_alias_replay_rejects_and_restores_damaged_identity() {
+        for damage in [
+            "mapper",
+            "alias arguments",
+            "alias identity",
+            "root cache",
+            "request result",
+            "request key",
+        ] {
+            let mut fixture = fixture(concat!(
+                "interface Box<Element> {} ",
+                "type Capture<Source, Fallback = never> = ",
+                "Source extends Box<infer Item> ? Item : Fallback; ",
+                "declare function inspect<Input>(value: Input): Capture<Input>;",
+            ));
+            let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "inspect");
+            let owner = node_symbol(&fixture, declaration);
+            let capture = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Capture");
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let callable = source_callables::plan_source_callable(
+                &fixture.store,
+                &host,
+                declaration,
+                owner,
+                None,
+            )
+            .unwrap();
+            let reference = callable.return_type.type_node().unwrap();
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mut query = CanonicalTypeQuery::new_with_session_for_test(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            let type_ = query
+                .get_type_of_source_callable(declaration, owner)
+                .unwrap();
+            let signature = function_signature(query.store, declaration);
+            let returned = query.get_return_type_of_signature(signature).unwrap();
+            let evidence = query.store.source_callable_type_query(signature).unwrap();
+            assert!(evidence.is_exact(query.store));
+            let parameters = evidence.type_parameters().to_vec();
+            let results = evidence.annotation_results.clone();
+            let input = query.store.signature(signature).unwrap().type_parameters()[0];
+            let plan = query.plan_source_callable_type_inputs(&callable).unwrap();
+            let links = query.store.type_alias_links(capture).unwrap().clone();
+            let declared = links.declared_type.unwrap();
+            let request_key = alias_instantiation_key(&[input], None);
+            assert_eq!(
+                links.instantiations.as_ref().unwrap().get(&request_key),
+                Some(&returned)
+            );
+            let TypeData::Conditional(conditional) =
+                query.store.type_payload(returned).unwrap().data()
+            else {
+                panic!("the source return must retain its conditional result")
+            };
+            let conditional = conditional.clone();
+            assert!(conditional.mapper.is_some());
+            let root_cache = query
+                .store
+                .conditional_root(conditional.root)
+                .unwrap()
+                .instantiations()
+                .clone();
+            let identity = query.store.type_payload(returned).unwrap().alias().unwrap();
+            assert_ne!(
+                Some(identity),
+                query
+                    .store
+                    .conditional_root(conditional.root)
+                    .unwrap()
+                    .alias()
+            );
+            let identity_arguments = query
+                .store
+                .type_alias(identity)
+                .unwrap()
+                .type_arguments()
+                .unwrap()
+                .to_vec();
+            let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+            let proof_key =
+                super::super::conditional_types::ConditionalQueryKey::AliasReference(reference);
+            assert!(
+                query
+                    .store
+                    .conditional_query_production(proof_key)
+                    .is_some()
+            );
+            let snapshot = |store: &CanonicalTypeMapperStore, session: &InstantiationSession| {
+                let record = store.type_payload(returned).unwrap();
+                let TypeData::Conditional(data) = record.data() else {
+                    unreachable!()
+                };
+                let alias = store.type_alias(identity).unwrap();
+                (
+                    source_callable_infer_replay_state(store, session),
+                    store.conditional_production_lengths(),
+                    store.type_alias_links(capture).cloned(),
+                    store
+                        .conditional_root(conditional.root)
+                        .unwrap()
+                        .instantiations()
+                        .clone(),
+                    store.conditional_query_production(proof_key).cloned(),
+                    (
+                        store.type_node_links(reference).cloned(),
+                        store.symbol_node_links(reference).cloned(),
+                    ),
+                    (data.clone(), record.alias()),
+                    (
+                        alias.symbol(),
+                        alias.type_arguments().map(<[TypeId]>::to_vec),
+                    ),
+                )
+            };
+            let warm = snapshot(query.store, query.instantiation_session.as_deref().unwrap());
+            match damage {
+                "mapper" => assert!(query.store.set_conditional_resolution(
+                    returned,
+                    conditional.resolved_true_type,
+                    conditional.resolved_false_type,
+                    conditional.resolved_inferred_true_type,
+                    conditional.resolved_default_constraint,
+                    conditional.resolved_constraint_of_distributive,
+                    None,
+                    conditional.combined_mapper,
+                )),
+                "alias arguments" => {
+                    let mut changed = identity_arguments.clone();
+                    changed[0] = number;
+                    assert!(
+                        query
+                            .store
+                            .set_type_alias_arguments(identity, Some(changed))
+                    );
+                }
+                "alias identity" => assert!(query.store.set_type_alias(returned, None)),
+                "root cache" => {
+                    let TypeCacheState::Allocated(mut changed) = root_cache.clone() else {
+                        unreachable!()
+                    };
+                    assert!(changed.values().any(|value| *value == returned));
+                    changed.retain(|_, value| *value != returned);
+                    assert!(query.store.set_conditional_root_instantiations(
+                        conditional.root,
+                        TypeCacheState::Allocated(changed)
+                    ));
+                }
+                "request result" | "request key" => {
+                    let mut changed = links.clone();
+                    let entries = changed.instantiations.as_mut().unwrap();
+                    if damage == "request result" {
+                        assert_eq!(entries.insert(request_key, declared), Some(returned));
+                    } else {
+                        assert_eq!(entries.remove(&request_key), Some(returned));
+                    }
+                    assert!(query.store.set_type_alias_links(capture, changed));
+                }
+                _ => unreachable!(),
+            }
+            let damaged = snapshot(query.store, query.instantiation_session.as_deref().unwrap());
+            let expected =
+                type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(reference));
+            for _ in 0..2 {
+                assert_eq!(
+                    plan.cached_source_callable_type(
+                        query.store,
+                        &callable,
+                        &parameters,
+                        reference
+                    ),
+                    Err(expected),
+                    "{damage}"
+                );
+                let mut replay = results.clone();
+                assert_eq!(
+                    query.capture_source_callable_query_results(
+                        &callable,
+                        &plan,
+                        &parameters,
+                        &mut replay,
+                    ),
+                    Err(expected),
+                    "{damage}"
+                );
+                assert!(
+                    !query
+                        .store
+                        .source_callable_type_query(signature)
+                        .unwrap()
+                        .is_exact(query.store)
+                );
+                assert_eq!(
+                    query
+                        .store
+                        .signature(signature)
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(returned)
+                );
+                assert_eq!(
+                    snapshot(query.store, query.instantiation_session.as_deref().unwrap()),
+                    damaged
+                );
+            }
+            match damage {
+                "mapper" => assert!(query.store.set_conditional_resolution(
+                    returned,
+                    conditional.resolved_true_type,
+                    conditional.resolved_false_type,
+                    conditional.resolved_inferred_true_type,
+                    conditional.resolved_default_constraint,
+                    conditional.resolved_constraint_of_distributive,
+                    conditional.mapper,
+                    conditional.combined_mapper,
+                )),
+                "alias arguments" => assert!(
+                    query
+                        .store
+                        .set_type_alias_arguments(identity, Some(identity_arguments))
+                ),
+                "alias identity" => assert!(query.store.set_type_alias(returned, Some(identity))),
+                "root cache" => assert!(
+                    query
+                        .store
+                        .set_conditional_root_instantiations(conditional.root, root_cache)
+                ),
+                "request result" | "request key" => {
+                    assert!(query.store.set_type_alias_links(capture, links))
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                snapshot(query.store, query.instantiation_session.as_deref().unwrap()),
+                warm
+            );
+            let mut replay = results.clone();
+            query
+                .capture_source_callable_query_results(&callable, &plan, &parameters, &mut replay)
+                .unwrap();
+            assert_eq!(replay, results);
+            assert!(
+                query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(query.store)
+            );
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(type_)
+            );
+            assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+            assert_eq!(
+                snapshot(query.store, query.instantiation_session.as_deref().unwrap()),
+                warm
+            );
+            assert!(query.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // A valid parameter result cannot replace the return node's own source request.
+    fn source_callable_conditional_alias_replay_rejects_a_result_without_its_source_request() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Element> {} ",
+            "type Capture<Source, Fallback = never> = ",
+            "Source extends Box<infer Item> ? Item : Fallback; ",
+            "declare function inspect<Input>(value: Capture<Input>): Capture<Input>;",
+        ));
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "inspect");
+        let owner = node_symbol(&fixture, declaration);
+        let capture = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Capture");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let callable =
+            source_callables::plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .unwrap();
+        let reference = callable.return_type.type_node().unwrap();
+        let parameter = callable.parameters[0].explicit_type_node().unwrap();
+        let argument = type_reference_argument_node(&fixture, reference, 0);
+        assert_ne!(reference, parameter);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let type_ = query
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+        let signature = function_signature(query.store, declaration);
+        let evidence = query.store.source_callable_type_query(signature).unwrap();
+        let parameter_type = evidence.annotation_type(parameter).unwrap();
+        assert_eq!(evidence.annotation_type(reference), None);
+        assert!(evidence.is_exact(query.store));
+        let parameters = evidence.type_parameters().to_vec();
+        let results = evidence.annotation_results.clone();
+        let plan = query.plan_source_callable_type_inputs(&callable).unwrap();
+        let input = query.get_type_from_type_node(argument).unwrap();
+        assert_eq!(
+            input,
+            query.store.signature(signature).unwrap().type_parameters()[0]
+        );
+        assert_eq!(plan.references[&reference].type_arguments, [argument]);
+        assert_eq!(
+            plan.cached_source_callable_type(query.store, &callable, &parameters, argument),
+            Ok(Some(input))
+        );
+        assert_eq!(
+            query
+                .store
+                .type_alias_links(capture)
+                .unwrap()
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&alias_instantiation_key(&[input], None)),
+            Some(&parameter_type)
+        );
+        assert_eq!(
+            validate_conditional_reference_result(query.store, parameter, parameter_type),
+            Ok(true)
+        );
+        assert_eq!(
+            validate_conditional_reference_result(query.store, reference, parameter_type),
+            Ok(false)
+        );
+        assert!(conditional_alias_projection(query.store, parameter_type).is_ok());
+        assert_eq!(query.store.type_node_links(reference), None);
+        assert_eq!(query.store.symbol_node_links(reference), None);
+
+        // Copy only the visible cache pair. No source request is published.
+        assert!(query.store.set_type_node_links(
+            reference,
+            TypeNodeLinks {
+                resolved_type: Some(parameter_type),
+                outer_type_parameters: None,
+            }
+        ));
+        assert!(query.store.set_symbol_node_links(
+            reference,
+            SymbolNodeLinks {
+                resolved_symbol: Some(capture),
+            }
+        ));
+        let poisoned = (
+            source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            ),
+            query.store.conditional_production_lengths(),
+            query.store.type_node_links(reference).cloned(),
+            query.store.symbol_node_links(reference).cloned(),
+        );
+        let expected = type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(reference));
+        for _ in 0..2 {
+            assert_eq!(
+                plan.cached_source_callable_type(query.store, &callable, &parameters, reference),
+                Err(expected)
+            );
+            let mut replay = results.clone();
+            assert_eq!(
+                query.capture_source_callable_query_results(
+                    &callable,
+                    &plan,
+                    &parameters,
+                    &mut replay,
+                ),
+                Err(expected)
+            );
+            assert_eq!(
+                validate_conditional_reference_result(query.store, reference, parameter_type),
+                Ok(false)
+            );
+            assert_eq!(
+                query
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                None
+            );
+            assert_eq!(
+                query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .annotation_type(reference),
+                None
+            );
+            assert_eq!(
+                (
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap()
+                    ),
+                    query.store.conditional_production_lengths(),
+                    query.store.type_node_links(reference).cloned(),
+                    query.store.symbol_node_links(reference).cloned(),
+                ),
+                poisoned
+            );
+        }
+        assert!(
+            query
+                .store
+                .set_type_node_links(reference, TypeNodeLinks::default())
+        );
+        assert!(
+            query
+                .store
+                .set_symbol_node_links(reference, SymbolNodeLinks::default())
+        );
+        assert_eq!(
+            plan.cached_source_callable_type(query.store, &callable, &parameters, reference),
+            Ok(None)
+        );
+        assert!(
+            query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(query.store)
+        );
+        assert_eq!(
+            query.get_return_type_of_signature(signature),
+            Ok(parameter_type)
+        );
+        assert_eq!(
+            validate_conditional_reference_result(query.store, reference, parameter_type),
+            Ok(true)
+        );
+        let warm = (
+            source_callable_infer_replay_state(
+                query.store,
+                query.instantiation_session.as_deref().unwrap(),
+            ),
+            query.store.conditional_production_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                query.get_type_of_source_callable(declaration, owner),
+                Ok(type_)
+            );
+            assert_eq!(
+                query.get_return_type_of_signature(signature),
+                Ok(parameter_type)
+            );
+            assert_eq!(
+                (
+                    source_callable_infer_replay_state(
+                        query.store,
+                        query.instantiation_session.as_deref().unwrap()
+                    ),
+                    query.store.conditional_production_lengths(),
+                ),
+                warm
+            );
+        }
+        assert!(query.diagnostics.is_empty());
     }
 
     #[test]
