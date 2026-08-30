@@ -278,8 +278,8 @@ fn captured_filter_keeps_the_generic_receiver_and_outer_observer() {
         context.diagnostics()
     );
     let observers_node = variable(&parsed, "_observers");
-    let observers_symbol = symbol(&context, observers_node);
-    let array_type = value_type(&context, observers_symbol);
+    let collection_symbol = symbol(&context, observers_node);
+    let array_type = value_type(&context, collection_symbol);
     let TypeData::TypeReference(array) = context.store().type_payload(array_type).unwrap().data()
     else {
         panic!("the captured local must keep its declared Array reference")
@@ -500,8 +500,8 @@ fn captured_filter_keeps_the_generic_receiver_and_outer_observer() {
     let locations = [
         (callback_read, observer_type, Some(parameter_symbol)),
         (captured_read, observer_type, Some(observer_symbol)),
-        (receiver, array_type, Some(observers_symbol)),
-        (assignment_target, array_type, Some(observers_symbol)),
+        (receiver, array_type, Some(collection_symbol)),
+        (assignment_target, array_type, Some(collection_symbol)),
         (callee, cached_type(&context, callee), Some(method)),
         (callback, callback_type, None),
         (comparison, boolean, None),

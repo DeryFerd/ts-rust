@@ -14,7 +14,7 @@ use std::{collections::HashSet, sync::Arc};
 use ts_ast::{ModifierList, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolver, CanonicalResolutionLocation, CanonicalSourceFileFacts, CheckFlags,
-    InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
 };
 
 use super::{
@@ -46,6 +46,7 @@ use super::{
     },
     reference_types::validate_direct_generic_reference,
     signatures::{ElementFlags, IndexFlags, Signature, SignatureFlags, TypePredicateKind},
+    source_flow::SourceCapturedLocal,
     store::{
         PreparedSourceGenericCallablePublication, ResolvedSourceCallableTypeParameter,
         SemanticStore, SourceCallableInferredReturnCycle, SourceCallableProvenance,
@@ -792,9 +793,14 @@ pub(super) struct SourceCallablePlan {
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+    captured_assignment: Option<SourceCapturedLocal>,
 }
 
 impl SourceCallablePlan {
+    pub(super) const fn captured_assignment(&self) -> Option<SourceCapturedLocal> {
+        self.captured_assignment
+    }
+
     pub(super) fn requires_type_query_evidence(&self) -> bool {
         !self.type_parameters.is_empty()
             && self.return_type.type_node().is_some()
@@ -1034,6 +1040,7 @@ pub(super) struct PreparedContextualSourceCallable {
 pub(super) struct PreparedContextualDirectCallSourceCallable {
     pub(super) declaration: NodeRef,
     pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) captured_assignment: Option<SourceCapturedLocal>,
     pub(super) contextual_target: TypeId,
     pub(super) parameters: Vec<ContextualSourceCallableParameter>,
     pub(super) flags: SignatureFlags,
@@ -1046,6 +1053,7 @@ struct PreparedContextualSourceCallableView<'a> {
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
     variable_symbol: Option<SemanticSymbolId>,
+    captured_assignment: Option<SourceCapturedLocal>,
     contextual_target: TypeId,
     parameters: &'a [ContextualSourceCallableParameter],
     flags: SignatureFlags,
@@ -3123,6 +3131,11 @@ fn plan_source_callable_with_owner_shape(
             || array_sort_argument_arrow
             || prototype_assignment_function
             || source_direct_call_arrow_has_zero_parameter_target(store, host, declaration)?);
+    let captured_assignment = if direct_call_argument_arrow {
+        plan_source_captured_assignment_callback(store, host, declaration)?
+    } else {
+        None
+    };
     let javascript_object_implicit_any_arrow = eligible_implicit_any_arrow
         && object_property_arrow
         && bound
@@ -3776,6 +3789,7 @@ fn plan_source_callable_with_owner_shape(
         flags,
         min_argument_count,
         array_targets,
+        captured_assignment,
     };
     if javascript_direct_implicit_any_arrow
         || view.family == SourceCallableFamily::ArrowFunction
@@ -4238,7 +4252,7 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                     == Some(SourceNodeParent::Parent(bound.source_file()))
         }
         NodeData::BinaryExpression(_) => {
-            source_captured_assignment_callback_is_exact(store, host, call, callee, container)?
+            plan_source_captured_assignment_callback(store, host, declaration)?.is_some()
         }
         _ => false,
     };
@@ -4262,20 +4276,35 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
 
 /// Keeps an Array callback inside the existing captured-local assignment proof.
 #[allow(clippy::too_many_lines)] // The assignment, captured receiver, and library member share one owner check.
-fn source_captured_assignment_callback_is_exact(
+fn plan_source_captured_assignment_callback(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
-    call: NodeRef,
-    callee: NodeRef,
-    assignment: NodeRef,
-) -> Result<bool, SourceCallableError> {
+    declaration: NodeRef,
+) -> Result<Option<SourceCapturedLocal>, SourceCallableError> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
+        return Ok(None);
+    }
+    let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
+        return Ok(None);
+    };
+    let call_record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return Ok(None);
+    };
+    if call_record.kind != SyntaxKind::CallExpression {
+        return Ok(None);
+    }
+    let callee = NodeRef::new(call.arena, call.file, call_data.expression);
+    let Some(SourceNodeParent::Parent(assignment)) = store.source_node_parent(call) else {
+        return Ok(None);
+    };
     let assignment_record = preflight_node(store, host, assignment)?;
     let NodeData::BinaryExpression(binary) = &assignment_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let callee_record = preflight_node(store, host, callee)?;
     let NodeData::PropertyAccessExpression(access) = &callee_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let target = NodeRef::new(assignment.arena, assignment.file, binary.left);
     let operator = NodeRef::new(assignment.arena, assignment.file, binary.operator_token);
@@ -4286,7 +4315,7 @@ fn source_captured_assignment_callback_is_exact(
     let (NodeData::Identifier(target_name), NodeData::Identifier(receiver_name)) =
         (&target_record.data, &receiver_record.data)
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if assignment_record.kind != SyntaxKind::BinaryExpression
         || assignment_record.flags.0 != 0
@@ -4307,28 +4336,28 @@ fn source_captured_assignment_callback_is_exact(
         || receiver_record.flags.0 != 0
         || receiver_name.flow_node.is_some()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
-        return Ok(false);
+        return Ok(None);
     };
     let statement_record = preflight_node(store, host, statement)?;
     let NodeData::ExpressionStatement(expression) = &statement_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(SourceNodeParent::Parent(body)) = store.source_node_parent(statement) else {
-        return Ok(false);
+        return Ok(None);
     };
     let body_record = preflight_node(store, host, body)?;
     let NodeData::Block(block) = &body_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(SourceNodeParent::Parent(writer)) = store.source_node_parent(body) else {
-        return Ok(false);
+        return Ok(None);
     };
     let writer_record = preflight_node(store, host, writer)?;
     let NodeData::ArrowFunction(arrow) = &writer_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let (arena, bound) = host
         .source(call)
@@ -4359,7 +4388,7 @@ fn source_captured_assignment_callback_is_exact(
         || bound.container(receiver) != Some(writer)
         || bound.flow_container(receiver) != Some(writer)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let mut callback_host = host.name_resolver_host(store)?;
     let mut resolver =
@@ -4376,7 +4405,7 @@ fn source_captured_assignment_callback_is_exact(
         )
         .map_err(DeclaredTypeError::from)?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if resolver
         .resolve(
@@ -4390,7 +4419,7 @@ fn source_captured_assignment_callback_is_exact(
         .map_err(DeclaredTypeError::from)?
         != Some(symbol)
     {
-        return Ok(false);
+        return Ok(None);
     }
     for node in [target, receiver] {
         if store
@@ -4400,27 +4429,27 @@ fn source_captured_assignment_callback_is_exact(
             return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node)));
         }
     }
-    if super::source_flow::plan_source_captured_local(store, host, writer, target, symbol)
-        .map_err(|_| invariant(SourceCallableInvariant::InvalidOwnerSymbol(target)))?
-        .is_none()
-    {
-        return Ok(false);
-    }
+    let Some(captured) =
+        super::source_flow::plan_source_captured_local(store, host, writer, target, symbol)
+            .map_err(|_| invariant(SourceCallableInvariant::InvalidOwnerSymbol(target)))?
+    else {
+        return Ok(None);
+    };
     let declaration = store
         .symbol(symbol)
         .and_then(ts_binder::semantic::Symbol::value_declaration)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(target)))?;
     let declaration_record = preflight_node(store, host, declaration)?;
     let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(annotation) = variable.type_ else {
-        return Ok(false);
+        return Ok(None);
     };
     let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
     let annotation_record = preflight_node(store, host, annotation)?;
     let NodeData::ArrayTypeNode(array) = &annotation_record.data else {
-        return Ok(false);
+        return Ok(None);
     };
     let element = NodeRef::new(annotation.arena, annotation.file, array.element_type);
     if annotation_record.kind != SyntaxKind::ArrayType
@@ -4428,11 +4457,11 @@ fn source_captured_assignment_callback_is_exact(
         || annotation_record.parent != Some(declaration.node)
         || preflight_node(store, host, element)?.parent != Some(annotation.node)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(name) = super::source_calls::source_global_array_callback_method_name(host, callee)
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(array) = store
         .intrinsic_bootstrap()
@@ -4440,7 +4469,7 @@ fn source_captured_assignment_callback_is_exact(
         .and_then(|globals| globals.get_source("Array"))
         .and_then(|array| store.get_merged_symbol(array))
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(method) = store
         .symbol(array)
@@ -4449,13 +4478,13 @@ fn source_captured_assignment_callback_is_exact(
         .and_then(|members| members.get_source(&name))
         .and_then(|method| store.get_merged_symbol(method))
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if store
         .authenticated_interface_method_owner(method)
         .is_none_or(|(owner, _)| owner != array)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let name = NodeRef::new(callee.arena, callee.file, access.name);
     for node in [callee, name] {
@@ -4466,7 +4495,7 @@ fn source_captured_assignment_callback_is_exact(
             return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node)));
         }
     }
-    Ok(true)
+    Ok(Some(captured))
 }
 
 /// Authenticates an anonymous function assigned to a real class prototype method.
@@ -5143,11 +5172,298 @@ pub(super) fn source_direct_call_arrow_has_zero_parameter_target(
         && target.modifiers.is_none())
 }
 
+/// Rechecks a source-proved capture without deriving lexical authority from caches.
+#[allow(clippy::too_many_lines)] // The opaque capture and its current source owners must agree before publication.
+pub(super) fn stored_captured_assignment_callback_is_exact<TypePayload, MapperPayload>(
+    store: &SemanticStore<TypePayload, MapperPayload>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    captured: SourceCapturedLocal,
+    globals: SymbolTableId,
+) -> bool {
+    let exact = || -> Option<()> {
+        let parent = |node| match store.source_node_parent(node) {
+            Some(SourceNodeParent::Parent(parent)) => Some(parent),
+            _ => None,
+        };
+        let bound_owner = |node| {
+            let [Some(owner), _] = store.symbol_store().source_binding_symbols(node)? else {
+                return None;
+            };
+            store.get_merged_symbol(owner)
+        };
+        let arrow_owner_is_current = |node, owner| {
+            store.source_node_kind(node) == Some(SyntaxKind::ArrowFunction)
+                && store.symbol_store().source_binding_symbols(node) == Some([Some(owner), None])
+                && store.source_symbol_declarations_match(owner)
+                && store.get_merged_symbol(owner) == Some(owner)
+                && store.symbol(owner).is_some_and(|symbol| {
+                    symbol.flags() == SymbolFlags::FUNCTION
+                        && symbol.check_flags() == CheckFlags::NONE
+                        && symbol.name() == InternalSymbolName::Function.as_ref()
+                        && symbol.declarations() == Some(&[node])
+                        && symbol.value_declaration() == Some(node)
+                        && symbol.members().is_none()
+                        && symbol.exports().is_none()
+                        && symbol.parent().is_none()
+                        && symbol.export_symbol().is_none()
+                })
+        };
+        if !arrow_owner_is_current(declaration, owner_symbol) {
+            return None;
+        }
+        let call = parent(declaration)?;
+        let call_children = store.source_direct_children(call)?;
+        let (&callee, arguments) = call_children.split_first()?;
+        let assignment = parent(call)?;
+        let assignment_children = store.source_direct_children(assignment)?;
+        let [target, operator, right] = assignment_children.as_slice() else {
+            return None;
+        };
+        let access_children = store.source_direct_children(callee)?;
+        let [receiver, method_name] = access_children.as_slice() else {
+            return None;
+        };
+        let statement = parent(assignment)?;
+        let body = parent(statement)?;
+        let writer = parent(body)?;
+        let writer_owner = bound_owner(writer)?;
+        if store.source_node_kind(call) != Some(SyntaxKind::CallExpression)
+            || arguments.first().copied() != Some(declaration)
+            || store.source_node_kind(callee) != Some(SyntaxKind::PropertyAccessExpression)
+            || store.source_node_kind(assignment) != Some(SyntaxKind::BinaryExpression)
+            || store.source_node_kind(*target) != Some(SyntaxKind::Identifier)
+            || store.source_node_kind(*operator) != Some(SyntaxKind::EqualsToken)
+            || *right != call
+            || *target != captured.target()
+            || store.source_node_kind(*receiver) != Some(SyntaxKind::Identifier)
+            || store.source_node_kind(*method_name) != Some(SyntaxKind::Identifier)
+            || store.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+            || store.source_direct_children(statement).as_deref() != Some(&[assignment])
+            || store.source_node_kind(body) != Some(SyntaxKind::Block)
+            || store.source_child_with_kind(writer, SyntaxKind::Block) != Some(body)
+            || writer != captured.writing_callable()
+            || writer == declaration
+            || !arrow_owner_is_current(writer, writer_owner)
+        {
+            return None;
+        }
+
+        let variable = captured.declaration();
+        let variable_owner = store.symbol(captured.symbol())?;
+        let variable_name = store.source_child_with_kind(variable, SyntaxKind::Identifier)?;
+        let name = store.source_identifier_text(variable_name)?;
+        let list = parent(variable)?;
+        let variable_statement = parent(list)?;
+        if store.source_node_kind(variable) != Some(SyntaxKind::VariableDeclaration)
+            || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+            || store.source_node_kind(variable_statement) != Some(SyntaxKind::VariableStatement)
+            || store.source_child_with_kind(variable_statement, SyntaxKind::VariableDeclarationList)
+                != Some(list)
+            || store.symbol_store().source_binding_symbols(variable)
+                != Some([Some(captured.symbol()), None])
+            || !store.source_symbol_declarations_match(captured.symbol())
+            || store.get_merged_symbol(captured.symbol()) != Some(captured.symbol())
+            || variable_owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || variable_owner.check_flags() != CheckFlags::NONE
+            || variable_owner.name().as_utf8() != Some(name)
+            || variable_owner.declarations() != Some(&[variable])
+            || variable_owner.value_declaration() != Some(variable)
+            || variable_owner.members().is_some()
+            || variable_owner.exports().is_some()
+            || variable_owner.parent().is_some()
+            || variable_owner.export_symbol().is_some()
+            || name.is_empty()
+            || store.source_identifier_text(*target) != Some(name)
+            || store.source_identifier_text(*receiver) != Some(name)
+            || store.source_child_with_kind(variable, SyntaxKind::ArrayType)
+                != Some(captured.annotation())
+            || store.source_node_start(variable)? >= store.source_node_start(writer)?
+        {
+            return None;
+        }
+        let annotation_children = store.source_direct_children(captured.annotation())?;
+        if annotation_children.len() != 1 {
+            return None;
+        }
+
+        let declaring = captured.declaring_callable();
+        let declaring_owner = bound_owner(declaring)?;
+        let declaring_record = store.symbol(declaring_owner)?;
+        if declaring == writer
+            || !store.source_merged_symbol_declarations_match(declaring_owner)
+            || !store.source_declaration_belongs_to_symbol(declaring, declaring_owner)
+            || declaring_record.check_flags() != CheckFlags::NONE
+            || declaring_record.members().is_some()
+            || declaring_record.export_symbol().is_some()
+        {
+            return None;
+        }
+        match store.source_node_kind(declaring)? {
+            SyntaxKind::ArrowFunction => {
+                if !arrow_owner_is_current(declaring, declaring_owner) {
+                    return None;
+                }
+            }
+            SyntaxKind::FunctionDeclaration => {
+                if !declaring_record.flags().contains(SymbolFlags::FUNCTION)
+                    || declaring_record.value_declaration() != Some(declaring)
+                {
+                    return None;
+                }
+                if let Some(owner_parent) = declaring_record.parent() {
+                    let mut namespace = parent(declaring)?;
+                    if store.source_node_kind(namespace) == Some(SyntaxKind::ModuleBlock) {
+                        namespace = parent(namespace)?;
+                    }
+                    if !matches!(
+                        store.source_node_kind(namespace),
+                        Some(SyntaxKind::SourceFile | SyntaxKind::ModuleDeclaration)
+                    ) || bound_owner(namespace) != Some(owner_parent)
+                        || store
+                            .symbol(owner_parent)?
+                            .exports()
+                            .and_then(|table| store.symbol_table(table))?
+                            .get(declaring_record.name())
+                            != Some(declaring_owner)
+                    {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        let enclosing_callable = |start| {
+            let mut node = parent(start)?;
+            let mut seen = HashSet::new();
+            while seen.insert(node) {
+                if matches!(
+                    store.source_node_kind(node)?,
+                    SyntaxKind::SourceFile
+                        | SyntaxKind::FunctionDeclaration
+                        | SyntaxKind::FunctionExpression
+                        | SyntaxKind::ArrowFunction
+                        | SyntaxKind::MethodDeclaration
+                        | SyntaxKind::Constructor
+                        | SyntaxKind::GetAccessor
+                        | SyntaxKind::SetAccessor
+                ) {
+                    return Some(node);
+                }
+                node = parent(node)?;
+            }
+            None
+        };
+        if enclosing_callable(variable) != Some(declaring) {
+            return None;
+        }
+        let mut ancestor = writer;
+        let mut seen = HashSet::new();
+        while ancestor != declaring {
+            if !seen.insert(ancestor) {
+                return None;
+            }
+            ancestor = parent(ancestor)?;
+        }
+
+        let mut stored_expression = writer;
+        let mut anchor = parent(stored_expression)?;
+        while store.source_node_kind(anchor) == Some(SyntaxKind::ParenthesizedExpression) {
+            if store.source_direct_children(anchor).as_deref() != Some(&[stored_expression]) {
+                return None;
+            }
+            stored_expression = anchor;
+            anchor = parent(anchor)?;
+        }
+        let anchor_owner = bound_owner(anchor)?;
+        let anchor_record = store.symbol(anchor_owner)?;
+        if !store.source_symbol_declarations_match(anchor_owner)
+            || anchor_record.declarations() != Some(&[anchor])
+            || anchor_record.value_declaration() != Some(anchor)
+            || anchor_owner == writer_owner
+        {
+            return None;
+        }
+        match store.source_node_kind(anchor)? {
+            SyntaxKind::PropertyAssignment if stored_expression == writer => {
+                if !store.source_contextual_callable_anchor_is_exact(
+                    writer,
+                    writer_owner,
+                    anchor_owner,
+                ) {
+                    return None;
+                }
+            }
+            SyntaxKind::VariableDeclaration => {
+                if !matches!(
+                    anchor_record.flags(),
+                    SymbolFlags::BLOCK_SCOPED_VARIABLE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                ) || anchor_record.check_flags() != CheckFlags::NONE
+                    || anchor_record.members().is_some()
+                    || anchor_record.exports().is_some()
+                    || anchor_record.parent().is_some()
+                    || anchor_record.export_symbol().is_some()
+                    || store.source_direct_children(anchor)?.last().copied()
+                        != Some(stored_expression)
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        let method_text = store.source_identifier_text(*method_name)?;
+        if !matches!(
+            method_text,
+            "map" | "filter" | "find" | "forEach" | "reduce"
+        ) {
+            return None;
+        }
+        let array = store.get_merged_symbol(store.symbol_table(globals)?.get_source("Array")?)?;
+        let method = store.get_merged_symbol(
+            store
+                .symbol_table(store.symbol(array)?.members()?)?
+                .get_source(method_text)?,
+        )?;
+        if store.authenticated_interface_method_owner(method)?.0 != array {
+            return None;
+        }
+        for (node, symbol) in [
+            (*target, captured.symbol()),
+            (*receiver, captured.symbol()),
+            (callee, method),
+            (*method_name, method),
+        ] {
+            if store
+                .symbol_node_links(node)
+                .is_some_and(|links| links.resolved_symbol.is_some_and(|actual| actual != symbol))
+            {
+                return None;
+            }
+        }
+        Some(())
+    };
+    exact().is_some()
+}
+
 fn stored_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     owner_symbol: SemanticSymbolId,
+    captured_assignment: Option<SourceCapturedLocal>,
 ) -> bool {
+    if let Some(captured) = captured_assignment {
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return false;
+        };
+        return stored_captured_assignment_callback_is_exact(
+            store,
+            declaration,
+            owner_symbol,
+            captured,
+            bootstrap.globals,
+        );
+    }
     let Some(owner) = store.symbol(owner_symbol) else {
         return false;
     };
@@ -9301,6 +9617,7 @@ pub(super) fn source_callable_state(
         generic_return_type_parameter,
         contextual_target: None,
         contextual_variable: None,
+        captured_assignment: None,
     };
     if record.flags() != TypeFlags::OBJECT
         || record.symbol() != Some(plan.owner_symbol)
@@ -10194,6 +10511,7 @@ pub(super) fn publish_contextual_source_callable(
             declaration: prepared.declaration,
             owner_symbol: prepared.owner_symbol,
             variable_symbol: Some(prepared.variable_symbol),
+            captured_assignment: None,
             contextual_target: prepared.contextual_target,
             parameters: &prepared.parameters,
             flags: prepared.flags,
@@ -10214,6 +10532,7 @@ pub(super) fn publish_contextual_direct_call_source_callable(
             declaration: prepared.declaration,
             owner_symbol: prepared.owner_symbol,
             variable_symbol: None,
+            captured_assignment: prepared.captured_assignment,
             contextual_target: prepared.contextual_target,
             parameters: &prepared.parameters,
             flags: prepared.flags,
@@ -10253,6 +10572,7 @@ fn publish_prepared_contextual_source_callable(
                 && provenance.export_local.is_none()
                 && provenance.contextual_target == Some(prepared.contextual_target)
                 && provenance.contextual_variable == prepared.variable_symbol
+                && provenance.captured_assignment == prepared.captured_assignment
         }) && signature.is_some_and(|signature| {
             signature.flags() == prepared.flags
                 && signature.parameters() == expected_symbols
@@ -10304,6 +10624,7 @@ fn publish_prepared_contextual_source_callable(
                 store,
                 prepared.declaration,
                 prepared.owner_symbol,
+                prepared.captured_assignment,
             )
         },
         |anchor| {
@@ -10464,6 +10785,7 @@ fn publish_prepared_contextual_source_callable(
             generic_return_type_parameter: None,
             contextual_target: Some(prepared.contextual_target),
             contextual_variable: prepared.variable_symbol,
+            captured_assignment: prepared.captured_assignment,
         },
     ));
     assert!(store.set_source_callable_inferred_return_type(signature, prepared.return_type));
@@ -10808,6 +11130,7 @@ pub(super) fn begin_source_callable(
             generic_return_type_parameter: None,
             contextual_target: None,
             contextual_variable: None,
+            captured_assignment: None,
         },
     );
     assert!(
@@ -12151,6 +12474,7 @@ pub(super) fn validate_stored_source_callable(
             generic_return_type_parameter: provenance.generic_return_type_parameter,
             contextual_target: provenance.contextual_target,
             contextual_variable: provenance.contextual_variable,
+            captured_assignment: provenance.captured_assignment,
         })
         || store.source_callable_type_for_owner(owner_symbol) != Some(type_)
         || store.source_callable_type_for_signature(provenance.signature) != Some(type_)
@@ -12212,18 +12536,24 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     }
     let contextual = match (provenance.contextual_target, provenance.contextual_variable) {
-        (None, None) => None,
+        (None, None) if provenance.captured_assignment.is_none() => None,
         (Some(target), Some(variable))
             if family == SourceCallableFamily::ArrowFunction
                 && target != type_
-                && variable != owner_symbol =>
+                && variable != owner_symbol
+                && provenance.captured_assignment.is_none() =>
         {
             Some((target, Some(variable)))
         }
         (Some(target), None)
             if family == SourceCallableFamily::ArrowFunction
                 && target != type_
-                && stored_direct_call_argument_arrow_is_exact(store, declaration, owner_symbol) =>
+                && stored_direct_call_argument_arrow_is_exact(
+                    store,
+                    declaration,
+                    owner_symbol,
+                    provenance.captured_assignment,
+                ) =>
         {
             Some((target, None))
         }
@@ -12485,7 +12815,14 @@ pub(super) fn validate_stored_source_callable(
     if let Some((target, variable)) = contextual {
         let direct_call_anchor = variable.is_none();
         let anchor_valid = variable.map_or_else(
-            || stored_direct_call_argument_arrow_is_exact(store, declaration, owner_symbol),
+            || {
+                stored_direct_call_argument_arrow_is_exact(
+                    store,
+                    declaration,
+                    owner_symbol,
+                    provenance.captured_assignment,
+                )
+            },
             |anchor| {
                 store.source_contextual_callable_anchor_is_exact(declaration, owner_symbol, anchor)
             },
@@ -13994,6 +14331,7 @@ fn validated_source_callable_type_query(
                 generic_return_type_parameter: expected_return_parameter,
                 contextual_target: None,
                 contextual_variable: None,
+                captured_assignment: None,
             })
     {
         return None;
@@ -19917,6 +20255,7 @@ mod tests {
                         generic_return_type_parameter: staged.generic_return_type_parameter,
                         contextual_target: None,
                         contextual_variable: None,
+                        captured_assignment: None,
                     }),
                 ),
             None
@@ -21342,6 +21681,60 @@ mod tests {
         assert_eq!(plan.min_argument_count, 1);
         assert!(plan.return_type.is_inferred());
         assert_eq!(plan.body.node, callback_data.body);
+        let captured = plan.captured_assignment().unwrap();
+        assert_eq!(captured.target(), target);
+        assert_eq!(captured.writing_callable(), writer);
+        assert_eq!(
+            bound.symbol(captured.declaration()),
+            Some(captured.symbol())
+        );
+        assert_ne!(captured.declaring_callable(), writer);
+        super::super::source_flow::validate_source_captured_local(
+            context.store(),
+            &host,
+            &captured,
+        )
+        .unwrap();
+        let wrong_origin = super::super::source_flow::plan_source_captured_local(
+            context.store(),
+            &host,
+            writer,
+            receiver,
+            captured.symbol(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wrong_origin.target(), receiver);
+        assert_eq!(wrong_origin.declaration(), captured.declaration());
+        assert_eq!(wrong_origin.annotation(), captured.annotation());
+        assert_eq!(wrong_origin.symbol(), captured.symbol());
+        assert_eq!(wrong_origin.writing_callable(), captured.writing_callable());
+        assert_eq!(
+            wrong_origin.declaring_callable(),
+            captured.declaring_callable()
+        );
+        assert_ne!(wrong_origin, captured);
+        assert!(stored_direct_call_argument_arrow_is_exact(
+            context.store(),
+            callback,
+            owner,
+            Some(captured),
+        ));
+        for origin in [None, Some(wrong_origin)] {
+            assert!(!stored_direct_call_argument_arrow_is_exact(
+                context.store(),
+                callback,
+                owner,
+                origin,
+            ));
+            assert_eq!(generic_transaction_state(context.store()), cold);
+        }
+        assert!(!stored_direct_call_argument_arrow_is_exact(
+            context.store(),
+            writer,
+            writer_owner,
+            Some(captured),
+        ));
         assert_eq!(generic_transaction_state(context.store()), cold);
         assert!(
             context
@@ -21380,6 +21773,12 @@ mod tests {
                     plan_source_callable(context.store(), &host, callback, owner, None),
                     Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(node))),
                 );
+                assert!(!stored_direct_call_argument_arrow_is_exact(
+                    context.store(),
+                    callback,
+                    owner,
+                    Some(captured),
+                ));
                 assert_eq!(generic_transaction_state(context.store()), poisoned);
             }
             assert!(
@@ -21409,6 +21808,12 @@ mod tests {
                 target
             ))),
         );
+        assert!(!stored_direct_call_argument_arrow_is_exact(
+            context.store(),
+            callback,
+            owner,
+            Some(captured),
+        ));
         assert_eq!(generic_transaction_state(context.store()), poisoned);
         assert!(context.store_mut_for_test().set_symbol_declarations(
             writer_owner,
@@ -21464,6 +21869,12 @@ mod tests {
                     SourceCallableUnsupported::MissingParameterType(parameter)
                 )),
             );
+            assert!(!stored_direct_call_argument_arrow_is_exact(
+                context.store(),
+                callback,
+                owner,
+                Some(captured),
+            ));
             assert_eq!(
                 context.store().symbol(method).unwrap().parent(),
                 Some(writer_owner)
@@ -21494,6 +21905,89 @@ mod tests {
             validate_stored_source_callable(context.store(), callable),
             StoredSourceCallableValidation::Valid(_)
         ));
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert_eq!(provenance.captured_assignment, Some(captured));
+        let signature = context.store().signature(provenance.signature).unwrap();
+        let prepared = PreparedContextualDirectCallSourceCallable {
+            declaration: callback,
+            owner_symbol: owner,
+            captured_assignment: Some(captured),
+            contextual_target: provenance.contextual_target.unwrap(),
+            parameters: vec![ContextualSourceCallableParameter {
+                declaration: parameter,
+                symbol: plan.parameters[0].symbol,
+                type_: context
+                    .store()
+                    .callable_signature_parameter_types(provenance.signature)
+                    .unwrap()[0],
+            }],
+            flags: signature.flags(),
+            min_argument_count: signature.min_argument_count(),
+            return_type: signature.resolved_return_type().unwrap(),
+        };
+        for origin in [None, Some(wrong_origin)] {
+            let damaged = PreparedContextualDirectCallSourceCallable {
+                captured_assignment: origin,
+                ..prepared.clone()
+            };
+            assert_eq!(
+                publish_contextual_direct_call_source_callable(
+                    context.store_mut_for_test(),
+                    &damaged,
+                ),
+                Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                    callback
+                ))),
+            );
+            assert_eq!(generic_transaction_state(context.store()), warm);
+            let damaged_provenance = SourceCallableProvenance {
+                captured_assignment: origin,
+                ..provenance
+            };
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .replace_source_callable_provenance_for_test(
+                        callable,
+                        Some(damaged_provenance),
+                    ),
+                Some(provenance),
+            );
+            let poisoned = generic_transaction_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_stored_source_callable(context.store(), callable),
+                    StoredSourceCallableValidation::Malformed,
+                );
+                assert_eq!(
+                    publish_contextual_direct_call_source_callable(
+                        context.store_mut_for_test(),
+                        &prepared,
+                    ),
+                    Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                        callback
+                    ))),
+                );
+                assert_eq!(generic_transaction_state(context.store()), poisoned);
+            }
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .replace_source_callable_provenance_for_test(callable, Some(provenance),),
+                Some(damaged_provenance),
+            );
+            assert_eq!(
+                publish_contextual_direct_call_source_callable(
+                    context.store_mut_for_test(),
+                    &prepared,
+                ),
+                Ok(callable),
+            );
+            assert_eq!(generic_transaction_state(context.store()), warm);
+        }
         for _ in 0..2 {
             assert_eq!(
                 plan_source_callable(context.store(), &host, callback, owner, None),
@@ -21514,6 +22008,16 @@ mod tests {
             Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
                 receiver
             )))
+        );
+        assert_eq!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Malformed,
+        );
+        assert_eq!(
+            publish_contextual_direct_call_source_callable(context.store_mut_for_test(), &prepared,),
+            Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                callback
+            ))),
         );
         assert_eq!(generic_transaction_state(context.store()), poisoned);
         assert!(
@@ -21703,6 +22207,7 @@ mod tests {
         let prepared = PreparedContextualDirectCallSourceCallable {
             declaration,
             owner_symbol: owner,
+            captured_assignment: None,
             contextual_target: target,
             parameters: vec![ContextualSourceCallableParameter {
                 declaration: parameter,
@@ -26411,6 +26916,7 @@ mod tests {
                 generic_return_type_parameter: None,
                 contextual_target: None,
                 contextual_variable: None,
+                captured_assignment: None,
             },
         ));
         assert_eq!(

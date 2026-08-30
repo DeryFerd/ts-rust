@@ -68,6 +68,7 @@ use super::{
         SourceCallableTypeParameterSyntaxProof, source_generic_index_map_syntax,
         source_type_parameter_default_is_assignable, valid_source_generic_index_map,
     },
+    source_flow::SourceCapturedLocal,
     source_imports::SourceFileNamespaceIdentity,
     source_meta::ImportMetaExpressionIdentity,
     source_namespaces::ModuleValueIdentity,
@@ -377,6 +378,8 @@ pub(super) struct SourceCallableProvenance {
     /// contextual anchor instead of a variable symbol.
     pub(super) contextual_target: Option<TypeId>,
     pub(super) contextual_variable: Option<SemanticSymbolId>,
+    /// Opaque captured-let authority from the source callable's exact plan.
+    pub(super) captured_assignment: Option<SourceCapturedLocal>,
 }
 
 /// Exact annotation and value edges for one source-overload parameter.
@@ -1910,10 +1913,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         provenance: SourceCallableProvenance,
     ) -> bool {
         let contextual_pair = match (provenance.contextual_target, provenance.contextual_variable) {
-            (None, None) => true,
+            (None, None) => provenance.captured_assignment.is_none(),
             (Some(target), Some(variable)) => {
                 provenance.family == SourceCallableFamily::ArrowFunction
                     && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                    && provenance.captured_assignment.is_none()
                     && target != type_
                     && self.types.get(target).is_some()
                     && self.source_contextual_callable_anchor_is_exact(
@@ -1932,12 +1936,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         provenance.owner_symbol,
                         provenance.signature,
                         target,
-                    ) || self.source_prototype_contextual_callable_is_exact(
-                        provenance.declaration,
-                        provenance.owner_symbol,
-                        provenance.signature,
-                        target,
-                    ))
+                        provenance.captured_assignment,
+                    ) || provenance.captured_assignment.is_none()
+                        && self.source_prototype_contextual_callable_is_exact(
+                            provenance.declaration,
+                            provenance.owner_symbol,
+                            provenance.signature,
+                            target,
+                        ))
             }
             _ => false,
         };
@@ -2405,6 +2411,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         owner_symbol: SemanticSymbolId,
         signature: SignatureId,
         contextual_target: TypeId,
+        captured_assignment: Option<SourceCapturedLocal>,
     ) -> bool {
         let Some(owner) = self.symbol(owner_symbol) else {
             return false;
@@ -2416,14 +2423,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         };
         let source = match self.source_node_kind(container) {
-            Some(SyntaxKind::ExpressionStatement) => {
+            Some(SyntaxKind::ExpressionStatement) if captured_assignment.is_none() => {
                 let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(container)
                 else {
                     return false;
                 };
                 source
             }
-            Some(SyntaxKind::VariableDeclaration) => {
+            Some(SyntaxKind::VariableDeclaration) if captured_assignment.is_none() => {
                 let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(container)
                 else {
                     return false;
@@ -2442,6 +2449,27 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     return false;
                 }
                 source
+            }
+            Some(SyntaxKind::BinaryExpression) => {
+                let Some(captured) = captured_assignment else {
+                    return false;
+                };
+                let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+                    return false;
+                };
+                if !super::source_callables::stored_captured_assignment_callback_is_exact(
+                    self,
+                    declaration,
+                    owner_symbol,
+                    captured,
+                    bootstrap.globals,
+                ) {
+                    return false;
+                }
+                let Some(source) = self.source_files.get(&declaration.file) else {
+                    return false;
+                };
+                source.node_ref()
             }
             _ => return false,
         };
@@ -10240,6 +10268,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             if provenance.family != SourceCallableFamily::ArrowFunction
                 || provenance.return_provenance != SourceCallableReturnProvenance::Inferred
                 || provenance.contextual_variable.is_some()
+                || provenance.captured_assignment.is_some()
                 || target == type_
                 || *argument != provenance.declaration
                 || !super::source_callables::stored_array_sort_argument_arrow_is_exact(
@@ -11519,6 +11548,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
             generic_return_type_parameter: prepared.generic_return_type_parameter,
             contextual_target: None,
             contextual_variable: None,
+            captured_assignment: None,
         };
         assert!(
             self.source_callable_provenance

@@ -197,12 +197,10 @@ impl SourceCapturedLocal {
         self.target
     }
 
-    #[cfg(test)]
     pub(super) const fn declaration(self) -> NodeRef {
         self.declaration
     }
 
-    #[cfg(test)]
     pub(super) const fn annotation(self) -> NodeRef {
         self.annotation
     }
@@ -211,12 +209,10 @@ impl SourceCapturedLocal {
         self.symbol
     }
 
-    #[cfg(test)]
     pub(super) const fn declaring_callable(self) -> NodeRef {
         self.declaring_callable
     }
 
-    #[cfg(test)]
     pub(super) const fn writing_callable(self) -> NodeRef {
         self.writing_callable
     }

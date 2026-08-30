@@ -35807,6 +35807,7 @@ fn check_contextual_direct_call_arrow(
         &PreparedContextualDirectCallSourceCallable {
             declaration: arrow.callable.declaration,
             owner_symbol: arrow.callable.owner_symbol,
+            captured_assignment: arrow.callable.captured_assignment(),
             contextual_target: contextual_type,
             parameters: prepared_parameters,
             flags: arrow.callable.flags,
