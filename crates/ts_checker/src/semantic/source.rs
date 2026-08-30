@@ -80,7 +80,7 @@
 use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
-use super::classes::plan_source_class_members;
+use super::classes::{plan_source_class_members, prepare_source_class_members};
 
 use ts_ast::{
     FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
@@ -121,7 +121,7 @@ use super::{
         plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
         plan_exported_static_member_name_grammar_diagnostics, plan_nongeneric_class_member_query,
         plan_nongeneric_class_member_query_with_type_context,
-        preflight_nongeneric_class_member_query, prepare_source_class_members,
+        preflight_nongeneric_class_member_query, prepare_source_class_members_with_type_queries,
         validate_class_heritage_members,
     },
     contextual::{
@@ -33525,19 +33525,16 @@ fn check_planned_source_class(
     if class.bodies.len() != class.source.bodies().len() {
         return Err(SourceCheckError::Class(declaration));
     }
-    for annotation in class.source.tuple_parameter_annotations() {
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-        )?
-        .get_type_from_type_node(annotation)?;
-    }
-    let prepared = prepare_source_class_members(store, host, &class.source)
-        .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
+    let prepared = prepare_source_class_members_with_type_queries(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        &class.source,
+    )
+    .map_err(|error| SourcePlanner::class_plan_error(declaration, error))?;
     let value_type = store
         .value_symbol_links(class.source.symbol())
         .and_then(|links| links.resolved_type)

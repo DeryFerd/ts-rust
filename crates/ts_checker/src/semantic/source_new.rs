@@ -3993,7 +3993,15 @@ pub(super) fn prepare_direct_default_news(
     for plan in plans {
         match &plan.target {
             SourceNewTarget::ConstructorOverloads(class) => {
-                super::classes::prepare_source_class_members(store, host, class)?;
+                super::classes::prepare_source_class_members_with_type_queries(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    class,
+                )?;
             }
             SourceNewTarget::DeclaredInterface(declared) => {
                 global_error::prepare(

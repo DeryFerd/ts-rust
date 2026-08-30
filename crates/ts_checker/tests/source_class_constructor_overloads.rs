@@ -476,6 +476,138 @@ fn constructor_compatibility_diagnostic_keeps_mixed_body_source_order() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Both entry orders share one constructor and tuple-method source.
+fn constructor_member_queries_prepare_tuple_methods_before_source_checking() {
+    let parsed = parse_source_file(concat!(
+        "class Model {\n",
+        "  constructor(value: string);\n",
+        "  constructor(value: number);\n",
+        "  constructor(value: any) {}\n",
+        "  first(pair: [number, string]): number { return pair[0]; }\n",
+        "}\n",
+        "declare const pair: [number, string];\n",
+        "const model = new Model(1);\n",
+        "const result: number = model.first(pair);\n",
+    ));
+    let classes = source_nodes(&parsed, SyntaxKind::ClassDeclaration);
+    let [class] = classes.as_slice() else {
+        panic!("the source must contain one class")
+    };
+    let constructors = source_nodes(&parsed, SyntaxKind::Constructor);
+    assert_eq!(constructors.len(), 3);
+    let methods = source_nodes(&parsed, SyntaxKind::MethodDeclaration);
+    let [method] = methods.as_slice() else {
+        panic!("the class must retain one tuple method")
+    };
+    let NodeData::MethodDeclaration(method_data) = &parsed.arena.get(method.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let parameter = NodeRef::new(parsed.arena.id(), FILE, method_data.parameters.nodes[0]);
+    let NodeData::ParameterDeclaration(parameter_data) =
+        &parsed.arena.get(parameter.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let annotation = NodeRef::new(parsed.arena.id(), FILE, parameter_data.type_.unwrap());
+    let constructions = source_nodes(&parsed, SyntaxKind::NewExpression);
+    let calls = source_nodes(&parsed, SyntaxKind::CallExpression);
+    assert_eq!(constructions.len(), 1);
+    assert_eq!(calls.len(), 1);
+
+    for members_first in [false, true] {
+        let mut context = context(&parsed);
+        let owner = bound_symbol(&context, *class);
+        let prepared = members_first.then(|| {
+            let members = context.get_nongeneric_class_members(owner).unwrap();
+            let before = counts(&context);
+            assert_eq!(
+                context.get_nongeneric_class_members(owner).unwrap(),
+                members
+            );
+            assert_eq!(counts(&context), before);
+            members
+        });
+
+        context.check_source_file(FILE).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        if let Some(prepared) = prepared {
+            assert_eq!(members, prepared);
+        }
+        let signatures = constructors
+            .iter()
+            .map(|&node| signature_at(&context, node))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            construct_signatures(&context, members.shells().value_type()),
+            signatures[..2]
+        );
+        assert!(!signatures[..2].contains(&signatures[2]));
+        assert_eq!(signature_at(&context, constructions[0]), signatures[1]);
+        assert_eq!(
+            context.get_type_at_location(constructions[0]).unwrap(),
+            members.shells().instance_type(),
+        );
+        let tuple = context.get_type_from_type_node(annotation).unwrap();
+        let parameter_symbol = bound_symbol(&context, parameter);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(parameter_symbol)
+                .unwrap()
+                .resolved_type,
+            Some(tuple),
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let TypeData::TypeReference(reference) =
+            context.store().type_payload(tuple).unwrap().data()
+        else {
+            panic!("the method parameter must keep its canonical tuple reference")
+        };
+        assert_eq!(
+            reference.resolved_type_arguments.as_deref(),
+            Some(&[number, string][..])
+        );
+        assert!(matches!(
+            context
+                .store()
+                .type_payload(reference.object.target.unwrap())
+                .unwrap()
+                .data(),
+            TypeData::Tuple(_),
+        ));
+        let method_signature = signature_at(&context, *method);
+        assert_eq!(
+            context
+                .store()
+                .signature(method_signature)
+                .unwrap()
+                .parameters(),
+            &[parameter_symbol]
+        );
+        assert_eq!(signature_at(&context, calls[0]), method_signature);
+        assert_eq!(context.get_type_at_location(calls[0]).unwrap(), number);
+        let mut replay = constructors.clone();
+        replay.extend([*method, annotation, constructions[0], calls[0]]);
+        assert_stable_replay(&mut context, &replay);
+        let before = counts(&context);
+        assert_eq!(
+            context.get_nongeneric_class_members(owner).unwrap(),
+            members
+        );
+        assert_eq!(counts(&context), before);
+    }
+}
+
+#[test]
 fn constructor_extra_arguments_use_the_argument_range_without_implementation_note() {
     let source = concat!(
         "class Model {\n",

@@ -2355,6 +2355,40 @@ fn validate_source_class_stored_layout(
     Ok(())
 }
 
+/// Resolves retained tuple parameters in the caller's query session before publication.
+pub(super) fn prepare_source_class_members_with_type_queries(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &SourceClassPlan,
+) -> Result<PreparedSourceClass, ClassError> {
+    if plan_source_class_members_with_context(
+        store,
+        host,
+        plan.symbol(),
+        plan.array_targets,
+        plan.type_query_context.as_ref(),
+    )? != *plan
+    {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration())));
+    }
+    for annotation in plan.tuple_parameter_annotations() {
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_from_type_node(annotation)?;
+    }
+    prepare_source_class_members(store, host, plan)
+}
+
 /// Publishes a header with real signatures. Inferred method returns stay absent.
 pub(super) fn prepare_source_class_members(
     store: &mut CanonicalTypeMapperStore,

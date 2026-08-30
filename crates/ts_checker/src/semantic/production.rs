@@ -1610,7 +1610,15 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             }
         };
         if let Some(plan) = overload_plan {
-            super::classes::prepare_source_class_members(store, &host, &plan)?;
+            super::classes::prepare_source_class_members_with_type_queries(
+                store,
+                &host,
+                global_types,
+                *options,
+                instantiation_session,
+                diagnostics,
+                &plan,
+            )?;
             return super::classes::source_class_constructor_overloads(store, &host, symbol)?
                 .map(|overloads| overloads.members)
                 .ok_or(super::classes::ClassError::Invariant(
