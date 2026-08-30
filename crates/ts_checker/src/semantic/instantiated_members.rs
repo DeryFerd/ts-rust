@@ -18382,7 +18382,15 @@ mod tests {
                         .unwrap()
                         .clone();
                     let signature = origin.signatures[1];
-                    let original = store.signature(signature).unwrap().clone();
+                    let (original_target, original_mapper, original_return, callback_parameter) = {
+                        let original = store.signature(signature).unwrap();
+                        (
+                            original.target(),
+                            original.mapper(),
+                            original.resolved_return_type(),
+                            original.parameters()[0],
+                        )
+                    };
                     let source_signature = origin.plan.signatures[1].source;
                     let source_return = origin.plan.signatures[1].return_type;
                     let fresh = store
@@ -18396,7 +18404,7 @@ mod tests {
                     };
                     let fresh_data = fresh_data.clone();
                     let callback = store
-                        .value_symbol_links(original.parameters()[0])
+                        .value_symbol_links(callback_parameter)
                         .unwrap()
                         .resolved_type
                         .unwrap();
@@ -18416,11 +18424,11 @@ mod tests {
                         "signature_target" => store.set_signature_target_and_mapper(
                             signature,
                             Some(origin.plan.signatures[0].source),
-                            original.mapper()
+                            original_mapper
                         ),
                         "signature_mapper" => store.set_signature_target_and_mapper(
                             signature,
-                            original.target(),
+                            original_target,
                             Some(wrong_mapper)
                         ),
                         "signature_return" =>
@@ -18465,13 +18473,11 @@ mod tests {
                         "signature_target" | "signature_mapper" => store
                             .set_signature_target_and_mapper(
                                 signature,
-                                original.target(),
-                                original.mapper()
+                                original_target,
+                                original_mapper
                             ),
-                        "signature_return" => store.set_signature_resolved_return_type(
-                            signature,
-                            original.resolved_return_type()
-                        ),
+                        "signature_return" =>
+                            store.set_signature_resolved_return_type(signature, original_return),
                         "source_return" => store.set_signature_resolved_return_type(
                             source_signature,
                             Some(source_return)
@@ -18505,7 +18511,7 @@ mod tests {
                         signature,
                         &mut session,
                         ReturnQuery::WithArrays,
-                        &Ok(original.resolved_return_type().unwrap()),
+                        &Ok(original_return.unwrap()),
                     );
                 }
             }
