@@ -15933,7 +15933,9 @@ mod tests {
                 .get(parameter.declaration.node)
                 .unwrap()
                 .flags
-                .contains(ts_ast::NodeFlags::REPARSED)
+                .0
+                & ts_ast::NodeFlags::REPARSED.0
+                != 0
         );
         assert_eq!(
             context
