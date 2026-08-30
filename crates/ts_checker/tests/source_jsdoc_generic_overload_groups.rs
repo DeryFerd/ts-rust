@@ -266,7 +266,7 @@ fn assert_source_clones(parsed: &ParseResult, functions: &[FunctionNodes]) {
         assert_eq!(template.parent, Some(function.declaration.node));
         assert_eq!(template.range, documented_template.name().range());
         let name = parsed.arena.get(function.template_name.node).unwrap();
-        assert_eq!(name.flags, NodeFlags::NONE);
+        assert_eq!(name.flags, NodeFlags::default());
         assert_eq!(name.parent, Some(function.template.node));
         assert_eq!(name.range, documented_template.name().range());
         assert_eq!(node_text(parsed, function.template_name), "T");
@@ -300,7 +300,7 @@ fn assert_source_clones(parsed: &ParseResult, functions: &[FunctionNodes]) {
             );
         } else {
             assert!(function.body.is_some());
-            assert!(!record.flags.contains(NodeFlags::REPARSED));
+            assert!(record.flags.0 & NodeFlags::REPARSED.0 == 0);
         }
         for (parameter, documented) in function.parameters.iter().zip(parameters) {
             assert!(parameter_nodes.insert(parameter.declaration));
@@ -442,7 +442,7 @@ fn snapshot(
                 .store()
                 .symbol_table(locals)
                 .unwrap()
-                .get(&EscapedName::source("T")),
+                .get(EscapedName::source("T").as_ref()),
             Some(template_symbol)
         );
         let mut parameters = Vec::new();
