@@ -2138,6 +2138,10 @@ impl SourceFlowPlan {
             .is_some_and(|record| {
                 record.kind == SyntaxKind::ArrowFunction
                     && matches!(record.data, NodeData::ArrowFunction(_))
+                    || record.kind == SyntaxKind::MethodDeclaration
+                        && bound.symbol(container).is_some_and(|owner| {
+                            store.source_object_literal_method_owner_is_exact(container, owner)
+                        })
             })
             .then_some(container);
         Self::preflight_with_effects(
@@ -4770,8 +4774,25 @@ fn validate_parameter_assignment(
     }
 
     let function = arena.get(container.node).ok_or_else(invalid)?;
-    let NodeData::FunctionDeclaration(function_data) = &function.data else {
-        return Err(invalid().into());
+    let (parameters, function_body) = match &function.data {
+        NodeData::FunctionDeclaration(function_data)
+            if function.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            (&function_data.parameters, function_data.body)
+        }
+        NodeData::MethodDeclaration(method)
+            if function.kind == SyntaxKind::MethodDeclaration
+                && method.asterisk_token.is_none()
+                && method.modifiers.is_none()
+                && method.type_parameters.is_none()
+                && method.postfix_token.is_none()
+                && bound.symbol(container).is_some_and(|owner| {
+                    store.source_object_literal_method_owner_is_exact(container, owner)
+                }) =>
+        {
+            (&method.parameters, method.body)
+        }
+        _ => return Err(invalid().into()),
     };
     let (parameter_declaration, parameter_name) = parameter_assignment_declaration_and_name(
         arena,
@@ -4790,11 +4811,11 @@ fn validate_parameter_assignment(
     let NodeData::Identifier(target_identifier) = &target.data else {
         return Err(invalid().into());
     };
-    if function.kind != SyntaxKind::FunctionDeclaration
-        || parameter.kind != SyntaxKind::Parameter
+    if parameter.kind != SyntaxKind::Parameter
         || parameter.parent != Some(container.node)
-        || function_data
-            .parameters
+        || function.kind == SyntaxKind::MethodDeclaration
+            && parameter_declaration != assignment.parameter
+        || parameters
             .nodes
             .iter()
             .filter(|node| **node == parameter_declaration.node)
@@ -4851,7 +4872,7 @@ fn validate_parameter_assignment(
         || statement_data.flow_node.is_some()
         || body.kind != SyntaxKind::Block
         || body.parent != Some(container.node)
-        || function_data.body != statement.parent
+        || function_body != statement.parent
     {
         return Err(invalid().into());
     }
@@ -4998,10 +5019,24 @@ fn validate_direct_call(
     let body_id = statement.parent.ok_or_else(invalid)?;
     let body = arena.get(body_id).ok_or_else(invalid)?;
     let function = arena.get(container.node).ok_or_else(invalid)?;
-    let NodeData::FunctionDeclaration(function_data) = &function.data else {
-        return Err(invalid().into());
-    };
-    let function_body = function_data.body.ok_or_else(invalid)?;
+    let function_body = match &function.data {
+        NodeData::FunctionDeclaration(function_data)
+            if function.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            function_data.body
+        }
+        NodeData::MethodDeclaration(method)
+            if function.kind == SyntaxKind::MethodDeclaration
+                && function
+                    .parent
+                    .and_then(|parent| arena.get(parent))
+                    .is_some_and(|parent| parent.kind == SyntaxKind::ObjectLiteralExpression) =>
+        {
+            method.body
+        }
+        _ => return Err(invalid().into()),
+    }
+    .ok_or_else(invalid)?;
     let scope = if body_id == function_body {
         container
     } else {
@@ -5013,7 +5048,6 @@ fn validate_direct_call(
         || statement_data.expression != expression.node
         || statement_data.flow_node.is_some()
         || body.kind != SyntaxKind::Block
-        || function.kind != SyntaxKind::FunctionDeclaration
         || arena.get(function_body).is_none_or(|body| {
             body.kind != SyntaxKind::Block || body.parent != Some(container.node)
         })
@@ -8991,6 +9025,235 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn object_method_parameter_assignment_keeps_its_owner_and_flow_state() {
+        let parsed = parse_source_file(concat!(
+            "const object = { update(value: string | number, other: number): void { ",
+            "value = 1; value; } };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_330);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let (method, data) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::MethodDeclaration(data) => {
+                    Some((NodeRef::new(parsed.arena.id(), file, node), data))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let [parameter, other] = data.parameters.nodes.as_slice() else {
+            panic!("the method must keep both parameters")
+        };
+        let parameter = NodeRef::new(parsed.arena.id(), file, *parameter);
+        let other = NodeRef::new(parsed.arena.id(), file, *other);
+        let symbol = bound.symbol(parameter).unwrap();
+        let other_symbol = bound.symbol(other).unwrap();
+        let owner = bound.symbol(method).unwrap();
+        assert!(
+            context
+                .store()
+                .source_object_literal_method_owner_is_exact(method, owner)
+        );
+        let NodeData::Block(body) = &parsed.arena.get(data.body.unwrap()).unwrap().data else {
+            panic!("the method must keep its block")
+        };
+        let [before, after] = body.statements.nodes.as_slice() else {
+            panic!("the method must keep its assignment and following read")
+        };
+        let before = NodeRef::new(parsed.arena.id(), file, *before);
+        let after = NodeRef::new(parsed.arena.id(), file, *after);
+        let expression = expression_statement_expression(&parsed, file, before);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("the first statement must assign the parameter")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowParameterAssignment {
+            target,
+            parameter,
+            symbol,
+        };
+        let (union, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_or_number_type, bootstrap.number_type)
+        };
+        let base = [(symbol, union), (other_symbol, number)]
+            .into_iter()
+            .collect::<SourceFlowTypes>();
+        let mut expected = base.clone();
+        expected.insert(symbol, number);
+        for _ in 0..2 {
+            let plan = SourceFlowPlan::preflight_linear(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                method,
+                [before, after],
+                [],
+                [assignment],
+                [],
+            )
+            .unwrap();
+            assert_eq!(plan.container, method);
+            assert_eq!(plan.assignment_declarations.get(&target), Some(&parameter));
+            let mut frame = plan.frame(&bound, base.clone()).unwrap();
+            assert_eq!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, before)
+                    .unwrap()
+                    .types(),
+                &base,
+            );
+            assert_eq!(
+                frame.snapshot_at(context.store_mut_for_test(), &globals, after),
+                Err(SourceFlowInvariant::PendingAssignment(target).into()),
+            );
+            frame.complete_assignment(target, symbol, number).unwrap();
+            let checked = frame
+                .snapshot_at(context.store_mut_for_test(), &globals, after)
+                .unwrap();
+            assert_eq!(checked.types(), &expected);
+            assert_eq!(
+                frame
+                    .snapshot_at(context.store_mut_for_test(), &globals, after)
+                    .unwrap(),
+                checked,
+            );
+            assert_eq!(
+                frame.complete_assignment(target, symbol, number),
+                Err(SourceFlowInvariant::AssignmentAlreadyCompleted(target).into()),
+            );
+            assert_eq!(bound.symbol(parameter), Some(symbol));
+            assert_eq!(bound.symbol(other), Some(other_symbol));
+            assert!(
+                context
+                    .store()
+                    .source_object_literal_method_owner_is_exact(method, owner)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn object_method_parameter_assignment_rejects_changed_owner_and_parameter_proofs() {
+        let parsed = parse_source_file(concat!(
+            "const object = { update(value: number, other: number): void { ",
+            "value = 1; value; } };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202_331);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let (method, data) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::MethodDeclaration(data) => {
+                    Some((NodeRef::new(parsed.arena.id(), file, node), data))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let [parameter, other] = data.parameters.nodes.as_slice() else {
+            panic!("the method must keep both parameters")
+        };
+        let parameter = NodeRef::new(parsed.arena.id(), file, *parameter);
+        let other = NodeRef::new(parsed.arena.id(), file, *other);
+        let symbol = bound.symbol(parameter).unwrap();
+        let other_symbol = bound.symbol(other).unwrap();
+        let owner = bound.symbol(method).unwrap();
+        let NodeData::Block(body) = &parsed.arena.get(data.body.unwrap()).unwrap().data else {
+            panic!("the method must keep its block")
+        };
+        let [before, after] = body.statements.nodes.as_slice() else {
+            panic!("the method must keep its assignment and following read")
+        };
+        let before = NodeRef::new(parsed.arena.id(), file, *before);
+        let after = NodeRef::new(parsed.arena.id(), file, *after);
+        let expression = expression_statement_expression(&parsed, file, before);
+        let NodeData::BinaryExpression(binary) = &parsed.arena.get(expression.node).unwrap().data
+        else {
+            panic!("the first statement must assign the parameter")
+        };
+        let target = NodeRef::new(parsed.arena.id(), file, binary.left);
+        let assignment = SourceFlowParameterAssignment {
+            target,
+            parameter,
+            symbol,
+        };
+        let preflight = |store: &CanonicalTypeMapperStore, assignment| {
+            SourceFlowPlan::preflight_linear(
+                &parsed.arena,
+                &bound,
+                store,
+                method,
+                [before, after],
+                [],
+                [assignment],
+                [],
+            )
+        };
+        let reject = |store: &CanonicalTypeMapperStore, assignment| {
+            let before = format!("{store:?}");
+            for _ in 0..2 {
+                assert!(matches!(
+                    preflight(store, assignment),
+                    Err(SourceFlowError::Invariant(
+                        SourceFlowInvariant::InvalidParameterAssignment(node)
+                    )) if node == target
+                ));
+                assert_eq!(format!("{store:?}"), before);
+            }
+        };
+        let store = context.store_mut_for_test();
+        assert!(preflight(store, assignment).is_ok());
+        let parent = store.symbol(owner).unwrap().parent().unwrap();
+        let name = store.symbol(owner).unwrap().name().to_owned();
+        let members = store.symbol(parent).unwrap().members().unwrap();
+        let flags = store.symbol(owner).unwrap().flags();
+        let checks = store.symbol(owner).unwrap().check_flags();
+        assert!(store.set_symbol_relationships(owner, None, None, None, None));
+        reject(store, assignment);
+        assert!(store.set_symbol_relationships(owner, None, None, Some(parent), None));
+        assert!(preflight(store, assignment).is_ok());
+        assert!(store.set_symbol_flags(owner, SymbolFlags::PROPERTY, checks));
+        reject(store, assignment);
+        assert!(store.set_symbol_flags(owner, flags, checks));
+        assert!(preflight(store, assignment).is_ok());
+        assert_eq!(
+            store.insert_symbol(members, name.clone(), other_symbol),
+            Some(Some(owner))
+        );
+        reject(store, assignment);
+        assert_eq!(
+            store.insert_symbol(members, name, owner),
+            Some(Some(other_symbol))
+        );
+        assert!(preflight(store, assignment).is_ok());
+        for forged in [
+            SourceFlowParameterAssignment {
+                symbol: other_symbol,
+                ..assignment
+            },
+            SourceFlowParameterAssignment {
+                parameter: other,
+                symbol: other_symbol,
+                ..assignment
+            },
+        ] {
+            reject(store, forged);
+        }
+        assert!(preflight(store, assignment).is_ok());
+        assert_eq!(bound.symbol(parameter), Some(symbol));
+        assert_eq!(bound.symbol(other), Some(other_symbol));
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

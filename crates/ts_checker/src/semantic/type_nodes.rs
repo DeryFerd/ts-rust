@@ -9789,8 +9789,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Ok(false);
         }
-        source_callables::is_reparsed_jsdoc_generic_arrow(self.store, self.host, arrow, templates)
-            .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))
+        source_callables::is_reparsed_jsdoc_generic_callable(
+            self.store, self.host, arrow, templates,
+        )
+        .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))
     }
 
     /// Authenticates `RefObject<T>.current: T | null` in the React namespace.
@@ -28301,7 +28303,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map(CanonicalArrayTargets::from_global_types);
         let family = match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration => SourceCallableFamily::FunctionDeclaration,
-            SyntaxKind::ArrowFunction => SourceCallableFamily::ArrowFunction,
+            SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression => {
+                SourceCallableFamily::ArrowFunction
+            }
+            SyntaxKind::MethodDeclaration => SourceCallableFamily::ObjectLiteralMethod,
             kind => {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
@@ -28363,8 +28368,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
-    /// Resolves one exact annotated `FunctionDeclaration` or `ArrowFunction` into
-    /// the callable value owned by its binder FUNCTION symbol.
+    /// Resolves an exact source function, expression, arrow, or object-literal method into
+    /// the callable value owned by its binder symbol.
     pub(super) fn get_type_of_source_callable(
         &mut self,
         declaration: NodeRef,
@@ -28381,7 +28386,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map(CanonicalArrayTargets::from_global_types);
         let family = match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration => SourceCallableFamily::FunctionDeclaration,
-            SyntaxKind::ArrowFunction => SourceCallableFamily::ArrowFunction,
+            SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression => {
+                SourceCallableFamily::ArrowFunction
+            }
+            SyntaxKind::MethodDeclaration => SourceCallableFamily::ObjectLiteralMethod,
             kind => {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
@@ -28876,7 +28884,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         match preflight_node(self.store, self.host, declaration)?.kind {
-            SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
+            SyntaxKind::FunctionDeclaration
+            | SyntaxKind::ArrowFunction
+            | SyntaxKind::FunctionExpression => {
+                return self.get_return_type_of_source_callable_signature(signature, declaration);
+            }
+            SyntaxKind::MethodDeclaration
+                if self
+                    .store
+                    .source_callable_type_for_signature(signature)
+                    .and_then(|type_| self.store.source_callable_provenance(type_))
+                    .is_some_and(|provenance| {
+                        provenance.family == SourceCallableFamily::ObjectLiteralMethod
+                            && provenance.signature == signature
+                            && provenance.declaration == declaration
+                            && self.store.source_object_literal_method_owner_is_exact(
+                                declaration,
+                                provenance.owner_symbol,
+                            )
+                    }) =>
+            {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
             }
             SyntaxKind::GetAccessor => {
@@ -29528,10 +29555,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             let record = self.store.signature(signature).ok_or_else(&invalid)?;
             // The host plan already proved the direct-call or property anchor.
             // Recheck its full capture value before using the published return.
+            let contextual_kind_is_exact = match (
+                callable.family,
+                self.host.node(declaration).map(|node| node.kind),
+            ) {
+                (SourceCallableFamily::ArrowFunction, Some(SyntaxKind::ArrowFunction)) => true,
+                (
+                    SourceCallableFamily::ObjectLiteralMethod,
+                    Some(SyntaxKind::MethodDeclaration),
+                ) => self.store.source_object_literal_method_owner_is_exact(
+                    declaration,
+                    callable.owner_symbol,
+                ),
+                _ => false,
+            };
             if retained.is_some()
-                || callable.family != SourceCallableFamily::ArrowFunction
-                || self.host.node(declaration).map(|node| node.kind)
-                    != Some(SyntaxKind::ArrowFunction)
+                || !contextual_kind_is_exact
                 || callable.family != provenance.family
                 || callable.declaration != provenance.declaration
                 || callable.owner_symbol != provenance.owner_symbol

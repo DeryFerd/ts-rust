@@ -499,8 +499,8 @@ fn authenticated_any_array_nonmatch(
     Ok(true)
 }
 
-/// Concrete scalars cannot satisfy a source parameter with no constraint or default.
-/// The retained signature proof excludes synthetic and recovery parameters.
+/// After simple relations, a concrete scalar and an unconstrained source parameter
+/// cannot be assigned in either direction. The signature proof excludes recovery.
 fn authenticated_scalar_source_parameter_nonmatch(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     source: TypeId,
@@ -513,20 +513,28 @@ fn authenticated_scalar_source_parameter_nonmatch(
     let source_record = store
         .type_payload(source)
         .ok_or(RelationUnavailable::Type(source))?;
-    if !source_record.flags().intersects(TypeFlags::PRIMITIVE)
-        || source_record.flags().intersects(
+    let (scalar, parameter) = if source_record.flags().intersects(TypeFlags::TYPE_PARAMETER) {
+        (target, source)
+    } else {
+        (source, target)
+    };
+    let scalar_record = store
+        .type_payload(scalar)
+        .ok_or(RelationUnavailable::Type(scalar))?;
+    if !scalar_record.flags().intersects(TypeFlags::PRIMITIVE)
+        || scalar_record.flags().intersects(
             TypeFlags::STRUCTURED_OR_INSTANTIABLE
                 | TypeFlags::ENUM_LIKE
                 | TypeFlags::UNIQUE_ES_SYMBOL,
         )
         || !matches!(
-            source_record.data(),
+            scalar_record.data(),
             TypeData::Intrinsic(_) | TypeData::Literal(_)
         )
     {
         return Ok(false);
     }
-    let Some(symbol) = cached_ordinary_type_parameter_owner(store, target) else {
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, parameter) else {
         return Ok(false);
     };
     let Some([declaration]) = store
@@ -556,7 +564,7 @@ fn authenticated_scalar_source_parameter_nonmatch(
         return Ok(false);
     }
     let Some(index) = evidence.type_parameters().iter().position(|row| {
-        row.provenance.type_parameter == target
+        row.provenance.type_parameter == parameter
             && row.provenance.symbol == symbol
             && row.provenance.declaration == *declaration
     }) else {
@@ -575,14 +583,14 @@ fn authenticated_scalar_source_parameter_nonmatch(
         || resolved.constraint != no_constraint
         || resolved.default_type != no_constraint
         || evidence.base_constraints().get(index) != Some(&no_constraint)
-        || source == bootstrap.missing_type
-        || source == bootstrap.optional_type
+        || scalar == bootstrap.missing_type
+        || scalar == bootstrap.optional_type
     {
         return Ok(false);
     }
     store
-        .validate_union_constituent(source)
-        .map_err(|error| union_validation_unavailable(source, error))?;
+        .validate_union_constituent(scalar)
+        .map_err(|error| union_validation_unavailable(scalar, error))?;
     Ok(true)
 }
 
@@ -6610,6 +6618,15 @@ impl<'store> RelaterSession<'store> {
         record: &ts_binder::semantic::Symbol,
         owner: SemanticSymbolId,
     ) -> bool {
+        if self
+            .store
+            .object_literal_property_requires_method_proof(symbol)
+        {
+            return self
+                .store
+                .object_literal_method_clone_type(symbol, owner)
+                .is_some();
+        }
         let name = record.name();
         if record.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
             || record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
@@ -15464,6 +15481,60 @@ mod tests {
                         );
                     }
                 }
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let reverse_cases = [
+                    (bootstrap.number_type, false),
+                    (bootstrap.string_type, false),
+                    (bootstrap.bigint_type, false),
+                    (bootstrap.es_symbol_type, false),
+                    (bootstrap.regular_true_type, false),
+                    (bootstrap.regular_false_type, false),
+                    (bootstrap.void_type, false),
+                    (bootstrap.undefined_type, false),
+                    (bootstrap.null_type, false),
+                    (bootstrap.any_type, true),
+                    (bootstrap.unknown_type, true),
+                    (bootstrap.wildcard_type, true),
+                    (bootstrap.error_type, true),
+                    (target, true),
+                ];
+                for (scalar, expected) in reverse_cases {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            store.is_type_assignable_to_with_session(
+                                target,
+                                scalar,
+                                None,
+                                Some(false),
+                                &mut instantiation,
+                            ),
+                            Ok(expected)
+                        );
+                        let bootstrap = store.relation_bootstrap_facts().unwrap();
+                        let mut relation =
+                            super::RelaterSession::new_with_global_types_options_and_session(
+                                store,
+                                RelationKind::Assignable,
+                                bootstrap,
+                                None,
+                                Some(false),
+                                Some(&mut instantiation),
+                            );
+                        assert_eq!(
+                            relation.is_related_to_ex(
+                                target,
+                                scalar,
+                                super::RecursionFlags::BOTH,
+                                super::IntersectionState::NONE,
+                            ),
+                            Ok(if expected {
+                                Ternary::True
+                            } else {
+                                Ternary::False
+                            })
+                        );
+                    }
+                }
             }
             assert_eq!(
                 store.is_type_assignable_to_with_session(
@@ -15525,6 +15596,7 @@ mod tests {
         let mapper = store.new_simple_type_mapper(target, number).unwrap();
         assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
         assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(store.is_type_assignable_to(target, number), Ok(false));
         let assert_rejected = |store: &mut TestStore| {
             let counts = (
                 store.type_len(),
@@ -15539,6 +15611,14 @@ mod tests {
                     Err(RelationUnavailable::StructuralRelation {
                         source: number,
                         target,
+                        relation: RelationKind::Assignable,
+                    })
+                );
+                assert_eq!(
+                    store.is_type_assignable_to(target, number),
+                    Err(RelationUnavailable::StructuralRelation {
+                        source: target,
+                        target: number,
                         relation: RelationKind::Assignable,
                     })
                 );
@@ -15565,6 +15645,7 @@ mod tests {
         assert_eq!(store.declared_type_links(row.symbol), Some(&poisoned_owner));
         assert!(store.set_declared_type_links(row.symbol, owner_links));
         assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(store.is_type_assignable_to(target, number), Ok(false));
 
         let annotation_links = store.type_node_links(annotation).unwrap().clone();
         let poisoned_annotation = TypeNodeLinks {
@@ -15579,6 +15660,7 @@ mod tests {
         );
         assert!(store.set_type_node_links(annotation, annotation_links));
         assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(store.is_type_assignable_to(target, number), Ok(false));
 
         let evidence = store
             .replace_source_callable_type_query_for_test(signature, None)
@@ -15591,6 +15673,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(store.is_type_assignable_to(target, number), Ok(false));
 
         let snapshot = |store: &TestStore| -> crate::semantic::type_records::TypeParameterData {
             let TypeData::TypeParameter(data) = store.type_payload(target).unwrap().data() else {
@@ -15626,6 +15709,7 @@ mod tests {
             ));
             assert_eq!(snapshot(store), data);
             assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+            assert_eq!(store.is_type_assignable_to(target, number), Ok(false));
         }
         assert!(store.set_resolved_base_constraint(target, Some(number)));
         assert_rejected(store);
@@ -15642,6 +15726,7 @@ mod tests {
         assert!(store.set_resolved_base_constraint(target, Some(no_constraint)));
         assert_eq!(snapshot(store), data);
         assert_eq!(store.is_type_assignable_to(number, target), Ok(false));
+        assert_eq!(store.is_type_assignable_to(target, number), Ok(false));
     }
 
     #[test]
@@ -15716,6 +15801,14 @@ mod tests {
                     relation: RelationKind::Assignable
                 })
             );
+            assert_eq!(
+                store.is_type_assignable_to(target, number),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: target,
+                    target: number,
+                    relation: RelationKind::Assignable
+                })
+            );
         }
         for source in [unknown, missing, optional] {
             assert_eq!(
@@ -15740,6 +15833,14 @@ mod tests {
                     relation
                 })
             );
+            assert_eq!(
+                store.is_type_related_to(target, number, relation),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: target,
+                    target: number,
+                    relation
+                })
+            );
         }
         assert_eq!(
             store.is_type_related_to(number, target, RelationKind::Identity),
@@ -15751,6 +15852,23 @@ mod tests {
                 forged_number
             ))
         );
+        assert_eq!(
+            store.is_type_assignable_to(target, forged_number),
+            Err(RelationUnavailable::UnsupportedUnionConstituent(
+                forged_number
+            ))
+        );
+        let never = store.intrinsic_bootstrap().unwrap().never_type;
+        for scalar in [missing, optional, never] {
+            assert_eq!(
+                store.is_type_assignable_to(target, scalar),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: target,
+                    target: scalar,
+                    relation: RelationKind::Assignable,
+                })
+            );
+        }
         assert_eq!(
             (
                 store.type_len(),
@@ -15786,6 +15904,14 @@ mod tests {
                 source: number,
                 target: constrained,
                 relation: RelationKind::Assignable
+            })
+        );
+        assert_eq!(
+            store.is_type_assignable_to(constrained, number),
+            Err(RelationUnavailable::StructuralRelation {
+                source: constrained,
+                target: number,
+                relation: RelationKind::Assignable,
             })
         );
         assert_eq!(snapshot(store), poisoned);
@@ -15878,6 +16004,140 @@ mod tests {
                 .resolved_return_type(),
             Some(target)
         );
+    }
+
+    #[test]
+    fn jsdoc_source_parameter_scalar_return_keeps_its_real_owner_and_replays() {
+        let source = ts_parser::parse_javascript_source_file(concat!(
+            "// @ts-check\n",
+            "/** @template T @param {T} value @returns {number} */\n",
+            "function numeric(value) { return value; }",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(96_456);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/source-parameter-return.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let (_, signature) = source_function_callable(&context, &source, file, "numeric");
+        let evidence = context
+            .store()
+            .source_callable_type_query(signature)
+            .unwrap();
+        let parameter = evidence.type_parameters()[0].provenance;
+        assert!(
+            source
+                .arena
+                .get(parameter.declaration.node)
+                .unwrap()
+                .flags
+                .0
+                & ts_ast::NodeFlags::REPARSED.0
+                != 0
+        );
+        assert_eq!(
+            context
+                .store()
+                .source_declaration_symbol(parameter.declaration),
+            Some(parameter.symbol)
+        );
+        let returned = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ReturnStatement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let diagnostics = context.diagnostics().clone();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the numeric return must report one real assignment error")
+        };
+        assert_eq!(diagnostic.node, Some(returned));
+        assert_eq!(diagnostic.range_override, None);
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'T' is not assignable to type 'number'."
+        );
+        assert!(diagnostic.related_information.is_empty());
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let counts = |store: &TestStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+                store.source_callable_provenance_lengths(),
+                store.source_callable_type_query_len(),
+            )
+        };
+        let warm = counts(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .is_type_assignable_to(parameter.type_parameter, number),
+                Ok(false)
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                source_function_callable(&context, &source, file, "numeric").1,
+                signature
+            );
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(counts(context.store()), warm);
+        }
+        let store = context.store_mut_for_test();
+        let evidence = store
+            .replace_source_callable_type_query_for_test(signature, None)
+            .unwrap();
+        let before = counts(store);
+        for _ in 0..2 {
+            assert_eq!(
+                store.is_type_assignable_to(parameter.type_parameter, number),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: parameter.type_parameter,
+                    target: number,
+                    relation: RelationKind::Assignable,
+                })
+            );
+            assert_eq!(counts(store), before);
+        }
+        assert!(
+            store
+                .replace_source_callable_type_query_for_test(signature, Some(evidence))
+                .is_none()
+        );
+        assert_eq!(
+            store.is_type_assignable_to(parameter.type_parameter, number),
+            Ok(false)
+        );
+        assert_eq!(counts(store), warm);
     }
 
     fn nullish_generic_relation_context<'arena>(
@@ -22499,6 +22759,323 @@ mod tests {
             store.relation_state_snapshot(),
             stale,
             "failed table revalidation must not publish a replacement relation"
+        );
+    }
+
+    fn object_method_relation_pair(
+        context: &mut CanonicalCheckerContext<'_>,
+        source: &ParseResult,
+        file: FileId,
+    ) -> (TypeId, TypeId) {
+        let unique_node = |kind| {
+            let nodes = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(source.arena.id(), file, node))
+                })
+                .collect::<Vec<_>>();
+            let [node] = nodes.as_slice() else {
+                panic!("the fixture must have one {kind:?} node")
+            };
+            *node
+        };
+        let object = unique_node(SyntaxKind::ObjectLiteralExpression);
+        let target = unique_node(SyntaxKind::TypeLiteral);
+        let target_type = context.get_type_from_type_node(target).unwrap();
+        let function = unique_node(SyntaxKind::FunctionType);
+        let NodeData::TypeLiteralNode(target_data) = &source.arena.get(target.node).unwrap().data
+        else {
+            panic!("the target must retain its type literal");
+        };
+        assert!(target_data.members.nodes.iter().any(|&member| {
+            matches!(
+                &source.arena.get(member).unwrap().data,
+                NodeData::PropertyDeclaration(property) if property.type_ == Some(function.node)
+            )
+        }));
+        let NodeData::FunctionTypeNode(function_data) =
+            &source.arena.get(function.node).unwrap().data
+        else {
+            panic!("the target property must retain its function type");
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, function_data.type_.unwrap());
+        let signature = context
+            .store()
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_eq!(
+            context.store().signature(signature).unwrap().declaration(),
+            Some(function)
+        );
+        assert_eq!(
+            context
+                .store()
+                .function_signature_return_annotation(signature),
+            Some((annotation, false))
+        );
+        let returned = context.get_return_type_of_signature(signature).unwrap();
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(returned));
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(returned)
+        );
+        assert!(context.diagnostics().is_empty());
+        (
+            context
+                .store()
+                .type_node_links(object)
+                .unwrap()
+                .resolved_type
+                .unwrap(),
+            target_type,
+        )
+    }
+
+    #[test]
+    fn object_method_clone_relations_keep_the_callable_and_caller_session() {
+        let library = parse_source_file("");
+        for (target_source, expected) in [
+            (
+                "const target: { method: (value: number) => number; text: string } = object;",
+                true,
+            ),
+            (
+                "const target: { method: (value: number) => string; text: string } = object;",
+                false,
+            ),
+        ] {
+            let source = parse_source_file(&format!(
+                "const object: any = {{ method(value: number): number {{ return value; }}, text: 'ready' }}; \
+                 function identity<T>(value: T): T {{ return value; }} {target_source}"
+            ));
+            let file = FileId::new(96_481);
+            let mut context = source_relation_context(
+                &library,
+                &source,
+                file,
+                CanonicalCheckerOptions::default(),
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let (fresh, target) = object_method_relation_pair(&mut context, &source, file);
+            let (_, signature) = source_function_callable(&context, &source, file, "identity");
+            let store = context.store_mut_for_test();
+            let parameter = store.signature(signature).unwrap().type_parameters()[0];
+            let (number, error) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.error_type)
+            };
+            let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+            let mut instantiation = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 1,
+                },
+                error,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::semantic::instantiate::instantiate_type_with_session(
+                    store,
+                    parameter,
+                    mapper,
+                    None,
+                    &mut instantiation
+                ),
+                Ok(number)
+            );
+            let limit_mark = instantiation.limit_event_mark();
+            let property = store
+                .resolved_own_property(fresh, "method")
+                .unwrap()
+                .unwrap();
+            let raw = store
+                .value_symbol_links(property.symbol)
+                .unwrap()
+                .target
+                .unwrap();
+            assert_eq!(
+                store.source_callable_type_for_owner(raw),
+                Some(property.type_)
+            );
+            assert_eq!(
+                store.is_type_assignable_to_with_session(
+                    fresh,
+                    target,
+                    None,
+                    Some(false),
+                    &mut instantiation
+                ),
+                Ok(expected)
+            );
+            let counts = |store: &TestStore| {
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.mapper_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.source_callable_provenance_lengths(),
+                    store.relation_state_snapshot(),
+                )
+            };
+            let warm = counts(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.resolved_own_property(fresh, "method"),
+                    Ok(Some(property))
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_session(
+                        fresh,
+                        target,
+                        None,
+                        Some(false),
+                        &mut instantiation
+                    ),
+                    Ok(expected)
+                );
+                assert_eq!(counts(store), warm);
+            }
+            assert_eq!(instantiation.query_count(), 1);
+            assert_eq!(instantiation.total_count(), 1);
+            assert_eq!(instantiation.recovery_error_type(), Some(error));
+            assert!(!instantiation.limit_event_occurred_since(limit_mark));
+        }
+    }
+
+    #[test]
+    fn object_method_clone_relations_reject_changed_proofs_before_warm_answers() {
+        let library = parse_source_file("");
+        let source = parse_source_file(concat!(
+            "const object: any = { method(value: number): number { return value; } }; ",
+            "const target: { method: (value: number) => number } = object;",
+        ));
+        let file = FileId::new(96_482);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (fresh, target) = object_method_relation_pair(&mut context, &source, file);
+        let store = context.store_mut_for_test();
+        let property = store
+            .resolved_own_property(fresh, "method")
+            .unwrap()
+            .unwrap();
+        let owner = store.type_payload(fresh).unwrap().symbol().unwrap();
+        let original = store.value_symbol_links(property.symbol).unwrap().clone();
+        let raw = original.target.unwrap();
+        let raw_links = store.value_symbol_links(raw).unwrap().clone();
+        let provenance = store.source_callable_provenance(property.type_).unwrap();
+        let returned = store
+            .signature(provenance.signature)
+            .unwrap()
+            .resolved_return_type()
+            .unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            store.is_type_assignable_to_with_strict_function_types(fresh, target, false),
+            Ok(true)
+        );
+        let key = store
+            .relation_key_if_available(fresh, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        let reject = |store: &mut TestStore| {
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::NONE
+            );
+            let counts = (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    store.resolved_own_property(fresh, "method"),
+                    Err(RelationUnavailable::UnsupportedProperty(property.symbol))
+                );
+                assert_eq!(
+                    store.is_type_assignable_to_with_strict_function_types(fresh, target, false),
+                    Err(RelationUnavailable::UnsupportedProperty(property.symbol))
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.signature_len(),
+                        store.mapper_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot()
+                    ),
+                    counts
+                );
+            }
+        };
+        for symbol in [property.symbol, raw] {
+            assert!(store.set_symbol_relationships(symbol, None, None, None, None));
+            reject(store);
+            assert!(store.set_symbol_relationships(symbol, None, None, Some(owner), None));
+            assert_eq!(
+                store.is_type_assignable_to_with_strict_function_types(fresh, target, false),
+                Ok(true)
+            );
+        }
+        assert!(store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                name_type: Some(string),
+                ..original.clone()
+            }
+        ));
+        reject(store);
+        assert!(store.set_value_symbol_links(property.symbol, original.clone()));
+        assert_eq!(
+            store.is_type_assignable_to_with_strict_function_types(fresh, target, false),
+            Ok(true)
+        );
+        assert!(store.set_value_symbol_links(raw, ValueSymbolLinks::default()));
+        reject(store);
+        assert!(store.set_symbol_flags(
+            property.symbol,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE
+        ));
+        assert!(store.set_symbol_flags(raw, SymbolFlags::PROPERTY, CheckFlags::NONE));
+        reject(store);
+        assert!(store.set_symbol_flags(raw, SymbolFlags::METHOD, CheckFlags::NONE));
+        assert!(store.set_symbol_flags(
+            property.symbol,
+            SymbolFlags::METHOD | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE
+        ));
+        assert!(store.set_value_symbol_links(raw, raw_links));
+        assert_eq!(
+            store.is_type_assignable_to_with_strict_function_types(fresh, target, false),
+            Ok(true)
+        );
+        assert!(store.set_signature_resolved_return_type(provenance.signature, Some(string)));
+        reject(store);
+        assert!(store.set_signature_resolved_return_type(provenance.signature, Some(returned)));
+        assert_eq!(
+            store.resolved_own_property(fresh, "method"),
+            Ok(Some(property))
+        );
+        assert_eq!(
+            store.is_type_assignable_to_with_strict_function_types(fresh, target, false),
+            Ok(true)
         );
     }
 

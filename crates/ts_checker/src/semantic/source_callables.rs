@@ -2,8 +2,8 @@
 //!
 //! This provider deliberately stops before statement/expression dispatch and
 //! function-body semantics. It proves one retained `FunctionDeclaration`,
-//! anonymous `FunctionExpression`, or `ArrowFunction` and its binder-owned
-//! FUNCTION symbol, publishes the callable shell/signature/parameter types,
+//! `FunctionExpression`, `ArrowFunction`, or object-literal method
+//! and its binder-owned symbol, publishes the callable shell/signature/parameter types,
 //! including authenticated identifier and assertion predicates, implicit `any`
 //! on ordinary function declarations, and implicit `any[]` rest parameters,
 //! and validates the resulting store shape.
@@ -2896,13 +2896,6 @@ fn plan_source_callable_with_owner_shape(
             }
         }
         NodeData::FunctionExpression(function) if record.kind == SyntaxKind::FunctionExpression => {
-            if let Some(name) = function.name {
-                let name = NodeRef::new(declaration.arena, declaration.file, name);
-                preflight_child(store, host, declaration, name)?;
-                return Err(SourceCallableError::Unsupported(
-                    SourceCallableUnsupported::OverloadDeclaration(name),
-                ));
-            }
             SourceSyntaxView {
                 family: SourceCallableFamily::ArrowFunction,
                 parameters: &function.parameters,
@@ -2911,7 +2904,7 @@ fn plan_source_callable_with_owner_shape(
                 return_type: function.type_,
                 body: Some(function.body),
                 asterisk_token: function.asterisk_token,
-                name: None,
+                name: function.name,
                 equals_greater_than_token: None,
                 invalid_parser_cache: function.full_signature.is_some()
                     || function.next_container.is_some()
@@ -2920,6 +2913,32 @@ fn plan_source_callable_with_owner_shape(
                     || function.end_flow_node.is_some()
                     || function.return_flow_node.is_some()
                     || function.facts != 0,
+            }
+        }
+        NodeData::MethodDeclaration(method) if record.kind == SyntaxKind::MethodDeclaration => {
+            if source_object_literal_method_symbol(store, host, declaration) != Some(owner_symbol)
+                || method.postfix_token.is_some()
+            {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::OverloadDeclaration(declaration),
+                ));
+            }
+            SourceSyntaxView {
+                family: SourceCallableFamily::ObjectLiteralMethod,
+                parameters: &method.parameters,
+                modifiers: method.modifiers.as_ref(),
+                type_parameters: method.type_parameters.as_ref(),
+                return_type: method.type_,
+                body: method.body,
+                asterisk_token: method.asterisk_token,
+                name: Some(method.name),
+                equals_greater_than_token: None,
+                invalid_parser_cache: method.full_signature.is_some()
+                    || method.next_container.is_some()
+                    || method.symbol.is_some()
+                    || method.flow_node.is_some()
+                    || method.end_flow_node.is_some()
+                    || method.facts != 0,
             }
         }
         _ => {
@@ -2970,8 +2989,7 @@ fn plan_source_callable_with_owner_shape(
     let bound = host
         .bound_file(declaration)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
-    let javascript_jsdoc_generic_arrow = view.family == SourceCallableFamily::ArrowFunction
-        && !type_parameters.is_empty()
+    let javascript_jsdoc_generic_callable = !type_parameters.is_empty()
         && bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
@@ -2998,10 +3016,13 @@ fn plan_source_callable_with_owner_shape(
         .is_some_and(|first| {
             valid_javascript_duplicate_function_owner_shape(store, host, owner_symbol, first)
         });
+    let object_literal_method = view.family == SourceCallableFamily::ObjectLiteralMethod;
     let exact_owner_declarations = match owner_shape {
         SourceCallableOwnerShape::Unique => {
             source_function_owner_declarations_are_exact(store, owner, declaration)
                 || javascript_duplicate_owner && owner.value_declaration() == Some(declaration)
+                || object_literal_method
+                    && store.source_object_literal_method_owner_is_exact(declaration, owner_symbol)
         }
         SourceCallableOwnerShape::AmbientOverload(declarations) => {
             declarations.len() >= 2
@@ -3020,7 +3041,8 @@ fn plan_source_callable_with_owner_shape(
                 && export_local.is_none()
         }
     };
-    if !owner.flags().contains(SymbolFlags::FUNCTION)
+    if !(owner.flags().contains(SymbolFlags::FUNCTION)
+        || object_literal_method && owner.flags() == SymbolFlags::METHOD)
         || owner.check_flags() != CheckFlags::NONE
         || !exact_owner_declarations
         || owner.members().is_some()
@@ -3039,7 +3061,9 @@ fn plan_source_callable_with_owner_shape(
         body_mode,
         &view,
     )?;
-    let exports_valid = if view.family == SourceCallableFamily::ArrowFunction {
+    let exports_valid = if object_literal_method {
+        owner.exports().is_none()
+    } else if view.family == SourceCallableFamily::ArrowFunction {
         bound_source_arrow_owner_expando_exports_are_valid(store, host, declaration, owner_symbol)
     } else if owner.flags() == SymbolFlags::FUNCTION && owner.exports().is_some() {
         bound_source_function_owner_expando_exports_are_valid(
@@ -3127,6 +3151,12 @@ fn plan_source_callable_with_owner_shape(
     let prototype_assignment_function = implicit_any_arrow_shape
         && record.kind == SyntaxKind::FunctionExpression
         && source_prototype_assignment_function_is_exact(store, host, declaration)?;
+    let ordinary_function_expression = record.kind == SyntaxKind::FunctionExpression
+        && view.modifiers.is_none()
+        && view.type_parameters.is_none()
+        && bound
+            .source_facts()
+            .is_some_and(|facts| !facts.is_javascript_file());
     let direct_call_argument_arrow = implicit_any_arrow_shape
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
@@ -3420,7 +3450,7 @@ fn plan_source_callable_with_owner_shape(
                 let type_node = NodeRef::new(declaration.arena, declaration.file, type_id);
                 let type_record = preflight_node(store, host, type_node)?;
                 let reparsed_jsdoc =
-                    javascript_jsdoc_generic_arrow && type_record.flags == NodeFlags::REPARSED;
+                    javascript_jsdoc_generic_callable && type_record.flags == NodeFlags::REPARSED;
                 if type_record.parent != Some(parameter.node)
                     || !reparsed_jsdoc
                         && (type_record.range.start < name_record.range.end
@@ -3445,6 +3475,8 @@ fn plan_source_callable_with_owner_shape(
                 )
             } else {
                 if !(view.family == SourceCallableFamily::FunctionDeclaration
+                    || ordinary_function_expression
+                    || object_literal_method
                     || direct_implicit_any_arrow
                         && (view.parameters.range == parameter_record.range
                             || javascript_direct_implicit_any_arrow
@@ -3619,7 +3651,7 @@ fn plan_source_callable_with_owner_shape(
         let type_node = NodeRef::new(declaration.arena, declaration.file, return_id);
         let return_record = preflight_node(store, host, type_node)?;
         let reparsed_jsdoc =
-            javascript_jsdoc_generic_arrow && return_record.flags == NodeFlags::REPARSED;
+            javascript_jsdoc_generic_callable && return_record.flags == NodeFlags::REPARSED;
         if return_record.parent != Some(declaration.node)
             || !reparsed_jsdoc
                 && (return_record.range.start < view.parameters.range.end
@@ -3685,8 +3717,11 @@ fn plan_source_callable_with_owner_shape(
             if body_record.parent != Some(declaration.node)
                 || body_record.range.start < return_end
                 || body_record.range.end > record.range.end
-                || view.family == SourceCallableFamily::FunctionDeclaration
-                    && body_record.kind != SyntaxKind::Block
+                || matches!(
+                    view.family,
+                    SourceCallableFamily::FunctionDeclaration
+                        | SourceCallableFamily::ObjectLiteralMethod
+                ) && body_record.kind != SyntaxKind::Block
             {
                 return Err(invariant(SourceCallableInvariant::InvalidSyntax(
                     declaration,
@@ -3913,27 +3948,30 @@ fn plan_source_callable_with_owner_shape(
     }
     match owner_shape {
         SourceCallableOwnerShape::Unique => {
-            let contextual_source_arrow = (object_property_arrow || direct_call_argument_arrow)
-                && store
-                    .source_callable_type_for_owner(owner_symbol)
-                    .and_then(|type_| store.source_callable_provenance(type_))
-                    .is_some_and(|provenance| {
-                        provenance.declaration == declaration
-                            && provenance.owner_symbol == owner_symbol
-                            && provenance.contextual_target.is_some()
-                            && (direct_call_argument_arrow
-                                && provenance.contextual_variable.is_none()
-                                || object_property_arrow
-                                    && provenance.contextual_variable.is_some_and(|anchor| {
-                                        store.source_contextual_callable_anchor_is_exact(
-                                            declaration,
-                                            owner_symbol,
-                                            anchor,
-                                        ) && store.symbol(anchor).is_some_and(|symbol| {
-                                            symbol.flags() == SymbolFlags::PROPERTY
-                                        })
-                                    }))
-                    });
+            let contextual_source_arrow =
+                (object_property_arrow || direct_call_argument_arrow || object_literal_method)
+                    && store
+                        .source_callable_type_for_owner(owner_symbol)
+                        .and_then(|type_| store.source_callable_provenance(type_))
+                        .is_some_and(|provenance| {
+                            provenance.declaration == declaration
+                                && provenance.owner_symbol == owner_symbol
+                                && provenance.contextual_target.is_some()
+                                && (direct_call_argument_arrow
+                                    && provenance.contextual_variable.is_none()
+                                    || (object_property_arrow || object_literal_method)
+                                        && provenance.contextual_variable.is_some_and(|anchor| {
+                                            store.source_contextual_callable_anchor_is_exact(
+                                                declaration,
+                                                owner_symbol,
+                                                anchor,
+                                            ) && store.symbol(anchor).is_some_and(|symbol| {
+                                                symbol.flags() == SymbolFlags::PROPERTY
+                                                    || object_literal_method
+                                                        && symbol.flags() == SymbolFlags::METHOD
+                                            })
+                                        }))
+                        });
             if contextual_source_arrow {
                 let type_ = store
                     .source_callable_type_for_owner(owner_symbol)
@@ -4165,6 +4203,32 @@ pub(super) fn source_object_property_arrow_symbol(
         && store.get_merged_symbol(planned.symbol) == Some(planned.symbol)
         && host.symbol_matches(store, property, planned.symbol))
     .then_some(planned.symbol))
+}
+
+/// Gets the binder-owned method symbol without changing the method's syntax.
+pub(super) fn source_object_literal_method_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Option<SemanticSymbolId> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration) {
+        return None;
+    }
+    let Some(SourceNodeParent::Parent(object)) = store.source_node_parent(declaration) else {
+        return None;
+    };
+    if store.source_node_kind(object) != Some(SyntaxKind::ObjectLiteralExpression) {
+        return None;
+    }
+    let plan = super::object_members::plan_object_literal(store, host, object).ok()?;
+    let symbol = plan.properties.iter().find_map(|property| {
+        (property.declaration == declaration && property.type_node == declaration)
+            .then_some(property.symbol)
+    });
+    symbol.filter(|symbol| {
+        store.source_object_literal_method_owner_is_exact(declaration, *symbol)
+            && host.symbol_matches(store, declaration, *symbol)
+    })
 }
 
 /// Authenticates one unparenthesized callback in a direct, array, or global sort call.
@@ -6118,6 +6182,11 @@ fn prove_source_type_parameter_syntax(
         {
             function.type_parameters.as_ref()
         }
+        NodeData::MethodDeclaration(method)
+            if declaration_record.kind == SyntaxKind::MethodDeclaration =>
+        {
+            method.type_parameters.as_ref()
+        }
         _ => {
             return Err(invariant(SourceCallableInvariant::InvalidSyntax(
                 declaration,
@@ -6214,15 +6283,15 @@ fn plan_exact_source_type_parameters(
         return Ok(Vec::new());
     };
     let declaration_record = preflight_node(store, host, declaration)?;
-    let jsdoc_arrow = family == SourceCallableFamily::ArrowFunction
-        && is_reparsed_jsdoc_generic_arrow(store, host, declaration, type_parameters)?;
+    let jsdoc_callable =
+        is_reparsed_jsdoc_generic_callable(store, host, declaration, type_parameters)?;
     let queried_arrow = family == SourceCallableFamily::ArrowFunction
         && query_annotations
         && store.source_arrow_has_ordinary_type_parameters(declaration);
-    if family != SourceCallableFamily::FunctionDeclaration && !jsdoc_arrow && !queried_arrow
+    if family != SourceCallableFamily::FunctionDeclaration && !jsdoc_callable && !queried_arrow
         || type_parameters.nodes.is_empty()
-        || !jsdoc_arrow && type_parameters.range.start < declaration_record.range.start
-        || jsdoc_arrow && type_parameters.range.end >= declaration_record.range.start
+        || !jsdoc_callable && type_parameters.range.start < declaration_record.range.start
+        || jsdoc_callable && type_parameters.range.end >= declaration_record.range.start
         || type_parameters.range.end > parameters.range.start
         || type_parameters.range.start >= type_parameters.range.end
     {
@@ -6367,7 +6436,8 @@ fn plan_exact_source_type_parameters(
     Ok(result)
 }
 
-pub(super) fn is_reparsed_jsdoc_generic_arrow(
+#[allow(clippy::too_many_lines)] // Check the actual JSDoc ranges and every bound signature node.
+pub(super) fn is_reparsed_jsdoc_generic_callable(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -6379,7 +6449,10 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
     if bound
         .source_facts()
         .is_none_or(|facts| !facts.is_javascript_file())
-        || store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || !matches!(
+            store.source_node_kind(declaration),
+            Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionDeclaration)
+        )
         || parameters.nodes.is_empty()
     {
         return Ok(false);
@@ -6390,22 +6463,37 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
         return Ok(false);
     };
     let declaration_record = preflight_node(store, host, declaration)?;
-    let NodeData::ArrowFunction(function) = &declaration_record.data else {
-        return Ok(false);
+    let (function_parameters, function_return_type, named_function) = match &declaration_record.data
+    {
+        NodeData::ArrowFunction(function) => (&function.parameters, function.type_, false),
+        NodeData::FunctionDeclaration(function) if function.body.is_some() => {
+            (&function.parameters, function.type_, true)
+        }
+        _ => return Ok(false),
     };
+    if named_function
+        && (jsdoc.template_parameters().len() != 1
+            || jsdoc.template_parameters().iter().any(|template| {
+                template.constraint().is_some() || template.default_type().is_some()
+            })
+            || jsdoc.type_().is_some()
+            || jsdoc.this_type().is_some()
+            || jsdoc.satisfies().is_some())
+    {
+        return Ok(false);
+    }
     let Some(return_type) = jsdoc.return_type() else {
         return Ok(false);
     };
-    let Some(return_node) = function
-        .type_
-        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    let Some(return_node) =
+        function_return_type.map(|node| NodeRef::new(declaration.arena, declaration.file, node))
     else {
         return Ok(false);
     };
     let return_record = preflight_node(store, host, return_node)?;
     if jsdoc.template_parameters().len() != parameters.nodes.len()
-        || jsdoc.parameters().len() != function.parameters.nodes.len()
-        || jsdoc.parameters().is_empty()
+        || jsdoc.parameters().len() != function_parameters.nodes.len()
+        || !named_function && jsdoc.parameters().is_empty()
         || return_record.flags != NodeFlags::REPARSED
         || return_record.parent != Some(declaration.node)
         || return_record.range != return_type.range()
@@ -6433,7 +6521,7 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
             return Ok(false);
         }
     }
-    for (node, documented) in function.parameters.nodes.iter().zip(jsdoc.parameters()) {
+    for (node, documented) in function_parameters.nodes.iter().zip(jsdoc.parameters()) {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *node);
         let parameter_record = preflight_node(store, host, parameter)?;
         let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
@@ -6454,6 +6542,11 @@ pub(super) fn is_reparsed_jsdoc_generic_arrow(
         if parameter_record.kind != SyntaxKind::Parameter
             || parameter_record.parent != Some(declaration.node)
             || identifier.text != documented.name()
+            || named_function
+                && (documented.is_optional()
+                    || data.question_token.is_some()
+                    || data.dot_dot_dot_token.is_some()
+                    || data.initializer.is_some())
             || annotation_record.flags != NodeFlags::REPARSED
             || annotation_record.parent != Some(parameter.node)
             || documented
@@ -9308,9 +9401,35 @@ fn validate_owner_name_and_export_route(
     view: &SourceSyntaxView<'_>,
 ) -> Result<(), SourceCallableError> {
     match view.family {
+        SourceCallableFamily::ObjectLiteralMethod => {
+            let symbol = source_object_literal_method_symbol(store, host, declaration);
+            if local_symbol.is_some()
+                || body_mode != SourceCallableBodyMode::Present
+                || symbol.is_none()
+                || symbol
+                    != host
+                        .bound_file(declaration)
+                        .and_then(|bound| bound.symbol(declaration))
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+                    declaration,
+                )));
+            }
+        }
         SourceCallableFamily::ArrowFunction => {
-            if view.name.is_some()
-                || owner.name() != InternalSymbolName::Function.as_ref()
+            if let Some(name) = view.name {
+                let name = NodeRef::new(declaration.arena, declaration.file, name);
+                preflight_child(store, host, declaration, name)?;
+                if store.source_node_kind(declaration) != Some(SyntaxKind::FunctionExpression)
+                    || store.source_child_with_kind(declaration, SyntaxKind::Identifier)
+                        != Some(name)
+                {
+                    return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+                        declaration,
+                    )));
+                }
+            }
+            if !source_expression_owner_name_is_exact(store, declaration, owner)
                 || owner.parent().is_some()
                 || local_symbol.is_some()
             {
@@ -9514,9 +9633,16 @@ fn valid_source_callable_plan_owner(
     }
 
     match plan.family {
+        SourceCallableFamily::ObjectLiteralMethod => {
+            store.source_object_literal_method_owner_is_exact(plan.declaration, plan.owner_symbol)
+                && plan.type_parameters.is_empty()
+                && !plan.is_async
+                && plan.body_mode == SourceCallableBodyMode::Present
+                && plan.export_local.is_none()
+        }
         SourceCallableFamily::ArrowFunction => {
             owner.flags() == SymbolFlags::FUNCTION
-                && owner.name() == InternalSymbolName::Function.as_ref()
+                && source_expression_owner_name_is_exact(store, plan.declaration, owner)
                 && owner.declarations() == Some(&[plan.declaration])
                 && owner.value_declaration() == Some(plan.declaration)
                 && source_arrow_owner_expando_exports_are_valid(
@@ -9600,6 +9726,28 @@ fn valid_queried_inferred_generic_source_callable(
             .is_none()
         && store.source_child_with_kind(plan.declaration, SyntaxKind::Block) == Some(plan.body)
         && store.source_node_parent(plan.body) == Some(SourceNodeParent::Parent(plan.declaration))
+}
+
+/// Checks the binder name against the registered expression syntax.
+fn source_expression_owner_name_is_exact(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner: &ts_binder::semantic::Symbol,
+) -> bool {
+    match store.source_node_kind(declaration) {
+        Some(SyntaxKind::FunctionExpression) => store
+            .source_child_with_kind(declaration, SyntaxKind::Identifier)
+            .map_or_else(
+                || owner.name() == InternalSymbolName::Function.as_ref(),
+                |name| {
+                    store.source_identifier_text(name).is_some_and(|name| {
+                        !name.is_empty() && owner.name().as_bytes() == name.as_bytes()
+                    })
+                },
+            ),
+        Some(SyntaxKind::ArrowFunction) => owner.name() == InternalSymbolName::Function.as_ref(),
+        _ => false,
+    }
 }
 
 fn valid_inferred_generic_source_callable(
@@ -10705,6 +10853,16 @@ fn publish_prepared_contextual_source_callable(
     store: &mut CanonicalTypeMapperStore,
     prepared: &PreparedContextualSourceCallableView<'_>,
 ) -> Result<TypeId, SourceCallableError> {
+    let object_method = store
+        .source_object_literal_method_owner_is_exact(prepared.declaration, prepared.owner_symbol);
+    let family = if object_method {
+        SourceCallableFamily::ObjectLiteralMethod
+    } else {
+        SourceCallableFamily::ArrowFunction
+    };
+    let owner_parent = store
+        .symbol(prepared.owner_symbol)
+        .and_then(ts_binder::semantic::Symbol::parent);
     if let Some(existing) = store.source_callable_type_for_owner(prepared.owner_symbol) {
         let provenance = store.source_callable_provenance(existing);
         let signature = provenance.and_then(|provenance| store.signature(provenance.signature));
@@ -10724,10 +10882,10 @@ fn publish_prepared_contextual_source_callable(
             validate_stored_source_callable(store, existing),
             StoredSourceCallableValidation::Valid(_)
         ) && provenance.is_some_and(|provenance| {
-            provenance.family == SourceCallableFamily::ArrowFunction
+            provenance.family == family
                 && provenance.declaration == prepared.declaration
                 && provenance.owner_symbol == prepared.owner_symbol
-                && provenance.owner_parent.is_none()
+                && provenance.owner_parent == owner_parent
                 && provenance.export_local.is_none()
                 && provenance.contextual_target == Some(prepared.contextual_target)
                 && provenance.contextual_variable == prepared.variable_symbol
@@ -10752,12 +10910,14 @@ fn publish_prepared_contextual_source_callable(
     let direct_call_anchor = prepared.variable_symbol.is_none();
     let owner = store.symbol(prepared.owner_symbol);
     let owner_valid = owner.is_some_and(|owner| {
-        matches!(
-            store.source_node_kind(prepared.declaration),
-            Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
-        ) && owner.flags() == SymbolFlags::FUNCTION
+        (object_method
+            || matches!(
+                store.source_node_kind(prepared.declaration),
+                Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression)
+            ) && owner.flags() == SymbolFlags::FUNCTION
+                && owner.name() == InternalSymbolName::Function.as_ref()
+                && owner.parent().is_none())
             && owner.check_flags() == CheckFlags::NONE
-            && owner.name() == InternalSymbolName::Function.as_ref()
             && owner.declarations() == Some(&[prepared.declaration])
             && owner.value_declaration() == Some(prepared.declaration)
             && owner.members().is_none()
@@ -10772,7 +10932,6 @@ fn publish_prepared_contextual_source_callable(
                     )
                     .is_some()
                 }))
-            && owner.parent().is_none()
             && owner.export_symbol().is_none()
             && store.get_merged_symbol(prepared.owner_symbol) == Some(prepared.owner_symbol)
             && default_parameter_links(store, prepared.owner_symbol)
@@ -10796,11 +10955,30 @@ fn publish_prepared_contextual_source_callable(
     );
     let property_anchor = anchor_valid
         && prepared.variable_symbol.is_some_and(|anchor| {
-            store
-                .symbol(anchor)
-                .is_some_and(|symbol| symbol.flags() == SymbolFlags::PROPERTY)
+            store.symbol(anchor).is_some_and(|symbol| {
+                symbol.flags() == SymbolFlags::PROPERTY
+                    || object_method && symbol.flags() == SymbolFlags::METHOD
+            })
         });
-    let target_valid = if direct_call_anchor {
+    let target_valid = if object_method {
+        authenticated_object_method_contextual_target(
+            store,
+            prepared.declaration,
+            prepared.owner_symbol,
+            prepared.contextual_target,
+        )
+        .is_some_and(|target| {
+            prepared.variable_symbol == Some(prepared.owner_symbol)
+                && prepared.flags == SignatureFlags::NONE
+                && minimum == Some(parameter_count)
+                && target.parameters.len() == parameter_count
+                && target
+                    .parameters
+                    .iter()
+                    .zip(prepared.parameters)
+                    .all(|(expected, actual)| *expected == actual.type_)
+        })
+    } else if direct_call_anchor {
         valid_direct_call_contextual_target(store, prepared.contextual_target, prepared.parameters)
             && prepared.flags == SignatureFlags::NONE
             && usize::try_from(prepared.min_argument_count).ok() == Some(parameter_count)
@@ -10932,10 +11110,10 @@ fn publish_prepared_contextual_source_callable(
     assert!(store.set_contextual_source_callable_provenance(
         type_,
         &SourceCallableProvenance {
-            family: SourceCallableFamily::ArrowFunction,
+            family,
             declaration: prepared.declaration,
             owner_symbol: prepared.owner_symbol,
-            owner_parent: None,
+            owner_parent,
             export_local: None,
             signature,
             flags: prepared.flags,
@@ -10991,6 +11169,32 @@ fn publish_prepared_contextual_source_callable(
         )));
     }
     Ok(type_)
+}
+
+/// Uses an existing nongeneric contextual signature for an ordinary method.
+pub(super) fn authenticated_object_method_contextual_target(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    target: TypeId,
+) -> Option<ValidatedSingleCallable> {
+    if !store.source_object_literal_method_owner_is_exact(declaration, owner_symbol)
+        || store.type_payload(target)?.symbol() == Some(owner_symbol)
+    {
+        return None;
+    }
+    let StoredSingleCallableValidation::Valid { callable, .. } =
+        validate_stored_single_callable(store, target)
+    else {
+        return None;
+    };
+    let signature = store.signature(callable.signature)?;
+    (signature.type_parameters().is_empty()
+        && signature.this_parameter().is_none()
+        && !signature.has_rest_parameter()
+        && callable.rest_parameter.is_none()
+        && callable.return_type.is_some())
+    .then_some(callable)
 }
 
 fn authenticated_contextual_declared_call_target(
@@ -11378,8 +11582,8 @@ pub(super) fn finalize_source_callable_structure(
     Ok(())
 }
 
-/// Publishes an authenticated zero-parameter anonymous function expression.
-pub(super) fn materialize_anonymous_source_function_expression(
+/// Publishes an authenticated zero-parameter function expression.
+pub(super) fn materialize_parameterless_source_function_expression(
     store: &mut CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
 ) -> Result<(TypeId, SignatureId), SourceCallableError> {
@@ -12366,6 +12570,26 @@ pub(super) fn source_callable_display_projection(
                         *value_type,
                     )?
                 }
+                NodeData::BindingPattern(pattern)
+                    if name_node.kind == SyntaxKind::ObjectBindingPattern =>
+                {
+                    let (arena, bound) = host
+                        .source(provenance.declaration)
+                        .ok_or(SourceCallableDisplayError::Malformed)?;
+                    let bindings = plan_function_object_parameter_bindings(
+                        arena,
+                        bound,
+                        store,
+                        provenance.declaration,
+                        declaration,
+                    )
+                    .map_err(|_| SourceCallableDisplayError::Malformed)?;
+                    source_object_binding_pattern_display(
+                        host,
+                        &bindings,
+                        pattern.elements.has_trailing_comma,
+                    )?
+                }
                 _ => return Err(SourceCallableDisplayError::Malformed),
             };
             parameters.push(ValidatedSingleCallParameterDisplay {
@@ -12457,37 +12681,11 @@ pub(super) fn source_callable_display_projection(
                     parameter.declaration,
                 )
                 .ok_or(SourceCallableDisplayError::Malformed)?;
-                let mut display = String::from("{");
-                if !bindings.is_empty() {
-                    display.push(' ');
-                }
-                for (index, binding) in bindings.iter().enumerate() {
-                    if index != 0 {
-                        display.push_str(", ");
-                    }
-                    if binding.property != binding.name {
-                        if let Some(key) = binding.computed_key {
-                            display.push('[');
-                            display.push_str(&source_object_binding_property_display(host, key)?);
-                            display.push(']');
-                        } else {
-                            display.push_str(&source_object_binding_property_display(
-                                host,
-                                binding.property,
-                            )?);
-                        }
-                        display.push_str(": ");
-                    }
-                    display.push_str(&source_object_binding_property_display(host, binding.name)?);
-                }
-                if pattern.elements.has_trailing_comma {
-                    display.push(',');
-                }
-                if !bindings.is_empty() {
-                    display.push(' ');
-                }
-                display.push('}');
-                display
+                source_object_binding_pattern_display(
+                    host,
+                    &bindings,
+                    pattern.elements.has_trailing_comma,
+                )?
             }
             NodeData::BindingPattern(pattern)
                 if authenticated_function_array_parameter_bindings(
@@ -12703,6 +12901,44 @@ fn contextual_sort_tuple_parameter_display_name(
     Ok(display)
 }
 
+fn source_object_binding_pattern_display(
+    host: &DeclaredTypeHost<'_>,
+    bindings: &[PlannedObjectBindingElement],
+    trailing_comma: bool,
+) -> Result<String, SourceCallableDisplayError> {
+    let mut display = String::from("{");
+    if !bindings.is_empty() {
+        display.push(' ');
+    }
+    for (index, binding) in bindings.iter().enumerate() {
+        if index != 0 {
+            display.push_str(", ");
+        }
+        if binding.property != binding.name {
+            if let Some(key) = binding.computed_key {
+                display.push('[');
+                display.push_str(&source_object_binding_property_display(host, key)?);
+                display.push(']');
+            } else {
+                display.push_str(&source_object_binding_property_display(
+                    host,
+                    binding.property,
+                )?);
+            }
+            display.push_str(": ");
+        }
+        display.push_str(&source_object_binding_property_display(host, binding.name)?);
+    }
+    if trailing_comma {
+        display.push(',');
+    }
+    if !bindings.is_empty() {
+        display.push(' ');
+    }
+    display.push('}');
+    Ok(display)
+}
+
 fn source_object_binding_property_display(
     host: &DeclaredTypeHost<'_>,
     node: NodeRef,
@@ -12786,6 +13022,11 @@ pub(super) fn validate_stored_source_callable(
     let Some(family) = source_family_for_kind(store.source_node_kind(declaration)) else {
         return not_source();
     };
+    if family == SourceCallableFamily::ObjectLiteralMethod
+        && !store.source_object_literal_method_owner_is_exact(declaration, owner_symbol)
+    {
+        return not_source();
+    }
     let Some(provenance) = provenance else {
         return StoredSourceCallableValidation::Malformed;
     };
@@ -12867,9 +13108,12 @@ pub(super) fn validate_stored_source_callable(
     let contextual = match (provenance.contextual_target, provenance.contextual_variable) {
         (None, None) if provenance.captured_assignment.is_none() => None,
         (Some(target), Some(variable))
-            if family == SourceCallableFamily::ArrowFunction
-                && target != type_
-                && variable != owner_symbol
+            if matches!(
+                family,
+                SourceCallableFamily::ArrowFunction | SourceCallableFamily::ObjectLiteralMethod
+            ) && target != type_
+                && (variable != owner_symbol
+                    || family == SourceCallableFamily::ObjectLiteralMethod)
                 && provenance.captured_assignment.is_none() =>
         {
             Some((target, Some(variable)))
@@ -13037,13 +13281,17 @@ pub(super) fn validate_stored_source_callable(
                     }))
         || family == SourceCallableFamily::FunctionDeclaration
             && !valid_source_function_owner_shape(store, owner_symbol, declaration)
+        || family == SourceCallableFamily::ObjectLiteralMethod
+            && (!store.source_object_literal_method_owner_is_exact(declaration, owner_symbol)
+                || provenance.export_local.is_some()
+                || !signature_record.type_parameters().is_empty())
         || owner.check_flags() != CheckFlags::NONE
         || owner.value_declaration() != Some(declaration)
         || owner.members().is_some()
         || owner.export_symbol().is_some()
         || owner.parent() != provenance.owner_parent
         || family == SourceCallableFamily::ArrowFunction
-            && (owner.name() != InternalSymbolName::Function.as_ref()
+            && (!source_expression_owner_name_is_exact(store, declaration, owner)
                 || provenance.owner_parent.is_some()
                 || provenance.export_local.is_some())
         || family == SourceCallableFamily::FunctionDeclaration
@@ -13166,7 +13414,21 @@ pub(super) fn validate_stored_source_callable(
                 .is_none()
             && !store.signature_has_circular_return_type(signature);
         let target_valid = target != type_
-            && if direct_call_anchor {
+            && if family == SourceCallableFamily::ObjectLiteralMethod {
+                variable == Some(owner_symbol)
+                    && signature_record.flags() == SignatureFlags::NONE
+                    && usize::try_from(signature_record.min_argument_count()).ok()
+                        == Some(signature_record.parameters().len())
+                    && authenticated_object_method_contextual_target(
+                        store,
+                        declaration,
+                        owner_symbol,
+                        target,
+                    )
+                    .is_some_and(|target| {
+                        expected_parameter_types == Some(target.parameters.as_slice())
+                    })
+            } else if direct_call_anchor {
                 signature_record.flags() == SignatureFlags::NONE
                     && usize::try_from(signature_record.min_argument_count()).ok()
                         == Some(signature_record.parameters().len())
@@ -14768,6 +15030,11 @@ pub(super) fn stored_source_callable_family(
     let owner = store.symbol(owner_symbol)?;
     let declaration = owner.value_declaration()?;
     let family = source_family_for_kind(store.source_node_kind(declaration))?;
+    if family == SourceCallableFamily::ObjectLiteralMethod
+        && !store.source_object_literal_method_owner_is_exact(declaration, owner_symbol)
+    {
+        return None;
+    }
     (owner.declarations() == Some(&[declaration])
         || family == SourceCallableFamily::FunctionDeclaration
             && valid_source_function_owner_shape(store, owner_symbol, declaration))
@@ -14780,6 +15047,7 @@ const fn source_family_for_kind(kind: Option<SyntaxKind>) -> Option<SourceCallab
         Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression) => {
             Some(SourceCallableFamily::ArrowFunction)
         }
+        Some(SyntaxKind::MethodDeclaration) => Some(SourceCallableFamily::ObjectLiteralMethod),
         _ => None,
     }
 }
@@ -16429,7 +16697,7 @@ mod tests {
             assert_eq!(publication_state(&fixture.store), before);
 
             let (callable, signature) =
-                materialize_anonymous_source_function_expression(&mut fixture.store, &plan)
+                materialize_parameterless_source_function_expression(&mut fixture.store, &plan)
                     .unwrap();
             let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
             assert_eq!(
@@ -16468,7 +16736,7 @@ mod tests {
 
             let warm = publication_state(&fixture.store);
             assert_eq!(
-                materialize_anonymous_source_function_expression(&mut fixture.store, &plan),
+                materialize_parameterless_source_function_expression(&mut fixture.store, &plan),
                 Ok((callable, signature)),
             );
             assert_eq!(publication_state(&fixture.store), warm);
@@ -16476,8 +16744,8 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_function_expression_plans_reject_names_and_corrupt_owners() {
-        let named = QueryFixture::new("const value = function inner() {};", FileId::new(1_902));
+    fn function_expression_plans_preserve_names_and_reject_corrupt_owners() {
+        let mut named = QueryFixture::new("const value = function inner() {};", FileId::new(1_902));
         let declaration = named
             .parsed
             .arena
@@ -16496,12 +16764,44 @@ mod tests {
             GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
         )
         .unwrap();
+        let plan = plan_source_callable(&named.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.declaration, declaration);
+        assert_eq!(plan.owner_symbol, owner);
+        assert!(plan.parameters.is_empty());
+        assert!(plan.return_type.is_inferred());
+        assert_eq!(
+            named.store.symbol(owner).unwrap().name().as_utf8(),
+            Some("inner")
+        );
+        let (callable, signature) =
+            materialize_parameterless_source_function_expression(&mut named.store, &plan).unwrap();
+        let void = named.store.intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            publish_inferred_source_callable_return(&mut named.store, &plan, signature, void),
+            Ok(void),
+        );
+        assert_eq!(
+            named.store.source_callable_type_for_owner(owner),
+            Some(callable)
+        );
+        assert_eq!(
+            named
+                .store
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(void),
+        );
         assert!(matches!(
-            plan_source_callable(&named.store, &host, declaration, owner, None),
-            Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::OverloadDeclaration(_)
-            ))
+            validate_stored_source_callable(&named.store, callable),
+            StoredSourceCallableValidation::Valid(_)
         ));
+        let warm = publication_state(&named.store);
+        assert_eq!(
+            materialize_parameterless_source_function_expression(&mut named.store, &plan),
+            Ok((callable, signature)),
+        );
+        assert_eq!(publication_state(&named.store), warm);
 
         let mut invalid = QueryFixture::new("const value = function () {};", FileId::new(1_903));
         let declaration = invalid

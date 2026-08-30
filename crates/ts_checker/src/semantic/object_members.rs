@@ -10368,6 +10368,7 @@ fn plan_members(
                     | SyntaxKind::ShorthandPropertyAssignment
                     | SyntaxKind::SpreadAssignment
                     | SyntaxKind::GetAccessor
+                    | SyntaxKind::MethodDeclaration
             ),
             PropertyObjectKind::TypeLiteral => matches!(
                 member_record.kind,
@@ -10726,6 +10727,23 @@ fn plan_members(
                             && property.facts == 0,
                     )
                 }
+                NodeData::MethodDeclaration(method)
+                    if kind == PropertyObjectKind::ObjectLiteral =>
+                {
+                    (
+                        method.name,
+                        Some(member.node),
+                        None,
+                        method.modifiers.as_ref(),
+                        None,
+                        method.symbol.is_none()
+                            && method.full_signature.is_none()
+                            && method.next_container.is_none()
+                            && method.flow_node.is_none()
+                            && method.end_flow_node.is_none()
+                            && method.facts == 0,
+                    )
+                }
                 NodeData::ShorthandPropertyAssignment(property)
                     if kind == PropertyObjectKind::ObjectLiteral =>
                 {
@@ -10836,7 +10854,11 @@ fn plan_members(
                 alias_symbol,
                 member,
             );
-        let valid_value_range = if member_record.kind == SyntaxKind::ShorthandPropertyAssignment
+        let object_method = kind == PropertyObjectKind::ObjectLiteral
+            && member_record.kind == SyntaxKind::MethodDeclaration;
+        let valid_value_range = if object_method {
+            type_node == member && type_record.range == member_record.range
+        } else if member_record.kind == SyntaxKind::ShorthandPropertyAssignment
             || kind == PropertyObjectKind::Interface && type_node == name
         {
             type_node == name && type_record.range == name_record.range
@@ -10846,7 +10868,12 @@ fn plan_members(
         } else {
             type_record.range.start >= name_record.range.end
         };
-        if type_record.parent != Some(member.node)
+        if type_record.parent
+            != Some(if object_method {
+                member_owner.node
+            } else {
+                member.node
+            })
             || !valid_value_range
             || type_record.range.end > member_record.range.end
         {
@@ -10887,17 +10914,19 @@ fn plan_members(
         let property_record = store
             .symbol(property_symbol)
             .ok_or_else(|| invalid_plan(&provisional))?;
-        let expected_flags = SymbolFlags::PROPERTY
-            | if optional {
-                SymbolFlags::OPTIONAL
-            } else {
-                SymbolFlags::NONE
-            }
-            | if kind == PropertyObjectKind::Interface {
-                property_record.flags() & SymbolFlags::ACCESSOR
-            } else {
-                SymbolFlags::NONE
-            };
+        let expected_flags = (if object_method {
+            SymbolFlags::METHOD
+        } else {
+            SymbolFlags::PROPERTY
+        }) | if optional {
+            SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        } | if kind == PropertyObjectKind::Interface {
+            property_record.flags() & SymbolFlags::ACCESSOR
+        } else {
+            SymbolFlags::NONE
+        };
         let expected_check_flags = source_property_check_flags(readonly);
         let symbol_declarations = property_record.declarations().unwrap_or_default();
         let declarations_valid = if kind == PropertyObjectKind::Interface {
@@ -18609,7 +18638,14 @@ fn valid_object_literal_property(
     }
     let bound = store.symbol(property.symbol)?;
     let cloned = store.symbol(cloned_symbol)?;
-    if bound.flags() != SymbolFlags::PROPERTY
+    let object_method =
+        store.source_object_literal_method_owner_is_exact(property.declaration, property.symbol);
+    if bound.flags()
+        != if object_method {
+            SymbolFlags::METHOD
+        } else {
+            SymbolFlags::PROPERTY
+        }
         || bound.check_flags() != CheckFlags::NONE
         || bound.name() != property.name.as_ref()
         || bound.declarations() != Some(&[property.declaration])
@@ -18647,6 +18683,24 @@ fn valid_object_literal_property_type(
     property: &PlannedProperty,
     type_: TypeId,
 ) -> bool {
+    if store.source_node_kind(property.declaration) == Some(SyntaxKind::MethodDeclaration) {
+        return property.type_node == property.declaration
+            && store.source_object_literal_method_owner_is_exact(
+                property.declaration,
+                property.symbol,
+            )
+            && store.source_callable_type_for_owner(property.symbol) == Some(type_)
+            && store
+                .source_callable_provenance(type_)
+                .is_some_and(|provenance| {
+                    provenance.family == super::store::SourceCallableFamily::ObjectLiteralMethod
+                        && provenance.declaration == property.declaration
+                })
+            && matches!(
+                super::source_callables::validate_stored_source_callable(store, type_),
+                super::source_callables::StoredSourceCallableValidation::Valid(_)
+            );
+    }
     store.type_payload(type_).is_some_and(|record| {
         !property.readonly
             || !matches!(record.data(), TypeData::Literal(literal) if literal.regular_type != type_)
@@ -18769,6 +18823,23 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
         };
         if record.flags().contains(SymbolFlags::METHOD) {
             let links = store.value_symbol_links(property.symbol);
+            if plan.kind == PropertyObjectKind::ObjectLiteral {
+                return store.source_object_literal_method_owner_is_exact(
+                    property.declaration,
+                    property.symbol,
+                ) && match links.and_then(|links| links.resolved_type) {
+                    Some(type_) => valid_object_literal_property_type(store, property, type_),
+                    None => {
+                        links.is_none_or(|links| links == &ValueSymbolLinks::default())
+                            && store
+                                .signature_links(property.declaration)
+                                .is_none_or(|links| links == &SignatureLinks::default())
+                            && store
+                                .source_callable_type_for_owner(property.symbol)
+                                .is_none()
+                    }
+                };
+            }
             if links.is_some_and(|links| links.resolved_type.is_some()) {
                 return resolved_interface_method_value(store, plan, property.symbol).is_some();
             }
@@ -22029,8 +22100,15 @@ fn valid_bound_object_literal_property(
     let Some(bound) = store.symbol(property.symbol) else {
         return false;
     };
+    let object_method =
+        store.source_object_literal_method_owner_is_exact(property.declaration, property.symbol);
     store.get_merged_symbol(property.symbol) == Some(property.symbol)
-        && bound.flags() == SymbolFlags::PROPERTY
+        && bound.flags()
+            == if object_method {
+                SymbolFlags::METHOD
+            } else {
+                SymbolFlags::PROPERTY
+            }
         && bound.check_flags() == CheckFlags::NONE
         && bound.name() == property.name.as_ref()
         && bound.declarations() == Some(&[property.declaration])
@@ -22043,8 +22121,12 @@ fn valid_bound_object_literal_property(
             == Some(SourceNodeParent::Parent(plan.node))
         && store.source_node_parent(property.name_node)
             == Some(SourceNodeParent::Parent(property.declaration))
-        && store.source_node_parent(property.type_node)
-            == Some(SourceNodeParent::Parent(property.declaration))
+        && if object_method {
+            property.type_node == property.declaration
+        } else {
+            store.source_node_parent(property.type_node)
+                == Some(SourceNodeParent::Parent(property.declaration))
+        }
         && plan
             .members
             .and_then(|members| store.symbol_table(members))

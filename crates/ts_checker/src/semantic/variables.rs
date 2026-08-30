@@ -660,8 +660,8 @@ pub(super) fn plan_class_object_binding_elements(
     )
 }
 
-/// Proves flat object bindings on a nongeneric function's annotated parameter.
-/// Named annotations need the callable planner's separate target and type proof.
+/// Proves flat object bindings on a nongeneric function or contextual arrow.
+/// The caller proves the parameter's annotated or contextual parent type.
 pub(super) fn plan_function_object_parameter_bindings(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -681,16 +681,7 @@ pub(super) fn plan_function_object_parameter_bindings(
     let function_record = arena
         .get(function.node)
         .ok_or(VariableInvariant::InvalidBindingPattern(function))?;
-    let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(function),
-        ));
-    };
-    if function_record.kind != SyntaxKind::FunctionDeclaration
-        || function_record.flags.0 != 0
-        || function_data.type_parameters.is_some()
-        || function_data.asterisk_token.is_some()
-        || function_data.body.is_none()
+    if function_record.flags.0 != 0
         || bound
             .source_facts()
             .is_none_or(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
@@ -699,20 +690,70 @@ pub(super) fn plan_function_object_parameter_bindings(
             VariableUnsupported::BindingPattern(function),
         ));
     }
-    if function_data.full_signature.is_some()
-        || function_data.next_container.is_some()
-        || function_data.symbol.is_some()
-        || function_data.local_symbol.is_some()
-        || function_data.flow_node.is_some()
-        || function_data.end_flow_node.is_some()
-        || function_data.return_flow_node.is_some()
-        || function_data.facts != 0
-        || function_data.parameters.range.start < function_record.range.start
-        || function_data.parameters.range.end > function_record.range.end
+    let (parameters, body, modifiers, contextual_arrow) = match &function_record.data {
+        NodeData::FunctionDeclaration(data)
+            if function_record.kind == SyntaxKind::FunctionDeclaration =>
+        {
+            if data.type_parameters.is_some()
+                || data.asterisk_token.is_some()
+                || data.body.is_none()
+            {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(function),
+                ));
+            }
+            if data.full_signature.is_some()
+                || data.next_container.is_some()
+                || data.symbol.is_some()
+                || data.local_symbol.is_some()
+                || data.flow_node.is_some()
+                || data.end_flow_node.is_some()
+                || data.return_flow_node.is_some()
+                || data.facts != 0
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(function).into());
+            }
+            (
+                &data.parameters,
+                data.body
+                    .ok_or(VariableInvariant::InvalidBindingPattern(function))?,
+                data.modifiers.as_ref(),
+                false,
+            )
+        }
+        NodeData::ArrowFunction(data) if function_record.kind == SyntaxKind::ArrowFunction => {
+            if data.type_parameters.is_some()
+                || data.modifiers.is_some()
+                || data.asterisk_token.is_some()
+                || data.type_.is_some()
+            {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(function),
+                ));
+            }
+            if data.full_signature.is_some()
+                || data.next_container.is_some()
+                || data.symbol.is_some()
+                || data.flow_node.is_some()
+                || data.end_flow_node.is_some()
+                || data.facts != 0
+            {
+                return Err(VariableInvariant::InvalidBindingPattern(function).into());
+            }
+            (&data.parameters, data.body, None, true)
+        }
+        _ => {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(function),
+            ));
+        }
+    };
+    if parameters.range.start < function_record.range.start
+        || parameters.range.end > function_record.range.end
     {
         return Err(VariableInvariant::InvalidBindingPattern(function).into());
     }
-    if let Some(modifiers) = &function_data.modifiers {
+    if let Some(modifiers) = modifiers {
         let mut kinds = Vec::with_capacity(modifiers.list.nodes.len());
         for modifier in &modifiers.list.nodes {
             let modifier = NodeRef::new(function.arena, function.file, *modifier);
@@ -775,10 +816,9 @@ pub(super) fn plan_function_object_parameter_bindings(
         || parameter_record.flags.0 != 0
         || parameter_data.symbol.is_some()
         || parameter_data.facts != 0
-        || parameter_record.range.start < function_data.parameters.range.start
-        || parameter_record.range.end > function_data.parameters.range.end
-        || function_data
-            .parameters
+        || parameter_record.range.start < parameters.range.start
+        || parameter_record.range.end > parameters.range.end
+        || parameters
             .nodes
             .iter()
             .filter(|node| **node == parameter.node)
@@ -799,60 +839,66 @@ pub(super) fn plan_function_object_parameter_bindings(
             VariableUnsupported::BindingPattern(parameter),
         ));
     }
-    let annotation = parameter_data
-        .type_
-        .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
-        .ok_or(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(parameter),
-        ))?;
-    let annotation_record = binding_child_node(arena, store, annotation, parameter)?;
-    if annotation_record.flags.0 != 0 {
-        return Err(VariablePlanError::Unsupported(
-            VariableUnsupported::BindingPattern(annotation),
-        ));
-    }
-    match (&annotation_record.data, annotation_record.kind) {
-        (NodeData::TypeLiteralNode(literal), SyntaxKind::TypeLiteral)
-            if literal.symbol.is_none() => {}
-        (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference)
-            if reference.type_arguments.is_none() =>
-        {
-            let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
-            let name_record = binding_child_node(arena, store, name, annotation)?;
-            let NodeData::Identifier(identifier) = &name_record.data else {
-                return Err(VariablePlanError::Unsupported(
-                    VariableUnsupported::BindingPattern(name),
-                ));
-            };
-            if name_record.kind != SyntaxKind::Identifier
-                || name_record.flags.0 != 0
-                || name_record.range != annotation_record.range
-                || identifier.flow_node.is_some()
-                || identifier.text.is_empty()
-            {
-                return Err(VariableInvariant::InvalidBindingPattern(name).into());
-            }
+    let annotation_record = if contextual_arrow {
+        if parameter_data.type_.is_some() {
+            return Err(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(parameter),
+            ));
         }
-        _ => {
+        None
+    } else {
+        let annotation = parameter_data
+            .type_
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+            .ok_or(VariablePlanError::Unsupported(
+                VariableUnsupported::BindingPattern(parameter),
+            ))?;
+        let annotation_record = binding_child_node(arena, store, annotation, parameter)?;
+        if annotation_record.flags.0 != 0 {
             return Err(VariablePlanError::Unsupported(
                 VariableUnsupported::BindingPattern(annotation),
             ));
         }
-    }
-    let body = NodeRef::new(
-        function.arena,
-        function.file,
-        function_data
-            .body
-            .ok_or(VariableInvariant::InvalidBindingPattern(function))?,
-    );
+        match (&annotation_record.data, annotation_record.kind) {
+            (NodeData::TypeLiteralNode(literal), SyntaxKind::TypeLiteral)
+                if literal.symbol.is_none() => {}
+            (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference)
+                if reference.type_arguments.is_none() =>
+            {
+                let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+                let name_record = binding_child_node(arena, store, name, annotation)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::BindingPattern(name),
+                    ));
+                };
+                if name_record.kind != SyntaxKind::Identifier
+                    || name_record.flags.0 != 0
+                    || name_record.range != annotation_record.range
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Err(VariableInvariant::InvalidBindingPattern(name).into());
+                }
+            }
+            _ => {
+                return Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(annotation),
+                ));
+            }
+        }
+        Some(annotation_record)
+    };
+    let body = NodeRef::new(function.arena, function.file, body);
     let body_record = binding_child_node(arena, store, body, function)?;
-    if body_record.kind != SyntaxKind::Block || !matches!(body_record.data, NodeData::Block(_)) {
+    if !contextual_arrow
+        && (body_record.kind != SyntaxKind::Block
+            || !matches!(body_record.data, NodeData::Block(_)))
+    {
         return Err(VariableInvariant::InvalidBindingPattern(body).into());
     }
 
-    let index = function_data
-        .parameters
+    let index = parameters
         .nodes
         .iter()
         .position(|node| *node == parameter.node)
@@ -890,7 +936,7 @@ pub(super) fn plan_function_object_parameter_bindings(
             VariableUnsupported::BindingPattern(pattern),
         ));
     }
-    if pattern_record.range.end > annotation_record.range.start
+    if annotation_record.is_some_and(|annotation| pattern_record.range.end > annotation.range.start)
         || bound.container(pattern) != Some(function)
         || bound.block_scope_container(pattern) != Some(function)
         || bound.symbol(pattern).is_some()
@@ -921,6 +967,11 @@ pub(super) fn plan_function_object_parameter_bindings(
             let property = NodeRef::new(element.arena, element.file, property);
             let property_record = binding_child_node(arena, store, property, element)?;
             if let NodeData::ComputedPropertyName(computed) = &property_record.data {
+                if contextual_arrow {
+                    return Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::BindingPattern(property),
+                    ));
+                }
                 let key = NodeRef::new(property.arena, property.file, computed.expression);
                 let key_record = binding_child_node(arena, store, key, property)?;
                 if !matches!(

@@ -4196,6 +4196,7 @@ fn resolve_published_source_callable_expando_property(
         return Ok(None);
     };
     let valid_exports = match provenance.family {
+        SourceCallableFamily::ObjectLiteralMethod => false,
         SourceCallableFamily::ArrowFunction => source_arrow_owner_expando_exports_are_valid(
             store,
             provenance.owner_symbol,

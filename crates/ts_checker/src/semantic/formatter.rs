@@ -1644,6 +1644,21 @@ fn validated_class_method_return_type(
     if method_record.flags() != SymbolFlags::METHOD {
         return Ok(None);
     }
+    if let Some(provenance) = store.source_callable_provenance(type_id)
+        && provenance.family == SourceCallableFamily::ObjectLiteralMethod
+    {
+        if provenance.owner_symbol != method
+            || !host.symbol_matches(store, provenance.declaration, method)
+            || !matches!(
+                validate_stored_source_callable(store, type_id),
+                StoredSourceCallableValidation::Valid(_)
+            )
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        // The source-callable display provider handles this object method.
+        return Ok(None);
+    }
     if let Some(return_type) =
         super::classes::selected_class_method_return_type(store, host, type_id)
             .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
@@ -11521,43 +11536,91 @@ mod tests {
     }
 
     #[test]
-    fn source_arrow_expando_display_keeps_annotated_function_expression_unsupported() {
-        use crate::semantic::{SourceCheckError, SourceSyntaxRole, UnsupportedSourceSyntax};
-
+    fn source_arrow_expando_display_keeps_annotated_function_expression_identity() {
         let parsed =
             parse_source_file("const foo = function (): void {}; foo.bar = 42; export {};");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(274);
         let mut context = external_parsed_context(&parsed, file);
-        let expression = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Syntax {
-                    node: expression,
-                    kind: SyntaxKind::FunctionExpression,
-                    role: SourceSyntaxRole::VariableInitializer,
-                }
-            ))
-        );
+        context.check_source_file(file).unwrap();
+        let (expression, callable) = source_arrow_display_type(&mut context, &parsed, file);
         let (_, bound) = context.file(file).unwrap();
         let owner = bound.symbol(expression).unwrap();
-        assert!(
-            context
-                .store()
-                .source_callable_type_for_owner(owner)
-                .is_none()
-        );
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let exports = context.store().symbol(owner).unwrap().exports().unwrap();
+        let property = context
+            .store()
+            .symbol_table(exports)
+            .unwrap()
+            .get_source("bar")
+            .unwrap();
+        let assignment = context
+            .store()
+            .symbol(property)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let NodeData::BinaryExpression(data) = &parsed.arena.get(assignment.node).unwrap().data
+        else {
+            panic!("the expando must retain its source assignment");
+        };
+        let left = NodeRef::new(assignment.arena, assignment.file, data.left);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, void) = (bootstrap.number_type, bootstrap.void_type);
+        for _ in 0..2 {
+            assert_eq!(context.get_type_at_location(expression), Ok(callable));
+            assert_eq!(context.get_type_at_location(left), Ok(number));
+            assert_eq!(context.get_symbol_at_location(left), Ok(Some(property)));
+            assert_eq!(context.get_return_type_of_signature(signature), Ok(void));
+            let store = context.store();
+            assert_eq!(store.source_callable_type_for_owner(owner), Some(callable));
+            assert_eq!(
+                store.source_callable_type_for_signature(signature),
+                Some(callable)
+            );
+            assert_eq!(
+                store.signature(signature).unwrap().declaration(),
+                Some(expression)
+            );
+            assert_eq!(
+                store.symbol_table(exports).unwrap().get_source("bar"),
+                Some(property)
+            );
+            assert_eq!(store.get_parent_of_symbol(property), Some(owner));
+            assert_eq!(
+                store.value_symbol_links(property).unwrap().resolved_type,
+                Some(number)
+            );
+            let before = format!("{store:?}");
+            let counts = (store.type_len(), store.symbol_len(), store.signature_len());
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                "{ (): void; bar: number; }"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        expression,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    )
+                    .unwrap(),
+                "{ (): void; bar: number; }",
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert!(context.diagnostics().is_empty());
+            context.recheck_source_file(file).unwrap();
+            let store = context.store();
+            assert_eq!(
+                (store.type_len(), store.symbol_len(), store.signature_len()),
+                counts
+            );
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
@@ -13901,6 +13964,456 @@ mod tests {
         assert_eq!(
             context.type_to_string(value),
             Err(TypeDisplayUnavailable::MalformedType(value))
+        );
+    }
+
+    fn source_method_display_parts(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> (NodeRef, SemanticSymbolId, TypeId) {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::MethodDeclaration(method) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(method.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(owner)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        (declaration, owner, callable)
+    }
+
+    fn assert_source_object_method_display(
+        context: &mut CanonicalCheckerContext<'_>,
+        declaration: NodeRef,
+        callable: TypeId,
+        expected: Result<&str, TypeDisplayUnavailable>,
+    ) {
+        let counts = alias_display_cache_counts(context);
+        let resolution = context.store().type_resolution_internal_state();
+        let diagnostics = context.diagnostics().clone();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let owner_links = context
+            .store()
+            .value_symbol_links(provenance.owner_symbol)
+            .cloned();
+        let signature_links = context.store().signature_links(declaration).cloned();
+        let node_links = context.store().type_node_links(declaration).cloned();
+        let returned = context
+            .store()
+            .signature(provenance.signature)
+            .unwrap()
+            .resolved_return_type();
+        for _ in 0..2 {
+            assert_eq!(
+                context.type_to_string(callable).as_deref(),
+                expected.as_ref().copied()
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location_with_flags(
+                        callable,
+                        declaration,
+                        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT
+                    )
+                    .as_deref(),
+                expected.as_ref().copied()
+            );
+            assert_eq!(alias_display_cache_counts(context), counts);
+            assert_eq!(context.store().type_resolution_internal_state(), resolution);
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(
+                context.store().source_callable_provenance(callable),
+                Some(provenance)
+            );
+            assert_eq!(
+                context.store().value_symbol_links(provenance.owner_symbol),
+                owner_links.as_ref()
+            );
+            assert_eq!(
+                context.store().signature_links(declaration),
+                signature_links.as_ref()
+            );
+            assert_eq!(
+                context.store().type_node_links(declaration),
+                node_links.as_ref()
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(provenance.signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                returned
+            );
+        }
+    }
+
+    #[test]
+    fn source_object_method_display_keeps_contextual_literal_diagnostics_and_identity() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { run(): 1; }\n",
+            "const object: Shape = { run() { return 2; } };\n",
+            "const result = object.run();",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(204);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let target_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the checked declaration must remain an object method")
+        };
+        let name = NodeRef::new(parsed.arena.id(), file, method.name);
+        for source_first in [false, true] {
+            let mut context = parsed_context(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    no_implicit_any: true,
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            if source_first {
+                context.check_source_file(file).unwrap();
+            } else {
+                context.get_type_at_location(declaration).unwrap();
+            }
+            let (actual_declaration, owner, callable) =
+                source_method_display_parts(&context, &parsed, file, "run");
+            assert_eq!(actual_declaration, declaration);
+            let object_owner = context.store().symbol(owner).unwrap().parent().unwrap();
+            assert_eq!(
+                context.store().symbol(object_owner).unwrap().flags(),
+                SymbolFlags::OBJECT_LITERAL
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .declared_type_links(object_owner)
+                    .and_then(|links| links.declared_type),
+                None
+            );
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            assert_eq!(provenance.family, SourceCallableFamily::ObjectLiteralMethod);
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(provenance.declaration, declaration);
+            assert!(
+                context
+                    .store()
+                    .source_object_literal_method_owner_is_exact(declaration, owner)
+            );
+            let returned = context
+                .store()
+                .signature(provenance.signature)
+                .unwrap()
+                .resolved_return_type()
+                .unwrap();
+            assert_eq!(context.type_to_string(returned).unwrap(), "2");
+            let TypeData::Literal(literal) = context.store().type_payload(returned).unwrap().data()
+            else {
+                panic!("the source return must retain its numeric literal")
+            };
+            assert_eq!(literal.regular_type, returned);
+            let diagnostics = context.diagnostics().clone();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("the method must report one contextual return mismatch")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(diagnostic.node, Some(name));
+            assert_eq!(diagnostic.range_override, None);
+            assert_eq!(diagnostic.diagnostic.arguments, ["() => 2", "() => 1"]);
+            let [related] = diagnostic.related_information.as_slice() else {
+                panic!("the target method declaration must remain in the diagnostic")
+            };
+            assert_eq!(related.diagnostic.code(), 6500);
+            assert_eq!(related.node, Some(target_declaration));
+            assert_eq!(related.diagnostic.arguments, ["run", "Shape"]);
+            let counts = alias_display_cache_counts(&context);
+            for _ in 0..2 {
+                assert_source_object_method_display(
+                    &mut context,
+                    declaration,
+                    callable,
+                    Ok("() => 2"),
+                );
+                assert_eq!(
+                    type_to_string(context.store(), callable),
+                    Err(TypeDisplayUnavailable::FunctionType {
+                        type_id: callable,
+                        reason: FunctionTypeDisplayUnavailable::SourceContext,
+                    })
+                );
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(
+                    source_method_display_parts(&context, &parsed, file, "run"),
+                    (declaration, owner, callable)
+                );
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(alias_display_cache_counts(&context), counts);
+            }
+        }
+    }
+
+    #[test]
+    fn source_object_method_display_rejects_changed_owners_signatures_and_unbranded_copies() {
+        let parsed = parse_source_file(concat!(
+            "const object: any = { run(value: number): number { return value; } };\n",
+            "class Model { classRun() {} }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(205);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (declaration, owner, callable) =
+            source_method_display_parts(&context, &parsed, file, "run");
+        let (_, class_method, class_callable) =
+            source_method_display_parts(&context, &parsed, file, "classRun");
+        let object_owner = context.store().symbol(owner).unwrap().parent().unwrap();
+        let class_owner = context
+            .store()
+            .symbol(class_method)
+            .unwrap()
+            .parent()
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert_eq!(provenance.family, SourceCallableFamily::ObjectLiteralMethod);
+        assert!(
+            context
+                .store()
+                .source_callable_provenance(class_callable)
+                .is_none()
+        );
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
+        );
+        assert_eq!(
+            context.type_to_string(class_callable).unwrap(),
+            "() => void"
+        );
+        for (method, wrong_parent, original_parent, type_, expected) in [
+            (
+                owner,
+                class_owner,
+                object_owner,
+                callable,
+                "(value: number) => number",
+            ),
+            (
+                class_method,
+                object_owner,
+                class_owner,
+                class_callable,
+                "() => void",
+            ),
+        ] {
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                method,
+                None,
+                None,
+                Some(wrong_parent),
+                None
+            ));
+            assert_malformed_display_without_writes(&context, type_);
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                method,
+                None,
+                None,
+                Some(original_parent),
+                None
+            ));
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+        let owner_links = context.store().value_symbol_links(owner).unwrap().clone();
+        let signature_links = context
+            .store()
+            .signature_links(declaration)
+            .unwrap()
+            .clone();
+        let (returned, parameter) = {
+            let signature = context.store().signature(provenance.signature).unwrap();
+            (
+                signature.resolved_return_type().unwrap(),
+                signature.parameters()[0],
+            )
+        };
+        let parameter_links = context
+            .store()
+            .value_symbol_links(parameter)
+            .unwrap()
+            .clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let reject = |context: &mut CanonicalCheckerContext<'_>| {
+            assert_source_object_method_display(
+                context,
+                declaration,
+                callable,
+                Err(TypeDisplayUnavailable::MalformedType(callable)),
+            );
+        };
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(owner, ValueSymbolLinks::default())
+        );
+        reject(&mut context);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(owner, owner_links)
+        );
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(declaration, SignatureLinks::default())
+        );
+        reject(&mut context);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(declaration, signature_links)
+        );
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(provenance.signature, Some(string))
+        );
+        reject(&mut context);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_return_type(provenance.signature, Some(returned))
+        );
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
+        );
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..parameter_links.clone()
+            }
+        ));
+        reject(&mut context);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(parameter, parameter_links)
+        );
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(callable, Some(class_method))
+        );
+        reject(&mut context);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(callable, Some(owner))
+        );
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
+        );
+
+        let unbranded = context
+            .store_mut_for_test()
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            unbranded,
+            None,
+            None,
+            Some(vec![provenance.signature]),
+            None,
+            None
+        ));
+        assert!(
+            context
+                .store()
+                .source_callable_provenance(unbranded)
+                .is_none()
+        );
+        assert_malformed_display_without_writes(&context, unbranded);
+        assert_source_object_method_display(
+            &mut context,
+            declaration,
+            callable,
+            Ok("(value: number) => number"),
         );
     }
 

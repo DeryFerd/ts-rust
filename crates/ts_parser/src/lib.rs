@@ -1182,7 +1182,7 @@ impl<'a> Parser<'a> {
             }
             let statement = self.parse_statement();
             if let Some(signature) = jsdoc_signature {
-                self.attach_javascript_jsdoc_arrow_signature(statement, signature);
+                self.attach_javascript_jsdoc_callable_signature(statement, signature);
             }
             statements.push(statement);
             if before == (self.current.kind, self.current.range) {
@@ -1234,36 +1234,53 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn javascript_jsdoc_arrow_parameters(
+    fn javascript_jsdoc_callable_parameters(
         &self,
         statement: NodeId,
         signature: &JavaScriptJsDocCallableSignature,
     ) -> Option<(NodeId, Vec<NodeId>)> {
-        let NodeData::VariableStatement(statement_data) = &self.arena.get(statement)?.data else {
-            return None;
-        };
-        let NodeData::VariableDeclarationList(declarations) =
-            &self.arena.get(statement_data.declaration_list)?.data
-        else {
-            return None;
-        };
-        let [declaration] = declarations.declarations.nodes.as_slice() else {
-            return None;
-        };
-        let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data else {
-            return None;
-        };
-        let arrow = variable.initializer?;
-        let NodeData::ArrowFunction(function) = &self.arena.get(arrow)?.data else {
-            return None;
-        };
-        if function.type_parameters.is_some()
-            || function.type_.is_some()
-            || function.parameters.nodes.len() != signature.parameters.len()
+        let (callable, parameters, type_parameters, return_type) =
+            match &self.arena.get(statement)?.data {
+                NodeData::FunctionDeclaration(function) if function.body.is_some() => (
+                    statement,
+                    &function.parameters,
+                    function.type_parameters.as_ref(),
+                    function.type_,
+                ),
+                NodeData::VariableStatement(statement_data) => {
+                    let NodeData::VariableDeclarationList(declarations) =
+                        &self.arena.get(statement_data.declaration_list)?.data
+                    else {
+                        return None;
+                    };
+                    let [declaration] = declarations.declarations.nodes.as_slice() else {
+                        return None;
+                    };
+                    let NodeData::VariableDeclaration(variable) =
+                        &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    let arrow = variable.initializer?;
+                    let NodeData::ArrowFunction(function) = &self.arena.get(arrow)?.data else {
+                        return None;
+                    };
+                    (
+                        arrow,
+                        &function.parameters,
+                        function.type_parameters.as_ref(),
+                        function.type_,
+                    )
+                }
+                _ => return None,
+            };
+        if type_parameters.is_some()
+            || return_type.is_some()
+            || parameters.nodes.len() != signature.parameters.len()
         {
             return None;
         }
-        let parameters = function.parameters.nodes.clone();
+        let parameters = parameters.nodes.clone();
         if parameters
             .iter()
             .zip(&signature.parameters)
@@ -1283,16 +1300,16 @@ impl<'a> Parser<'a> {
         {
             return None;
         }
-        Some((arrow, parameters))
+        Some((callable, parameters))
     }
 
-    fn attach_javascript_jsdoc_arrow_signature(
+    fn attach_javascript_jsdoc_callable_signature(
         &mut self,
         statement: NodeId,
         signature: JavaScriptJsDocCallableSignature,
     ) {
-        let Some((arrow, parameters)) =
-            self.javascript_jsdoc_arrow_parameters(statement, &signature)
+        let Some((callable, parameters)) =
+            self.javascript_jsdoc_callable_parameters(statement, &signature)
         else {
             return;
         };
@@ -1351,22 +1368,27 @@ impl<'a> Parser<'a> {
         }
         if let Some(node) = self.arena.get_mut(return_type) {
             node.flags = NodeFlags::REPARSED;
-            node.parent = Some(arrow);
+            node.parent = Some(callable);
         }
         if let Some(node) = self.arena.get_mut(type_parameter) {
-            node.parent = Some(arrow);
+            node.parent = Some(callable);
         }
-        let Some(NodeData::ArrowFunction(function)) =
-            self.arena.get_mut(arrow).map(|node| &mut node.data)
-        else {
-            return;
-        };
-        function.type_parameters = Some(NodeList {
+        let type_parameters = Some(NodeList {
             range: signature.template_range,
             nodes: vec![type_parameter],
             has_trailing_comma: false,
         });
-        function.type_ = Some(return_type);
+        match self.arena.get_mut(callable).map(|node| &mut node.data) {
+            Some(NodeData::ArrowFunction(function)) => {
+                function.type_parameters = type_parameters;
+                function.type_ = Some(return_type);
+            }
+            Some(NodeData::FunctionDeclaration(function)) => {
+                function.type_parameters = type_parameters;
+                function.type_ = Some(return_type);
+            }
+            _ => unreachable!("the source-owned callable was checked before reparsing"),
+        }
     }
 
     fn parse_javascript_jsdoc_type(
