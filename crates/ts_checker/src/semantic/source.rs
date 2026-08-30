@@ -59904,13 +59904,18 @@ fn recover_unclosed_jsx_source(
     options: CanonicalCheckerOptions,
     error: SourceCheckError,
 ) -> Result<bool, SourceCheckError> {
-    let SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
-        node: failure,
-        kind: SyntaxKind::MethodDeclaration,
-        role: SourceSyntaxRole::ObjectProperty,
-    }) = error
-    else {
-        return Ok(false);
+    let (failure, is_receiver_failure) = match error {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node,
+            kind: SyntaxKind::MethodDeclaration,
+            role: SourceSyntaxRole::ObjectProperty,
+        }) => (node, false),
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node,
+            kind: SyntaxKind::Identifier,
+            role: SourceSyntaxRole::VariableInitializer,
+        }) => (node, true),
+        _ => return Ok(false),
     };
     let Some(facts) = bound.source_facts() else {
         return Ok(false);
@@ -59973,7 +59978,7 @@ fn recover_unclosed_jsx_source(
     else {
         return Ok(false);
     };
-    if object_variable.annotation.is_some() || method != failure {
+    if object_variable.annotation.is_some() || !is_receiver_failure && method != failure {
         return Ok(false);
     }
 
@@ -60060,6 +60065,7 @@ fn recover_unclosed_jsx_source(
     };
     if outer_tag_record.kind != SyntaxKind::PropertyAccessExpression
         || outer_tag_record.flags.0 != 0
+        || is_receiver_failure && receiver != failure
         || access.flow_node.is_some()
         || access.question_dot_token.is_some()
         || access.facts != 0
@@ -76461,6 +76467,234 @@ mod tests {
         }
         assert!(context.diagnostics().is_empty());
         let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    const UNCLOSED_JSX_RECOVERY_SOURCE: &str = concat!(
+        "declare const React: any\n",
+        "\n",
+        "let Foo = {\n",
+        "  Bar() {}\n",
+        "}\n",
+        "\n",
+        "let Baz = () => {}\n",
+        "\n",
+        "let x = <    Foo.Bar >Hello\n",
+        "\n",
+        "let y = <   Baz >Hello",
+    );
+
+    fn unclosed_jsx_recovery_options() -> CanonicalCheckerOptions {
+        CanonicalCheckerOptions {
+            jsx_runtime: super::super::production::CanonicalJsxRuntime::Classic,
+            name_resolution: CanonicalNameResolverOptions {
+                emit_target: ts_options::ScriptTarget::Es2015,
+                ..CanonicalNameResolverOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        }
+    }
+
+    fn unclosed_jsx_recovery_nodes(source: &ParseResult, file: FileId) -> [NodeRef; 5] {
+        let object = variable_initializer(source, file, "Foo");
+        let NodeData::ObjectLiteralExpression(object_data) =
+            &source.arena.get(object.node).unwrap().data
+        else {
+            panic!("Foo must retain its real object initializer")
+        };
+        let [method] = object_data.properties.nodes.as_slice() else {
+            panic!("the original object must have one method")
+        };
+        let view = variable_initializer(source, file, "x");
+        let NodeData::JsxElement(outer) = &source.arena.get(view.node).unwrap().data else {
+            panic!("x must retain the unclosed outer element")
+        };
+        let NodeData::JsxOpeningElement(opening) =
+            &source.arena.get(outer.opening_element).unwrap().data
+        else {
+            panic!("the outer element must have its real opening tag")
+        };
+        let tag = child_ref(view, opening.tag_name);
+        let NodeData::PropertyAccessExpression(access) = &source.arena.get(tag.node).unwrap().data
+        else {
+            panic!("the outer tag must be the written property access")
+        };
+        let [_, inner] = outer.children.nodes.as_slice() else {
+            panic!("the outer element must retain its text and inner element")
+        };
+        let NodeData::JsxElement(inner) = &source.arena.get(*inner).unwrap().data else {
+            panic!("the second opening must remain an inner JSX element")
+        };
+        let NodeData::JsxOpeningElement(inner_opening) =
+            &source.arena.get(inner.opening_element).unwrap().data
+        else {
+            panic!("the inner element must have its real opening tag")
+        };
+        let declaration = variable_declaration(source, file, "Foo");
+        let NodeData::VariableDeclaration(variable) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("Foo must retain its bound declaration")
+        };
+        [
+            child_ref(object, *method),
+            child_ref(tag, access.expression),
+            child_ref(tag, access.name),
+            child_ref(view, inner_opening.tag_name),
+            child_ref(declaration, variable.name),
+        ]
+    }
+
+    fn assert_unclosed_jsx_recovery_is_read_only(
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+        error: SourceCheckError,
+        expected: bool,
+    ) {
+        let before = observable_state(context, file);
+        let store_before = format!("{:#?}", context.store());
+        let (arena, bound) = context.file(file).unwrap();
+        let host = context.declared_type_host().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                recover_unclosed_jsx_source(
+                    arena,
+                    bound,
+                    &host,
+                    context.store(),
+                    context.options(),
+                    error,
+                ),
+                Ok(expected),
+                "{error:?}",
+            );
+            assert_eq!(observable_state(context, file), before);
+            assert_eq!(format!("{:#?}", context.store()), store_before);
+        }
+    }
+
+    #[test]
+    fn unclosed_jsx_recovery_keeps_method_and_outer_receiver_anchors() {
+        let source = ts_parser::parse_jsx_source_file(UNCLOSED_JSX_RECOVERY_SOURCE);
+        assert_eq!(source.diagnostics.len(), 3);
+        let file = FileId::new(202_330);
+        let mut context = context(&[(file, &source)], unclosed_jsx_recovery_options());
+        let [method, receiver, _, _, _] = unclosed_jsx_recovery_nodes(&source, file);
+        let method_error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node: method,
+            kind: SyntaxKind::MethodDeclaration,
+            role: SourceSyntaxRole::ObjectProperty,
+        });
+        let receiver_error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+            node: receiver,
+            kind: SyntaxKind::Identifier,
+            role: SourceSyntaxRole::VariableInitializer,
+        });
+        let before = observable_state(&context, file);
+        let store_before = format!("{:#?}", context.store());
+        let actual_error = {
+            let (arena, bound) = context.file(file).unwrap();
+            let host = context.declared_type_host().unwrap();
+            let Err(error) = SourcePlanner::new_semantic_with_global_types(
+                arena,
+                bound,
+                context.source_file(file).unwrap(),
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+            )
+            .finish() else {
+                panic!("ordinary JSX planning must retain its actual receiver boundary")
+            };
+            error
+        };
+        assert_eq!(actual_error, receiver_error);
+        assert_eq!(observable_state(&context, file), before);
+        assert_eq!(format!("{:#?}", context.store()), store_before);
+        for error in [method_error, actual_error] {
+            assert_unclosed_jsx_recovery_is_read_only(&context, file, error, true);
+        }
+        assert!(!is_type_checked(&context, file));
+
+        context.check_source_file(file).unwrap();
+
+        assert!(is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_declaration(method)
+                .is_none()
+        );
+        assert!(context.store().type_node_links(receiver).is_none());
+        let warm = observable_state(&context, file);
+        for error in [method_error, actual_error] {
+            assert_unclosed_jsx_recovery_is_read_only(&context, file, error, true);
+        }
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn unclosed_jsx_recovery_rejects_wrong_nodes_roles_foreign_owners_and_invariants() {
+        let source = ts_parser::parse_jsx_source_file(UNCLOSED_JSX_RECOVERY_SOURCE);
+        let foreign_source = ts_parser::parse_jsx_source_file(UNCLOSED_JSX_RECOVERY_SOURCE);
+        let file = FileId::new(202_331);
+        let foreign_file = FileId::new(202_332);
+        let mut context = context(&[(file, &source)], unclosed_jsx_recovery_options());
+        let [method, receiver, property, inner, declaration_name] =
+            unclosed_jsx_recovery_nodes(&source, file);
+        let [foreign_method, foreign_receiver, _, _, _] =
+            unclosed_jsx_recovery_nodes(&foreign_source, foreign_file);
+        let receiver_error = |node| {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node,
+                kind: SyntaxKind::Identifier,
+                role: SourceSyntaxRole::VariableInitializer,
+            })
+        };
+        let method_error = |node| {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node,
+                kind: SyntaxKind::MethodDeclaration,
+                role: SourceSyntaxRole::ObjectProperty,
+            })
+        };
+        let errors = [
+            receiver_error(property),
+            receiver_error(inner),
+            receiver_error(declaration_name),
+            receiver_error(method),
+            method_error(receiver),
+            receiver_error(foreign_receiver),
+            method_error(foreign_method),
+            receiver_error(NodeRef::new(receiver.arena, foreign_file, receiver.node)),
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: receiver,
+                kind: SyntaxKind::Identifier,
+                role: SourceSyntaxRole::ObjectProperty,
+            }),
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: method,
+                kind: SyntaxKind::MethodDeclaration,
+                role: SourceSyntaxRole::VariableInitializer,
+            }),
+            SourceCheckError::Property(receiver),
+        ];
+        for error in errors {
+            assert_unclosed_jsx_recovery_is_read_only(&context, file, error, false);
+        }
+        assert!(!is_type_checked(&context, file));
+        assert!(context.diagnostics().is_empty());
+
+        context.check_source_file(file).unwrap();
+
+        let warm = observable_state(&context, file);
+        for error in errors {
+            assert_unclosed_jsx_recovery_is_read_only(&context, file, error, false);
+        }
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
