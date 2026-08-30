@@ -7296,6 +7296,13 @@ fn authenticate_synthetic_import_namespace_identity(
     let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
         return Err(invalid());
     };
+    let import_name = store
+        .source_child_with_kind(binding, SyntaxKind::Identifier)
+        .ok_or_else(invalid)?;
+    let import_name_text = store
+        .source_identifier_text(import_name)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(invalid)?;
 
     if record.flags() != expected_flags
         || record.check_flags() != CheckFlags::NONE
@@ -7350,7 +7357,10 @@ fn authenticate_synthetic_import_namespace_identity(
         || store.source_node_parent(clause) != Some(SourceNodeParent::Parent(originating_import))
         || store.source_node_kind(originating_import) != Some(SyntaxKind::ImportDeclaration)
         || alias_record.flags() != SymbolFlags::ALIAS
-        || alias_record.name() != owner.name()
+        || alias_record.check_flags() != CheckFlags::NONE
+        || store.source_declaration_symbol(binding) != Some(alias)
+        || !store.source_symbol_declarations_match(alias)
+        || alias_record.name().as_utf8() != Some(import_name_text)
         || store.alias_symbol_links(alias).is_none_or(|alias_links| {
             alias_links.immediate_target != Some(synthetic)
                 || alias_links.alias_target != AliasTargetState::Resolved(synthetic)
@@ -7698,7 +7708,14 @@ fn plan_synthetic_import_namespace(
         || binding_data.local_symbol.is_some()
         || binding_data.symbol.is_some()
         || import_bound.symbol(binding) != Some(alias)
-        || imported_name_text != function_name_text
+        || import_bound
+            .locals(import_bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&imported_name_text))
+            != Some(alias)
+        || store
+            .symbol(alias)
+            .is_none_or(|record| record.name().as_utf8() != Some(imported_name_text.as_str()))
     {
         return Err(invalid());
     }
@@ -18521,6 +18538,171 @@ export default <T>(): Subject<T> => {
                 .and_then(|links| links.resolved_type),
             Some(callable),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep cold and warm ownership damage with exact recovery.
+    fn renamed_synthetic_namespace_imports_reject_cross_import_proofs_and_recover() {
+        for warm in [false, true] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    "import * as renamed from './foo'; const imported = renamed;",
+                    "import * as renamed from './foo'; const imported = renamed;",
+                    concat!(
+                        "declare function foo(): void; ",
+                        "declare namespace foo { export const items: number; } ",
+                        "export = foo;",
+                    ),
+                ],
+                &[
+                    Route {
+                        source: 0,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                    Route {
+                        source: 1,
+                        specifier: 0,
+                        target: Some(2),
+                    },
+                ],
+                &[2],
+            );
+            let plans = [fixture.plan_import(0, 0), fixture.plan_import(1, 0)];
+            let reads: [_; 2] = std::array::from_fn(|index| {
+                let file = &fixture.files[index];
+                plan_source_import_identifier_read(
+                    &file.parsed.arena,
+                    fixture.bound.get(&file.file).unwrap(),
+                    &fixture.store,
+                    &plans[index].bindings[0],
+                    identifier_initializer(&fixture, index, "renamed"),
+                    "renamed",
+                    plans[index].bindings[0].alias_symbol,
+                )
+                .unwrap()
+            });
+            let resolved: [_; 2] = std::array::from_fn(|index| {
+                resolve_all(&mut fixture, &plans[index].bindings)
+                    .unwrap()
+                    .remove(0)
+            });
+            let aliases = plans.each_ref().map(|plan| plan.bindings[0].alias_symbol);
+            let wrappers = resolved.each_ref().map(|value| value.target_symbol);
+            assert_ne!(aliases[0], aliases[1]);
+            assert_ne!(wrappers[0], wrappers[1]);
+            for value in &resolved {
+                resolve_namespace_exports(&mut fixture, value).unwrap();
+            }
+            let published = warm.then(|| {
+                let values: [_; 2] = std::array::from_fn(|index| {
+                    prepare_one(&mut fixture, &resolved[index], &reads[index]).unwrap()
+                });
+                assert_ne!(values[0].type_, values[1].type_);
+                publish_for_test(&mut fixture.store, &values);
+                values
+            });
+            let original_links = fixture
+                .store
+                .export_type_links(wrappers[0])
+                .unwrap()
+                .clone();
+            let other_links = fixture
+                .store
+                .export_type_links(wrappers[1])
+                .unwrap()
+                .clone();
+            assert_eq!(original_links.target, other_links.target);
+            assert_ne!(
+                original_links.originating_import,
+                other_links.originating_import
+            );
+            assert_eq!(
+                fixture.store.symbol(aliases[0]).unwrap().name(),
+                fixture.store.symbol(aliases[1]).unwrap().name(),
+            );
+
+            // A matching spelling and forged origin must not replace the real binder owner.
+            assert!(fixture.store.set_symbol_declarations(
+                aliases[0],
+                Some(vec![plans[1].bindings[0].declaration]),
+                None,
+            ));
+            assert!(
+                fixture
+                    .store
+                    .set_export_type_links(wrappers[0], other_links)
+            );
+            let damaged = store_state(&fixture.store);
+            assert!(matches!(
+                authenticate_synthetic_import_namespace_identity(&fixture.store, aliases[0], wrappers[0]),
+                Err(SourceImportError::Invariant(SourceImportInvariant::InvalidTargetLinks(target)))
+                    if target == wrappers[0]
+            ));
+            assert_eq!(
+                resolve_namespace_exports(&mut fixture, &resolved[0]),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::InvalidTargetLinks(wrappers[0])
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), damaged);
+            assert!(fixture.store.set_symbol_declarations(
+                aliases[0],
+                Some(vec![plans[0].bindings[0].declaration]),
+                None,
+            ));
+            assert!(
+                fixture
+                    .store
+                    .set_export_type_links(wrappers[0], original_links.clone())
+            );
+
+            let first_bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let locals = first_bound.locals(first_bound.source_file()).unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(locals, EscapedName::source("renamed"), aliases[1]),
+                Some(Some(aliases[0])),
+            );
+            let damaged = store_state(&fixture.store);
+            let host = property_type_import_host(&fixture.files, &fixture.bound, None);
+            assert!(matches!(
+                plan_synthetic_import_namespace(
+                    &fixture.store, &host, &fixture.global_types, aliases[0], wrappers[0],
+                ),
+                Err(SourceImportError::Invariant(SourceImportInvariant::InvalidTargetLinks(target)))
+                    if target == wrappers[0]
+            ));
+            assert_eq!(store_state(&fixture.store), damaged);
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(locals, EscapedName::source("renamed"), aliases[0]),
+                Some(Some(aliases[1])),
+            );
+            let restored: [_; 2] = std::array::from_fn(|index| {
+                resolve_namespace_exports(&mut fixture, &resolved[index]).unwrap();
+                prepare_one(&mut fixture, &resolved[index], &reads[index]).unwrap()
+            });
+            assert_ne!(restored[0].type_, restored[1].type_);
+            if let Some(published) = published {
+                assert_eq!(restored, published);
+            }
+            assert_eq!(
+                fixture.store.export_type_links(wrappers[0]),
+                Some(&original_links)
+            );
+            publish_for_test(&mut fixture.store, &restored);
+            let replay = store_state(&fixture.store);
+            for index in 0..2 {
+                assert_eq!(
+                    prepare_one(&mut fixture, &resolved[index], &reads[index]).unwrap(),
+                    restored[index],
+                );
+            }
+            assert_eq!(store_state(&fixture.store), replay);
+        }
     }
 
     #[test]

@@ -2621,9 +2621,14 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let NodeData::Identifier(import_name_data) = &import_name.data else {
             return Err(malformed());
         };
-        if clause_data.name.is_some() || import_name_data.text != expression_name.text {
+        if clause_data.name.is_some() {
             return Ok(None);
         }
+        let alias_record = store.symbol(alias).ok_or_else(malformed)?;
+        let import_scope = importer
+            .bound
+            .container(declaration)
+            .ok_or_else(malformed)?;
         if namespace_import.kind != SyntaxKind::NamespaceImport
             || namespace_import.flags.0 != 0
             || namespace_import_data.local_symbol.is_some()
@@ -2645,6 +2650,22 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             || import_data.facts != 0
             || import_data.modifiers.is_some()
             || importer.bound.symbol(declaration) != Some(alias)
+            || store.source_declaration_symbol(declaration) != Some(alias)
+            || alias_record.flags() != SymbolFlags::ALIAS
+            || alias_record.check_flags() != CheckFlags::NONE
+            || alias_record.declarations() != Some(&[declaration])
+            || alias_record.value_declaration().is_some()
+            || alias_record.members().is_some()
+            || alias_record.exports().is_some()
+            || alias_record.parent().is_some()
+            || alias_record.export_symbol().is_some()
+            || store.get_merged_symbol(alias) != Some(alias)
+            || importer
+                .bound
+                .locals(import_scope)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&import_name_data.text))
+                != Some(alias)
             || !importer.bound.contains(originating_import)
             || !store.contains_node_ref(originating_import)
             || !matches!(
@@ -2654,7 +2675,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                         && import_name.parent == Some(declaration.node)
                         && import_name.flags.0 == 0
                         && name.flow_node.is_none()
-                        && name.text == expression_name.text
+                        && !name.text.is_empty()
+                        && alias_record.name().as_utf8() == Some(name.text.as_str())
             )
         {
             return Err(malformed());
@@ -6591,6 +6613,138 @@ mod tests {
             (store.symbol_len(), store.symbol_store().symbol_table_len()),
             allocations,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check local-table damage before and after wrapper publication.
+    fn declaration_namespace_import_renames_keep_binder_owners_cold_and_warm() {
+        for warm in [false, true] {
+            let first = parsed("import * as renamed from './foo';");
+            let second = parsed("import * as renamed from './foo';");
+            let provider = parsed(concat!(
+                "declare function foo(): void; ",
+                "declare namespace foo { export const items: number; } ",
+                "export = foo;",
+            ));
+            let first_file = FileId::new(13_870);
+            let second_file = FileId::new(13_871);
+            let provider_file = FileId::new(13_872);
+            let files = [
+                (first_file, &first, CanonicalModuleState::External),
+                (second_file, &second, CanonicalModuleState::External),
+                (provider_file, &provider, CanonicalModuleState::External),
+            ];
+            let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+                &files,
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        node_ref(&first, first_file, module_specifiers(&first)[0]),
+                        esm(provider_file),
+                    ),
+                    CanonicalModuleResolutionEntry::resolved(
+                        node_ref(&second, second_file, module_specifiers(&second)[0]),
+                        esm(provider_file),
+                    ),
+                ]),
+                &[provider_file],
+            );
+            let bindings = [
+                alias_declaration_named(&first, first_file, "renamed"),
+                alias_declaration_named(&second, second_file, "renamed"),
+            ];
+            let aliases = bindings.map(|binding| alias(&bound_files, binding));
+            let first_bound = bound_files.get(&first_file).unwrap();
+            let locals = first_bound.locals(first_bound.source_file()).unwrap();
+            let provider_bound = bound_files.get(&provider_file).unwrap();
+            let original = store
+                .symbol_table(provider_bound.locals(provider_bound.source_file()).unwrap())
+                .unwrap()
+                .get_source("foo")
+                .unwrap();
+            let module = source_module(&bound_files, provider_file);
+            let mut host =
+                ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                    .unwrap();
+            if warm {
+                for alias in aliases {
+                    host.get_target_of_alias_declaration(&mut store, alias)
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                store.insert_symbol(locals, EscapedName::source("renamed"), aliases[1]),
+                Some(Some(aliases[0])),
+            );
+            let before = (
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                aliases.map(|alias| store.alias_symbol_links(alias).cloned()),
+            );
+            assert_eq!(
+                host.get_target_of_alias_declaration(&mut store, aliases[0]),
+                Err(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                    declaration: bindings[0],
+                    module,
+                }),
+            );
+            assert_eq!(
+                (
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                    aliases.map(|alias| store.alias_symbol_links(alias).cloned()),
+                ),
+                before,
+            );
+            assert_eq!(
+                store.insert_symbol(locals, EscapedName::source("renamed"), aliases[0]),
+                Some(Some(aliases[1])),
+            );
+            let wrappers = aliases.map(|alias| {
+                let CanonicalImmediateAliasTarget::Resolved(wrapper) = host
+                    .get_target_of_alias_declaration(&mut store, alias)
+                    .unwrap()
+                else {
+                    panic!("the namespace import resolves")
+                };
+                wrapper
+            });
+            assert_ne!(wrappers[0], wrappers[1]);
+            for (index, wrapper) in wrappers.into_iter().enumerate() {
+                assert_ne!(wrapper, original);
+                let parsed = files[index].1;
+                let clause = parsed
+                    .arena
+                    .get(bindings[index].node)
+                    .unwrap()
+                    .parent
+                    .unwrap();
+                let import = parsed.arena.get(clause).unwrap().parent.unwrap();
+                assert_eq!(
+                    store.export_type_links(wrapper),
+                    Some(&ExportTypeLinks {
+                        target: Some(original),
+                        originating_import: Some(node_ref(parsed, files[index].0, import)),
+                    }),
+                );
+                assert_eq!(
+                    store.symbol(aliases[index]).unwrap().name().as_utf8(),
+                    Some("renamed")
+                );
+            }
+            let allocations = (store.symbol_len(), store.symbol_store().symbol_table_len());
+            for (alias, wrapper) in aliases.into_iter().zip(wrappers) {
+                assert_eq!(
+                    host.get_target_of_alias_declaration(&mut store, alias),
+                    Ok(CanonicalImmediateAliasTarget::Resolved(wrapper)),
+                );
+            }
+            assert_eq!(
+                (store.symbol_len(), store.symbol_store().symbol_table_len()),
+                allocations,
+            );
+        }
     }
 
     #[test]

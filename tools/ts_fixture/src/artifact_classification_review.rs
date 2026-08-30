@@ -190,6 +190,72 @@ fn assert_single_failed_variant(run: &ReviewRun, status: &str, outcome: &str) {
     );
 }
 
+fn assert_rendered_namespace_diagnostics(run: &ReviewRun, requested: bool) {
+    let types = run.generated.types.as_deref().unwrap();
+    assert!(types.contains(">foo : typeof foo\r\n"));
+    assert!(types.contains(">items.customMethod() : string\r\n"));
+    assert!(!run.generated.symbols.as_deref().unwrap().is_empty());
+    assert!(run.summary.is_success(), "{}", run.output);
+    assert_eq!(run.summary.executed_variants, 1);
+    assert_eq!(run.summary.matched, 1);
+    assert_eq!(run.summary.mismatched, 0);
+    assert_eq!(run.summary.diagnostic_failures, 0);
+    for (field, expected) in [
+        ("executedVariants", 1),
+        ("exactMatches", 1),
+        ("fatalInvariants", 0),
+        ("unsupportedDetails", 0),
+        ("headerMismatches", 0),
+        ("actualDiagnostics", 2),
+    ] {
+        assert_eq!(run.scorecard["summary"][field], expected, "{field}");
+    }
+    let result = &run.scorecard["variants"][0];
+    assert_eq!(result["status"], "exact_match");
+    assert_eq!(result["outcomeClass"], "exact");
+    assert!(result["frontierBlocker"].is_null());
+    assert!(result["firstDifference"].is_null());
+    assert_eq!(result["mismatchKinds"], serde_json::json!([]));
+    assert_eq!(result["unsupportedDetails"], serde_json::json!([]));
+    assert_eq!(result["diagnostics"], run.diagnostics);
+    let diagnostics = run.diagnostics.as_array().unwrap();
+    assert_eq!(diagnostics.len(), 2);
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic["code"], 2451);
+        assert_eq!(
+            diagnostic["relatedInformation"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(diagnostic["relatedInformation"][0]["code"], 6203);
+    }
+    if requested {
+        for kind in ["types", "symbols"] {
+            for (field, expected) in [
+                ("expectedBaselines", 1),
+                ("exactMatches", 1),
+                ("mismatches", 0),
+                ("unsupported", 0),
+                ("notReached", 0),
+            ] {
+                assert_eq!(
+                    run.scorecard["semanticArtifacts"][kind][field], expected,
+                    "{kind}.{field}"
+                );
+            }
+            let artifact = &result["semanticArtifacts"][kind];
+            assert_eq!(artifact["status"], "exact_match");
+            assert!(artifact["visitedNodes"].as_u64().unwrap() > 0);
+            assert!(artifact.get("unsupportedDetail").is_none());
+            assert!(artifact.get("firstDifference").is_none());
+        }
+    } else {
+        assert!(run.scorecard.get("semanticArtifacts").is_none());
+        assert!(result.get("semanticArtifacts").is_none());
+    }
+    assert!(!run.output.contains("FATAL "));
+    assert!(!run.output.contains("MISMATCH "));
+}
+
 #[test]
 fn review_artifact_execution_preserves_real_typed_failures_and_diagnostics() {
     for (label, source, expected_class) in [
@@ -205,13 +271,6 @@ fn review_artifact_execution_preserves_real_typed_failures_and_diagnostics() {
             inputs::CALLABLE_DISPLAY,
             CanonicalProgramCheckFailureClass::Unsupported {
                 capability_code: "T07.TYPE_DISPLAY",
-            },
-        ),
-        (
-            "fatal-with-diagnostics",
-            inputs::FATAL_WITH_DIAGNOSTICS,
-            CanonicalProgramCheckFailureClass::Fatal {
-                invariant_code: "INV.SOURCE.TYPE_DISPLAY",
             },
         ),
     ] {
@@ -268,24 +327,14 @@ fn review_artifact_execution_preserves_real_typed_failures_and_diagnostics() {
             run.scorecard["semanticArtifacts"]["symbols"]["exactMatches"],
             1
         );
-        if !unsupported {
-            assert_eq!(run.diagnostics.as_array().unwrap().len(), 2);
-            assert!(
-                run.diagnostics
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|diagnostic| {
-                        diagnostic["relatedInformation"].as_array().unwrap().len() == 1
-                    })
-            );
-            assert!(run.output.contains("FATAL "));
-            assert!(
-                run.output
-                    .contains(result["frontierBlocker"]["detail"].as_str().unwrap())
-            );
-        }
     }
+    let run = run_case(
+        "fatal-with-diagnostics",
+        inputs::FATAL_WITH_DIAGNOSTICS,
+        true,
+        true,
+    );
+    assert_rendered_namespace_diagnostics(&run, true);
 }
 
 #[test]
@@ -296,7 +345,6 @@ fn review_artifact_execution_ignores_unrequested_render_failures() {
             "diagnostics-only-callable-display",
             inputs::CALLABLE_DISPLAY,
         ),
-        ("diagnostics-only-fatal", inputs::FATAL_WITH_DIAGNOSTICS),
         ("diagnostics-only-no-check", inputs::DISABLED_CHECKER),
     ] {
         let run = run_case(label, source, false, true);
@@ -318,6 +366,13 @@ fn review_artifact_execution_ignores_unrequested_render_failures() {
                 .is_none()
         );
     }
+    let run = run_case(
+        "diagnostics-only-fatal",
+        inputs::FATAL_WITH_DIAGNOSTICS,
+        false,
+        true,
+    );
+    assert_rendered_namespace_diagnostics(&run, false);
 }
 
 #[test]
