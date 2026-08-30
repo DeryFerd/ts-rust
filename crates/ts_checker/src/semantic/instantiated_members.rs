@@ -15152,7 +15152,7 @@ mod tests {
             {
                 let original_signature = store.signature(original.signature).unwrap();
                 let copied_signature = store.signature(copied.signature).unwrap();
-                let mapper = copied_signature.mapper().unwrap();
+                let signature_mapper = copied_signature.mapper().unwrap();
                 assert_ne!(copied.signature, original.signature);
                 assert_eq!(copied_signature.target(), Some(original.signature));
                 assert_eq!(
@@ -15180,7 +15180,7 @@ mod tests {
                     callback_record.target(),
                     Some(source_callback_signature.signature)
                 );
-                assert_eq!(callback_record.mapper(), Some(mapper));
+                assert_eq!(callback_record.mapper(), Some(signature_mapper));
                 assert_eq!(
                     callback_record.declaration(),
                     source_callback_record.declaration()
@@ -15204,7 +15204,7 @@ mod tests {
                     panic!("recovery must keep a copied callback object")
                 };
                 assert_eq!(callback_object.target, Some(source_callback.owner));
-                assert_eq!(callback_object.mapper, Some(mapper));
+                assert_eq!(callback_object.mapper, Some(signature_mapper));
                 let source_array = store
                     .canonical_array_reference(globals, source_callback_signature.parameters[2])
                     .unwrap()
@@ -15230,7 +15230,7 @@ mod tests {
                     assert_eq!(original.constraint, Some(fixture.source_element));
                     assert_eq!(copied.constraint, Some(expected_element));
                     assert_eq!(copied.target, Some(source_parameter));
-                    assert_eq!(copied.mapper, Some(mapper));
+                    assert_eq!(copied.mapper, Some(signature_mapper));
                     assert_eq!(copied.resolved_default_type, None);
                     let source_predicate = store
                         .type_predicate(source_callback_record.resolved_type_predicate().unwrap())
@@ -15253,7 +15253,7 @@ mod tests {
                         Some(if recovered { error } else { fresh })
                     );
                 } else {
-                    assert_eq!(mapper, owner_mapper);
+                    assert_eq!(signature_mapper, owner_mapper);
                     assert_eq!(callback_record.resolved_type_predicate(), None);
                 }
                 if recovered {
@@ -15264,7 +15264,7 @@ mod tests {
                             store,
                             source_callback.owner,
                             callback.owner,
-                            mapper,
+                            signature_mapper,
                             Some(CanonicalArrayTargets::from_global_types(globals)),
                         ),
                         Some(true)
@@ -15459,13 +15459,13 @@ mod tests {
             let TypeData::Object(method) = store.type_payload(actual).unwrap().data() else {
                 unreachable!()
             };
-            let mapper = method.mapper.unwrap();
+            let receiver_mapper = method.mapper.unwrap();
             let before = budget(&session);
             assert_eq!(
                 instantiate_type_with_session(
                     store,
                     fixture.source_element,
-                    mapper,
+                    receiver_mapper,
                     Some(targets),
                     &mut session,
                 ),
@@ -15623,14 +15623,14 @@ mod tests {
             session: &mut InstantiationSession,
         ) {
             let expected = GenericInterfaceMemberError::InvalidCachedMembers(fixture.receiver);
-            assert_rejected_with_error(fixture, actual, session, expected);
+            assert_rejected_with_error(fixture, actual, session, &expected);
         }
 
         fn assert_rejected_with_error(
             fixture: &mut Fixture<'_>,
             actual: TypeId,
             session: &mut InstantiationSession,
-            expected: GenericInterfaceMemberError,
+            expected: &GenericInterfaceMemberError,
         ) {
             let before = counts(fixture.context.store());
             let session_before = budget(session);
@@ -15680,7 +15680,7 @@ mod tests {
                             .map(|_| false)
                     );
                 }
-                assert_eq!(demand(fixture, session), Err(expected.clone()));
+                assert_eq!(demand(fixture, session).as_ref(), Err(expected));
                 assert_eq!(counts(fixture.context.store()), before);
                 assert_eq!(budget(session), session_before);
             }
@@ -15749,11 +15749,11 @@ mod tests {
                             record.array_targets =
                                 CanonicalArrayTargets::for_single_target_validation(
                                     globals.readonly_array_type,
-                                )
+                                );
                         }
                         "foreign_targets" => {
                             record.array_targets =
-                                CanonicalArrayTargets::for_test(foreign_type, foreign_type)
+                                CanonicalArrayTargets::for_test(foreign_type, foreign_type);
                         }
                         _ => unreachable!(),
                     }
@@ -15908,7 +15908,7 @@ mod tests {
                 } else {
                     GenericInterfaceMemberError::InvalidCachedMembers(fixture.receiver)
                 };
-                assert_rejected_with_error(&mut fixture, actual, &mut session, expected);
+                assert_rejected_with_error(&mut fixture, actual, &mut session, &expected);
                 let store = fixture.context.store_mut_for_test();
                 assert!(
                     store
