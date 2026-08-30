@@ -23725,19 +23725,28 @@ pub(super) fn validate_cold_class_instance_for_display(
     if owner.flags() != SymbolFlags::CLASS
         || owner.check_flags() != CheckFlags::NONE
         || owner.value_declaration() != Some(*declaration)
-        || owner.parent().is_some()
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
         || !host.symbol_matches(store, *declaration, symbol)
-        || host
-            .bound_file(*declaration)
-            .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node))
         || class
             .type_parameters
             .as_ref()
             .is_some_and(|parameters| !parameters.nodes.is_empty())
     {
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+    }
+    if owner.parent().is_some()
+        || host
+            .bound_file(*declaration)
+            .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node))
+    {
+        super::source_namespaces::validate_ambient_namespace_class_for_display(
+            store,
+            host,
+            symbol,
+            *declaration,
+        )
+        .map_err(|_| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
     }
     let instance = exact_class_instance_identity(store, symbol, instance_type)
         .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(symbol)))?;

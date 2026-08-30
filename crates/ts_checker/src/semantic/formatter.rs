@@ -2461,23 +2461,6 @@ fn display_validated_class_type(
     let NodeData::ClassDeclaration(class) = &declaration_node.data else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
-    if cold_instance
-        && (owner.flags() != SymbolFlags::CLASS
-            || owner.check_flags() != CheckFlags::NONE
-            || owner.parent().is_some()
-            || owner.export_symbol().is_some()
-            || owner.value_declaration() != Some(declaration)
-            || store.get_merged_symbol(symbol) != Some(symbol)
-            || class
-                .type_parameters
-                .as_ref()
-                .is_some_and(|parameters| !parameters.nodes.is_empty())
-            || host
-                .bound_file(declaration)
-                .is_none_or(|bound| declaration_node.parent != Some(bound.source_file().node)))
-    {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
-    }
     let name = class
         .name
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
@@ -13178,6 +13161,453 @@ mod tests {
         let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
         let instance = context.get_declared_type_of_symbol(symbol).unwrap();
         assert_eq!(context.type_to_string(instance).unwrap(), "Box<T>");
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ColdAmbientClassDisplaySnapshot {
+        id: TypeId,
+        flags: TypeFlags,
+        object_flags: ObjectFlags,
+        symbol: Option<SemanticSymbolId>,
+        alias: Option<TypeAliasId>,
+        interface: crate::semantic::type_records::InterfaceTypeData,
+    }
+
+    fn cold_ambient_class_display_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+        instance: TypeId,
+    ) -> ColdAmbientClassDisplaySnapshot {
+        let record = context.store().type_payload(instance).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("the declared class keeps its interface record")
+        };
+        ColdAmbientClassDisplaySnapshot {
+            id: record.id(),
+            flags: record.flags(),
+            object_flags: record.object_flags(),
+            symbol: record.symbol(),
+            alias: record.alias(),
+            interface: interface.clone(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Damage and restore each real namespace/class binding.
+    fn cold_ambient_namespace_class_display_rejects_binding_damage() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace Models { ",
+            "class Model { value: string; method(): number; static count: number; } ",
+            "class Other { value: string; method(): number; static count: number; } ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_520);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [model_declaration, other_declaration] = declarations.as_slice() else {
+            panic!("the source has two classes")
+        };
+        let bound = context.file(file).unwrap().1;
+        let model = bound.symbol(*model_declaration).unwrap();
+        let other = bound.symbol(*other_declaration).unwrap();
+        let model_local = bound.local_symbol(*model_declaration).unwrap();
+        let namespace = context.store().symbol(model).unwrap().parent().unwrap();
+        let namespace_declaration = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let locals = bound.locals(namespace_declaration).unwrap();
+        let namespace_exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let model_exports = context.store().symbol(model).unwrap().exports().unwrap();
+        let other_exports = context.store().symbol(other).unwrap().exports().unwrap();
+        let model_members = context.store().symbol(model).unwrap().members().unwrap();
+        let other_members = context.store().symbol(other).unwrap().members().unwrap();
+        let instance = context.get_declared_type_of_symbol(model).unwrap();
+        let retained = cold_ambient_class_display_snapshot(&context, instance);
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+
+        for (table, name, donor, donor_name) in [
+            (namespace_exports, "Model", namespace_exports, "Other"),
+            (locals, "Model", locals, "Other"),
+            (model_exports, "prototype", other_exports, "prototype"),
+            (model_exports, "count", other_exports, "count"),
+            (model_members, "value", other_members, "value"),
+            (model_members, "method", other_members, "method"),
+        ] {
+            let original = context
+                .store()
+                .symbol_table(table)
+                .unwrap()
+                .get_source(name)
+                .unwrap();
+            let foreign = context
+                .store()
+                .symbol_table(donor)
+                .unwrap()
+                .get_source(donor_name)
+                .unwrap();
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    table,
+                    EscapedName::source(name),
+                    foreign
+                ),
+                Some(Some(original)),
+            );
+            assert_malformed_display_without_writes(&context, instance);
+            assert_eq!(
+                context.store_mut_for_test().insert_symbol(
+                    table,
+                    EscapedName::source(name),
+                    original
+                ),
+                Some(Some(foreign)),
+            );
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        }
+
+        assert_eq!(
+            context.store().symbol(model_local).unwrap().flags(),
+            SymbolFlags::EXPORT_VALUE
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model_local,
+            None,
+            None,
+            None,
+            Some(other),
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model_local,
+            None,
+            None,
+            None,
+            Some(model),
+        ));
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model,
+            Some(model_members),
+            Some(model_exports),
+            Some(other),
+            None,
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            model,
+            Some(model_members),
+            Some(model_exports),
+            Some(namespace),
+            None,
+        ));
+        let prototype = context
+            .store()
+            .symbol_table(model_exports)
+            .unwrap()
+            .get_source("prototype")
+            .unwrap();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            prototype,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            prototype,
+            SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+        assert_eq!(context.get_declared_type_of_symbol(model), Ok(instance));
+        assert_eq!(
+            cold_ambient_class_display_snapshot(&context, instance),
+            retained
+        );
+        assert!(context.store().value_symbol_links(model).is_none());
+        assert!(context.store().declared_type_links(other).is_none());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Retain each damaged cache and its exact restored identity.
+    fn cold_ambient_namespace_class_display_rejects_type_cache_damage() {
+        let parsed =
+            parse_source_file("declare namespace Models { class Model {} class Other {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_521);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owners = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::ClassDeclaration)
+            .map(|(node, _)| {
+                context
+                    .file(file)
+                    .unwrap()
+                    .1
+                    .symbol(NodeRef::new(parsed.arena.id(), file, node))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let [model, other] = owners.as_slice() else {
+            panic!("the source has two class owners")
+        };
+        let (model, other) = (*model, *other);
+        let instance = context.get_declared_type_of_symbol(model).unwrap();
+        let other_type = context.get_declared_type_of_symbol(other).unwrap();
+        let retained = cold_ambient_class_display_snapshot(&context, instance);
+        let this = retained.interface.this_type.unwrap();
+        let declared = context.store().declared_type_links(model).unwrap().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+
+        let mut wrong_declared = declared.clone();
+        wrong_declared.declared_type = Some(other_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(model, wrong_declared)
+        );
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_declared_type_links(model, declared.clone())
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(instance, true, None, None)
+        );
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_interface_base_resolution(instance, false, None, None)
+        );
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            this,
+            Some(instance),
+            None,
+            None,
+            Some(number),
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store_mut_for_test().set_type_parameter_resolution(
+            this,
+            Some(instance),
+            None,
+            None,
+            None,
+        ));
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            model,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(model, ValueSymbolLinks::default())
+        );
+
+        let restored = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+            assert_eq!(context.get_declared_type_of_symbol(model), Ok(instance));
+            assert_eq!(
+                cold_ambient_class_display_snapshot(&context, instance),
+                retained
+            );
+            assert_eq!(context.store().declared_type_links(model), Some(&declared));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                restored,
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn cold_ambient_namespace_class_display_does_not_admit_runtime_namespaces() {
+        let parsed = parse_source_file("namespace Models { export class Model {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_522);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        assert_malformed_display_without_writes(&context, instance);
+        assert!(context.store().value_symbol_links(symbol).is_none());
+    }
+
+    #[test]
+    fn cold_ambient_namespace_class_display_keeps_nested_namespace_identity() {
+        let parsed =
+            parse_source_file("declare namespace Models { namespace Inner { class Model {} } }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_523);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().checker_link_allocated_lengths(),
+            cold_ambient_class_display_snapshot(&context, instance),
+        );
+        let outside = context.source_file(file).unwrap().node_ref();
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(instance).unwrap(), "Model");
+            assert_eq!(
+                context
+                    .type_to_string_at_location(instance, declaration)
+                    .unwrap(),
+                "Model"
+            );
+            assert_eq!(
+                context
+                    .type_to_string_at_location(instance, outside)
+                    .unwrap(),
+                "Models.Inner.Model"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    cold_ambient_class_display_snapshot(&context, instance),
+                ),
+                before,
+            );
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn cold_ambient_namespace_class_display_rejects_generic_owner_proof() {
+        let parsed = parse_source_file("declare namespace Models { class Model<T> {} }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(14_524);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context.get_declared_type_of_symbol(symbol).unwrap();
+        let host = DeclaredTypeHost::new([context.file(file).unwrap()]).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            validate_cold_class_instance_for_display(context.store(), &host, symbol, instance),
+            Err(crate::semantic::classes::ClassError::Invariant(
+                crate::semantic::classes::ClassInvariant::InvalidOwnerSymbol(symbol),
+            )),
+        );
+        assert_eq!(
+            crate::semantic::source_namespaces::validate_ambient_namespace_class_for_display(
+                context.store(),
+                &host,
+                symbol,
+                declaration,
+            ),
+            Err(crate::semantic::SourceCheckError::Class(declaration)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.store().value_symbol_links(symbol).is_none());
     }
 
     #[test]
