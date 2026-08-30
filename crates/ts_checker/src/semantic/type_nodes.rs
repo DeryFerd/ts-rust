@@ -54556,9 +54556,24 @@ mod tests {
                 ))
             );
             assert_eq!(
-                query.get_type_from_type_node(reference),
+                query
+                    .plan_source_callable_type_inputs(&callable)
+                    .map(|_| ()),
                 Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias)
+                ))
+            );
+            assert!(
+                !query
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(query.store)
+            );
+            assert_eq!(
+                query.get_type_from_type_node(reference),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionType(declaration)
                 ))
             );
             assert_eq!(query.store.type_alias_links(alias), Some(&damaged_links));
@@ -54584,9 +54599,24 @@ mod tests {
             query.instantiation_session.as_deref().unwrap(),
         );
         assert_eq!(
-            query.get_type_from_type_node(reference),
+            query
+                .plan_source_callable_type_inputs(&callable)
+                .map(|_| ()),
             Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidCachedTypeAlias(alias)
+            ))
+        );
+        assert!(
+            !query
+                .store
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(query.store)
+        );
+        assert_eq!(
+            query.get_type_from_type_node(reference),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidFunctionType(declaration)
             ))
         );
         assert_eq!(
@@ -54924,13 +54954,62 @@ mod tests {
             "export function first<P>(): RequiredKeys<P>; ",
             "export function second<Q>(): RequiredKeys<Q>; }",
         );
-        let PropTypesInferPropsFixture {
-            declarations: parsed,
-            declaration_file: file,
-            files,
-            store,
-            ..
-        } = prop_types_declaration_fixture(parse_source_file(""), parse_source_file(source), false);
+        let library = parse_source_file("");
+        let parsed = parse_source_file(source);
+        let library_file = FileId::new(8_690);
+        let file = FileId::new(8_691);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file) in [(&library, library_file), (&parsed, file)] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/prop-types-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [(&library, library_file), (&parsed, file)] {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        // The empty companion has no global declarations to merge.
+        let declaration = files.get(&file).unwrap();
+        let locals = declaration
+            .locals(declaration.source_file())
+            .expect("the prop-types declaration has source locals");
+        let symbols = store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        assert!(
+            !symbols.is_empty(),
+            "the prop-types declaration has globals"
+        );
+        for symbol in symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
         let mut fixture = Fixture {
             parsed,
             file,
@@ -55140,10 +55219,17 @@ mod tests {
                 ),
                 Ok(false)
             );
+            assert!(
+                !fixture
+                    .store
+                    .source_callable_type_query(signature)
+                    .unwrap()
+                    .is_exact(&fixture.store)
+            );
             assert_eq!(
                 query_global_node(&mut fixture, &globals, second_reference, &mut diagnostics),
                 Err(type_node_unavailable(
-                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias)
+                    TypeNodeUnavailable::InvalidFunctionType(second)
                 ))
             );
             assert!(matches!(

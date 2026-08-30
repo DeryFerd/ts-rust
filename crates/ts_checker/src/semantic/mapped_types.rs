@@ -456,9 +456,9 @@ fn source_mapped_lookup_projection_worker(
     let argument = if mapped_type == origin.target {
         origin.source
     } else {
-        let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+        let substitution = mapped.object.mapper.ok_or_else(invalid)?;
         let Some(TypeMapperApplication::Composite { second, .. }) =
-            store.mapper_application(mapper, origin.key)
+            store.mapper_application(substitution, origin.key)
         else {
             return Err(invalid());
         };
@@ -896,9 +896,9 @@ fn validate_source_mapped_lookup_instance(
         return Err(invalid());
     };
     let parameter = mapped.type_parameter.ok_or_else(invalid)?;
-    let mapper = mapped.object.mapper.ok_or_else(invalid)?;
+    let substitution = mapped.object.mapper.ok_or_else(invalid)?;
     let Some(TypeMapperApplication::Composite { first, second }) =
-        store.mapper_application(mapper, origin.key)
+        store.mapper_application(substitution, origin.key)
     else {
         return Err(invalid());
     };
@@ -954,7 +954,7 @@ fn validate_source_mapped_lookup_instance(
             || template_record.symbol().is_some()
             || conditional.root != original.root
             || conditional.extends_type != original.extends_type
-            || conditional.mapper != Some(mapper)
+            || conditional.mapper != Some(substitution)
             || conditional.combined_mapper.is_some()
         {
             return Err(invalid());
@@ -1062,14 +1062,14 @@ pub(super) fn instantiate_source_mapped_lookup_instance(
     let key_mapper = store
         .new_simple_type_mapper(origin.key, parameter)
         .ok_or(MappedTypeError::InvalidTypeParameter(origin.key))?;
-    let mapper = store
+    let substitution = store
         .combine_type_mappers(Some(key_mapper), outer_mapper)
         .ok_or(MappedTypeError::InvalidMappedType(origin.target))?;
     if !store.set_type_parameter_resolution(
         parameter,
         Some(constraint),
         Some(origin.key),
-        Some(mapper),
+        Some(substitution),
         None,
     ) {
         return Err(MappedTypeError::InvalidTypeParameter(parameter));
@@ -1085,7 +1085,7 @@ pub(super) fn instantiate_source_mapped_lookup_instance(
             Some(origin.declaration),
         )
         .ok_or(MappedTypeError::Capacity)?;
-    if !store.set_object_target_and_mapper(mapped, Some(origin.target), Some(mapper))
+    if !store.set_object_target_and_mapper(mapped, Some(origin.target), Some(substitution))
         || !store.set_mapped_type_resolution(
             mapped,
             Some(origin.declaration),
@@ -8361,6 +8361,14 @@ mod tests {
             ),
             Ok(never)
         );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
         let TypeData::Conditional(warm) = store.type_payload(template).unwrap().data() else {
             unreachable!()
         };
@@ -8373,7 +8381,7 @@ mod tests {
             store.type_resolution_internal_state(),
         );
         let links = store.type_alias_links(projection.alias).unwrap().clone();
-        for _ in 0..2 {
+        for attempt in 1..=2 {
             let identity = source_mapped_lookup_identity_projection(store, mapped, None)
                 .unwrap()
                 .unwrap();
@@ -8393,6 +8401,14 @@ mod tests {
             assert_eq!(
                 instantiate_source_mapped_lookup_instance(store, &identity, &[later], None),
                 Err(MappedTypeError::UnsupportedTemplate(template))
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (attempt - 1, attempt - 1, 0)
             );
             assert_eq!(
                 instantiate_type_with_vector_and_session(
@@ -8424,7 +8440,7 @@ mod tests {
                     session.total_count(),
                     session.limit_event_count()
                 ),
-                (0, 0, 0)
+                (attempt, attempt, 0)
             );
         }
     }
