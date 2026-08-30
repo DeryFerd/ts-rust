@@ -8141,22 +8141,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         parent: NodeRef,
         kind: SyntaxKind,
     ) -> Option<NodeRef> {
-        self.source_node_fact(parent)?;
         let mut children = self
-            .source_node_facts
-            .get(&parent.arena)?
-            .iter()
-            .enumerate()
-            .filter_map(|(index, facts)| {
-                let facts = facts.as_ref()?;
-                (facts.parent == Some(parent.node) && facts.kind == kind)
-                    .then(|| {
-                        u32::try_from(index).ok().map(|index| {
-                            NodeRef::new(parent.arena, parent.file, NodeId::new(index))
-                        })
-                    })
-                    .flatten()
-            });
+            .source_direct_children(parent)?
+            .into_iter()
+            .filter(|&child| self.source_node_kind(child) == Some(kind));
         let child = children.next()?;
         children.next().is_none().then_some(child)
     }
@@ -15447,6 +15435,80 @@ mod tests {
             FileId::new(33),
             invalid_root
         )));
+    }
+
+    #[test]
+    fn source_child_kind_queries_match_the_retained_fact_scan() {
+        let mut parsed =
+            parse_source_file("interface Item { run?(value: string): boolean; other(): void }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(57);
+        let root = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let name = node_ref_of_kind(&parsed.arena, file, SyntaxKind::Identifier);
+        let mut detached = parsed.arena.get(name.node).unwrap().clone();
+        detached.parent = None;
+        let detached = parsed.arena.alloc(detached);
+        let mut store = TestStore::new();
+        assert_eq!(
+            store.source_child_with_kind(root, SyntaxKind::Identifier),
+            None
+        );
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let before = format!("{store:?}");
+        let facts = store.source_node_facts.get(&parsed.arena.id()).unwrap();
+        for (index, parent) in facts.iter().enumerate() {
+            if parent.is_none() {
+                continue;
+            }
+            let parent = NodeRef::new(
+                parsed.arena.id(),
+                file,
+                NodeId::new(u32::try_from(index).unwrap()),
+            );
+            for kind in [
+                SyntaxKind::Identifier,
+                SyntaxKind::MethodSignature,
+                SyntaxKind::Parameter,
+                SyntaxKind::QuestionToken,
+            ] {
+                let matching = facts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, child)| {
+                        let child = child.as_ref()?;
+                        (child.parent == Some(parent.node) && child.kind == kind).then(|| {
+                            NodeRef::new(
+                                parent.arena,
+                                parent.file,
+                                NodeId::new(u32::try_from(index).unwrap()),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let expected = match matching.as_slice() {
+                    [child] => Some(*child),
+                    _ => None,
+                };
+                assert_eq!(store.source_child_with_kind(parent, kind), expected);
+            }
+        }
+        let foreign = NodeArena::new();
+        for invalid in [
+            NodeRef::new(parsed.arena.id(), file, detached),
+            NodeRef::new(foreign.id(), file, root.node),
+            NodeRef::new(root.arena, FileId::new(58), root.node),
+            NodeRef::new(root.arena, file, NodeId::new(u32::MAX)),
+        ] {
+            assert_eq!(
+                store.source_child_with_kind(invalid, SyntaxKind::Identifier),
+                None
+            );
+        }
+        assert_eq!(format!("{store:?}"), before);
     }
 
     #[test]
