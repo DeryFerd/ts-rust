@@ -10940,7 +10940,7 @@ mod tests {
                         let other_value = context
                             .store()
                             .symbol(other)
-                            .and_then(|other| other.exports())
+                            .and_then(ts_binder::semantic::Symbol::exports)
                             .and_then(|exports| context.store().symbol_table(exports))
                             .and_then(|exports| exports.get_source("value"))
                             .unwrap();
