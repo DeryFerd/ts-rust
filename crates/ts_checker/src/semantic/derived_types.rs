@@ -19,6 +19,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     ids::TypeId,
+    instantiate::InstantiationSession,
     links::ValueSymbolLinks,
     mapper::TypeMapper,
     object_members::{
@@ -312,7 +313,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// property-only object-literal prefix.
     #[cfg(test)]
     pub(super) fn get_widened_type(&mut self, type_: TypeId) -> Result<TypeId, DerivedTypeError> {
-        self.get_widened_type_worker(type_, None)
+        self.get_widened_type_worker(type_, None, None)
     }
 
     /// Applies pinned root-context widening with authoritative global-array
@@ -323,13 +324,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         type_: TypeId,
         global_types: &CanonicalGlobalTypes,
     ) -> Result<TypeId, DerivedTypeError> {
-        self.get_widened_type_worker(type_, Some(global_types))
+        self.get_widened_type_worker(type_, Some(global_types), None)
+    }
+
+    /// Keeps widening's union checks in the caller's instantiation session.
+    pub(super) fn get_widened_type_with_global_types_and_session(
+        &mut self,
+        type_: TypeId,
+        global_types: &CanonicalGlobalTypes,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, DerivedTypeError> {
+        self.get_widened_type_worker(type_, Some(global_types), Some(session))
     }
 
     fn get_widened_type_worker(
         &mut self,
         type_: TypeId,
         global_types: Option<&CanonicalGlobalTypes>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, DerivedTypeError> {
         let record = self
             .type_payload(type_)
@@ -465,8 +477,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
         if union_count != 0 {
-            let result = match global_types {
-                Some(global_types) => self.prepare_type_query_types_with_global_types(
+            let result = match (global_types, session.as_deref_mut()) {
+                (Some(global_types), Some(session)) => self
+                    .prepare_type_query_types_with_global_types_and_session(
+                        &[],
+                        &[],
+                        &[],
+                        union_count,
+                        0,
+                        global_types,
+                        session,
+                    ),
+                (Some(global_types), None) => self.prepare_type_query_types_with_global_types(
                     &[],
                     &[],
                     &[],
@@ -474,13 +496,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     0,
                     global_types,
                 ),
-                None => self.prepare_type_query_types(&[], &[], &[], union_count, 0),
+                (None, _) => self.prepare_type_query_types(&[], &[], &[], union_count, 0),
             };
             result.map_err(|error| widening_union_error(type_, error))?;
         }
 
         for plan in plans {
-            self.publish_widened_type(plan, global_types);
+            self.publish_widened_type(plan, global_types, session.as_deref_mut())?;
         }
         Ok(*self
             .derived_types
@@ -1165,7 +1187,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &mut self,
         plan: WidenPlan,
         global_types: Option<&CanonicalGlobalTypes>,
-    ) {
+        session: Option<&mut InstantiationSession>,
+    ) -> Result<(), DerivedTypeError> {
         match plan {
             WidenPlan::Existing { source, target } => {
                 assert_eq!(
@@ -1392,8 +1415,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     super::bootstrap::UnionReduction::Literal
                 };
                 let widened = if let Some(global_types) = global_types {
-                    self.expression_union_type_with_global_types(global_types, &members, reduction)
-                        .expect("preflighted widened union members remain canonical")
+                    match session {
+                        Some(session) => self
+                            .expression_union_type_with_global_types_and_session(
+                                global_types,
+                                &members,
+                                reduction,
+                                session,
+                            )
+                            .map_err(|error| widening_union_error(source, error))?,
+                        None => self
+                            .expression_union_type_with_global_types(
+                                global_types,
+                                &members,
+                                reduction,
+                            )
+                            .expect("preflighted widened union members remain canonical"),
+                    }
                 } else {
                     let mut prepared = self
                         .prepare_type_query_types(&[], &[], &[], 1, 0)
@@ -1412,6 +1450,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
         }
+        Ok(())
     }
 
     fn clone_symbol_with_type(
