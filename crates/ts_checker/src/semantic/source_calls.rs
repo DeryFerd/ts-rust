@@ -33,7 +33,7 @@ use super::{
     calls::{
         ClassBodyInvocationResolution, DirectCallApplicability, DirectCallError, DirectCallForm,
         DirectCallRequest, DirectCallResolution, DirectCallUnsupported,
-        resolve_class_body_invocation, resolve_direct_call,
+        resolve_class_body_invocation, resolve_direct_call_with_receiver,
     },
     classes::{
         ClassBodyAccessToken, ClassBodyCallable, ClassBodyIdentities, ClassError,
@@ -63,6 +63,7 @@ use super::{
     object_diagnostics::{
         callable_assignability_details, exact_optional_property_mismatch_details,
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
+        this_context_mismatch_diagnostic,
     },
     signatures::{ElementFlags, SignatureFlags, SignatureKind, TypePredicateKind},
     source::{
@@ -5211,6 +5212,7 @@ struct SourceCallResolutionRequest<'a> {
     callee_type: TypeId,
     argument_types: &'a [TypeId],
     explicit_type_arguments: Option<&'a [TypeId]>,
+    receiver: Option<TypeId>,
 }
 
 fn resolve_source_call_once(
@@ -5227,6 +5229,7 @@ fn resolve_source_call_once(
         callee_type,
         argument_types,
         explicit_type_arguments,
+        receiver,
     } = request;
     let nongeneric_type_arguments = if explicit_type_arguments.is_some() {
         match validate_stored_callable_set(store, callee_type) {
@@ -5259,7 +5262,14 @@ fn resolve_source_call_once(
             callee: callee_type,
             arguments: argument_types,
         };
-        match resolve_direct_call(store, global_types, options.strict_function_types, request) {
+        match resolve_direct_call_with_receiver(
+            store,
+            global_types,
+            options.strict_function_types,
+            request,
+            receiver,
+            Some(session),
+        ) {
             Ok(resolution) => {
                 let resolved = ResolvedLegacySourceCall {
                     signature: resolution.projection.signature,
@@ -5471,6 +5481,7 @@ fn resolve_jsx_call_signature(
                 callee_type: callee,
                 argument_types: arguments,
                 explicit_type_arguments: None,
+                receiver: None,
             },
         ) {
             Ok(resolution) => break resolution,
@@ -5645,6 +5656,19 @@ struct SourceCallDiagnosticSite<'a> {
     callee_diagnostic_node: NodeRef,
     form: DirectCallForm,
     arguments: &'a [PlannedExpression],
+    receiver: Option<&'a PlannedExpression>,
+}
+
+fn source_call_receiver(mut callee: &PlannedExpression) -> Option<&PlannedExpression> {
+    loop {
+        match &callee.kind {
+            PlannedExpressionKind::Parenthesized(inner)
+            | PlannedExpressionKind::Assertion { operand: inner, .. } => callee = inner,
+            PlannedExpressionKind::Property(property) => return Some(&property.receiver),
+            PlannedExpressionKind::Element(element) => return Some(&element.receiver),
+            _ => return None,
+        }
+    }
 }
 
 impl<'a> From<&'a SourceCallPlan> for SourceCallDiagnosticSite<'a> {
@@ -5654,6 +5678,7 @@ impl<'a> From<&'a SourceCallPlan> for SourceCallDiagnosticSite<'a> {
             callee_diagnostic_node: plan.callee_diagnostic_node,
             form: plan.form,
             arguments: &plan.arguments,
+            receiver: source_call_receiver(&plan.callee),
         }
     }
 }
@@ -6303,6 +6328,39 @@ fn prepare_fixed_source_call_diagnostic(
                 ),
                 related_information: Vec::new(),
             }
+        }
+        DirectCallApplicability::ThisContextNotAssignable {
+            argument_type,
+            parameter_type,
+        } => {
+            let actual_receiver = match plan.receiver {
+                Some(receiver) => store
+                    .type_node_links(receiver.node)
+                    .and_then(|links| links.resolved_type),
+                None => store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.void_type),
+            };
+            let expected_receiver = store
+                .signature(resolution.signature)
+                .and_then(super::signatures::Signature::this_parameter)
+                .and_then(|symbol| store.value_symbol_links(symbol))
+                .and_then(|links| links.resolved_type);
+            if actual_receiver != Some(argument_type) || expected_receiver != Some(parameter_type) {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            let flags = source_call_display_flags(options);
+            this_context_mismatch_diagnostic(
+                store,
+                host,
+                global_types,
+                argument_type,
+                parameter_type,
+                plan.receiver.map_or(plan.node, |receiver| receiver.node),
+                flags,
+                options,
+                session,
+            )?
         }
         DirectCallApplicability::ArgumentNotAssignable {
             index,
@@ -7556,6 +7614,7 @@ pub(super) fn check_source_super_call(
             callee_diagnostic_node: plan.syntax.callee,
             form: DirectCallForm::New,
             arguments: &plan.arguments,
+            receiver: None,
         },
         argument_types,
         legacy_class_call_resolution(&resolution),
@@ -7914,6 +7973,24 @@ pub(super) fn check_direct_source_call(
     let mut retried_members = HashSet::new();
     let mut retried_properties = HashSet::new();
     let mut relation_candidates = Vec::new();
+    let has_this_parameter =
+        store
+            .source_callable_provenance(callee_type)
+            .is_some_and(|provenance| {
+                store
+                    .signature(provenance.signature)
+                    .is_some_and(|signature| signature.this_parameter().is_some())
+            });
+    let receiver = has_this_parameter
+        .then(|| source_call_receiver(&plan.callee))
+        .flatten()
+        .map(|receiver| {
+            store
+                .type_node_links(receiver.node)
+                .and_then(|links| links.resolved_type)
+                .ok_or(SourceCheckError::Call(plan.node))
+        })
+        .transpose()?;
     let resolution = loop {
         match resolve_source_call_once(
             store,
@@ -7927,6 +8004,7 @@ pub(super) fn check_direct_source_call(
                 callee_type,
                 argument_types,
                 explicit_type_arguments: explicit_type_arguments.as_deref(),
+                receiver,
             },
         ) {
             Ok(resolution) => break resolution,
@@ -7949,6 +8027,10 @@ pub(super) fn check_direct_source_call(
             )) => {
                 if relation_candidates.is_empty() {
                     relation_candidates.extend_from_slice(argument_types);
+                    if has_this_parameter {
+                        relation_candidates.push(callee_type);
+                        relation_candidates.extend(receiver);
+                    }
                 }
                 if let RelationUnavailable::UnresolvedStructuredMembers(type_) = error
                     && !relation_candidates.contains(&type_)

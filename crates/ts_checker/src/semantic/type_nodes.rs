@@ -3609,8 +3609,7 @@ impl SourceCallableTypeQueryEvidence {
             .flat_map(|parameter| [parameter.constraint, parameter.default_type])
             .chain(
                 self.callable
-                    .parameters
-                    .iter()
+                    .all_parameters()
                     .map(|parameter| parameter.explicit_type_node()),
             )
             .flatten();
@@ -5246,8 +5245,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .flat_map(|parameter| [parameter.constraint, parameter.default_type])
             .chain(
                 callable
-                    .parameters
-                    .iter()
+                    .all_parameters()
                     .map(|parameter| parameter.explicit_type_node()),
             )
             .chain(std::iter::once(callable.return_type.type_node()))
@@ -5366,7 +5364,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node(default_type)?;
             }
         }
-        for parameter in &callable.parameters {
+        for parameter in callable.all_parameters() {
             if let Some(annotation) = parameter.explicit_type_node() {
                 self.plan_type_node(annotation)?;
             }
@@ -16338,7 +16336,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.plan_type_node(annotation)?;
             }
         }
-        for parameter in &callable.parameters {
+        for parameter in callable.all_parameters() {
             if let Some(annotation) = parameter.explicit_type_node() {
                 self.plan_type_node(annotation)?;
             }
@@ -27759,7 +27757,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     );
                 }
             }
-            for parameter in &callable.parameters {
+            for parameter in callable.all_parameters() {
                 let node = parameter.explicit_type_node().ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidFunctionType(
                         callable.declaration,
@@ -27960,7 +27958,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         };
         source_callables::finalize_source_callable_structure(self.store, callable, pending)
             .map_err(|error| source_callable_error(error, callable.family))?;
-        if callable.parameters.is_empty() {
+        if callable.parameter_count() == 0 {
             return match source_callables::source_callable_state(self.store, callable, false)
                 .map_err(|error| source_callable_error(error, callable.family))?
             {
@@ -27975,8 +27973,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
         }
         let base_types = callable
-            .parameters
-            .iter()
+            .all_parameters()
             .map(|parameter| {
                 parameter
                     .explicit_type_node()
@@ -28312,7 +28309,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             prepared.clear_pending_function_types();
             return Err(error);
         }
-        if callable.parameters.is_empty() {
+        if callable.parameter_count() == 0 {
             self.pending_function_parameters.clear();
             prepared.clear_pending_function_types();
             return match source_callables::source_callable_state(self.store, &callable, false)
@@ -28330,8 +28327,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             };
         }
 
-        let mut base_types = Vec::with_capacity(callable.parameters.len());
-        for parameter in &callable.parameters {
+        let mut base_types = Vec::with_capacity(callable.parameter_count());
+        for parameter in callable.all_parameters() {
             if let Some(resolution) = callable
                 .alias_resolutions()
                 .iter()

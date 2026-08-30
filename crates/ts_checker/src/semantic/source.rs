@@ -7478,8 +7478,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             .flat_map(|parameter| [parameter.constraint, parameter.default_type])
             .chain(
                 callable
-                    .parameters
-                    .iter()
+                    .all_parameters()
                     .map(|parameter| parameter.explicit_type_node()),
             )
             .chain(std::iter::once(callable.return_type.type_node()))
@@ -12027,7 +12026,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         callable: &SourceCallablePlan,
     ) -> Result<Vec<PlannedParameterInitializer>, SourceCheckError> {
         let mut initializers = Vec::new();
-        for (entered, parameter) in callable.parameters.iter().enumerate() {
+        for (entered, parameter) in callable.all_parameters().enumerate() {
             let bindings = match self.callable_parameter_binding_symbols(callable, parameter) {
                 Ok(bindings) => bindings,
                 Err(error) => {
@@ -12252,7 +12251,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &mut self,
         callable: &SourceCallablePlan,
     ) -> Result<(), SourceCheckError> {
-        self.leave_callable_parameter_prefix_scope(callable, callable.parameters.len())
+        self.leave_callable_parameter_prefix_scope(callable, callable.parameter_count())
     }
 
     fn leave_callable_parameter_prefix_scope(
@@ -12261,7 +12260,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         entered: usize,
     ) -> Result<(), SourceCheckError> {
         let mut invalid = None;
-        for parameter in callable.parameters.iter().take(entered) {
+        for parameter in callable.all_parameters().take(entered) {
             for binding in self.callable_parameter_binding_symbols(callable, parameter)? {
                 let removed_prior = self.prior_variables.remove(&binding);
                 let removed_readable = self.readable_variables.remove(&binding);
@@ -22033,7 +22032,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.readable_variables = readable_variables;
         self.hoisted_functions = hoisted_functions;
         let expression = result?;
-        if named || !callable.parameters.is_empty() || !callable.return_type.is_inferred() {
+        if named || callable.parameter_count() != 0 || !callable.return_type.is_inferred() {
             self.nested_arrow_callables.push(callable);
         }
         Ok(PlannedExpression::new(
@@ -22237,6 +22236,43 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         expression: NodeRef,
     ) -> Result<PlannedExpression, SourceCheckError> {
         let kind = self.node(expression)?.kind;
+        if kind == SyntaxKind::ThisKeyword
+            && let Some((store, host)) = self.semantic
+            && let Some(parameter) = super::source_callables::plan_source_callable_this_read(
+                store,
+                host,
+                expression,
+                self.array_targets,
+            )
+            .map_err(Self::callable_plan_error)?
+        {
+            if !self.prior_variables.contains(&parameter.symbol)
+                || !self.readable_variables.contains(&parameter.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::MissingCurrentFlowType(parameter.symbol),
+                ));
+            }
+            if let Some(type_) = parameter.base_type(store) {
+                preflight_source_expression_cache(store, expression, type_)?;
+            } else if store
+                .type_node_links(expression)
+                .is_some_and(|links| links != &TypeNodeLinks::default())
+            {
+                return Err(SourceCheckError::Function(
+                    SourceFunctionInvariant::Callable(expression),
+                ));
+            }
+            self.identifier_reads.push((expression, parameter.symbol));
+            return Ok(PlannedExpression::new(
+                expression,
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    resolved_symbol: parameter.symbol,
+                    value_symbol: parameter.symbol,
+                    kind: PlannedIdentifierReadKind::Variable,
+                }),
+            ));
+        }
         if matches!(kind, SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword)
             && let Some((store, host)) = self.semantic
             && let Some(context) = plan_class_access_context(store, host, expression)
@@ -28069,6 +28105,9 @@ fn preflight_inferred_function_return_dependencies(
             )
             .chain(enums.iter().map(|enumeration| enumeration.owner_symbol))
             .collect::<HashSet<_>>();
+        if let Some(parameter) = function.callable.this_parameter {
+            locals.insert(parameter.symbol);
+        }
         for parameter in &function.callable.parameters {
             if let Some(bindings) = authenticated_function_array_parameter_bindings(
                 store,
@@ -35445,7 +35484,7 @@ fn check_planned_arrow_argument(
     };
     if function_expression
         && !named_function_expression
-        && arrow.callable.parameters.is_empty()
+        && arrow.callable.parameter_count() == 0
         && arrow.callable.return_type.is_inferred()
         && arrow
             .callable
@@ -39750,7 +39789,7 @@ fn issue_implicit_any_parameter_diagnostics(
     callable: &SourceCallablePlan,
     javascript_jsdoc: Option<&PlannedJavaScriptJsDoc>,
 ) -> Result<(), SourceCheckError> {
-    for parameter in &callable.parameters {
+    for parameter in callable.all_parameters() {
         if !parameter.is_implicit_any() {
             continue;
         }
@@ -40318,7 +40357,7 @@ fn check_callable_parameter_initializers_with_capture_context(
     let mut flow_types = outer_flow_types.clone();
     let mut initializer_index = 0usize;
     let mut object_binding_index = 0usize;
-    for parameter in &callable.parameters {
+    for parameter in callable.all_parameters() {
         let body_type = store
             .value_symbol_links(parameter.symbol)
             .and_then(|links| links.resolved_type)
@@ -50426,8 +50465,7 @@ fn source_callable_type_import_capabilities(
         .flat_map(|parameter| [parameter.constraint, parameter.default_type])
         .chain(
             callable
-                .parameters
-                .iter()
+                .all_parameters()
                 .map(|parameter| parameter.explicit_type_node()),
         )
         .chain(std::iter::once(callable.return_type.type_node()))

@@ -31,6 +31,7 @@ use super::{
         ClassConstructorVisibility, ClassHeritageMembersValidation, class_member_visibility,
         validate_class_heritage_members, validated_class_derives_from,
     },
+    derived_types::DerivedObjectLiteralValidation,
     formatter::{
         FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -44,7 +45,7 @@ use super::{
     instantiate::InstantiationSession,
     object_members::{
         DeclaredPropertyTypeGraphValidation, PropertyObjectPlan,
-        object_literal_getter_projection_with_host, plan_object_literal,
+        object_literal_getter_projection_with_host, object_literal_state, plan_object_literal,
         validate_resolved_declared_property_type_graph,
     },
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
@@ -1995,8 +1996,95 @@ pub(super) fn declared_property_mismatch_details(
         options,
         1,
         &mut HashSet::new(),
+        None,
     )
     .map(Option::unwrap_or_default)
+}
+
+/// Receiver errors also compare proven source object literals and their widened types.
+#[allow(clippy::too_many_arguments)] // Keep the call's options and session together.
+pub(super) fn this_context_mismatch_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    node: NodeRef,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+    )?;
+    if let Some(source) =
+        diagnostic_properties(store, host, global_types, source_type, Some(session))?
+        && let Some(target) =
+            diagnostic_properties(store, host, global_types, target_type, Some(session))?
+    {
+        let mut missing = Vec::new();
+        for property in &target {
+            if !property.optional
+                && !source.iter().any(|source| source.name == property.name)
+                && store
+                    .global_object_property_symbol(property.name.as_ref())?
+                    .is_none()
+            {
+                missing.push(property);
+            }
+        }
+        if !missing.is_empty() {
+            return missing_property_diagnostic(
+                store,
+                host,
+                global_types,
+                source_type,
+                target_type,
+                node,
+                &missing,
+                flags,
+            );
+        }
+        let property_only_target = store
+            .type_payload(target_type)
+            .and_then(|record| record.data().structured())
+            .is_some_and(|structured| {
+                structured.signatures.as_ref().is_none_or(Vec::is_empty)
+                    && structured.index_infos.as_ref().is_none_or(Vec::is_empty)
+            });
+        if source_type != global_types.object_type
+            && !source.is_empty()
+            && !target.is_empty()
+            && property_only_target
+            && target.iter().all(|property| property.optional)
+            && !source
+                .iter()
+                .any(|source| target.iter().any(|target| target.name == source.name))
+        {
+            return primary(2559, node, vec![display.source, display.target]);
+        }
+    }
+    let details = recursive_declared_property_mismatch_details(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        1,
+        &mut HashSet::new(),
+        Some(session),
+    )
+    .map(Option::unwrap_or_default)?;
+    let mut diagnostic = primary(2684, node, vec![display.source, display.target])?;
+    diagnostic.diagnostic.details = details;
+    Ok(diagnostic)
 }
 
 fn diagnostic_properties(
@@ -2004,6 +2092,7 @@ fn diagnostic_properties(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     type_: TypeId,
+    source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
     match validate_class_heritage_members(store, type_) {
         ClassHeritageMembersValidation::Malformed => return Err(invalid_structure(type_)),
@@ -2042,7 +2131,14 @@ fn diagnostic_properties(
     }
     match validate_resolved_declared_property_type_graph(store, type_) {
         DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
-        DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
+        DeclaredPropertyTypeGraphValidation::Opaque => {
+            return match source_literal_session {
+                Some(session) => {
+                    diagnostic_source_literal_properties(store, host, global_types, type_, session)
+                }
+                None => Ok(None),
+            };
+        }
         DeclaredPropertyTypeGraphValidation::Malformed => return Err(invalid_structure(type_)),
     }
     store
@@ -2050,6 +2146,81 @@ fn diagnostic_properties(
         .map(|properties| properties.properties().to_vec())
         .ok_or_else(|| invalid_structure(type_))
         .map(Some)
+}
+
+fn diagnostic_source_literal_properties(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+    session: &mut InstantiationSession,
+) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
+    let Some(owner) = store
+        .type_payload(type_)
+        .and_then(|record| record.symbol())
+        .and_then(|symbol| store.symbol(symbol))
+        .filter(|owner| owner.flags() == SymbolFlags::OBJECT_LITERAL)
+    else {
+        return Ok(None);
+    };
+    let Some([declaration]) = owner.declarations() else {
+        return Err(invalid_structure(type_));
+    };
+    let plan =
+        plan_object_literal(store, host, *declaration).map_err(|_| invalid_structure(type_))?;
+    let fresh = object_literal_state(store, &plan)
+        .map_err(|_| invalid_structure(type_))?
+        .ok_or_else(|| invalid_structure(type_))?
+        .type_id();
+    let mut current = type_;
+    let mut visited = HashSet::new();
+    while current != fresh {
+        if !visited.insert(current) {
+            return Err(invalid_structure(type_));
+        }
+        let DerivedObjectLiteralValidation::Valid { source, .. } =
+            store.validate_derived_object_literal_with_global_types(current, global_types)
+        else {
+            return Err(invalid_structure(type_));
+        };
+        current = source;
+    }
+    let symbols = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(|| invalid_structure(type_))?
+        .properties
+        .clone()
+        .unwrap_or_default();
+    let mut properties = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        let property = store
+            .symbol(symbol)
+            .ok_or_else(|| invalid_structure(type_))?;
+        let name = property.name().to_owned();
+        let declaration = property
+            .value_declaration()
+            .ok_or_else(|| invalid_structure(type_))?;
+        let resolved = store
+            .resolved_own_property_by_key_with_context(
+                type_,
+                name.as_ref(),
+                Some(global_types),
+                session,
+            )?
+            .ok_or_else(|| invalid_structure(type_))?;
+        if resolved.symbol != symbol {
+            return Err(invalid_structure(type_));
+        }
+        properties.push(ResolvedDeclaredProperty {
+            symbol,
+            name,
+            type_: resolved.type_,
+            optional: resolved.optional,
+            declaration,
+        });
+    }
+    Ok(Some(properties))
 }
 
 fn diagnostic_property_visibility(
@@ -2157,6 +2328,7 @@ fn recursive_declared_property_mismatch_details(
     options: CanonicalCheckerOptions,
     indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
+    source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
     if active.len() >= 64 || !active.insert((source_type, target_type)) {
         return Ok(None);
@@ -2172,6 +2344,7 @@ fn recursive_declared_property_mismatch_details(
         options,
         indentation,
         active,
+        source_literal_session,
     );
     assert!(active.remove(&(source_type, target_type)));
     result
@@ -2188,11 +2361,26 @@ fn recursive_declared_property_mismatch_details_inner(
     options: CanonicalCheckerOptions,
     indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
+    mut source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
-    let Some(source) = diagnostic_properties(store, host, global_types, source_type)? else {
+    let Some(source) = diagnostic_properties(
+        store,
+        host,
+        global_types,
+        source_type,
+        source_literal_session.as_deref_mut(),
+    )?
+    else {
         return Ok(None);
     };
-    let Some(target) = diagnostic_properties(store, host, global_types, target_type)? else {
+    let Some(target) = diagnostic_properties(
+        store,
+        host,
+        global_types,
+        target_type,
+        source_literal_session.as_deref_mut(),
+    )?
+    else {
         return Ok(None);
     };
     if target
@@ -2222,12 +2410,22 @@ fn recursive_declared_property_mismatch_details_inner(
         )? {
             return Ok(Some(vec![detail]));
         }
-        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
-            source_property.type_,
-            target_property.type_,
-            global_types,
-            options.strict_function_types,
-        )? {
+        let assignable = match source_literal_session.as_deref_mut() {
+            Some(session) => store.is_type_assignable_to_with_session(
+                source_property.type_,
+                target_property.type_,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            ),
+            None => store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                source_property.type_,
+                target_property.type_,
+                global_types,
+                options.strict_function_types,
+            ),
+        }?;
+        if assignable {
             continue;
         }
         return recursive_property_mismatch_details(
@@ -2241,6 +2439,7 @@ fn recursive_declared_property_mismatch_details_inner(
             options,
             indentation,
             active,
+            source_literal_session,
         );
     }
     Ok(None)
@@ -2258,6 +2457,7 @@ fn recursive_property_mismatch_details(
     options: CanonicalCheckerOptions,
     indentation: usize,
     active: &mut HashSet<(TypeId, TypeId)>,
+    mut source_literal_session: Option<&mut InstantiationSession>,
 ) -> Result<Option<Vec<String>>, SourceCheckError> {
     let nested = if is_terminal_scalar_relation_leaf(store, source_type)
         && is_terminal_scalar_relation_leaf(store, target_type)
@@ -2266,12 +2466,22 @@ fn recursive_property_mismatch_details(
     } else if let Some((source_element, target_element)) =
         nested_collection_element_types(store, global_types, source_type, target_type)?
     {
-        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
-            source_element,
-            target_element,
-            global_types,
-            options.strict_function_types,
-        )? {
+        let assignable = match source_literal_session.as_deref_mut() {
+            Some(session) => store.is_type_assignable_to_with_session(
+                source_element,
+                target_element,
+                Some(global_types),
+                Some(options.strict_function_types),
+                session,
+            ),
+            None => store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                source_element,
+                target_element,
+                global_types,
+                options.strict_function_types,
+            ),
+        }?;
+        if assignable {
             return Ok(None);
         }
 
@@ -2290,6 +2500,7 @@ fn recursive_property_mismatch_details(
                 options,
                 indentation + 3,
                 active,
+                source_literal_session,
             )?
             else {
                 return Ok(None);
@@ -2319,6 +2530,7 @@ fn recursive_property_mismatch_details(
             options,
             indentation + 2,
             active,
+            source_literal_session,
         )?
         else {
             return Ok(None);
@@ -3691,6 +3903,7 @@ mod tests {
                 CanonicalCheckerOptions::default(),
                 1,
                 &mut active,
+                None,
             )
             .unwrap(),
             None,

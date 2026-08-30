@@ -4514,6 +4514,21 @@ impl<'store> RelaterSession<'store> {
         }
         let result = (|| {
             let mut result = Ternary::True;
+            if let (Some(source_this), Some(target_this)) = (
+                self.signature_this_type(source)?,
+                self.signature_this_type(target)?,
+            ) {
+                let related = self.is_related_to_ex(
+                    source_this,
+                    target_this,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?;
+                if related == Ternary::False {
+                    return Ok(Ternary::False);
+                }
+                result &= related;
+            }
             for index in 0..parameter_count {
                 let source_type =
                     try_get_type_at_position(self.store, array_targets, source, index)
@@ -4585,6 +4600,23 @@ impl<'store> RelaterSession<'store> {
             self.compare_signatures_related_worker(source, target, check_mode, intersection_state);
         self.active_signature_pairs.remove(&key);
         result
+    }
+
+    fn signature_this_type(
+        &self,
+        callable: &ValidatedSingleCallable,
+    ) -> Result<Option<TypeId>, RelationUnavailable> {
+        self.store
+            .signature(callable.signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(callable.owner))?
+            .this_parameter()
+            .map(|parameter| {
+                self.store
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or(RelationUnavailable::UnresolvedPropertyType(parameter))
+            })
+            .transpose()
     }
 
     fn is_top_signature(
@@ -5367,6 +5399,33 @@ impl<'store> RelaterSession<'store> {
                 .strict_function_types
                 .ok_or(RelationUnavailable::StructuredSignatures(target.owner))?;
         let mut result = Ternary::True;
+        if let Some(source_this) = self.signature_this_type(source)?
+            && source_this != self.bootstrap.void_type
+            && let Some(target_this) = self.signature_this_type(target)?
+        {
+            let mut related = if strict_variance {
+                Ternary::False
+            } else {
+                self.is_related_to_ex(
+                    source_this,
+                    target_this,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?
+            };
+            if related == Ternary::False {
+                related = self.is_related_to_ex(
+                    target_this,
+                    source_this,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?;
+            }
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
         let source_count =
             get_parameter_count(self.store, array_targets, source).map_err(source_error)?;
         let compare_rest = self.signature_has_non_array_rest(source)?

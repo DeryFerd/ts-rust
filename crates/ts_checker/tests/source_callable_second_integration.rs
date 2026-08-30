@@ -770,3 +770,189 @@ fn named_jsdoc_overload_call_keeps_its_literal_computed_binding_and_rest_key() {
         );
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Check one receiver and contextual signature through each query order.
+fn contextual_function_this_keeps_receiver_and_value_parameter_identities() {
+    let parsed = parse_source_file(
+        "const read: (input: string) => number = function(this: { value: number }, input) { return this.value; };",
+    );
+    let binding = named_declaration(&parsed, only_node(&parsed, SyntaxKind::VariableDeclaration));
+    let NodeData::VariableDeclaration(variable) =
+        &parsed.arena.get(binding.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let expression = node(&parsed, variable.initializer.unwrap());
+    let annotation = node(&parsed, variable.type_.unwrap());
+    let NodeData::FunctionExpression(function) = &parsed.arena.get(expression.node).unwrap().data
+    else {
+        panic!("the source must retain its ordinary function expression")
+    };
+    assert!(function.type_.is_none());
+    let [receiver, input] = function.parameters.nodes.as_slice() else {
+        panic!("the source must retain its receiver and one value parameter")
+    };
+    let receiver = named_declaration(&parsed, node(&parsed, *receiver));
+    let input = named_declaration(&parsed, node(&parsed, *input));
+    let NodeData::ParameterDeclaration(receiver_data) =
+        &parsed.arena.get(receiver.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    assert_eq!(node_text(&parsed, receiver.name), "this");
+    let receiver_annotation = node(&parsed, receiver_data.type_.unwrap());
+    let NodeData::ParameterDeclaration(input_data) =
+        &parsed.arena.get(input.declaration.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    assert!(input_data.type_.is_none());
+    let NodeData::FunctionTypeNode(contextual) = &parsed.arena.get(annotation.node).unwrap().data
+    else {
+        panic!("the variable must retain its written function type")
+    };
+    let [target_input] = contextual.parameters.nodes.as_slice() else {
+        panic!("the target must have one value parameter and no receiver")
+    };
+    let target_input = named_declaration(&parsed, node(&parsed, *target_input));
+    let body = only_node(&parsed, SyntaxKind::PropertyAccessExpression);
+    let NodeData::PropertyAccessExpression(property) = &parsed.arena.get(body.node).unwrap().data
+    else {
+        unreachable!()
+    };
+    let this_read = node(&parsed, property.expression);
+    let property_name = node(&parsed, property.name);
+    let property_declaration = only_node(&parsed, SyntaxKind::PropertySignature);
+    assert_eq!(
+        parsed.arena.get(this_read.node).unwrap().kind,
+        SyntaxKind::ThisKeyword
+    );
+
+    for first in [None, Some(expression), Some(body)] {
+        let mut checker = context(&parsed, CanonicalSourceLanguage::TypeScript);
+        let early = first.map(|node| checker.get_type_at_location(node).unwrap());
+        checker.check_source_file(FILE).unwrap();
+        let source = checker.get_type_at_location(expression).unwrap();
+        let target = checker.get_type_at_location(annotation).unwrap();
+        let receiver_type = checker
+            .get_type_from_type_node(receiver_annotation)
+            .unwrap();
+        let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        assert_ne!(source, target);
+        for (type_, declaration) in [
+            (source, expression),
+            (target, annotation),
+            (receiver_type, receiver_annotation),
+        ] {
+            assert_eq!(
+                checker.store().type_payload(type_).unwrap().symbol(),
+                Some(symbol(&checker, declaration))
+            );
+        }
+        let owner = symbol(&checker, expression);
+        let owner_record = checker.store().symbol(owner).unwrap();
+        assert_eq!(owner_record.flags(), SymbolFlags::FUNCTION);
+        assert_eq!(owner_record.declarations(), Some(&[expression][..]));
+        assert_eq!(owner_record.value_declaration(), Some(expression));
+        let receiver_symbol = assert_value(
+            &mut checker,
+            receiver,
+            receiver_type,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        );
+        let input_symbol = assert_value(
+            &mut checker,
+            input,
+            string,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        );
+        let target_input_symbol = assert_value(
+            &mut checker,
+            target_input,
+            string,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        );
+        assert_ne!(receiver_symbol, input_symbol);
+        assert_ne!(receiver_symbol, target_input_symbol);
+        assert_ne!(input_symbol, target_input_symbol);
+        assert_ne!(
+            assert_value(
+                &mut checker,
+                binding,
+                target,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE
+            ),
+            owner
+        );
+
+        let source_signature = callable_signature(&checker, source);
+        let target_signature = callable_signature(&checker, target);
+        assert_ne!(source_signature, target_signature);
+        let signature = checker.store().signature(source_signature).unwrap();
+        assert_eq!(signature.declaration(), Some(expression));
+        assert_eq!(signature.this_parameter(), Some(receiver_symbol));
+        assert_eq!(signature.parameters(), &[input_symbol]);
+        assert_eq!(signature.min_argument_count(), 1);
+        assert!(signature.type_parameters().is_empty());
+        assert!(signature.target().is_none());
+        assert!(signature.mapper().is_none());
+        assert_signature(
+            &checker,
+            target_signature,
+            annotation,
+            &[target_input_symbol],
+            &[],
+        );
+        assert_eq!(
+            checker.file(FILE).unwrap().1.this_container(this_read),
+            Some(expression)
+        );
+        assert_eq!(
+            checker.file(FILE).unwrap().1.container(this_read),
+            Some(expression)
+        );
+        assert_eq!(
+            checker.get_symbol_at_location(this_read),
+            Ok(Some(receiver_symbol))
+        );
+        assert_eq!(checker.get_type_at_location(this_read), Ok(receiver_type));
+        let property_symbol = symbol(&checker, property_declaration);
+        assert_eq!(
+            checker.get_symbol_at_location(property_name),
+            Ok(Some(property_symbol))
+        );
+        assert_eq!(checker.get_type_at_location(body), Ok(number));
+        if let Some(early) = early {
+            assert_eq!(
+                early,
+                if first == Some(expression) {
+                    source
+                } else {
+                    number
+                }
+            );
+        }
+        assert_replay(
+            &mut checker,
+            &parsed,
+            &[
+                (expression, source),
+                (annotation, target),
+                (binding.name, target),
+                (receiver.declaration, receiver_type),
+                (receiver.name, receiver_type),
+                (receiver_annotation, receiver_type),
+                (input.declaration, string),
+                (input.name, string),
+                (target_input.declaration, string),
+                (target_input.name, string),
+                (this_read, receiver_type),
+                (body, number),
+            ],
+            &[(source_signature, number), (target_signature, number)],
+        );
+    }
+}
