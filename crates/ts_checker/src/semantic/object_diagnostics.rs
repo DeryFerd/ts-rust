@@ -2157,7 +2157,7 @@ fn diagnostic_source_literal_properties(
 ) -> Result<Option<Vec<ResolvedDeclaredProperty>>, SourceCheckError> {
     let Some(owner) = store
         .type_payload(type_)
-        .and_then(|record| record.symbol())
+        .and_then(super::type_records::TypeRecord::symbol)
         .and_then(|symbol| store.symbol(symbol))
         .filter(|owner| owner.flags() == SymbolFlags::OBJECT_LITERAL)
     else {

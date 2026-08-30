@@ -3945,12 +3945,11 @@ fn plan_source_callable_with_owner_shape(
             .and_then(|type_| store.source_callable_provenance(type_))
             .filter(|provenance| provenance.contextual_variable.is_some())
             .and_then(|provenance| provenance.contextual_target)
+        && !apply_function_expression_context(store, host, &mut plan, target)?
     {
-        if !apply_function_expression_context(store, host, &mut plan, target)? {
-            return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
-                declaration,
-            )));
-        }
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            declaration,
+        )));
     }
     if javascript_direct_implicit_any_arrow
         || view.family == SourceCallableFamily::ArrowFunction

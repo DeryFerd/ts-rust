@@ -7801,7 +7801,7 @@ pub(super) fn resolve_source_call_effects_signature(
     let state = match callee_type.map(|type_| validate_stored_callable_set(store, type_)) {
         Some(StoredCallableSetValidation::Valid { projection, .. }) => {
             let mut candidates = Vec::new();
-            for callable in projection.call_signatures.iter() {
+            for callable in &projection.call_signatures {
                 let signature = store.signature(callable.signature).ok_or_else(invalid)?;
                 let result = signature
                     .resolved_return_type()
@@ -7881,7 +7881,7 @@ pub(super) fn check_direct_source_call(
             && projection.call_signatures.iter().any(|callable| {
                 store
                     .signature(callable.signature)
-                    .and_then(|signature| signature.resolved_type_predicate())
+                    .and_then(super::signatures::Signature::resolved_type_predicate)
                     .and_then(|predicate| store.type_predicate(predicate))
                     .is_some_and(|predicate| {
                         matches!(
