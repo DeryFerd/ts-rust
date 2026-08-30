@@ -4352,7 +4352,10 @@ fn source_captured_assignment_callback_is_exact(
         || writer_record.kind != SyntaxKind::ArrowFunction
         || arrow.body != body.node
         || bound.container(call) != Some(writer)
-        || bound.flow_container(call) != Some(writer)
+        || bound.flow_container(statement) != Some(writer)
+        || bound
+            .flow_container(call)
+            .is_some_and(|owner| owner != writer)
         || bound.container(receiver) != Some(writer)
         || bound.flow_container(receiver) != Some(writer)
     {
@@ -21317,6 +21320,16 @@ mod tests {
         let target = reference(binary.left);
         let writer = bound.container(call).unwrap();
         let writer_owner = bound.symbol(writer).unwrap();
+        let statement = reference(host.node(assignment).unwrap().parent.unwrap());
+        assert_eq!(
+            host.node(statement).unwrap().kind,
+            SyntaxKind::ExpressionStatement
+        );
+        assert_eq!(bound.container(call), Some(writer));
+        assert_eq!(bound.flow_container(call), None);
+        assert_eq!(bound.flow_container(statement), Some(writer));
+        assert_eq!(bound.flow_container(receiver), Some(writer));
+        assert_eq!(bound.flow_container(target), Some(writer));
         let cold = generic_transaction_state(context.store());
         let plan = plan_source_callable(context.store(), &host, callback, owner, None).unwrap();
         assert_eq!(plan.declaration, callback);

@@ -280,13 +280,19 @@ fn captured_filter_keeps_the_generic_receiver_and_outer_observer() {
     let observers_node = variable(&parsed, "_observers");
     let observers_symbol = symbol(&context, observers_node);
     let array_type = value_type(&context, observers_symbol);
-    let array = context
-        .store()
-        .canonical_array_reference(context.global_types(), array_type)
-        .unwrap()
-        .unwrap();
-    assert!(!array.readonly);
-    let observer_type = array.element_type;
+    let TypeData::TypeReference(array) = context.store().type_payload(array_type).unwrap().data()
+    else {
+        panic!("the captured local must keep its declared Array reference")
+    };
+    assert_eq!(array.object.target, Some(context.global_types().array_type));
+    assert_ne!(
+        array.object.target,
+        Some(context.global_types().readonly_array_type)
+    );
+    let [observer_type] = array.resolved_type_arguments.as_deref().unwrap() else {
+        panic!("the mutable Array must retain its one Observer<T> argument")
+    };
+    let observer_type = *observer_type;
     let subscribe_node = variable(&parsed, "subscribe");
     let NodeData::VariableDeclaration(subscribe) =
         &parsed.arena.get(subscribe_node.node).unwrap().data
