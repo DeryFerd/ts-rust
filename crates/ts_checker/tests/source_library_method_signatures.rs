@@ -425,8 +425,12 @@ fn real_library_keys_calls_preserve_overload_selection_arrays_and_arity_errors()
     assert_eq!(accesses.len(), 3);
     let callable = context.get_type_at_location(methods[0].name).unwrap();
     let mut queries = Vec::new();
-    for (call, access) in calls.into_iter().zip(accesses) {
-        assert_eq!(signature(&context, call), selected);
+    for ((call, access), expected) in calls.into_iter().zip(accesses).zip([
+        signature(&context, methods[0].declaration),
+        selected,
+        selected,
+    ]) {
+        assert_eq!(signature(&context, call), expected);
         assert_eq!(context.get_type_at_location(call), Ok(result));
         assert_eq!(context.get_type_at_location(access), Ok(callable));
         assert_eq!(context.get_symbol_at_location(access), Ok(Some(merged)));
