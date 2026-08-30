@@ -4158,7 +4158,15 @@ impl SourceFlowFrame<'_, '_> {
 
         let result = (|| {
             for antecedent in &antecedents[1..] {
-                let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
+                let next = if self.plan.region.is_some() && self.reference.is_some() {
+                    // The backedge can repeat the demand's prefix before reaching this loop.
+                    let outer_visiting = std::mem::take(&mut self.visiting);
+                    let result = self.resolve_flow(store, globals, *antecedent, depth + 1);
+                    self.visiting = outer_visiting;
+                    result
+                } else {
+                    self.resolve_flow(store, globals, *antecedent, depth + 1)
+                }?;
                 current = self.join_snapshots(store, globals, flow, &current, &next)?;
                 self.loop_snapshots.insert(key, current.clone());
             }
@@ -6928,7 +6936,13 @@ fn linear_antecedent(flow: FlowRef, node: &FlowNode) -> Result<FlowRef, SourceFl
 }
 
 fn label_antecedents(flow: FlowRef, node: &FlowNode) -> Result<&[FlowRef], SourceFlowError> {
-    if node.antecedents.len() < 2 {
+    let minimum = match source_flow_kind(flow, node.flags)? {
+        SourceFlowKind::LoopLabel => 1,
+        SourceFlowKind::BranchLabel => 2,
+        _ => return Err(SourceFlowInvariant::InvalidAntecedents(flow).into()),
+    };
+    // A terminal break can leave the binder's loop label with only its entry edge.
+    if node.antecedents.len() < minimum {
         return Err(SourceFlowInvariant::InvalidAntecedents(flow).into());
     }
     let mut unique = HashSet::with_capacity(node.antecedents.len());
@@ -7024,6 +7038,622 @@ mod tests {
                 .then_some(NodeRef::new(parsed.arena.id(), file, node))
             })
             .unwrap()
+    }
+
+    const SOURCE_LOOP_BACKEDGE_INPUT: &str = concat!(
+        "for (var count: 0 | 1 = 0; count < 2; ++count) { ",
+        "const unrelated = true; const inside: number = count; }",
+    );
+
+    struct SourceLoopBackedgeFixture {
+        plan: SourceFlowPlan,
+        count: SourceFlowAssignment,
+        unrelated: SourceFlowAssignment,
+        inside: SourceFlowAssignment,
+        annotation: NodeRef,
+        initial_annotation: NodeRef,
+        header_read: NodeRef,
+        body_read: NodeRef,
+        label: FlowRef,
+        prefix: FlowRef,
+    }
+
+    fn source_loop_backedge_fixture(
+        parsed: &ParseResult,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+    ) -> SourceLoopBackedgeFixture {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = bound.file_id();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let assignment = |name| {
+            let declaration = captured_variable(parsed, file, name);
+            SourceFlowAssignment {
+                declaration,
+                symbol: bound.symbol(declaration).unwrap(),
+            }
+        };
+        let count = assignment("count");
+        let unrelated = assignment("unrelated");
+        let inside = assignment("inside");
+        let (statement, iteration) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((reference(node), iteration)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::BinaryExpression(condition) =
+            &parsed.arena.get(iteration.condition.unwrap()).unwrap().data
+        else {
+            panic!("expected the count comparison")
+        };
+        let header_read = reference(condition.left);
+        let NodeData::PrefixUnaryExpression(update) = &parsed
+            .arena
+            .get(iteration.incrementor.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the count update")
+        };
+        let NodeData::VariableDeclaration(count_data) =
+            &parsed.arena.get(count.declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let NodeData::NumericLiteral(initializer) = &parsed
+            .arena
+            .get(count_data.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the written zero initializer")
+        };
+        assert_eq!(initializer.text, "0");
+        let annotation = reference(count_data.type_.unwrap());
+        let NodeData::UnionTypeNode(union) = &parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("expected the written count union")
+        };
+        let initial_annotation = reference(union.types.nodes[0]);
+        let NodeData::VariableDeclaration(inside_data) =
+            &parsed.arena.get(inside.declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body_read = reference(inside_data.initializer.unwrap());
+        validate_source_reference(&parsed.arena, bound, store, host, body_read, count.symbol)
+            .unwrap();
+        let label = bound.flow_at(header_read).unwrap();
+        let prefix = bound.flow_at(body_read).unwrap();
+        assert_eq!(
+            source_flow_kind(label, flow_node(bound.flow_graph(), label).unwrap().flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        let prefix_node = flow_node(bound.flow_graph(), prefix).unwrap();
+        assert_eq!(
+            source_flow_kind(prefix, prefix_node.flags),
+            Ok(SourceFlowKind::Assignment)
+        );
+        assert_eq!(ast_payload(prefix, &prefix_node), Ok(unrelated.declaration));
+        let mut points = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let node = reference(node);
+                (record.kind == SyntaxKind::Identifier
+                    && source_node_is_descendant_of(&parsed.arena, node, statement.node)
+                    && bound.flow_at(node).is_some())
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        points.sort_unstable();
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            bound,
+            store,
+            host,
+            statement,
+            points,
+            [],
+            [count, unrelated, inside],
+            [SourceFlowUpdate {
+                target: reference(update.operand),
+                declaration: count.declaration,
+                symbol: count.symbol,
+                readonly: false,
+            }],
+            [],
+        )
+        .unwrap();
+        assert_ne!(prefix, plan.region.unwrap().entry);
+        SourceLoopBackedgeFixture {
+            plan,
+            count,
+            unrelated,
+            inside,
+            annotation,
+            initial_annotation,
+            header_read,
+            body_read,
+            label,
+            prefix,
+        }
+    }
+
+    fn source_loop_backedge_types(
+        context: &mut CanonicalCheckerContext<'_>,
+        fixture: &SourceLoopBackedgeFixture,
+    ) -> (TypeId, TypeId, TypeId, TypeId) {
+        let declared = context.get_type_from_type_node(fixture.annotation).unwrap();
+        let initial = context
+            .get_type_from_type_node(fixture.initial_annotation)
+            .unwrap();
+        assert_eq!(context.type_to_string(initial).unwrap(), "0");
+        let TypeData::Union(union) = context.store().type_payload(declared).unwrap().data() else {
+            panic!("expected the declared union")
+        };
+        assert!(union.union.types.contains(&initial));
+        let mut members = union
+            .union
+            .types
+            .iter()
+            .map(|type_| context.type_to_string(*type_).unwrap())
+            .collect::<Vec<_>>();
+        members.sort_unstable();
+        assert_eq!(members, ["0", "1"]);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        assert_ne!(declared, number);
+        assert_ne!(initial, declared);
+        (declared, initial, number, bootstrap.regular_true_type)
+    }
+
+    #[test]
+    fn source_loop_backedge_revisits_assignments_after_completion_invalidates_memo() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SOURCE_LOOP_BACKEDGE_INPUT);
+        let file = FileId::new(32_260);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let fixture = source_loop_backedge_fixture(&parsed, &bound, context.store(), &host);
+        let (declared, initial, number, true_type) =
+            source_loop_backedge_types(&mut context, &fixture);
+        let mut frame = fixture
+            .plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.count.declaration,
+                fixture.count.symbol,
+                declared,
+                initial,
+            )
+            .unwrap();
+        let header = frame
+            .snapshot_for_symbols_at(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.header_read,
+                [fixture.count.symbol],
+            )
+            .unwrap();
+        assert_eq!(header.type_of(fixture.count.symbol), Some(number));
+        assert!(
+            frame
+                .memo
+                .contains_key(&(fixture.label, Some(fixture.count.symbol)))
+        );
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.unrelated.declaration,
+                fixture.unrelated.symbol,
+                true_type,
+                true_type,
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        let body = frame
+            .snapshot_for_symbols_at(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.body_read,
+                [fixture.count.symbol],
+            )
+            .unwrap();
+        assert_eq!(body.type_of(fixture.count.symbol), Some(number));
+        assert_eq!(frame.declared_types[&fixture.count.symbol], declared);
+        assert_eq!(
+            frame.assignment_states[&fixture.inside.declaration],
+            SourceFlowAssignmentState::Pending
+        );
+        let memo = frame.memo.clone();
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frame.snapshot_for_symbols_at(
+                    context.store_mut_for_test(),
+                    &globals,
+                    fixture.body_read,
+                    [fixture.count.symbol],
+                ),
+                Ok(body.clone())
+            );
+            assert_eq!(frame.memo, memo);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            assert_eq!(frame.reference, None);
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.inside.declaration,
+                fixture.inside.symbol,
+                number,
+                number,
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        let exit = frame
+            .snapshot_for_symbols_at_end(
+                context.store_mut_for_test(),
+                &globals,
+                [fixture.count.symbol],
+            )
+            .unwrap();
+        assert_eq!(exit.type_of(fixture.count.symbol), Some(number));
+        assert_eq!(frame.declared_types[&fixture.count.symbol], declared);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(fixture.annotation)
+                .unwrap()
+                .resolved_type,
+            Some(declared)
+        );
+    }
+
+    #[test]
+    fn source_loop_backedge_revisits_a_real_false_condition_prefix() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "declare const stop: boolean; for (;;) { ",
+            "if (stop) { break; } const inside: false = stop; continue; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(32_261);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let statement = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ForStatement).then_some(reference(node))
+            })
+            .unwrap();
+        let condition = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::IfStatement(data) => Some(reference(data.expression)),
+                _ => None,
+            })
+            .unwrap();
+        let stop = bound
+            .symbol(captured_variable(&parsed, file, "stop"))
+            .unwrap();
+        let declaration = captured_variable(&parsed, file, "inside");
+        let inside = bound.symbol(declaration).unwrap();
+        let NodeData::VariableDeclaration(data) = &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let read = reference(data.initializer.unwrap());
+        validate_source_reference(&parsed.arena, &bound, context.store(), &host, read, stop)
+            .unwrap();
+        let prefix = bound.flow_at(read).unwrap();
+        let prefix_node = flow_node(bound.flow_graph(), prefix).unwrap();
+        assert_eq!(
+            source_flow_kind(prefix, prefix_node.flags),
+            Ok(SourceFlowKind::FalseCondition)
+        );
+        assert_eq!(ast_payload(prefix, &prefix_node), Ok(condition));
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            [condition, reference(data.name), read],
+            [SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                expression: condition,
+                symbol: stop,
+                negated: false,
+            })],
+            [SourceFlowAssignment {
+                declaration,
+                symbol: inside,
+            }],
+            [],
+            [],
+        )
+        .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (boolean, false_type, true_type) = (
+            bootstrap.boolean_type,
+            bootstrap.regular_false_type,
+            bootstrap.regular_true_type,
+        );
+        let mut frame = plan
+            .frame_with_captured_locals(
+                context.store(),
+                &host,
+                &bound,
+                [(stop, boolean)].into_iter().collect(),
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        let body = frame
+            .snapshot_for_symbols_at(context.store_mut_for_test(), &globals, read, [stop])
+            .unwrap();
+        assert_eq!(body.type_of(stop), Some(false_type));
+        assert_eq!(frame.declared_types[&stop], boolean);
+        assert_eq!(
+            frame.assignment_states[&declaration],
+            SourceFlowAssignmentState::Pending
+        );
+        frame
+            .complete_source_declaration(&host, declaration, inside, false_type, false_type)
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        assert_eq!(
+            frame.snapshot_for_symbols_at(context.store_mut_for_test(), &globals, read, [stop]),
+            Ok(body)
+        );
+        let exit = frame
+            .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [stop])
+            .unwrap();
+        assert_eq!(exit.type_of(stop), Some(true_type));
+        assert!(frame.visiting.is_empty());
+        assert!(frame.loop_snapshots.is_empty());
+        assert_eq!(frame.reference, None);
+    }
+
+    #[test]
+    fn source_loop_backedge_restores_outer_guards_before_success_and_pending_errors() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SOURCE_LOOP_BACKEDGE_INPUT);
+        let file = FileId::new(32_262);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let fixture = source_loop_backedge_fixture(&parsed, &bound, context.store(), &host);
+        let (declared, initial, number, _) = source_loop_backedge_types(&mut context, &fixture);
+        let mut frame = fixture
+            .plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.count.declaration,
+                fixture.count.symbol,
+                declared,
+                initial,
+            )
+            .unwrap();
+        let state = |frame: &SourceFlowFrame<'_, '_>| {
+            (
+                frame.base.clone(),
+                frame.declared_types.clone(),
+                frame.assignment_states.clone(),
+                frame.condition_values.clone(),
+                frame.call_effects.clone(),
+                frame.reference,
+            )
+        };
+        let node = flow_node(bound.flow_graph(), fixture.label).unwrap();
+        frame.reference = Some(fixture.count.symbol);
+        frame.visiting = [
+            (fixture.prefix, frame.reference),
+            (fixture.label, frame.reference),
+        ]
+        .into_iter()
+        .collect();
+        let outer = frame.visiting.clone();
+        let before = state(&frame);
+        let result = frame
+            .resolve_loop_label(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.label,
+                &node,
+                0,
+            )
+            .unwrap();
+        assert_eq!(result.type_of(fixture.count.symbol), Some(number));
+        assert!(!result.incomplete);
+        assert_eq!(frame.visiting, outer);
+        assert!(frame.loop_snapshots.is_empty());
+        assert_eq!(state(&frame), before);
+
+        frame.reference = Some(fixture.inside.symbol);
+        frame.visiting = [
+            (fixture.prefix, frame.reference),
+            (fixture.label, frame.reference),
+        ]
+        .into_iter()
+        .collect();
+        let outer = frame.visiting.clone();
+        let before = state(&frame);
+        for _ in 0..2 {
+            assert_eq!(
+                frame.resolve_loop_label(
+                    context.store_mut_for_test(),
+                    &globals,
+                    fixture.label,
+                    &node,
+                    0
+                ),
+                Err(SourceFlowInvariant::PendingAssignment(fixture.inside.declaration).into())
+            );
+            assert_eq!(frame.visiting, outer);
+            assert!(frame.loop_snapshots.is_empty());
+            assert_eq!(state(&frame), before);
+            assert!(frame.memo.values().all(|snapshot| !snapshot.incomplete));
+        }
+        assert!(!frame.memo.contains_key(&(fixture.label, frame.reference)));
+        assert!(!frame.memo.contains_key(&(fixture.prefix, frame.reference)));
+        frame.reference = None;
+        frame.visiting = [(fixture.plan.region.unwrap().entry, None)]
+            .into_iter()
+            .collect();
+        let outer = frame.visiting.clone();
+        assert_eq!(
+            frame.snapshot_for_symbols_at(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.body_read,
+                [fixture.inside.symbol]
+            ),
+            Err(SourceFlowInvariant::PendingAssignment(fixture.inside.declaration).into())
+        );
+        assert_eq!(frame.reference, None);
+        assert_eq!(frame.visiting, outer);
+        assert!(frame.loop_snapshots.is_empty());
+    }
+
+    #[test]
+    fn source_loop_backedge_keeps_active_non_label_first_entry_and_depth_guards() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SOURCE_LOOP_BACKEDGE_INPUT);
+        let file = FileId::new(32_263);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let fixture = source_loop_backedge_fixture(&parsed, &bound, context.store(), &host);
+        let (declared, initial, _, _) = source_loop_backedge_types(&mut context, &fixture);
+        let mut frame = fixture
+            .plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        frame
+            .complete_source_declaration(
+                &host,
+                fixture.count.declaration,
+                fixture.count.symbol,
+                declared,
+                initial,
+            )
+            .unwrap();
+        frame.reference = Some(fixture.count.symbol);
+        let key = (fixture.prefix, frame.reference);
+        assert!(frame.memo.is_empty());
+        assert!(frame.loop_snapshots.is_empty());
+        assert!(frame.visiting.insert(key));
+        // This is an active-key check on a real assignment, not a fabricated graph.
+        assert_eq!(
+            frame.resolve_flow(context.store_mut_for_test(), &globals, fixture.prefix, 0),
+            Err(SourceFlowInvariant::Cycle(fixture.prefix).into())
+        );
+        assert_eq!(frame.visiting, [key].into_iter().collect());
+        let node = flow_node(bound.flow_graph(), fixture.label).unwrap();
+        let entry = node.antecedents[0];
+        assert_ne!(entry, fixture.plan.region.unwrap().entry);
+        assert_eq!(
+            ast_payload(entry, &flow_node(bound.flow_graph(), entry).unwrap()),
+            Ok(fixture.count.declaration)
+        );
+        frame.visiting = [(entry, frame.reference)].into_iter().collect();
+        assert_eq!(
+            frame.resolve_loop_label(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.label,
+                &node,
+                0
+            ),
+            Err(SourceFlowInvariant::Cycle(entry).into())
+        );
+        assert_eq!(
+            frame.visiting,
+            [(entry, frame.reference)].into_iter().collect()
+        );
+        assert!(frame.memo.is_empty());
+        assert!(frame.loop_snapshots.is_empty());
+
+        frame.visiting = [key, (fixture.label, frame.reference)]
+            .into_iter()
+            .collect();
+        let outer = frame.visiting.clone();
+        let first = frame
+            .resolve_flow(context.store_mut_for_test(), &globals, entry, 0)
+            .unwrap();
+        assert_eq!(first.type_of(fixture.count.symbol), Some(initial));
+        let memo = frame.memo.clone();
+        let backedge = node.antecedents[1];
+        let target =
+            ast_payload(backedge, &flow_node(bound.flow_graph(), backedge).unwrap()).unwrap();
+        assert_eq!(fixture.plan.updates[&target].symbol, fixture.count.symbol);
+        assert!(!memo.contains_key(&(backedge, frame.reference)));
+        assert_eq!(
+            frame.resolve_loop_label(
+                context.store_mut_for_test(),
+                &globals,
+                fixture.label,
+                &node,
+                FLOW_DEPTH_LIMIT
+            ),
+            Err(SourceFlowInvariant::DepthLimit(backedge).into())
+        );
+        assert_eq!(frame.visiting, outer);
+        assert_eq!(frame.memo, memo);
+        assert!(frame.loop_snapshots.is_empty());
+        assert_eq!(frame.reference, Some(fixture.count.symbol));
+        assert_eq!(frame.declared_types[&fixture.count.symbol], declared);
     }
 
     #[test]
@@ -8426,6 +9056,271 @@ mod tests {
         assert_eq!(
             label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
+        );
+    }
+
+    const SINGLE_EDGE_LOOP_SOURCE: &str = "declare const value: number; for (;;) { value; break; }";
+
+    fn single_edge_loop_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef, NodeRef) {
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let (statement, body) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((node, iteration.statement)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::Block(block) = &parsed.arena.get(body).unwrap().data else {
+            panic!("expected the actual loop body")
+        };
+        let [expression, jump] = block.statements.nodes.as_slice() else {
+            panic!("expected the source read and terminal break")
+        };
+        let NodeData::ExpressionStatement(expression) =
+            &parsed.arena.get(*expression).unwrap().data
+        else {
+            panic!("expected the source expression statement")
+        };
+        assert_eq!(
+            parsed.arena.get(*jump).unwrap().kind,
+            SyntaxKind::BreakStatement
+        );
+        (
+            reference(statement),
+            reference(expression.expression),
+            reference(*jump),
+        )
+    }
+
+    #[test]
+    fn single_edge_loop_label_checks_the_real_terminal_break_and_replays() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_209);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (statement, read, jump) = single_edge_loop_nodes(&parsed, file);
+        let entry = bound.flow_at(statement).unwrap();
+        let label = bound.flow_at(read).unwrap();
+        let row = flow_node(bound.flow_graph(), label).unwrap();
+        assert_eq!(
+            source_flow_kind(label, row.flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        assert_eq!(label_antecedents(label, &row), Ok([entry].as_slice()));
+        assert_eq!(bound.flow_at(jump), Some(label));
+        assert_eq!(
+            bound.flow_graph().container_end(bound.source_file()),
+            Some(label)
+        );
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            [statement, read, jump],
+            [],
+            [],
+            [],
+            [],
+        )
+        .unwrap();
+        assert_eq!(plan.end, Some(label));
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let owner = bound
+            .symbol(captured_variable(&parsed, file, "value"))
+            .unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .unwrap()
+                .resolved_type,
+            Some(number)
+        );
+        assert_eq!(context.get_type_at_location(read), Ok(number));
+        let globals = context.global_types().clone();
+        let snapshot = |context: &CanonicalCheckerContext<'_>| {
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+                context.store().type_node_links(read).cloned(),
+                context.store().value_symbol_links(owner).cloned(),
+                context
+                    .store()
+                    .source_file_links(context.source_file(file).unwrap())
+                    .cloned(),
+                context.diagnostics().clone(),
+            )
+        };
+        let before = snapshot(&context);
+        for _ in 0..2 {
+            let mut frame = plan
+                .frame_with_captured_locals(
+                    context.store(),
+                    &host,
+                    &bound,
+                    [(owner, number)].into(),
+                )
+                .unwrap();
+            for point in [read, jump, read] {
+                let actual = frame
+                    .snapshot_for_symbols_at(context.store_mut_for_test(), &globals, point, [owner])
+                    .unwrap();
+                assert_eq!(actual.type_of(owner), Some(number));
+                assert!(actual.reachable);
+                assert!(!actual.incomplete);
+            }
+            let exit = frame
+                .snapshot_for_symbols_at_end(context.store_mut_for_test(), &globals, [owner])
+                .unwrap();
+            assert_eq!(exit.type_of(owner), Some(number));
+            assert!(exit.reachable);
+            assert!(!exit.incomplete);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(snapshot(&context), before);
+        }
+    }
+
+    #[test]
+    fn single_edge_loop_label_rejects_changed_kind_and_shape() {
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_210);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let (statement, read, _) = single_edge_loop_nodes(&parsed, file);
+        let label = bound.flow_at(read).unwrap();
+        let entry = bound.flow_at(statement).unwrap();
+        let original = flow_node(bound.flow_graph(), label).unwrap();
+        assert_eq!(label_antecedents(label, &original), Ok([entry].as_slice()));
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        let mut empty = original.clone();
+        empty.antecedents.clear();
+        let mut duplicate = original.clone();
+        duplicate.antecedents.push(entry);
+        let mut linear = original.clone();
+        linear.antecedent = Some(entry);
+        let mut payload = original.clone();
+        payload.payload = Some(FlowNodePayload::Ast(statement));
+        let mut branch = original.clone();
+        branch.flags = FlowFlags::BRANCH_LABEL;
+        let mut wrong_kind = original.clone();
+        wrong_kind.flags = FlowFlags::START;
+        wrong_kind.antecedents.push(label);
+        for changed in [empty, duplicate, linear, payload, branch, wrong_kind] {
+            assert_eq!(
+                label_antecedents(label, &changed),
+                Err(SourceFlowInvariant::InvalidAntecedents(label).into())
+            );
+            assert_eq!(label_antecedents(label, &original), Ok([entry].as_slice()));
+        }
+        let mut composite = original.clone();
+        composite.flags = FlowFlags::LOOP_LABEL | FlowFlags::BRANCH_LABEL;
+        assert_eq!(
+            label_antecedents(label, &composite),
+            Err(SourceFlowInvariant::InvalidFlowFlags {
+                flow: label,
+                flags: composite.flags
+            }
+            .into())
+        );
+        for metadata in [
+            FlowFlags::REFERENCED,
+            FlowFlags::SHARED,
+            FlowFlags::REFERENCED | FlowFlags::SHARED,
+        ] {
+            let mut annotated = original.clone();
+            annotated.flags = FlowFlags::LOOP_LABEL | metadata;
+            assert_eq!(label_antecedents(label, &annotated), Ok([entry].as_slice()));
+        }
+        assert_eq!(flow_node(bound.flow_graph(), label).unwrap(), original);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn single_edge_loop_label_keeps_foreign_flow_and_source_owner_rejection() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let file = FileId::new(32_211);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (statement, read, jump) = single_edge_loop_nodes(&parsed, file);
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            bound,
+            context.store(),
+            &host,
+            statement,
+            [statement, read, jump],
+            [],
+            [],
+            [],
+            [],
+        )
+        .unwrap();
+        let foreign = parse_source_file(SINGLE_EDGE_LOOP_SOURCE);
+        let foreign_file = FileId::new(32_212);
+        let foreign_context = loop_context(&foreign, foreign_file);
+        let foreign_bound = foreign_context.file(foreign_file).unwrap().1;
+        let (_, foreign_read, _) = single_edge_loop_nodes(&foreign, foreign_file);
+        let foreign_flow = foreign_bound.flow_at(foreign_read).unwrap();
+        let mut foreign_point = plan.clone();
+        foreign_point.points.insert(read, foreign_flow);
+        let mut foreign_exit = plan.clone();
+        foreign_exit.end = Some(foreign_flow);
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for changed in [foreign_point, foreign_exit] {
+            assert_eq!(
+                changed.validate_flow_paths(bound),
+                Err(SourceFlowInvariant::ForeignFlow(foreign_flow).into())
+            );
+            assert_eq!(plan.validate_flow_paths(bound), Ok(()));
+        }
+        let mut wrong_owner = plan.clone();
+        wrong_owner.region.as_mut().unwrap().statement = read;
+        assert!(matches!(
+            wrong_owner.frame_with_captured_locals(context.store(), &host, bound, HashMap::new()),
+            Err(SourceFlowError::Invariant(SourceFlowInvariant::InvalidSourceRegion(node))) if node == read
+        ));
+        plan.frame_with_captured_locals(context.store(), &host, bound, HashMap::new())
+            .unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before
         );
     }
 

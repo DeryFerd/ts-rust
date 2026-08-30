@@ -427,16 +427,19 @@ fn validated_intersection_relation_projection(
     }
 }
 
-/// Rejects strict nullish sources after proving a supported object target.
+/// Rejects canonical void or strict nullish sources against a proven object target.
 /// Generic members may stay cold. Declared property objects must be resolved.
-fn authenticated_nullish_object_nonmatch(
+fn authenticated_void_or_nullish_object_nonmatch(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     source: TypeId,
     target: TypeId,
     bootstrap: RelationBootstrapFacts,
     array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, RelationUnavailable> {
-    if !bootstrap.strict_null_checks || !store.type_flags(source)?.intersects(TypeFlags::NULLABLE) {
+    if source != bootstrap.void_type
+        && (!bootstrap.strict_null_checks
+            || !store.type_flags(source)?.intersects(TypeFlags::NULLABLE))
+    {
         return Ok(false);
     }
     if !matches!(
@@ -2473,7 +2476,7 @@ impl<'store> RelaterSession<'store> {
             return Ok(Ternary::False);
         }
 
-        if authenticated_nullish_object_nonmatch(
+        if authenticated_void_or_nullish_object_nonmatch(
             self.store,
             source,
             target,
@@ -9597,7 +9600,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(false);
         }
 
-        if authenticated_nullish_object_nonmatch(
+        if authenticated_void_or_nullish_object_nonmatch(
             self,
             source,
             target,
@@ -16289,6 +16292,421 @@ mod tests {
                 Ternary::False
             }),
         );
+    }
+
+    #[derive(Clone, Copy)]
+    struct WrittenThisRelationTarget {
+        type_: TypeId,
+        annotation: NodeRef,
+        owner: SemanticSymbolId,
+        property: SemanticSymbolId,
+    }
+
+    fn written_this_relation_target(
+        context: &CanonicalCheckerContext<'_>,
+        source: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> WrittenThisRelationTarget {
+        let (_, signature) = source_function_callable(context, source, file, name);
+        let store = context.store();
+        let signature = store.signature(signature).unwrap();
+        let declaration = signature.declaration().unwrap();
+        let written =
+            crate::semantic::source_callables::source_callable_this_parameter(store, declaration)
+                .unwrap()
+                .unwrap();
+        let bound = context.file(file).unwrap().1;
+        assert_eq!(bound.symbol(written.declaration), Some(written.symbol));
+        assert_eq!(signature.this_parameter(), Some(written.symbol));
+        let [input] = signature.parameters() else {
+            panic!("the written receiver must leave one ordinary input parameter");
+        };
+        assert_ne!(*input, written.symbol);
+        assert_eq!(
+            store.symbol(*input).unwrap().name().as_utf8(),
+            Some("input")
+        );
+        assert_eq!(signature.min_argument_count(), 1);
+        let type_ = store
+            .type_node_links(written.annotation)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(
+            store
+                .value_symbol_links(written.symbol)
+                .unwrap()
+                .resolved_type,
+            Some(type_),
+        );
+        let owner = bound.symbol(written.annotation).unwrap();
+        let owner_record = store.symbol(owner).unwrap();
+        assert_eq!(owner_record.flags(), SymbolFlags::TYPE_LITERAL);
+        assert_eq!(owner_record.declarations(), Some(&[written.annotation][..]));
+        assert_eq!(store.type_payload(type_).unwrap().symbol(), Some(owner));
+        let NodeData::TypeLiteralNode(literal) =
+            &source.arena.get(written.annotation.node).unwrap().data
+        else {
+            panic!("the receiver must retain its written type literal");
+        };
+        let [property] = literal.members.nodes.as_slice() else {
+            panic!("the written receiver has one value property");
+        };
+        let property = NodeRef::new(source.arena.id(), file, *property);
+        let property_annotation = store.source_direct_type_annotation(property).unwrap();
+        let property = bound.symbol(property).unwrap();
+        assert_eq!(store.symbol(property).unwrap().parent(), Some(owner));
+        let structured = store
+            .type_payload(type_)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap();
+        assert_eq!(structured.members, owner_record.members());
+        assert_eq!(structured.properties.as_deref(), Some(&[property][..]));
+        assert_eq!(
+            store.value_symbol_links(property).unwrap().resolved_type,
+            Some(store.intrinsic_bootstrap().unwrap().number_type),
+        );
+        assert_eq!(
+            store.source_node_kind(property_annotation),
+            Some(SyntaxKind::NumberKeyword),
+        );
+        assert_eq!(
+            super::validate_resolved_declared_property_object(store, type_),
+            super::DeclaredPropertyObjectValidation::Valid(
+                super::DeclaredPropertyObjectProof::TypeLiteral,
+            ),
+        );
+        WrittenThisRelationTarget {
+            type_,
+            annotation: written.annotation,
+            owner,
+            property,
+        }
+    }
+
+    fn void_object_relation_snapshot(
+        store: &TestStore,
+        source: &ParseResult,
+        file: FileId,
+        targets: &[TypeId],
+    ) -> impl std::fmt::Debug + PartialEq + use<> {
+        let nodes = source
+            .arena
+            .iter()
+            .map(|(node, _)| NodeRef::new(source.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        let void = store.intrinsic_bootstrap().unwrap().void_type;
+        let source_file = crate::semantic::SourceFileRef::new(
+            store.id(),
+            NodeRef::new(source.arena.id(), file, source.source_file),
+        );
+        (
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.type_alias_len(),
+                store.index_info_len(),
+                store.symbol_store().symbol_table_len(),
+                store.merged_symbol_len(),
+            ),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+            nodes
+                .iter()
+                .map(|node| {
+                    (
+                        store.type_node_links(*node).cloned(),
+                        store.symbol_node_links(*node).cloned(),
+                        store.signature_links(*node).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            nodes
+                .iter()
+                .filter_map(|node| store.source_declaration_symbol(*node))
+                .map(|symbol| {
+                    (
+                        symbol,
+                        store.symbol(symbol).cloned(),
+                        store.value_symbol_links(symbol).cloned(),
+                        store.declared_type_links(symbol).cloned(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            std::iter::once(void)
+                .chain(targets.iter().copied())
+                .map(|type_| {
+                    let record = store.type_payload(type_).unwrap();
+                    let data = match record.data() {
+                        TypeData::Intrinsic(data) => (Some(data.clone()), None),
+                        TypeData::Object(data) => (None, Some(data.clone())),
+                        _ => panic!("the relation keeps its intrinsic and object endpoints"),
+                    };
+                    (
+                        record.id(),
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        data,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            store.source_file_links(source_file).cloned(),
+            store.type_resolution_is_empty(),
+        )
+    }
+
+    #[test]
+    fn void_object_nonmatches_keep_source_receiver_identity_and_null_modes() {
+        let library = parse_source_file("");
+        let source = parse_source_file(
+            "function read(this: { value: number }, input: string): number { return this.value; }",
+        );
+        let file = FileId::new(96_455);
+        for strict_null_checks in [false, true] {
+            let mut context = source_relation_context(
+                &library,
+                &source,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types: false,
+                    },
+                    no_implicit_any: true,
+                    no_implicit_this: true,
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let target = written_this_relation_target(&context, &source, file, "read");
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let (void, null, undefined, error) = (
+                bootstrap.void_type,
+                bootstrap.null_type,
+                bootstrap.undefined_type,
+                bootstrap.error_type,
+            );
+            assert_eq!(store.claim_strict_function_types(true), Ok(()));
+            let before = void_object_relation_snapshot(store, &source, file, &[target.type_]);
+            let mut session = super::InstantiationSession::new_recovering(
+                store,
+                super::InstantiationLimits {
+                    max_depth: 0,
+                    max_count: 0,
+                },
+                error,
+            )
+            .unwrap();
+            let mark = session.limit_event_mark();
+            for (source_type, related) in [
+                (void, false),
+                (null, !strict_null_checks),
+                (undefined, !strict_null_checks),
+            ] {
+                for kind in [RelationKind::Assignable, RelationKind::Comparable] {
+                    for _ in 0..2 {
+                        assert_nullish_relation_entries(
+                            store,
+                            (source_type, target.type_),
+                            kind,
+                            Some(&globals),
+                            &mut session,
+                            Ok(related),
+                        );
+                        assert_eq!(
+                            void_object_relation_snapshot(store, &source, file, &[target.type_]),
+                            before,
+                        );
+                    }
+                }
+            }
+            assert_eq!((session.query_count(), session.total_count()), (0, 0));
+            assert!(!session.limit_event_occurred_since(mark));
+            assert_eq!(session.recovery_error_type(), Some(error));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each source-owned cache is damaged and restored on one caller.
+    fn void_object_nonmatches_reject_changed_owners_and_caches() {
+        #[derive(Clone, Copy)]
+        enum Damage {
+            VoidOwner,
+            TargetOwner,
+            Annotation,
+            PropertyValue,
+        }
+
+        let library = parse_source_file("");
+        let source = parse_source_file(concat!(
+            "function read(this: { value: number }, input: string): number { return this.value; }\n",
+            "function other(this: { value: number }, input: string): number { return this.value; }",
+        ));
+        let file = FileId::new(96_456);
+        for strict_null_checks in [false, true] {
+            for damage in [
+                Damage::VoidOwner,
+                Damage::TargetOwner,
+                Damage::Annotation,
+                Damage::PropertyValue,
+            ] {
+                let mut context = source_relation_context(
+                    &library,
+                    &source,
+                    file,
+                    CanonicalCheckerOptions {
+                        intrinsic: IntrinsicBootstrapOptions {
+                            strict_null_checks,
+                            exact_optional_property_types: false,
+                        },
+                        no_implicit_any: true,
+                        no_implicit_this: true,
+                        strict_function_types: true,
+                        ..CanonicalCheckerOptions::default()
+                    },
+                );
+                context.check_source_file(file).unwrap();
+                assert!(context.diagnostics().is_empty());
+                let target = written_this_relation_target(&context, &source, file, "read");
+                let other = written_this_relation_target(&context, &source, file, "other");
+                assert_ne!(target.type_, other.type_);
+                assert_ne!(target.owner, other.owner);
+                let globals = context.global_types().clone();
+                let store = context.store_mut_for_test();
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let (void, number, error) = (
+                    bootstrap.void_type,
+                    bootstrap.number_type,
+                    bootstrap.error_type,
+                );
+                let unowned_property = alloc_typed_property(store, "value", number, false);
+                let unowned = alloc_property_object(store, vec![unowned_property]);
+                assert_eq!(
+                    super::validate_resolved_declared_property_object(store, unowned),
+                    super::DeclaredPropertyObjectValidation::NotDeclared,
+                );
+                let annotation = store.type_node_links(target.annotation).unwrap().clone();
+                let property_value = store.value_symbol_links(target.property).unwrap().clone();
+                assert_eq!(store.claim_strict_function_types(true), Ok(()));
+                let targets = [target.type_, other.type_, unowned];
+                let original = void_object_relation_snapshot(store, &source, file, &targets);
+                let mut session = super::InstantiationSession::new_recovering(
+                    store,
+                    super::InstantiationLimits {
+                        max_depth: 0,
+                        max_count: 0,
+                    },
+                    error,
+                )
+                .unwrap();
+                let mark = session.limit_event_mark();
+                let assert_unchanged = |store: &mut TestStore,
+                                        session: &mut super::InstantiationSession,
+                                        target_type,
+                                        kind,
+                                        expected| {
+                    let before = void_object_relation_snapshot(store, &source, file, &targets);
+                    for _ in 0..2 {
+                        assert_nullish_relation_entries(
+                            store,
+                            (void, target_type),
+                            kind,
+                            Some(&globals),
+                            session,
+                            expected,
+                        );
+                        assert_eq!(
+                            void_object_relation_snapshot(store, &source, file, &targets),
+                            before
+                        );
+                    }
+                };
+                for kind in [RelationKind::Assignable, RelationKind::Comparable] {
+                    for warm in [false, true] {
+                        if warm {
+                            assert_unchanged(store, &mut session, target.type_, kind, Ok(false));
+                        }
+                        assert_unchanged(
+                            store,
+                            &mut session,
+                            unowned,
+                            kind,
+                            Err(RelationUnavailable::StructuralRelation {
+                                source: void,
+                                target: unowned,
+                                relation: kind,
+                            }),
+                        );
+
+                        let expected = match damage {
+                            Damage::VoidOwner => {
+                                assert!(store.set_type_symbol(void, Some(target.owner)));
+                                RelationUnavailable::UnsupportedUnionConstituent(void)
+                            }
+                            Damage::TargetOwner => {
+                                assert!(store.set_type_symbol(target.type_, Some(other.owner)));
+                                RelationUnavailable::InvalidStructuredMembers(target.type_)
+                            }
+                            Damage::Annotation => {
+                                assert!(store.set_type_node_links(
+                                    target.annotation,
+                                    TypeNodeLinks {
+                                        resolved_type: Some(other.type_),
+                                        ..annotation.clone()
+                                    }
+                                ));
+                                RelationUnavailable::InvalidStructuredMembers(target.type_)
+                            }
+                            Damage::PropertyValue => {
+                                assert!(store.set_value_symbol_links(
+                                    target.property,
+                                    ValueSymbolLinks {
+                                        resolved_type: None,
+                                        ..property_value.clone()
+                                    }
+                                ));
+                                RelationUnavailable::InvalidStructuredMembers(target.type_)
+                            }
+                        };
+                        assert_unchanged(store, &mut session, target.type_, kind, Err(expected));
+                        match damage {
+                            Damage::VoidOwner => assert!(store.set_type_symbol(void, None)),
+                            Damage::TargetOwner => {
+                                assert!(store.set_type_symbol(target.type_, Some(target.owner)));
+                            }
+                            Damage::Annotation => assert!(
+                                store.set_type_node_links(target.annotation, annotation.clone())
+                            ),
+                            Damage::PropertyValue => {
+                                assert!(store.set_value_symbol_links(
+                                    target.property,
+                                    property_value.clone()
+                                ));
+                            }
+                        }
+                        assert_unchanged(store, &mut session, target.type_, kind, Ok(false));
+                        assert_eq!(
+                            void_object_relation_snapshot(store, &source, file, &targets),
+                            original
+                        );
+                    }
+                }
+                assert_eq!((session.query_count(), session.total_count()), (0, 0));
+                assert!(!session.limit_event_occurred_since(mark));
+                assert_eq!(session.recovery_error_type(), Some(error));
+            }
+        }
     }
 
     #[test]
