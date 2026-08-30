@@ -4479,12 +4479,15 @@ pub(super) fn narrow_by_equality(
     {
         return Ok(input);
     }
-    if !strict && matches!(value_kind, SourceEqualityValueKind::Literal(_)) {
-        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
-    }
-
     let mut leaves = Vec::new();
-    collect_source_equality_leaves(store, input, &mut leaves, &mut HashSet::new())?;
+    if !strict && matches!(value_kind, SourceEqualityValueKind::Literal(_)) {
+        if discriminant.is_some() {
+            return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+        }
+        collect_source_loose_numeric_equality_leaves(store, globals, input, value, &mut leaves)?;
+    } else {
+        collect_source_equality_leaves(store, input, &mut leaves, &mut HashSet::new())?;
+    }
     let mut retained = Vec::with_capacity(leaves.len());
     for leaf in &leaves {
         let flags = store
@@ -4641,6 +4644,42 @@ pub(super) fn narrow_by_equality(
             .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
             .map_err(SourceEqualityNarrowingError::Union),
     }
+}
+
+/// Same-domain numbers need no loose-equality coercion. Check every input before filtering.
+fn collect_source_loose_numeric_equality_leaves(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    input: TypeId,
+    value: TypeId,
+    leaves: &mut Vec<TypeId>,
+) -> Result<(), SourceEqualityNarrowingError> {
+    let numeric_literal = |record: &TypeRecord| {
+        record.flags() == TypeFlags::NUMBER_LITERAL
+            && matches!(record.data(), TypeData::Literal(literal)
+                if matches!(&literal.value, LiteralValue::Number(_)))
+    };
+    if !store.type_payload(value).is_some_and(numeric_literal) {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    }
+    collect_source_equality_leaves(store, input, leaves, &mut HashSet::new())?;
+    if leaves.is_empty()
+        || !leaves.iter().all(|leaf| {
+            store.type_payload(*leaf).is_some_and(|record| {
+                numeric_literal(record)
+                    || record.flags() == TypeFlags::NUMBER
+                        && matches!(record.data(), TypeData::Intrinsic(_))
+            })
+        })
+    {
+        return Err(SourceEqualityNarrowingError::UnsupportedType(value));
+    }
+    store
+        .validate_union_constituent_with_global_types(globals, value)
+        .map_err(SourceEqualityNarrowingError::Union)?;
+    store
+        .validate_union_constituent_with_global_types(globals, input)
+        .map_err(SourceEqualityNarrowingError::Union)
 }
 
 fn source_equality_value_kind(
@@ -9737,6 +9776,693 @@ mod tests {
             ),
             Err(SourceEqualityNarrowingError::UnsupportedType(ready)),
         );
+    }
+
+    fn source_numeric_equality_types(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (TypeId, [TypeId; 3]) {
+        let declaration = captured_variable(parsed, file, "choices");
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let annotation = NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap());
+        let NodeData::UnionTypeNode(union) = &parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("expected the written numeric union")
+        };
+        let [zero, one, two] = union.types.nodes.as_slice() else {
+            panic!("expected three written numeric members")
+        };
+        let literals = [*zero, *one, *two].map(|node| {
+            context
+                .get_type_from_type_node(NodeRef::new(parsed.arena.id(), file, node))
+                .unwrap()
+        });
+        let choices = context.get_type_from_type_node(annotation).unwrap();
+        let mut expected = literals;
+        expected.sort_unstable();
+        assert_eq!(
+            union_constituents(context.store(), choices),
+            Some(expected.as_slice())
+        );
+        (choices, literals)
+    }
+
+    #[test]
+    fn loose_numeric_equality_keeps_written_literals_and_cold_warm_results() {
+        let parsed = parse_source_file("declare const choices: 0 | 1 | 2;");
+        let file = FileId::new(32_270);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (choices, [zero, one, two]) =
+            source_numeric_equality_types(&mut context, &parsed, file);
+        let fresh_one = context.store().fresh_type_of_literal_type(one).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, never) = (bootstrap.number_type, bootstrap.never_type);
+
+        let rejected = narrow_by_equality(
+            context.store_mut_for_test(),
+            &globals,
+            choices,
+            fresh_one,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let mut remaining = [zero, two];
+        remaining.sort_unstable();
+        assert_eq!(
+            union_constituents(context.store(), rejected),
+            Some(remaining.as_slice()),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .expression_union_type_with_global_types(
+                    &globals,
+                    &remaining,
+                    UnionReduction::Literal,
+                ),
+            Ok(rejected),
+        );
+
+        for (input, value, require_match, expected) in [
+            (zero, one, true, never),
+            (zero, one, false, zero),
+            (one, fresh_one, true, one),
+            (one, fresh_one, false, never),
+            (fresh_one, one, true, fresh_one),
+            (fresh_one, one, false, never),
+            (number, fresh_one, true, one),
+            (number, fresh_one, false, number),
+            (choices, one, true, one),
+            (choices, one, false, rejected),
+            (choices, fresh_one, true, one),
+            (choices, fresh_one, false, rejected),
+        ] {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    value,
+                    false,
+                    require_match,
+                    None,
+                ),
+                Ok(expected),
+            );
+            let warm = (
+                context.store().type_len(),
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().relation_state_snapshot(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    narrow_by_equality(
+                        context.store_mut_for_test(),
+                        &globals,
+                        input,
+                        value,
+                        false,
+                        require_match,
+                        None,
+                    ),
+                    Ok(expected),
+                );
+                assert_eq!(
+                    (
+                        context.store().type_len(),
+                        context
+                            .store()
+                            .intrinsic_bootstrap()
+                            .unwrap()
+                            .union_cache_len(),
+                        context.store().checker_link_allocated_lengths(),
+                        context.store().relation_state_snapshot(),
+                    ),
+                    warm,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damage case restores the same checked numeric inputs.
+    fn loose_numeric_equality_rejects_mixed_foreign_and_damaged_inputs_before_filtering() {
+        use crate::semantic::type_records::RegularLiteralLink;
+
+        let parsed = parse_source_file("declare const choices: 0 | 1 | 2;");
+        let file = FileId::new(32_271);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (choices, [zero, one, two]) =
+            source_numeric_equality_types(&mut context, &parsed, file);
+        let fresh_one = context.store().fresh_type_of_literal_type(one).unwrap();
+        let fresh_two = context.store().fresh_type_of_literal_type(two).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, unknown, null, regular_true) = (
+            bootstrap.number_type,
+            bootstrap.unknown_type,
+            bootstrap.null_type,
+            bootstrap.regular_true_type,
+        );
+        let text = context
+            .store_mut_for_test()
+            .regular_string_literal_type("1".to_owned())
+            .unwrap();
+        let mixed = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[zero, text],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let nullable = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[zero, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let foreign = loop_context(&parsed, FileId::new(32_272));
+        let foreign_number = foreign.store().intrinsic_bootstrap().unwrap().number_type;
+        let value = match context.store().type_payload(one).unwrap().data() {
+            TypeData::Literal(literal) => literal.value.clone(),
+            _ => unreachable!(),
+        };
+        let copied_one = context
+            .store_mut_for_test()
+            .alloc_literal_type(
+                TypeFlags::NUMBER_LITERAL,
+                value,
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        let copied_number = context
+            .store_mut_for_test()
+            .alloc_intrinsic_type(TypeFlags::NUMBER, "number")
+            .unwrap();
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            )
+        };
+        for (input, value, expected) in [
+            (
+                mixed,
+                one,
+                SourceEqualityNarrowingError::UnsupportedType(one),
+            ),
+            (
+                unknown,
+                one,
+                SourceEqualityNarrowingError::UnsupportedType(one),
+            ),
+            (
+                nullable,
+                one,
+                SourceEqualityNarrowingError::UnsupportedType(one),
+            ),
+            (
+                choices,
+                text,
+                SourceEqualityNarrowingError::UnsupportedType(text),
+            ),
+            (
+                zero,
+                regular_true,
+                SourceEqualityNarrowingError::UnsupportedType(regular_true),
+            ),
+            (
+                foreign_number,
+                one,
+                SourceEqualityNarrowingError::InvalidType(foreign_number),
+            ),
+            (
+                one,
+                foreign_number,
+                SourceEqualityNarrowingError::InvalidType(foreign_number),
+            ),
+            (
+                choices,
+                copied_one,
+                SourceEqualityNarrowingError::Union(LiteralTypeCacheError::InvalidCachedLiteral(
+                    copied_one,
+                )),
+            ),
+            (
+                copied_number,
+                one,
+                SourceEqualityNarrowingError::Union(
+                    LiteralTypeCacheError::UnsupportedUnionConstituent(copied_number),
+                ),
+            ),
+        ] {
+            let before = snapshot(context.store());
+            for require_match in [true, false] {
+                assert_eq!(
+                    narrow_by_equality(
+                        context.store_mut_for_test(),
+                        &globals,
+                        input,
+                        value,
+                        false,
+                        require_match,
+                        None,
+                    ),
+                    Err(expected),
+                );
+                assert_eq!(snapshot(context.store()), before);
+            }
+        }
+
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                one,
+                false,
+                true,
+                Some("kind"),
+            ),
+            Err(SourceEqualityNarrowingError::UnsupportedType(one)),
+        );
+        assert_eq!(snapshot(context.store()), before);
+
+        // Warm the result before damaging a leaf that a match would remove.
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Ok(one),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(two, Some(two), two)
+        );
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::Union(
+                LiteralTypeCacheError::InvalidCachedLiteral(two)
+            )),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(two, Some(fresh_two), two)
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(fresh_one, None, one)
+        );
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                number,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::Union(
+                LiteralTypeCacheError::InvalidCachedLiteral(fresh_one)
+            )),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(fresh_one, Some(fresh_one), one)
+        );
+
+        let owner = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(captured_variable(&parsed, file, "choices"))
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(choices, Some(owner))
+        );
+        let before = snapshot(context.store());
+        assert_eq!(
+            narrow_by_equality(
+                context.store_mut_for_test(),
+                &globals,
+                choices,
+                fresh_one,
+                false,
+                true,
+                None,
+            ),
+            Err(SourceEqualityNarrowingError::Union(
+                LiteralTypeCacheError::InvalidCachedUnion(choices)
+            )),
+        );
+        assert_eq!(snapshot(context.store()), before);
+        assert!(context.store_mut_for_test().set_type_symbol(choices, None));
+        let restored = snapshot(context.store());
+        for _ in 0..2 {
+            assert_eq!(
+                narrow_by_equality(
+                    context.store_mut_for_test(),
+                    &globals,
+                    choices,
+                    fresh_one,
+                    false,
+                    true,
+                    None,
+                ),
+                Ok(one),
+            );
+            assert_eq!(snapshot(context.store()), restored);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The source and frame checks share the exact const-loop graph.
+    fn loose_numeric_equality_keeps_the_real_const_loop_and_reference_replay() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "for (const fixed = 0; fixed < 1; ++fixed) {\n",
+            "  const current: 0 = fixed;\n",
+            "  if (fixed == 1) { break; }\n",
+            "  if (fixed == 2) { continue; }\n",
+            "}\n",
+        ));
+        let file = FileId::new(32_273);
+        let mut context = loop_context(&parsed, file);
+        // The unchanged source must check before any test supplies frame values.
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2588, 2367, 2367],
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let assignment = |name| {
+            let declaration = captured_variable(&parsed, file, name);
+            SourceFlowAssignment {
+                declaration,
+                symbol: bound.symbol(declaration).unwrap(),
+            }
+        };
+        let fixed = assignment("fixed");
+        let current = assignment("current");
+        assert_ne!(fixed.symbol, current.symbol);
+        let (statement, iteration) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| match &record.data {
+                NodeData::ForStatement(iteration) => Some((reference(node), iteration)),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::BinaryExpression(header) =
+            &parsed.arena.get(iteration.condition.unwrap()).unwrap().data
+        else {
+            panic!("expected the original header comparison")
+        };
+        let header_read = reference(header.left);
+        let NodeData::PrefixUnaryExpression(update) = &parsed
+            .arena
+            .get(iteration.incrementor.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the original prefix update")
+        };
+        let update_target = reference(update.operand);
+        let NodeData::VariableDeclaration(current_data) =
+            &parsed.arena.get(current.declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let body_read = reference(current_data.initializer.unwrap());
+        let mut conditions = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::BinaryExpression(binary) = &record.data else {
+                    return None;
+                };
+                (parsed.arena.get(binary.operator_token).unwrap().kind
+                    == SyntaxKind::EqualsEqualsToken)
+                    .then_some((
+                        reference(node),
+                        reference(binary.left),
+                        reference(binary.right),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        conditions.sort_by_key(|(node, _, _)| parsed.arena.get(node.node).unwrap().range.start);
+        let [first, second] = conditions.as_slice() else {
+            panic!("expected both original loose comparisons")
+        };
+        let second_flow = bound.flow_at(second.1).unwrap();
+        let second_row = flow_node(bound.flow_graph(), second_flow).unwrap();
+        assert_eq!(
+            source_flow_kind(second_flow, second_row.flags),
+            Ok(SourceFlowKind::FalseCondition)
+        );
+        assert_eq!(ast_payload(second_flow, &second_row), Ok(first.0));
+        let label = bound.flow_at(header_read).unwrap();
+        assert_eq!(
+            source_flow_kind(label, flow_node(bound.flow_graph(), label).unwrap().flags),
+            Ok(SourceFlowKind::LoopLabel)
+        );
+        for read in [header_read, update_target, body_read, first.1, second.1] {
+            validate_source_reference(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                &host,
+                read,
+                fixed.symbol,
+            )
+            .unwrap();
+        }
+        let mut points = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let node = reference(node);
+                (record.kind == SyntaxKind::Identifier
+                    && source_node_is_descendant_of(&parsed.arena, node, statement.node)
+                    && bound.flow_at(node).is_some())
+                .then_some(node)
+            })
+            .collect::<Vec<_>>();
+        points.sort_unstable();
+        let plan = SourceFlowPlan::preflight_source_statement(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            &host,
+            statement,
+            points,
+            conditions.iter().map(|(expression, _, value)| {
+                SourceFlowCondition::Equality(SourceEqualityCondition {
+                    expression: *expression,
+                    symbol: fixed.symbol,
+                    value: *value,
+                    comparison: SourceTypeofComparison::Equal,
+                    strict: false,
+                    discriminant: None,
+                })
+            }),
+            [fixed, current],
+            [SourceFlowUpdate {
+                target: update_target,
+                declaration: fixed.declaration,
+                symbol: fixed.symbol,
+                readonly: true,
+            }],
+            [],
+        )
+        .unwrap();
+        let value_type = |symbol| {
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type
+                .unwrap()
+        };
+        let zero = value_type(fixed.symbol);
+        let current_type = value_type(current.symbol);
+        assert!(matches!(
+            context.store().type_payload(zero).unwrap().data(),
+            TypeData::Literal(_)
+        ));
+        assert!(matches!(
+            context.store().type_payload(current_type).unwrap().data(),
+            TypeData::Literal(_)
+        ));
+        let mut frame = plan
+            .frame_with_captured_locals(context.store(), &host, &bound, HashMap::new())
+            .unwrap();
+        for (_, _, value) in &conditions {
+            frame
+                .complete_condition_value(
+                    *value,
+                    context
+                        .store()
+                        .type_node_links(*value)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        // The checked non-union declared types are also the post-assignment flow types.
+        frame
+            .complete_source_declaration(&host, fixed.declaration, fixed.symbol, zero, zero)
+            .unwrap();
+        assert_eq!(
+            frame.assignment_states[&update_target],
+            SourceFlowAssignmentState::ReadonlyUpdate
+        );
+        assert_eq!(
+            frame.assignment_states[&current.declaration],
+            SourceFlowAssignmentState::Pending
+        );
+        for read in [header_read, update_target, body_read] {
+            let snapshot = frame
+                .snapshot_for_symbols_at(
+                    context.store_mut_for_test(),
+                    &globals,
+                    read,
+                    [fixed.symbol],
+                )
+                .unwrap();
+            assert_eq!(snapshot.type_of(fixed.symbol), Some(zero));
+            assert!(snapshot.reachable);
+            assert!(!snapshot.incomplete);
+        }
+        assert!(frame.memo.contains_key(&(label, Some(fixed.symbol))));
+        frame
+            .complete_source_declaration(
+                &host,
+                current.declaration,
+                current.symbol,
+                current_type,
+                current_type,
+            )
+            .unwrap();
+        assert!(frame.memo.is_empty());
+        for read in [first.1, second.1] {
+            assert_eq!(
+                frame
+                    .snapshot_for_symbols_at(
+                        context.store_mut_for_test(),
+                        &globals,
+                        read,
+                        [fixed.symbol]
+                    )
+                    .unwrap()
+                    .type_of(fixed.symbol),
+                Some(zero)
+            );
+        }
+        let memo = frame.memo.clone();
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frame
+                    .snapshot_for_symbols_at(
+                        context.store_mut_for_test(),
+                        &globals,
+                        second.1,
+                        [fixed.symbol]
+                    )
+                    .unwrap()
+                    .type_of(fixed.symbol),
+                Some(zero)
+            );
+            assert_eq!(frame.memo, memo);
+            assert!(frame.visiting.is_empty());
+            assert!(frame.loop_snapshots.is_empty());
+            assert_eq!(frame.reference, None);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot()
+                ),
+                before
+            );
+        }
+        let diagnostics = context.diagnostics().clone();
+        for _ in 0..2 {
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.diagnostics(), &diagnostics);
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot()
+                ),
+                before
+            );
+        }
     }
 
     #[test]
