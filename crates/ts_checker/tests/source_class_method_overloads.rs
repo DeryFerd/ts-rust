@@ -4,7 +4,7 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, SignatureId, TypeData, TypeId,
+    CanonicalCheckerContext, CanonicalCheckerOptions, ElementFlags, SignatureId, TypeData, TypeId,
 };
 use ts_options::ScriptTarget;
 use ts_parser::{ParseResult, parse_source_file};
@@ -584,4 +584,139 @@ fn method_body_calls_keep_array_overloads_and_their_shared_return() {
         .chain([call, callee(&parsed, call)])
         .collect::<Vec<_>>();
     assert_replay(&mut context, &names);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // The shared group proves tuple identity and overload choice together.
+fn tuple_method_overloads_keep_selected_signatures_on_cold_and_warm_queries() {
+    let source = concat!(
+        "class Choice {\n",
+        "  choose(pair: [number, string]): number;\n",
+        "  choose(pair: [string, number]): string;\n",
+        "  choose(pair: any): any { return pair; }\n",
+        "}\n",
+        "declare const numbers: [number, string];\n",
+        "declare const strings: [string, number];\n",
+        "const choice = new Choice();\n",
+        "const count: number = choice.choose(numbers);\n",
+        "const text: string = choice.choose(strings);\n",
+    );
+    for query_first in [false, true] {
+        let parsed = parse_source_file(source);
+        let mut context = context(&parsed, None);
+        let declarations = nodes(&parsed, SyntaxKind::MethodDeclaration);
+        let [first, second, implementation] = declarations.as_slice() else {
+            panic!("expected two tuple overloads and their implementation")
+        };
+        let annotations = [*first, *second].map(|declaration| {
+            let NodeData::MethodDeclaration(method) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!()
+            };
+            let NodeData::ParameterDeclaration(parameter) =
+                &parsed.arena.get(method.parameters.nodes[0]).unwrap().data
+            else {
+                unreachable!()
+            };
+            NodeRef::new(declaration.arena, FILE, parameter.type_.unwrap())
+        });
+        let queried = query_first.then(|| {
+            annotations.map(|annotation| context.get_type_from_type_node(annotation).unwrap())
+        });
+
+        context.check_source_file(FILE).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let owner = merged_symbol(&context, *first);
+        assert!(
+            declarations
+                .iter()
+                .all(|node| merged_symbol(&context, *node) == owner)
+        );
+        assert_eq!(
+            context.store().symbol(owner).unwrap().declarations(),
+            Some(declarations.as_slice())
+        );
+        let signatures = [*first, *second, *implementation].map(|node| signature(&context, node));
+        let callable = context
+            .store()
+            .value_symbol_links(owner)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let record = context.store().type_payload(callable).unwrap();
+        let TypeData::Object(object) = record.data() else {
+            panic!("the method must retain one shared overload object")
+        };
+        assert_eq!(record.symbol(), Some(owner));
+        assert_eq!(
+            object.structured.signatures.as_deref(),
+            Some(&signatures[..2])
+        );
+        assert_eq!(object.structured.call_signature_count, 2);
+        assert_eq!(
+            context
+                .store()
+                .signature(signatures[2])
+                .unwrap()
+                .declaration(),
+            Some(*implementation)
+        );
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let mut tuples = Vec::new();
+        for (signature, expected) in signatures[..2]
+            .iter()
+            .zip([[number, string], [string, number]])
+        {
+            let parameter = context.store().signature(*signature).unwrap().parameters()[0];
+            let tuple_type = context
+                .store()
+                .value_symbol_links(parameter)
+                .unwrap()
+                .resolved_type
+                .unwrap();
+            let TypeData::TypeReference(reference) =
+                context.store().type_payload(tuple_type).unwrap().data()
+            else {
+                panic!("each overload parameter must keep its canonical tuple reference")
+            };
+            assert_eq!(
+                reference.resolved_type_arguments.as_deref(),
+                Some(expected.as_slice())
+            );
+            let target = reference.object.target.unwrap();
+            let TypeData::Tuple(tuple) = context.store().type_payload(target).unwrap().data()
+            else {
+                panic!("a tuple parameter must target a tuple, not an array")
+            };
+            assert_eq!(tuple.metadata.element_flags(), [ElementFlags::REQUIRED; 2]);
+            assert_eq!(tuple.metadata.fixed_length(), 2);
+            tuples.push(tuple_type);
+        }
+        if let Some(queried) = queried {
+            assert_eq!(queried.as_slice(), tuples.as_slice());
+        }
+        let calls = nodes(&parsed, SyntaxKind::CallExpression);
+        assert_eq!(calls.len(), 2);
+        for ((call, signature_id), expected) in
+            calls.iter().zip(&signatures[..2]).zip([number, string])
+        {
+            assert_eq!(signature(&context, *call), *signature_id);
+            assert_eq!(context.get_type_at_location(*call).unwrap(), expected);
+        }
+        let queries = declarations
+            .iter()
+            .map(|node| method_name(&parsed, *node))
+            .chain(annotations)
+            .chain(calls)
+            .collect::<Vec<_>>();
+        assert_replay(&mut context, &queries);
+    }
 }
