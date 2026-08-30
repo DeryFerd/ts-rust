@@ -33,8 +33,9 @@ use super::{
     },
     callables::{
         CallableFamily, SingleCallableDisplayError, StoredSingleCallableValidation,
-        ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
-        single_callable_family, validate_stored_single_callable,
+        ValidatedSingleCallSignatureDisplay, fixed_method_display_projection,
+        single_callable_display_projection, single_callable_family,
+        validate_stored_single_callable,
     },
     classes::{
         ClassHeritageMembersValidation, validate_class_heritage_members,
@@ -1313,6 +1314,27 @@ fn display_object_type(
             state,
             visiting,
         );
+    }
+
+    if let Some(host) = host
+        && let Some(projection) =
+            fixed_method_display_projection(store, host, type_id, global_types)
+                .map_err(|error| callable_display_unavailable(type_id, error))?
+    {
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        let result = display_single_call_signature(
+            store,
+            Some(host),
+            global_types,
+            &projection,
+            flags,
+            state,
+            visiting,
+        );
+        visiting.remove(&type_id);
+        return result;
     }
 
     if let Some(host) = host
@@ -3458,6 +3480,9 @@ const fn callable_display_unavailable(
         }
         SingleCallableDisplayError::SourceCallable(error) => {
             source_callable_display_unavailable(type_id, error)
+        }
+        SingleCallableDisplayError::MalformedMethod => {
+            TypeDisplayUnavailable::MalformedType(type_id)
         }
     }
 }
@@ -13775,6 +13800,929 @@ mod tests {
             context.type_to_string(value),
             Err(TypeDisplayUnavailable::MalformedType(value))
         );
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedMethodDisplayParts {
+        owner: SemanticSymbolId,
+        method: SemanticSymbolId,
+        declaration: NodeRef,
+        callable: TypeId,
+        signature: SignatureId,
+        parameter: SemanticSymbolId,
+        parameter_declaration: NodeRef,
+        annotation: NodeRef,
+        return_annotation: NodeRef,
+    }
+
+    fn fixed_method_display_parts(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        owner_name: &str,
+    ) -> FixedMethodDisplayParts {
+        let (declaration, parameter, returned) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let (parameters, returned) = match &record.data {
+                    NodeData::MethodDeclaration(method) => (&method.parameters, method.type_),
+                    NodeData::MethodSignatureDeclaration(method) => {
+                        (&method.parameters, method.type_)
+                    }
+                    _ => return None,
+                };
+                let parent = parsed.arena.get(record.parent?)?;
+                let owner_name_node = match &parent.data {
+                    NodeData::ClassDeclaration(class) => class.name?,
+                    NodeData::InterfaceDeclaration(interface) => interface.name,
+                    _ => return None,
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(owner_name_node)?.data else {
+                    return None;
+                };
+                if name.text != owner_name {
+                    return None;
+                }
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    *parameters.nodes.first()?,
+                    returned?,
+                ))
+            })
+            .unwrap();
+        let parameter_declaration = NodeRef::new(parsed.arena.id(), file, parameter);
+        let NodeData::ParameterDeclaration(parameter_data) =
+            &parsed.arena.get(parameter).unwrap().data
+        else {
+            panic!("the method has its real parameter declaration");
+        };
+        let bound = context.file(file).unwrap().1;
+        let method = bound.symbol(declaration).unwrap();
+        let owner = context.store().symbol(method).unwrap().parent().unwrap();
+        let parameter = bound.symbol(parameter_declaration).unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(method)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        let signature = context
+            .store()
+            .signature_links(declaration)
+            .unwrap()
+            .resolved_signature
+            .signature()
+            .unwrap();
+        assert_eq!(
+            context.store().signature(signature).unwrap().parameters(),
+            [parameter]
+        );
+        FixedMethodDisplayParts {
+            owner,
+            method,
+            declaration,
+            callable,
+            signature,
+            parameter,
+            parameter_declaration,
+            annotation: NodeRef::new(parsed.arena.id(), file, parameter_data.type_.unwrap()),
+            return_annotation: NodeRef::new(parsed.arena.id(), file, returned),
+        }
+    }
+
+    fn assert_fixed_method_projection_without_writes(
+        context: &CanonicalCheckerContext<'_>,
+        callable: TypeId,
+        expected: Result<Option<ValidatedSingleCallSignatureDisplay>, SingleCallableDisplayError>,
+    ) {
+        let before = format!("{:?}", context.store());
+        let host = context.declared_type_host().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                fixed_method_display_projection(
+                    context.store(),
+                    &host,
+                    callable,
+                    Some(context.global_types()),
+                ),
+                expected,
+            );
+            assert_eq!(
+                single_callable_display_projection(
+                    context.store(),
+                    &host,
+                    callable,
+                    Some(context.global_types()),
+                ),
+                expected,
+            );
+            assert_eq!(format!("{:?}", context.store()), before);
+            assert_eq!(single_callable_family(context.store(), callable), None);
+        }
+    }
+
+    const FIXED_METHOD_DISPLAY_SOURCE: &str = concat!(
+        "interface Contract { run(expected: number): boolean; } ",
+        "class Model implements Contract { run(actual: number): boolean { return false; } } ",
+        "class Other { run(actual: number): boolean { return true; } }",
+    );
+
+    #[test]
+    fn fixed_method_display_projections_keep_real_source_owners_and_replay() {
+        use crate::semantic::callables::ValidatedSingleCallParameterDisplay;
+
+        let parsed = parse_source_file(FIXED_METHOD_DISPLAY_SOURCE);
+        let file = FileId::new(205_205);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let source = fixed_method_display_parts(&context, &parsed, file, "Model");
+        let target = fixed_method_display_parts(&context, &parsed, file, "Contract");
+        assert_ne!(source.owner, target.owner);
+        assert_ne!(source.method, target.method);
+        assert_ne!(source.signature, target.signature);
+        assert_ne!(source.parameter, target.parameter);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, boolean) = (bootstrap.number_type, bootstrap.boolean_type);
+        for (parts, name) in [(source, "actual"), (target, "expected")] {
+            let expected = ValidatedSingleCallSignatureDisplay {
+                owner: parts.callable,
+                signature: parts.signature,
+                parameters: vec![ValidatedSingleCallParameterDisplay {
+                    name: name.to_owned(),
+                    value_type: number,
+                    annotation_type: Some(number),
+                    optional: false,
+                    rest: false,
+                }],
+                return_type: Some(boolean),
+            };
+            let signature = context.store().signature(parts.signature).unwrap();
+            assert_eq!(signature.declaration(), Some(parts.declaration));
+            assert_eq!(signature.min_argument_count(), 1);
+            assert_eq!(signature.resolved_return_type(), Some(boolean));
+            assert_eq!(signature.target(), None);
+            assert_eq!(signature.mapper(), None);
+            assert!(
+                context
+                    .store()
+                    .source_direct_type_annotation_is_exact(parts.annotation, number)
+            );
+            let text = format!("({name}: number) => boolean");
+            let counts = alias_display_cache_counts(&context);
+            for _ in 0..2 {
+                assert_fixed_method_projection_without_writes(
+                    &context,
+                    parts.callable,
+                    Ok(Some(expected.clone())),
+                );
+                assert_source_class_display_without_writes(
+                    &mut context,
+                    parts.callable,
+                    parts.declaration,
+                    Ok(&text),
+                );
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(alias_display_cache_counts(&context), counts);
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(parts.method)
+                        .unwrap()
+                        .resolved_type,
+                    Some(parts.callable),
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .signature_links(parts.declaration)
+                        .unwrap()
+                        .resolved_signature,
+                    ResolvedSignatureState::Resolved(parts.signature),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_method_display_projections_reject_changed_evidence_and_restore() {
+        let parsed = parse_source_file(FIXED_METHOD_DISPLAY_SOURCE);
+        let file = FileId::new(205_206);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let source = fixed_method_display_parts(&context, &parsed, file, "Model");
+        let other = fixed_method_display_parts(&context, &parsed, file, "Other");
+        let owner_links = context
+            .store()
+            .declared_type_links(source.owner)
+            .unwrap()
+            .clone();
+        let other_instance = context
+            .store()
+            .declared_type_links(other.owner)
+            .unwrap()
+            .declared_type;
+        let method_links = context
+            .store()
+            .value_symbol_links(source.method)
+            .unwrap()
+            .clone();
+        let signature_links = context
+            .store()
+            .signature_links(source.declaration)
+            .unwrap()
+            .clone();
+        let parameter_links = context
+            .store()
+            .value_symbol_links(source.parameter)
+            .unwrap()
+            .clone();
+        let annotation_links = context
+            .store()
+            .type_node_links(source.annotation)
+            .unwrap()
+            .clone();
+        let return_links = context
+            .store()
+            .type_node_links(source.return_annotation)
+            .unwrap()
+            .clone();
+        let returned = context
+            .store()
+            .signature(source.signature)
+            .unwrap()
+            .resolved_return_type();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let expected = fixed_method_display_projection(
+            context.store(),
+            &context.declared_type_host().unwrap(),
+            source.callable,
+            Some(context.global_types()),
+        )
+        .unwrap();
+        assert!(expected.is_some());
+        let counts = alias_display_cache_counts(&context);
+        for damage in [
+            "method_value",
+            "signature_link",
+            "parameter_value",
+            "parameter_annotation",
+            "paired_parameter",
+            "parameter_declaration",
+            "return",
+            "paired_return",
+            "method_parent",
+            "callable_owner",
+            "class_instance",
+        ] {
+            match damage {
+                "method_value" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_value_symbol_links(source.method, ValueSymbolLinks::default(),)
+                ),
+                "signature_link" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_links(source.declaration, SignatureLinks::default(),)
+                ),
+                "parameter_value" | "paired_parameter" => {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        source.parameter,
+                        ValueSymbolLinks {
+                            resolved_type: Some(string),
+                            ..parameter_links.clone()
+                        }
+                    ))
+                }
+                "parameter_annotation" => {}
+                "parameter_declaration" => {
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        source.parameter,
+                        Some(vec![other.parameter_declaration]),
+                        Some(other.parameter_declaration),
+                    ))
+                }
+                "return" | "paired_return" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_signature_resolved_return_type(source.signature, Some(string),)
+                ),
+                "method_parent" => assert!(context.store_mut_for_test().set_symbol_relationships(
+                    source.method,
+                    None,
+                    None,
+                    Some(other.owner),
+                    None,
+                )),
+                "callable_owner" => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_symbol(source.callable, Some(other.method),)
+                ),
+                "class_instance" => assert!(context.store_mut_for_test().set_declared_type_links(
+                    source.owner,
+                    crate::semantic::DeclaredTypeLinks {
+                        declared_type: other_instance,
+                        ..owner_links.clone()
+                    },
+                )),
+                _ => unreachable!("every changed cache is listed"),
+            }
+            if matches!(damage, "parameter_annotation" | "paired_parameter") {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    source.annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..annotation_links.clone()
+                    }
+                ));
+            }
+            if damage == "paired_return" {
+                assert!(context.store_mut_for_test().set_type_node_links(
+                    source.return_annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(string),
+                        ..return_links.clone()
+                    }
+                ));
+            }
+            assert_fixed_method_projection_without_writes(
+                &context,
+                source.callable,
+                Err(SingleCallableDisplayError::MalformedMethod),
+            );
+            assert_malformed_display_without_writes(&context, source.callable);
+
+            let store = context.store_mut_for_test();
+            assert!(store.set_declared_type_links(source.owner, owner_links.clone()));
+            assert!(store.set_value_symbol_links(source.method, method_links.clone()));
+            assert!(store.set_signature_links(source.declaration, signature_links.clone()));
+            assert!(store.set_value_symbol_links(source.parameter, parameter_links.clone()));
+            assert!(store.set_type_node_links(source.annotation, annotation_links.clone()));
+            assert!(store.set_type_node_links(source.return_annotation, return_links.clone()));
+            assert!(store.set_signature_resolved_return_type(source.signature, returned));
+            assert!(store.set_symbol_declarations(
+                source.parameter,
+                Some(vec![source.parameter_declaration]),
+                Some(source.parameter_declaration)
+            ));
+            assert!(store.set_symbol_relationships(
+                source.method,
+                None,
+                None,
+                Some(source.owner),
+                None
+            ));
+            assert!(store.set_type_symbol(source.callable, Some(source.method)));
+            assert_fixed_method_projection_without_writes(
+                &context,
+                source.callable,
+                Ok(expected.clone()),
+            );
+            assert_source_class_display_without_writes(
+                &mut context,
+                source.callable,
+                source.declaration,
+                Ok("(actual: number) => boolean"),
+            );
+            assert_eq!(alias_display_cache_counts(&context), counts);
+        }
+
+        let copied = context
+            .store_mut_for_test()
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(source.declaration),
+                Vec::new(),
+                None,
+                vec![source.parameter],
+                returned,
+                None,
+                1,
+            )
+            .unwrap();
+        let counts = alias_display_cache_counts(&context);
+        assert!(context.store_mut_for_test().set_signature_links(
+            source.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(copied),
+                ..SignatureLinks::default()
+            }
+        ));
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            source.callable,
+            None,
+            None,
+            Some(vec![copied]),
+            None,
+            None,
+        ));
+        assert_fixed_method_projection_without_writes(
+            &context,
+            source.callable,
+            Err(SingleCallableDisplayError::MalformedMethod),
+        );
+        assert_malformed_display_without_writes(&context, source.callable);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(source.declaration, signature_links)
+        );
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            source.callable,
+            None,
+            None,
+            Some(vec![source.signature]),
+            None,
+            None,
+        ));
+        assert_fixed_method_projection_without_writes(
+            &context,
+            source.callable,
+            Ok(expected.clone()),
+        );
+        assert_eq!(alias_display_cache_counts(&context), counts);
+
+        let unbranded = context
+            .store_mut_for_test()
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(source.method))
+            .unwrap();
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            unbranded,
+            None,
+            None,
+            Some(vec![source.signature]),
+            None,
+            None,
+        ));
+        let counts = alias_display_cache_counts(&context);
+        assert_fixed_method_projection_without_writes(
+            &context,
+            unbranded,
+            Err(SingleCallableDisplayError::MalformedMethod),
+        );
+        assert_malformed_display_without_writes(&context, unbranded);
+        assert_fixed_method_projection_without_writes(&context, source.callable, Ok(expected));
+        assert_eq!(alias_display_cache_counts(&context), counts);
+    }
+
+    #[test]
+    fn fixed_method_display_requires_completion_without_publishing_on_read() {
+        let parsed =
+            parse_source_file("class Model { run(actual: number): boolean { return false; } }");
+        let file = FileId::new(205_207);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let (owner, _) = source_class_display_owner(&context, &parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let type_context = crate::semantic::classes::ClassTypeQueryContext::new(
+            context.global_types(),
+            context.options(),
+        );
+        let plan = crate::semantic::classes::plan_source_class_members_with_type_context(
+            context.store(),
+            &host,
+            owner,
+            Some(&type_context),
+        )
+        .unwrap();
+        crate::semantic::classes::prepare_source_class_members(
+            context.store_mut_for_test(),
+            &host,
+            &plan,
+        )
+        .unwrap();
+        let parts = fixed_method_display_parts(&context, &parsed, file, "Model");
+        assert!(
+            crate::semantic::classes::completed_source_class_members(context.store(), &host, owner)
+                .unwrap()
+                .is_none()
+        );
+        assert_fixed_method_projection_without_writes(
+            &context,
+            parts.callable,
+            Err(SingleCallableDisplayError::MalformedMethod),
+        );
+        assert_malformed_display_without_writes(&context, parts.callable);
+        context.check_source_file(file).unwrap();
+        assert!(
+            crate::semantic::classes::completed_source_class_members(context.store(), &host, owner)
+                .unwrap()
+                .is_some()
+        );
+        let completed = fixed_method_display_parts(&context, &parsed, file, "Model");
+        assert_eq!(completed.callable, parts.callable);
+        assert_eq!(completed.signature, parts.signature);
+        assert_source_class_display_without_writes(
+            &mut context,
+            parts.callable,
+            parts.declaration,
+            Ok("(actual: number) => boolean"),
+        );
+    }
+
+    #[test]
+    fn fixed_method_display_preserves_the_cold_selected_method_reader() {
+        let parsed =
+            parse_source_file("declare class Model { selected(): number; pending: string; }");
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(205_210);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let method = bound.symbol(declaration).unwrap();
+        let owner = context.store().symbol(method).unwrap().parent().unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let mut session = crate::semantic::instantiate::InstantiationSession::new(
+            crate::semantic::instantiate::InstantiationLimits::default(),
+        );
+        let mut diagnostics = crate::semantic::CanonicalCheckerDiagnostics::default();
+        let callable = crate::semantic::classes::ClassValueQuery {
+            store: context.store_mut_for_test(),
+            host: &host,
+            global_types: &globals,
+            options,
+            session: &mut session,
+            diagnostics: &mut diagnostics,
+        }
+        .member_type(method)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        assert!(
+            context
+                .store()
+                .source_class_provenance_for_symbol(owner)
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .declared_type_links(owner)
+                .is_none_or(|links| links.declared_type.is_none())
+        );
+        assert_fixed_method_projection_without_writes(&context, callable, Ok(None));
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok("() => number"),
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(method)
+                .unwrap()
+                .resolved_type,
+            Some(callable)
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            callable,
+            declaration,
+            Ok("() => number"),
+        );
+    }
+
+    #[test]
+    fn fixed_method_display_declines_only_authenticated_receiver_copies() {
+        let parsed = parse_source_file(concat!(
+            "interface Box<T> { convert(value: T): T; } ",
+            "declare const box: Box<string>; const convert = box.convert; ",
+            "class Model { run(actual: number): boolean { return false; } }",
+        ));
+        let file = FileId::new(205_211);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let source = fixed_method_display_parts(&context, &parsed, file, "Model");
+        let (access, receiver) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, access.expression),
+                ))
+            })
+            .unwrap();
+        let copied = context.get_type_at_location(access).unwrap();
+        let receiver = context.get_type_at_location(receiver).unwrap();
+        let proxy = context
+            .store()
+            .type_payload(receiver)
+            .unwrap()
+            .data()
+            .structured()
+            .and_then(|structured| structured.members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("convert"))
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .symbol(proxy)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::METHOD | SymbolFlags::TRANSIENT)
+        );
+        assert!(
+            context
+                .store()
+                .symbol(proxy)
+                .unwrap()
+                .check_flags()
+                .contains(CheckFlags::INSTANTIATED)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type,
+            Some(copied)
+        );
+        let TypeData::Object(object) = context.store().type_payload(copied).unwrap().data() else {
+            panic!("the receiver method retains its copied object");
+        };
+        assert!(object.target.is_some());
+        assert!(object.mapper.is_some());
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the copied method has its one actual signature");
+        };
+        let signature = *signature;
+        let record = context.store().signature(signature).unwrap();
+        let (target, mapper) = (record.target(), record.mapper());
+        assert!(target.is_some());
+        assert!(mapper.is_some());
+        assert_fixed_method_projection_without_writes(&context, copied, Ok(None));
+        assert_source_class_display_without_writes(
+            &mut context,
+            copied,
+            access,
+            Ok("(value: string) => string"),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(signature, target, None)
+        );
+        assert_fixed_method_projection_without_writes(
+            &context,
+            copied,
+            Err(SingleCallableDisplayError::MalformedMethod),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_target_and_mapper(signature, target, mapper)
+        );
+        assert_fixed_method_projection_without_writes(&context, copied, Ok(None));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(source.callable, Some(proxy))
+        );
+        assert_fixed_method_projection_without_writes(
+            &context,
+            source.callable,
+            Err(SingleCallableDisplayError::MalformedMethod),
+        );
+        assert_malformed_display_without_writes(&context, source.callable);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_symbol(source.callable, Some(source.method))
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            source.callable,
+            source.declaration,
+            Ok("(actual: number) => boolean"),
+        );
+    }
+
+    #[test]
+    fn fixed_method_display_keeps_caller_arrays_and_hidden_implementation_checks() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "class Model { run(actual: number[]): void {} } ",
+            "class Overloaded { run(value: any): void; run(hidden: number[]): void {} }",
+        ));
+        let file = FileId::new(205_208);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let arrays = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for annotation in arrays {
+            context.get_type_from_type_node(annotation).unwrap();
+        }
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let source = fixed_method_display_parts(&context, &parsed, file, "Model");
+        let overloaded = fixed_method_display_parts(&context, &parsed, file, "Overloaded");
+        let overloads = crate::semantic::classes::source_class_method_overloads(
+            context.store(),
+            overloaded.callable,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(overloads.signatures.len(), 1);
+        assert_eq!(overloads.signatures[0].signature, overloaded.signature);
+        assert_ne!(overloads.implementation.signature, overloaded.signature);
+        let globals = context.global_types().clone();
+        let array = context
+            .store()
+            .value_symbol_links(source.parameter)
+            .unwrap()
+            .resolved_type
+            .unwrap();
+        assert_eq!(overloads.implementation.parameters, [array]);
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_reference(&globals, array)
+                .unwrap()
+                .unwrap()
+                .element_type,
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        assert_source_class_display_without_writes(
+            &mut context,
+            source.callable,
+            source.declaration,
+            Ok("(actual: number[]) => void"),
+        );
+        assert_fixed_method_projection_without_writes(&context, overloaded.callable, Ok(None));
+        let mut only_readonly = globals.clone();
+        only_readonly.array_type = globals.readonly_array_type;
+        let before = format!("{:?}", context.store());
+        {
+            let host = context.declared_type_host().unwrap();
+            for callable in [source.callable, overloaded.callable] {
+                for authority in [None, Some(&only_readonly)] {
+                    assert_eq!(
+                        fixed_method_display_projection(
+                            context.store(),
+                            &host,
+                            callable,
+                            authority
+                        ),
+                        Err(SingleCallableDisplayError::MalformedMethod)
+                    );
+                    assert_eq!(
+                        single_callable_display_projection(
+                            context.store(),
+                            &host,
+                            callable,
+                            authority
+                        ),
+                        Err(SingleCallableDisplayError::MalformedMethod)
+                    );
+                    assert_eq!(format!("{:?}", context.store()), before);
+                }
+            }
+        }
+        let hidden = context
+            .store()
+            .signature(overloads.implementation.signature)
+            .unwrap()
+            .parameters()[0];
+        let saved = context.store().value_symbol_links(hidden).unwrap().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            hidden,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..saved.clone()
+            }
+        ));
+        assert_fixed_method_projection_without_writes(
+            &context,
+            overloaded.callable,
+            Err(SingleCallableDisplayError::MalformedMethod),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(hidden, saved)
+        );
+        assert_fixed_method_projection_without_writes(&context, overloaded.callable, Ok(None));
+        assert_eq!(format!("{:?}", context.store()), before);
+    }
+
+    #[test]
+    fn fixed_method_display_keeps_exact_implements_child_diagnostics() {
+        for (source, expected) in [
+            (
+                concat!(
+                    "interface Contract { run(expected: string): void; }\n",
+                    "class Model implements Contract { run(actual: number): void {} }\n",
+                ),
+                concat!(
+                    "Property 'run' in type 'Model' is not assignable to the same property in base type 'Contract'.\n",
+                    "  Type '(actual: number) => void' is not assignable to type '(expected: string) => void'.\n",
+                    "    Types of parameters 'actual' and 'expected' are incompatible.\n",
+                    "      Type 'string' is not assignable to type 'number'.",
+                ),
+            ),
+            (
+                concat!(
+                    "interface Contract { run(expected: unknown): string; }\n",
+                    "class Model implements Contract { run(actual: number): boolean { return false; } }\n",
+                ),
+                concat!(
+                    "Property 'run' in type 'Model' is not assignable to the same property in base type 'Contract'.\n",
+                    "  Type '(actual: number) => boolean' is not assignable to type '(expected: unknown) => string'.\n",
+                    "    Type 'boolean' is not assignable to type 'string'.",
+                ),
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let file = FileId::new(205_209);
+            let mut context = parsed_context(
+                &parsed,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            let parts = fixed_method_display_parts(&context, &parsed, file, "Model");
+            let NodeData::MethodDeclaration(method) =
+                &parsed.arena.get(parts.declaration.node).unwrap().data
+            else {
+                panic!("the diagnostic retains the class method");
+            };
+            let name = NodeRef::new(parsed.arena.id(), file, method.name);
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("the source must report its one method error");
+            };
+            assert_eq!(diagnostic.node, Some(name));
+            assert_eq!(diagnostic.range_override, None);
+            assert_eq!(diagnostic.diagnostic.code(), 2416);
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                ["run", "Model", "Contract"]
+            );
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), expected);
+            assert!(diagnostic.related_information.is_empty());
+            let diagnostics = context.diagnostics().clone();
+            let counts = alias_display_cache_counts(&context);
+            for _ in 0..2 {
+                context.check_source_file(file).unwrap();
+                context.recheck_source_file(file).unwrap();
+                assert_eq!(context.diagnostics(), &diagnostics);
+                assert_eq!(alias_display_cache_counts(&context), counts);
+                assert_eq!(
+                    context
+                        .store()
+                        .signature_links(parts.declaration)
+                        .unwrap()
+                        .resolved_signature,
+                    ResolvedSignatureState::Resolved(parts.signature)
+                );
+            }
+        }
     }
 
     #[test]
