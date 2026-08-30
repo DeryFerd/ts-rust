@@ -317,7 +317,10 @@ fn local_named_type_exports_preserve_declaration_and_annotation_identity() {
                     .immediate_target,
                 Some(exported)
             );
-            assert_eq!(context.resolve_alias(exported).unwrap(), target);
+            assert_eq!(
+                context.resolve_alias(exported).unwrap().target,
+                AliasTargetState::Resolved(target)
+            );
             assert_annotation_identity(&mut context, &consumer, name, target);
         }
         assert_unchecked(&context, &files);
@@ -360,11 +363,20 @@ fn renamed_local_type_exports_survive_a_type_reexport_barrel() {
                 .immediate_target,
             Some(reexport)
         );
-        assert_eq!(context.resolve_alias(reexport).unwrap(), target);
-        assert_eq!(context.resolve_alias(local_export).unwrap(), target);
         assert_eq!(
-            context.resolve_alias(symbol(&context, binding)).unwrap(),
-            target
+            context.resolve_alias(reexport).unwrap().target,
+            AliasTargetState::Resolved(target)
+        );
+        assert_eq!(
+            context.resolve_alias(local_export).unwrap().target,
+            AliasTargetState::Resolved(target)
+        );
+        assert_eq!(
+            context
+                .resolve_alias(symbol(&context, binding))
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(target)
         );
         assert_annotation_identity(&mut context, &consumer, local, target);
     }
