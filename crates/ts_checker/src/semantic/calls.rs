@@ -1418,7 +1418,7 @@ pub(super) fn overload_failure_signature_return_type(
                 if projection.construct_signatures.is_empty()
                     && !projection.call_signatures.is_empty() =>
             {
-                projection.call_signatures
+                projection.call_signatures.into_vec()
             }
             _ => return Err(invalid().into()),
         }
