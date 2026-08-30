@@ -16556,7 +16556,7 @@ mod tests {
                         match damage {
                             Damage::VoidOwner => assert!(store.set_type_symbol(void, None)),
                             Damage::TargetOwner => {
-                                assert!(store.set_type_symbol(target.type_, Some(target.owner)))
+                                assert!(store.set_type_symbol(target.type_, Some(target.owner)));
                             }
                             Damage::Annotation => assert!(
                                 store.set_type_node_links(target.annotation, annotation.clone())
@@ -16565,7 +16565,7 @@ mod tests {
                                 assert!(store.set_value_symbol_links(
                                     target.property,
                                     property_value.clone()
-                                ))
+                                ));
                             }
                         }
                         assert_unchanged(store, &mut session, target.type_, kind, Ok(false));
