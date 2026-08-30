@@ -65,6 +65,9 @@
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
 //! Ambient script classes also admit empty namespaces from other source files.
+//! Empty JavaScript classes can use a qualified empty ambient namespace class
+//! as their base. The actual extends expression retains its constructor and
+//! instance identities independently of a mismatched JSDoc annotation.
 //! Class namespace augmentations preserve private static visibility and reject
 //! unqualified references to class members.
 //! Inherited arrow fields retain exact inaccessible `super` property diagnostics.
@@ -12211,6 +12214,197 @@ fn plan_null_class_base(
     }))
 }
 
+#[allow(clippy::too_many_lines)] // Check the actual qualified value, both leaves, and retained caches together.
+fn plan_qualified_empty_javascript_class_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    node: NodeRef,
+    expression: NodeRef,
+) -> Result<SemanticSymbolId, ClassError> {
+    let reject = || unsupported(ClassUnsupported::Heritage(expression));
+    let invalid = || invariant(ClassInvariant::InvalidHeritage(expression));
+    let (arena, bound) = host.source(expression).ok_or_else(invalid)?;
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::ClassDeclaration(class) = &declaration_record.data else {
+        return Err(invalid());
+    };
+    if !bound.source_facts().is_some_and(|facts| {
+        facts.is_javascript_file()
+            && !facts.is_declaration_file()
+            && !facts.is_external_or_common_js_module()
+    }) || class.type_parameters.is_some()
+        || class.modifiers.is_some()
+        || !class.members.nodes.is_empty()
+    {
+        return Err(reject());
+    }
+    for comment in super::jsdoc::leading_jsdoc_comments(arena, declaration)
+        .map_err(|_| invariant(ClassInvariant::InvalidDeclaration(declaration)))?
+    {
+        // Go reparses these tags into class parameters or base type arguments.
+        if comment.template_tags().next().is_some() {
+            return Err(unsupported(ClassUnsupported::Generic(declaration)));
+        }
+        if comment.tags().iter().any(|tag| {
+            tag.kind() == super::jsdoc::JsDocTagKind::Augments
+                && tag
+                    .type_expression()
+                    .is_none_or(|annotation| !matches!(annotation.type_(), JsDocType::Named(_)))
+        }) {
+            return Err(reject());
+        }
+    }
+    let record = preflight_node(store, host, expression)?;
+    let wrapper = preflight_node(store, host, node)?;
+    let (left, right) = match &record.data {
+        NodeData::QualifiedName(name)
+            if record.kind == SyntaxKind::QualifiedName
+                && name.flow_node.is_none()
+                && name.facts == 0 =>
+        {
+            (name.left, name.right)
+        }
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            (access.expression, access.name)
+        }
+        _ => return Err(reject()),
+    };
+    let left = NodeRef::new(expression.arena, expression.file, left);
+    let right = NodeRef::new(expression.arena, expression.file, right);
+    let left_record = preflight_node(store, host, left)?;
+    let right_record = preflight_node(store, host, right)?;
+    let (NodeData::Identifier(namespace_name), NodeData::Identifier(class_name)) =
+        (&left_record.data, &right_record.data)
+    else {
+        return Err(reject());
+    };
+    if record.flags.0 != 0
+        || record.parent != Some(node.node)
+        || record.range.start < wrapper.range.start
+        || record.range.end > wrapper.range.end
+        || left_record.kind != SyntaxKind::Identifier
+        || right_record.kind != SyntaxKind::Identifier
+        || left_record.flags.0 != 0
+        || right_record.flags.0 != 0
+        || left_record.parent != Some(expression.node)
+        || right_record.parent != Some(expression.node)
+        || left_record.range.start < record.range.start
+        || right_record.range.end > record.range.end
+        || left_record.range.end > right_record.range.start
+        || namespace_name.flow_node.is_some()
+        || class_name.flow_node.is_some()
+        || namespace_name.text.is_empty()
+        || class_name.text.is_empty()
+    {
+        return Err(invalid());
+    }
+    let mut callbacks = host.name_resolver_host(store)?;
+    let raw = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callbacks)
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(left)),
+            &namespace_name.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .ok_or_else(reject)?;
+    let namespace = store.get_merged_symbol(raw).ok_or_else(invalid)?;
+    let namespace_record = store.symbol(namespace).ok_or_else(invalid)?;
+    if !store.source_merged_symbol_declarations_match(namespace) {
+        return Err(invalid());
+    }
+    if namespace_record.flags() != SymbolFlags::VALUE_MODULE {
+        return Err(reject());
+    }
+    let symbol = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&class_name.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(reject)?;
+    let base = store.symbol(symbol).ok_or_else(invalid)?;
+    if !store.source_merged_symbol_declarations_match(symbol) {
+        return Err(invalid());
+    }
+    if symbol == owner || base.flags() != SymbolFlags::CLASS {
+        return Err(reject());
+    }
+    let base_declaration = base.value_declaration().ok_or_else(invalid)?;
+    if !empty_ambient_namespace_class_syntax(host, base_declaration) {
+        return Err(reject());
+    }
+    if base.name().as_utf8() != Some(class_name.text.as_str())
+        || store.get_parent_of_symbol(symbol) != Some(namespace)
+    {
+        return Err(invalid());
+    }
+    super::source_namespaces::validate_ambient_namespace_class_bindings(
+        store,
+        host,
+        symbol,
+        base_declaration,
+    )
+    .map_err(|_| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+    let namespace_type = store
+        .module_value_identity(namespace)
+        .map(super::source_namespaces::ModuleValueIdentity::type_);
+    if let Some(type_) = namespace_type {
+        if super::source_namespaces::validate_module_value_identity(store, host, type_)
+            .map_err(|_| invalid())?
+            != namespace
+        {
+            return Err(invalid());
+        }
+    } else if store
+        .value_symbol_links(namespace)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(invalid());
+    }
+    let instance = super::declared::cached_class_type(store, symbol)?;
+    let value = exact_optional_class_value(store, symbol)?;
+    for (reference, expected_symbol, expected_type) in [
+        (left, namespace, namespace_type),
+        (right, symbol, value),
+        (expression, symbol, instance),
+    ] {
+        if store.symbol_node_links(reference).is_some_and(|links| {
+            links != &SymbolNodeLinks::default()
+                && links
+                    != &SymbolNodeLinks {
+                        resolved_symbol: Some(expected_symbol),
+                    }
+        }) {
+            return Err(invariant(ClassInvariant::InvalidPropertySymbol(reference)));
+        }
+        if store.type_node_links(reference).is_some_and(|links| {
+            links != &TypeNodeLinks::default()
+                && expected_type.is_none_or(|type_| {
+                    links
+                        != &TypeNodeLinks {
+                            resolved_type: Some(type_),
+                            ..TypeNodeLinks::default()
+                        }
+                })
+        }) {
+            return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                reference,
+            )));
+        }
+    }
+    Ok(symbol)
+}
+
 fn plan_direct_class_base(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -12262,6 +12456,29 @@ fn plan_direct_class_base(
     }
     let expression = NodeRef::new(declaration.arena, declaration.file, base.expression);
     let expression_record = preflight_node(store, host, expression)?;
+    if matches!(
+        expression_record.data,
+        NodeData::QualifiedName(_) | NodeData::PropertyAccessExpression(_)
+    ) {
+        if base.type_arguments.is_some() {
+            return Err(unsupported(ClassUnsupported::Heritage(node)));
+        }
+        let symbol = plan_qualified_empty_javascript_class_base(
+            store,
+            host,
+            declaration,
+            owner,
+            node,
+            expression,
+        )?;
+        return Ok(DirectClassBasePlan {
+            clause,
+            node,
+            expression,
+            symbol,
+            type_arguments: Vec::new(),
+        });
+    }
     let NodeData::Identifier(identifier) = &expression_record.data else {
         return Err(unsupported(ClassUnsupported::Heritage(expression)));
     };
@@ -14339,6 +14556,44 @@ fn validate_plain_class_type_parameters(
     Ok(())
 }
 
+/// Selects the empty ambient form before its full namespace binding proof.
+fn empty_ambient_namespace_class_syntax(host: &DeclaredTypeHost<'_>, declaration: NodeRef) -> bool {
+    let Some((arena, bound)) = host.source(declaration) else {
+        return false;
+    };
+    if !bound.source_facts().is_some_and(|facts| {
+        facts.is_declaration_file()
+            && !facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module()
+    }) {
+        return false;
+    }
+    let Some(record) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return false;
+    };
+    let Some(block) = record.parent.and_then(|parent| arena.get(parent)) else {
+        return false;
+    };
+    let Some(namespace) = block.parent.and_then(|parent| arena.get(parent)) else {
+        return false;
+    };
+    record.kind == SyntaxKind::ClassDeclaration
+        && class.type_parameters.is_none()
+        && class.heritage_clauses.is_none()
+        && class.modifiers.is_none()
+        && class.members.nodes.is_empty()
+        && block.kind == SyntaxKind::ModuleBlock
+        && matches!(block.data, NodeData::ModuleBlock(_))
+        && namespace.kind == SyntaxKind::ModuleDeclaration
+        && namespace.parent == Some(bound.source_file().node)
+        && matches!(&namespace.data, NodeData::ModuleDeclaration(module)
+            if matches!(module.keyword, SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword)
+                && matches!(arena.get(module.name).map(|name| &name.data), Some(NodeData::Identifier(_))))
+}
+
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
 fn plan_class_declaration_header(
@@ -14391,15 +14646,42 @@ fn plan_class_declaration_header(
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     };
     let name = NodeRef::new(declaration.arena, declaration.file, name);
-    let (ambient, abstract_class, export_local) = plan_class_declaration_modifiers(
-        store,
-        host,
-        declaration,
-        symbol,
-        symbol_record,
-        name,
-        class.modifiers.as_ref(),
-    )?;
+    let ambient_namespace_class = empty_ambient_namespace_class_syntax(host, declaration);
+    let (ambient, abstract_class, export_local) = if ambient_namespace_class {
+        super::source_namespaces::validate_ambient_namespace_class_bindings(
+            store,
+            host,
+            symbol,
+            declaration,
+        )
+        .map_err(|_| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+        let parent = store
+            .get_parent_of_symbol(symbol)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
+        if !store.source_merged_symbol_declarations_match(parent) {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+        if store
+            .symbol(parent)
+            .is_none_or(|parent| parent.flags() != SymbolFlags::VALUE_MODULE)
+        {
+            return Err(unsupported(ClassUnsupported::MergedDeclarations(parent)));
+        }
+        if !stored_empty_ambient_namespace_class_parent(store, symbol, declaration, parent) {
+            return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
+        }
+        (true, false, None)
+    } else {
+        plan_class_declaration_modifiers(
+            store,
+            host,
+            declaration,
+            symbol,
+            symbol_record,
+            name,
+            class.modifiers.as_ref(),
+        )?
+    };
     let exported_ambient_declaration = ambient
         && export_local.is_some()
         && host.bound_file(declaration).is_some_and(|bound| {
@@ -14489,22 +14771,24 @@ fn plan_class_declaration_header(
     };
     let parent = NodeRef::new(declaration.arena, declaration.file, parent);
     let parent_record = preflight_node(store, host, parent)?;
-    let NodeData::SourceFile(source) = &parent_record.data else {
-        return Err(unsupported(ClassUnsupported::NestedDeclaration(
-            declaration,
-        )));
-    };
-    if parent_record.kind != SyntaxKind::SourceFile
-        || parent_record.parent.is_some()
-        || source
-            .statements
-            .nodes
-            .iter()
-            .filter(|node| **node == declaration.node)
-            .count()
-            != 1
-    {
-        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    if !ambient_namespace_class {
+        let NodeData::SourceFile(source) = &parent_record.data else {
+            return Err(unsupported(ClassUnsupported::NestedDeclaration(
+                declaration,
+            )));
+        };
+        if parent_record.kind != SyntaxKind::SourceFile
+            || parent_record.parent.is_some()
+            || source
+                .statements
+                .nodes
+                .iter()
+                .filter(|node| **node == declaration.node)
+                .count()
+                != 1
+        {
+            return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+        }
     }
 
     let instance_members = symbol_record.members();
@@ -25334,6 +25618,15 @@ pub(super) fn class_query_type_side(
     {
         return Ok(None);
     }
+    if let Some(shells) = empty_ambient_namespace_class_shells(store, host, symbol)? {
+        return Ok(if type_ == shells.instance_type {
+            Some(ClassQueryTypeSide::Instance)
+        } else if type_ == shells.value_type {
+            Some(ClassQueryTypeSide::Value)
+        } else {
+            None
+        });
+    }
     let plan = match plan_class_query(store, host, symbol) {
         Ok(plan) => plan,
         Err(ClassError::Unsupported(_)) => return Ok(None),
@@ -25602,6 +25895,38 @@ pub(super) fn preflight_nongeneric_class_members(
     plan: &ClassMemberPlan,
 ) -> Result<(), ClassError> {
     validated_nongeneric_class_member_state(store, host, plan).map(drop)
+}
+
+/// Reads an exact empty namespace class shell or completed member graph.
+pub(super) fn empty_ambient_namespace_class_shells(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<Option<ClassShells>, ClassError> {
+    let Some(declaration) = store.symbol(symbol).and_then(Symbol::value_declaration) else {
+        return Ok(None);
+    };
+    if !empty_ambient_namespace_class_syntax(host, declaration) {
+        return Ok(None);
+    }
+    // Cold display has a wider namespace proof than this member producer.
+    if exact_optional_class_value(store, symbol)?.is_none() {
+        return Ok(None);
+    }
+    let plan = plan_nongeneric_class_members(store, host, symbol)?;
+    if let Some(members) = class_member_state(store, host, &plan)? {
+        return Ok(Some(members.shells));
+    }
+    let state = shell_state(store, host, &plan.class)?;
+    Ok(match (state.instance, state.value) {
+        (Some(instance_type), StaticShellState::WarmShell(value_type)) => Some(ClassShells {
+            declaration,
+            symbol,
+            instance_type,
+            value_type,
+        }),
+        _ => None,
+    })
 }
 
 struct PreparedClassMethodSignatures {
@@ -30138,6 +30463,94 @@ fn stored_class_owner_declaration(
     Some(declaration)
 }
 
+fn stored_empty_ambient_namespace_class_parent(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    parent: SemanticSymbolId,
+) -> bool {
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(namespace) = store.symbol(parent) else {
+        return false;
+    };
+    let Some([Some(bound_owner), Some(local)]) =
+        store.symbol_store().source_binding_symbols(declaration)
+    else {
+        return false;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(block)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(namespace_declaration)) = store.source_node_parent(block)
+    else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source_file)) =
+        store.source_node_parent(namespace_declaration)
+    else {
+        return false;
+    };
+    let Some(children) = store.source_direct_children(declaration) else {
+        return false;
+    };
+    let [name] = children.as_slice() else {
+        return false;
+    };
+    let Some(namespace_name) =
+        store.source_child_with_kind(namespace_declaration, SyntaxKind::Identifier)
+    else {
+        return false;
+    };
+    store.source_is_script_declaration_file(declaration)
+        && store.source_node_kind(block) == Some(SyntaxKind::ModuleBlock)
+        && store.source_node_kind(namespace_declaration) == Some(SyntaxKind::ModuleDeclaration)
+        && store.source_node_kind(source_file) == Some(SyntaxKind::SourceFile)
+        && store.source_node_parent(source_file) == Some(SourceNodeParent::Root)
+        && store.source_child_with_kind(namespace_declaration, SyntaxKind::ModuleBlock)
+            == Some(block)
+        && store
+            .source_identifier_text(*name)
+            .is_some_and(|name| !name.is_empty() && owner.name().as_utf8() == Some(name))
+        && owner.flags() == SymbolFlags::CLASS
+        && owner.declarations() == Some(&[declaration])
+        && store.source_symbol_declarations_match(symbol)
+        && store.source_symbol_export_table_matches(symbol)
+        && store.get_merged_symbol(bound_owner) == Some(symbol)
+        && local != symbol
+        && store.get_merged_symbol(local) == Some(local)
+        && local_record.flags() == SymbolFlags::EXPORT_VALUE
+        && local_record.check_flags() == CheckFlags::NONE
+        && local_record.name() == owner.name()
+        && local_record.declarations() == Some(&[declaration])
+        && local_record.value_declaration().is_none()
+        && local_record.members().is_none()
+        && local_record.exports().is_none()
+        && local_record.parent().is_none()
+        && local_record.export_symbol() == Some(symbol)
+        && store.source_symbol_declarations_match(local)
+        && namespace.flags() == SymbolFlags::VALUE_MODULE
+        && namespace.check_flags() == CheckFlags::NONE
+        && namespace.members().is_none()
+        && namespace.parent().is_none()
+        && namespace.export_symbol().is_none()
+        && store.get_merged_symbol(parent) == Some(parent)
+        && store.source_identifier_text(namespace_name) == namespace.name().as_utf8()
+        && store.source_declaration_belongs_to_symbol(namespace_declaration, parent)
+        && store.source_symbol_declarations_match(parent)
+        && store.source_merged_symbol_declarations_match(parent)
+        && store.source_symbol_export_table_matches(parent)
+        && namespace
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(owner.name()))
+            == Some(symbol)
+}
+
 fn stored_class_parts(
     store: &CanonicalTypeMapperStore,
     instance_type: TypeId,
@@ -30150,31 +30563,32 @@ fn stored_class_parts(
     let valid_owner_parent = match owner.parent() {
         None => true,
         Some(parent) => {
-            declaration
-                .node
-                .index()
-                .checked_add(1)
-                .and_then(|index| u32::try_from(index).ok())
-                .map(|index| {
-                    NodeRef::new(
-                        declaration.arena,
-                        declaration.file,
-                        ts_ast::NodeId::new(index),
-                    )
-                })
-                .is_some_and(|modifier| {
-                    store.source_node_kind(modifier) == Some(SyntaxKind::ExportKeyword)
-                        && store.source_node_parent(modifier)
-                            == Some(SourceNodeParent::Parent(declaration))
-                })
-                && store.symbol(parent).is_some_and(|module| {
-                    module.flags() == SymbolFlags::VALUE_MODULE
-                        && module
-                            .exports()
-                            .and_then(|exports| store.symbol_table(exports))
-                            .and_then(|exports| exports.get(owner.name()))
-                            == Some(symbol)
-                })
+            stored_empty_ambient_namespace_class_parent(store, symbol, declaration, parent)
+                || declaration
+                    .node
+                    .index()
+                    .checked_add(1)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .map(|index| {
+                        NodeRef::new(
+                            declaration.arena,
+                            declaration.file,
+                            ts_ast::NodeId::new(index),
+                        )
+                    })
+                    .is_some_and(|modifier| {
+                        store.source_node_kind(modifier) == Some(SyntaxKind::ExportKeyword)
+                            && store.source_node_parent(modifier)
+                                == Some(SourceNodeParent::Parent(declaration))
+                    })
+                    && store.symbol(parent).is_some_and(|module| {
+                        module.flags() == SymbolFlags::VALUE_MODULE
+                            && module
+                                .exports()
+                                .and_then(|exports| store.symbol_table(exports))
+                                .and_then(|exports| exports.get(owner.name()))
+                                == Some(symbol)
+                    })
         }
     };
     if record.object_flags()
@@ -31698,6 +32112,773 @@ mod query_tests {
                 let after = snapshot(&context);
                 assert_eq!(context.get_class_query_shells(owner), Ok(restored));
                 assert_eq!(snapshot(&context), after);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod javascript_qualified_base_tests {
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+    };
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
+
+    use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, DeclaredTypeLinks, TypeAliasId, type_records::InterfaceTypeData,
+    };
+
+    const AMBIENT_FILE: FileId = FileId::new(202_932);
+    const JAVASCRIPT_FILE: FileId = FileId::new(202_933);
+    const AMBIENT: &str = "declare namespace Library { class Base {} class Other {} }";
+    const JAVASCRIPT: &str =
+        "/** @extends {Library.Other} */ class Derived extends Library.Base {}";
+
+    fn context<'a>(
+        ambient: &'a ParseResult,
+        javascript: &'a ParseResult,
+        declaration_file: bool,
+        language: CanonicalSourceLanguage,
+    ) -> CanonicalCheckerContext<'a> {
+        let sources = [
+            (
+                AMBIENT_FILE,
+                ambient,
+                "\"/library.d.ts\"",
+                CanonicalSourceLanguage::TypeScript,
+                declaration_file,
+            ),
+            (JAVASCRIPT_FILE, javascript, "\"/main.js\"", language, false),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, path, language, declaration_file) in sources {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        language,
+                        declaration_file,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed, _, language, _) in sources {
+            if language == CanonicalSourceLanguage::JavaScript {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            } else {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            sources
+                .into_iter()
+                .map(|(file, parsed, ..)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                no_emit: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn class(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> (NodeRef, SemanticSymbolId) {
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                matches!(&parsed.arena.get(class.name?)?.data,
+                NodeData::Identifier(identifier) if identifier.text == name)
+                .then_some(node)
+            })
+            .unwrap();
+        let declaration = NodeRef::new(parsed.arena.id(), file, node);
+        (
+            declaration,
+            context.file(file).unwrap().1.symbol(declaration).unwrap(),
+        )
+    }
+
+    fn heritage(parsed: &ParseResult) -> [NodeRef; 3] {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::QualifiedName(name) = &record.data else {
+                    return None;
+                };
+                record
+                    .parent
+                    .and_then(|parent| parsed.arena.get(parent))
+                    .is_some_and(|parent| {
+                        matches!(parent.data, NodeData::ExpressionWithTypeArguments(_))
+                    })
+                    .then_some(
+                        [name.left, name.right, node]
+                            .map(|node| NodeRef::new(parsed.arena.id(), JAVASCRIPT_FILE, node)),
+                    )
+            })
+            .unwrap()
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Payload {
+        Instance(InterfaceTypeData),
+        Value(ObjectTypeData),
+        Parameter(TypeParameterData),
+    }
+
+    type TypeState = (
+        TypeId,
+        TypeFlags,
+        ObjectFlags,
+        Option<SemanticSymbolId>,
+        Option<TypeAliasId>,
+        Payload,
+    );
+    type SymbolState = (
+        SemanticSymbolId,
+        Symbol,
+        Option<DeclaredTypeLinks>,
+        Option<ValueSymbolLinks>,
+    );
+    type NodeState = (NodeRef, Option<TypeNodeLinks>, Option<SymbolNodeLinks>);
+    type SignatureState = (
+        SignatureId,
+        SignatureFlags,
+        Option<TypeId>,
+        Option<SignatureId>,
+        Option<TypeMapperId>,
+    );
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct Snapshot {
+        counts: [usize; 7],
+        links: [usize; 26],
+        symbols: Vec<SymbolState>,
+        types: Vec<TypeState>,
+        nodes: Vec<NodeState>,
+        signatures: Vec<SignatureState>,
+    }
+
+    fn snapshot(
+        context: &CanonicalCheckerContext<'_>,
+        ambient: &ParseResult,
+        javascript: &ParseResult,
+    ) -> Snapshot {
+        let store = context.store();
+        Snapshot {
+            counts: [
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.mapper_len(),
+                store.type_alias_len(),
+                store.symbol_store().symbol_table_len(),
+                store.type_resolution_len(),
+            ],
+            links: store.checker_link_allocated_lengths(),
+            symbols: store
+                .symbol_store()
+                .symbols()
+                .map(|(symbol, record)| {
+                    (
+                        symbol,
+                        record.clone(),
+                        store.declared_type_links(symbol).cloned(),
+                        store.value_symbol_links(symbol).cloned(),
+                    )
+                })
+                .collect(),
+            types: store
+                .types()
+                .filter_map(|(id, record)| {
+                    let payload = match record.data() {
+                        TypeData::Interface(data) => Payload::Instance(data.clone()),
+                        TypeData::Object(data) => Payload::Value(data.clone()),
+                        TypeData::TypeParameter(data) => Payload::Parameter(data.clone()),
+                        _ => return None,
+                    };
+                    Some((
+                        id,
+                        record.flags(),
+                        record.object_flags(),
+                        record.symbol(),
+                        record.alias(),
+                        payload,
+                    ))
+                })
+                .collect(),
+            nodes: [(AMBIENT_FILE, ambient), (JAVASCRIPT_FILE, javascript)]
+                .into_iter()
+                .flat_map(|(file, parsed)| {
+                    parsed.arena.iter().map(move |(node, _)| {
+                        let node = NodeRef::new(parsed.arena.id(), file, node);
+                        (
+                            node,
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                        )
+                    })
+                })
+                .collect(),
+            signatures: store
+                .signatures()
+                .map(|(id, signature)| {
+                    (
+                        id,
+                        signature.flags(),
+                        signature.resolved_return_type(),
+                        signature.target(),
+                        signature.mapper(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both cache states, each damaged owner edge, and restoration together.
+    fn javascript_qualified_base_rejects_binding_damage_and_restores_the_real_pair() {
+        for warm in [false, true] {
+            for damage in 0..7 {
+                let ambient = parse_source_file(AMBIENT);
+                let javascript = parse_javascript_source_file(JAVASCRIPT);
+                let mut context = context(
+                    &ambient,
+                    &javascript,
+                    true,
+                    CanonicalSourceLanguage::JavaScript,
+                );
+                let (_, derived) = class(&context, &javascript, JAVASCRIPT_FILE, "Derived");
+                let (declaration, base) = class(&context, &ambient, AMBIENT_FILE, "Base");
+                let (_, other) = class(&context, &ambient, AMBIENT_FILE, "Other");
+                let local = context
+                    .file(AMBIENT_FILE)
+                    .unwrap()
+                    .1
+                    .local_symbol(declaration)
+                    .unwrap();
+                let namespace = context.store().symbol(base).unwrap().parent().unwrap();
+                let exports = context
+                    .store()
+                    .symbol(namespace)
+                    .unwrap()
+                    .exports()
+                    .unwrap();
+                let prototype = context
+                    .store()
+                    .symbol_table(context.store().symbol(base).unwrap().exports().unwrap())
+                    .unwrap()
+                    .get_source(PROTOTYPE_NAME)
+                    .unwrap();
+                let saved_local = context.store().symbol(local).unwrap().clone();
+                let saved_prototype = context.store().symbol(prototype).unwrap().clone();
+                let saved_namespace = context.store().symbol(namespace).unwrap().clone();
+                let saved_base = context.store().symbol(base).unwrap().clone();
+                let prior = warm.then(|| context.get_nongeneric_class_members(derived).unwrap());
+                let store = context.store_mut_for_test();
+                match damage {
+                    0 => assert_eq!(
+                        store.insert_symbol(exports, EscapedName::source("Base"), other),
+                        Some(Some(base))
+                    ),
+                    1 => assert!(store.set_symbol_relationships(
+                        local,
+                        None,
+                        None,
+                        None,
+                        Some(other)
+                    )),
+                    2 => assert!(store.set_symbol_relationships(
+                        prototype,
+                        None,
+                        None,
+                        Some(other),
+                        None
+                    )),
+                    3 => assert!(store.set_symbol_declarations(
+                        namespace,
+                        saved_namespace.declarations().map(<[NodeRef]>::to_vec),
+                        None,
+                    )),
+                    4 => assert!(store.set_symbol_relationships(
+                        namespace,
+                        Some(exports),
+                        Some(exports),
+                        None,
+                        None,
+                    )),
+                    _ => {
+                        let (symbol, record) = if damage == 5 {
+                            (namespace, &saved_namespace)
+                        } else {
+                            (base, &saved_base)
+                        };
+                        let copied = store.clone_symbol_table(record.exports().unwrap()).unwrap();
+                        assert!(store.set_symbol_relationships(
+                            symbol,
+                            record.members(),
+                            Some(copied),
+                            record.parent(),
+                            record.export_symbol(),
+                        ));
+                    }
+                }
+                let expected = if damage == 0 {
+                    invariant(ClassInvariant::InvalidHeritage(heritage(&javascript)[2]))
+                } else {
+                    invariant(ClassInvariant::InvalidOwnerSymbol(base))
+                };
+                let damaged = snapshot(&context, &ambient, &javascript);
+                for _ in 0..2 {
+                    if let Some(prior) = prior.as_ref() {
+                        assert_eq!(
+                            validate_class_heritage_members(
+                                context.store(),
+                                prior.shells.instance_type
+                            ),
+                            ClassHeritageMembersValidation::Malformed,
+                        );
+                    }
+                    assert_eq!(context.get_nongeneric_class_members(derived), Err(expected));
+                    assert_eq!(
+                        context
+                            .store()
+                            .symbol_table(exports)
+                            .unwrap()
+                            .get_source("Base"),
+                        Some(if damage == 0 { other } else { base }),
+                    );
+                    assert_eq!(snapshot(&context, &ambient, &javascript), damaged);
+                }
+                let store = context.store_mut_for_test();
+                assert_eq!(
+                    store.insert_symbol(exports, EscapedName::source("Base"), base),
+                    Some(Some(if damage == 0 { other } else { base }))
+                );
+                assert!(store.set_symbol_declarations(
+                    namespace,
+                    saved_namespace.declarations().map(<[NodeRef]>::to_vec),
+                    saved_namespace.value_declaration(),
+                ));
+                for (symbol, record) in [
+                    (local, saved_local),
+                    (prototype, saved_prototype),
+                    (namespace, saved_namespace),
+                    (base, saved_base),
+                ] {
+                    assert!(store.set_symbol_relationships(
+                        symbol,
+                        record.members(),
+                        record.exports(),
+                        record.parent(),
+                        record.export_symbol()
+                    ));
+                }
+                let restored = context.get_nongeneric_class_members(derived).unwrap();
+                assert_eq!(restored.base().unwrap().symbol(), base);
+                assert_eq!(
+                    validate_class_heritage_members(context.store(), restored.shells.instance_type),
+                    ClassHeritageMembersValidation::Valid,
+                );
+                if let Some(prior) = prior {
+                    assert_eq!(restored, prior);
+                }
+                let stable = snapshot(&context, &ambient, &javascript);
+                assert_eq!(context.get_nongeneric_class_members(derived), Ok(restored));
+                assert_eq!(snapshot(&context, &ambient, &javascript), stable);
+                assert!(context.store().value_symbol_links(other).is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check each qualified source node before and after member publication.
+    fn javascript_qualified_base_rejects_reference_cache_damage_before_publication() {
+        for warm in [false, true] {
+            for symbol_damage in [false, true] {
+                for index in 0..3 {
+                    let ambient = parse_source_file(AMBIENT);
+                    let javascript = parse_javascript_source_file(JAVASCRIPT);
+                    let mut context = context(
+                        &ambient,
+                        &javascript,
+                        true,
+                        CanonicalSourceLanguage::JavaScript,
+                    );
+                    let (_, derived) = class(&context, &javascript, JAVASCRIPT_FILE, "Derived");
+                    let (_, other) = class(&context, &ambient, AMBIENT_FILE, "Other");
+                    let prior =
+                        warm.then(|| context.get_nongeneric_class_members(derived).unwrap());
+                    let node = heritage(&javascript)[index];
+                    let saved_type = context
+                        .store()
+                        .type_node_links(node)
+                        .cloned()
+                        .unwrap_or_default();
+                    let saved_symbol = context
+                        .store()
+                        .symbol_node_links(node)
+                        .cloned()
+                        .unwrap_or_default();
+                    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                    let store = context.store_mut_for_test();
+                    let expected = if symbol_damage {
+                        assert!(store.set_symbol_node_links(
+                            node,
+                            SymbolNodeLinks {
+                                resolved_symbol: Some(other)
+                            }
+                        ));
+                        invariant(ClassInvariant::InvalidPropertySymbol(node))
+                    } else {
+                        assert!(store.set_type_node_links(
+                            node,
+                            TypeNodeLinks {
+                                resolved_type: Some(number),
+                                ..TypeNodeLinks::default()
+                            }
+                        ));
+                        invariant(ClassInvariant::InvalidPropertyTypeCache(node))
+                    };
+                    let damaged = snapshot(&context, &ambient, &javascript);
+                    for _ in 0..2 {
+                        assert_eq!(context.get_nongeneric_class_members(derived), Err(expected));
+                        assert_eq!(snapshot(&context, &ambient, &javascript), damaged);
+                    }
+                    let store = context.store_mut_for_test();
+                    assert!(store.set_symbol_node_links(node, saved_symbol));
+                    assert!(store.set_type_node_links(node, saved_type));
+                    let restored = context.get_nongeneric_class_members(derived).unwrap();
+                    if let Some(prior) = prior {
+                        assert_eq!(restored, prior);
+                    }
+                    let stable = snapshot(&context, &ambient, &javascript);
+                    assert_eq!(context.get_nongeneric_class_members(derived), Ok(restored));
+                    assert_eq!(snapshot(&context, &ambient, &javascript), stable);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged base or constructor graph must remain unchanged until restoration.
+    fn javascript_qualified_base_rejects_completed_graph_damage_without_repairing_it() {
+        for damage in 0..4 {
+            let ambient = parse_source_file(AMBIENT);
+            let javascript = parse_javascript_source_file(JAVASCRIPT);
+            let mut context = context(
+                &ambient,
+                &javascript,
+                true,
+                CanonicalSourceLanguage::JavaScript,
+            );
+            let (_, derived) = class(&context, &javascript, JAVASCRIPT_FILE, "Derived");
+            let (_, base) = class(&context, &ambient, AMBIENT_FILE, "Base");
+            let members = context.get_nongeneric_class_members(derived).unwrap();
+            let base_members = context.get_nongeneric_class_members(base).unwrap();
+            let selected = if damage % 2 == 0 {
+                &base_members
+            } else {
+                &members
+            };
+            let instance = selected.shells.instance_type;
+            let signature = selected.default_construct_signature;
+            let TypeData::Interface(saved) = context.store().type_payload(instance).unwrap().data()
+            else {
+                panic!("the source class retains its interface record")
+            };
+            let saved = saved.clone();
+            let wrong = if damage % 2 == 0 {
+                members.shells.instance_type
+            } else {
+                base_members.shells.instance_type
+            };
+            let store = context.store_mut_for_test();
+            if damage < 2 {
+                assert!(store.set_interface_base_resolution(
+                    instance,
+                    saved.base_types_resolved,
+                    Some(wrong),
+                    saved.resolved_base_types.clone()
+                ));
+            } else {
+                assert!(store.set_signature_resolved_return_type(signature, Some(wrong)));
+            }
+            let damaged = snapshot(&context, &ambient, &javascript);
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_class_heritage_members(context.store(), members.shells.instance_type),
+                    ClassHeritageMembersValidation::Malformed
+                );
+                assert_eq!(
+                    context.get_nongeneric_class_members(derived),
+                    Err(invariant(if damage % 2 == 0 {
+                        ClassInvariant::InvalidInstanceMembers(base)
+                    } else {
+                        ClassInvariant::InvalidHeritageCache(derived)
+                    }))
+                );
+                assert_eq!(snapshot(&context, &ambient, &javascript), damaged);
+            }
+            let store = context.store_mut_for_test();
+            assert!(store.set_interface_base_resolution(
+                instance,
+                saved.base_types_resolved,
+                saved.resolved_base_constructor_type,
+                saved.resolved_base_types
+            ));
+            assert!(store.set_signature_resolved_return_type(signature, Some(instance)));
+            assert_eq!(
+                context.get_nongeneric_class_members(derived),
+                Ok(members.clone())
+            );
+            let stable = snapshot(&context, &ambient, &javascript);
+            let outside = context.source_file(JAVASCRIPT_FILE).unwrap().node_ref();
+            assert_eq!(
+                context.type_to_string_at_location(base_members.shells.instance_type, outside),
+                Ok("Library.Base".to_owned())
+            );
+            assert_eq!(
+                context.type_to_string_at_location(base_members.shells.value_type, outside),
+                Ok("typeof Library.Base".to_owned())
+            );
+            assert_eq!(context.get_nongeneric_class_members(derived), Ok(members));
+            assert_eq!(snapshot(&context, &ambient, &javascript), stable);
+        }
+    }
+
+    #[test]
+    fn javascript_qualified_base_keeps_a_valid_ambient_shell_through_source_checking() {
+        let ambient = parse_source_file(AMBIENT);
+        let javascript = parse_javascript_source_file(JAVASCRIPT);
+        let mut context = context(
+            &ambient,
+            &javascript,
+            true,
+            CanonicalSourceLanguage::JavaScript,
+        );
+        let (_, derived) = class(&context, &javascript, JAVASCRIPT_FILE, "Derived");
+        let (_, base) = class(&context, &ambient, AMBIENT_FILE, "Base");
+        let shells = context.get_nongeneric_class_shells(base).unwrap();
+        assert!(context.store().value_symbol_links(derived).is_none());
+        for file in [AMBIENT_FILE, JAVASCRIPT_FILE] {
+            context.check_source_file(file).unwrap();
+        }
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the written base and JSDoc annotation retain one mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 8023);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["extends", "Other", "Base"]
+        );
+        let stable = snapshot(&context, &ambient, &javascript);
+        let outside = context.source_file(JAVASCRIPT_FILE).unwrap().node_ref();
+        assert_eq!(
+            context.type_to_string_at_location(shells.instance_type, outside),
+            Ok("Library.Base".to_owned())
+        );
+        assert_eq!(
+            context.type_to_string_at_location(shells.value_type, outside),
+            Ok("typeof Library.Base".to_owned())
+        );
+        assert_eq!(context.get_nongeneric_class_shells(base), Ok(shells));
+        assert_eq!(snapshot(&context, &ambient, &javascript), stable);
+        let derived_members = context.get_nongeneric_class_members(derived).unwrap();
+        let base_members = context.get_nongeneric_class_members(base).unwrap();
+        assert_eq!(base_members.shells, shells);
+        assert_eq!(
+            derived_members.base().unwrap().value_type(),
+            shells.value_type
+        );
+        assert_eq!(
+            derived_members.base().unwrap().instance_type(),
+            shells.instance_type
+        );
+        assert_eq!(
+            validate_class_heritage_members(context.store(), derived_members.shells.instance_type),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
+    fn javascript_qualified_base_keeps_cold_merged_namespace_display() {
+        let first = parse_source_file("declare namespace Library { class Base {} }");
+        let second = parse_source_file("declare namespace Library { class Other {} }");
+        for reverse in [false, true] {
+            let mut sources = [(AMBIENT_FILE, &first), (JAVASCRIPT_FILE, &second)];
+            if reverse {
+                sources.reverse();
+            }
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed) in sources {
+                assert!(parsed.diagnostics.is_empty());
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!("\"/part-{}.d.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            true,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, parsed) in sources {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                sources
+                    .into_iter()
+                    .map(|(file, parsed)| (file, &parsed.arena))
+                    .collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+            let (_, base) = class(&context, &first, AMBIENT_FILE, "Base");
+            let (_, other) = class(&context, &second, JAVASCRIPT_FILE, "Other");
+            let namespace = context.store().get_parent_of_symbol(base).unwrap();
+            assert_eq!(context.store().get_parent_of_symbol(other), Some(namespace));
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(namespace)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let instance = context.get_declared_type_of_symbol(base).unwrap();
+            let outside = context.source_file(JAVASCRIPT_FILE).unwrap().node_ref();
+            let cold = snapshot(&context, &first, &second);
+            for _ in 0..2 {
+                assert_eq!(context.type_to_string(instance), Ok("Base".to_owned()));
+                assert_eq!(
+                    context.type_to_string_at_location(instance, outside),
+                    Ok("Library.Base".to_owned())
+                );
+                assert_eq!(snapshot(&context, &first, &second), cold);
+                for symbol in [base, other, namespace] {
+                    assert!(context.store().value_symbol_links(symbol).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_qualified_base_keeps_jsdoc_parameters_outside_this_slice() {
+        for (source, generic) in [
+            (
+                "/**\n * @template T\n * @extends {Library.Base}\n */\nclass Derived extends Library.Base {}",
+                true,
+            ),
+            (
+                "/** @extends {Library.Base<string>} */ class Derived extends Library.Base {}",
+                false,
+            ),
+        ] {
+            let ambient = parse_source_file(AMBIENT);
+            let javascript = parse_javascript_source_file(source);
+            let mut context = context(
+                &ambient,
+                &javascript,
+                true,
+                CanonicalSourceLanguage::JavaScript,
+            );
+            let (declaration, derived) = class(&context, &javascript, JAVASCRIPT_FILE, "Derived");
+            let NodeData::ClassDeclaration(class) =
+                &javascript.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the source declaration is a JavaScript class")
+            };
+            assert!(class.type_parameters.is_none());
+            let expected = if generic {
+                ClassUnsupported::Generic(declaration)
+            } else {
+                ClassUnsupported::Heritage(heritage(&javascript)[2])
+            };
+            let cold = snapshot(&context, &ambient, &javascript);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_nongeneric_class_members(derived),
+                    Err(unsupported(expected))
+                );
+                assert_eq!(snapshot(&context, &ambient, &javascript), cold);
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_qualified_base_keeps_other_source_families_unsupported_and_cold() {
+        for (source, declaration_file, language) in [
+            (
+                "declare namespace Library { class Base<T> {} }",
+                true,
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "declare namespace Library { class Base { value: number; } }",
+                true,
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "declare namespace Library { interface Base {} class Other {} }",
+                true,
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (
+                "namespace Library { export class Base {} }",
+                false,
+                CanonicalSourceLanguage::JavaScript,
+            ),
+            (AMBIENT, true, CanonicalSourceLanguage::TypeScript),
+        ] {
+            let ambient = parse_source_file(source);
+            let javascript = if language == CanonicalSourceLanguage::JavaScript {
+                parse_javascript_source_file(JAVASCRIPT)
+            } else {
+                parse_source_file(JAVASCRIPT)
+            };
+            let mut context = context(&ambient, &javascript, declaration_file, language);
+            let (_, derived) = class(&context, &javascript, JAVASCRIPT_FILE, "Derived");
+            let cold = snapshot(&context, &ambient, &javascript);
+            for _ in 0..2 {
+                assert_eq!(
+                    context.get_nongeneric_class_members(derived),
+                    Err(unsupported(ClassUnsupported::Heritage(
+                        heritage(&javascript)[2]
+                    )))
+                );
+                assert_eq!(snapshot(&context, &ambient, &javascript), cold);
             }
         }
     }
