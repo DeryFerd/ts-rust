@@ -35961,9 +35961,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return Err(invalid());
         }
-        // Defaults in a wrapper RHS need a separate source substitution proof.
-        if arguments.len() != referenced.type_parameters.len() {
-            return Err(unsupported());
+        let omitted = referenced
+            .type_parameters
+            .get(arguments.len()..)
+            .ok_or_else(unsupported)?;
+        for parameter in omitted {
+            let annotations = self
+                .store
+                .source_alias_type_parameter_annotations(parameter.declaration)
+                .ok_or_else(invalid)?;
+            if annotations.constraint != parameter.constraint
+                || annotations.default_type != parameter.default_type
+            {
+                return Err(invalid());
+            }
+            if annotations.default_type.is_none() {
+                return Err(unsupported());
+            }
         }
         let cached = self
             .store
@@ -36080,6 +36094,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             })?;
         }
         Ok(())
+    }
+
+    fn prove_property_alias_reference_defaults(
+        &self,
+        reference: &PlannedTypeReference,
+        declared_type: TypeId,
+        effective_arguments: &[TypeId],
+    ) -> Result<(), DeclaredTypeError> {
+        super::object_aliases::validate_property_object_alias_source_defaults(
+            self.store,
+            reference.symbol,
+            reference.type_arguments.len(),
+            effective_arguments,
+        )
+        .map_err(|error| match error {
+            super::relater::RelationUnavailable::UnsupportedStructuredType(_) => {
+                type_node_unavailable(TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                    alias: reference.symbol,
+                    declared_type,
+                })
+            }
+            _ => type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                reference.symbol,
+            )),
+        })
     }
 
     fn execute_generic_alias_instantiation(
@@ -36203,6 +36242,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let key =
             self.type_alias_instantiation_key(&provided_arguments, alias_identity.as_ref())?;
         let provided_argument_count = provided_arguments.len();
+        let wrapper_defaults = property_object_alias
+            && alias_identity.is_some()
+            && provided_argument_count < type_parameters.len();
         if ordinary_intersection {
             let retained = self
                 .store
@@ -36271,6 +36313,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .expect("the exact request reader checked this record")
                     .effective_arguments
                     .clone();
+                if wrapper_defaults {
+                    self.prove_property_alias_reference_defaults(
+                        reference,
+                        declared_type,
+                        &effective_arguments,
+                    )?;
+                }
                 self.check_generic_alias_type_argument_constraints(
                     reference,
                     &metadata,
@@ -36305,6 +36354,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &type_arguments,
             )?;
             type_arguments.push(default_type);
+        }
+        if wrapper_defaults {
+            self.prove_property_alias_reference_defaults(
+                reference,
+                declared_type,
+                &type_arguments,
+            )?;
         }
         if plan.recursive_mapped_aliases.contains_key(&symbol)
             && alias_identity.is_none()
@@ -47128,6 +47184,172 @@ mod tests {
         }
         assert_eq!(union_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each changed cache must fail without replacing the real default or caller state.
+    fn property_object_alias_wrapper_defaults_reject_changed_source_caches() {
+        let mut fixture = fixture(concat!(
+            "type Bound<T extends string = 'original'> = { value: T }; ",
+            "type Defaulted = Bound;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Defaulted");
+        let parameter_symbol = named_symbol(&fixture, SyntaxKind::TypeParameter, "T");
+        let parameter_node = named_node(&fixture, SyntaxKind::TypeParameter, "T");
+        let rhs = alias_parts(&fixture, "Defaulted").2;
+        let default_node = alias_type_parameter_default(&fixture, "Bound", 0);
+        let NodeData::TypeParameterDeclaration(syntax) =
+            &fixture.parsed.arena.get(parameter_node.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let constraint_node = NodeRef::new(
+            parameter_node.arena,
+            parameter_node.file,
+            syntax.constraint.unwrap(),
+        );
+        let annotations = fixture
+            .store
+            .source_alias_type_parameter_annotations(parameter_node)
+            .unwrap();
+        assert_eq!(annotations.constraint, Some(constraint_node));
+        assert_eq!(annotations.default_type, Some(default_node));
+        assert_ne!(constraint_node, default_node);
+        assert!(fixture.store.type_node_links(default_node).is_none());
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (number, string, error) = (
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.error_type,
+        );
+        let mut session = InstantiationSession::new_recovering(
+            &fixture.store,
+            InstantiationLimits::default(),
+            error,
+        )
+        .unwrap();
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut query = CanonicalTypeQuery::new_with_session_for_test(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let result = query.get_type_from_type_node(rhs).unwrap();
+        assert_eq!(query.get_declared_type_of_symbol(owner), Ok(result));
+        let parameter = query
+            .store
+            .declared_type_links(parameter_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let original_parameter = match query.store.type_payload(parameter).unwrap().data() {
+            TypeData::TypeParameter(data) => data.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(original_parameter.constraint, Some(string));
+        let original_default = query.store.type_node_links(default_node).unwrap().clone();
+        let default_type = original_default.resolved_type.unwrap();
+        let projection =
+            super::super::object_aliases::property_object_alias_projection(query.store, result)
+                .unwrap()
+                .unwrap();
+        assert_eq!(projection.arguments, [default_type]);
+        assert_eq!(projection.identity_symbol, owner);
+        assert!(projection.identity_arguments.is_empty());
+        let wrong_literal = query
+            .store
+            .regular_string_literal_type("changed".to_owned())
+            .unwrap();
+
+        for change in 0..4 {
+            match change {
+                0 | 1 => assert!(query.store.set_type_parameter_resolution(
+                    parameter,
+                    if change == 0 {
+                        Some(number)
+                    } else {
+                        original_parameter.constraint
+                    },
+                    original_parameter.target,
+                    original_parameter.mapper,
+                    if change == 1 {
+                        Some(wrong_literal)
+                    } else {
+                        original_parameter.resolved_default_type
+                    },
+                )),
+                _ => assert!(query.store.set_type_node_links(
+                    default_node,
+                    TypeNodeLinks {
+                        resolved_type: Some(if change == 2 { number } else { wrong_literal }),
+                        ..original_default.clone()
+                    },
+                )),
+            }
+            let changed_parameter = match query.store.type_payload(parameter).unwrap().data() {
+                TypeData::TypeParameter(data) => data.clone(),
+                _ => unreachable!(),
+            };
+            let changed_default = query.store.type_node_links(default_node).cloned();
+            let changed_owner = query.store.type_alias_links(owner).cloned();
+            let state = union_state(query.store);
+            let caller = query.instantiation_session.as_deref().unwrap();
+            let counts = (
+                caller.query_count(),
+                caller.total_count(),
+                caller.limit_event_count(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    query.get_type_from_type_node(rhs),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(_))
+                ));
+                assert!(matches!(
+                    query.get_declared_type_of_symbol(owner),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(_))
+                ));
+                assert_eq!(union_state(query.store), state);
+                assert_eq!(
+                    query.store.type_payload(parameter).unwrap().data(),
+                    &TypeData::TypeParameter(changed_parameter.clone()),
+                );
+                assert_eq!(
+                    query.store.type_node_links(default_node),
+                    changed_default.as_ref()
+                );
+                assert_eq!(query.store.type_alias_links(owner), changed_owner.as_ref());
+                let caller = query.instantiation_session.as_deref().unwrap();
+                assert_eq!(
+                    (
+                        caller.query_count(),
+                        caller.total_count(),
+                        caller.limit_event_count()
+                    ),
+                    counts,
+                );
+            }
+            assert!(query.store.set_type_parameter_resolution(
+                parameter,
+                original_parameter.constraint,
+                original_parameter.target,
+                original_parameter.mapper,
+                original_parameter.resolved_default_type,
+            ));
+            assert!(
+                query
+                    .store
+                    .set_type_node_links(default_node, original_default.clone())
+            );
+            assert_eq!(query.get_type_from_type_node(rhs), Ok(result));
+            assert_eq!(query.get_declared_type_of_symbol(owner), Ok(result));
+        }
+        assert!(query.diagnostics.is_empty());
     }
 
     #[test]

@@ -2586,6 +2586,89 @@ fn original_identity_source_argument(
     ))
 }
 
+fn identity_source_default_argument(
+    store: &CanonicalTypeMapperStore,
+    header: &PropertyObjectAliasSourceHeader,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(TypeId, IdentitySourceArgument), RelationUnavailable> {
+    let invalid = || RelationUnavailable::Symbol(symbol);
+    if !header.parameters.contains(&(declaration, symbol))
+        || store.source_node_parent(declaration)
+            != Some(SourceNodeParent::Parent(header.alias_declaration))
+    {
+        return Err(invalid());
+    }
+    let annotations = store
+        .source_alias_type_parameter_annotations(declaration)
+        .ok_or_else(invalid)?;
+    let default_node = annotations.default_type.ok_or_else(invalid)?;
+    let (default_type, argument) = original_identity_source_argument(store, header, default_node)?;
+    if !matches!(argument, IdentitySourceArgument::Fixed(_)) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(default_type));
+    }
+    let parameter = source_parameter(store, declaration, header.alias_symbol)?;
+    let Some(TypeData::TypeParameter(data)) = store.type_payload(parameter).map(TypeRecord::data)
+    else {
+        return Err(invalid());
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let constraint = annotations
+        .constraint
+        .map(|node| {
+            original_identity_source_argument(store, header, node).map(|(type_, _)| {
+                if type_ == bootstrap.any_type {
+                    bootstrap.unknown_type
+                } else {
+                    type_
+                }
+            })
+        })
+        .transpose()?;
+    if data.is_this_type
+        || data.target.is_some()
+        || data.mapper.is_some()
+        || data
+            .resolved_default_type
+            .is_some_and(|cached| cached != default_type)
+        || match constraint {
+            Some(expected) => data.constraint != Some(expected),
+            None => data
+                .constraint
+                .is_some_and(|cached| cached != bootstrap.no_constraint_type),
+        }
+    {
+        return Err(invalid());
+    }
+    Ok((default_type, argument))
+}
+
+/// Checks filled slots against closed defaults on the referenced alias's own parameters.
+/// This read-only proof does not check the provider declaration's diagnostics.
+pub(super) fn validate_property_object_alias_source_defaults(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    supplied_count: usize,
+    effective_arguments: &[TypeId],
+) -> Result<(), RelationUnavailable> {
+    let header = property_object_alias_identity_source_header(store, symbol)?;
+    if supplied_count > header.parameters.len()
+        || effective_arguments.len() != header.parameters.len()
+    {
+        return Err(RelationUnavailable::Symbol(symbol));
+    }
+    for (index, &(declaration, parameter)) in
+        header.parameters.iter().enumerate().skip(supplied_count)
+    {
+        let (expected, _) =
+            identity_source_default_argument(store, &header, declaration, parameter)?;
+        if effective_arguments[index] != expected {
+            return Err(RelationUnavailable::Symbol(parameter));
+        }
+    }
+    Ok(())
+}
+
 /// Wrapper RHS references form one chain. Fold it from the original source
 /// without recursively validating a projection or any instantiation map.
 #[allow(clippy::too_many_lines)] // Keep source, header, and exact cache-row checks together.
@@ -2652,7 +2735,7 @@ fn identity_source_mapping(
                     .and_then(|record| record.name().as_utf8())
                     == store.source_identifier_text(reference.name)
             })
-            || reference.arguments.len() != referenced_header.parameters.len()
+            || reference.arguments.len() > referenced_header.parameters.len()
             || store
                 .type_node_links(reference.name)
                 .is_some_and(|links| links != &TypeNodeLinks::default())
@@ -2682,13 +2765,27 @@ fn identity_source_mapping(
         if store.source_direct_type_annotation(header.alias_declaration) != Some(reference.body) {
             return Err(invalid());
         }
-        let mut arguments = Vec::with_capacity(reference.arguments.len());
+        let mut arguments = Vec::with_capacity(referenced_header.parameters.len());
         let mut original_arguments = Vec::with_capacity(reference.arguments.len());
         for argument in &reference.arguments {
             let (type_, source_argument) =
                 original_identity_source_argument(store, &header, *argument)?;
             original_arguments.push(type_);
             arguments.push(source_argument);
+        }
+        // Defaults fill physical slots. The request key keeps only written arguments.
+        for &(declaration, parameter) in referenced_header
+            .parameters
+            .iter()
+            .skip(reference.arguments.len())
+        {
+            let (_, argument) = identity_source_default_argument(
+                store,
+                &referenced_header,
+                declaration,
+                parameter,
+            )?;
+            arguments.push(argument);
         }
         let request = object_identity_cache_key(store, &original_arguments, symbol, &parameters)?;
         if store

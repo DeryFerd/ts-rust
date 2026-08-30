@@ -110,10 +110,24 @@ struct SourceNodeFacts {
     default_function_name: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
     type_operator: Option<SyntaxKind>,
+    alias_type_parameter: Option<Box<AliasTypeParameterSyntaxFacts>>,
     mapped_type: Option<Box<MappedTypeSyntaxFacts>>,
     plain_interface_heritage: Option<Box<PlainInterfaceHeritageFacts>>,
     exported: bool,
     signature_links_eligible: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AliasTypeParameterSyntaxFacts {
+    constraint: Option<NodeId>,
+    default_type: Option<NodeId>,
+}
+
+/// Actual annotation roles on a type parameter owned by a type alias.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceAliasTypeParameterAnnotations {
+    pub constraint: Option<NodeRef>,
+    pub default_type: Option<NodeRef>,
 }
 
 /// Exact heritage syntax retained without resolving base names.
@@ -8464,6 +8478,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             })
     }
 
+    pub(super) fn source_alias_type_parameter_annotations(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SourceAliasTypeParameterAnnotations> {
+        let facts = self.source_node_fact(declaration)?;
+        let parent = NodeRef::new(declaration.arena, declaration.file, facts.parent?);
+        if facts.kind != SyntaxKind::TypeParameter
+            || self.source_node_kind(parent) != Some(SyntaxKind::TypeAliasDeclaration)
+        {
+            return None;
+        }
+        let annotations = facts.alias_type_parameter.as_deref()?;
+        let child = |node| {
+            let node = NodeRef::new(declaration.arena, declaration.file, node);
+            (self.source_node_parent(node) == Some(SourceNodeParent::Parent(declaration)))
+                .then_some(node)
+        };
+        Some(SourceAliasTypeParameterAnnotations {
+            constraint: match annotations.constraint {
+                Some(node) => Some(child(node)?),
+                None => None,
+            },
+            default_type: match annotations.default_type {
+                Some(node) => Some(child(node)?),
+                None => None,
+            },
+        })
+    }
+
     /// Returns the final direct type annotation on a registered declaration.
     #[must_use]
     pub(super) fn source_direct_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
@@ -8612,6 +8655,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 },
                 type_operator: match &node.data {
                     NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
+                alias_type_parameter: match &node.data {
+                    NodeData::TypeParameterDeclaration(parameter)
+                        if node
+                            .parent
+                            .and_then(|parent| arena.get(parent))
+                            .is_some_and(|parent| {
+                                parent.kind == SyntaxKind::TypeAliasDeclaration
+                            }) =>
+                    {
+                        Some(Box::new(AliasTypeParameterSyntaxFacts {
+                            constraint: parameter.constraint,
+                            default_type: parameter.default_type,
+                        }))
+                    }
                     _ => None,
                 },
                 mapped_type: match &node.data {
