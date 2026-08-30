@@ -3707,7 +3707,7 @@ fn validate_declared_call_signature_records(
     StoredDeclaredCallSetValidation::Valid(edges)
 }
 
-/// Validates the declared call template before any reference substitutes its types.
+/// Validates the ordered declared call templates before a reference substitutes their types.
 /// Generic member validation separately proves the interface's property table.
 pub(super) fn generic_declared_call_signature_edges(
     store: &CanonicalTypeMapperStore,
@@ -3730,16 +3730,26 @@ pub(super) fn generic_declared_call_signature_edges(
         return (call_symbol.is_none() && !store.type_has_declared_call_set_provenance(target))
             .then(Vec::new);
     };
-    let [signature] = signatures else {
+    if signatures.is_empty() {
         return None;
-    };
+    }
     let [declaration] = owner_record.declarations()? else {
         return None;
     };
     let symbol = call_symbol?;
     let symbol_record = store.symbol(symbol)?;
-    let signature_record = store.signature(*signature)?;
-    let call = signature_record.declaration()?;
+    let calls = signatures
+        .iter()
+        .map(|signature| {
+            let record = store.signature(*signature)?;
+            let declaration = record.declaration()?;
+            (record.type_parameters().is_empty()
+                && !record.has_rest_parameter()
+                && record.resolved_type_predicate().is_none()
+                && store.source_declaration_belongs_to_symbol(declaration, symbol))
+            .then_some(declaration)
+        })
+        .collect::<Option<Vec<_>>>()?;
     if validate_direct_generic_reference(store, target)
         .ok()?
         .target
@@ -3747,20 +3757,17 @@ pub(super) fn generic_declared_call_signature_edges(
         || !store.type_has_declared_call_set_provenance(target)
         || !interface.declared_members_resolved
         || interface.resolved_base_types.is_some()
-        || !signature_record.type_parameters().is_empty()
-        || signature_record.has_rest_parameter()
-        || signature_record.resolved_type_predicate().is_some()
         || symbol_record.flags() != SymbolFlags::SIGNATURE
         || symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.name() != InternalSymbolName::Call.as_ref()
-        || symbol_record.declarations() != Some(&[call])
+        || symbol_record.declarations() != Some(calls.as_slice())
         || symbol_record.value_declaration().is_some()
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.export_symbol().is_some()
         || store.get_parent_of_symbol(symbol) != Some(owner)
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || !store.source_declaration_belongs_to_symbol(call, symbol)
+        || !store.source_symbol_declarations_match(symbol)
         || !store.source_declaration_belongs_to_symbol(*declaration, owner)
     {
         return None;
@@ -9483,7 +9490,7 @@ pub(super) fn plan_generic_interface(
     )?;
     plan.heritage = heritage;
     if let Some(call) = plan.call_signatures.first()
-        && !supported_generic_interface_call(&plan)
+        && !supported_generic_interface_calls(&plan)
     {
         return Err(PropertyObjectError::UnsupportedMember {
             node: call.declaration,
@@ -9501,24 +9508,24 @@ pub(super) fn plan_generic_interface(
     Ok(plan)
 }
 
-/// The enclosing interface supplies the mapper. Call-owned generics, overloads,
-/// constructors, and inherited call sets keep their existing unsupported boundary.
-fn supported_generic_interface_call(plan: &PropertyObjectPlan) -> bool {
-    let [call] = plan.call_signatures.as_slice() else {
-        return false;
-    };
+/// The enclosing interface supplies one mapper for its ordered call signatures.
+/// Call-owned generics, constructors, and inherited calls remain unsupported.
+fn supported_generic_interface_calls(plan: &PropertyObjectPlan) -> bool {
     plan.kind == PropertyObjectKind::Interface
         && plan.declarations.len() == 1
         && plan.heritage.is_none()
         && plan.methods.is_empty()
         && plan.accessors.is_empty()
         && plan.indexes.is_empty()
-        && call.type_parameters.is_empty()
-        && call.type_predicate.is_none()
-        && !call.implicit_any_return
-        && !call.is_construct()
-        && !call.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
-        && call.parameters.iter().all(|parameter| !parameter.optional)
+        && !plan.call_signatures.is_empty()
+        && plan.call_signatures.iter().all(|call| {
+            call.type_parameters.is_empty()
+                && call.type_predicate.is_none()
+                && !call.implicit_any_return
+                && !call.is_construct()
+                && !call.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+                && call.parameters.iter().all(|parameter| !parameter.optional)
+        })
 }
 
 /// Validates a reopened generic interface without reading its member annotations.
@@ -19242,7 +19249,7 @@ fn valid_planned_call_signature_set(
             .iter()
             .any(PlannedCallSignature::is_construct),
     );
-    let enclosing_parameter_count = if supported_generic_interface_call(plan) {
+    let enclosing_parameter_count = if supported_generic_interface_calls(plan) {
         members
             .iter()
             .filter(|(_, symbol)| {
@@ -20861,7 +20868,7 @@ pub(super) fn publish_declared_members(
             && record.object_flags().contains(ObjectFlags::REFERENCE)
     });
     if generic_interface
-        && (!supported_generic_interface_call(plan)
+        && (!supported_generic_interface_calls(plan)
             || state.is_resolved()
             || store.type_payload(type_).is_none_or(|record| {
                 let TypeData::Interface(interface) = record.data() else {
@@ -21379,7 +21386,7 @@ fn publish_generic_interface_declared_members_worker(
     };
     if plan.kind != PropertyObjectKind::Interface
         || plan.alias_symbol.is_some()
-        || !plan.call_signatures.is_empty() && !supported_generic_interface_call(plan)
+        || !plan.call_signatures.is_empty() && !supported_generic_interface_calls(plan)
         || plan.properties.len() != property_types.len()
         || property_types
             .iter()
@@ -22003,10 +22010,11 @@ fn valid_generic_publication_target(
             return false;
         }
     }
-    for call in &plan.call_signatures {
-        if !symbols.insert(call.symbol) {
-            return false;
-        }
+    // The validated Call symbol owns every overload declaration in this plan.
+    if let Some(call) = plan.call_signatures.first()
+        && !symbols.insert(call.symbol)
+    {
+        return false;
     }
     raw_table.iter().all(|(name, symbol)| {
         store

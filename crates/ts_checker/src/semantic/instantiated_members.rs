@@ -9382,6 +9382,202 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Check source and copied signature order on cold and warm references.
+    fn generic_interface_overloads_reject_changed_signature_order_and_count() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: T): T; (value: T, extra: number): T; } ",
+            "declare const callable: Callable<string>;",
+        ));
+        let file = FileId::new(202_625);
+        for corruption in 0..4 {
+            let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let reference =
+                property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+            let store = context.store_mut_for_test();
+            let target = validate_direct_generic_reference(store, reference)
+                .unwrap()
+                .target;
+            let copies = if corruption == 3 {
+                None
+            } else {
+                resolve_members_with_array_targets(store, reference, None).unwrap();
+                let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                    validate_generic_interface_callable(store, reference, None)
+                else {
+                    panic!("the interface must retain both mapped call signatures")
+                };
+                assert_eq!(projection.call_signatures.len(), 2);
+                Some(
+                    projection
+                        .call_signatures
+                        .iter()
+                        .map(|call| call.signature)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            if corruption == 0 || corruption == 3 {
+                let TypeData::Interface(interface) = store.type_payload(target).unwrap().data()
+                else {
+                    panic!("the declared target must be an interface")
+                };
+                let mut signatures = interface.declared_call_signatures.clone().unwrap();
+                signatures.reverse();
+                if corruption == 3 {
+                    let declaration = store
+                        .signature(signatures[0])
+                        .unwrap()
+                        .declaration()
+                        .unwrap();
+                    let call_symbol = store.source_declaration_symbol(declaration).unwrap();
+                    let mut declarations = store
+                        .symbol(call_symbol)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .to_vec();
+                    declarations.reverse();
+                    assert!(store.set_symbol_declarations(call_symbol, Some(declarations), None));
+                }
+                assert!(store.set_interface_declared_members(
+                    target,
+                    true,
+                    None,
+                    Some(signatures),
+                    None,
+                    None
+                ));
+            } else {
+                let mut signatures = copies.unwrap();
+                if corruption == 1 {
+                    signatures.reverse();
+                } else {
+                    signatures.pop();
+                }
+                assert!(store.set_structured_type_members(
+                    reference,
+                    None,
+                    None,
+                    Some(signatures),
+                    None,
+                    None
+                ));
+            }
+            let expected = if corruption == 0 || corruption == 3 {
+                GenericInterfaceMemberError::InvalidTarget(target)
+            } else {
+                GenericInterfaceMemberError::InvalidCachedMembers(reference)
+            };
+            let warm = (store.type_len(), store.signature_len(), store.mapper_len());
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_generic_interface_callable(store, reference, None),
+                    Some(StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }),
+                );
+                assert_eq!(
+                    resolve_members_with_array_targets(store, reference, None),
+                    Err(expected.clone()),
+                );
+                assert_eq!(
+                    (store.type_len(), store.signature_len(), store.mapper_len()),
+                    warm
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_interface_overload_later_limits_leave_all_signature_rows_unpublished() {
+        let parsed = parse_source_file(concat!(
+            "interface Callable<T> { (value: number): string; (value: T): T; } ",
+            "declare const callable: Callable<boolean>;",
+        ));
+        let file = FileId::new(202_626);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let reference =
+            property_object_alias_variable_type(&parsed, file, &mut context, "callable");
+        let store = context.store_mut_for_test();
+        let target = validate_direct_generic_reference(store, reference)
+            .unwrap()
+            .target;
+        let TypeData::Interface(interface) = store.type_payload(target).unwrap().data() else {
+            panic!("the declared target must be an interface")
+        };
+        let originals = interface.declared_call_signatures.clone().unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let boolean = bootstrap.boolean_type;
+        let error_type = bootstrap.error_type;
+        let mut session = InstantiationSession::new_recovering(
+            store,
+            InstantiationLimits {
+                max_count: 0,
+                ..InstantiationLimits::default()
+            },
+            error_type,
+        )
+        .unwrap();
+        let mark = session.limit_event_mark();
+        assert_eq!(
+            resolve_members_with_array_targets_and_session(store, reference, None, &mut session),
+            Err(GenericInterfaceMemberError::UnsupportedPropertyType(
+                reference
+            )),
+        );
+        assert!(session.limit_event_occurred_since(mark));
+        let copied = store
+            .signatures()
+            .filter_map(|(id, signature)| {
+                signature
+                    .target()
+                    .filter(|source| originals.contains(source))
+                    .map(|_| id)
+            })
+            .collect::<Vec<_>>();
+        assert!(!copied.is_empty());
+        assert_eq!(
+            store.signature(copied[0]).unwrap().target(),
+            Some(originals[0])
+        );
+        assert_eq!(
+            store.signature(copied[0]).unwrap().resolved_return_type(),
+            Some(string)
+        );
+        assert!(copied.iter().all(|signature| {
+            store
+                .declared_call_set_type_for_signature(*signature)
+                .is_none()
+        }));
+        assert!(!store.type_has_declared_call_set_provenance(reference));
+        assert_eq!(
+            store.type_payload(reference).unwrap().data().structured(),
+            Some(&StructuredTypeData::default())
+        );
+        resolve_members_with_array_targets(store, reference, None).unwrap();
+        let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+            validate_generic_interface_callable(store, reference, None)
+        else {
+            panic!("a fresh session must publish the complete overload set")
+        };
+        assert_eq!(projection.call_signatures.len(), originals.len());
+        for ((call, original), return_type) in projection
+            .call_signatures
+            .iter()
+            .zip(originals)
+            .zip([string, boolean])
+        {
+            assert_eq!(
+                store.signature(call.signature).unwrap().target(),
+                Some(original)
+            );
+            assert_eq!(call.return_type, Some(return_type));
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Compare cold templates with the same reference's published values.
     fn generic_interface_type_edges_preserve_cold_templates_and_warm_values() {
         let parsed = parse_source_file(concat!(
