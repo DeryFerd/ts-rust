@@ -348,6 +348,33 @@ pub(super) fn resolve_object_property_by_key_with_source(
     session: &mut InstantiationSession,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<ResolvedOwnProperty>, SourceCheckError> {
+    let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
+        matches!(record.data(), TypeData::Mapped(mapped)
+        if mapped.template_type.is_some_and(|template| {
+            matches!(store.type_payload(template).map(TypeRecord::data),
+                Some(TypeData::Conditional(_)))
+        }))
+    });
+    if conditional_mapped {
+        return CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+        )?
+        .get_type_of_mapped_property(receiver, name)
+        .map(|property| {
+            property.map(|property| ResolvedOwnProperty {
+                symbol: property.symbol(),
+                type_: property.type_id(),
+                optional: property.is_optional(),
+                readonly: property.is_readonly(),
+            })
+        })
+        .map_err(Into::into);
+    }
     if source_property_object_projection(store, receiver)?.is_some() {
         let members = match validate_property_object_alias_members_with_array_targets(
             store,

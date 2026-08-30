@@ -10,17 +10,18 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind, append_js_string};
 use ts_binder::{
-    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
-    SymbolTableId, semantic::PreparedSymbolTable,
+    CheckFlags, EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolData,
+    SymbolFlags, SymbolTableId, semantic::PreparedSymbolTable,
 };
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IndexInfoId, TypeId,
-    TypeMapperId, TypeResolutionTarget, TypeSystemPropertyName,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
+    IndexInfoId, TypeId, TypeMapperId, TypeResolutionTarget, TypeSystemPropertyName,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     conditional_types::{
+        ConditionalBranchSource, ConditionalTypeError, cached_source_conditional_instantiation,
         conditional_alias_projection, conditional_query_alias,
         validate_conditional_reference_result,
     },
@@ -34,7 +35,7 @@ use super::{
     },
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, MappedTemplateFrame,
-        cached_instantiation_with_vector, canonical_anonymous_union,
+        cached_instantiation_with_vector, canonical_anonymous_union, instantiate_type_with_source,
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
         with_mapped_template_frame,
     },
@@ -1988,7 +1989,16 @@ pub(super) struct MappedPropertyRecovery {
     key_type: TypeId,
     result: TypeId,
     links: ValueSymbolLinks,
-    identity: Vec<RecoveredPropertyTypeIdentity>,
+    identity: MappedRecoveryIdentity,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MappedRecoveryIdentity {
+    Types(Vec<RecoveredPropertyTypeIdentity>),
+    SourceConditional {
+        demand: SourceConditionalMappedDemand,
+        inputs: Vec<RecoveredPropertyTypeIdentity>,
+    },
 }
 
 impl MappedPropertyRecovery {
@@ -2037,7 +2047,26 @@ fn mapped_property_recovery_identity(
     shape: &MappedShape,
     key_type: TypeId,
     result: TypeId,
-) -> Option<Vec<RecoveredPropertyTypeIdentity>> {
+) -> Option<MappedRecoveryIdentity> {
+    if source_mapped_lookup_origin(store, shape.type_)
+        .ok()?
+        .is_some()
+    {
+        let demand = source_conditional_mapped_demand(store, shape.type_).ok()?;
+        if source_conditional_mapped_key(store, demand).ok()? != key_type
+            || store.intrinsic_bootstrap()?.error_type != result
+        {
+            return None;
+        }
+        let mut roots = vec![demand.argument, key_type, result];
+        for property in &shape.source_properties {
+            roots.push(store.value_symbol_links(property.symbol)?.resolved_type?);
+        }
+        return Some(MappedRecoveryIdentity::SourceConditional {
+            demand,
+            inputs: property_recovery_type_identity(store, &roots, None)?,
+        });
+    }
     let mut roots = vec![
         shape.template_type,
         shape.type_parameter,
@@ -2053,7 +2082,7 @@ fn mapped_property_recovery_identity(
     }
     roots.extend(shape.name_type);
     roots.extend(shape.template_parameters.into_iter().flatten());
-    property_recovery_type_identity(store, &roots, None)
+    property_recovery_type_identity(store, &roots, None).map(MappedRecoveryIdentity::Types)
 }
 
 /// Created only when mapped index evaluation observes a caller limit event.
@@ -2064,7 +2093,7 @@ pub(super) struct MappedIndexRecovery {
     shape: MappedShape,
     plan: PlannedMappedIndex,
     result: TypeId,
-    identity: Vec<RecoveredPropertyTypeIdentity>,
+    identity: MappedRecoveryIdentity,
 }
 
 impl MappedIndexRecovery {
@@ -2162,6 +2191,20 @@ struct PropTypesRequiredKeysShape {
     source_parameter: TypeId,
     source_argument: TypeId,
     conditional: TypeId,
+}
+
+struct MappedConditionalSource<'a> {
+    globals: &'a CanonicalGlobalTypes,
+    branches: &'a mut dyn ConditionalBranchSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceConditionalMappedDemand {
+    origin: SourceMappedLookupOrigin,
+    lookup: TypeId,
+    argument: TypeId,
+    parameter: TypeId,
+    mapper: TypeMapperId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3610,6 +3653,25 @@ impl CanonicalTypeMapperStore {
         type_arguments: &[TypeId],
         instantiated: TypeId,
     ) -> Result<(), MappedTypeError> {
+        self.validate_prop_types_required_keys_instantiation_worker(
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            instantiated,
+            true,
+        )
+    }
+
+    fn validate_prop_types_required_keys_instantiation_worker(
+        &self,
+        alias: SemanticSymbolId,
+        declared_type: TypeId,
+        type_parameters: &[TypeId],
+        type_arguments: &[TypeId],
+        instantiated: TypeId,
+        validate_members: bool,
+    ) -> Result<(), MappedTypeError> {
         let shape = validate_prop_types_required_keys_request(
             self,
             alias,
@@ -3734,6 +3796,9 @@ impl CanonicalTypeMapperStore {
             .object_flags()
             .contains(ObjectFlags::MEMBERS_RESOLVED)
         {
+            if !validate_members {
+                return Ok(());
+            }
             let member_shape = validate_mapped_shape(self, indexed_access.object_type)
                 .map_err(|_| MappedTypeError::InvalidMappedType(instantiated))?;
             let (properties, indexes) =
@@ -3780,6 +3845,16 @@ impl CanonicalTypeMapperStore {
         modifiers: MappedTypeModifiers,
         session: &mut InstantiationSession,
     ) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
+        self.resolve_mapped_type_members_worker(type_, modifiers, session, None)
+    }
+
+    fn resolve_mapped_type_members_worker(
+        &mut self,
+        type_: TypeId,
+        modifiers: MappedTypeModifiers,
+        session: &mut InstantiationSession,
+        source: Option<&MappedConditionalSource<'_>>,
+    ) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
         if !modifiers.valid() {
             return Err(MappedTypeError::InvalidModifiers);
         }
@@ -3805,7 +3880,13 @@ impl CanonicalTypeMapperStore {
         }
         let modifiers = declared;
         validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
-        reject_deferred_conditional_mapped_demand(self, type_)?;
+        if let Some(source) = source {
+            let demand = source_conditional_mapped_demand(self, type_)?;
+            source_conditional_mapped_key(self, demand)?;
+            source.branches.preflight(self, demand.origin.template)?;
+        } else {
+            reject_deferred_conditional_mapped_demand(self, type_)?;
+        }
         if let Some(source) = mapped_member_dependency(self, type_) {
             if self.type_payload(source).is_some_and(|record| {
                 !record
@@ -3822,6 +3903,11 @@ impl CanonicalTypeMapperStore {
         }
         let shape = validate_mapped_shape(self, type_)?;
         let (properties, indexes) = plan_mapped_members(self, &shape, modifiers)?;
+        if source.is_some() && (properties.len() != 1 || !indexes.is_empty()) {
+            return Err(MappedTypeError::UnsupportedConstraint(
+                shape.constraint_type,
+            ));
+        }
         if let Some(cached) = validate_warm_mapped_members(self, &shape, &properties, &indexes)? {
             return Ok(cached);
         }
@@ -4068,6 +4154,66 @@ impl CanonicalTypeMapperStore {
         }))
     }
 
+    pub(super) fn resolve_mapped_type_property_with_source(
+        &mut self,
+        type_: TypeId,
+        name: EscapedNameRef<'_>,
+        modifiers: MappedTypeModifiers,
+        globals: &CanonicalGlobalTypes,
+        session: &mut InstantiationSession,
+        branches: &mut dyn ConditionalBranchSource,
+    ) -> Result<Option<ResolvedMappedProperty>, MappedTypeError> {
+        let mut source = MappedConditionalSource { globals, branches };
+        let source = source_mapped_lookup_origin(self, type_)?
+            .is_some()
+            .then_some(&mut source);
+        let members =
+            self.resolve_mapped_type_members_worker(type_, modifiers, session, source.as_deref())?;
+        let Some(symbol) = self
+            .symbol_table(members.members)
+            .and_then(|table| table.get(name))
+        else {
+            return Ok(None);
+        };
+        if !members.properties.contains(&symbol) {
+            return Err(MappedTypeError::InvalidCachedProperty(symbol));
+        }
+        let type_ = self.resolve_mapped_symbol_type_worker(symbol, session, source)?;
+        let record = self
+            .symbol(symbol)
+            .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
+        Ok(Some(ResolvedMappedProperty {
+            symbol,
+            type_,
+            optional: record.flags().contains(SymbolFlags::OPTIONAL),
+            readonly: record.check_flags().contains(CheckFlags::READONLY),
+        }))
+    }
+
+    pub(super) fn resolve_mapped_lookup_with_source(
+        &mut self,
+        lookup: TypeId,
+        globals: &CanonicalGlobalTypes,
+        session: &mut InstantiationSession,
+        source: &mut dyn ConditionalBranchSource,
+    ) -> Result<TypeId, MappedTypeError> {
+        let Some(TypeData::IndexedAccess(indexed)) =
+            self.type_payload(lookup).map(TypeRecord::data)
+        else {
+            return Err(MappedTypeError::InvalidMappedType(lookup));
+        };
+        let demand = source_conditional_mapped_demand(self, indexed.object_type)?;
+        if demand.lookup != lookup {
+            return Err(MappedTypeError::InvalidMappedType(lookup));
+        }
+        source_conditional_mapped_key(self, demand)?;
+        source.preflight(self, demand.origin.template)?;
+        super::instantiate::resolve_indexed_access_with_source(
+            self, lookup, globals, session, source,
+        )
+        .map_err(|error| mapped_instantiation_error(lookup, &error))
+    }
+
     /// Evaluates the delayed template attached to a mapped property symbol.
     ///
     /// # Errors
@@ -4090,8 +4236,25 @@ impl CanonicalTypeMapperStore {
         symbol: SemanticSymbolId,
         session: &mut InstantiationSession,
     ) -> Result<TypeId, MappedTypeError> {
+        self.resolve_mapped_symbol_type_worker(symbol, session, None)
+    }
+
+    fn resolve_mapped_symbol_type_worker(
+        &mut self,
+        symbol: SemanticSymbolId,
+        session: &mut InstantiationSession,
+        source: Option<&mut MappedConditionalSource<'_>>,
+    ) -> Result<TypeId, MappedTypeError> {
         let (containing_type, key_type, cached) = validate_mapped_property_header(self, symbol)?;
-        reject_deferred_conditional_mapped_demand(self, containing_type)?;
+        if let Some(source) = source.as_ref() {
+            let demand = source_conditional_mapped_demand(self, containing_type)?;
+            if source_conditional_mapped_key(self, demand)? != key_type {
+                return Err(MappedTypeError::InvalidCachedProperty(symbol));
+            }
+            source.branches.preflight(self, demand.origin.template)?;
+        } else {
+            reject_deferred_conditional_mapped_demand(self, containing_type)?;
+        }
         if let Some(cached) = cached {
             let shape = validate_mapped_shape(self, containing_type)?;
             let modifiers = self.declared_mapped_modifiers(containing_type)?;
@@ -4123,8 +4286,17 @@ impl CanonicalTypeMapperStore {
         }
 
         let limit_mark = session.limit_event_mark();
-        let computed =
-            compute_mapped_property_type(self, containing_type, symbol, key_type, session);
+        let computed = match source {
+            Some(source) => compute_mapped_property_type_worker(
+                self,
+                containing_type,
+                symbol,
+                key_type,
+                session,
+                Some(source),
+            ),
+            None => compute_mapped_property_type(self, containing_type, symbol, key_type, session),
+        };
         let cycle_free = self
             .pop_type_resolution()
             .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
@@ -4579,6 +4751,106 @@ fn reject_deferred_conditional_mapped_demand(
         return Err(MappedTypeError::UnsupportedTemplate(template));
     }
     Ok(())
+}
+
+/// The original alias row owns this lookup. This proof does not inspect mapped
+/// property values, so cached value validation cannot recurse through itself.
+fn source_conditional_mapped_demand(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<SourceConditionalMappedDemand, MappedTypeError> {
+    let invalid = || MappedTypeError::InvalidMappedType(type_);
+    let origin = source_mapped_lookup_origin(store, type_)?
+        .ok_or(MappedTypeError::UnsupportedTemplate(type_))?;
+    let Some(TypeData::Mapped(mapped)) = store.type_payload(type_).map(TypeRecord::data) else {
+        return Err(invalid());
+    };
+    let argument = mapped.modifiers_type.ok_or_else(invalid)?;
+    let parameter = mapped.type_parameter.ok_or_else(invalid)?;
+    let mapper = mapped
+        .object
+        .mapper
+        .ok_or(MappedTypeError::UnsupportedTemplate(origin.template))?;
+    let lookup = store
+        .type_alias_links(origin.alias)
+        .and_then(|links| links.instantiations.as_ref())
+        .and_then(|entries| entries.get(&type_list_key(&[argument])))
+        .copied()
+        .ok_or_else(invalid)?;
+    let Some(TypeData::IndexedAccess(indexed)) = store.type_payload(lookup).map(TypeRecord::data)
+    else {
+        return Err(invalid());
+    };
+    if indexed.object_type != type_ {
+        return Err(invalid());
+    }
+    store.validate_prop_types_required_keys_instantiation_worker(
+        origin.alias,
+        origin.declared_lookup,
+        &[origin.source],
+        &[argument],
+        lookup,
+        false,
+    )?;
+    // Retained source productions prove the complete ordered capture vector.
+    if cached_source_conditional_instantiation(
+        store,
+        origin.template,
+        &[origin.source, origin.key],
+        &[origin.source, origin.key],
+    )
+    .map_err(|_| invalid())?
+        != Some(origin.template)
+    {
+        return Err(invalid());
+    }
+    source_mapped_lookup_state_is_warm(store, origin, type_)?;
+    Ok(SourceConditionalMappedDemand {
+        origin,
+        lookup,
+        argument,
+        parameter,
+        mapper,
+    })
+}
+
+fn source_conditional_mapped_key(
+    store: &CanonicalTypeMapperStore,
+    demand: SourceConditionalMappedDemand,
+) -> Result<TypeId, MappedTypeError> {
+    let Some(TypeData::IndexedAccess(indexed)) =
+        store.type_payload(demand.lookup).map(TypeRecord::data)
+    else {
+        return Err(MappedTypeError::InvalidMappedType(demand.lookup));
+    };
+    let key = indexed.index_type;
+    if !matches!(store.type_payload(key).map(TypeRecord::data),
+        Some(TypeData::Literal(literal)) if matches!(literal.value, LiteralValue::String(_)))
+    {
+        return Err(MappedTypeError::UnsupportedConstraint(key));
+    }
+    Ok(key)
+}
+
+fn cached_source_mapped_template(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    key: TypeId,
+) -> Result<Option<TypeId>, MappedTypeError> {
+    let demand = source_conditional_mapped_demand(store, type_)?;
+    if source_conditional_mapped_key(store, demand)? != key {
+        return Err(MappedTypeError::InvalidMappedType(type_));
+    }
+    cached_source_conditional_instantiation(
+        store,
+        demand.origin.template,
+        &[demand.origin.source, demand.origin.key],
+        &[demand.argument, key],
+    )
+    .map_err(|error| match error {
+        ConditionalTypeError::Declared(error) => MappedTypeError::Declared(error),
+        _ => MappedTypeError::InvalidMappedType(type_),
+    })
 }
 
 fn mapped_template_source_is_exact(
@@ -7143,8 +7415,11 @@ fn cached_mapped_property_type(
     property: &PlannedMappedProperty,
     key_type: TypeId,
 ) -> Result<Option<TypeId>, MappedTypeError> {
-    reject_deferred_conditional_mapped_demand(store, shape.type_)?;
-    let direct_request = direct_mapped_request_template(store, shape)?;
+    let source_conditional = source_mapped_lookup_origin(store, shape.type_)?.is_some();
+    if !source_conditional {
+        reject_deferred_conditional_mapped_demand(store, shape.type_)?;
+    }
+    let direct_request = !source_conditional && direct_mapped_request_template(store, shape)?;
     let template_type = if direct_request {
         shape.template_type
     } else {
@@ -7156,29 +7431,40 @@ fn cached_mapped_property_type(
     let template = store
         .type_payload(template_type)
         .ok_or(MappedTypeError::UnsupportedTemplate(template_type))?;
-    let raw = match template.data() {
-        TypeData::IndexedAccess(_) if mapped_template_indexes_source(store, shape) => {
-            cached_indexed_mapped_template(store, shape, key_type)?
-        }
-        TypeData::IndexedAccess(_) => {
-            return Err(MappedTypeError::UnsupportedTemplate(template_type));
-        }
-        _ if template_type == shape.template_type
-            && mapped_template_is_value_parameter(store, shape) =>
-        {
-            Some(template_type)
-        }
-        _ if template_type == shape.type_parameter => Some(key_type),
-        _ if !template
-            .flags()
-            .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::UNION | TypeFlags::OBJECT) =>
-        {
-            Some(template_type)
-        }
-        _ => {
-            let (sources, targets) = mapped_template_mapping(shape, key_type);
-            cached_instantiation_with_vector(store, template_type, &sources, &targets, None, None)
+    let raw = if source_conditional {
+        cached_source_mapped_template(store, shape.type_, key_type)?
+    } else {
+        match template.data() {
+            TypeData::IndexedAccess(_) if mapped_template_indexes_source(store, shape) => {
+                cached_indexed_mapped_template(store, shape, key_type)?
+            }
+            TypeData::IndexedAccess(_) => {
+                return Err(MappedTypeError::UnsupportedTemplate(template_type));
+            }
+            _ if template_type == shape.template_type
+                && mapped_template_is_value_parameter(store, shape) =>
+            {
+                Some(template_type)
+            }
+            _ if template_type == shape.type_parameter => Some(key_type),
+            _ if !template
+                .flags()
+                .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::UNION | TypeFlags::OBJECT) =>
+            {
+                Some(template_type)
+            }
+            _ => {
+                let (sources, targets) = mapped_template_mapping(shape, key_type);
+                cached_instantiation_with_vector(
+                    store,
+                    template_type,
+                    &sources,
+                    &targets,
+                    None,
+                    None,
+                )
                 .map_err(|error| mapped_instantiation_error(template_type, &error))?
+            }
         }
     };
     let Some(mut type_) = raw else {
@@ -7265,8 +7551,24 @@ fn compute_mapped_property_type(
     key_type: TypeId,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, MappedTypeError> {
+    compute_mapped_property_type_worker(store, containing_type, symbol, key_type, session, None)
+}
+
+fn compute_mapped_property_type_worker(
+    store: &mut CanonicalTypeMapperStore,
+    containing_type: TypeId,
+    symbol: SemanticSymbolId,
+    key_type: TypeId,
+    session: &mut InstantiationSession,
+    source: Option<&mut MappedConditionalSource<'_>>,
+) -> Result<TypeId, MappedTypeError> {
     let shape = validate_mapped_shape(store, containing_type)?;
-    let mut type_ = instantiate_mapped_template(store, &shape, key_type, session)?;
+    let mut type_ = match source {
+        Some(source) => {
+            instantiate_source_mapped_template(store, &shape, key_type, session, source)?
+        }
+        None => instantiate_mapped_template(store, &shape, key_type, session)?,
+    };
     let (optional, strip_optional) = {
         let property = store
             .symbol(symbol)
@@ -7539,6 +7841,38 @@ fn instantiate_mapped_template(
         session,
     )
     .map_err(|error| mapped_instantiation_error(template_type, &error))
+}
+
+fn instantiate_source_mapped_template(
+    store: &mut CanonicalTypeMapperStore,
+    shape: &MappedShape,
+    key_type: TypeId,
+    session: &mut InstantiationSession,
+    source: &mut MappedConditionalSource<'_>,
+) -> Result<TypeId, MappedTypeError> {
+    let demand = source_conditional_mapped_demand(store, shape.type_)?;
+    if source_conditional_mapped_key(store, demand)? != key_type {
+        return Err(MappedTypeError::InvalidMappedType(shape.type_));
+    }
+    source.branches.preflight(store, demand.origin.template)?;
+    if let Some(cached) = cached_source_mapped_template(store, shape.type_, key_type)? {
+        return Ok(cached);
+    }
+    if !store.try_reserve_mappers(2) {
+        return Err(MappedTypeError::Capacity);
+    }
+    let mapper = store
+        .append_type_mapping(Some(demand.mapper), demand.parameter, key_type)
+        .ok_or(MappedTypeError::InvalidMappedType(shape.type_))?;
+    instantiate_type_with_source(
+        store,
+        demand.origin.template,
+        mapper,
+        source.globals,
+        session,
+        source.branches,
+    )
+    .map_err(|error| mapped_instantiation_error(demand.origin.template, &error))
 }
 
 fn instantiate_direct_mapped_request_template(
@@ -7825,6 +8159,7 @@ fn mapped_cache_error(error: LiteralTypeCacheError) -> MappedTypeError {
 
 fn mapped_instantiation_error(type_: TypeId, error: &InstantiationError) -> MappedTypeError {
     match error {
+        InstantiationError::Declared(error) => MappedTypeError::Declared(*error),
         InstantiationError::DepthLimit { depth, limit } => {
             MappedTypeError::InstantiationDepthLimit {
                 depth: *depth,
@@ -8077,6 +8412,467 @@ mod tests {
         assert_ne!(projection.type_, projection.lookup);
         assert!(context.diagnostics().is_empty());
         (context, projection, incoming, later)
+    }
+
+    const SOURCE_CONDITIONAL_DEMAND: &str = concat!(
+        "interface Error { name: string; message: string; stack?: string; }\n",
+        "declare module 'prop-types' {\n",
+        "export const nominalTypeHack: unique symbol;\n",
+        "export type IsOptional<T> = undefined | null extends T ? true : ",
+        "undefined extends T ? true : null extends T ? true : false;\n",
+        "export type RequiredKeys<V> = { [K in keyof V]: V[K] extends Validator<infer T> ? ",
+        "IsOptional<T> extends true ? never : K : never }[keyof V];\n",
+        "export interface Validator<T> {\n",
+        "(props: object, propName: string, componentName: string, location: string, ",
+        "propFullName: string): Error | null;\n",
+        "[nominalTypeHack]?: T;\n",
+        "}\n",
+        "export type Required = RequiredKeys<{ value: Validator<string> }>;\n",
+        "}\n",
+    );
+
+    fn source_conditional_demand_fixture(
+        parsed: &ParseResult,
+    ) -> (
+        CanonicalCheckerContext<'_>,
+        NodeRef,
+        TypeId,
+        super::SourceConditionalMappedDemand,
+    ) {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(0);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/project/source-conditional-demand.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let (alias, node) = mapped_constraint_alias_parts(parsed, &context, "Required");
+        let lookup = context.get_declared_type_of_symbol(alias).unwrap();
+        let TypeData::IndexedAccess(indexed) = context.store().type_payload(lookup).unwrap().data()
+        else {
+            panic!("declared alias query must retain the whole lookup");
+        };
+        let mapped = indexed.object_type;
+        let demand = super::source_conditional_mapped_demand(context.store(), mapped).unwrap();
+        assert_eq!(demand.lookup, lookup);
+        assert_eq!(
+            context.store().type_node_links(node).unwrap().resolved_type,
+            Some(lookup)
+        );
+        assert!(
+            !context
+                .store()
+                .type_payload(mapped)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(context.diagnostics().is_empty());
+        (context, node, mapped, demand)
+    }
+
+    fn query_source_conditional_demand(
+        parsed: &ParseResult,
+        context: &mut CanonicalCheckerContext<'_>,
+        node: NodeRef,
+        session: &mut InstantiationSession,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let bound = context.file(FileId::new(0)).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            options,
+            session,
+            diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(node)
+    }
+
+    fn source_conditional_value_symbol(
+        store: &CanonicalTypeMapperStore,
+        mapped: TypeId,
+    ) -> SemanticSymbolId {
+        store
+            .type_payload(mapped)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .unwrap()
+            .get_source("value")
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The same source query covers fail-fast, recovery, and spent warm replay.
+    fn source_mapped_conditional_demand_preserves_spent_limits_and_recovery() {
+        for recovering in [false, true] {
+            let parsed = parse_source_file(SOURCE_CONDITIONAL_DEMAND);
+            let (mut context, node, mapped, demand) = source_conditional_demand_fixture(&parsed);
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (string, error) = (bootstrap.string_type, bootstrap.error_type);
+            let key = super::source_conditional_mapped_key(context.store(), demand).unwrap();
+            let mut session = if recovering {
+                InstantiationSession::new_recovering(
+                    context.store(),
+                    InstantiationLimits {
+                        max_depth: 100,
+                        max_count: 1,
+                    },
+                    error,
+                )
+                .unwrap()
+            } else {
+                InstantiationSession::new(InstantiationLimits {
+                    max_depth: 100,
+                    max_count: 1,
+                })
+            };
+            assert_eq!(
+                instantiate_type_with_vector_and_session(
+                    context.store_mut_for_test(),
+                    demand.origin.source,
+                    &[demand.origin.source],
+                    &[string],
+                    None,
+                    &mut session,
+                ),
+                Ok(string)
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (1, 1, 0)
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = query_source_conditional_demand(
+                &parsed,
+                &mut context,
+                node,
+                &mut session,
+                &mut diagnostics,
+            );
+            let symbol = source_conditional_value_symbol(context.store(), mapped);
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (1, 1, 1)
+            );
+            assert!(context.store().type_resolution_is_empty());
+            assert_eq!(
+                context.store().type_node_links(node).unwrap().resolved_type,
+                Some(demand.lookup)
+            );
+            assert_eq!(
+                super::cached_source_mapped_template(context.store(), mapped, key),
+                Ok(None)
+            );
+            if recovering {
+                assert_eq!(result, Ok(error));
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type,
+                    Some(error)
+                );
+                assert!(context.store().mapped_property_recovery(symbol).is_some());
+            } else {
+                assert_eq!(
+                    result,
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax {
+                            node: demand.origin.declaration,
+                            kind: SyntaxKind::MappedType,
+                        }
+                    ))
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(symbol)
+                        .unwrap()
+                        .resolved_type,
+                    None
+                );
+                assert!(context.store().mapped_property_recovery(symbol).is_none());
+                let mut retry = InstantiationSession::new(InstantiationLimits::default());
+                assert_eq!(
+                    query_source_conditional_demand(
+                        &parsed,
+                        &mut context,
+                        node,
+                        &mut retry,
+                        &mut diagnostics
+                    ),
+                    Ok(key)
+                );
+                assert!(retry.total_count() > 0);
+                assert_eq!(retry.limit_event_count(), 0);
+            }
+            let warm = cache_state(context.store());
+            let expected = if recovering { error } else { key };
+            assert_eq!(
+                query_source_conditional_demand(
+                    &parsed,
+                    &mut context,
+                    node,
+                    &mut session,
+                    &mut diagnostics
+                ),
+                Ok(expected)
+            );
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(cache_state(context.store()), warm);
+            assert!(context.store().type_resolution_is_empty());
+        }
+    }
+
+    #[test]
+    fn source_mapped_conditional_demand_rejects_warm_mapper_and_value_damage() {
+        let parsed = parse_source_file(SOURCE_CONDITIONAL_DEMAND);
+        let (mut context, node, mapped, demand) = source_conditional_demand_fixture(&parsed);
+        let result = context.get_type_from_type_node(node).unwrap();
+        let symbol = source_conditional_value_symbol(context.store(), mapped);
+        let links = context.store().value_symbol_links(symbol).unwrap().clone();
+        assert_eq!(links.resolved_type, Some(result));
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let wrong = store
+            .new_simple_type_mapper(demand.origin.source, number)
+            .unwrap();
+        for damage in 0..2 {
+            if damage == 0 {
+                assert!(store.set_object_target_and_mapper(
+                    mapped,
+                    Some(demand.origin.target),
+                    Some(wrong)
+                ));
+            } else {
+                let mut damaged = links.clone();
+                damaged.resolved_type = Some(number);
+                assert!(store.set_value_symbol_links(symbol, damaged));
+            }
+            let before = cache_state(store);
+            for _ in 0..2 {
+                assert_eq!(
+                    store.validate_prop_types_required_keys_instantiation(
+                        demand.origin.alias,
+                        demand.origin.declared_lookup,
+                        &[demand.origin.source],
+                        &[demand.argument],
+                        demand.lookup,
+                    ),
+                    Err(MappedTypeError::InvalidMappedType(demand.lookup))
+                );
+                assert_eq!(cache_state(store), before);
+                assert!(store.type_resolution_is_empty());
+            }
+            assert!(store.set_object_target_and_mapper(
+                mapped,
+                Some(demand.origin.target),
+                Some(demand.mapper)
+            ));
+            assert!(store.set_value_symbol_links(symbol, links.clone()));
+            assert_eq!(
+                store.validate_prop_types_required_keys_instantiation(
+                    demand.origin.alias,
+                    demand.origin.declared_lookup,
+                    &[demand.origin.source],
+                    &[demand.argument],
+                    demand.lookup,
+                ),
+                Ok(())
+            );
+        }
+        let before = cache_state(store);
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_depth: 0,
+            max_count: 0,
+        });
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_source_conditional_demand(
+                &parsed,
+                &mut context,
+                node,
+                &mut session,
+                &mut diagnostics
+            ),
+            Ok(result)
+        );
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(cache_state(context.store()), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The source error, incomplete member state, and retry stay in one caller session.
+    fn source_mapped_conditional_demand_keeps_a_failed_branch_value_unpublished() {
+        use crate::semantic::conditional_types::{ConditionalBranchKind, ConditionalBranchSource};
+
+        struct RefusingSource {
+            demand: super::SourceConditionalMappedDemand,
+            error: DeclaredTypeError,
+            calls: usize,
+        }
+
+        impl ConditionalBranchSource for RefusingSource {
+            fn preflight(
+                &self,
+                store: &CanonicalTypeMapperStore,
+                conditional: TypeId,
+            ) -> Result<(), DeclaredTypeError> {
+                if conditional != self.demand.origin.template {
+                    return Err(self.error);
+                }
+                let parameters = [self.demand.origin.source, self.demand.origin.key];
+                match super::cached_source_conditional_instantiation(
+                    store,
+                    conditional,
+                    &parameters,
+                    &parameters,
+                ) {
+                    Ok(Some(result)) if result == conditional => Ok(()),
+                    _ => Err(self.error),
+                }
+            }
+
+            fn resolve_branch(
+                &mut self,
+                _store: &mut CanonicalTypeMapperStore,
+                _conditional: TypeId,
+                _branch: ConditionalBranchKind,
+                _session: &mut InstantiationSession,
+            ) -> Result<TypeId, DeclaredTypeError> {
+                self.calls += 1;
+                Err(self.error)
+            }
+        }
+
+        let parsed = parse_source_file(SOURCE_CONDITIONAL_DEMAND);
+        let (mut context, node, mapped, demand) = source_conditional_demand_fixture(&parsed);
+        let globals = context.global_types().clone();
+        let error =
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: demand.origin.declaration,
+                kind: SyntaxKind::MappedType,
+            });
+        let mut source = RefusingSource {
+            demand,
+            error,
+            calls: 0,
+        };
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let result = context
+            .store_mut_for_test()
+            .resolve_mapped_lookup_with_source(demand.lookup, &globals, &mut session, &mut source);
+        assert_eq!(result, Err(MappedTypeError::Declared(error)));
+        assert_eq!(source.calls, 1);
+        assert!(session.query_count() > 0);
+        assert_eq!(session.limit_event_count(), 0);
+        let symbol = source_conditional_value_symbol(context.store(), mapped);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type,
+            None
+        );
+        assert!(context.store().mapped_property_recovery(symbol).is_none());
+        assert!(context.store().type_resolution_is_empty());
+        let key = super::source_conditional_mapped_key(context.store(), demand).unwrap();
+        assert_eq!(
+            super::cached_source_mapped_template(context.store(), mapped, key),
+            Ok(None)
+        );
+        assert_eq!(
+            context.store().type_node_links(node).unwrap().resolved_type,
+            Some(demand.lookup)
+        );
+        let count = session.total_count();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_source_conditional_demand(
+                &parsed,
+                &mut context,
+                node,
+                &mut session,
+                &mut diagnostics
+            ),
+            Ok(key)
+        );
+        assert!(session.total_count() > count);
+        assert_eq!(session.limit_event_count(), 0);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .unwrap()
+                .resolved_type,
+            Some(key)
+        );
+        assert!(context.store().type_resolution_is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

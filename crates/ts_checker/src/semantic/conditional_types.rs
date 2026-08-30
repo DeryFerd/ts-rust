@@ -16,7 +16,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     constraints::{self, ConstraintError},
-    declared::{cached_ordinary_type_parameter_owner, malformed_alias_merge},
+    declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, malformed_alias_merge},
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         cached_instantiation_with_vector, canonical_anonymous_union, instantiate_type_with_session,
@@ -43,6 +43,60 @@ pub(super) const CONDITIONAL_TAIL_RECURSION_LIMIT: usize = 1_000;
 pub(super) struct ConditionalTypeBranches {
     pub true_type: TypeId,
     pub false_type: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConditionalBranchKind {
+    True,
+    False,
+}
+
+/// Supplies source branch types. The conditional evaluator owns the decision
+/// and applies its current mapper after the source query returns.
+pub(super) trait ConditionalBranchSource {
+    fn preflight(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        conditional: TypeId,
+    ) -> Result<(), DeclaredTypeError>;
+
+    fn resolve_branch(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        conditional: TypeId,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, DeclaredTypeError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConditionalBranchInput {
+    Resolved(ConditionalTypeBranches),
+    Source(TypeId),
+}
+
+impl ConditionalBranchInput {
+    fn get(
+        self,
+        store: &mut CanonicalTypeMapperStore,
+        kind: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+        source: &mut Option<&mut dyn ConditionalBranchSource>,
+    ) -> Result<TypeId, ConditionalTypeError> {
+        let type_ = match self {
+            Self::Resolved(branches) => match kind {
+                ConditionalBranchKind::True => branches.true_type,
+                ConditionalBranchKind::False => branches.false_type,
+            },
+            Self::Source(conditional) => source
+                .as_deref_mut()
+                .ok_or(ConditionalTypeError::InvalidConditional(conditional))?
+                .resolve_branch(store, conditional, kind, session)
+                .map_err(ConditionalTypeError::Declared)?,
+        };
+        validate_owned_type(store, type_)?;
+        Ok(type_)
+    }
 }
 
 /// Fully validated inputs needed to create one canonical conditional root.
@@ -233,6 +287,7 @@ pub(super) enum ConditionalTypeError {
     UnsupportedInference { source: TypeId, target: TypeId },
     TailRecursionLimit { count: usize, limit: usize },
     Instantiation(InstantiationError),
+    Declared(DeclaredTypeError),
     Constraint(Box<ConstraintError>),
     Relation(RelationUnavailable),
     Template(TemplateTypeError),
@@ -297,6 +352,7 @@ impl std::fmt::Display for ConditionalTypeError {
                 "conditional tail recursion count {count} reached limit {limit}"
             ),
             Self::Instantiation(error) => error.fmt(formatter),
+            Self::Declared(error) => error.fmt(formatter),
             Self::Constraint(error) => error.fmt(formatter),
             Self::Relation(error) => error.fmt(formatter),
             Self::Template(error) => error.fmt(formatter),
@@ -310,6 +366,7 @@ impl std::error::Error for ConditionalTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Instantiation(error) => Some(error),
+            Self::Declared(error) => Some(error),
             Self::Constraint(error) => Some(error.as_ref()),
             Self::Relation(error) => Some(error),
             Self::Template(error) => Some(error),
@@ -535,6 +592,37 @@ pub(super) fn conditional_remap_projection(
     store: &CanonicalTypeMapperStore,
     conditional: TypeId,
 ) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
+    conditional_remap_projection_worker(store, conditional, None)
+}
+
+pub(super) fn conditional_remap_projection_with_source(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+    source: &dyn ConditionalBranchSource,
+) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
+    conditional_remap_projection_worker(store, conditional, Some(source))
+}
+
+fn conditional_remap_projection_worker(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
+    let projection = conditional_remap_identity_projection(store, conditional)?;
+    if let Some(source) = source {
+        source
+            .preflight(store, conditional)
+            .map_err(ConditionalTypeError::Declared)?;
+    } else {
+        validate_remap_capture_source(store, &projection)?;
+    }
+    Ok(projection)
+}
+
+fn conditional_remap_identity_projection(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> Result<ConditionalRemapProjection, ConditionalTypeError> {
     let production = validated_conditional_production(store, conditional)?;
     conditional_snapshot(store, conditional)?;
     let definition = &production.definition;
@@ -601,8 +689,31 @@ pub(super) fn conditional_remap_projection(
         projection.arguments(),
         projection.alias(),
     )?;
-    validate_remap_capture_source(store, &projection)?;
     Ok(projection)
+}
+
+/// Validates an existing inline-source result after its owner proved the exact
+/// capture vector. This reader cannot construct a projection or evaluate work.
+pub(super) fn cached_source_conditional_instantiation(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    let projection = conditional_remap_identity_projection(store, conditional)?;
+    if projection.parameters() != parameters
+        || projection.arguments() != parameters
+        || projection.alias().is_some()
+        || !projection.production.mapped_parameters.is_empty()
+        || parameters.len() != arguments.len()
+    {
+        return Err(ConditionalTypeError::InvalidConditional(conditional));
+    }
+    let mut visiting = HashSet::new();
+    for argument in arguments {
+        validate_conditional_operand(store, *argument, &mut visiting)?;
+    }
+    remap_cached_result(store, &projection, arguments, None)
 }
 
 fn validate_remap_capture_source(
@@ -789,7 +900,17 @@ fn validate_conditional_remap_inputs(
     arguments: &[TypeId],
     alias: Option<ConditionalAliasIdentity<'_>>,
 ) -> Result<(), ConditionalTypeError> {
-    if conditional_remap_projection(store, projection.type_id())? != *projection {
+    validate_conditional_remap_inputs_worker(store, projection, arguments, alias, None)
+}
+
+fn validate_conditional_remap_inputs_worker(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    source: Option<&dyn ConditionalBranchSource>,
+) -> Result<(), ConditionalTypeError> {
+    if conditional_remap_projection_worker(store, projection.type_id(), source)? != *projection {
         return Err(ConditionalTypeError::InvalidConditional(
             projection.type_id(),
         ));
@@ -1033,6 +1154,76 @@ pub(super) fn cached_deferred_conditional_remap(
     } else {
         Ok(ConditionalRemapLookup::Cold)
     }
+}
+
+/// Reads the existing root production. It never resolves a source branch.
+pub(super) fn cached_conditional_remap_with_source(
+    store: &CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    validate_conditional_remap_inputs_worker(store, projection, arguments, alias, Some(source))?;
+    let cached = remap_cached_result(store, projection, arguments, alias)?;
+    if cached.is_some() {
+        let definition = &projection.production.definition;
+        for operand in [definition.check_type, definition.extends_type] {
+            if super::instantiate::cached_instantiation_with_vector_and_source(
+                store,
+                operand,
+                projection.parameters(),
+                arguments,
+                globals,
+                source,
+            )?
+            .is_none()
+            {
+                return Err(ConditionalTypeError::InvalidInstantiationCache(
+                    definition.root,
+                ));
+            }
+        }
+    }
+    Ok(cached)
+}
+
+/// Uses the normal root cache and evaluator with lazily supplied source branches.
+pub(super) fn remap_conditional_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    projection: &ConditionalRemapProjection,
+    arguments: &[TypeId],
+    alias: Option<ConditionalAliasIdentity<'_>>,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, ConditionalTypeError> {
+    if let Some(cached) =
+        cached_conditional_remap_with_source(store, projection, arguments, alias, globals, source)?
+    {
+        return Ok(cached);
+    }
+    let alias_source = projection
+        .production
+        .alias_reference
+        .zip(alias)
+        .map(|(reference, alias)| (alias, reference));
+    instantiate_conditional_root(
+        store,
+        ConditionalRootInstantiation {
+            conditional_type: projection.type_id(),
+            type_arguments: arguments,
+            branches: ConditionalBranchInput::Source(projection.type_id()),
+            alias: remap_query_alias(projection, alias),
+            alias_source,
+            for_constraint: false,
+        },
+        Some(globals),
+        Some(session),
+        0,
+        &mut Some(source),
+    )
 }
 
 /// Remaps only a still-deferred conditional. Branch nodes and lazy branch caches
@@ -1525,7 +1716,7 @@ pub(super) fn get_true_type_from_conditional_type(
         store,
         conditional,
         branches,
-        ConditionalBranchKind::True,
+        ConditionalResolutionKind::True,
         global_types,
         session,
     )
@@ -1543,7 +1734,7 @@ pub(super) fn get_false_type_from_conditional_type(
         store,
         conditional,
         branches,
-        ConditionalBranchKind::False,
+        ConditionalResolutionKind::False,
         global_types,
         session,
     )
@@ -1579,7 +1770,7 @@ pub(super) fn get_inferred_true_type_from_conditional_type(
         store,
         conditional,
         branches,
-        ConditionalBranchKind::InferredTrue,
+        ConditionalResolutionKind::InferredTrue,
         global_types,
         session,
     )
@@ -1776,7 +1967,7 @@ pub(super) fn cached_conditional_branches(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConditionalBranchKind {
+enum ConditionalResolutionKind {
     True,
     False,
     InferredTrue,
@@ -1786,18 +1977,20 @@ fn resolve_conditional_branch(
     store: &mut CanonicalTypeMapperStore,
     conditional: TypeId,
     branches: ConditionalTypeBranches,
-    branch: ConditionalBranchKind,
+    branch: ConditionalResolutionKind,
     global_types: Option<&CanonicalGlobalTypes>,
     session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, ConditionalTypeError> {
     validate_branch_types(store, branches)?;
     let data = conditional_snapshot(store, conditional)?;
     let (cached, source, mapper) = match branch {
-        ConditionalBranchKind::True => (data.resolved_true_type, branches.true_type, data.mapper),
-        ConditionalBranchKind::False => {
+        ConditionalResolutionKind::True => {
+            (data.resolved_true_type, branches.true_type, data.mapper)
+        }
+        ConditionalResolutionKind::False => {
             (data.resolved_false_type, branches.false_type, data.mapper)
         }
-        ConditionalBranchKind::InferredTrue => (
+        ConditionalResolutionKind::InferredTrue => (
             data.resolved_inferred_true_type,
             branches.true_type,
             data.combined_mapper.or(data.mapper),
@@ -1813,9 +2006,9 @@ fn resolve_conditional_branch(
     let resolved = map_type_with_stored_mapper(store, source, mapper, global_types, session)?;
     let mut data = conditional_snapshot(store, conditional)?;
     match branch {
-        ConditionalBranchKind::True => data.resolved_true_type = Some(resolved),
-        ConditionalBranchKind::False => data.resolved_false_type = Some(resolved),
-        ConditionalBranchKind::InferredTrue => {
+        ConditionalResolutionKind::True => data.resolved_true_type = Some(resolved),
+        ConditionalResolutionKind::False => data.resolved_false_type = Some(resolved),
+        ConditionalResolutionKind::InferredTrue => {
             data.resolved_inferred_true_type = Some(resolved);
             if data.combined_mapper.is_none() {
                 data.resolved_true_type = Some(resolved);
@@ -1905,9 +2098,7 @@ fn get_conditional_type_instantiation_with_tail_count(
             limit: CONDITIONAL_TAIL_RECURSION_LIMIT,
         });
     }
-    let definition = validated_conditional_production(store, request.conditional_type)?
-        .definition
-        .clone();
+    validated_conditional_production(store, request.conditional_type)?;
     validate_branch_types(store, request.branches)?;
     if let Some(proof) = request.alias
         && !proof.matches_request(store, request.conditional_type, request.type_arguments)
@@ -1924,6 +2115,57 @@ fn get_conditional_type_instantiation_with_tail_count(
             .identity()
             .map(|identity| (identity, proof.reference()))
     });
+    instantiate_conditional_root(
+        store,
+        ConditionalRootInstantiation {
+            conditional_type: request.conditional_type,
+            type_arguments: request.type_arguments,
+            branches: ConditionalBranchInput::Resolved(request.branches),
+            alias,
+            alias_source,
+            for_constraint: request.for_constraint,
+        },
+        global_types,
+        session,
+        tail_count,
+        &mut None,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ConditionalRootInstantiation<'a> {
+    conditional_type: TypeId,
+    type_arguments: &'a [TypeId],
+    branches: ConditionalBranchInput,
+    alias: Option<ConditionalAliasIdentity<'a>>,
+    alias_source: Option<(ConditionalAliasIdentity<'a>, NodeRef)>,
+    for_constraint: bool,
+}
+
+fn instantiate_conditional_root(
+    store: &mut CanonicalTypeMapperStore,
+    request: ConditionalRootInstantiation<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+    tail_count: usize,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if tail_count >= CONDITIONAL_TAIL_RECURSION_LIMIT {
+        return Err(ConditionalTypeError::TailRecursionLimit {
+            count: tail_count,
+            limit: CONDITIONAL_TAIL_RECURSION_LIMIT,
+        });
+    }
+    let definition = validated_conditional_production(store, request.conditional_type)?
+        .definition
+        .clone();
+    if let Some(source) = source.as_deref() {
+        source
+            .preflight(store, request.conditional_type)
+            .map_err(ConditionalTypeError::Declared)?;
+    }
+    let alias = request.alias;
+    let alias_source = request.alias_source;
     if let Some(alias) = alias {
         validate_alias_identity(store, alias, &mut HashSet::new())?;
     }
@@ -1999,13 +2241,15 @@ fn get_conditional_type_instantiation_with_tail_count(
 
     let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
     let session = session.unwrap_or(&mut owned_session);
-    let mapped_check = map_type(
+    let mark = session.limit_event_mark();
+    let mapped_check = map_type_with_source(
         store,
         check_type,
         &outer_parameters,
         request.type_arguments,
         global_types,
         session,
+        source,
     )?;
 
     let result = if distributive && mapped_check != check_type {
@@ -2022,7 +2266,7 @@ fn get_conditional_type_instantiation_with_tail_count(
                 for constituent in constituents {
                     let mut arguments = request.type_arguments.to_vec();
                     arguments[check_index] = constituent;
-                    results.push(evaluate_conditional(
+                    results.push(evaluate_conditional_worker(
                         store,
                         root,
                         request.branches,
@@ -2033,12 +2277,13 @@ fn get_conditional_type_instantiation_with_tail_count(
                         None,
                         session,
                         tail_count,
+                        source,
                     )?);
                 }
                 union_result_with_alias(store, &results, global_types, alias)?
             }
             Some(_) if is_never(store, mapped_check)? => mapped_check,
-            Some(_) => evaluate_conditional(
+            Some(_) => evaluate_conditional_worker(
                 store,
                 root,
                 request.branches,
@@ -2049,11 +2294,12 @@ fn get_conditional_type_instantiation_with_tail_count(
                 alias_source,
                 session,
                 tail_count,
+                source,
             )?,
             None => return Err(ConditionalTypeError::InvalidType(mapped_check)),
         }
     } else {
-        evaluate_conditional(
+        evaluate_conditional_worker(
             store,
             root,
             request.branches,
@@ -2064,8 +2310,16 @@ fn get_conditional_type_instantiation_with_tail_count(
             alias_source,
             session,
             tail_count,
+            source,
         )?
     };
+
+    if source.is_some()
+        && session.limit_event_occurred_since(mark)
+        && let Some(error) = session.recovery_error_type()
+    {
+        return Ok(error);
+    }
 
     let mut cache = match store
         .conditional_root(root)
@@ -2115,6 +2369,35 @@ fn evaluate_conditional(
     session: &mut InstantiationSession,
     tail_count: usize,
 ) -> Result<TypeId, ConditionalTypeError> {
+    evaluate_conditional_worker(
+        store,
+        root,
+        ConditionalBranchInput::Resolved(branches),
+        mapped_parameters,
+        type_arguments,
+        global_types,
+        for_constraint,
+        alias,
+        session,
+        tail_count,
+        &mut None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // The source reader does not own evaluation or mapping.
+fn evaluate_conditional_worker(
+    store: &mut CanonicalTypeMapperStore,
+    root: ConditionalRootId,
+    branches: ConditionalBranchInput,
+    mapped_parameters: &[TypeId],
+    type_arguments: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+    for_constraint: bool,
+    alias: Option<(ConditionalAliasIdentity<'_>, NodeRef)>,
+    session: &mut InstantiationSession,
+    tail_count: usize,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
     if tail_count >= CONDITIONAL_TAIL_RECURSION_LIMIT {
         return Err(ConditionalTypeError::TailRecursionLimit {
             count: tail_count,
@@ -2131,21 +2414,23 @@ fn evaluate_conditional(
             record.infer_type_parameters().unwrap_or_default().to_vec(),
         )
     };
-    let check_type = map_type(
+    let check_type = map_type_with_source(
         store,
         root_check,
         mapped_parameters,
         type_arguments,
         global_types,
         session,
+        source,
     )?;
-    let extends_type = map_type(
+    let extends_type = map_type_with_source(
         store,
         root_extends,
         mapped_parameters,
         type_arguments,
         global_types,
         session,
+        source,
     )?;
 
     let bootstrap = store
@@ -2159,6 +2444,7 @@ fn evaluate_conditional(
     }
 
     if infer_parameters.is_empty()
+        && let ConditionalBranchInput::Resolved(branches) = branches
         && let Some(simplified) = trivial_conditional_identity(
             store,
             check_type,
@@ -2208,13 +2494,15 @@ fn evaluate_conditional(
             session,
         )?;
         if !matched {
-            return map_type(
+            let branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
+            return map_type_with_source(
                 store,
-                branches.false_type,
+                branch,
                 mapped_parameters,
                 type_arguments,
                 global_types,
                 session,
+                source,
             );
         }
         inference_matched = true;
@@ -2236,27 +2524,31 @@ fn evaluate_conditional(
                 &combined_arguments,
                 global_types,
                 session,
+                source,
             )? {
-                return map_type(
+                let branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
+                return map_type_with_source(
                     store,
-                    branches.false_type,
+                    branch,
                     mapped_parameters,
                     type_arguments,
                     global_types,
                     session,
+                    source,
                 );
             }
             combined_parameters.push(*parameter);
             combined_arguments.push(inferred);
         }
     }
-    let inferred_extends = map_type(
+    let inferred_extends = map_type_with_source(
         store,
         root_extends,
         &combined_parameters,
         &combined_arguments,
         global_types,
         session,
+        source,
     )?;
     let resolved_parameters = combined_parameters.iter().copied().collect::<HashSet<_>>();
     if contains_type_parameter(store, inferred_extends, &resolved_parameters)? {
@@ -2279,56 +2571,80 @@ fn evaluate_conditional(
         inference_matched && is_structural_inference_target(store, extends_type)?;
     let assignable = extends_any_or_unknown
         || inference_proves_assignability
-        || is_assignable(store, check_type, inferred_extends, global_types)?;
+        || is_assignable_in_query(
+            store,
+            check_type,
+            inferred_extends,
+            global_types,
+            session,
+            source.is_some(),
+        )?;
 
     if is_any && !extends_any_or_unknown {
-        let when_true = map_type(
+        let true_branch = branches.get(store, ConditionalBranchKind::True, session, source)?;
+        let when_true = map_type_with_source(
             store,
-            branches.true_type,
+            true_branch,
             &combined_parameters,
             &combined_arguments,
             global_types,
             session,
+            source,
         )?;
-        let when_false = map_type(
+        let false_branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
+        let when_false = map_type_with_source(
             store,
-            branches.false_type,
+            false_branch,
             mapped_parameters,
             type_arguments,
             global_types,
             session,
+            source,
         )?;
         return union_result(store, &[when_true, when_false], global_types);
     }
 
     if !assignable && for_constraint && !is_never(store, inferred_extends)? {
-        let reverse = is_assignable(store, inferred_extends, check_type, global_types)?;
+        let reverse = is_assignable_in_query(
+            store,
+            inferred_extends,
+            check_type,
+            global_types,
+            session,
+            source.is_some(),
+        )?;
         if reverse {
-            let when_true = map_type(
+            let true_branch = branches.get(store, ConditionalBranchKind::True, session, source)?;
+            let when_true = map_type_with_source(
                 store,
-                branches.true_type,
+                true_branch,
                 &combined_parameters,
                 &combined_arguments,
                 global_types,
                 session,
+                source,
             )?;
-            let when_false = map_type(
+            let false_branch =
+                branches.get(store, ConditionalBranchKind::False, session, source)?;
+            let when_false = map_type_with_source(
                 store,
-                branches.false_type,
+                false_branch,
                 mapped_parameters,
                 type_arguments,
                 global_types,
                 session,
+                source,
             )?;
             return union_result(store, &[when_true, when_false], global_types);
         }
     }
 
     if assignable {
+        let branch = branches.get(store, ConditionalBranchKind::True, session, source)?;
         if let Some(result) = evaluate_conditional_tail(
             store,
             root,
-            branches.true_type,
+            branch,
             branches,
             &combined_parameters,
             &combined_arguments,
@@ -2336,22 +2652,25 @@ fn evaluate_conditional(
             for_constraint,
             session,
             tail_count,
+            source,
         )? {
             return Ok(result);
         }
-        map_type(
+        map_type_with_source(
             store,
-            branches.true_type,
+            branch,
             &combined_parameters,
             &combined_arguments,
             global_types,
             session,
+            source,
         )
     } else {
+        let branch = branches.get(store, ConditionalBranchKind::False, session, source)?;
         if let Some(result) = evaluate_conditional_tail(
             store,
             root,
-            branches.false_type,
+            branch,
             branches,
             mapped_parameters,
             type_arguments,
@@ -2359,16 +2678,18 @@ fn evaluate_conditional(
             for_constraint,
             session,
             tail_count,
+            source,
         )? {
             return Ok(result);
         }
-        map_type(
+        map_type_with_source(
             store,
-            branches.false_type,
+            branch,
             mapped_parameters,
             type_arguments,
             global_types,
             session,
+            source,
         )
     }
 }
@@ -2610,13 +2931,14 @@ fn evaluate_conditional_tail(
     store: &mut CanonicalTypeMapperStore,
     current_root: ConditionalRootId,
     branch: TypeId,
-    current_branches: ConditionalTypeBranches,
+    current_branches: ConditionalBranchInput,
     mapped_parameters: &[TypeId],
     type_arguments: &[TypeId],
     global_types: Option<&CanonicalGlobalTypes>,
     for_constraint: bool,
     session: &mut InstantiationSession,
     tail_count: usize,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<Option<TypeId>, ConditionalTypeError> {
     let Some(TypeData::Conditional(conditional)) = store.type_payload(branch).map(TypeRecord::data)
     else {
@@ -2644,25 +2966,33 @@ fn evaluate_conditional_tail(
 
     let mut arguments = Vec::with_capacity(parameters.len());
     for parameter in &parameters {
-        let nested =
-            map_type_with_stored_mapper(store, *parameter, nested_mapper, global_types, session)?;
-        arguments.push(map_type(
+        let nested = if let (Some(mapper), Some(source)) = (nested_mapper, source.as_deref_mut()) {
+            let globals = global_types.ok_or(ConditionalTypeError::MissingBootstrap)?;
+            super::instantiate::instantiate_type_with_source(
+                store, *parameter, mapper, globals, session, source,
+            )?
+        } else {
+            map_type_with_stored_mapper(store, *parameter, nested_mapper, global_types, session)?
+        };
+        arguments.push(map_type_with_source(
             store,
             nested,
             mapped_parameters,
             type_arguments,
             global_types,
             session,
+            source,
         )?);
     }
     if distributive {
-        let mapped_check = map_type(
+        let mapped_check = map_type_with_source(
             store,
             check_type,
             &parameters,
             &arguments,
             global_types,
             session,
+            source,
         )?;
         if mapped_check != check_type
             && type_flags(store, mapped_check)?.intersects(TypeFlags::UNION | TypeFlags::NEVER)
@@ -2673,8 +3003,10 @@ fn evaluate_conditional_tail(
 
     let branches = if next_root == current_root {
         current_branches
+    } else if source.is_some() {
+        ConditionalBranchInput::Source(branch)
     } else if let Some(branches) = cached_conditional_branches(store, branch)? {
-        branches
+        ConditionalBranchInput::Resolved(branches)
     } else {
         return Ok(None);
     };
@@ -2697,18 +3029,20 @@ fn evaluate_conditional_tail(
     }
 
     let next_count = tail_count + usize::from(aliased);
-    get_conditional_type_instantiation_with_tail_count(
+    instantiate_conditional_root(
         store,
-        ConditionalTypeInstantiation {
+        ConditionalRootInstantiation {
             conditional_type: branch,
             type_arguments: &arguments,
             branches,
             alias: None,
+            alias_source: None,
             for_constraint,
         },
         global_types,
         Some(session),
         next_count,
+        source,
     )
     .map(Some)
 }
@@ -3360,6 +3694,25 @@ fn map_type(
         arguments,
         array_targets,
         session,
+    )
+    .map_err(Into::into)
+}
+
+fn map_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    parameters: &[TypeId],
+    arguments: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let Some(source) = source.as_deref_mut() else {
+        return map_type(store, type_, parameters, arguments, global_types, session);
+    };
+    let globals = global_types.ok_or(ConditionalTypeError::MissingBootstrap)?;
+    super::instantiate::instantiate_type_with_vector_and_source(
+        store, type_, parameters, arguments, globals, session, source,
     )
     .map_err(Into::into)
 }
@@ -4592,6 +4945,7 @@ fn inferred_candidate_satisfies_constraint(
     type_arguments: &[TypeId],
     global_types: Option<&CanonicalGlobalTypes>,
     session: &mut InstantiationSession,
+    source: &mut Option<&mut dyn ConditionalBranchSource>,
 ) -> Result<bool, ConditionalTypeError> {
     let constraint = match store.type_payload(parameter).map(TypeRecord::data) {
         Some(TypeData::TypeParameter(data)) => data.constraint,
@@ -4606,15 +4960,23 @@ fn inferred_candidate_satisfies_constraint(
     if constraint == bootstrap.no_constraint_type {
         return Ok(true);
     }
-    let constraint = map_type(
+    let constraint = map_type_with_source(
         store,
         constraint,
         mapped_parameters,
         type_arguments,
         global_types,
         session,
+        source,
     )?;
-    is_assignable(store, candidate, constraint, global_types)
+    is_assignable_in_query(
+        store,
+        candidate,
+        constraint,
+        global_types,
+        session,
+        source.is_some(),
+    )
 }
 
 fn union_result(
@@ -4662,7 +5024,14 @@ pub(super) fn conditional_check_is_assignable(
 ) -> Result<bool, ConditionalTypeError> {
     validate_owned_type(store, source)?;
     validate_owned_type(store, target)?;
-    conditional_check_is_assignable_worker(store, source, target, global_types, &mut HashSet::new())
+    conditional_check_is_assignable_worker(
+        store,
+        source,
+        target,
+        global_types,
+        &mut HashSet::new(),
+        &mut None,
+    )
 }
 
 fn is_assignable(
@@ -4674,12 +5043,36 @@ fn is_assignable(
     conditional_check_is_assignable(store, source, target, global_types)
 }
 
+fn is_assignable_in_query(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    globals: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+    use_caller: bool,
+) -> Result<bool, ConditionalTypeError> {
+    if !use_caller {
+        return is_assignable(store, source, target, globals);
+    }
+    validate_owned_type(store, source)?;
+    validate_owned_type(store, target)?;
+    conditional_check_is_assignable_worker(
+        store,
+        source,
+        target,
+        globals,
+        &mut HashSet::new(),
+        &mut Some(session),
+    )
+}
+
 fn conditional_check_is_assignable_worker(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     target: TypeId,
     global_types: Option<&CanonicalGlobalTypes>,
     visiting: &mut HashSet<(TypeId, TypeId)>,
+    session: &mut Option<&mut InstantiationSession>,
 ) -> Result<bool, ConditionalTypeError> {
     if source == target {
         return Ok(true);
@@ -4697,6 +5090,7 @@ fn conditional_check_is_assignable_worker(
             &target_shape,
             global_types,
             visiting,
+            session,
         )
     } else if matches!(
         store.type_payload(target).map(TypeRecord::data),
@@ -4710,7 +5104,12 @@ fn conditional_check_is_assignable_worker(
             .is_type_matched_by_template_literal_type(source, target)
             .map_err(Into::into)
     } else {
-        ordinary_assignability(store, source, target, global_types)
+        match session.as_deref_mut() {
+            Some(session) => store
+                .is_type_assignable_to_with_session(source, target, global_types, None, session)
+                .map_err(Into::into),
+            None => ordinary_assignability(store, source, target, global_types),
+        }
     };
     visiting.remove(&(source, target));
     result
@@ -4722,6 +5121,7 @@ fn concrete_tuple_types_are_assignable(
     target: &InferenceTupleShape,
     global_types: Option<&CanonicalGlobalTypes>,
     visiting: &mut HashSet<(TypeId, TypeId)>,
+    session: &mut Option<&mut InstantiationSession>,
 ) -> Result<bool, ConditionalTypeError> {
     if source.readonly && !target.readonly {
         return Ok(false);
@@ -4770,6 +5170,7 @@ fn concrete_tuple_types_are_assignable(
             target.element_types[target_index],
             global_types,
             visiting,
+            session,
         )? {
             return Ok(false);
         }

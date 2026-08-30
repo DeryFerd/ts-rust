@@ -1769,8 +1769,16 @@ pub(super) fn check_direct_source_property_with_source(
                         if !interface.declared_members_resolved
                             && !record.object_flags().contains(ObjectFlags::CLASS))
                 });
+            let conditional_mapped = store.type_payload(receiver).is_some_and(|record| {
+                matches!(record.data(), TypeData::Mapped(mapped)
+                if mapped.template_type.is_some_and(|template| {
+                    matches!(store.type_payload(template).map(TypeRecord::data),
+                        Some(TypeData::Conditional(_)))
+                }))
+            });
             if !property_alias
                 && !cold_interface
+                && !conditional_mapped
                 && !is_cold_direct_nongeneric_interface(store, receiver)
             {
                 return resolve_direct_source_own_property(

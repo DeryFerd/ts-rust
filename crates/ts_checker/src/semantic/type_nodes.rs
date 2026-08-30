@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ts_ast::{NodeData, NodeFlags, NodeRef, SyntaxKind, TypeAliasDeclarationData};
 use ts_binder::{
     CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags,
-    EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    EscapedName, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     canonical_has_syntactic_modifier,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -25,8 +25,9 @@ use super::{
         preflight_nongeneric_class_member_query,
     },
     conditional_types::{
-        ConditionalAliasIdentity, ConditionalTypeBranches, ConditionalTypeInstantiation,
-        ConditionalTypeRequest, conditional_alias_projection, conditional_check_is_assignable,
+        ConditionalAliasIdentity, ConditionalBranchKind, ConditionalBranchSource,
+        ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
+        conditional_alias_projection, conditional_check_is_assignable,
         conditional_operands_have_disjoint_primitive_domains, conditional_query_alias,
         get_conditional_type_instantiation, get_type_from_conditional_type,
         record_conditional_alias_declaration, validate_conditional_alias_declaration,
@@ -84,9 +85,9 @@ use super::{
     },
     mapped_types::{
         MappedTypeDeclarationPlan, MappedTypeError, MappedTypeKeys, MappedTypeModifiers,
-        MappedTypeRequest, SourceMappedLookupProjection, plan_mapped_type_declaration,
-        plan_mapped_type_keys, source_mapped_lookup_identity_projection,
-        source_mapped_lookup_projection,
+        MappedTypeRequest, ResolvedMappedProperty, SourceMappedLookupProjection,
+        plan_mapped_type_declaration, plan_mapped_type_keys,
+        source_mapped_lookup_identity_projection, source_mapped_lookup_projection,
     },
     object_aliases::InlinePropertyObjectSourceHeader,
     object_diagnostics,
@@ -19182,6 +19183,146 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         })
     }
 
+    fn source_mapped_conditional_alias(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<(SemanticSymbolId, PropTypesKeyAliasPlan)>, DeclaredTypeError> {
+        let Some(TypeData::Mapped(mapped)) = self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(None);
+        };
+        let Some(declaration) = mapped.declaration else {
+            return Ok(None);
+        };
+        let record = preflight_node(self.store, self.host, declaration)?;
+        let Some(parent) = record.parent else {
+            return Ok(None);
+        };
+        let lookup = NodeRef::new(declaration.arena, declaration.file, parent);
+        let lookup_record = preflight_node(self.store, self.host, lookup)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &lookup_record.data else {
+            return Ok(None);
+        };
+        if indexed.object_type != declaration.node {
+            return Ok(None);
+        }
+        let Some(parent) = lookup_record.parent else {
+            return Ok(None);
+        };
+        let owner = NodeRef::new(lookup.arena, lookup.file, parent);
+        let owner_record = preflight_node(self.store, self.host, owner)?;
+        let NodeData::TypeAliasDeclaration(alias) = &owner_record.data else {
+            return Ok(None);
+        };
+        if alias.type_ != lookup.node {
+            return Ok(None);
+        }
+        let Some(symbol) = self
+            .host
+            .bound_file(owner)
+            .and_then(|bound| bound.symbol(owner))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return Ok(None);
+        };
+        let Some(proof) = self.authenticated_prop_types_key_alias(symbol) else {
+            return Ok(None);
+        };
+        if proof.kind != PropTypesKeyAliasKind::Required || proof.body != lookup {
+            return Ok(None);
+        }
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                symbol,
+            ))
+        };
+        let original = mapped.object.target.unwrap_or(type_);
+        let Some(TypeData::Mapped(original_mapped)) =
+            self.store.type_payload(original).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let source = plan_mapped_type_declaration(self.store, self.host, declaration)
+            .map_err(|_| invalid())?;
+        let template = source.template().ok_or_else(invalid)?;
+        if original_mapped.declaration != Some(declaration)
+            || original_mapped.object.target.is_some()
+            || original_mapped.object.mapper.is_some()
+            || self
+                .store
+                .type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                != Some(original)
+            || self
+                .store
+                .type_node_links(template)
+                .and_then(|links| links.resolved_type)
+                != original_mapped.template_type
+            || original_mapped.template_type.is_none_or(|template| {
+                !matches!(
+                    self.store.type_payload(template).map(TypeRecord::data),
+                    Some(TypeData::Conditional(_))
+                )
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(Some((symbol, proof)))
+    }
+
+    /// Limits branch demand to the source lookup and its referenced IsOptional chain.
+    fn source_mapped_conditional_owns_root(
+        &mut self,
+        proof: PropTypesKeyAliasPlan,
+        node: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let body = preflight_node(self.store, self.host, proof.body)?;
+        let NodeData::IndexedAccessTypeNode(lookup) = &body.data else {
+            return Err(invalid());
+        };
+        let mapped_node = NodeRef::new(proof.body.arena, proof.body.file, lookup.object_type);
+        let mapped = plan_mapped_type_declaration(self.store, self.host, mapped_node)
+            .map_err(|_| invalid())?;
+        let template = mapped.template().ok_or_else(invalid)?;
+        let outer = preflight_node(self.store, self.host, template)?;
+        let NodeData::ConditionalTypeNode(outer) = &outer.data else {
+            return Err(invalid());
+        };
+        let when_true = NodeRef::new(template.arena, template.file, outer.true_type);
+        if node == template || node == when_true {
+            return Ok(true);
+        }
+
+        let optional = self
+            .store
+            .symbol(proof.module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("IsOptional"))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .ok_or_else(invalid)?;
+        self.plan_type_alias(optional, false)?;
+        let alias = self.plan.aliases.get(&optional).ok_or_else(invalid)?;
+        let mut current = alias.type_node;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            let record = preflight_node(self.store, self.host, current)?;
+            let NodeData::ConditionalTypeNode(conditional) = &record.data else {
+                return Ok(false);
+            };
+            if current == node {
+                return Ok(true);
+            }
+            let next = NodeRef::new(current.arena, current.file, conditional.false_type);
+            if preflight_node(self.store, self.host, next)?.parent != Some(current.node) {
+                return Err(invalid());
+            }
+            current = next;
+        }
+        Err(invalid())
+    }
+
     fn authenticated_prop_types_required_key_template(
         &self,
         module: SemanticSymbolId,
@@ -26101,6 +26242,110 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     pending_function_parameters: Vec<FunctionTypePlan>,
 }
 
+/// One mapped read borrows source state but uses the kernel's store and session.
+struct MappedConditionalBranchSource<'host, 'arena, 'diagnostics> {
+    host: &'host DeclaredTypeHost<'arena>,
+    global_types: CanonicalGlobalTypes,
+    options: CanonicalTypeQueryOptions,
+    diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
+    mapped_type: TypeId,
+    alias: SemanticSymbolId,
+    plan: PropTypesKeyAliasPlan,
+}
+
+impl ConditionalBranchSource for MappedConditionalBranchSource<'_, '_, '_> {
+    fn preflight(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        conditional: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                self.alias,
+            ))
+        };
+        let aliases = HashMap::new();
+        let mut planner = TypeQueryPlanner::new(
+            store,
+            self.host,
+            Some(self.global_types.array_type),
+            Some(CanonicalArrayTargets::from_global_types(&self.global_types)),
+            self.options.strict_builtin_iterator_return,
+            &aliases,
+        );
+        planner.replay_cached_annotations = true;
+        if planner.source_mapped_conditional_alias(self.mapped_type)?
+            != Some((self.alias, self.plan))
+        {
+            return Err(invalid());
+        }
+        let Some(TypeData::Conditional(data)) =
+            store.type_payload(conditional).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let root = store.conditional_root(data.root).ok_or_else(invalid)?;
+        let node = root.node();
+        if !planner.source_mapped_conditional_owns_root(self.plan, node)? {
+            return Err(invalid());
+        }
+        planner.plan_type_node(node)?;
+        let source = planner.plan.conditionals.get(&node).ok_or_else(invalid)?;
+        validate_conditional_source_captures(
+            store,
+            node,
+            source.outer_parameters.as_deref(),
+            &source.infer_parameters,
+        )
+        .map_err(|_| invalid())?;
+        Ok(())
+    }
+
+    fn resolve_branch(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        conditional: TypeId,
+        branch: ConditionalBranchKind,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        self.preflight(store, conditional)?;
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                self.alias,
+            ))
+        };
+        let Some(TypeData::Conditional(data)) =
+            store.type_payload(conditional).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let root = store.conditional_root(data.root).ok_or_else(invalid)?;
+        let node = root.node();
+        let record = preflight_node(store, self.host, node)?;
+        let NodeData::ConditionalTypeNode(conditional) = &record.data else {
+            return Err(invalid());
+        };
+        let selected = match branch {
+            ConditionalBranchKind::True => conditional.true_type,
+            ConditionalBranchKind::False => conditional.false_type,
+        };
+        let selected = NodeRef::new(node.arena, node.file, selected);
+        if preflight_node(store, self.host, selected)?.parent != Some(node.node) {
+            return Err(invalid());
+        }
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            self.host,
+            &self.global_types,
+            self.options,
+            session,
+            &mut *self.diagnostics,
+        )?;
+        // Branch syntax keeps its generic identity. Only the evaluator substitutes it.
+        query.get_type_from_type_node_worker(selected, false, true)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn source_callable_type_query_evidence_for_test(
     store: &mut CanonicalTypeMapperStore,
@@ -26654,13 +26899,133 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ///
     /// # Errors
     ///
-    /// Returns a typed unavailable or provenance error before mutation when
-    /// the node's dependency closure is outside the installed semantic cut.
+    /// Returns a typed unavailable or provenance error for unsupported source
+    /// dependencies or a delayed mapped-property demand.
     pub(super) fn get_type_from_type_node(
         &mut self,
         node: NodeRef,
     ) -> Result<TypeId, DeclaredTypeError> {
-        self.get_type_from_type_node_worker(node, false, false)
+        let type_ = self.get_type_from_type_node_worker(node, false, false)?;
+        let Some(TypeData::IndexedAccess(indexed)) =
+            self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Ok(type_);
+        };
+        let mapped_type = indexed.object_type;
+        let generic_source = self
+            .store
+            .type_payload(mapped_type)
+            .and_then(|record| match record.data() {
+                TypeData::Mapped(mapped) => mapped.modifiers_type,
+                _ => None,
+            })
+            .and_then(|source| self.store.type_payload(source))
+            .is_some_and(|source| source.flags().contains(TypeFlags::TYPE_PARAMETER));
+        if generic_source
+            || !self
+                .store
+                .type_payload(indexed.index_type)
+                .is_some_and(|index| index.flags().contains(TypeFlags::STRING_LITERAL))
+            || self.source_mapped_conditional_alias(mapped_type)?.is_none()
+        {
+            return Ok(type_);
+        }
+        let mark = self
+            .instantiation_session
+            .as_deref()
+            .map(InstantiationSession::limit_event_mark);
+        let result = self.with_source_mapped_conditional_demand(
+            mapped_type,
+            |store, globals, session, source| {
+                store.resolve_mapped_lookup_with_source(type_, globals, session, source)
+            },
+        );
+        self.report_property_alias_instantiation_limit(node, mark);
+        result
+    }
+
+    fn source_mapped_conditional_alias(
+        &self,
+        mapped_type: TypeId,
+    ) -> Result<Option<(SemanticSymbolId, PropTypesKeyAliasPlan)>, DeclaredTypeError> {
+        TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        )
+        .source_mapped_conditional_alias(mapped_type)
+    }
+
+    fn with_source_mapped_conditional_demand<R>(
+        &mut self,
+        mapped_type: TypeId,
+        demand: impl FnOnce(
+            &mut CanonicalTypeMapperStore,
+            &CanonicalGlobalTypes,
+            &mut InstantiationSession,
+            &mut dyn ConditionalBranchSource,
+        ) -> Result<R, MappedTypeError>,
+    ) -> Result<R, DeclaredTypeError> {
+        let declaration = self
+            .store
+            .type_payload(mapped_type)
+            .and_then(|record| match record.data() {
+                TypeData::Mapped(mapped) => mapped.declaration,
+                _ => None,
+            })
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidPreparedTypeQuery))?;
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node: declaration,
+                kind: SyntaxKind::MappedType,
+            })
+        };
+        let (alias, plan) = self
+            .source_mapped_conditional_alias(mapped_type)?
+            .ok_or_else(unsupported)?;
+        let globals = self.global_types.clone().ok_or_else(unsupported)?;
+        let mut source = MappedConditionalBranchSource {
+            host: self.host,
+            global_types: globals.clone(),
+            options: self.options,
+            diagnostics: &mut *self.diagnostics,
+            mapped_type,
+            alias,
+            plan,
+        };
+        let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
+        let session = self
+            .instantiation_session
+            .as_deref_mut()
+            .unwrap_or(&mut owned_session);
+        demand(self.store, &globals, session, &mut source)
+            .map_err(|error| mapped_type_error(error, declaration))
+    }
+
+    /// Reads one source-owned conditional mapped value in the caller's query.
+    pub(super) fn get_type_of_mapped_property(
+        &mut self,
+        mapped_type: TypeId,
+        name: EscapedNameRef<'_>,
+    ) -> Result<Option<ResolvedMappedProperty>, DeclaredTypeError> {
+        self.with_source_mapped_conditional_demand(
+            mapped_type,
+            |store, globals, session, source| {
+                store.resolve_mapped_type_property_with_source(
+                    mapped_type,
+                    name,
+                    MappedTypeModifiers::NONE,
+                    globals,
+                    session,
+                    source,
+                )
+            },
+        )
     }
 
     /// Replays a written getter annotation before or after its body is checked.
@@ -54452,6 +54817,202 @@ mod tests {
             Ok(resolved),
         );
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Source scope, capture damage, and real branch replay share one query.
+    fn source_mapped_conditional_demand_source_scope_and_capture_replay() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Error { name: string; message: string; stack?: string; }",
+        ));
+        let declarations = parse_source_file(concat!(
+            "declare module 'prop-types' { ",
+            "export const nominalTypeHack: unique symbol; ",
+            "export type IsOptional<T> = undefined | null extends T ? true : ",
+            "undefined extends T ? true : null extends T ? true : false; ",
+            "export type RequiredKeys<V> = { [K in keyof V]: ",
+            "V[K] extends Validator<infer T> ? IsOptional<T> extends true ? never : K : never ",
+            "}[keyof V]; ",
+            "export interface Validator<T> { ",
+            "(props: object, propName: string, componentName: string, ",
+            "location: string, propFullName: string): Error | null; ",
+            "[nominalTypeHack]?: T; ",
+            "} ",
+            "export type Deferred<V> = RequiredKeys<V>; ",
+            "export type Other<V> = V extends string ? number : boolean; ",
+            "}",
+        ));
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(library, declarations, true);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, files.get(&declaration_file).unwrap()),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let global_symbols = store.intrinsic_bootstrap().unwrap().globals;
+        let globals =
+            initialize_global_library_types(&mut store, &host, global_symbols, false).unwrap();
+        let body = |expected| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, alias.name) == Some(expected)).then_some(
+                        NodeRef::new(declarations.arena.id(), declaration_file, alias.type_),
+                    )
+                })
+                .unwrap()
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut store,
+            &host,
+            &globals,
+            CanonicalTypeQueryOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let lookup = query.get_type_from_type_node(body("Deferred")).unwrap();
+        let other = query.get_type_from_type_node(body("Other")).unwrap();
+        let TypeData::IndexedAccess(indexed) = query.store.type_payload(lookup).unwrap().data()
+        else {
+            panic!("the generic request must retain its whole lookup")
+        };
+        let mapped_type = indexed.object_type;
+        let TypeData::Mapped(mapped) = query.store.type_payload(mapped_type).unwrap().data() else {
+            panic!("the source lookup must retain its mapped child")
+        };
+        let target = mapped.object.target.unwrap();
+        let TypeData::Mapped(original) = query.store.type_payload(target).unwrap().data() else {
+            panic!("the instance must keep its original mapped target")
+        };
+        let template = original.template_type.unwrap();
+        let TypeData::Conditional(conditional) = query.store.type_payload(template).unwrap().data()
+        else {
+            panic!("the source template must be conditional")
+        };
+        let template_node = query
+            .store
+            .conditional_root(conditional.root)
+            .unwrap()
+            .node();
+        let (alias, plan) = query
+            .source_mapped_conditional_alias(mapped_type)
+            .unwrap()
+            .unwrap();
+        drop(query);
+
+        let mut source = MappedConditionalBranchSource {
+            host: &host,
+            global_types: globals,
+            options: CanonicalTypeQueryOptions::default(),
+            diagnostics: &mut diagnostics,
+            mapped_type,
+            alias,
+            plan,
+        };
+        assert_eq!(source.preflight(&store, template), Ok(()));
+        let before = function_store_state(&store);
+        for _ in 0..2 {
+            assert_eq!(
+                source.preflight(&store, other),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
+                )),
+            );
+            assert!(
+                source
+                    .resolve_branch(&mut store, other, ConditionalBranchKind::True, &mut session)
+                    .is_err()
+            );
+            assert_eq!(function_store_state(&store), before);
+        }
+
+        let original_links = store.type_node_links(template_node).cloned().unwrap();
+        assert!(original_links.outer_type_parameters.is_none());
+        let TypeData::Conditional(conditional) = store.type_payload(template).unwrap().data()
+        else {
+            unreachable!()
+        };
+        let mut captures = store
+            .conditional_root(conditional.root)
+            .unwrap()
+            .outer_type_parameters()
+            .unwrap()
+            .to_vec();
+        assert_eq!(captures.len(), 2);
+        captures.swap(0, 1);
+        let mut reversed = original_links.clone();
+        reversed.outer_type_parameters = Some(captures);
+        assert!(store.set_type_node_links(template_node, reversed));
+        let damaged = function_store_state(&store);
+        for _ in 0..2 {
+            assert!(source.preflight(&store, template).is_err());
+            assert!(
+                source
+                    .resolve_branch(
+                        &mut store,
+                        template,
+                        ConditionalBranchKind::True,
+                        &mut session,
+                    )
+                    .is_err()
+            );
+            assert_eq!(function_store_state(&store), damaged);
+        }
+        assert!(store.set_type_node_links(template_node, original_links));
+        assert_eq!(source.preflight(&store, template), Ok(()));
+        assert_eq!(function_store_state(&store), before);
+
+        let branch = source
+            .resolve_branch(
+                &mut store,
+                template,
+                ConditionalBranchKind::True,
+                &mut session,
+            )
+            .unwrap();
+        assert_ne!(branch, template);
+        assert!(matches!(
+            store.type_payload(branch).map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        ));
+        assert_eq!(source.preflight(&store, branch), Ok(()));
+        let TypeData::Conditional(conditional) = store.type_payload(template).unwrap().data()
+        else {
+            unreachable!()
+        };
+        assert!(conditional.resolved_true_type.is_none());
+        assert!(conditional.resolved_false_type.is_none());
+        assert!(conditional.resolved_inferred_true_type.is_none());
+        let warm = function_store_state(&store);
+        assert_eq!(
+            source.resolve_branch(
+                &mut store,
+                template,
+                ConditionalBranchKind::True,
+                &mut session,
+            ),
+            Ok(branch),
+        );
+        assert_eq!(function_store_state(&store), warm);
+        drop(source);
         assert!(diagnostics.is_empty());
     }
 

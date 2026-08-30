@@ -14,16 +14,18 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    TypeAliasId, TypeId, TypeMapperId,
+    CanonicalGlobalTypes, TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     conditional_types::{
-        ConditionalAliasIdentity, ConditionalRemapLookup, ConditionalRemapProjection,
-        ConditionalRemapResult, ConditionalTypeError, cached_deferred_conditional_remap,
+        ConditionalAliasIdentity, ConditionalBranchSource, ConditionalRemapLookup,
+        ConditionalRemapProjection, ConditionalRemapResult, ConditionalTypeError,
+        cached_conditional_remap_with_source, cached_deferred_conditional_remap,
         conditional_alias_projection, conditional_remap_projection,
+        conditional_remap_projection_with_source, remap_conditional_with_source,
         remap_deferred_conditional_with_session,
     },
-    declared::{cached_ordinary_type_parameter_owner, type_list_key},
+    declared::{DeclaredTypeError, cached_ordinary_type_parameter_owner, type_list_key},
     indexed_access_types::{
         cached_deferred_indexed_access_type, get_instantiated_indexed_access_type,
     },
@@ -110,6 +112,7 @@ pub(super) enum InstantiationError {
     Reference(DirectGenericReferenceError),
     Template(TemplateTypeError),
     Union(LiteralTypeCacheError),
+    Declared(DeclaredTypeError),
 }
 
 impl std::fmt::Display for InstantiationError {
@@ -163,6 +166,7 @@ impl std::fmt::Display for InstantiationError {
             Self::Reference(error) => error.fmt(formatter),
             Self::Template(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
+            Self::Declared(error) => error.fmt(formatter),
         }
     }
 }
@@ -174,6 +178,7 @@ impl std::error::Error for InstantiationError {
             Self::Reference(error) => Some(error),
             Self::Template(error) => Some(error),
             Self::Union(error) => Some(error),
+            Self::Declared(error) => Some(error),
             _ => None,
         }
     }
@@ -1294,6 +1299,69 @@ pub(super) fn instantiate_type_with_vector_and_session(
     )
 }
 
+struct InstantiationSource<'a> {
+    globals: &'a CanonicalGlobalTypes,
+    branches: &'a mut dyn ConditionalBranchSource,
+}
+
+pub(super) fn instantiate_type_with_vector_and_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, InstantiationError> {
+    if sources.len() != targets.len() {
+        return Err(InstantiationError::InvalidType(type_));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(InstantiationError::InvalidType(*endpoint));
+        }
+    }
+    instantiate_type_with_alias_input_and_source(
+        store,
+        type_,
+        InstantiationMapping::Vector { sources, targets },
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        None,
+        session,
+        None,
+        Some(&mut InstantiationSource {
+            globals,
+            branches: source,
+        }),
+    )
+}
+
+pub(super) fn instantiate_type_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper: TypeMapperId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, InstantiationError> {
+    if store.mapper_payload(mapper).is_none() {
+        return Err(InstantiationError::InvalidMapper(mapper));
+    }
+    instantiate_type_with_alias_input_and_source(
+        store,
+        type_,
+        InstantiationMapping::Stored(mapper),
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        None,
+        session,
+        None,
+        Some(&mut InstantiationSource {
+            globals,
+            branches: source,
+        }),
+    )
+}
+
 /// Instantiates one root with a borrowed alias identity in the caller's session.
 /// Child substitutions do not inherit the override or remap its arguments.
 pub(super) fn instantiate_type_with_vector_and_alias_and_session(
@@ -1554,15 +1622,54 @@ fn instantiate_type_with_alias_input_and_receipt(
     session: &mut InstantiationSession,
     receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
 ) -> Result<TypeId, InstantiationError> {
+    instantiate_type_with_alias_input_and_source(
+        store,
+        type_,
+        mapping,
+        array_targets,
+        alias,
+        session,
+        receipt,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Source queries share the same frame and mapper identity.
+fn instantiate_type_with_alias_input_and_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias: Option<InstantiationAliasInput<'_>>,
+    session: &mut InstantiationSession,
+    receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
+    source: Option<&mut InstantiationSource<'_>>,
+) -> Result<TypeId, InstantiationError> {
     if matches!(
         store.type_payload(type_).map(TypeRecord::data),
         Some(TypeData::Union(_))
     ) {
         instantiable_union_source_types(store, type_, array_targets)?;
     }
-    if !could_contain_installed_type_variables(store, type_, array_targets)? {
+    let conditional_source = source.as_ref().filter(|_| {
+        matches!(
+            store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        )
+    });
+    let contains = if let Some(source) = conditional_source {
+        conditional_remap_projection_with_source(store, type_, source.branches)
+            .map_err(|error| conditional_remap_error(type_, error))?;
+        true
+    } else {
+        could_contain_installed_type_variables(store, type_, array_targets)?
+    };
+    if !contains {
         return Ok(type_);
     }
+    // The frame invokes validation and work in sequence. Neither callback keeps
+    // the source reader, and no source reader is installed in the session.
+    let source = std::cell::RefCell::new(source);
     with_instantiation_frame(
         store,
         mapping,
@@ -1585,13 +1692,17 @@ fn instantiate_type_with_alias_input_and_receipt(
                     type_arguments,
                 } => Some((*symbol, type_arguments.as_slice())),
             };
-            if cached_instantiated_type_worker(
+            let source = source.borrow();
+            if cached_instantiated_type_with_source_worker(
                 store,
                 type_,
                 mapping,
                 array_targets,
                 alias,
                 &mut HashSet::new(),
+                source
+                    .as_ref()
+                    .map(|source| (source.globals, &*source.branches)),
             )? != Some(cached)
             {
                 return Err(InstantiationError::InvalidType(type_));
@@ -1618,6 +1729,7 @@ fn instantiate_type_with_alias_input_and_receipt(
                 alias,
                 session,
                 receipt,
+                source.borrow_mut().as_deref_mut(),
             )
         },
     )
@@ -2769,6 +2881,54 @@ fn cached_instantiated_type_worker(
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     active: &mut HashSet<TypeId>,
 ) -> Result<Option<TypeId>, InstantiationError> {
+    cached_instantiated_type_with_source_worker(
+        store,
+        template,
+        mapping,
+        array_targets,
+        alias_override,
+        active,
+        None,
+    )
+}
+
+pub(super) fn cached_instantiation_with_vector_and_source(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    sources: &[TypeId],
+    targets: &[TypeId],
+    globals: &CanonicalGlobalTypes,
+    source: &dyn ConditionalBranchSource,
+) -> Result<Option<TypeId>, InstantiationError> {
+    if sources.len() != targets.len() {
+        return Err(InstantiationError::InvalidType(template));
+    }
+    for endpoint in sources.iter().chain(targets) {
+        if store.type_payload(*endpoint).is_none() {
+            return Err(InstantiationError::InvalidType(*endpoint));
+        }
+    }
+    cached_instantiated_type_with_source_worker(
+        store,
+        template,
+        InstantiationMapping::Vector { sources, targets },
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        None,
+        &mut HashSet::new(),
+        Some((globals, source)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Cached replay receives the same source capability as work.
+fn cached_instantiated_type_with_source_worker(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    alias_override: Option<(SemanticSymbolId, &[TypeId])>,
+    active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
+) -> Result<Option<TypeId>, InstantiationError> {
     if !active.insert(template) {
         return Err(InstantiationError::UnsupportedType(template));
     }
@@ -2844,8 +3004,13 @@ fn cached_instantiated_type_worker(
             )
         }
         TypeData::Conditional(_) => {
-            let projection = conditional_remap_projection(store, template)
-                .map_err(|error| conditional_remap_error(template, error))?;
+            let projection = match source {
+                Some((_, source)) => {
+                    conditional_remap_projection_with_source(store, template, source)
+                }
+                None => conditional_remap_projection(store, template),
+            }
+            .map_err(|error| conditional_remap_error(template, error))?;
             cached_instantiated_deferred_conditional(
                 store,
                 &projection,
@@ -2853,24 +3018,27 @@ fn cached_instantiated_type_worker(
                 array_targets,
                 alias_override,
                 active,
+                source,
             )
         }
         TypeData::IndexedAccess(indexed) => {
-            let object = cached_instantiated_type_worker(
+            let object = cached_instantiated_type_with_source_worker(
                 store,
                 indexed.object_type,
                 mapping,
                 array_targets,
                 None,
                 active,
+                source,
             )?;
-            let index = cached_instantiated_type_worker(
+            let index = cached_instantiated_type_with_source_worker(
                 store,
                 indexed.index_type,
                 mapping,
                 array_targets,
                 None,
                 active,
+                source,
             )?;
             let (Some(object), Some(index)) = (object, index) else {
                 return Ok(None);
@@ -3202,11 +3370,22 @@ fn cached_instantiated_type_worker(
 fn conditional_remap_error(source: TypeId, error: ConditionalTypeError) -> InstantiationError {
     match error {
         ConditionalTypeError::Instantiation(error) => error,
+        ConditionalTypeError::Declared(error) => InstantiationError::Declared(error),
         ConditionalTypeError::InvalidMapper(mapper) => InstantiationError::InvalidMapper(mapper),
         ConditionalTypeError::Capacity => {
             InstantiationError::Union(LiteralTypeCacheError::Capacity)
         }
         _ => InstantiationError::InvalidType(source),
+    }
+}
+
+fn conditional_source_error(source: TypeId, error: ConditionalTypeError) -> InstantiationError {
+    match error {
+        ConditionalTypeError::UnsupportedInference { .. }
+        | ConditionalTypeError::TailRecursionLimit { .. } => {
+            InstantiationError::UnsupportedType(source)
+        }
+        _ => conditional_remap_error(source, error),
     }
 }
 
@@ -3235,6 +3414,7 @@ fn cached_instantiated_deferred_conditional(
     array_targets: Option<CanonicalArrayTargets>,
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     active: &mut HashSet<TypeId>,
+    source: Option<(&CanonicalGlobalTypes, &dyn ConditionalBranchSource)>,
 ) -> Result<Option<TypeId>, InstantiationError> {
     validate_conditional_alias_override(store, projection, alias_override)?;
     let mut arguments = Vec::with_capacity(projection.arguments().len());
@@ -3242,7 +3422,15 @@ fn cached_instantiated_deferred_conditional(
         let mapped = if parameter == argument {
             cached_apply_mapping(store, *parameter, mapping, array_targets)?
         } else {
-            cached_instantiated_type_worker(store, *argument, mapping, array_targets, None, active)?
+            cached_instantiated_type_with_source_worker(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                active,
+                source,
+            )?
         };
         let Some(mapped) = mapped else {
             return Ok(None);
@@ -3252,13 +3440,14 @@ fn cached_instantiated_deferred_conditional(
     let mut alias_arguments = Vec::new();
     if let Some(alias) = projection.alias() {
         for argument in alias.type_arguments {
-            let Some(mapped) = cached_instantiated_type_worker(
+            let Some(mapped) = cached_instantiated_type_with_source_worker(
                 store,
                 *argument,
                 mapping,
                 array_targets,
                 None,
                 active,
+                source,
             )?
             else {
                 return Ok(None);
@@ -3274,6 +3463,12 @@ fn cached_instantiated_deferred_conditional(
         && alias_override != alias.map(|alias| (alias.symbol, alias.type_arguments))
     {
         return Err(InstantiationError::UnsupportedType(projection.type_id()));
+    }
+    if let Some((globals, source)) = source {
+        return cached_conditional_remap_with_source(
+            store, projection, &arguments, alias, globals, source,
+        )
+        .map_err(|error| conditional_remap_error(projection.type_id(), error));
     }
     match cached_deferred_conditional_remap(store, projection, &arguments, alias, array_targets)
         .map_err(|error| conditional_remap_error(projection.type_id(), error))?
@@ -3991,6 +4186,7 @@ enum InstantiationWork {
     Unsupported,
 }
 
+#[allow(clippy::too_many_arguments)] // The source reader borrows the existing frame and caller session.
 fn instantiate_type_worker(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
@@ -3999,6 +4195,7 @@ fn instantiate_type_worker(
     alias: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
     receipt: Option<&mut OrdinaryIntersectionReceiptBuilder>,
+    mut source: Option<&mut InstantiationSource<'_>>,
 ) -> Result<TypeId, InstantiationError> {
     let work = {
         let record = store
@@ -4069,10 +4266,16 @@ fn instantiate_type_worker(
                         .ok_or(InstantiationError::UnsupportedType(type_))?,
                 )
             }
-            TypeData::Conditional(_) => InstantiationWork::DeferredConditional(Box::new(
-                conditional_remap_projection(store, type_)
-                    .map_err(|error| conditional_remap_error(type_, error))?,
-            )),
+            TypeData::Conditional(_) => {
+                let projection = match source.as_ref() {
+                    Some(source) => {
+                        conditional_remap_projection_with_source(store, type_, source.branches)
+                    }
+                    None => conditional_remap_projection(store, type_),
+                }
+                .map_err(|error| conditional_remap_error(type_, error))?;
+                InstantiationWork::DeferredConditional(Box::new(projection))
+            }
             TypeData::IndexedAccess(indexed) => InstantiationWork::IndexedAccess {
                 object: indexed.object_type,
                 index: indexed.index_type,
@@ -4134,77 +4337,39 @@ fn instantiate_type_worker(
             index,
             flags,
         } => {
-            let object =
-                instantiate_type_with_alias(store, object, mapping, array_targets, None, session)?;
-            let index =
-                instantiate_type_with_alias(store, index, mapping, array_targets, None, session)?;
-            match indexed_access_resolution(store, object, index, flags, array_targets)? {
-                IndexedAccessResolution::Type(type_) => Ok(type_),
-                IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
-                    .literal_union_type_with_alias_and_array_targets(
-                        &[type_, sentinel],
-                        None,
-                        array_targets,
-                    )
-                    .map_err(Into::into),
-                IndexedAccessResolution::Deferred => {
-                    get_instantiated_indexed_access_type(store, object, index, flags)
-                        .ok_or(InstantiationError::InvalidType(type_))
-                }
-                IndexedAccessResolution::Property(name) => {
-                    if matches!(
-                        store.type_payload(object).map(TypeRecord::data),
-                        Some(TypeData::Mapped(_))
-                    ) {
-                        store
-                            .validate_mapped_type_relation_endpoint(object)
-                            .map_err(|error| mapped_indexed_access_error(object, error))?;
-                        let members = store
-                            .resolve_mapped_type_members_with_session(
-                                object,
-                                MappedTypeModifiers::NONE,
-                                session,
-                            )
-                            .map_err(|error| mapped_indexed_access_error(object, error))?;
-                        let symbol = store
-                            .symbol_table(members.members())
-                            .and_then(|members| members.get(name.as_ref()))
-                            .ok_or(InstantiationError::UnsupportedType(type_))?;
-                        if !members.properties().contains(&symbol) {
-                            return Err(InstantiationError::InvalidType(object));
-                        }
-                        return store
-                            .resolve_mapped_symbol_type_with_session(symbol, session)
-                            .map_err(|error| mapped_indexed_access_error(object, error));
-                    }
-                    let property = super::object_members::resolve_object_property_by_key(
-                        store,
-                        None,
-                        object,
-                        name.as_ref(),
-                        session,
-                    )
-                    .map_err(|_| InstantiationError::UnsupportedType(type_))?
-                    .ok_or(InstantiationError::UnsupportedType(type_))?;
-                    match indexed_access_property_optional_sentinel(
-                        store,
-                        property.symbol,
-                        property.type_,
-                    )? {
-                        Some(sentinel) => store
-                            .literal_union_type_with_alias_and_array_targets(
-                                &[property.type_, sentinel],
-                                None,
-                                array_targets,
-                            )
-                            .map_err(Into::into),
-                        None => Ok(property.type_),
-                    }
-                }
-            }
+            let object = instantiate_type_with_alias_input_and_source(
+                store,
+                object,
+                mapping,
+                array_targets,
+                None,
+                session,
+                None,
+                source.as_deref_mut(),
+            )?;
+            let index = instantiate_type_with_alias_input_and_source(
+                store,
+                index,
+                mapping,
+                array_targets,
+                None,
+                session,
+                None,
+                source.as_deref_mut(),
+            )?;
+            resolve_instantiated_indexed_access(
+                store,
+                type_,
+                object,
+                index,
+                flags,
+                array_targets,
+                session,
+                source,
+            )
         }
         InstantiationWork::TypeParameter => {
-            apply_mapping(store, type_, mapping, array_targets, session)
+            apply_mapping_with_source(store, type_, mapping, array_targets, session, source)
         }
         InstantiationWork::Identity => Ok(type_),
         InstantiationWork::TemplateLiteral { texts, types } => instantiate_template_literal(
@@ -4267,8 +4432,135 @@ fn instantiate_type_worker(
             array_targets,
             alias,
             session,
+            source,
         ),
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
+    }
+}
+
+/// Performs an explicit one-key demand without an empty-mapper identity shortcut.
+pub(super) fn resolve_indexed_access_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    lookup: TypeId,
+    globals: &CanonicalGlobalTypes,
+    session: &mut InstantiationSession,
+    source: &mut dyn ConditionalBranchSource,
+) -> Result<TypeId, InstantiationError> {
+    let Some(TypeData::IndexedAccess(indexed)) = store.type_payload(lookup).map(TypeRecord::data)
+    else {
+        return Err(InstantiationError::InvalidType(lookup));
+    };
+    let (object, index, flags) = (
+        indexed.object_type,
+        indexed.index_type,
+        indexed.access_flags,
+    );
+    if cached_deferred_indexed_access_type(store, object, index, flags)
+        .map_err(InstantiationError::InvalidType)?
+        != Some(lookup)
+    {
+        return Err(InstantiationError::InvalidType(lookup));
+    }
+    resolve_instantiated_indexed_access(
+        store,
+        lookup,
+        object,
+        index,
+        flags,
+        Some(CanonicalArrayTargets::from_global_types(globals)),
+        session,
+        Some(&mut InstantiationSource {
+            globals,
+            branches: source,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Shares the indexed-access operation with ordinary substitution.
+fn resolve_instantiated_indexed_access(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    object: TypeId,
+    index: TypeId,
+    flags: AccessFlags,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    source: Option<&mut InstantiationSource<'_>>,
+) -> Result<TypeId, InstantiationError> {
+    match indexed_access_resolution(store, object, index, flags, array_targets)? {
+        IndexedAccessResolution::Type(type_) => Ok(type_),
+        IndexedAccessResolution::TypeWithSentinel(type_, sentinel) => store
+            .literal_union_type_with_alias_and_array_targets(
+                &[type_, sentinel],
+                None,
+                array_targets,
+            )
+            .map_err(Into::into),
+        IndexedAccessResolution::Deferred => {
+            get_instantiated_indexed_access_type(store, object, index, flags)
+                .ok_or(InstantiationError::InvalidType(type_))
+        }
+        IndexedAccessResolution::Property(name) => {
+            if matches!(
+                store.type_payload(object).map(TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            ) {
+                if let Some(source) = source {
+                    return store
+                        .resolve_mapped_type_property_with_source(
+                            object,
+                            name.as_ref(),
+                            MappedTypeModifiers::NONE,
+                            source.globals,
+                            session,
+                            source.branches,
+                        )
+                        .map_err(|error| mapped_indexed_access_error(object, error))?
+                        .map(super::mapped_types::ResolvedMappedProperty::type_id)
+                        .ok_or(InstantiationError::UnsupportedType(type_));
+                }
+                store
+                    .validate_mapped_type_relation_endpoint(object)
+                    .map_err(|error| mapped_indexed_access_error(object, error))?;
+                let members = store
+                    .resolve_mapped_type_members_with_session(
+                        object,
+                        MappedTypeModifiers::NONE,
+                        session,
+                    )
+                    .map_err(|error| mapped_indexed_access_error(object, error))?;
+                let symbol = store
+                    .symbol_table(members.members())
+                    .and_then(|members| members.get(name.as_ref()))
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                if !members.properties().contains(&symbol) {
+                    return Err(InstantiationError::InvalidType(object));
+                }
+                return store
+                    .resolve_mapped_symbol_type_with_session(symbol, session)
+                    .map_err(|error| mapped_indexed_access_error(object, error));
+            }
+            let property = super::object_members::resolve_object_property_by_key(
+                store,
+                source.as_ref().map(|source| source.globals),
+                object,
+                name.as_ref(),
+                session,
+            )
+            .map_err(|_| InstantiationError::UnsupportedType(type_))?
+            .ok_or(InstantiationError::UnsupportedType(type_))?;
+            match indexed_access_property_optional_sentinel(store, property.symbol, property.type_)?
+            {
+                Some(sentinel) => store
+                    .literal_union_type_with_alias_and_array_targets(
+                        &[property.type_, sentinel],
+                        None,
+                        array_targets,
+                    )
+                    .map_err(Into::into),
+                None => Ok(property.type_),
+            }
+        }
     }
 }
 
@@ -4279,6 +4571,7 @@ fn instantiate_deferred_conditional(
     array_targets: Option<CanonicalArrayTargets>,
     alias_override: Option<(SemanticSymbolId, &[TypeId])>,
     session: &mut InstantiationSession,
+    mut source: Option<&mut InstantiationSource<'_>>,
 ) -> Result<TypeId, InstantiationError> {
     validate_conditional_alias_override(store, projection, alias_override)?;
     let mark = session.limit_event_mark();
@@ -4287,9 +4580,25 @@ fn instantiate_deferred_conditional(
         // Go's composite mapper traverses a changed first result through the
         // second mapper. An unchanged parameter needs only its direct mapping.
         let mapped = if parameter == argument {
-            apply_mapping(store, *parameter, mapping, array_targets, session)?
+            apply_mapping_with_source(
+                store,
+                *parameter,
+                mapping,
+                array_targets,
+                session,
+                source.as_deref_mut(),
+            )?
         } else {
-            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?
+            instantiate_type_with_alias_input_and_source(
+                store,
+                *argument,
+                mapping,
+                array_targets,
+                None,
+                session,
+                None,
+                source.as_deref_mut(),
+            )?
         };
         if session.limit_event_occurred_since(mark)
             && let Some(error) = session.recovery_error_type()
@@ -4301,13 +4610,15 @@ fn instantiate_deferred_conditional(
     let mut alias_arguments = Vec::new();
     if let Some(alias) = projection.alias() {
         for argument in alias.type_arguments {
-            let mapped = instantiate_type_with_alias(
+            let mapped = instantiate_type_with_alias_input_and_source(
                 store,
                 *argument,
                 mapping,
                 array_targets,
                 None,
                 session,
+                None,
+                source.as_deref_mut(),
             )?;
             if session.limit_event_occurred_since(mark)
                 && let Some(error) = session.recovery_error_type()
@@ -4325,6 +4636,18 @@ fn instantiate_deferred_conditional(
         && alias_override != alias.map(|alias| (alias.symbol, alias.type_arguments))
     {
         return Err(InstantiationError::UnsupportedType(projection.type_id()));
+    }
+    if let Some(source) = source {
+        return remap_conditional_with_source(
+            store,
+            projection,
+            &arguments,
+            alias,
+            source.globals,
+            session,
+            source.branches,
+        )
+        .map_err(|error| conditional_source_error(projection.type_id(), error));
     }
     match remap_deferred_conditional_with_session(
         store,
@@ -4675,6 +4998,7 @@ fn instantiated_keyof_error(source: TypeId, error: NongenericKeyofError) -> Inst
 
 fn mapped_indexed_access_error(object: TypeId, error: MappedTypeError) -> InstantiationError {
     match error {
+        MappedTypeError::Declared(error) => InstantiationError::Declared(error),
         MappedTypeError::InstantiationDepthLimit { depth, limit } => {
             InstantiationError::DepthLimit { depth, limit }
         }
@@ -5240,6 +5564,17 @@ fn apply_mapping(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    apply_mapping_with_source(store, type_, mapping, array_targets, session, None)
+}
+
+fn apply_mapping_with_source(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+    mut source: Option<&mut InstantiationSource<'_>>,
+) -> Result<TypeId, InstantiationError> {
     match mapping {
         InstantiationMapping::Vector { sources, targets } => {
             if store.type_payload(type_).is_none() {
@@ -5260,45 +5595,51 @@ fn apply_mapping(
             match application {
                 TypeMapperApplication::Direct(mapped_type) => Ok(mapped_type),
                 TypeMapperApplication::Merged { first, second } => {
-                    let intermediate = apply_mapping(
+                    let intermediate = apply_mapping_with_source(
                         store,
                         type_,
                         InstantiationMapping::Stored(first),
                         array_targets,
                         session,
+                        source.as_deref_mut(),
                     )?;
-                    apply_mapping(
+                    apply_mapping_with_source(
                         store,
                         intermediate,
                         InstantiationMapping::Stored(second),
                         array_targets,
                         session,
+                        source,
                     )
                 }
                 TypeMapperApplication::Composite { first, second } => {
-                    let intermediate = apply_mapping(
+                    let intermediate = apply_mapping_with_source(
                         store,
                         type_,
                         InstantiationMapping::Stored(first),
                         array_targets,
                         session,
+                        source.as_deref_mut(),
                     )?;
                     if intermediate == type_ {
-                        apply_mapping(
+                        apply_mapping_with_source(
                             store,
                             type_,
                             InstantiationMapping::Stored(second),
                             array_targets,
                             session,
+                            source,
                         )
                     } else {
-                        instantiate_type_with_alias(
+                        instantiate_type_with_alias_input_and_source(
                             store,
                             intermediate,
                             InstantiationMapping::Stored(second),
                             array_targets,
                             None,
                             session,
+                            None,
+                            source,
                         )
                     }
                 }
