@@ -1773,7 +1773,8 @@ fn literal_values_equal(store: &CanonicalTypeMapperStore, left: TypeId, right: T
     }
 }
 
-fn intersect_property_types(
+/// Reuses the canonical primitive intersection rules for properties and failed calls.
+pub(super) fn intersect_property_types(
     store: &CanonicalTypeMapperStore,
     types: &[TypeId],
 ) -> Result<TypeId, IntersectionTypeError> {

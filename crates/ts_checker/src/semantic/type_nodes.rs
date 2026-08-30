@@ -28305,6 +28305,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
             ));
         }
+        if let Some(return_type) = super::calls::overload_failure_signature_return_type(
+            self.store,
+            signature,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+        )
+        .map_err(|_| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+        })? {
+            self.reject_type_reference_alias_capabilities()?;
+            return Ok(return_type);
+        }
         if let Some(return_type) =
             super::instantiated_members::instantiated_property_function_signature_return_type(
                 self.store,

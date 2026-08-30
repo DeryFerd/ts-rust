@@ -284,6 +284,7 @@ fn method_overloads_preserve_binder_order_and_selected_returns() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_broad_method_implementation_does_not_accept_bad_overload_arguments() {
     let parsed = parse_source_file(concat!(
         "class Reader {\n",
@@ -324,10 +325,57 @@ fn a_broad_method_implementation_does_not_accept_bad_overload_arguments() {
         "The call would have succeeded against this implementation, but implementation signatures of overloads are not externally visible."
     );
     let call = nodes(&parsed, SyntaxKind::CallExpression)[0];
-    assert_eq!(
-        signature(&context, call),
-        signature(&context, declarations[0])
-    );
+    let recovered = signature(&context, call);
+    let original = declarations
+        .iter()
+        .map(|declaration| signature(&context, *declaration))
+        .collect::<Vec<_>>();
+    assert!(!original.contains(&recovered));
+    let record = context.store().signature(recovered).unwrap();
+    assert_eq!(record.flags(), ts_checker::semantic::signatures::SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE);
+    assert_eq!(record.declaration(), Some(declarations[0]));
+    assert_eq!(record.min_argument_count(), 1);
+    assert_eq!(record.parameters().len(), 2);
+    let sources = [
+        context.store().signature(original[0]).unwrap().parameters()[0],
+        context.store().signature(original[1]).unwrap().parameters()[1],
+    ];
+    for (parameter, source) in record.parameters().iter().zip(sources) {
+        assert_ne!(*parameter, source);
+        let links = context.store().value_symbol_links(*parameter).unwrap();
+        assert_eq!(links.target, Some(source));
+        assert_eq!(
+            context.store().symbol(*parameter).unwrap().declarations(),
+            context.store().symbol(source).unwrap().declarations()
+        );
+    }
+    let parameter_types = record
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            context
+                .type_to_string(
+                    context
+                        .store()
+                        .value_symbol_links(*parameter)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap(),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameter_types, ["string | number", "number"]);
+    let callable = context.get_type_at_location(callee(&parsed, call)).unwrap();
+    let members = context
+        .store()
+        .type_payload(callable)
+        .unwrap()
+        .data()
+        .structured()
+        .unwrap();
+    assert_eq!(members.signatures.as_deref(), Some(&original[..2]));
+    assert_eq!(members.call_signature_count, 2);
     assert_eq!(
         context
             .type_to_string(resolved_type(&context, call))

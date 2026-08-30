@@ -50,6 +50,7 @@ use super::{
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     indexed_access_types::cached_deferred_indexed_access_type,
+    instantiate::InstantiationSession,
     instantiated_members::validate_property_object_alias_members_with_array_targets,
     links::{
         LateBoundLinks, MembersAndExportsLinks, SignatureLinks, TypeNodeLinks, ValueSymbolLinks,
@@ -61,7 +62,7 @@ use super::{
         validate_direct_generic_reference, validate_nongeneric_interface_argument_origin,
     },
     relater::RelationUnavailable,
-    relation::RelationStateSnapshot,
+    relation::{RelationKind, RelationStateSnapshot},
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
     store::{PlainInterfaceHeritageFacts, SemanticStore, SourceNodeParent},
     structured_members::{
@@ -1217,6 +1218,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 result,
                 array_validation,
                 &allowed_pending,
+                None,
             )?;
         }
         Ok(())
@@ -1311,6 +1313,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result: TypeId,
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<(), LiteralTypeCacheError> {
         if !self.valid_union_alias_key(key.alias.as_ref()) {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
@@ -1330,6 +1333,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             key.alias,
             array_validation.global_types(),
             true,
+            session,
         )? {
             UnionPlan::Existing(expected) => expected,
             UnionPlan::Union {
@@ -6050,6 +6054,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         types: &mut Vec<TypeId>,
         has_object_types: bool,
         global_types: Option<&CanonicalGlobalTypes>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<(), LiteralTypeCacheError> {
         // This is the dependency-closed `removeSubtypes` prefix for expression
         // unions. The validator admits primitives, literals, recursively
@@ -6125,13 +6130,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 {
                     continue;
                 }
-                let related = match global_types {
-                    Some(global_types) => self.is_type_strict_subtype_of_with_global_types(
+                let related = if let Some(session) = session.as_deref_mut() {
+                    self.is_type_related_to_with_session(
                         source,
                         target,
+                        RelationKind::StrictSubtype,
                         global_types,
-                    ),
-                    None => self.is_type_strict_subtype_of(source, target),
+                        None,
+                        session,
+                    )
+                } else {
+                    match global_types {
+                        Some(global_types) => self.is_type_strict_subtype_of_with_global_types(
+                            source,
+                            target,
+                            global_types,
+                        ),
+                        None => self.is_type_strict_subtype_of(source, target),
+                    }
                 }
                 .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(source))?;
                 if related {
@@ -6214,6 +6230,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             None,
             &mut prepared,
             UnionArrayValidation::None,
+            None,
         )
     }
 
@@ -6233,6 +6250,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             None,
             &mut prepared,
             UnionArrayValidation::GlobalTypes(global_types),
+            None,
+        )
+    }
+
+    /// Keeps subtype reduction in the caller's instantiation session.
+    pub(super) fn expression_union_type_with_global_types_and_session(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        types: &[TypeId],
+        reduction: UnionReduction,
+        session: &mut InstantiationSession,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let mut prepared =
+            self.prepare_type_query_types_with_global_types(&[], &[], &[], 1, 0, global_types)?;
+        self.union_type_prepared(
+            types,
+            reduction,
+            None,
+            &mut prepared,
+            UnionArrayValidation::GlobalTypes(global_types),
+            Some(session),
         )
     }
 
@@ -6310,6 +6348,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments)),
             prepared,
             UnionArrayValidation::from_global_types(global_types),
+            None,
         )
     }
 
@@ -6336,6 +6375,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias.map(|(symbol, arguments)| UnionAliasCacheKey::new(symbol, arguments)),
             &mut prepared,
             targets.map_or(UnionArrayValidation::None, UnionArrayValidation::Targets),
+            None,
         )
     }
 
@@ -6497,7 +6537,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if types.len() == 1 {
             return Ok(types[0]);
         }
-        match self.plan_union_type(types, UnionReduction::Literal, None, None, false)? {
+        match self.plan_union_type(types, UnionReduction::Literal, None, None, false, None)? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
                 types,
@@ -6523,6 +6563,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<UnionAliasCacheKey>,
         prepared: &mut PreparedTypeQueryTypes,
         array_validation: UnionArrayValidation<'_>,
+        mut session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         let array_targets = array_validation.targets();
         prepared.consume_union(self.id(), alias.is_some(), array_targets)?;
@@ -6597,6 +6638,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 cached,
                 array_validation,
                 &prepared.pending_function_types,
+                session.as_deref_mut(),
             )?;
             return Ok(cached);
         }
@@ -6607,6 +6649,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias,
             array_validation,
             &prepared.pending_function_types,
+            session,
         )?;
         if let Some(key) = union_of_union_key {
             let bootstrap = self
@@ -6625,6 +6668,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<UnionAliasCacheKey>,
         array_validation: UnionArrayValidation<'_>,
         allowed_pending: &HashSet<TypeId>,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
         match self.plan_union_type(
             types,
@@ -6632,6 +6676,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             alias,
             array_validation.global_types(),
             true,
+            session,
         )? {
             UnionPlan::Existing(existing) => Ok(existing),
             UnionPlan::Union {
@@ -6657,6 +6702,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         alias: Option<UnionAliasCacheKey>,
         global_types: Option<&CanonicalGlobalTypes>,
         synthesize_origin: bool,
+        session: Option<&mut InstantiationSession>,
     ) -> Result<UnionPlan, LiteralTypeCacheError> {
         let (mut normalized, includes) = match self.normalize_union_members(types, reduction)? {
             UnionMembersPlan::Existing(existing) => return Ok(UnionPlan::Existing(existing)),
@@ -6667,6 +6713,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 &mut normalized,
                 includes.intersects(TypeFlags::OBJECT),
                 global_types,
+                session,
             )?;
         }
         self.finish_union_type_plan(
@@ -10276,6 +10323,198 @@ mod tests {
             .and_then(|members| members.get_source("value"))
             .unwrap();
         (derived, base, value)
+    }
+
+    #[test]
+    fn overload_failure_parameter_union_uses_the_caller_instantiation_budget() {
+        use crate::semantic::{
+            calls::{
+                DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
+                DirectCallUnsupported, resolve_direct_call_with_session,
+            },
+            instantiate::{InstantiationLimits, InstantiationSession},
+        };
+
+        let declarations = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface Base<T> { value: T; [index: number]: Array<number>; }",
+        ));
+        let parsed = parse_source_file(concat!(
+            "interface Derived extends Base<number> {} ",
+            "interface Plain { value: number; } ",
+            "interface Recovery { (value: Derived): number; (value: Plain): number; } ",
+            "function keep(callable: Recovery): number { return 1; }",
+        ));
+        assert!(declarations.diagnostics.is_empty());
+        assert!(parsed.diagnostics.is_empty());
+        let file = FileId::new(62_290);
+        let library_file = FileId::new(62_291);
+        let mut binder = CanonicalBinder::new();
+        for (file, source, is_declaration) in
+            [(library_file, &declarations, true), (file, &parsed, false)]
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &declarations.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(interface.name).unwrap().data
+                else {
+                    return None;
+                };
+                (name.text == "Recovery").then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let callee = context.get_declared_type_of_symbol(owner).unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callee)
+        else {
+            panic!("the source overload group must be published")
+        };
+        assert_eq!(projection.call_signatures.len(), 2);
+        let (derived, _, proxy) = inherited_graph_property(context.store());
+        assert_eq!(projection.call_signatures[0].parameters, [derived]);
+        let broad = projection.call_signatures[1].parameters[0];
+        assert!(
+            context
+                .store()
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let request = DirectCallRequest {
+            form: DirectCallForm::Call,
+            optional_chain: false,
+            type_argument_count: 0,
+            has_spread_argument: false,
+            callee,
+            arguments: &[],
+        };
+        let before = (
+            store.signature_len(),
+            store.symbol_len(),
+            store.overload_failure_signatures.len(),
+        );
+        let mut limited = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        let mark = limited.limit_event_mark();
+        assert!(matches!(
+            resolve_direct_call_with_session(store, &globals, false, request, None, &mut limited),
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::OverloadFailureRecovery(type_))) if type_ == callee
+        ));
+        assert!(limited.limit_event_occurred_since(mark));
+        assert_eq!(limited.limit_event_count(), 1);
+        assert!(
+            store
+                .value_symbol_links(proxy)
+                .unwrap()
+                .resolved_type
+                .is_none()
+        );
+        assert_eq!(
+            (
+                store.signature_len(),
+                store.symbol_len(),
+                store.overload_failure_signatures.len()
+            ),
+            before
+        );
+
+        let mut adequate = InstantiationSession::new(InstantiationLimits::default());
+        let recovered =
+            resolve_direct_call_with_session(store, &globals, false, request, None, &mut adequate)
+                .unwrap();
+        assert!(adequate.total_count() > 0);
+        assert_eq!(adequate.limit_event_count(), 0);
+        assert!(matches!(
+            recovered.applicability,
+            DirectCallApplicability::TooFewArguments {
+                expected_at_least: 1,
+                actual: 0
+            }
+        ));
+        let record = store.signature(recovered.projection.signature).unwrap();
+        assert_eq!(
+            record.flags(),
+            SignatureFlags::IS_SIGNATURE_CANDIDATE_FOR_OVERLOAD_FAILURE
+        );
+        assert_eq!(
+            store
+                .value_symbol_links(record.parameters()[0])
+                .unwrap()
+                .resolved_type,
+            Some(broad)
+        );
+        assert_eq!(
+            store.value_symbol_links(proxy).unwrap().resolved_type,
+            Some(store.intrinsic_bootstrap().unwrap().number_type)
+        );
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.mapper_len(),
+            store.overload_failure_signatures.len(),
+        );
+        let count = adequate.total_count();
+        assert_eq!(
+            resolve_direct_call_with_session(
+                store,
+                &globals,
+                false,
+                request,
+                Some(recovered.projection.signature),
+                &mut adequate
+            )
+            .unwrap(),
+            recovered
+        );
+        assert_eq!(adequate.total_count(), count);
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.mapper_len(),
+                store.overload_failure_signatures.len()
+            ),
+            warm
+        );
     }
 
     #[test]
@@ -14994,7 +15233,9 @@ mod tests {
                 let mut types = Vec::new();
                 store.insert_union_type(&mut types, target).unwrap();
                 store.insert_union_type(&mut types, canonical).unwrap();
-                store.remove_union_subtypes(&mut types, true, None).unwrap();
+                store
+                    .remove_union_subtypes(&mut types, true, None, None)
+                    .unwrap();
                 assert_eq!(types, [canonical]);
             }
         }
