@@ -27837,6 +27837,33 @@ fn preflight_inferred_function_return_dependencies(
                 | PlannedIdentifierReadKind::Import
                 | PlannedIdentifierReadKind::Unresolved => false,
             },
+            PlannedExpressionKind::Arrow(arrow)
+                if arrow.callable.family == SourceCallableFamily::ObjectLiteralMethod =>
+            {
+                if arrow.callable.declaration != expression.node
+                    || arrow.callable.body_mode != SourceCallableBodyMode::Present
+                    || arrow.callable.is_async
+                    || !arrow.callable.parameters.is_empty()
+                    || !arrow.callable.type_parameters.is_empty()
+                    || !arrow.parameter_initializers.is_empty()
+                    || arrow.expression_statement.is_some()
+                    || arrow.linear_body.is_some()
+                    || arrow.loop_body.is_some()
+                    || arrow.prototype_this.is_some()
+                    || super::source_callables::source_object_literal_method_symbol(
+                        functions.store,
+                        functions.host,
+                        expression.node,
+                    ) != Some(arrow.callable.owner_symbol)
+                {
+                    return false;
+                }
+                let PlannedArrowBody::Return { expression, .. } = &arrow.body else {
+                    return false;
+                };
+                // The method's inferred result still depends on its deferred body reads.
+                expression_is_closed(expression, parameters, locals, functions)
+            }
             PlannedExpressionKind::Arrow(arrow) => {
                 if arrow.callable.family != SourceCallableFamily::ArrowFunction
                     || arrow.callable.parameters.is_empty()
@@ -71243,6 +71270,124 @@ mod tests {
                 assert_eq!(observable_state(&context, file), warm);
                 assert!(context.diagnostics().is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn inferred_object_method_returns_reject_pending_function_dependencies() {
+        let source = parsed(concat!(
+            "function make() { return { read() { return pending(); } }; } ",
+            "function pending() { return 1; }",
+        ));
+        let file = FileId::new(202_323);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let bound = context.file(file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let plan = SourcePlanner::new_semantic_with_global_types(
+            &source.arena,
+            &bound,
+            context.source_file(file).unwrap(),
+            context.store(),
+            &host,
+            &globals,
+            options,
+        )
+        .finish()
+        .unwrap();
+        let [make, pending] = plan.functions.as_slice() else {
+            panic!("expected the factory followed by its pending dependency")
+        };
+        assert!(make.callable.return_type.is_inferred());
+        assert!(pending.callable.return_type.is_inferred());
+        let PlannedFunctionBody::Return { expression, .. } = &make.body else {
+            panic!("the factory must return its object directly")
+        };
+        let PlannedExpressionKind::Object { properties, .. } = &expression.kind else {
+            panic!("the return must keep its actual object plan")
+        };
+        let [PlannedObjectMember::Eager(expression)] = properties.as_slice() else {
+            panic!("the object must keep its one method value")
+        };
+        let PlannedExpressionKind::Arrow(method) = &expression.kind else {
+            panic!("the method must use its retained callable plan")
+        };
+        assert_eq!(
+            method.callable.family,
+            SourceCallableFamily::ObjectLiteralMethod
+        );
+        assert_eq!(method.callable.declaration, expression.node);
+        assert_eq!(method.callable.body_mode, SourceCallableBodyMode::Present);
+        assert!(method.callable.parameters.is_empty());
+        assert!(method.callable.type_parameters.is_empty());
+        assert_eq!(
+            super::super::source_callables::source_object_literal_method_symbol(
+                context.store(),
+                &host,
+                expression.node,
+            ),
+            Some(method.callable.owner_symbol),
+        );
+        let PlannedArrowBody::Return { expression, .. } = &method.body else {
+            panic!("the method must keep its single return expression")
+        };
+        let PlannedExpressionKind::Call(call) = &expression.kind else {
+            panic!("the method must call its pending dependency")
+        };
+        let PlannedExpressionKind::Identifier(callee) = &call.callee.kind else {
+            panic!("the call must retain its actual function identifier")
+        };
+        assert_eq!(callee.kind, PlannedIdentifierReadKind::Function);
+        assert_eq!(callee.value_symbol, pending.callable.owner_symbol);
+        let expected = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
+            SourceFunctionUnsupported::FunctionBody(make.callable.body),
+        ));
+        assert_eq!(
+            preflight_inferred_function_return_dependencies(
+                context.store(),
+                &host,
+                &plan.functions,
+                &plan.ambient_variables,
+                &plan.cross_file_global_reads,
+                &[],
+            ),
+            Err(expected),
+        );
+        assert_eq!(context.check_source_file(file), Err(expected));
+        let rejected = observable_state(&context, file);
+        for _ in 0..2 {
+            assert_eq!(context.check_source_file(file), Err(expected));
+            assert!(!is_type_checked(&context, file));
+            assert!(context.diagnostics().is_empty());
+            for declaration in [
+                make.callable.declaration,
+                pending.callable.declaration,
+                method.callable.declaration,
+            ] {
+                assert!(
+                    context
+                        .store()
+                        .source_callable_type_for_declaration(declaration)
+                        .is_none()
+                );
+            }
+            assert!(context.store().type_node_links(call.node).is_none());
+            assert!(context.store().signature_links(call.node).is_none());
+            assert_eq!(observable_state(&context, file), rejected);
         }
     }
 
