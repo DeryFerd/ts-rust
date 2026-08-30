@@ -25,10 +25,13 @@ use super::{
         validate_property_object_alias_members_with_array_targets,
     },
     links::ValueSymbolLinks,
-    object_aliases::source_property_object_projection,
+    object_aliases::{
+        closed_declared_property_object_is_mapping_invariant, source_property_object_projection,
+    },
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
-        resolved_declared_property_types, validate_resolved_declared_property_object,
+        DeclaredPropertyTypeGraphValidation, resolved_declared_property_types,
+        validate_resolved_declared_property_object, validate_resolved_declared_property_type_graph,
     },
     reference_types::validate_direct_generic_reference,
     type_nodes::CanonicalTypeQuery,
@@ -1722,6 +1725,31 @@ fn validate_property_type_worker(
                 Ok(())
             }
             DeclaredPropertyObjectValidation::NotDeclared
+                if record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+                    && matches!(
+                        closed_declared_property_object_is_mapping_invariant(store, type_),
+                        Ok(true)
+                    ) =>
+            {
+                let DeclaredPropertyTypeGraphValidation::Traversable(property_types) =
+                    validate_resolved_declared_property_type_graph(store, type_)
+                else {
+                    return Err(IntersectionTypeError::UnsupportedPropertyType(type_));
+                };
+                for property_type in property_types {
+                    validate_property_type_with_array_targets(
+                        store,
+                        property_type,
+                        array_targets,
+                        validating,
+                        validated,
+                    )?;
+                }
+                Ok(())
+            }
+            DeclaredPropertyObjectValidation::NotDeclared
             | DeclaredPropertyObjectValidation::Malformed => {
                 Err(IntersectionTypeError::UnsupportedPropertyType(type_))
             }
@@ -1964,6 +1992,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        object_members::{ensure_type_literal_shell, plan_type_literal, publish_property_members},
+        production::GlobalMergeCompletion,
     };
 
     fn generic_intersection_context(
@@ -2043,6 +2073,351 @@ mod tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Check cold members, real publication, and recursive recovery on one alias.
+    fn closed_alias_property_types_require_resolved_members_and_preserve_traversal() {
+        let source = parse_source_file(concat!(
+            "export type Noop = () => void;\n",
+            "export type Subscription = { unsubscribe: Noop; };\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(46_221);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/closed-intersection-properties.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let alias = generic_intersection_alias_symbol(&source, &context, file, "Subscription");
+        let declaration = context
+            .store()
+            .symbol(alias)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let literal = context
+            .store()
+            .source_direct_type_annotation(declaration)
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let plan = plan_type_literal(context.store(), &host, literal, Some(alias)).unwrap();
+        assert_eq!(plan.properties.len(), 1);
+        let property = &plan.properties[0];
+        let shell = ensure_type_literal_shell(context.store_mut_for_test(), &plan).unwrap();
+        let subscription = shell.type_id();
+        {
+            let store = context.store();
+            assert!(
+                !store
+                    .type_payload(subscription)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            );
+            assert_eq!(
+                closed_declared_property_object_is_mapping_invariant(store, subscription),
+                Ok(true)
+            );
+            let before = intersection_cache_state(store);
+            for _ in 0..2 {
+                let mut validating = HashSet::new();
+                let mut validated = HashSet::new();
+                assert_eq!(
+                    validate_property_type(store, subscription, &mut validating, &mut validated),
+                    Err(IntersectionTypeError::UnsupportedPropertyType(subscription))
+                );
+                assert!(validating.is_empty());
+                assert!(validated.is_empty());
+                assert!(store.value_symbol_links(property.symbol).is_none());
+                assert!(store.type_node_links(property.type_node).is_none());
+                assert_eq!(intersection_cache_state(store), before);
+            }
+        }
+        let noop = context.get_type_from_type_node(property.type_node).unwrap();
+        assert_eq!(
+            publish_property_members(context.store_mut_for_test(), &plan, shell, &[noop]),
+            Ok(subscription)
+        );
+        assert_eq!(context.get_declared_type_of_symbol(alias), Ok(subscription));
+        let store = context.store();
+        let void = store.intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            validate_resolved_declared_property_object(store, subscription),
+            DeclaredPropertyObjectValidation::NotDeclared
+        );
+        assert_eq!(
+            closed_declared_property_object_is_mapping_invariant(store, subscription),
+            Ok(true)
+        );
+        assert!(matches!(
+            validate_resolved_declared_property_type_graph(store, subscription),
+            DeclaredPropertyTypeGraphValidation::Traversable(edges) if edges == [noop]
+        ));
+        let before = (
+            intersection_cache_state(store),
+            store.signature_len(),
+            store.type_alias_len(),
+        );
+        let object = store
+            .type_payload(subscription)
+            .unwrap()
+            .data()
+            .structured()
+            .unwrap()
+            .clone();
+        let links = store.value_symbol_links(property.symbol).unwrap().clone();
+        for _ in 0..2 {
+            let mut validating = HashSet::new();
+            let mut validated = HashSet::new();
+            assert_eq!(
+                validate_property_type(store, subscription, &mut validating, &mut validated),
+                Ok(())
+            );
+            assert!(validating.is_empty());
+            assert_eq!(validated, HashSet::from([subscription, noop, void]));
+            assert_eq!(
+                store.validate_intersection_constituent(subscription),
+                Err(IntersectionTypeError::UnsupportedConstituent(subscription))
+            );
+        }
+        let mut validating = HashSet::from([noop]);
+        let mut validated = HashSet::new();
+        assert_eq!(
+            validate_property_type(store, subscription, &mut validating, &mut validated),
+            Err(IntersectionTypeError::UnsupportedPropertyType(noop))
+        );
+        assert_eq!(validating, HashSet::from([noop]));
+        assert!(validated.is_empty());
+        assert!(validating.remove(&noop));
+        assert_eq!(
+            validate_property_type(store, subscription, &mut validating, &mut validated),
+            Ok(())
+        );
+        assert!(validating.is_empty());
+        assert_eq!(validated, HashSet::from([subscription, noop, void]));
+        assert_eq!(store.value_symbol_links(property.symbol), Some(&links));
+        assert_eq!(
+            store
+                .type_payload(subscription)
+                .unwrap()
+                .data()
+                .structured(),
+            Some(&object)
+        );
+        assert_eq!(
+            (
+                intersection_cache_state(store),
+                store.signature_len(),
+                store.type_alias_len(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each damaged source or cache edge must reject and restore the same alias.
+    fn closed_alias_property_types_reject_damaged_source_caches_without_writes() {
+        let source = parse_source_file("export type Closed = { value: number; };\n");
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(46_222);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/damaged-intersection-properties.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let alias = generic_intersection_alias_symbol(&source, &context, file, "Closed");
+        let declaration = context
+            .store()
+            .symbol(alias)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let literal = context
+            .store()
+            .source_direct_type_annotation(declaration)
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&source.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let plan = plan_type_literal(context.store(), &host, literal, Some(alias)).unwrap();
+        assert_eq!(plan.properties.len(), 1);
+        let property = &plan.properties[0];
+        let shell = ensure_type_literal_shell(context.store_mut_for_test(), &plan).unwrap();
+        let closed = shell.type_id();
+        let number = context.get_type_from_type_node(property.type_node).unwrap();
+        assert_eq!(
+            number,
+            context.store().intrinsic_bootstrap().unwrap().number_type
+        );
+        assert_eq!(
+            publish_property_members(context.store_mut_for_test(), &plan, shell, &[number]),
+            Ok(closed)
+        );
+        assert_eq!(context.get_declared_type_of_symbol(alias), Ok(closed));
+        let store = context.store_mut_for_test();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let flags = store.type_payload(closed).unwrap().object_flags();
+        let alias_flags = store.symbol(alias).unwrap().flags();
+        let alias_checks = store.symbol(alias).unwrap().check_flags();
+        let alias_links = store.type_alias_links(alias).unwrap().clone();
+        let literal_links = store.type_node_links(literal).unwrap().clone();
+        let annotation_links = store.type_node_links(property.type_node).unwrap().clone();
+        let value_links = store.value_symbol_links(property.symbol).unwrap().clone();
+        assert_eq!(
+            validate_resolved_declared_property_object(store, closed),
+            DeclaredPropertyObjectValidation::NotDeclared
+        );
+        assert!(matches!(
+            validate_resolved_declared_property_type_graph(store, closed),
+            DeclaredPropertyTypeGraphValidation::Traversable(edges) if edges == [number]
+        ));
+        for damage in 0..7 {
+            match damage {
+                0 => assert!(
+                    store.set_type_object_flags(closed, flags & !ObjectFlags::MEMBERS_RESOLVED)
+                ),
+                1 => assert!(store.set_object_target_and_mapper(closed, Some(number), None)),
+                2 => {
+                    let mut poisoned = alias_links.clone();
+                    poisoned.declared_type = Some(number);
+                    assert!(store.set_type_alias_links(alias, poisoned));
+                }
+                3 => {
+                    let mut poisoned = literal_links.clone();
+                    poisoned.resolved_type = Some(number);
+                    assert!(store.set_type_node_links(literal, poisoned));
+                }
+                4 => {
+                    let mut poisoned = annotation_links.clone();
+                    poisoned.resolved_type = Some(string);
+                    assert!(store.set_type_node_links(property.type_node, poisoned));
+                    let mut poisoned = value_links.clone();
+                    poisoned.resolved_type = Some(string);
+                    assert!(store.set_value_symbol_links(property.symbol, poisoned));
+                }
+                5 => assert!(store.set_symbol_flags(
+                    alias,
+                    alias_flags | SymbolFlags::TRANSIENT,
+                    alias_checks
+                )),
+                6 => {
+                    let mut poisoned = value_links.clone();
+                    poisoned.write_type = Some(number);
+                    assert!(store.set_value_symbol_links(property.symbol, poisoned));
+                }
+                _ => unreachable!(),
+            }
+            let before = intersection_cache_state(store);
+            let damaged_alias = store.type_alias_links(alias).unwrap().clone();
+            let damaged_literal = store.type_node_links(literal).unwrap().clone();
+            let damaged_annotation = store.type_node_links(property.type_node).unwrap().clone();
+            let damaged_value = store.value_symbol_links(property.symbol).unwrap().clone();
+            for _ in 0..2 {
+                let mut validating = HashSet::new();
+                let mut validated = HashSet::new();
+                assert_eq!(
+                    validate_property_type(store, closed, &mut validating, &mut validated),
+                    Err(IntersectionTypeError::UnsupportedPropertyType(closed)),
+                    "damage {damage}"
+                );
+                assert!(validating.is_empty());
+                assert!(validated.is_empty());
+                assert_eq!(intersection_cache_state(store), before);
+                assert_eq!(store.type_alias_links(alias), Some(&damaged_alias));
+                assert_eq!(store.type_node_links(literal), Some(&damaged_literal));
+                assert_eq!(
+                    store.type_node_links(property.type_node),
+                    Some(&damaged_annotation)
+                );
+                assert_eq!(
+                    store.value_symbol_links(property.symbol),
+                    Some(&damaged_value)
+                );
+            }
+            assert!(store.set_type_object_flags(closed, flags));
+            assert!(store.set_object_target_and_mapper(closed, None, None));
+            assert!(store.set_symbol_flags(alias, alias_flags, alias_checks));
+            assert!(store.set_type_alias_links(alias, alias_links.clone()));
+            assert!(store.set_type_node_links(literal, literal_links.clone()));
+            assert!(store.set_type_node_links(property.type_node, annotation_links.clone()));
+            assert!(store.set_value_symbol_links(property.symbol, value_links.clone()));
+            let mut validating = HashSet::new();
+            let mut validated = HashSet::new();
+            assert_eq!(
+                validate_property_type(store, closed, &mut validating, &mut validated),
+                Ok(())
+            );
+            assert!(validating.is_empty());
+            assert_eq!(validated, HashSet::from([closed, number]));
+            assert_eq!(intersection_cache_state(store), before);
+        }
+        let unowned = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(unowned, None, None, None, None, None));
+        assert_eq!(
+            validate_resolved_declared_property_object(store, unowned),
+            DeclaredPropertyObjectValidation::NotDeclared
+        );
+        assert_eq!(
+            closed_declared_property_object_is_mapping_invariant(store, unowned),
+            Ok(false)
+        );
+        let before = intersection_cache_state(store);
+        let mut validating = HashSet::new();
+        let mut validated = HashSet::new();
+        assert_eq!(
+            validate_property_type(store, unowned, &mut validating, &mut validated),
+            Err(IntersectionTypeError::UnsupportedPropertyType(unowned))
+        );
+        assert!(validating.is_empty());
+        assert!(validated.is_empty());
+        assert_eq!(intersection_cache_state(store), before);
     }
 
     #[test]
