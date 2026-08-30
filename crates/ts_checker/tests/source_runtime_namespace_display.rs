@@ -330,18 +330,18 @@ fn assert_callable(
 
 fn assert_display(
     context: &mut CanonicalCheckerContext<'_>,
-    callable: TypeId,
+    type_: TypeId,
     unqualified: &str,
     locations: &[(NodeRef, &str)],
 ) {
     let before = snapshot(context);
     for _ in 0..2 {
-        assert_eq!(context.type_to_string(callable).unwrap(), unqualified);
+        assert_eq!(context.type_to_string(type_).unwrap(), unqualified);
         for &(location, expected) in locations {
             assert_eq!(
                 context
                     .type_to_string_at_location_with_flags(
-                        callable,
+                        type_,
                         location,
                         CanonicalTypeFormatFlags::NO_TRUNCATION
                             | CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE,
@@ -630,6 +630,8 @@ fn runtime_namespace_display_uses_each_importers_value_scope() {
             ],
         );
         let declaration = node(&provider, provider_file, SyntaxKind::FunctionDeclaration);
+        let namespace = node(&provider, provider_file, SyntaxKind::ModuleDeclaration);
+        let export = node(&provider, provider_file, SyntaxKind::ExportAssignment);
         let original = owner(&context, declaration);
         assert!(context.store().value_symbol_links(original).is_none());
         let cold = query_first.then(|| context.get_type_at_location(names[0]).unwrap());
@@ -658,10 +660,32 @@ fn runtime_namespace_display_uses_each_importers_value_scope() {
                 callable,
                 "typeof foo",
                 &[
+                    (declaration, "typeof foo"),
+                    (namespace, "typeof foo"),
+                    (export, "typeof foo"),
+                ],
+            );
+            // Each wrapper uses its own alias. A hidden alias leaves the provider name.
+            assert_display(
+                &mut context,
+                namespaces[0].1,
+                "typeof foo",
+                &[
                     (aliases[0], "typeof renamed"),
-                    (aliases[1], "typeof other"),
                     (type_only_body, "typeof renamed"),
-                    (hidden_body, "typeof import(\"foo\")"),
+                    (hidden_body, "typeof foo"),
+                    (aliases[1], "typeof foo"),
+                    (declaration, "typeof foo"),
+                ],
+            );
+            assert_display(
+                &mut context,
+                namespaces[1].1,
+                "typeof foo",
+                &[
+                    (aliases[1], "typeof other"),
+                    (aliases[0], "typeof foo"),
+                    (declaration, "typeof foo"),
                 ],
             );
             for file in [files[1], provider_file, files[0]] {
@@ -872,8 +896,14 @@ fn original_array_augmentation_fixture_keeps_namespace_display_and_both_diagnost
                 &[
                     (declaration, "typeof foo"),
                     (namespace, "typeof foo"),
-                    (import, "typeof foo"),
+                    (exported, "typeof foo"),
                 ],
+            );
+            assert_display(
+                &mut context,
+                imported.1,
+                "typeof foo",
+                &[(import, "typeof foo"), (declaration, "typeof foo")],
             );
             for file in files {
                 context.recheck_source_file(file).unwrap();

@@ -2136,11 +2136,18 @@ fn display_validated_module_namespace(
         .source_callable_provenance(type_id)
         .is_some_and(|provenance| provenance.family == SourceCallableFamily::FunctionDeclaration);
     let Some(owner) = record.symbol() else {
-        return if source_function {
-            Err(TypeDisplayUnavailable::MalformedType(type_id))
-        } else {
-            Ok(None)
+        if source_function {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        let Some(owner) =
+            super::source_imports::validated_synthetic_namespace_type_owner(store, host, type_id)
+                .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+        else {
+            return Ok(None);
         };
+        let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
+        state.add(7);
+        return Ok(Some(format!("typeof {name}")));
     };
     let owner_record = store
         .symbol(owner)
