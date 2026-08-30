@@ -37,7 +37,7 @@ use super::{
     instantiate::{InlinePropertyObjectRecovery, PropertyObjectAliasRecovery},
     instantiated_members::{
         InstantiatedIndexRecovery, InstantiatedPropertyAliasCallable, InstantiatedPropertyRecovery,
-        PublishedInterfaceMethodRecovery,
+        PublishedInterfaceMethodOrigin, PublishedInterfaceMethodRecovery,
     },
     intersection_types::IntersectionTypeCacheKey,
     jsdoc::{SourceJsDocCallbackIdentity, SourceJsDocTypedefIdentity},
@@ -615,6 +615,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     constructor_annotation_bindings: HashMap<NodeRef, SemanticSymbolId>,
     declared_value_provenance: HashMap<SemanticSymbolId, DeclaredValueProvenance>,
     instantiated_property_alias_callables: HashMap<TypeId, InstantiatedPropertyAliasCallable>,
+    published_interface_method_origins: HashMap<TypeId, PublishedInterfaceMethodOrigin>,
+    published_interface_method_signature_owners: HashMap<SignatureId, TypeId>,
     published_interface_method_recoveries: HashMap<TypeId, PublishedInterfaceMethodRecovery>,
     instantiated_property_alias_callable_types_by_signature: HashMap<SignatureId, TypeId>,
     instantiated_property_recoveries: HashMap<SemanticSymbolId, InstantiatedPropertyRecovery>,
@@ -791,6 +793,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             constructor_annotation_bindings: HashMap::new(),
             declared_value_provenance: HashMap::new(),
             instantiated_property_alias_callables: HashMap::new(),
+            published_interface_method_origins: HashMap::new(),
+            published_interface_method_signature_owners: HashMap::new(),
             published_interface_method_recoveries: HashMap::new(),
             instantiated_property_alias_callable_types_by_signature: HashMap::new(),
             instantiated_property_recoveries: HashMap::new(),
@@ -9680,6 +9684,114 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 }
 
 impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
+    pub(super) fn try_reserve_published_interface_method_origins(
+        &mut self,
+        signature_count: usize,
+    ) -> bool {
+        self.published_interface_method_origins
+            .try_reserve(1)
+            .is_ok()
+            && self
+                .published_interface_method_signature_owners
+                .try_reserve(signature_count)
+                .is_ok()
+    }
+
+    /// Readers must validate a retained origin, including a damaged record.
+    pub(super) fn published_interface_method_origin(
+        &self,
+        type_: TypeId,
+    ) -> Option<&PublishedInterfaceMethodOrigin> {
+        self.observe_relation_type_read(type_);
+        self.published_interface_method_origins.get(&type_)
+    }
+
+    pub(super) fn published_interface_method_type_for_signature(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        self.observe_relation_signature_read(signature);
+        self.published_interface_method_signature_owners
+            .get(&signature)
+            .copied()
+    }
+
+    /// Only the selected method producer can publish this complete signature group.
+    pub(super) fn publish_published_interface_method_origin(
+        &mut self,
+        origin: PublishedInterfaceMethodOrigin,
+    ) -> bool {
+        let type_ = origin.result_type();
+        let signatures = origin.signatures();
+        if self.published_interface_method_origins.contains_key(&type_)
+            || signatures.is_empty()
+            || signatures.iter().enumerate().any(|(index, signature)| {
+                signatures[..index].contains(signature)
+                    || self
+                        .published_interface_method_signature_owners
+                        .contains_key(signature)
+            })
+            || !origin.matches_current_type(self)
+        {
+            return false;
+        }
+        for &signature in signatures {
+            self.published_interface_method_signature_owners
+                .insert(signature, type_);
+        }
+        self.published_interface_method_origins
+            .insert(type_, origin);
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_interface_method_origin_len(&self) -> usize {
+        self.published_interface_method_origins.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_interface_method_signature_owner_len(&self) -> usize {
+        self.published_interface_method_signature_owners.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_published_interface_method_origin_for_test(
+        &mut self,
+        type_: TypeId,
+        origin: Option<PublishedInterfaceMethodOrigin>,
+    ) -> Option<PublishedInterfaceMethodOrigin> {
+        let previous = match origin {
+            Some(origin) => self
+                .published_interface_method_origins
+                .insert(type_, origin),
+            None => self.published_interface_method_origins.remove(&type_),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_published_interface_method_type_for_signature_for_test(
+        &mut self,
+        signature: SignatureId,
+        type_: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let previous = match type_ {
+            Some(type_) => self
+                .published_interface_method_signature_owners
+                .insert(signature, type_),
+            None => self
+                .published_interface_method_signature_owners
+                .remove(&signature),
+        };
+        self.mark_relation_inputs_dirty();
+        self.mark_union_cache_validation_dirty();
+        previous
+    }
+
     pub(super) fn published_interface_method_recovery(
         &self,
         type_: TypeId,
@@ -12930,6 +13042,78 @@ mod tests {
 
     type TestStore = SemanticStore<&'static str, &'static str>;
     type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
+
+    #[test]
+    fn published_interface_method_origin_misses_are_observed_and_test_writes_invalidate() {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let type_ = store.intrinsic_bootstrap().unwrap().number_type;
+        let signature = empty_signature(&mut store);
+        let key = CacheHashKey::from_halves(43, 47);
+        for reverse in [false, true] {
+            let observation = store.begin_relation_read_observation().unwrap();
+            assert!(store.published_interface_method_origin(type_).is_none());
+            assert_eq!(
+                store.published_interface_method_type_for_signature(signature),
+                None
+            );
+            assert!(store.commit_relation_cache_writes(
+                observation,
+                RelationKind::Assignable,
+                [(key, RelationComparisonResult::SUCCEEDED)],
+            ));
+            assert!(store.relation_type_is_observable(type_));
+            assert!(store.relation_signature_is_observable(signature));
+            store.union_cache_needs_validation = false;
+
+            assert!(store.try_reserve_published_interface_method_origins(1));
+            assert_eq!(store.published_interface_method_origin_len(), 0);
+            assert_eq!(store.published_interface_method_signature_owner_len(), 0);
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::SUCCEEDED
+            );
+            assert!(!store.union_cache_needs_validation);
+
+            if reverse {
+                assert_eq!(
+                    store.replace_published_interface_method_type_for_signature_for_test(
+                        signature,
+                        Some(type_),
+                    ),
+                    None
+                );
+                assert_eq!(
+                    store.published_interface_method_type_for_signature(signature),
+                    Some(type_)
+                );
+                assert_eq!(store.published_interface_method_signature_owner_len(), 1);
+            } else {
+                assert!(
+                    store
+                        .replace_published_interface_method_origin_for_test(type_, None)
+                        .is_none()
+                );
+            }
+            assert_eq!(store.published_interface_method_origin_len(), 0);
+            assert_eq!(
+                store.relation_cache_get(RelationKind::Assignable, key),
+                RelationComparisonResult::NONE
+            );
+            assert!(store.union_cache_needs_validation);
+            if reverse {
+                assert_eq!(
+                    store.replace_published_interface_method_type_for_signature_for_test(
+                        signature, None,
+                    ),
+                    Some(type_)
+                );
+                assert_eq!(store.published_interface_method_signature_owner_len(), 0);
+            }
+        }
+    }
 
     #[test]
     fn published_interface_method_recovery_misses_are_observed_and_test_writes_invalidate() {

@@ -68,7 +68,9 @@ use super::{
         instantiate_type_with_vector_and_alias_and_session,
         instantiate_type_with_vector_and_session,
     },
-    instantiated_members::instantiated_function_member_signature_return,
+    instantiated_members::{
+        instantiated_function_member_signature_return, published_interface_method_signature_return,
+    },
     interface_heritage::{
         DirectInterfaceBaseKind, DirectInterfaceBasePlan, DirectInterfaceHeritagePlan,
     },
@@ -26797,6 +26799,29 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 })?;
             self.require_type_reference_alias_root_capability(declaration)?;
             return Ok(return_type);
+        }
+        let array_targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let invalid_method =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+        if let Some(method) =
+            published_interface_method_signature_return(self.store, signature, array_targets)
+                .map_err(|_| invalid_method())?
+        {
+            self.reject_type_reference_alias_capabilities()?;
+            let source_return = self
+                .get_return_type_of_declared_method_signature(method.source, method.declaration)
+                .map_err(|_| invalid_method())?;
+            if source_return != method.source_return
+                || published_interface_method_signature_return(self.store, signature, array_targets)
+                    .map_err(|_| invalid_method())?
+                    != Some(method)
+            {
+                return Err(invalid_method());
+            }
+            return Ok(method.return_type);
         }
         if let Some(type_) = self
             .store
@@ -69562,6 +69587,108 @@ mod tests {
             diagnostics,
         )?
         .preflight_type_of_interface_method(symbol)
+    }
+
+    #[test]
+    fn copied_interface_method_return_rejects_active_push_before_ready_return() {
+        let mut fixture = default_library_fixture(concat!(
+            "interface Array<T> { push(...items: T[]): number; } ",
+            "interface ReadonlyArray<T> {} interface Object {} interface Function {} ",
+            "interface IArguments {} interface String {} interface Number {} ",
+            "interface Boolean {} interface RegExp {} interface ThisType<T> {}",
+        ));
+        let globals = initialize_fixture_global_types(&mut fixture);
+        let (method, _) = selected_interface_method_return(&fixture, "Array", "push");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut setup = InstantiationSession::new(InstantiationLimits::default());
+        let source = CanonicalTypeQuery::new_with_global_types_and_session(
+            &mut fixture.store,
+            &host,
+            &globals,
+            CanonicalTypeQueryOptions::default(),
+            &mut setup,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_interface_method(method)
+        .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let receiver = fixture
+            .store
+            .create_direct_generic_reference_type(globals.array_type, &[number])
+            .unwrap();
+        let copied = super::super::instantiated_members::instantiate_published_generic_interface_method_with_session(
+            &mut fixture.store,
+            &globals,
+            receiver,
+            method,
+            &mut setup,
+        )
+        .unwrap();
+        let origin = fixture
+            .store
+            .published_interface_method_origin(copied)
+            .unwrap();
+        let [signature] = origin.signatures() else {
+            panic!("push must retain its one copied signature")
+        };
+        let signature = *signature;
+        assert_ne!(source, copied);
+        let recorded = fixture.store.signature(signature).unwrap();
+        assert!(recorded.has_rest_parameter());
+        assert_eq!(recorded.resolved_return_type(), Some(number));
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                function_store_state(store),
+                store.symbol_len(),
+                store.published_interface_method_origin_len(),
+                store.published_interface_method_signature_owner_len(),
+            )
+        };
+        let before = snapshot(&fixture.store);
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                &mut fixture.store,
+                &host,
+                &globals,
+                CanonicalTypeQueryOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(query.resolving_instantiated_signatures.insert(signature));
+            assert_eq!(
+                query.get_return_type_of_signature(signature),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(signature)
+                ))
+            );
+            assert!(query.resolving_instantiated_signatures.contains(&signature));
+            assert_eq!(snapshot(query.store), before);
+            assert!(query.resolving_instantiated_signatures.remove(&signature));
+            for _ in 0..2 {
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(number));
+                assert!(query.resolving_instantiated_signatures.is_empty());
+                assert_eq!(snapshot(query.store), before);
+            }
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0)
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

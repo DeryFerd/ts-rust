@@ -373,6 +373,76 @@ pub(super) struct InstantiatedPropertyRecovery {
     identity: Vec<RecoveredPropertyTypeIdentity>,
 }
 
+/// The selected-method producer owns this exact copied overload group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PublishedInterfaceMethodOrigin {
+    result: TypeId,
+    plan: PublishedInterfaceMethodPlan,
+    mapper: TypeMapperId,
+    array_targets: CanonicalArrayTargets,
+    signatures: Box<[SignatureId]>,
+}
+
+impl PublishedInterfaceMethodOrigin {
+    pub(super) const fn result_type(&self) -> TypeId {
+        self.result
+    }
+
+    pub(super) fn signatures(&self) -> &[SignatureId] {
+        &self.signatures
+    }
+
+    pub(super) fn matches_current_type(&self, store: &CanonicalTypeMapperStore) -> bool {
+        if !published_interface_method_header_matches(store, &self.plan, self.result, self.mapper) {
+            return false;
+        }
+        let Some(signatures) = store
+            .type_payload(self.result)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+        else {
+            return false;
+        };
+        self.result != self.plan.source
+            && store
+                .type_payload(self.array_targets.array_type())
+                .is_some()
+            && store
+                .type_payload(self.array_targets.readonly_array_type())
+                .is_some()
+            && !self.signatures.is_empty()
+            && signatures == self.signatures.as_ref()
+            && self.signatures.len() == self.plan.signatures.len()
+            && self
+                .signatures
+                .iter()
+                .zip(&self.plan.signatures)
+                .all(|(&signature, source)| {
+                    let Some(original) = store.signature(source.source) else {
+                        return false;
+                    };
+                    signature != source.source
+                        && original.target().is_none()
+                        && original.mapper().is_none()
+                        && store.signature(signature).is_some_and(|copied| {
+                            copied.target() == Some(source.source)
+                                && copied.mapper().is_some()
+                                && copied.declaration() == original.declaration()
+                        })
+                })
+    }
+}
+
+/// A ready method return whose original declaration still needs the caller's host check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PublishedInterfaceMethodSignatureReturn {
+    pub(super) owner: TypeId,
+    pub(super) source: SignatureId,
+    pub(super) declaration: NodeRef,
+    pub(super) source_return: TypeId,
+    pub(super) return_type: TypeId,
+}
+
 /// A selected method keeps its own recovery proof, without inventing a member proxy.
 #[derive(Debug)]
 pub(super) struct PublishedInterfaceMethodRecovery {
@@ -3244,6 +3314,11 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
     } else {
         None
     };
+    if !store.try_reserve_published_interface_method_origins(signatures.len()) {
+        return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+    }
+    let origin_plan = plan.clone();
+    let origin_signatures = signatures.clone().into_boxed_slice();
     let callable = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.method))
         .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
@@ -3267,6 +3342,15 @@ pub(super) fn instantiate_published_generic_interface_method_with_session(
             }
         ));
     }
+    assert!(
+        store.publish_published_interface_method_origin(PublishedInterfaceMethodOrigin {
+            result: callable,
+            plan: origin_plan,
+            mapper,
+            array_targets: targets,
+            signatures: origin_signatures,
+        })
+    );
     mapped_interface_method_value(store, global_types, &plan, callable)
 }
 
@@ -4020,51 +4104,164 @@ fn cached_published_interface_method(
         if cached_receiver != plan.receiver {
             continue;
         }
-        if cached.replace(type_).is_some()
-            || record.flags() != TypeFlags::OBJECT
-            || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
-            || record.alias().is_some()
-            || object.instantiations != TypeCacheState::Unallocated
-            || object.structured.members.is_some()
-            || object.structured.properties.is_some()
-            || object.structured.index_infos.is_some()
-            || object.structured.constrained != ConstrainedTypeData::default()
-            || object
-                .structured
-                .object_type_without_abstract_construct_signatures
-                .is_some()
-            || object.structured.call_signature_count != plan.signatures.len()
-        {
-            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
-                plan.receiver,
-            ));
+        if cached.replace(type_).is_some() {
+            return Err(invalid());
         }
-        let signatures = object
-            .structured
-            .signatures
-            .as_deref()
-            .filter(|signatures| signatures.len() == plan.signatures.len())
-            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
-                plan.receiver,
-            ))?;
-        if let Some(recovery) = store.published_interface_method_recovery(type_) {
-            if recovery.result_type() != type_
-                || recovery.plan != *plan
-                || recovery.mapper != mapper
-                || recovery.array_targets != targets
-                || recovery.checked_identity(store).is_none()
-            {
-                return Err(invalid());
-            }
-            continue;
-        }
-        for (&signature, source) in signatures.iter().zip(&plan.signatures) {
-            validate_published_interface_method_signature(
-                store, plan, source, signature, mapper, targets,
-            )?;
-        }
+        validate_published_interface_method_copy(store, plan, type_, mapper, targets)?;
     }
     Ok(cached)
+}
+
+fn published_interface_method_header_matches(
+    store: &CanonicalTypeMapperStore,
+    plan: &PublishedInterfaceMethodPlan,
+    type_: TypeId,
+    mapper: TypeMapperId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    record.flags() == TypeFlags::OBJECT
+        && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        && record.symbol() == Some(plan.method)
+        && record.alias().is_none()
+        && object.target == Some(plan.source)
+        && object.mapper == Some(mapper)
+        && object.instantiations == TypeCacheState::Unallocated
+        && object.structured.members.is_none()
+        && object.structured.properties.is_none()
+        && object.structured.index_infos.is_none()
+        && object.structured.constrained == ConstrainedTypeData::default()
+        && object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_none()
+        && object.structured.call_signature_count == plan.signatures.len()
+        && store.type_mapper_has_exact_endpoints(mapper, &plan.mapper_sources, &plan.mapper_targets)
+            == Some(true)
+}
+
+/// Shares the selected method's warm checks without searching for its owner.
+fn validate_published_interface_method_copy(
+    store: &CanonicalTypeMapperStore,
+    plan: &PublishedInterfaceMethodPlan,
+    type_: TypeId,
+    mapper: TypeMapperId,
+    targets: CanonicalArrayTargets,
+) -> Result<(), GenericInterfaceMemberError> {
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver);
+    if !published_interface_method_header_matches(store, plan, type_, mapper) {
+        return Err(invalid());
+    }
+    let signatures = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.signatures.as_deref())
+        .filter(|signatures| signatures.len() == plan.signatures.len())
+        .ok_or_else(invalid)?;
+    if let Some(recovery) = store.published_interface_method_recovery(type_) {
+        if recovery.result_type() != type_
+            || recovery.plan != *plan
+            || recovery.mapper != mapper
+            || recovery.array_targets != targets
+            || recovery.checked_identity(store).is_none()
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    for (&signature, source) in signatures.iter().zip(&plan.signatures) {
+        validate_published_interface_method_signature(
+            store, plan, source, signature, mapper, targets,
+        )?;
+    }
+    Ok(())
+}
+
+/// Reads only the copied method group retained by this signature's producer.
+pub(super) fn published_interface_method_signature_return(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<PublishedInterfaceMethodSignatureReturn>, GenericInterfaceMemberError> {
+    let Some(owner) = store.published_interface_method_type_for_signature(signature) else {
+        return Ok(None);
+    };
+    let invalid = || GenericInterfaceMemberError::InvalidCachedMembers(owner);
+    let origin = store
+        .published_interface_method_origin(owner)
+        .ok_or_else(invalid)?;
+    if origin.result != owner
+        || !origin.matches_current_type(store)
+        || origin.signatures.iter().any(|&signature| {
+            store.published_interface_method_type_for_signature(signature) != Some(owner)
+        })
+    {
+        return Err(invalid());
+    }
+    let index = origin
+        .signatures
+        .iter()
+        .position(|&candidate| candidate == signature)
+        .ok_or_else(invalid)?;
+    let targets = array_targets.ok_or_else(invalid)?;
+    if targets != origin.array_targets {
+        return Err(invalid());
+    }
+    let plan = plan_published_interface_method(
+        store,
+        Some(targets),
+        origin.plan.receiver,
+        origin.plan.method,
+    )?;
+    if plan != origin.plan {
+        return Err(invalid());
+    }
+    validate_published_interface_method_copy(store, &plan, owner, origin.mapper, targets)?;
+    let StoredCallableSetValidation::Valid {
+        family: CallableFamily::DeclaredCallSignatures,
+        projection,
+        ..
+    } = super::callable_sets::validate_stored_callable_set(store, owner)
+    else {
+        return Err(invalid());
+    };
+    if projection.owner != owner
+        || !projection.construct_signatures.is_empty()
+        || projection.call_signatures.len() != origin.signatures.len()
+        || projection
+            .call_signatures
+            .iter()
+            .zip(origin.signatures.iter())
+            .any(|(callable, signature)| callable.signature != *signature)
+    {
+        return Err(invalid());
+    }
+    for type_ in [plan.source, plan.receiver, owner] {
+        store
+            .validate_cached_array_capability_with_array_targets(targets, type_)
+            .map_err(|_| invalid())?;
+    }
+    let source = plan.signatures.get(index).ok_or_else(invalid)?;
+    let declaration = store
+        .signature(source.source)
+        .and_then(super::signatures::Signature::declaration)
+        .ok_or_else(invalid)?;
+    let return_type = projection
+        .call_signatures
+        .get(index)
+        .and_then(|callable| callable.return_type)
+        .ok_or_else(invalid)?;
+    Ok(Some(PublishedInterfaceMethodSignatureReturn {
+        owner,
+        source: source.source,
+        declaration,
+        source_return: source.return_type,
+        return_type,
+    }))
 }
 
 fn validate_published_interface_method_signature(
@@ -16570,6 +16767,7 @@ mod tests {
     mod published_array_method_recovery_tests {
         use super::*;
         use crate::semantic::callable_sets::validate_stored_callable_set;
+        use crate::semantic::{DeclaredTypeError, TypeNodeUnavailable};
 
         struct Fixture<'arena> {
             context: CanonicalCheckerContext<'arena>,
@@ -17816,6 +18014,612 @@ mod tests {
             }
             assert_eq!(counts(store), before);
             assert_warm(&mut fixture, actual, &mut session);
+        }
+
+        #[derive(Clone, Copy)]
+        enum ReturnQuery {
+            WithArrays,
+            WithoutArrays,
+            MissingLibraryHost,
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct ReturnSnapshot {
+            arenas: [usize; 12],
+            links: [usize; 26],
+            origins: usize,
+            signature_owners: usize,
+        }
+
+        fn return_snapshot(store: &CanonicalTypeMapperStore) -> ReturnSnapshot {
+            let (arenas, links) = counts(store);
+            ReturnSnapshot {
+                arenas,
+                links,
+                origins: store.published_interface_method_origin_len(),
+                signature_owners: store.published_interface_method_signature_owner_len(),
+            }
+        }
+
+        fn query_return(
+            fixture: &mut Fixture<'_>,
+            library: &ParseResult,
+            source: &ParseResult,
+            signature: SignatureId,
+            session: &mut InstantiationSession,
+            mode: ReturnQuery,
+        ) -> Result<TypeId, DeclaredTypeError> {
+            let files = [
+                (FileId::new(20_220), library),
+                (FileId::new(20_221), source),
+            ];
+            let bounds = files.map(|(file, _)| fixture.context.file(file).unwrap().1.clone());
+            let options = fixture.context.options();
+            let globals = fixture.context.global_types().clone();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                files
+                    .iter()
+                    .zip(&bounds)
+                    .filter(|((file, _), _)| {
+                        !matches!(mode, ReturnQuery::MissingLibraryHost)
+                            || *file == FileId::new(20_221)
+                    })
+                    .map(|((_, parsed), bound)| (&parsed.arena, bound)),
+                crate::semantic::production::GlobalMergeCompletion::for_test(
+                    options.name_resolution,
+                ),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = if matches!(mode, ReturnQuery::WithoutArrays) {
+                CanonicalTypeQuery::new_with_session_for_test(
+                    fixture.context.store_mut_for_test(),
+                    &host,
+                    options,
+                    session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature)
+            } else {
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    fixture.context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    options,
+                    session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature)
+            };
+            assert!(diagnostics.is_empty());
+            result
+        }
+
+        fn assert_return(
+            fixture: &mut Fixture<'_>,
+            library: &ParseResult,
+            source: &ParseResult,
+            signature: SignatureId,
+            session: &mut InstantiationSession,
+            mode: ReturnQuery,
+            expected: &Result<TypeId, DeclaredTypeError>,
+        ) {
+            let before = return_snapshot(fixture.context.store());
+            let work = budget(session);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_return(fixture, library, source, signature, session, mode).as_ref(),
+                    expected.as_ref(),
+                );
+                assert_eq!(return_snapshot(fixture.context.store()), before);
+                assert_eq!(budget(session), work);
+            }
+        }
+
+        fn invalid_return(signature: SignatureId) -> DeclaredTypeError {
+            DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                signature,
+            ))
+        }
+
+        #[test]
+        fn copied_interface_method_returns_keep_normal_recovery_and_warm_identity() {
+            let library = library();
+            for readonly in [false, true] {
+                let source = parse_source_file(&format!(
+                    "declare const values: {}number[]; values.filter;",
+                    if readonly { "readonly " } else { "" },
+                ));
+                for limits in ["normal", "adequate_recovery", "count", "depth"] {
+                    let mut fixture = fixture(&library, &source);
+                    let store = fixture.context.store();
+                    assert_eq!(store.published_interface_method_origin_len(), 0);
+                    assert_eq!(store.published_interface_method_signature_owner_len(), 0);
+                    let mut session = if limits == "normal" {
+                        InstantiationSession::new(InstantiationLimits::default())
+                    } else {
+                        InstantiationSession::new_recovering(
+                            store,
+                            InstantiationLimits {
+                                max_count: if limits == "count" {
+                                    0
+                                } else {
+                                    InstantiationLimits::default().max_count
+                                },
+                                max_depth: if limits == "depth" {
+                                    1
+                                } else {
+                                    InstantiationLimits::default().max_depth
+                                },
+                            },
+                            store.intrinsic_bootstrap().unwrap().error_type,
+                        )
+                        .unwrap()
+                    };
+                    let actual = demand(&mut fixture, &mut session).unwrap();
+                    let recovered = matches!(limits, "count" | "depth");
+                    assert_eq!(session.limit_event_count() > 0, recovered);
+                    if limits != "depth" {
+                        assert_mapping(&fixture, actual, limits == "count");
+                    }
+                    let store = fixture.context.store();
+                    let copied = projection(store, actual);
+                    assert_eq!(store.published_interface_method_origin_len(), 1);
+                    assert_eq!(store.published_interface_method_signature_owner_len(), 2);
+                    for callable in &copied.call_signatures {
+                        assert_eq!(
+                            store.published_interface_method_type_for_signature(callable.signature),
+                            Some(actual)
+                        );
+                    }
+                    for callable in copied.call_signatures {
+                        assert_return(
+                            &mut fixture,
+                            &library,
+                            &source,
+                            callable.signature,
+                            &mut session,
+                            ReturnQuery::WithArrays,
+                            &Ok(callable.return_type.unwrap()),
+                        );
+                    }
+                    assert_warm(&mut fixture, actual, &mut session);
+                }
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Each ownership row is damaged, read twice, and restored.
+        fn copied_interface_method_returns_reject_owner_damage_without_growth() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            for recovering in [false, true] {
+                for mutation in [
+                    "forward_missing",
+                    "forward_result",
+                    "forward_receiver",
+                    "forward_group",
+                    "forward_targets",
+                    "reverse_missing",
+                    "reverse_owner",
+                    "reverse_original",
+                    "sibling_missing",
+                ] {
+                    let mut fixture = fixture(&library, &source);
+                    let mut session = if recovering {
+                        recovery_session(fixture.context.store())
+                    } else {
+                        InstantiationSession::new(InstantiationLimits::default())
+                    };
+                    let actual = demand(&mut fixture, &mut session).unwrap();
+                    let store = fixture.context.store_mut_for_test();
+                    let origin = store
+                        .published_interface_method_origin(actual)
+                        .unwrap()
+                        .clone();
+                    let signature = origin.signatures[0];
+                    let requested = if mutation == "reverse_original" {
+                        origin.plan.signatures[0].source
+                    } else {
+                        signature
+                    };
+                    let returned = store
+                        .signature(requested)
+                        .unwrap()
+                        .resolved_return_type()
+                        .unwrap();
+                    let before = return_snapshot(store);
+                    match mutation {
+                        "reverse_missing" | "sibling_missing" => {
+                            let removed = if mutation == "sibling_missing" {
+                                origin.signatures[1]
+                            } else {
+                                signature
+                            };
+                            assert_eq!(
+                                store
+                                    .replace_published_interface_method_type_for_signature_for_test(
+                                        removed, None
+                                    ),
+                                Some(actual)
+                            );
+                        }
+                        "reverse_owner" | "reverse_original" => {
+                            assert_eq!(
+                                store
+                                    .replace_published_interface_method_type_for_signature_for_test(
+                                        requested,
+                                        Some(if mutation == "reverse_owner" {
+                                            fixture.source
+                                        } else {
+                                            actual
+                                        }),
+                                    ),
+                                (mutation == "reverse_owner").then_some(actual)
+                            );
+                        }
+                        "forward_missing" => {
+                            assert_eq!(
+                                store.replace_published_interface_method_origin_for_test(
+                                    actual, None
+                                ),
+                                Some(origin.clone())
+                            );
+                        }
+                        _ => {
+                            let mut damaged = origin.clone();
+                            match mutation {
+                                "forward_result" => damaged.result = fixture.source,
+                                "forward_receiver" => damaged.plan.receiver = fixture.element,
+                                "forward_group" => damaged.signatures.swap(0, 1),
+                                "forward_targets" => {
+                                    damaged.array_targets =
+                                        CanonicalArrayTargets::for_single_target_validation(
+                                            origin.array_targets.array_type(),
+                                        );
+                                }
+                                _ => unreachable!(),
+                            }
+                            assert_eq!(
+                                store.replace_published_interface_method_origin_for_test(
+                                    actual,
+                                    Some(damaged)
+                                ),
+                                Some(origin.clone())
+                            );
+                        }
+                    }
+                    assert!(!store.publish_published_interface_method_origin(origin.clone()));
+                    assert_return(
+                        &mut fixture,
+                        &library,
+                        &source,
+                        requested,
+                        &mut session,
+                        ReturnQuery::WithArrays,
+                        &Err(invalid_return(requested)),
+                    );
+                    let store = fixture.context.store_mut_for_test();
+                    match mutation {
+                        "reverse_missing" | "reverse_owner" | "sibling_missing" => {
+                            let restored = if mutation == "sibling_missing" {
+                                origin.signatures[1]
+                            } else {
+                                signature
+                            };
+                            assert_eq!(
+                                store
+                                    .replace_published_interface_method_type_for_signature_for_test(
+                                        restored,
+                                        Some(actual)
+                                    ),
+                                (mutation == "reverse_owner").then_some(fixture.source)
+                            );
+                        }
+                        "reverse_original" => {
+                            assert_eq!(
+                                store
+                                    .replace_published_interface_method_type_for_signature_for_test(
+                                        requested, None
+                                    ),
+                                Some(actual)
+                            );
+                        }
+                        _ => {
+                            assert_eq!(
+                                store
+                                    .replace_published_interface_method_origin_for_test(
+                                        actual,
+                                        Some(origin),
+                                    )
+                                    .is_some(),
+                                mutation != "forward_missing",
+                            );
+                        }
+                    }
+                    assert_eq!(return_snapshot(store), before);
+                    assert_return(
+                        &mut fixture,
+                        &library,
+                        &source,
+                        requested,
+                        &mut session,
+                        ReturnQuery::WithArrays,
+                        &Ok(returned),
+                    );
+                }
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)] // Both normal and recovered graphs use the same raw-return reader.
+        fn copied_interface_method_returns_reject_graph_damage_then_restore() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            for recovering in [false, true] {
+                for mutation in [
+                    "object_mapper",
+                    "signature_target",
+                    "signature_mapper",
+                    "signature_return",
+                    "source_return",
+                    "signature_order",
+                    "fresh_constraint",
+                    "callback_return",
+                ] {
+                    let mut fixture = fixture(&library, &source);
+                    let mut session = if recovering {
+                        recovery_session(fixture.context.store())
+                    } else {
+                        InstantiationSession::new(InstantiationLimits::default())
+                    };
+                    let actual = demand(&mut fixture, &mut session).unwrap();
+                    let store = fixture.context.store_mut_for_test();
+                    let origin = store
+                        .published_interface_method_origin(actual)
+                        .unwrap()
+                        .clone();
+                    let signature = origin.signatures[1];
+                    let original = store.signature(signature).unwrap().clone();
+                    let source_signature = origin.plan.signatures[1].source;
+                    let source_return = origin.plan.signatures[1].return_type;
+                    let fresh = store
+                        .signature(origin.signatures[0])
+                        .unwrap()
+                        .type_parameters()[0];
+                    let TypeData::TypeParameter(fresh_data) =
+                        store.type_payload(fresh).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let fresh_data = fresh_data.clone();
+                    let callback = store
+                        .value_symbol_links(original.parameters()[0])
+                        .unwrap()
+                        .resolved_type
+                        .unwrap();
+                    let callback = projection(store, callback).call_signatures[0].clone();
+                    let number = store.intrinsic_bootstrap().unwrap().number_type;
+                    let string = store.intrinsic_bootstrap().unwrap().string_type;
+                    let wrong_mapper = store
+                        .new_simple_type_mapper(fixture.source_element, string)
+                        .unwrap();
+                    let before = return_snapshot(store);
+                    assert!(match mutation {
+                        "object_mapper" => store.set_object_target_and_mapper(
+                            actual,
+                            Some(fixture.source),
+                            Some(wrong_mapper)
+                        ),
+                        "signature_target" => store.set_signature_target_and_mapper(
+                            signature,
+                            Some(origin.plan.signatures[0].source),
+                            original.mapper()
+                        ),
+                        "signature_mapper" => store.set_signature_target_and_mapper(
+                            signature,
+                            original.target(),
+                            Some(wrong_mapper)
+                        ),
+                        "signature_return" =>
+                            store.set_signature_resolved_return_type(signature, Some(string)),
+                        "source_return" =>
+                            store.set_signature_resolved_return_type(source_signature, Some(number)),
+                        "signature_order" => store.set_structured_type_members(
+                            actual,
+                            None,
+                            None,
+                            Some(vec![origin.signatures[1], origin.signatures[0]]),
+                            None,
+                            None
+                        ),
+                        "fresh_constraint" => store.set_type_parameter_resolution(
+                            fresh,
+                            Some(string),
+                            fresh_data.target,
+                            fresh_data.mapper,
+                            fresh_data.resolved_default_type
+                        ),
+                        "callback_return" => store
+                            .set_signature_resolved_return_type(callback.signature, Some(string)),
+                        _ => unreachable!(),
+                    });
+                    assert_return(
+                        &mut fixture,
+                        &library,
+                        &source,
+                        signature,
+                        &mut session,
+                        ReturnQuery::WithArrays,
+                        &Err(invalid_return(signature)),
+                    );
+                    let store = fixture.context.store_mut_for_test();
+                    assert!(match mutation {
+                        "object_mapper" => store.set_object_target_and_mapper(
+                            actual,
+                            Some(fixture.source),
+                            Some(origin.mapper)
+                        ),
+                        "signature_target" | "signature_mapper" => store
+                            .set_signature_target_and_mapper(
+                                signature,
+                                original.target(),
+                                original.mapper()
+                            ),
+                        "signature_return" => store.set_signature_resolved_return_type(
+                            signature,
+                            original.resolved_return_type()
+                        ),
+                        "source_return" => store.set_signature_resolved_return_type(
+                            source_signature,
+                            Some(source_return)
+                        ),
+                        "signature_order" => store.set_structured_type_members(
+                            actual,
+                            None,
+                            None,
+                            Some(origin.signatures.to_vec()),
+                            None,
+                            None
+                        ),
+                        "fresh_constraint" => store.set_type_parameter_resolution(
+                            fresh,
+                            fresh_data.constraint,
+                            fresh_data.target,
+                            fresh_data.mapper,
+                            fresh_data.resolved_default_type
+                        ),
+                        "callback_return" => store.set_signature_resolved_return_type(
+                            callback.signature,
+                            callback.return_type
+                        ),
+                        _ => unreachable!(),
+                    });
+                    assert_eq!(return_snapshot(store), before);
+                    assert_return(
+                        &mut fixture,
+                        &library,
+                        &source,
+                        signature,
+                        &mut session,
+                        ReturnQuery::WithArrays,
+                        &Ok(original.resolved_return_type().unwrap()),
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn copied_interface_method_returns_require_caller_arrays_and_source_host() {
+            let library = library();
+            let source =
+                parse_source_file("declare const values: readonly number[]; values.filter;");
+            for recovering in [false, true] {
+                let mut fixture = fixture(&library, &source);
+                let mut session = if recovering {
+                    recovery_session(fixture.context.store())
+                } else {
+                    InstantiationSession::new(InstantiationLimits::default())
+                };
+                let actual = demand(&mut fixture, &mut session).unwrap();
+                let origin = fixture
+                    .context
+                    .store()
+                    .published_interface_method_origin(actual)
+                    .unwrap()
+                    .clone();
+                let signature = origin.signatures[1];
+                let returned = fixture
+                    .context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type()
+                    .unwrap();
+                for mode in [ReturnQuery::WithoutArrays, ReturnQuery::MissingLibraryHost] {
+                    assert_return(
+                        &mut fixture,
+                        &library,
+                        &source,
+                        signature,
+                        &mut session,
+                        mode,
+                        &Err(invalid_return(signature)),
+                    );
+                }
+                let store = fixture.context.store();
+                let before = return_snapshot(store);
+                for targets in [
+                    CanonicalArrayTargets::for_single_target_validation(
+                        origin.array_targets.array_type(),
+                    ),
+                    CanonicalArrayTargets::for_single_target_validation(
+                        origin.array_targets.readonly_array_type(),
+                    ),
+                ] {
+                    assert!(
+                        published_interface_method_signature_return(
+                            store,
+                            signature,
+                            Some(targets)
+                        )
+                        .is_err()
+                    );
+                }
+                assert_eq!(return_snapshot(store), before);
+                assert_return(
+                    &mut fixture,
+                    &library,
+                    &source,
+                    signature,
+                    &mut session,
+                    ReturnQuery::WithArrays,
+                    &Ok(returned),
+                );
+            }
+        }
+
+        #[test]
+        fn copied_interface_method_returns_keep_recovery_revoked_after_raw_write() {
+            let library = library();
+            let source = parse_source_file("declare const values: number[]; values.filter;");
+            let mut fixture = fixture(&library, &source);
+            let mut session = recovery_session(fixture.context.store());
+            let actual = demand(&mut fixture, &mut session).unwrap();
+            let store = fixture.context.store_mut_for_test();
+            let signature = store
+                .published_interface_method_origin(actual)
+                .unwrap()
+                .signatures[1];
+            let parameter = store.signature(signature).unwrap().parameters()[0];
+            let links = store.value_symbol_links(parameter).unwrap().clone();
+            assert!(store.set_value_symbol_links(parameter, links.clone()));
+            assert_return(
+                &mut fixture,
+                &library,
+                &source,
+                signature,
+                &mut session,
+                ReturnQuery::WithArrays,
+                &Err(invalid_return(signature)),
+            );
+            assert!(
+                fixture
+                    .context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(parameter, links)
+            );
+            assert_return(
+                &mut fixture,
+                &library,
+                &source,
+                signature,
+                &mut session,
+                ReturnQuery::WithArrays,
+                &Err(invalid_return(signature)),
+            );
         }
     }
 
