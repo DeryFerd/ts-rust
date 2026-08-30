@@ -8059,7 +8059,7 @@ mod tests {
                 4 => {
                     assert!(context.store_mut_for_test().set_literal_links(
                         regular_false,
-                        Some(truth),
+                        Some(regular_false),
                         regular_false,
                     ));
                     SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(
@@ -8098,6 +8098,18 @@ mod tests {
                     "poison {poison}"
                 );
                 assert_eq!(state(&context), before, "poison {poison}");
+            }
+            if poison == 4 {
+                assert!(context.store_mut_for_test().set_literal_links(
+                    regular_false,
+                    Some(falsity),
+                    regular_false,
+                ));
+                let restored = state(&context);
+                for (node, expected) in [(outer, truth), (inner, falsity), (literal, truth)] {
+                    assert_eq!(context.get_type_at_location(node), Ok(expected));
+                    assert_eq!(state(&context), restored);
+                }
             }
         }
     }
