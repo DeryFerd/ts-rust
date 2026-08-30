@@ -389,7 +389,7 @@ fn assert_diagnostics(
                         .unwrap()
                         .range
                 },
-                |range| range.range(),
+                ts_checker::semantic::CanonicalCheckerDiagnosticRange::range,
             );
             (
                 diagnostic.diagnostic.code(),
