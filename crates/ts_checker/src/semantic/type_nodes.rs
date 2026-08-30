@@ -5874,10 +5874,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     break self.conditional_capture_identifier_symbol(name, SymbolFlags::VALUE)?;
                 }
                 NodeData::QualifiedName(data) => {
-                    name = NodeRef::new(name.arena, name.file, data.left)
+                    name = NodeRef::new(name.arena, name.file, data.left);
                 }
                 NodeData::PropertyAccessExpression(data) => {
-                    name = NodeRef::new(name.arena, name.file, data.expression)
+                    name = NodeRef::new(name.arena, name.file, data.expression);
                 }
                 _ if self
                     .host
