@@ -22,9 +22,9 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
-    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
-    ResolvedSignatureState, SignatureId, SignatureLinks, TypeDisplayUnavailable, TypeId,
-    TypeNodeLinks, ValueSymbolLinks,
+    CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, EffectsSignatureState,
+    RelationUnavailable, ResolvedSignatureState, SignatureId, SignatureLinks,
+    TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::{
@@ -69,7 +69,7 @@ use super::{
         PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
         UnsupportedSourceSyntax, logical_binary_operator_text, merge_retry_diagnostic,
         merge_retry_diagnostics, primitive_binary_operator_text,
-        retry_source_generic_member_failure,
+        retry_source_generic_member_failure, source_call_effects_target_type,
     },
     source_callables::{
         CallableTypePredicatePlan, StoredSourceCallableValidation,
@@ -5109,6 +5109,7 @@ fn preflight_call_cache_state(
     if let Some(links) = store.signature_links(node) {
         let expected = SignatureLinks {
             resolved_signature: links.resolved_signature,
+            effects_signature: links.effects_signature,
             ..SignatureLinks::default()
         };
         if links != &expected
@@ -5117,6 +5118,10 @@ fn preflight_call_cache_state(
                 ResolvedSignatureState::Resolving => true,
                 ResolvedSignatureState::Resolved(signature) => store.signature(signature).is_none(),
             }
+            || links
+                .effects_signature
+                .signature()
+                .is_some_and(|signature| store.signature(signature).is_none())
         {
             return Err(SourceCheckError::Call(node));
         }
@@ -5147,6 +5152,12 @@ fn preflight_super_call_links(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
 ) -> Result<(), SourceCheckError> {
+    if store
+        .signature_links(node)
+        .is_some_and(|links| links.effects_signature != EffectsSignatureState::Unresolved)
+    {
+        return Err(SourceCheckError::Call(node));
+    }
     let Some((type_, signature)) = preflight_call_cache_state(store, node)? else {
         return Ok(());
     };
@@ -7588,6 +7599,12 @@ pub(super) fn check_class_body_method_call(
     argument_types: &[TypeId],
     access: &ClassBodyAccessToken,
 ) -> Result<ClassBodyMethodCallResult, SourceCheckError> {
+    if store
+        .signature_links(plan.node)
+        .is_some_and(|links| links.effects_signature != EffectsSignatureState::Unresolved)
+    {
+        return Err(SourceCheckError::Call(plan.node));
+    }
     if plan.arguments.len() != argument_types.len() {
         return Err(SourceCheckError::Call(plan.node));
     }
@@ -7678,6 +7695,98 @@ pub(super) fn check_class_body_method_call(
     }))
 }
 
+/// Dotted assertion targets use declared types, not types inferred through flow.
+pub(super) fn source_effects_symbol_is_explicit(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    call: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let symbol = store.symbol(symbol).ok_or(SourceCheckError::Call(call))?;
+    if symbol.flags().intersects(
+        SymbolFlags::FUNCTION
+            | SymbolFlags::METHOD
+            | SymbolFlags::CLASS
+            | SymbolFlags::VALUE_MODULE,
+    ) {
+        return Ok(true);
+    }
+    if !symbol
+        .flags()
+        .intersects(SymbolFlags::VARIABLE | SymbolFlags::PROPERTY)
+    {
+        return Ok(false);
+    }
+    let Some(declaration) = symbol.value_declaration() else {
+        return Ok(false);
+    };
+    let declaration = host.node(declaration).ok_or(SourceCheckError::Call(call))?;
+    Ok(match &declaration.data {
+        NodeData::VariableDeclaration(variable) => variable.type_.is_some(),
+        NodeData::PropertyDeclaration(property) => property.type_.is_some(),
+        NodeData::PropertySignatureDeclaration(property) => property.type_.is_some(),
+        NodeData::ParameterDeclaration(parameter) => parameter.type_.is_some(),
+        _ => false,
+    })
+}
+
+/// Uses the pinned effects-signature cache independently of argument diagnostics.
+/// `None` is the Go no-explicit-target result, not an unknown callable type.
+pub(super) fn resolve_source_call_effects_signature(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceCallPlan,
+    callee_type: Option<TypeId>,
+) -> Result<EffectsSignatureState, SourceCheckError> {
+    let invalid = || SourceCheckError::Call(plan.node);
+    let unsupported = || SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(plan.node));
+    let state = match callee_type.map(|type_| validate_stored_callable_set(store, type_)) {
+        Some(StoredCallableSetValidation::Valid { projection, .. }) => {
+            let mut candidates = Vec::new();
+            for callable in projection.call_signatures.iter() {
+                let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+                let result = signature
+                    .resolved_return_type()
+                    .and_then(|type_| store.type_payload(type_))
+                    .ok_or_else(unsupported)?;
+                if signature.resolved_type_predicate().is_some()
+                    || result.flags().intersects(TypeFlags::NEVER)
+                {
+                    candidates.push(callable.signature);
+                }
+            }
+            if candidates.is_empty() {
+                EffectsSignatureState::NoEffects
+            } else {
+                let [callable] = projection.call_signatures.as_ref() else {
+                    return Err(unsupported());
+                };
+                let signature = store.signature(callable.signature).ok_or_else(invalid)?;
+                if !signature.type_parameters().is_empty() {
+                    return Err(unsupported());
+                }
+                EffectsSignatureState::Resolved(callable.signature)
+            }
+        }
+        None | Some(StoredCallableSetValidation::NotCallable) => EffectsSignatureState::NoEffects,
+        Some(StoredCallableSetValidation::Pending { .. }) => return Err(unsupported()),
+        Some(StoredCallableSetValidation::Malformed { .. }) => return Err(invalid()),
+    };
+    let mut links = store
+        .signature_links(plan.node)
+        .cloned()
+        .unwrap_or_default();
+    if links.effects_signature != EffectsSignatureState::Unresolved
+        && links.effects_signature != state
+    {
+        return Err(invalid());
+    }
+    links.effects_signature = state;
+    if !store.set_signature_links(plan.node, links) {
+        return Err(invalid());
+    }
+    Ok(state)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_direct_source_call(
     store: &mut CanonicalTypeMapperStore,
@@ -7690,6 +7799,45 @@ pub(super) fn check_direct_source_call(
     callee_type: TypeId,
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceCall, SourceCheckError> {
+    if store
+        .signature_links(plan.node)
+        .is_some_and(|links| links.effects_signature != EffectsSignatureState::Unresolved)
+    {
+        let declared_target = source_call_effects_target_type(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            &std::collections::HashMap::new(),
+            plan,
+            &std::collections::HashMap::new(),
+        )?;
+        let explicit = declared_target.is_some();
+        resolve_source_call_effects_signature(store, plan, declared_target)?;
+        if !explicit
+            && let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(store, callee_type)
+            && projection.call_signatures.iter().any(|callable| {
+                store
+                    .signature(callable.signature)
+                    .and_then(|signature| signature.resolved_type_predicate())
+                    .and_then(|predicate| store.type_predicate(predicate))
+                    .is_some_and(|predicate| {
+                        matches!(
+                            predicate.kind(),
+                            TypePredicateKind::AssertsIdentifier | TypePredicateKind::AssertsThis
+                        )
+                    })
+            })
+        {
+            // TS2775 needs the explicit-annotation diagnostic and related declaration.
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(plan.node),
+            ));
+        }
+    }
     preflight_call_links(store, plan.node)?;
     if argument_types.len() != plan.arguments.len() {
         return Err(SourceCheckError::Call(plan.node));
@@ -8029,6 +8177,11 @@ fn publish_call_links(
     };
     let expected_signature = SignatureLinks {
         resolved_signature: ResolvedSignatureState::Resolved(signature),
+        effects_signature: store
+            .signature_links(node)
+            .map_or(EffectsSignatureState::Unresolved, |links| {
+                links.effects_signature
+            }),
         ..SignatureLinks::default()
     };
     let type_links = store.type_node_links(node);
@@ -8038,7 +8191,13 @@ fn publish_call_links(
         return Ok(());
     }
     let type_is_cold = type_links.is_none_or(|links| links == &TypeNodeLinks::default());
-    let signature_is_cold = signature_links.is_none_or(|links| links == &SignatureLinks::default());
+    let signature_is_cold = signature_links.is_none_or(|links| {
+        links
+            == &SignatureLinks {
+                effects_signature: expected_signature.effects_signature,
+                ..SignatureLinks::default()
+            }
+    });
     if !type_is_cold || !signature_is_cold {
         return Err(SourceCheckError::Call(node));
     }

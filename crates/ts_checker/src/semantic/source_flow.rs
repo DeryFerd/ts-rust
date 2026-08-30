@@ -30,21 +30,26 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalCheckerRelatedInformation,
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, EffectsSignatureState,
+    RelationUnavailable, SignatureId, TypeId,
     array_types::ArrayTypeError,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     classes::{
         ClassBodyAccessToken, ClassBodyKind, ClassBodyPlan, ClassMemberOrigin, ClassMemberSource,
         ClassPropertySide, class_body_identities, class_member_source,
     },
-    logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
+    logical_operators::{
+        LogicalBinaryError, TruthinessAssumption, base_type_of_literal_type, narrow_by_truthiness,
+    },
+    signatures::TypePredicateKind,
     source::CheckedClassPropertyAssignment,
     source_properties::{
         ClassAccessContext, SourceClassPropertyWritePlan, SourcePropertyError,
         plan_class_property_write, validate_class_property_write_access,
     },
     source_statements::{
-        SourceLinearLogicalStatementSyntax, plan_source_linear_logical_statement_syntax,
+        SourceCapturedIterationStatementSyntax, SourceLinearLogicalStatementSyntax,
+        plan_source_for_statement_syntax, plan_source_linear_logical_statement_syntax,
     },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -57,21 +62,29 @@ pub(super) type SourceFlowTypes = HashMap<SemanticSymbolId, TypeId>;
 
 /// One immutable map of current invocation-local symbol types.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SourceFlowSnapshot(Arc<SourceFlowTypes>);
+pub(super) struct SourceFlowSnapshot {
+    types: Arc<SourceFlowTypes>,
+    reachable: bool,
+    incomplete: bool,
+}
 
 impl SourceFlowSnapshot {
     fn new(types: SourceFlowTypes) -> Self {
-        Self(Arc::new(types))
+        Self {
+            types: Arc::new(types),
+            reachable: true,
+            incomplete: false,
+        }
     }
 
     #[must_use]
     pub(super) fn types(&self) -> &SourceFlowTypes {
-        self.0.as_ref()
+        self.types.as_ref()
     }
 
     #[must_use]
     pub(super) fn type_of(&self, symbol: SemanticSymbolId) -> Option<TypeId> {
-        self.0.get(&symbol).copied()
+        self.types.get(&symbol).copied()
     }
 
     fn with_type(&self, symbol: SemanticSymbolId, type_: TypeId) -> Self {
@@ -80,8 +93,50 @@ impl SourceFlowSnapshot {
         }
         let mut updated = self.types().clone();
         updated.insert(symbol, type_);
-        Self::new(updated)
+        Self {
+            types: Arc::new(updated),
+            reachable: self.reachable,
+            incomplete: self.incomplete,
+        }
     }
+}
+
+/// An update target and the declaration found through the lexical resolver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceFlowUpdate {
+    pub(super) target: NodeRef,
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) readonly: bool,
+}
+
+/// A call fact keeps the checked effects signature and its actual argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceFlowCallEffect {
+    Unchanged,
+    Assertion {
+        signature: SignatureId,
+        argument: NodeRef,
+        symbol: SemanticSymbolId,
+    },
+    AssertionNoReference {
+        signature: SignatureId,
+        argument: Option<NodeRef>,
+    },
+    AssertionFalse {
+        signature: SignatureId,
+        argument: NodeRef,
+    },
+    Never(SignatureId),
+}
+
+/// A source statement uses its real entry and following source-file flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceFlowRegion {
+    statement: NodeRef,
+    entry: FlowRef,
+    exit: FlowRef,
+    unreachable_incrementor: Option<NodeRef>,
 }
 
 /// A direct identifier whose current type is narrowed on an `if` edge.
@@ -1020,6 +1075,8 @@ pub(super) struct SourceFlowPlan {
     logical_statements: Vec<SourceLogicalStatementFlow>,
     class_body: Option<ClassBodyPlan>,
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
+    region: Option<SourceFlowRegion>,
+    updates: HashMap<NodeRef, SourceFlowUpdate>,
 }
 
 /// The detached logical join proves both condition edges, but is not an exit.
@@ -1139,6 +1196,9 @@ pub(super) enum SourceFlowInvariant {
     InvalidCapturedLocal(NodeRef),
     InvalidArrayMutation(NodeRef),
     InvalidCall(NodeRef),
+    InvalidSourceRegion(NodeRef),
+    InvalidUpdate(NodeRef),
+    InvalidCallEffect(NodeRef),
     InvalidLogicalStatement(NodeRef),
     InvalidDeclarationUse(NodeRef),
     InvalidClassBody(NodeRef),
@@ -1154,6 +1214,7 @@ pub(super) enum SourceFlowInvariant {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceFlowError {
     Array(ArrayTypeError),
+    Relation(RelationUnavailable),
     Unsupported(SourceFlowUnsupported),
     Invariant(SourceFlowInvariant),
     Narrowing {
@@ -1225,6 +1286,8 @@ enum SourceFlowKind {
 enum SourceFlowAssignmentState {
     Pending,
     Resolved(TypeId),
+    Update,
+    ReadonlyUpdate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1251,6 +1314,9 @@ struct SourceFlowEffects {
     class_body: Option<ClassBodyPlan>,
     start_container: Option<NodeRef>,
     property_assignments: HashMap<NodeRef, ClassPropertyFlowAssignment>,
+    region: Option<SourceFlowRegion>,
+    updates: HashMap<NodeRef, SourceFlowUpdate>,
+    region_points: HashMap<NodeRef, FlowRef>,
 }
 
 const TRUE_CONDITION_EDGE: u8 = 1 << 0;
@@ -1523,6 +1589,94 @@ fn source_node_is_descendant_of(
 }
 
 impl SourceFlowPlan {
+    pub(super) fn contains_call(&self, call: NodeRef) -> bool {
+        self.calls.contains_key(&call)
+    }
+
+    pub(super) fn contains_condition_value(&self, value: NodeRef) -> bool {
+        self.conditions.values().any(|condition| {
+            matches!(condition,
+            SourceFlowCondition::Equality(condition) if condition.value == value)
+        })
+    }
+
+    /// Proves an ordinary source statement against the existing source-file graph.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preflight_source_statement(
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        statement: NodeRef,
+        points: impl IntoIterator<Item = NodeRef>,
+        conditions: impl IntoIterator<Item = SourceFlowCondition>,
+        assignments: impl IntoIterator<Item = SourceFlowAssignment>,
+        updates: impl IntoIterator<Item = SourceFlowUpdate>,
+        calls: impl IntoIterator<Item = NodeRef>,
+    ) -> Result<Self, SourceFlowError> {
+        let region = source_statement_flow_region(arena, bound, store, statement)?;
+        let container = bound.source_file();
+        let mut effects = SourceFlowEffects {
+            region: Some(region),
+            ..SourceFlowEffects::default()
+        };
+        let points = points.into_iter().collect::<Vec<_>>();
+        for point in &points {
+            let flow = source_region_point_flow(arena, bound, *point, Some(region))?;
+            if effects.region_points.insert(*point, flow).is_some() {
+                return Err(SourceFlowInvariant::DuplicatePoint(*point).into());
+            }
+        }
+        let mut assignments = assignments.into_iter().collect::<Vec<_>>();
+        let retained_conditions = bound
+            .flow_graph()
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.flags
+                    .intersects(FlowFlags::TRUE_CONDITION | FlowFlags::FALSE_CONDITION)
+            })
+            .filter_map(|node| match node.payload.as_ref() {
+                Some(FlowNodePayload::Ast(node)) => Some(*node),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let conditions = conditions
+            .into_iter()
+            .filter(|condition| retained_conditions.contains(&condition.expression()))
+            .collect::<Vec<_>>();
+        for update in updates {
+            validate_source_update(arena, bound, store, host, update)?;
+            if effects.updates.insert(update.target, update).is_some()
+                || effects
+                    .assignment_declarations
+                    .insert(update.target, update.declaration)
+                    .is_some()
+            {
+                return Err(SourceFlowInvariant::DuplicateAssignment(update.target).into());
+            }
+            assignments.push(SourceFlowAssignment {
+                declaration: update.target,
+                symbol: update.symbol,
+            });
+        }
+        for call in calls {
+            let statement = validate_source_statement_call(arena, bound, call)?;
+            if effects.calls.insert(call, statement).is_some() {
+                return Err(SourceFlowInvariant::DuplicateCall(call).into());
+            }
+        }
+        Self::preflight_with_effects(
+            bound,
+            container,
+            None,
+            points,
+            conditions,
+            assignments,
+            effects,
+        )
+    }
+
     pub(super) fn has_reachable_end(&self) -> bool {
         self.end.is_some()
     }
@@ -2232,6 +2386,14 @@ impl SourceFlowPlan {
         let mut planned_points = HashMap::new();
         let mut point_order = Vec::new();
         for point in points {
+            if let Some(flow) = effects.region_points.get(&point).copied() {
+                validate_bound_node(bound, graph, point)?;
+                if planned_points.insert(point, flow).is_some() {
+                    return Err(SourceFlowInvariant::DuplicatePoint(point).into());
+                }
+                point_order.push(point);
+                continue;
+            }
             insert_flow_point(
                 bound,
                 graph,
@@ -2270,7 +2432,10 @@ impl SourceFlowPlan {
                         .ok_or(SourceFlowInvariant::InvalidClassBody(body.declaration))?,
                 )
             }
-            _ => graph.container_end(container),
+            _ => effects
+                .region
+                .map(|region| region.exit)
+                .or_else(|| graph.container_end(container)),
         };
         let plan = Self {
             container,
@@ -2289,6 +2454,8 @@ impl SourceFlowPlan {
             logical_statements: effects.logical_statements,
             class_body: effects.class_body,
             property_assignments: effects.property_assignments,
+            region: effects.region,
+            updates: effects.updates,
         };
         plan.validate_flow_paths(bound)?;
         Ok(plan)
@@ -2315,6 +2482,22 @@ impl SourceFlowPlan {
         bound: &'graph BoundFile,
         base: SourceFlowTypes,
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
+        if let Some(region) = self.region {
+            let (arena, _) = host
+                .source(region.statement)
+                .ok_or(SourceFlowInvariant::InvalidSourceRegion(region.statement))?;
+            if source_statement_flow_region(arena, bound, store, region.statement)? != region {
+                return Err(SourceFlowInvariant::InvalidSourceRegion(region.statement).into());
+            }
+            for (point, expected) in &self.points {
+                if source_region_point_flow(arena, bound, *point, Some(region))? != *expected {
+                    return Err(SourceFlowInvariant::MissingFlowPoint(*point).into());
+                }
+            }
+            for update in self.updates.values() {
+                validate_source_update(arena, bound, store, host, *update)?;
+            }
+        }
         if self.captured_origins.is_empty() {
             return self.frame(bound, base);
         }
@@ -2339,6 +2522,15 @@ impl SourceFlowPlan {
     ) -> Result<SourceFlowFrame<'plan, 'graph>, SourceFlowError> {
         let graph = bound.flow_graph();
         validate_container(graph, self.container)?;
+        if let Some(region) = self.region
+            && (bound.flow_at(region.statement).or_else(|| {
+                (bound.flow_graph().is_unreachable(region.statement) == Some(true))
+                    .then(|| bound.flow_graph().nodes().unreachable())
+            }) != Some(region.entry)
+                || bound.flow_container(region.statement) != Some(self.container))
+        {
+            return Err(SourceFlowInvariant::InvalidSourceRegion(region.statement).into());
+        }
         let actual = graph
             .container_start(self.start_container)
             .ok_or(SourceFlowInvariant::MissingStart(self.start_container))?;
@@ -2438,16 +2630,29 @@ impl SourceFlowPlan {
             plan: self,
             bound,
             graph,
+            declared_types: base.clone(),
             base: SourceFlowSnapshot::new(base),
             assignment_states: self
                 .assignments
                 .keys()
                 .copied()
-                .map(|declaration| (declaration, SourceFlowAssignmentState::Pending))
+                .map(|declaration| {
+                    let state = match self.updates.get(&declaration) {
+                        Some(update) if update.readonly => {
+                            SourceFlowAssignmentState::ReadonlyUpdate
+                        }
+                        Some(_) => SourceFlowAssignmentState::Update,
+                        None => SourceFlowAssignmentState::Pending,
+                    };
+                    (declaration, state)
+                })
                 .collect(),
+            call_effects: HashMap::new(),
+            condition_values: HashMap::new(),
             memo: HashMap::new(),
             visiting: HashSet::new(),
             loop_snapshots: HashMap::new(),
+            reference: None,
         })
     }
 
@@ -2551,6 +2756,10 @@ impl SourceFlowPlan {
         coverage: &mut SourceFlowCoverage,
     ) -> Result<(), SourceFlowError> {
         let graph = bound.flow_graph();
+        if self.region.is_some_and(|region| region.entry == flow) {
+            flow_node(graph, flow)?;
+            return Ok(());
+        }
         if validated.contains(&flow) {
             return Ok(());
         }
@@ -2664,10 +2873,14 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     bound: &'graph BoundFile,
     graph: &'graph BoundFlowGraph,
     base: SourceFlowSnapshot,
+    declared_types: SourceFlowTypes,
     assignment_states: HashMap<NodeRef, SourceFlowAssignmentState>,
-    memo: HashMap<FlowRef, SourceFlowSnapshot>,
-    visiting: HashSet<FlowRef>,
-    loop_snapshots: HashMap<FlowRef, SourceFlowSnapshot>,
+    call_effects: HashMap<NodeRef, SourceFlowCallEffect>,
+    condition_values: HashMap<NodeRef, TypeId>,
+    memo: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
+    visiting: HashSet<(FlowRef, Option<SemanticSymbolId>)>,
+    loop_snapshots: HashMap<(FlowRef, Option<SemanticSymbolId>), SourceFlowSnapshot>,
+    reference: Option<SemanticSymbolId>,
 }
 
 /// Keeps class initialization queries tied to one prepared body and binder graph.
@@ -3324,6 +3537,167 @@ fn class_type_has_uninitialized_value(
 }
 
 impl SourceFlowFrame<'_, '_> {
+    pub(super) fn set_source_declared_entry_types(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        types: &SourceFlowTypes,
+    ) -> Result<(), SourceFlowError> {
+        if self.plan.region.is_none() {
+            return Err(SourceFlowInvariant::InvalidSourceRegion(self.plan.container).into());
+        }
+        for (&symbol, &type_) in types {
+            if self.base.type_of(symbol).is_some() {
+                if store.symbol(symbol).is_none() || store.type_payload(type_).is_none() {
+                    return Err(SourceFlowInvariant::MissingCurrentType(symbol).into());
+                }
+                self.declared_types.insert(symbol, type_);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete_condition_value(
+        &mut self,
+        node: NodeRef,
+        type_: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        if !self.plan.conditions.values().any(|condition| {
+            matches!(condition, SourceFlowCondition::Equality(condition) if condition.value == node)
+        }) || self.condition_values.insert(node, type_).is_some() {
+            return Err(SourceFlowInvariant::UnknownCondition(node).into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn complete_source_declaration(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        declared_type: TypeId,
+        current_type: TypeId,
+    ) -> Result<(), SourceFlowError> {
+        if self.plan.region.is_none()
+            || self.bound.symbol(declaration) != Some(symbol)
+            || self.bound.container(declaration) != Some(self.plan.container)
+        {
+            return Err(SourceFlowInvariant::InvalidParameterAssignment(declaration).into());
+        }
+        let record = host
+            .node(declaration)
+            .ok_or(SourceFlowInvariant::UnknownAssignment(declaration))?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+        };
+        if self.declared_types.insert(symbol, declared_type).is_some() {
+            return Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into());
+        }
+        if self.plan.assignments.contains_key(&declaration) {
+            self.complete_assignment(declaration, symbol, current_type)?;
+        } else if variable.initializer.is_none() {
+            self.base = self.base.with_type(symbol, current_type);
+        } else {
+            let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+            if self.plan.points.get(&name).copied() != Some(self.graph.nodes().unreachable()) {
+                return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
+            }
+        }
+        self.memo.clear();
+        Ok(())
+    }
+
+    /// Queries only the requested references. Unrelated pending writes are not demands.
+    pub(super) fn snapshot_for_symbols_at(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        node: NodeRef,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let flow = *self
+            .plan
+            .points
+            .get(&node)
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(node))?;
+        self.snapshot_for_symbols(store, globals, flow, symbols)
+    }
+
+    pub(super) fn snapshot_for_symbols_at_end(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let flow = self
+            .plan
+            .end
+            .ok_or(SourceFlowInvariant::MissingFlowPoint(self.plan.container))?;
+        self.snapshot_for_symbols(store, globals, flow, symbols)
+    }
+
+    fn snapshot_for_symbols(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        symbols: impl IntoIterator<Item = SemanticSymbolId>,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let mut result = self.base.clone();
+        for symbol in symbols {
+            let previous = self.reference.replace(symbol);
+            let snapshot = self.resolve_flow(store, globals, flow, 0);
+            self.reference = previous;
+            let snapshot = snapshot?;
+            if snapshot.incomplete {
+                return Err(SourceFlowInvariant::Cycle(flow).into());
+            }
+            let type_ = (if snapshot.reachable {
+                snapshot.type_of(symbol)
+            } else {
+                self.declared_types
+                    .get(&symbol)
+                    .copied()
+                    .or_else(|| snapshot.type_of(symbol))
+            })
+            .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+            result = result.with_type(
+                symbol,
+                Self::finalize_flow_type(store, globals, flow, type_)?,
+            );
+            result.reachable &= snapshot.reachable;
+        }
+        Ok(result)
+    }
+
+    /// Effects signatures are resolved without publishing a provisional argument type.
+    pub(super) fn complete_call_effect(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        call: NodeRef,
+        effect: SourceFlowCallEffect,
+    ) -> Result<(), SourceFlowError> {
+        if !self.plan.calls.contains_key(&call) || self.call_effects.contains_key(&call) {
+            return Err(SourceFlowInvariant::InvalidCallEffect(call).into());
+        }
+        validate_source_call_effect(store, host, self.bound, call, effect)?;
+        self.call_effects.insert(call, effect);
+        Ok(())
+    }
+
+    fn query_base(&self) -> SourceFlowSnapshot {
+        match self.reference {
+            Some(symbol) => SourceFlowSnapshot::new(
+                self.base
+                    .type_of(symbol)
+                    .map(|type_| (symbol, type_))
+                    .into_iter()
+                    .collect(),
+            ),
+            None => self.base.clone(),
+        }
+    }
+
     /// Returns the immutable current-type map at one cold-preflighted AST
     /// point, memoizing completed flow nodes for the rest of this invocation.
     pub(super) fn snapshot_at(
@@ -3431,7 +3805,9 @@ impl SourceFlowFrame<'_, '_> {
                 *state = SourceFlowAssignmentState::Resolved(current_type);
                 Ok(())
             }
-            SourceFlowAssignmentState::Resolved(_) => {
+            SourceFlowAssignmentState::Resolved(_)
+            | SourceFlowAssignmentState::Update
+            | SourceFlowAssignmentState::ReadonlyUpdate => {
                 Err(SourceFlowInvariant::AssignmentAlreadyCompleted(declaration).into())
             }
         }
@@ -3444,25 +3820,36 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         depth: usize,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
-        if let Some(snapshot) = self.loop_snapshots.get(&flow) {
-            return Ok(snapshot.clone());
+        let key = (flow, self.reference);
+        if self.plan.region.is_some_and(|region| region.entry == flow) {
+            let mut snapshot = self.query_base();
+            if flow == self.graph.nodes().unreachable() {
+                snapshot.reachable = false;
+            }
+            return Ok(snapshot);
         }
-        if let Some(snapshot) = self.memo.get(&flow) {
+        if let Some(snapshot) = self.loop_snapshots.get(&key) {
+            let mut snapshot = snapshot.clone();
+            snapshot.incomplete = true;
+            return Ok(snapshot);
+        }
+        if let Some(snapshot) = self.memo.get(&key) {
             return Ok(snapshot.clone());
         }
         if depth > FLOW_DEPTH_LIMIT {
             return Err(SourceFlowInvariant::DepthLimit(flow).into());
         }
-        if !self.visiting.insert(flow) {
+        if !self.visiting.insert(key) {
             return Err(SourceFlowInvariant::Cycle(flow).into());
         }
         let result = self.resolve_flow_uncached(store, globals, flow, depth);
-        let removed = self.visiting.remove(&flow);
+        let removed = self.visiting.remove(&key);
         debug_assert!(removed);
         if let Ok(snapshot) = &result
             && self.loop_snapshots.is_empty()
+            && !snapshot.incomplete
         {
-            self.memo.insert(flow, snapshot.clone());
+            self.memo.insert(key, snapshot.clone());
         }
         result
     }
@@ -3478,11 +3865,26 @@ impl SourceFlowFrame<'_, '_> {
         match source_flow_kind(flow, node.flags)? {
             SourceFlowKind::Unreachable => {
                 validate_unreachable_node(self.graph, flow, &node)?;
-                Ok(self.base.clone())
+                if self.plan.region.is_none() {
+                    return Ok(self.base.clone());
+                }
+                let mut snapshot = match self.reference {
+                    Some(symbol) => SourceFlowSnapshot::new(
+                        self.declared_types
+                            .get(&symbol)
+                            .copied()
+                            .map(|type_| (symbol, type_))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    None => self.base.clone(),
+                };
+                snapshot.reachable = false;
+                Ok(snapshot)
             }
             SourceFlowKind::Start => {
                 validate_start_node(self.plan, flow, &node)?;
-                Ok(self.base.clone())
+                Ok(self.query_base())
             }
             SourceFlowKind::Assignment | SourceFlowKind::ArrayMutation => {
                 let antecedent = linear_antecedent(flow, &node)?;
@@ -3496,8 +3898,30 @@ impl SourceFlowFrame<'_, '_> {
                     .get(&declaration)
                     .ok_or(SourceFlowInvariant::UnknownAssignment(declaration))?;
                 let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                if self
+                    .reference
+                    .is_some_and(|symbol| symbol != assignment.symbol)
+                    || !prior.reachable
+                {
+                    return Ok(prior);
+                }
                 let current_type = match self.assignment_states.get(&declaration) {
                     Some(SourceFlowAssignmentState::Resolved(type_)) => *type_,
+                    Some(SourceFlowAssignmentState::ReadonlyUpdate) => return Ok(prior),
+                    Some(SourceFlowAssignmentState::Update) => {
+                        let current = prior
+                            .type_of(assignment.symbol)
+                            .ok_or(SourceFlowInvariant::MissingCurrentType(assignment.symbol))?;
+                        store
+                            .validate_union_constituent_with_global_types(globals, current)
+                            .map_err(|error| SourceFlowError::Join { flow, error })?;
+                        base_type_of_literal_type(store, Some(globals), current).map_err(
+                            |error| SourceFlowError::Narrowing {
+                                condition: declaration,
+                                error,
+                            },
+                        )?
+                    }
                     Some(SourceFlowAssignmentState::Pending) => {
                         return Err(SourceFlowInvariant::PendingAssignment(declaration).into());
                     }
@@ -3519,7 +3943,60 @@ impl SourceFlowFrame<'_, '_> {
                 validate_planned_call_container(
                     self.bound, self.plan, call, statement, antecedent,
                 )?;
-                self.resolve_flow(store, globals, antecedent, depth + 1)
+                let prior = self.resolve_flow(store, globals, antecedent, depth + 1)?;
+                let Some(effect) = self.call_effects.get(&call).copied() else {
+                    return if self.plan.region.is_some() {
+                        Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+                    } else {
+                        Ok(prior)
+                    };
+                };
+                if !prior.reachable {
+                    return Ok(prior);
+                }
+                match effect {
+                    SourceFlowCallEffect::Unchanged
+                    | SourceFlowCallEffect::AssertionNoReference { .. } => Ok(prior),
+                    SourceFlowCallEffect::Never(_)
+                    | SourceFlowCallEffect::AssertionFalse { .. } => {
+                        let mut result = prior;
+                        result.reachable = false;
+                        Ok(result)
+                    }
+                    SourceFlowCallEffect::Assertion {
+                        signature, symbol, ..
+                    } => {
+                        if self.reference.is_some_and(|reference| reference != symbol) {
+                            return Ok(prior);
+                        }
+                        let current = prior
+                            .type_of(symbol)
+                            .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
+                        let predicate = store
+                            .signature(signature)
+                            .and_then(|signature| signature.resolved_type_predicate())
+                            .and_then(|predicate| store.type_predicate(predicate))
+                            .ok_or(SourceFlowInvariant::InvalidCallEffect(call))?;
+                        let narrowed = match predicate.type_id() {
+                            Some(asserted) => narrow_source_assertion_type(
+                                store, globals, flow, call, current, asserted,
+                            )?,
+                            None => narrow_by_truthiness(
+                                store,
+                                Some(globals),
+                                current,
+                                TruthinessAssumption::Truthy,
+                            )
+                            .map_err(|error| {
+                                SourceFlowError::Narrowing {
+                                    condition: call,
+                                    error,
+                                }
+                            })?,
+                        };
+                        Ok(prior.with_type(symbol, narrowed))
+                    }
+                }
             }
             kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
                 let antecedent = linear_antecedent(flow, &node)?;
@@ -3533,6 +4010,9 @@ impl SourceFlowFrame<'_, '_> {
                 let Some(symbol) = condition.symbol() else {
                     return Ok(prior);
                 };
+                if self.reference.is_some_and(|reference| reference != symbol) || !prior.reachable {
+                    return Ok(prior);
+                }
                 let current = prior
                     .type_of(symbol)
                     .ok_or(SourceFlowInvariant::MissingCurrentType(symbol))?;
@@ -3580,9 +4060,15 @@ impl SourceFlowFrame<'_, '_> {
                         }
                     })?,
                     SourceFlowCondition::Equality(condition) => {
-                        let value = store
-                            .type_node_links(condition.value)
-                            .and_then(|links| links.resolved_type)
+                        let value = self
+                            .condition_values
+                            .get(&condition.value)
+                            .copied()
+                            .or_else(|| {
+                                store
+                                    .type_node_links(condition.value)
+                                    .and_then(|links| links.resolved_type)
+                            })
                             .ok_or(SourceFlowError::Invariant(
                                 SourceFlowInvariant::EqualityNarrowing(
                                     SourceEqualityNarrowingError::MissingValue(condition.value),
@@ -3665,18 +4151,21 @@ impl SourceFlowFrame<'_, '_> {
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let antecedents = label_antecedents(flow, node)?;
         let mut current = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
-        let previous = self.loop_snapshots.insert(flow, current.clone());
+        let first_incomplete = current.incomplete;
+        let key = (flow, self.reference);
+        let previous = self.loop_snapshots.insert(key, current.clone());
         debug_assert!(previous.is_none());
 
         let result = (|| {
             for antecedent in &antecedents[1..] {
                 let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
                 current = self.join_snapshots(store, globals, flow, &current, &next)?;
-                self.loop_snapshots.insert(flow, current.clone());
+                self.loop_snapshots.insert(key, current.clone());
             }
+            current.incomplete = first_incomplete;
             Ok(current)
         })();
-        let removed = self.loop_snapshots.remove(&flow);
+        let removed = self.loop_snapshots.remove(&key);
         debug_assert!(removed.is_some());
         result
     }
@@ -3689,6 +4178,12 @@ impl SourceFlowFrame<'_, '_> {
         then_snapshot: &SourceFlowSnapshot,
         else_snapshot: &SourceFlowSnapshot,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        if !then_snapshot.reachable {
+            return Ok(else_snapshot.clone());
+        }
+        if !else_snapshot.reachable {
+            return Ok(then_snapshot.clone());
+        }
         let mut symbols = then_snapshot
             .types()
             .keys()
@@ -3728,6 +4223,7 @@ impl SourceFlowFrame<'_, '_> {
                 .iter()
                 .copied()
                 .find(|candidate| *candidate == then_type || *candidate == else_type)
+                .filter(|_| self.reference.is_none())
             {
                 candidate
             } else {
@@ -3742,7 +4238,9 @@ impl SourceFlowFrame<'_, '_> {
             };
             joined.insert(symbol, joined_type);
         }
-        Ok(SourceFlowSnapshot::new(joined))
+        let mut result = SourceFlowSnapshot::new(joined);
+        result.incomplete = then_snapshot.incomplete || else_snapshot.incomplete;
+        Ok(result)
     }
 
     fn join_identity_candidates(&self, symbol: SemanticSymbolId) -> Vec<TypeId> {
@@ -3780,6 +4278,65 @@ impl SourceFlowFrame<'_, '_> {
             .find(|candidate| union_constituents(store, *candidate) == Some(anonymous_types))
             .unwrap_or(anonymous)
     }
+}
+
+fn narrow_source_assertion_type(
+    store: &mut CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    flow: FlowRef,
+    call: NodeRef,
+    current: TypeId,
+    asserted: TypeId,
+) -> Result<TypeId, SourceFlowError> {
+    let record = store
+        .type_payload(current)
+        .ok_or(SourceFlowError::Relation(RelationUnavailable::Type(
+            current,
+        )))?;
+    if record.flags().intersects(TypeFlags::ANY)
+        && (asserted == globals.object_type || asserted == globals.function_type)
+    {
+        return Ok(current);
+    }
+    if record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
+        return Ok(asserted);
+    }
+    if matches!(record.data(), TypeData::Union(_)) {
+        let mut constituents = Vec::new();
+        collect_source_equality_leaves(store, current, &mut constituents, &mut HashSet::new())
+            .map_err(|error| SourceFlowInvariant::EqualityNarrowing(error))?;
+        let narrowed = constituents
+            .into_iter()
+            .map(|type_| narrow_source_assertion_type(store, globals, flow, call, type_, asserted))
+            .collect::<Result<Vec<_>, _>>()?;
+        return store
+            .expression_union_type_with_global_types(globals, &narrowed, UnionReduction::Subtype)
+            .map_err(|error| SourceFlowError::Join { flow, error });
+    }
+    if store
+        .is_type_assignable_to_with_global_types(current, asserted, globals)
+        .map_err(SourceFlowError::Relation)?
+    {
+        return Ok(current);
+    }
+    if store
+        .is_type_assignable_to_with_global_types(asserted, current, globals)
+        .map_err(SourceFlowError::Relation)?
+    {
+        return Ok(asserted);
+    }
+    store
+        .canonical_intersection_type(&[current, asserted], None)
+        .map_err(|error| {
+            use super::intersection_types::IntersectionTypeError;
+            match error {
+                IntersectionTypeError::UnsupportedConstituent(_)
+                | IntersectionTypeError::UnsupportedPropertyType(_) => {
+                    SourceFlowUnsupported::Call(call).into()
+                }
+                _ => SourceFlowInvariant::InvalidCallEffect(call).into(),
+            }
+        })
 }
 
 /// Confirms that `typeof` can classify canonical top types, authenticated
@@ -4563,6 +5120,517 @@ fn source_typeof_object_is_function(
         }
     }
     Ok(false)
+}
+
+fn source_region_point_flow(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    point: NodeRef,
+    region: Option<SourceFlowRegion>,
+) -> Result<FlowRef, SourceFlowError> {
+    validate_bound_node(bound, bound.flow_graph(), point)?;
+    if let Some(flow) = bound.flow_at(point) {
+        if bound.flow_container(point) != Some(bound.source_file()) {
+            return Err(SourceFlowInvariant::MissingFlowPoint(point).into());
+        }
+        return Ok(flow);
+    }
+    let mut current = point;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        if region.is_some_and(|region| region.unreachable_incrementor == Some(current))
+            && bound.container(point) == Some(bound.source_file())
+        {
+            return Ok(bound.flow_graph().nodes().unreachable());
+        }
+        if bound.flow_graph().is_unreachable(current) == Some(true)
+            && bound.flow_container(current) == Some(bound.source_file())
+        {
+            return Ok(bound.flow_graph().nodes().unreachable());
+        }
+        let Some(parent) = arena.get(current.node).and_then(|record| record.parent) else {
+            break;
+        };
+        current = NodeRef::new(point.arena, point.file, parent);
+    }
+    Err(SourceFlowInvariant::MissingFlowPoint(point).into())
+}
+
+fn source_statement_flow_region(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<SourceFlowRegion, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidSourceRegion(statement);
+    let source = bound.source_file();
+    if arena.id() != bound.node_arena_id()
+        || arena.revision() != bound.node_arena_revision()
+        || !statement.is_for(arena.id(), bound.file_id())
+        || bound.flow_container(statement) != Some(source)
+    {
+        return Err(invalid().into());
+    }
+    let NodeData::SourceFile(file) = &arena.get(source.node).ok_or_else(invalid)?.data else {
+        return Err(invalid().into());
+    };
+    let index = file
+        .statements
+        .nodes
+        .iter()
+        .position(|node| *node == statement.node)
+        .ok_or_else(invalid)?;
+    let entry = source_region_point_flow(arena, bound, statement, None)?;
+    let syntax =
+        plan_source_for_statement_syntax(arena, bound, store, statement).map_err(|_| invalid())?;
+    let literal_false_body = syntax.control.condition.is_some_and(|condition| {
+        arena
+            .get(condition.node)
+            .is_some_and(|record| record.kind == SyntaxKind::FalseKeyword)
+    });
+    let has_reachable_continue = syntax
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            SourceCapturedIterationStatementSyntax::ConditionalJump { jump, .. } => Some(*jump),
+            _ => None,
+        })
+        .chain(syntax.terminal_jump)
+        .any(|jump| {
+            arena
+                .get(jump.node)
+                .is_some_and(|record| record.kind == SyntaxKind::ContinueStatement)
+                && bound.flow_at(jump).is_some()
+        });
+    let ends_with_break = syntax.terminal_jump.is_some_and(|jump| {
+        arena.get(jump.node).is_some_and(|record| record.kind == SyntaxKind::BreakStatement)
+    }) || syntax.statements.iter().any(|statement| {
+        matches!(statement, SourceCapturedIterationStatementSyntax::ConditionalJump { condition, jump }
+            if arena.get(condition.node).is_some_and(|record| record.kind == SyntaxKind::TrueKeyword)
+            && arena.get(jump.node).is_some_and(|record| record.kind == SyntaxKind::BreakStatement))
+    });
+    // The syntax proof owns these jumps. A terminal break and no live continue
+    // leave the binder's pre-incrementor join with no reachable antecedent.
+    let unreachable_incrementor = syntax
+        .control
+        .incrementor
+        .filter(|_| literal_false_body || ends_with_break && !has_reachable_continue);
+    let mut exit = None;
+    for following in &file.statements.nodes[index + 1..] {
+        let node = NodeRef::new(arena.id(), bound.file_id(), *following);
+        exit = source_following_statement_entry(arena, bound, node)?;
+        if exit.is_some() {
+            break;
+        }
+    }
+    let exit = exit
+        .or_else(|| bound.flow_graph().container_end(source))
+        .ok_or_else(invalid)?;
+    Ok(SourceFlowRegion {
+        statement,
+        entry,
+        exit,
+        unreachable_incrementor,
+    })
+}
+
+/// Finds an entry before the next declaration can evaluate a key or initializer.
+fn source_following_statement_entry(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+) -> Result<Option<FlowRef>, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidSourceRegion(statement);
+    let mut pending = vec![statement];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(invalid().into());
+        }
+        validate_bound_node(bound, bound.flow_graph(), node)?;
+        let record = arena.get(node.node).ok_or_else(invalid)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::FunctionDeclaration
+                | SyntaxKind::InterfaceDeclaration
+                | SyntaxKind::TypeAliasDeclaration
+                | SyntaxKind::EmptyStatement
+        ) {
+            continue;
+        }
+        if bound.flow_container(node) == Some(bound.source_file()) {
+            if let Some(flow) = bound.flow_at(node) {
+                return Ok(Some(flow));
+            }
+            if bound.flow_graph().is_unreachable(node) == Some(true) {
+                return Ok(Some(bound.flow_graph().nodes().unreachable()));
+            }
+        }
+        match &record.data {
+            NodeData::Block(block) => {
+                pending.extend(
+                    block
+                        .statements
+                        .nodes
+                        .iter()
+                        .rev()
+                        .map(|node| NodeRef::new(statement.arena, statement.file, *node)),
+                );
+            }
+            NodeData::ClassDeclaration(class) => {
+                if class.modifiers.as_ref().is_some_and(|modifiers| {
+                    modifiers.list.nodes.iter().any(|modifier| {
+                        arena
+                            .get(*modifier)
+                            .is_none_or(|record| !matches!(record.data, NodeData::Token(_)))
+                    })
+                }) {
+                    return Err(invalid().into());
+                }
+                let name = class.name.ok_or_else(invalid)?;
+                if arena.get(name).is_none_or(|record| {
+                    record.kind != SyntaxKind::Identifier || record.parent != Some(node.node)
+                }) {
+                    return Err(invalid().into());
+                }
+                return source_region_point_flow(
+                    arena,
+                    bound,
+                    NodeRef::new(node.arena, node.file, name),
+                    None,
+                )
+                .map(Some);
+            }
+            NodeData::EnumDeclaration(enumeration) => {
+                let name = enumeration.name;
+                if arena.get(name).is_none_or(|record| {
+                    record.kind != SyntaxKind::Identifier || record.parent != Some(node.node)
+                }) {
+                    return Err(invalid().into());
+                }
+                return source_region_point_flow(
+                    arena,
+                    bound,
+                    NodeRef::new(node.arena, node.file, name),
+                    None,
+                )
+                .map(Some);
+            }
+            _ => return Err(invalid().into()),
+        }
+    }
+    Ok(None)
+}
+
+fn validate_source_reference(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidUpdate(node);
+    let record = host.node(node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(invalid().into());
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || bound.flow_container(node) != Some(bound.source_file())
+        || store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|actual| actual != symbol))
+    {
+        return Err(invalid().into());
+    }
+    let mut callback_host = host.name_resolver_host(store).map_err(|_| invalid())?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|_| invalid())?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(node)),
+                &identifier.text,
+                SymbolFlags::VALUE,
+                None,
+                false,
+                false,
+            )
+            .map_err(|_| invalid())?;
+    if resolved != Some(symbol) {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_source_update(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    update: SourceFlowUpdate,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidUpdate(update.target);
+    validate_source_reference(arena, bound, store, host, update.target, update.symbol)?;
+    let declaration = host.node(update.declaration).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &declaration.data else {
+        return Err(invalid().into());
+    };
+    let list = declaration
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+        return Err(invalid().into());
+    };
+    let target = host.node(update.target).ok_or_else(invalid)?;
+    let expression = target
+        .parent
+        .and_then(|node| arena.get(node))
+        .ok_or_else(invalid)?;
+    let (operand, operator) = match &expression.data {
+        NodeData::PrefixUnaryExpression(unary)
+            if expression.kind == SyntaxKind::PrefixUnaryExpression =>
+        {
+            (unary.operand, unary.operator)
+        }
+        NodeData::PostfixUnaryExpression(unary)
+            if expression.kind == SyntaxKind::PostfixUnaryExpression =>
+        {
+            (unary.operand, unary.operator)
+        }
+        _ => return Err(invalid().into()),
+    };
+    if declaration.kind != SyntaxKind::VariableDeclaration
+        || arena
+            .get(variable.name)
+            .is_none_or(|name| name.kind != SyntaxKind::Identifier)
+        || bound.symbol(update.declaration) != Some(update.symbol)
+        || store
+            .symbol(update.symbol)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+            != Some(update.declaration)
+        || list.kind != SyntaxKind::VariableDeclarationList
+        || !matches!(list.flags.0, 0 | 1 | 2)
+        || !declarations
+            .declarations
+            .nodes
+            .contains(&update.declaration.node)
+        || update.readonly != (list.flags.0 == 2)
+        || operand != update.target.node
+        || !matches!(
+            operator,
+            SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+        )
+    {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
+fn validate_source_statement_call(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    call: NodeRef,
+) -> Result<NodeRef, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCall(call);
+    if !call.is_for(arena.id(), bound.file_id())
+        || !bound.contains(call)
+        || bound.container(call) != Some(bound.source_file())
+    {
+        return Err(invalid().into());
+    }
+    let record = arena.get(call.node).ok_or_else(invalid)?;
+    let NodeData::CallExpression(data) = &record.data else {
+        return Err(invalid().into());
+    };
+    let statement = NodeRef::new(call.arena, call.file, record.parent.ok_or_else(invalid)?);
+    let statement_record = arena.get(statement.node).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::CallExpression
+        || record.flags.0 != 0
+        || data.question_dot_token.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || !matches!(&statement_record.data, NodeData::ExpressionStatement(expression) if expression.expression == call.node && expression.flow_node.is_none())
+        || bound.flow_container(statement) != Some(bound.source_file())
+        || bound.block_scope_container(call) != bound.block_scope_container(statement)
+        || arena.get(data.expression).is_none_or(|callee| {
+            !matches!(
+                callee.kind,
+                SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+            ) || callee.parent != Some(call.node)
+        })
+    {
+        return Err(invalid().into());
+    }
+    Ok(statement)
+}
+
+fn validate_source_call_effect(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    call: NodeRef,
+    effect: SourceFlowCallEffect,
+) -> Result<(), SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidCallEffect(call);
+    let cached = store
+        .signature_links(call)
+        .map(|links| links.effects_signature)
+        .ok_or_else(invalid)?;
+    let signature = match effect {
+        SourceFlowCallEffect::Unchanged => {
+            let no_effect = cached == EffectsSignatureState::NoEffects
+                || cached
+                    .signature()
+                    .and_then(|signature| store.signature(signature))
+                    .is_some_and(|signature| {
+                        signature
+                            .resolved_type_predicate()
+                            .and_then(|predicate| store.type_predicate(predicate))
+                            .is_some_and(|predicate| {
+                                matches!(
+                                    predicate.kind(),
+                                    TypePredicateKind::Identifier | TypePredicateKind::This
+                                )
+                            })
+                            && signature
+                                .resolved_return_type()
+                                .and_then(|type_| store.type_payload(type_))
+                                .is_some_and(|record| !record.flags().intersects(TypeFlags::NEVER))
+                    });
+            return if no_effect {
+                Ok(())
+            } else {
+                Err(invalid().into())
+            };
+        }
+        SourceFlowCallEffect::Never(signature)
+        | SourceFlowCallEffect::Assertion { signature, .. }
+        | SourceFlowCallEffect::AssertionNoReference { signature, .. }
+        | SourceFlowCallEffect::AssertionFalse { signature, .. } => signature,
+    };
+    if cached != EffectsSignatureState::Resolved(signature) {
+        return Err(invalid().into());
+    }
+    let signature = store.signature(signature).ok_or_else(invalid)?;
+    match effect {
+        SourceFlowCallEffect::Unchanged => unreachable!(),
+        SourceFlowCallEffect::Never(_) => {
+            if signature
+                .resolved_return_type()
+                .and_then(|type_| store.type_payload(type_))
+                .is_none_or(|record| !record.flags().intersects(TypeFlags::NEVER))
+            {
+                return Err(invalid().into());
+            }
+        }
+        SourceFlowCallEffect::Assertion {
+            argument, symbol, ..
+        } => {
+            let predicate = signature
+                .resolved_type_predicate()
+                .and_then(|predicate| store.type_predicate(predicate))
+                .ok_or_else(invalid)?;
+            let NodeData::CallExpression(data) = &host.node(call).ok_or_else(invalid)?.data else {
+                return Err(invalid().into());
+            };
+            let index = usize::try_from(predicate.parameter_index()).map_err(|_| invalid())?;
+            let mut actual_argument = data
+                .arguments
+                .nodes
+                .get(index)
+                .copied()
+                .ok_or_else(invalid)?;
+            let mut visited = HashSet::new();
+            while visited.insert(actual_argument) {
+                let node = NodeRef::new(call.arena, call.file, actual_argument);
+                let Some(NodeData::ParenthesizedExpression(parenthesized)) =
+                    host.node(node).map(|record| &record.data)
+                else {
+                    break;
+                };
+                actual_argument = parenthesized.expression;
+            }
+            if predicate.kind() != TypePredicateKind::AssertsIdentifier
+                || actual_argument != argument.node
+            {
+                return Err(invalid().into());
+            }
+            let (arena, actual_bound) = host.source(call).ok_or_else(invalid)?;
+            if actual_bound.node_arena_revision() != bound.node_arena_revision() {
+                return Err(invalid().into());
+            }
+            validate_source_reference(arena, bound, store, host, argument, symbol)
+                .map_err(|_| invalid())?;
+        }
+        SourceFlowCallEffect::AssertionNoReference { .. }
+        | SourceFlowCallEffect::AssertionFalse { .. } => {
+            let predicate = signature
+                .resolved_type_predicate()
+                .and_then(|predicate| store.type_predicate(predicate))
+                .ok_or_else(invalid)?;
+            if predicate.kind() != TypePredicateKind::AssertsIdentifier {
+                return Err(invalid().into());
+            }
+            let NodeData::CallExpression(data) = &host.node(call).ok_or_else(invalid)?.data else {
+                return Err(invalid().into());
+            };
+            let index = usize::try_from(predicate.parameter_index()).map_err(|_| invalid())?;
+            let actual = data
+                .arguments
+                .nodes
+                .get(index)
+                .map(|node| NodeRef::new(call.arena, call.file, *node));
+            let actual = actual
+                .map(|mut node| {
+                    let mut visited = HashSet::new();
+                    loop {
+                        if !visited.insert(node) {
+                            return Err(invalid());
+                        }
+                        match &host.node(node).ok_or_else(invalid)?.data {
+                            NodeData::ParenthesizedExpression(inner) => {
+                                node.node = inner.expression
+                            }
+                            _ => return Ok(node),
+                        }
+                    }
+                })
+                .transpose()?;
+            let expected = match effect {
+                SourceFlowCallEffect::AssertionNoReference { argument, .. } => argument,
+                SourceFlowCallEffect::AssertionFalse { argument, .. } => Some(argument),
+                _ => unreachable!(),
+            };
+            if actual != expected {
+                return Err(invalid().into());
+            }
+            if let Some(argument) = actual {
+                let record = host.node(argument).ok_or_else(invalid)?;
+                if matches!(effect, SourceFlowCallEffect::AssertionFalse { .. }) {
+                    if record.kind != SyntaxKind::FalseKeyword || predicate.type_id().is_some() {
+                        return Err(invalid().into());
+                    }
+                } else if !matches!(
+                    record.kind,
+                    SyntaxKind::StringLiteral
+                        | SyntaxKind::NumericLiteral
+                        | SyntaxKind::BigIntLiteral
+                        | SyntaxKind::TrueKeyword
+                        | SyntaxKind::NullKeyword
+                ) && !(record.kind == SyntaxKind::FalseKeyword
+                    && predicate.type_id().is_some())
+                {
+                    return Err(SourceFlowUnsupported::Call(call).into());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_container(graph: &BoundFlowGraph, container: NodeRef) -> Result<(), SourceFlowError> {
@@ -5939,6 +7007,188 @@ mod tests {
                 .then_some(NodeRef::new(parsed.arena.id(), file, node))
             })
             .unwrap()
+    }
+
+    #[test]
+    fn ordinary_source_regions_prove_dead_updates_and_pre_class_exits() {
+        for (body, dead_update) in [
+            ("break;", true),
+            ("if (stop) { continue; } break;", false),
+            ("if (true) { break; }", true),
+        ] {
+            let source = format!(
+                "declare const stop: boolean; let count = 0; for (;; ++count) {{ {body} }} class Tail {{}}"
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(32_205);
+            let context = loop_context(&parsed, file);
+            let bound = context.file(file).unwrap().1;
+            let (node, data) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    if let NodeData::ForStatement(data) = &record.data {
+                        Some((node, data))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let statement = NodeRef::new(parsed.arena.id(), file, node);
+            let incrementor = data.incrementor.unwrap();
+            let NodeData::PrefixUnaryExpression(update) =
+                &parsed.arena.get(incrementor).unwrap().data
+            else {
+                unreachable!()
+            };
+            let operand = NodeRef::new(parsed.arena.id(), file, update.operand);
+            let class_name = parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| match &record.data {
+                    NodeData::ClassDeclaration(class) => class.name,
+                    _ => None,
+                })
+                .unwrap();
+            let class_name = NodeRef::new(parsed.arena.id(), file, class_name);
+            let before = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let region =
+                source_statement_flow_region(&parsed.arena, bound, context.store(), statement)
+                    .unwrap();
+            assert_eq!(region.exit, bound.flow_at(class_name).unwrap());
+            assert_eq!(
+                region.unreachable_incrementor,
+                dead_update.then_some(NodeRef::new(parsed.arena.id(), file, incrementor))
+            );
+            let actual =
+                source_region_point_flow(&parsed.arena, bound, operand, Some(region)).unwrap();
+            if dead_update {
+                assert_eq!(bound.flow_at(operand), None);
+                assert_eq!(actual, bound.flow_graph().nodes().unreachable());
+                assert_eq!(
+                    source_region_point_flow(&parsed.arena, bound, operand, None),
+                    Err(SourceFlowInvariant::MissingFlowPoint(operand).into())
+                );
+            } else {
+                assert_eq!(Some(actual), bound.flow_at(operand));
+                assert_ne!(actual, bound.flow_graph().nodes().unreachable());
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_assertion_effects_reject_changed_arguments_and_cache_identity() {
+        use crate::semantic::production::GlobalMergeCompletion;
+
+        let parsed = parse_source_file(concat!(
+            "declare function assertString(value: unknown): asserts value is string; ",
+            "declare const value: unknown; ",
+            "for (;;) { assertString(value); break; }",
+        ));
+        let file = FileId::new(32_206);
+        let mut context = loop_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let (call, argument) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                if let NodeData::CallExpression(call) = &record.data {
+                    Some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, call.arguments.nodes[0]),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let symbol = bound
+            .symbol(captured_variable(&parsed, file, "value"))
+            .unwrap();
+        let signature = context
+            .store()
+            .signature_links(call)
+            .unwrap()
+            .effects_signature
+            .signature()
+            .unwrap();
+        let effect = SourceFlowCallEffect::Assertion {
+            signature,
+            argument,
+            symbol,
+        };
+        assert_eq!(
+            validate_source_call_effect(context.store(), &host, &bound, call, effect),
+            Ok(())
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            validate_source_call_effect(
+                context.store(),
+                &host,
+                &bound,
+                call,
+                SourceFlowCallEffect::AssertionNoReference {
+                    signature,
+                    argument: None
+                }
+            ),
+            Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+        );
+        assert_eq!(
+            validate_source_call_effect(
+                context.store(),
+                &host,
+                &bound,
+                call,
+                SourceFlowCallEffect::Assertion {
+                    signature,
+                    argument: call,
+                    symbol
+                }
+            ),
+            Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+        );
+        let mut links = context.store().signature_links(call).unwrap().clone();
+        links.effects_signature = EffectsSignatureState::NoEffects;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(call, links)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                validate_source_call_effect(context.store(), &host, &bound, call, effect),
+                Err(SourceFlowInvariant::InvalidCallEffect(call).into())
+            );
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths()
+            ),
+            before
+        );
     }
 
     fn captured_assignment_syntax(

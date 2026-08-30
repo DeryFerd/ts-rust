@@ -463,7 +463,7 @@ fn for_expression_and_omitted_headers_check_calls_and_terminal_jumps() {
 }
 
 #[test]
-fn for_flow_changing_guards_and_updates_stop_before_body_publication() {
+fn for_flow_changing_guards_and_updates_publish_actual_types() {
     for (source, guard_kind) in [
         (
             concat!(
@@ -493,63 +493,75 @@ fn for_flow_changing_guards_and_updates_stop_before_body_publication() {
     ] {
         let parsed = parse_source_file(source);
         let mut checker = context(&parsed);
-        let guards = nodes_of_kind(&parsed, guard_kind);
-        let [guard] = guards.as_slice() else {
-            panic!("expected one source guard")
-        };
-        let condition = match &parsed.arena.get(guard.node).unwrap().data {
-            NodeData::ForStatement(iteration) => iteration.condition.unwrap(),
-            NodeData::IfStatement(branch) => branch.expression,
-            NodeData::PrefixUnaryExpression(_) => guard.node,
-            _ => unreachable!(),
-        };
-        let condition = NodeRef::new(parsed.arena.id(), FILE, condition);
+        checker.check_source_file(FILE).unwrap();
+        let file = checker.source_file(FILE).unwrap();
+        let file_links = checker.store().source_file_links(file).unwrap();
+        assert!(file_links.type_checked);
         let inside = variable(&parsed, "inside");
         let inside_symbol = symbol(&checker, inside);
-        let error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
-            node: condition,
-            kind: parsed.arena.get(condition.node).unwrap().kind,
-            role: SourceSyntaxRole::Statement,
-        });
-        assert_eq!(checker.check_source_file(FILE), Err(error));
-        let counts = (
-            checker.store().type_len(),
-            checker.store().mapper_len(),
-            checker.store().signature_len(),
-            checker.store().relation_state_snapshot(),
-        );
-        for _ in 0..2 {
-            assert_eq!(checker.check_source_file(FILE), Err(error));
-            assert_eq!(
-                (
-                    checker.store().type_len(),
-                    checker.store().mapper_len(),
-                    checker.store().signature_len(),
-                    checker.store().relation_state_snapshot(),
-                ),
-                counts
-            );
-            assert!(checker.store().value_symbol_links(inside_symbol).is_none());
-            assert!(checker.store().type_node_links(inside.name).is_none());
-            assert!(
-                checker
-                    .store()
-                    .type_node_links(inside.initializer.unwrap())
-                    .is_none()
-            );
-            assert!(checker.diagnostics().is_empty());
-            assert!(
-                checker
-                    .store()
-                    .source_file_links(checker.source_file(FILE).unwrap())
-                    .is_none_or(|links| !links.type_checked)
-            );
+        let bootstrap = checker.store().intrinsic_bootstrap().unwrap();
+        let boolean = bootstrap.boolean_type;
+        let (name, expected_flow, expected_inside) = match guard_kind {
+            SyntaxKind::ForStatement => ("value", bootstrap.string_type, "string"),
+            SyntaxKind::IfStatement => ("stop", bootstrap.regular_false_type, "boolean"),
+            SyntaxKind::PrefixUnaryExpression => ("count", bootstrap.number_type, "0"),
+            _ => unreachable!(),
+        };
+        let input = variable(&parsed, name);
+        let owner = symbol(&checker, input);
+        let declared = value_type(&checker, owner);
+        assert_eq!(checker.get_type_at_location(input.name), Ok(declared));
+        if guard_kind == SyntaxKind::IfStatement {
+            assert_eq!(declared, boolean);
+            assert_eq!(value_type(&checker, inside_symbol), boolean);
+        } else {
+            let ts_checker::semantic::TypeData::Union(union) =
+                checker.store().type_payload(declared).unwrap().data()
+            else {
+                panic!("expected the original declared union")
+            };
+            let mut members = union
+                .union
+                .types
+                .iter()
+                .map(|&type_| checker.type_to_string(type_).unwrap())
+                .collect::<Vec<_>>();
+            members.sort_unstable();
+            let expected = if guard_kind == SyntaxKind::ForStatement {
+                ["string", "undefined"]
+            } else {
+                ["0", "1"]
+            };
+            assert_eq!(members, expected);
         }
+        let read = inside.initializer.unwrap();
+        assert_eq!(checker.get_type_at_location(read), Ok(expected_flow));
+        assert_eq!(checker.get_symbol_at_location(read), Ok(Some(owner)));
+        let inside_type = value_type(&checker, inside_symbol);
+        assert_eq!(
+            checker.type_to_string(inside_type).unwrap(),
+            expected_inside
+        );
+        assert_eq!(checker.get_type_at_location(inside.name), Ok(inside_type));
+        if guard_kind == SyntaxKind::PrefixUnaryExpression {
+            assert_diagnostics(
+                &checker,
+                &parsed,
+                source,
+                &[(2322, "inside", &["number", "0"])],
+            );
+            assert_eq!(checker.diagnostics().as_slice()[0].node, Some(inside.name));
+        } else {
+            assert_diagnostics(&checker, &parsed, source, &[]);
+        }
+        checker.check_source_file(FILE).unwrap();
+        assert_recheck_stable(&mut checker, &parsed);
+        assert_eq!(value_type(&checker, owner), declared);
     }
 }
 
 #[test]
-fn for_assertion_calls_stop_before_later_local_publication() {
+fn for_assertion_calls_publish_later_local_types() {
     let parsed = parse_source_file(concat!(
         "declare function assertString(value: unknown): asserts value is string;\n",
         "declare const value: unknown;\n",
@@ -560,14 +572,16 @@ fn for_assertion_calls_stop_before_later_local_publication() {
         "}\n",
     ));
     let mut checker = context(&parsed);
+    checker.check_source_file(FILE).unwrap();
+    let file = checker.source_file(FILE).unwrap();
+    let file_links = checker.store().source_file_links(file).unwrap();
+    assert!(file_links.type_checked);
     let calls = nodes_of_kind(&parsed, SyntaxKind::CallExpression);
     let [call] = calls.as_slice() else {
         panic!("expected the assertion call")
     };
     let inside = variable(&parsed, "inside");
     let inside_symbol = symbol(&checker, inside);
-    let error = SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(*call));
-    assert_eq!(checker.check_source_file(FILE), Err(error));
 
     let call_links = checker.store().signature_links(*call).cloned().unwrap();
     let signature = checker
@@ -584,6 +598,22 @@ fn for_assertion_calls_stop_before_later_local_publication() {
     assert_eq!(predicate.parameter_index(), 0);
     assert_eq!(predicate.parameter_name(), "value");
     assert_eq!(predicate.type_id(), Some(bootstrap.string_type));
+    let string = bootstrap.string_type;
+    let unknown = bootstrap.unknown_type;
+    assert_eq!(
+        call_links.effects_signature,
+        ts_checker::semantic::EffectsSignatureState::Resolved(
+            call_links.resolved_signature.signature().unwrap()
+        )
+    );
+    let value = symbol(&checker, variable(&parsed, "value"));
+    assert_eq!(value_type(&checker, value), unknown);
+    assert_eq!(value_type(&checker, inside_symbol), string);
+    assert_eq!(checker.get_type_at_location(inside.name), Ok(string));
+    let read = inside.initializer.unwrap();
+    assert_eq!(checker.get_type_at_location(read), Ok(string));
+    assert_eq!(checker.get_symbol_at_location(read), Ok(Some(value)));
+    assert!(checker.diagnostics().is_empty());
 
     let counts = (
         checker.store().type_len(),
@@ -592,31 +622,19 @@ fn for_assertion_calls_stop_before_later_local_publication() {
         checker.store().type_predicate_len(),
         checker.store().relation_state_snapshot(),
     );
-    for _ in 0..2 {
-        assert_eq!(checker.check_source_file(FILE), Err(error));
-        assert_eq!(
-            (
-                checker.store().type_len(),
-                checker.store().mapper_len(),
-                checker.store().signature_len(),
-                checker.store().type_predicate_len(),
-                checker.store().relation_state_snapshot(),
-            ),
-            counts
-        );
-        assert_eq!(checker.store().signature_links(*call), Some(&call_links));
-        assert!(checker.store().value_symbol_links(inside_symbol).is_none());
-        for node in [inside.name, inside.initializer.unwrap()] {
-            assert!(checker.store().type_node_links(node).is_none());
-        }
-        assert!(checker.diagnostics().is_empty());
-        assert!(
-            checker
-                .store()
-                .source_file_links(checker.source_file(FILE).unwrap())
-                .is_none_or(|links| !links.type_checked)
-        );
-    }
+    checker.check_source_file(FILE).unwrap();
+    assert_recheck_stable(&mut checker, &parsed);
+    assert_eq!(
+        (
+            checker.store().type_len(),
+            checker.store().mapper_len(),
+            checker.store().signature_len(),
+            checker.store().type_predicate_len(),
+            checker.store().relation_state_snapshot(),
+        ),
+        counts
+    );
+    assert_eq!(checker.store().signature_links(*call), Some(&call_links));
 }
 
 #[test]
