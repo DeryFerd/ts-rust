@@ -22496,6 +22496,50 @@ mod tests {
         };
         let object = unique_node(SyntaxKind::ObjectLiteralExpression);
         let target = unique_node(SyntaxKind::TypeLiteral);
+        let target_type = context.get_type_from_type_node(target).unwrap();
+        let function = unique_node(SyntaxKind::FunctionType);
+        let NodeData::TypeLiteralNode(target_data) = &source.arena.get(target.node).unwrap().data
+        else {
+            panic!("the target must retain its type literal");
+        };
+        assert!(target_data.members.nodes.iter().any(|&member| {
+            matches!(
+                &source.arena.get(member).unwrap().data,
+                NodeData::PropertySignatureDeclaration(property) if property.type_ == function.node
+            )
+        }));
+        let NodeData::FunctionTypeNode(function_data) =
+            &source.arena.get(function.node).unwrap().data
+        else {
+            panic!("the target property must retain its function type");
+        };
+        let annotation = NodeRef::new(source.arena.id(), file, function_data.type_.unwrap());
+        let signature = context
+            .store()
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_eq!(
+            context.store().signature(signature).unwrap().declaration(),
+            Some(function)
+        );
+        assert_eq!(
+            context
+                .store()
+                .function_signature_return_annotation(signature),
+            Some((annotation, false))
+        );
+        let returned = context.get_return_type_of_signature(signature).unwrap();
+        assert_eq!(context.get_type_from_type_node(annotation), Ok(returned));
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(returned)
+        );
+        assert!(context.diagnostics().is_empty());
         (
             context
                 .store()
@@ -22503,7 +22547,7 @@ mod tests {
                 .unwrap()
                 .resolved_type
                 .unwrap(),
-            context.get_type_from_type_node(target).unwrap(),
+            target_type,
         )
     }
 
