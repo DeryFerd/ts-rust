@@ -27938,7 +27938,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map(CanonicalArrayTargets::from_global_types);
         let family = match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration => SourceCallableFamily::FunctionDeclaration,
-            SyntaxKind::ArrowFunction => SourceCallableFamily::ArrowFunction,
+            SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression => {
+                SourceCallableFamily::ArrowFunction
+            }
             kind => {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
@@ -28000,7 +28002,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(())
     }
 
-    /// Resolves one exact annotated `FunctionDeclaration` or `ArrowFunction` into
+    /// Resolves one exact source function declaration or expression into
     /// the callable value owned by its binder FUNCTION symbol.
     pub(super) fn get_type_of_source_callable(
         &mut self,
@@ -28018,7 +28020,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map(CanonicalArrayTargets::from_global_types);
         let family = match preflight_node(self.store, self.host, declaration)?.kind {
             SyntaxKind::FunctionDeclaration => SourceCallableFamily::FunctionDeclaration,
-            SyntaxKind::ArrowFunction => SourceCallableFamily::ArrowFunction,
+            SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression => {
+                SourceCallableFamily::ArrowFunction
+            }
             kind => {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
@@ -28513,7 +28517,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         match preflight_node(self.store, self.host, declaration)?.kind {
-            SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction => {
+            SyntaxKind::FunctionDeclaration
+            | SyntaxKind::ArrowFunction
+            | SyntaxKind::FunctionExpression => {
                 return self.get_return_type_of_source_callable_signature(signature, declaration);
             }
             SyntaxKind::GetAccessor => {

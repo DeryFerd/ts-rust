@@ -3,7 +3,7 @@
 //! Callable construction belongs to `source_callables`; source checking owns
 //! statement order and body execution. This module only proves the exact
 //! top-level or nested function value symbol (including direct-export routing)
-//! and the hoisted identifier route used by source expressions.
+//! and the identifier route for hoisted functions and lexical expression names.
 
 use std::collections::HashSet;
 
@@ -263,7 +263,8 @@ pub(super) fn plan_nested_function(
     Ok(function)
 }
 
-/// Resolves one identifier as a precollected, hoisted source function.
+/// Resolves one identifier as an available source function.
+/// Named expression owners are available only while their own body is planned.
 ///
 /// The caller invokes this only after the independent variable planner has
 /// resolved the same identifier and rejected its routed target specifically as
