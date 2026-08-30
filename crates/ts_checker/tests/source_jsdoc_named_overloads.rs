@@ -203,7 +203,7 @@ fn assert_source_clones(parsed: &ParseResult, functions: &[FunctionNodes]) {
     );
     let tags = comments
         .iter()
-        .flat_map(|comment| comment.tags())
+        .flat_map(ts_checker::semantic::jsdoc::ParsedJsDocComment::tags)
         .filter(|tag| tag.kind() == JsDocTagKind::Overload)
         .collect::<Vec<_>>();
     let (implementation, overloads) = functions.split_last().unwrap();
@@ -359,7 +359,7 @@ fn snapshot(
                 context.get_symbol_declarations(symbol).unwrap(),
                 [parameter.declaration]
             );
-            let type_ = context
+            let resolved = context
                 .get_type_from_type_node(parameter.annotation)
                 .unwrap();
             assert_eq!(
@@ -368,14 +368,14 @@ fn snapshot(
                     .value_symbol_links(symbol)
                     .unwrap()
                     .resolved_type,
-                Some(type_)
+                Some(resolved)
             );
             for node in [parameter.name, parameter.annotation] {
-                assert_eq!(context.get_type_at_location(node).unwrap(), type_);
-                query_types.push((node, type_));
+                assert_eq!(context.get_type_at_location(node).unwrap(), resolved);
+                query_types.push((node, resolved));
             }
             symbols.push(symbol);
-            types.push(type_);
+            types.push(resolved);
         }
         let returned = context.get_return_type_of_signature(signature).unwrap();
         assert_eq!(

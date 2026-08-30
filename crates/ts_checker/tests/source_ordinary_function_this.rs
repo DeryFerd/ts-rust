@@ -84,6 +84,7 @@ fn signature(checker: &CanonicalCheckerContext<'_>, node: NodeRef) -> SignatureI
         .unwrap()
 }
 
+#[derive(Clone, Copy)]
 enum FirstQuery {
     Source,
     Type(NodeRef),
