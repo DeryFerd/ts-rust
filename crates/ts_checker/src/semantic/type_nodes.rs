@@ -39634,7 +39634,7 @@ mod tests {
                 &mut diagnostics,
             )
             .unwrap()
-            .get_type_from_type_node_worker(annotation, true)
+            .get_type_from_type_node_worker(annotation, true, false)
             .unwrap();
             assert_eq!((session.query_count(), session.total_count()), (0, 0));
             let root_type = context
