@@ -918,7 +918,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let record = self
                 .type_payload(*member)
                 .ok_or(DerivedTypeError::Type(*member))?;
-            if record.flags().intersects(TypeFlags::NULLABLE) {
+            if record.flags().intersects(TypeFlags::NULLABLE)
+                || self.is_non_widening_contextual_scalar(*member)
+            {
                 continue;
             }
             if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
@@ -1616,6 +1618,35 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .is_some_and(|properties| properties.iter().any(|candidate| candidate.name == name))
     }
 
+    // Scalar siblings keep their exact type and add no contextual properties.
+    // Fresh literals remain outside this regular-literal admission.
+    fn is_non_widening_contextual_scalar(&self, type_: TypeId) -> bool {
+        let Some(record) = self.type_payload(type_) else {
+            return false;
+        };
+        if record.object_flags() != ObjectFlags::NONE {
+            return false;
+        }
+        let supported = match record.data() {
+            TypeData::Intrinsic(_) => matches!(
+                record.flags(),
+                TypeFlags::STRING | TypeFlags::NUMBER | TypeFlags::BIG_INT | TypeFlags::ES_SYMBOL
+            ),
+            TypeData::Literal(literal) => {
+                literal.regular_type == type_
+                    && matches!(
+                        record.flags(),
+                        TypeFlags::STRING_LITERAL
+                            | TypeFlags::NUMBER_LITERAL
+                            | TypeFlags::BIG_INT_LITERAL
+                            | TypeFlags::BOOLEAN_LITERAL
+                    )
+            }
+            _ => false,
+        };
+        supported && self.validate_union_constituent(type_).is_ok()
+    }
+
     fn contextual_sibling_properties(&self, union: TypeId) -> Option<Vec<PropertyShape>> {
         let TypeData::Union(data) = self.type_payload(union)?.data() else {
             return None;
@@ -1624,7 +1655,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let mut names = HashMap::<EscapedName, usize>::new();
         for member in &data.union.types {
             let record = self.type_payload(*member)?;
-            if record.flags().intersects(TypeFlags::NULLABLE) {
+            if record.flags().intersects(TypeFlags::NULLABLE)
+                || self.is_non_widening_contextual_scalar(*member)
+            {
                 continue;
             }
             if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
@@ -2637,6 +2670,19 @@ mod tests {
         )
     }
 
+    fn assert_widening_query_preserves_store(
+        store: &mut CanonicalTypeMapperStore,
+        source: TypeId,
+        expected: Result<TypeId, DerivedTypeError>,
+    ) {
+        let before = format!("{store:?}");
+        assert_eq!(store.get_widened_type(source), expected);
+        assert!(
+            format!("{store:?}") == before,
+            "the widening query changed the store"
+        );
+    }
+
     #[test]
     fn regular_and_widened_object_literals_are_dependency_closed_and_stable() {
         let source = parsed(concat!(
@@ -3080,6 +3126,306 @@ mod tests {
             Ok(widened),
         );
         assert_eq!(observable_state(context.store()), warm);
+    }
+
+    #[test]
+    fn contextual_scalar_unions_keep_regular_identities_cold_and_warm() {
+        let source = parsed("const first: any = { now: 1 }; const second: any = { later: 2 };");
+        let file = FileId::new(202_360);
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..crate::semantic::IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let first =
+            resolved_expression_type(&context, variable_initializer(&source, file, "first"));
+        let second =
+            resolved_expression_type(&context, variable_initializer(&source, file, "second"));
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let undefined = bootstrap.undefined_or_missing_type;
+        let scalar_rows = [
+            vec![bootstrap.zero_type, bootstrap.regular_false_type],
+            vec![bootstrap.empty_string_type, bootstrap.zero_bigint_type],
+            vec![bootstrap.string_type],
+            vec![bootstrap.number_type],
+            vec![bootstrap.bigint_type],
+            vec![bootstrap.es_symbol_type],
+        ];
+
+        for scalars in scalar_rows {
+            let members = scalars
+                .iter()
+                .copied()
+                .chain([first, second])
+                .collect::<Vec<_>>();
+            let union = context
+                .store_mut_for_test()
+                .expression_union_type(&members, UnionReduction::None)
+                .unwrap();
+            let TypeData::Union(source_union) = context.store().type_payload(union).unwrap().data()
+            else {
+                panic!("the source must retain scalar and object members");
+            };
+            assert_eq!(source_union.union.types.len(), members.len());
+            assert!(
+                members
+                    .iter()
+                    .all(|member| source_union.union.types.contains(member))
+            );
+            assert!(
+                !context
+                    .store()
+                    .derived_types
+                    .widened_types
+                    .contains_key(&union)
+            );
+
+            let widened = context
+                .store_mut_for_test()
+                .get_widened_type(union)
+                .unwrap();
+            let TypeData::Union(result) = context.store().type_payload(widened).unwrap().data()
+            else {
+                panic!("widening must retain scalar and object members");
+            };
+            assert_eq!(result.union.types.len(), members.len());
+            for scalar in &scalars {
+                assert!(result.union.types.contains(scalar));
+                assert!(
+                    !context
+                        .store()
+                        .derived_types
+                        .widened_types
+                        .contains_key(scalar)
+                );
+                assert!(
+                    !context
+                        .store()
+                        .derived_types
+                        .contextual_widened_types
+                        .contains_key(&(union, *scalar))
+                );
+            }
+            for (object, own_name, optional_name) in
+                [(first, "now", "later"), (second, "later", "now")]
+            {
+                let fresh_shape = context.store().fresh_object_shape(object).unwrap();
+                let target =
+                    context.store().derived_types.contextual_widened_types[&(union, object)];
+                assert_ne!(target, object);
+                assert!(result.union.types.contains(&target));
+                let shape = context.store().resolved_object_shape(target).unwrap();
+                assert_eq!(shape.properties.len(), 2);
+                assert_eq!(shape.symbol, fresh_shape.symbol);
+                assert_eq!(
+                    shape.object_flags,
+                    ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                );
+                assert_eq!(
+                    property(&shape, own_name).symbol,
+                    property(&fresh_shape, own_name).symbol
+                );
+                assert_eq!(
+                    property(&shape, own_name).type_,
+                    property(&fresh_shape, own_name).type_
+                );
+                let optional = property(&shape, optional_name);
+                assert_eq!(optional.type_, undefined);
+                assert!(
+                    context
+                        .store()
+                        .validate_contextual_widened_object_property(target, optional.symbol)
+                );
+            }
+            for _ in 0..3 {
+                assert_widening_query_preserves_store(
+                    context.store_mut_for_test(),
+                    union,
+                    Ok(widened),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_scalar_unions_reject_poisoned_cold_and_warm_caches() {
+        let source = parsed("const value: any = { now: 1 };");
+        let file = FileId::new(202_361);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let object =
+            resolved_expression_type(&context, variable_initializer(&source, file, "value"));
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let zero = bootstrap.zero_type;
+        let regular_false = bootstrap.regular_false_type;
+        let fresh_false = bootstrap.false_type;
+        let number = bootstrap.number_type;
+        let union = context
+            .store_mut_for_test()
+            .expression_union_type(&[zero, regular_false, object], UnionReduction::None)
+            .unwrap();
+        assert!(
+            !context
+                .store()
+                .derived_types
+                .widened_types
+                .contains_key(&union)
+        );
+        assert!(
+            !context
+                .store()
+                .derived_types
+                .contextual_widened_types
+                .contains_key(&(union, object))
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(regular_false, None, regular_false)
+        );
+        assert_widening_query_preserves_store(
+            context.store_mut_for_test(),
+            union,
+            Err(DerivedTypeError::InvalidWidenedTypeCache {
+                source: union,
+                cached: regular_false,
+            }),
+        );
+        assert!(context.store_mut_for_test().set_literal_links(
+            regular_false,
+            Some(fresh_false),
+            regular_false
+        ));
+        let widened = context
+            .store_mut_for_test()
+            .get_widened_type(union)
+            .unwrap();
+        let widened_object =
+            context.store().derived_types.contextual_widened_types[&(union, object)];
+        let invalid_warm = Err(DerivedTypeError::InvalidWidenedTypeCache {
+            source: union,
+            cached: widened,
+        });
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_literal_links(regular_false, None, regular_false)
+        );
+        assert_widening_query_preserves_store(context.store_mut_for_test(), union, invalid_warm);
+        assert!(context.store_mut_for_test().set_literal_links(
+            regular_false,
+            Some(fresh_false),
+            regular_false
+        ));
+        assert_widening_query_preserves_store(context.store_mut_for_test(), union, Ok(widened));
+
+        let flags = context.store().type_payload(union).unwrap().object_flags();
+        assert!(!flags.intersects(ObjectFlags::CONTAINS_WIDENING_TYPE));
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(union, flags | ObjectFlags::CONTAINS_WIDENING_TYPE)
+        );
+        assert_widening_query_preserves_store(context.store_mut_for_test(), union, invalid_warm);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(union, flags)
+        );
+        assert_widening_query_preserves_store(context.store_mut_for_test(), union, Ok(widened));
+
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .contextual_widened_types
+                .insert((union, object), object),
+            Some(widened_object)
+        );
+        assert_widening_query_preserves_store(context.store_mut_for_test(), union, invalid_warm);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .contextual_widened_types
+                .insert((union, object), widened_object),
+            Some(object)
+        );
+        assert_widening_query_preserves_store(context.store_mut_for_test(), union, Ok(widened));
+
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(union, number),
+            Some(widened)
+        );
+        assert_widening_query_preserves_store(
+            context.store_mut_for_test(),
+            union,
+            Err(DerivedTypeError::InvalidWidenedTypeCache {
+                source: union,
+                cached: number,
+            }),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(union, widened),
+            Some(number)
+        );
+        for _ in 0..3 {
+            assert_widening_query_preserves_store(context.store_mut_for_test(), union, Ok(widened));
+        }
+    }
+
+    #[test]
+    fn contextual_scalar_unions_keep_fresh_literals_outside_the_scalar_guard() {
+        let source = parsed("const value: any = { now: 1 };");
+        let file = FileId::new(202_362);
+        let mut context = checker_context(&[(file, &source)]);
+        context.check_source_file(file).unwrap();
+        let object =
+            resolved_expression_type(&context, variable_initializer(&source, file, "value"));
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let regular = bootstrap.regular_false_type;
+        let fresh = bootstrap.false_type;
+        let record = context.store().type_payload(fresh).unwrap();
+        assert_eq!(record.object_flags(), ObjectFlags::NONE);
+        assert!(
+            matches!(record.data(), TypeData::Literal(literal) if literal.regular_type == regular && regular != fresh)
+        );
+        assert_eq!(context.store().validate_union_constituent(fresh), Ok(()));
+        let union = context
+            .store_mut_for_test()
+            .expression_union_type(&[fresh, object], UnionReduction::None)
+            .unwrap();
+        let TypeData::Union(members) = context.store().type_payload(union).unwrap().data() else {
+            panic!("the fresh literal must remain a union sibling");
+        };
+        assert!(members.union.types.contains(&fresh));
+        for _ in 0..2 {
+            assert_widening_query_preserves_store(
+                context.store_mut_for_test(),
+                union,
+                Err(DerivedTypeError::UnsupportedWideningType(fresh)),
+            );
+        }
     }
 
     #[test]

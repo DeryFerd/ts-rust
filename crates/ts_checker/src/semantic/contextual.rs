@@ -2108,7 +2108,7 @@ mod tests {
             ),
             (
                 Some(&wrong_globals),
-                RelationUnavailable::UnsupportedStructuredType(fixed_type),
+                RelationUnavailable::UnsupportedUnionConstituent(fixed_type),
             ),
         ] {
             assert_eq!(
@@ -2400,7 +2400,7 @@ mod tests {
             ),
             (
                 Some(&wrong_globals),
-                RelationUnavailable::UnsupportedStructuredType(array),
+                RelationUnavailable::UnsupportedUnionConstituent(array),
             ),
         ] {
             assert_eq!(

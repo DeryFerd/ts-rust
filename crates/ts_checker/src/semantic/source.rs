@@ -59745,7 +59745,11 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::GenericInterface(interface) => {
-                for property in interface.property_type_nodes() {
+                for annotation in interface.property_type_nodes().chain(
+                    interface
+                        .index_type_nodes()
+                        .flat_map(|(key, value)| [key, value]),
+                ) {
                     session.reset_query();
                     CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
@@ -59755,7 +59759,7 @@ pub(super) fn check_source_file(
                         session,
                         &mut type_import_preflight_diagnostics,
                     )?
-                    .preflight_type_from_type_node(property)?;
+                    .preflight_type_from_type_node(annotation)?;
                 }
             }
             PlannedStatement::GlobalArrayCallAugmentation(augmentation) => {
@@ -61593,6 +61597,23 @@ pub(super) fn check_source_file(
                         }
                     }
                     property_types.push(property_type);
+                }
+                for (key, value) in interface.index_type_nodes() {
+                    for annotation in [key, value] {
+                        session.reset_query();
+                        let mut index_diagnostics = CanonicalCheckerDiagnostics::default();
+                        let result = CanonicalTypeQuery::new_with_global_types_and_session(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            &mut index_diagnostics,
+                        )?
+                        .get_type_from_type_node(annotation);
+                        merge_retry_diagnostics(diagnostics, index_diagnostics);
+                        result?;
+                    }
                 }
                 let bases_resolved = matches!(
                     store.type_payload(target).map(TypeRecord::data),
@@ -109892,7 +109913,8 @@ class Foo2 {
     }
 
     #[test]
-    fn function_expression_logical_initializers_keep_the_unplanned_condition_atomic() {
+    #[allow(clippy::too_many_lines)] // Keep all three original capture sources and their published identities together.
+    fn function_expression_logical_initializers_preserve_capture_and_return_identities() {
         for (file, text, mutable_var) in [
             (
                 FileId::new(98_331),
@@ -109948,28 +109970,304 @@ class Foo2 {
                 })
                 .map(|node| (node, context.file(file).unwrap().1.symbol(node).unwrap()))
                 .collect::<Vec<_>>();
-            let before = observable_state(&context, file);
-            for _ in 0..2 {
-                assert_eq!(
-                    context.check_source_file(file),
-                    Err(SourceCheckError::Function(
-                        SourceFunctionInvariant::Callable(declaration)
-                    )),
-                    "{text}",
-                );
-                assert_eq!(observable_state(&context, file), before, "{text}");
-                assert!(!is_type_checked(&context, file));
-                for (node, owner) in &callables {
-                    assert!(
+            context
+                .check_source_file(file)
+                .unwrap_or_else(|error| panic!("{text}: {error:?}"));
+            assert!(is_type_checked(&context, file));
+
+            let declared = variable_value_type(&context, &source, file, "value");
+            let value_symbol = variable_symbol(&context, &source, file, "value");
+            let (number, false_type) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.regular_false_type)
+            };
+            let TypeData::Union(union) = context.store().type_payload(declared).unwrap().data()
+            else {
+                panic!("value must keep its written number | false type")
+            };
+            assert_eq!(union.union.types.len(), 2);
+            assert!(union.union.types.contains(&number));
+            assert!(union.union.types.contains(&false_type));
+
+            let callable_cache = callables
+                .iter()
+                .map(|&(node, owner)| {
+                    let type_ = resolved_node_type(&context, node);
+                    let provenance = context.store().source_callable_provenance(type_).unwrap();
+                    assert_eq!(provenance.owner_symbol, owner);
+                    assert_eq!(provenance.declaration, node);
+                    assert_eq!(
+                        context.store().source_callable_type_for_owner(owner),
+                        Some(type_)
+                    );
+                    assert_eq!(
                         context
                             .store()
-                            .source_callable_type_for_owner(*owner)
-                            .is_none()
+                            .signature(provenance.signature)
+                            .unwrap()
+                            .declaration(),
+                        Some(node)
                     );
-                    assert!(context.store().signature_links(*node).is_none());
-                    assert!(context.store().type_node_links(*node).is_none());
-                }
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature_links(node)
+                            .unwrap()
+                            .resolved_signature
+                            .signature(),
+                        Some(provenance.signature)
+                    );
+                    (node, owner, type_, provenance.signature)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                callable_cache
+                    .iter()
+                    .map(|(_, owner, _, _)| *owner)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                callables.len()
+            );
+            assert_eq!(
+                callable_cache
+                    .iter()
+                    .map(|(_, _, _, signature)| *signature)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                callables.len()
+            );
+
+            let NodeData::ArrowFunction(factory) =
+                &source.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the original generic factory")
+            };
+            let factory_type = resolved_node_type(&context, declaration);
+            let factory_signature = context
+                .store()
+                .source_callable_provenance(factory_type)
+                .unwrap()
+                .signature;
+            let factory_signature = context.store().signature(factory_signature).unwrap();
+            let [parameter] = factory_signature.type_parameters() else {
+                panic!("the factory must retain its one real type parameter")
+            };
+            let parameter = *parameter;
+            let [seed] = factory_signature.parameters() else {
+                panic!("the factory must retain its seed parameter")
+            };
+            let seed = *seed;
+            let parameter_node = NodeRef::new(
+                source.arena.id(),
+                file,
+                factory.type_parameters.as_ref().unwrap().nodes[0],
+            );
+            assert_eq!(
+                context.store().type_payload(parameter).unwrap().symbol(),
+                context.file(file).unwrap().1.symbol(parameter_node)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(seed)
+                    .unwrap()
+                    .resolved_type,
+                Some(parameter)
+            );
+            assert_eq!(factory_signature.resolved_return_type(), Some(parameter));
+            let NodeData::Block(factory_body) = &source.arena.get(factory.body).unwrap().data
+            else {
+                panic!("the factory must retain its original block")
+            };
+            let NodeData::ReturnStatement(seed_return) = &source
+                .arena
+                .get(*factory_body.statements.nodes.last().unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("the factory must return its seed")
+            };
+            let seed_read = NodeRef::new(source.arena.id(), file, seed_return.expression.unwrap());
+            assert_eq!(resolved_node_type(&context, seed_read), parameter);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(seed_read)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(seed)
+            );
+
+            let function = callables
+                .iter()
+                .find_map(|&(node, _)| {
+                    (source.arena.get(node.node).unwrap().kind == SyntaxKind::FunctionExpression)
+                        .then_some(node)
+                })
+                .unwrap();
+            let NodeData::FunctionExpression(function_data) =
+                &source.arena.get(function.node).unwrap().data
+            else {
+                panic!("expected the actual stored function expression")
+            };
+            let NodeData::Block(body) = &source.arena.get(function_data.body).unwrap().data else {
+                panic!("expected the original return-only body")
+            };
+            let [return_statement] = body.statements.nodes.as_slice() else {
+                panic!("the stored function must retain its one return")
+            };
+            let NodeData::ReturnStatement(statement) =
+                &source.arena.get(*return_statement).unwrap().data
+            else {
+                panic!("expected the actual return statement")
+            };
+            let returned = NodeRef::new(source.arena.id(), file, statement.expression.unwrap());
+            let function_type = resolved_node_type(&context, function);
+            let function_signature = context
+                .store()
+                .source_callable_provenance(function_type)
+                .unwrap()
+                .signature;
+            let function_signature = context.store().signature(function_signature).unwrap();
+            assert!(function_signature.parameters().is_empty());
+            assert!(function_signature.type_parameters().is_empty());
+            let function_return = function_signature.resolved_return_type().unwrap();
+            let property = source.arena.get(function.node).unwrap().parent.unwrap();
+            let object = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(property).unwrap().parent.unwrap(),
+            );
+            assert_eq!(
+                object_property_initializer(&source, file, object, "read"),
+                function
+            );
+            assert_eq!(
+                object_property_type(&context, object, "read"),
+                function_type
+            );
+
+            let nested = if source.arena.get(returned.node).unwrap().kind
+                == SyntaxKind::ObjectLiteralExpression
+            {
+                let nested = object_property_initializer(&source, file, returned, "nested");
+                let NodeData::ArrowFunction(arrow) = &source.arena.get(nested.node).unwrap().data
+                else {
+                    panic!("expected the original nested arrow")
+                };
+                let nested_type = resolved_node_type(&context, nested);
+                let signature = context
+                    .store()
+                    .source_callable_provenance(nested_type)
+                    .unwrap()
+                    .signature;
+                let signature = context.store().signature(signature).unwrap();
+                assert!(signature.parameters().is_empty());
+                assert!(signature.type_parameters().is_empty());
+                assert_eq!(signature.resolved_return_type(), Some(number));
+                assert_eq!(
+                    object_property_type(&context, returned, "nested"),
+                    nested_type
+                );
+                let returned_property =
+                    declared_object_property_symbol(&context, function_return, "nested");
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(returned_property)
+                        .unwrap()
+                        .resolved_type,
+                    Some(nested_type)
+                );
+                Some((nested, NodeRef::new(source.arena.id(), file, arrow.body)))
+            } else {
+                assert_eq!(function_return, declared);
+                None
+            };
+            assert_eq!(callables.len(), if nested.is_some() { 3 } else { 2 });
+            let captured = nested.map_or(returned, |(_, captured)| captured);
+            let expected = if mutable_var { declared } else { number };
+            assert_eq!(
+                source.arena.get(captured.node).unwrap().kind,
+                SyntaxKind::Identifier
+            );
+            assert_eq!(resolved_node_type(&context, captured), expected);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(captured)
+                    .unwrap()
+                    .resolved_symbol,
+                Some(value_symbol)
+            );
+            if mutable_var && nested.is_some() {
+                let [diagnostic] = context.diagnostics().as_slice() else {
+                    panic!("only the nested var read must fail its number return annotation")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2322);
+                assert_eq!(diagnostic.node, Some(captured));
+                assert!(diagnostic.range_override.is_none());
+                assert_eq!(
+                    diagnostic.diagnostic.arguments,
+                    ["number | false", "number"]
+                );
+                assert!(diagnostic.diagnostic.details.is_empty());
+                assert!(diagnostic.related_information.is_empty());
+            } else {
                 assert!(context.diagnostics().is_empty());
+            }
+
+            let returned_type = resolved_node_type(&context, returned);
+            let warm = observable_state(&context, file);
+            let diagnostics = context.diagnostics().clone();
+            for _ in 0..2 {
+                context.recheck_source_file(file).unwrap();
+                assert!(is_type_checked(&context, file));
+                for &(node, owner, type_, signature) in &callable_cache {
+                    assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+                    assert_eq!(resolved_node_type(&context, node), type_);
+                    assert_eq!(
+                        context.store().source_callable_type_for_owner(owner),
+                        Some(type_)
+                    );
+                    let provenance = context.store().source_callable_provenance(type_).unwrap();
+                    assert_eq!(provenance.owner_symbol, owner);
+                    assert_eq!(provenance.declaration, node);
+                    assert_eq!(provenance.signature, signature);
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature_links(node)
+                            .unwrap()
+                            .resolved_signature
+                            .signature(),
+                        Some(signature)
+                    );
+                }
+                for (node, type_) in [
+                    (captured, expected),
+                    (returned, returned_type),
+                    (seed_read, parameter),
+                ] {
+                    assert_eq!(context.get_type_at_location(node).unwrap(), type_);
+                    assert_eq!(resolved_node_type(&context, node), type_);
+                }
+                assert_eq!(
+                    context
+                        .store()
+                        .signature(
+                            context
+                                .store()
+                                .source_callable_provenance(function_type)
+                                .unwrap()
+                                .signature
+                        )
+                        .unwrap()
+                        .resolved_return_type(),
+                    Some(function_return)
+                );
+                assert_eq!(observable_state(&context, file), warm, "{text}");
+                assert_eq!(context.diagnostics(), &diagnostics);
             }
         }
     }
