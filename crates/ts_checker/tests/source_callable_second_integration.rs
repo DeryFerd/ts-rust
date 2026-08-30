@@ -7,6 +7,7 @@ use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
     DeclaredTypeLinks, IntrinsicBootstrapOptions, SignatureId, SignatureLinks, SourceFileLinks,
     SymbolNodeLinks, TypeData, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    type_records::StructuredTypeData,
 };
 use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
@@ -660,15 +661,25 @@ fn assert_jsdoc_overload_key(
     (key, public, body)
 }
 
+fn structured_fields(data: &TypeData) -> Option<&StructuredTypeData> {
+    match data {
+        TypeData::Object(data) => Some(&data.structured),
+        TypeData::TypeReference(data) => Some(&data.object.structured),
+        TypeData::Interface(data) => Some(&data.reference.object.structured),
+        TypeData::Tuple(data) => Some(&data.interface.reference.object.structured),
+        TypeData::InstantiationExpression(data) => Some(&data.object.structured),
+        TypeData::Mapped(data) => Some(&data.object.structured),
+        TypeData::ReverseMapped(data) => Some(&data.object.structured),
+        TypeData::EvolvingArray(data) => Some(&data.object.structured),
+        TypeData::Union(data) => Some(&data.union.structured),
+        TypeData::Intersection(data) => Some(&data.intersection.structured),
+        _ => None,
+    }
+}
+
 fn assert_rest_property(checker: &mut CanonicalCheckerContext<'_>, rest: TypeId) {
     assert_eq!(checker.type_to_string(rest).unwrap(), "{ keep: boolean; }");
-    let structured = checker
-        .store()
-        .type_payload(rest)
-        .unwrap()
-        .data()
-        .structured()
-        .unwrap();
+    let structured = structured_fields(checker.store().type_payload(rest).unwrap().data()).unwrap();
     let [property] = structured.properties.as_deref().unwrap() else {
         panic!("rest must exclude only the value property")
     };
@@ -823,7 +834,7 @@ fn contextual_function_this_keeps_receiver_and_value_parameter_identities() {
     };
     let this_read = node(&parsed, property.expression);
     let property_name = node(&parsed, property.name);
-    let property_declaration = only_node(&parsed, SyntaxKind::PropertySignature);
+    let property_declaration = only_node(&parsed, SyntaxKind::PropertyDeclaration);
     assert_eq!(
         parsed.arena.get(this_read.node).unwrap().kind,
         SyntaxKind::ThisKeyword
