@@ -94,31 +94,35 @@ fn value_type(context: &CanonicalCheckerContext<'_>, symbol: SemanticSymbolId) -
         .unwrap()
 }
 
-fn allocations(context: &CanonicalCheckerContext<'_>) -> ([usize; 7], Vec<usize>) {
+fn allocations(context: &CanonicalCheckerContext<'_>) -> [usize; 7] {
     let store = context.store();
-    (
-        [
-            store.type_len(),
-            store.symbol_len(),
-            store.signature_len(),
-            store.mapper_len(),
-            store.type_alias_len(),
-            store.index_info_len(),
-            store.symbol_store().symbol_table_len(),
-        ],
-        store.checker_link_allocated_lengths().to_vec(),
-    )
+    [
+        store.type_len(),
+        store.symbol_len(),
+        store.signature_len(),
+        store.mapper_len(),
+        store.type_alias_len(),
+        store.index_info_len(),
+        store.symbol_store().symbol_table_len(),
+    ]
 }
 
-fn assert_properties(context: &CanonicalCheckerContext<'_>, parsed: &ParseResult, type_: TypeId) {
+fn assert_properties(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    interface_type: TypeId,
+) {
     let owner = symbol(context, parsed, "Loose");
     let implicit = symbol(context, parsed, "value");
     let typed = symbol(context, parsed, "typed");
     let store = context.store();
-    let TypeData::Interface(interface) = store.type_payload(type_).unwrap().data() else {
+    let TypeData::Interface(interface) = store.type_payload(interface_type).unwrap().data() else {
         panic!("Loose must retain its declared interface type");
     };
-    assert_eq!(store.type_payload(type_).unwrap().symbol(), Some(owner));
+    assert_eq!(
+        store.type_payload(interface_type).unwrap().symbol(),
+        Some(owner),
+    );
     assert!(interface.declared_members_resolved);
     assert_eq!(
         interface.declared_members,
