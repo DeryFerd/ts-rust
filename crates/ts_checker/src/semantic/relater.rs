@@ -9845,8 +9845,6 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             || conditional.combined_mapper.is_some()
             || !root.is_distributive()
             || root.infer_type_parameters().is_some()
-            || root.outer_type_parameters().is_some()
-            || root.instantiations() != &TypeCacheState::Unallocated
             || root.alias().is_some()
             || self.source_node_kind(node) != Some(SyntaxKind::ConditionalType)
             || self.type_node_links(node)
@@ -9897,6 +9895,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             || signature_record.min_argument_count() != 0
             || signature_record.resolved_return_type() != Some(type_)
             || self.function_signature_return_annotation(signature) != Some((node, false))
+        {
+            return Err(malformed());
+        }
+        if root.outer_type_parameters() != Some(signature_record.type_parameters())
+            || super::conditional_types::conditional_query_alias(self, node) != Ok(None)
         {
             return Err(malformed());
         }
@@ -14328,6 +14331,12 @@ mod tests {
             _ => unreachable!("the template return remains conditional"),
         };
         let root_node = fixture.store.conditional_root(root).unwrap().node();
+        let root_instantiations = fixture
+            .store
+            .conditional_root(root)
+            .unwrap()
+            .instantiations()
+            .clone();
         let warm = fixture.store.relation_state_snapshot();
         assert!(
             fixture.store.set_conditional_root_instantiations(
@@ -14346,7 +14355,7 @@ mod tests {
         assert!(
             fixture
                 .store
-                .set_conditional_root_instantiations(root, TypeCacheState::Unallocated)
+                .set_conditional_root_instantiations(root, root_instantiations)
         );
 
         let alias = fixture
