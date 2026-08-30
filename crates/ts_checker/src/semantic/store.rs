@@ -1910,7 +1910,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     pub(super) fn set_source_callable_provenance(
         &mut self,
         type_: TypeId,
-        provenance: SourceCallableProvenance,
+        provenance: &SourceCallableProvenance,
     ) -> bool {
         let contextual_pair = match (provenance.contextual_target, provenance.contextual_variable) {
             (None, None) => provenance.captured_assignment.is_none(),
@@ -1953,7 +1953,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     fn set_source_callable_provenance_with_context(
         &mut self,
         type_: TypeId,
-        provenance: SourceCallableProvenance,
+        provenance: &SourceCallableProvenance,
         contextual_pair: bool,
     ) -> bool {
         let exact_type_parameters =
@@ -2014,7 +2014,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self
                 .relation_observable_symbols
                 .contains(&provenance.owner_symbol);
-        let by_type = self.source_callable_provenance.insert(type_, provenance);
+        let by_type = self.source_callable_provenance.insert(type_, *provenance);
         let by_declaration = self
             .source_callable_types_by_declaration
             .insert(provenance.declaration, type_);
@@ -3131,15 +3131,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     pub(super) fn replace_source_callable_provenance_for_test(
         &mut self,
         type_: TypeId,
-        replacement: Option<SourceCallableProvenance>,
+        replacement: Option<&SourceCallableProvenance>,
     ) -> Option<SourceCallableProvenance> {
-        if self.source_callable_provenance.get(&type_).copied() != replacement
-            && let Some(provenance) = self.source_callable_provenance.get(&type_).copied()
+        if self.source_callable_provenance.get(&type_) != replacement
+            && let Some(provenance) = self.source_callable_provenance.get(&type_)
         {
             self.invalidate_inferred_return_cycles_for_node(provenance.declaration, None);
         }
         match replacement {
-            Some(replacement) => self.source_callable_provenance.insert(type_, replacement),
+            Some(replacement) => self.source_callable_provenance.insert(type_, *replacement),
             None => self.source_callable_provenance.remove(&type_),
         }
     }
@@ -10253,7 +10253,7 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
     pub(super) fn set_contextual_source_callable_provenance(
         &mut self,
         type_: TypeId,
-        provenance: SourceCallableProvenance,
+        provenance: &SourceCallableProvenance,
     ) -> bool {
         let sort_target_is_exact = (|| {
             let target = provenance.contextual_target?;

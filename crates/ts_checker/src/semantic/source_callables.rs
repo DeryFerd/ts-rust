@@ -10772,7 +10772,7 @@ fn publish_prepared_contextual_source_callable(
         .ok_or_else(|| invariant(SourceCallableInvariant::Publication(prepared.declaration)))?;
     assert!(store.set_contextual_source_callable_provenance(
         type_,
-        SourceCallableProvenance {
+        &SourceCallableProvenance {
             family: SourceCallableFamily::ArrowFunction,
             declaration: prepared.declaration,
             owner_symbol: prepared.owner_symbol,
@@ -11117,7 +11117,7 @@ pub(super) fn begin_source_callable(
         .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
     let provenance = store.set_source_callable_provenance(
         type_,
-        SourceCallableProvenance {
+        &SourceCallableProvenance {
             family: plan.family,
             declaration: plan.declaration,
             owner_symbol: plan.owner_symbol,
@@ -12723,7 +12723,7 @@ pub(super) fn validate_stored_source_callable(
                 owner_symbol,
                 owner,
                 declaration,
-                provenance,
+                &provenance,
             )
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
         || store.value_symbol_links(owner_symbol) != Some(&owner_links)
@@ -14344,7 +14344,7 @@ fn valid_stored_function_export_route(
     owner_symbol: SemanticSymbolId,
     owner: &ts_binder::semantic::Symbol,
     declaration: NodeRef,
-    provenance: SourceCallableProvenance,
+    provenance: &SourceCallableProvenance,
 ) -> bool {
     match (provenance.owner_parent, provenance.export_local) {
         (None, None) => owner.parent().is_none(),
@@ -20242,7 +20242,7 @@ mod tests {
                 .store
                 .replace_source_callable_provenance_for_test(
                     poison_type,
-                    Some(SourceCallableProvenance {
+                    Some(&SourceCallableProvenance {
                         family: SourceCallableFamily::FunctionDeclaration,
                         declaration: staged.declaration,
                         owner_symbol: staged.owner,
@@ -21952,7 +21952,7 @@ mod tests {
                     .store_mut_for_test()
                     .replace_source_callable_provenance_for_test(
                         callable,
-                        Some(damaged_provenance),
+                        Some(&damaged_provenance),
                     ),
                 Some(provenance),
             );
@@ -21976,7 +21976,7 @@ mod tests {
             assert_eq!(
                 context
                     .store_mut_for_test()
-                    .replace_source_callable_provenance_for_test(callable, Some(provenance),),
+                    .replace_source_callable_provenance_for_test(callable, Some(&provenance),),
                 Some(damaged_provenance),
             );
             assert_eq!(
@@ -23069,7 +23069,7 @@ mod tests {
         {
             fixture.store.replace_source_callable_provenance_for_test(
                 callable,
-                Some(SourceCallableProvenance {
+                Some(&SourceCallableProvenance {
                     contextual_target,
                     contextual_variable,
                     ..provenance
@@ -23082,7 +23082,7 @@ mod tests {
         }
         fixture
             .store
-            .replace_source_callable_provenance_for_test(callable, Some(provenance));
+            .replace_source_callable_provenance_for_test(callable, Some(&provenance));
         assert!(matches!(
             validate_stored_source_callable(&fixture.store, callable),
             StoredSourceCallableValidation::Valid(_)
@@ -26903,7 +26903,7 @@ mod tests {
             .unwrap();
         assert!(!fixture.store.set_source_callable_provenance(
             callable,
-            SourceCallableProvenance {
+            &SourceCallableProvenance {
                 family: SourceCallableFamily::FunctionDeclaration,
                 declaration,
                 owner_symbol: owner,

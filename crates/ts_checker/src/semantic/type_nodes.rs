@@ -104,7 +104,7 @@ use super::{
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::{
         ResolvedSourceCallableTypeParameter, SourceCallableInferredReturnCycle,
-        SourceCallableTypeParameterProvenance, SourceNodeParent,
+        SourceCallableReturnProvenance, SourceCallableTypeParameterProvenance, SourceNodeParent,
     },
     structured_members,
     template_types::{StringMappingKind, TemplateTypeError},
@@ -28205,6 +28205,48 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidFunctionSignature(signature),
             ));
+        }
+        if provenance.contextual_target.is_some() {
+            self.reject_type_reference_alias_capabilities()?;
+            let invalid =
+                || type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+            let type_ = self
+                .store
+                .source_callable_type_for_signature(signature)
+                .ok_or_else(&invalid)?;
+            let record = self.store.signature(signature).ok_or_else(&invalid)?;
+            // The host plan already proved the direct-call or property anchor.
+            // Recheck its full capture value before using the published return.
+            if retained.is_some()
+                || callable.family != SourceCallableFamily::ArrowFunction
+                || self.host.node(declaration).map(|node| node.kind)
+                    != Some(SyntaxKind::ArrowFunction)
+                || callable.family != provenance.family
+                || callable.declaration != provenance.declaration
+                || callable.owner_symbol != provenance.owner_symbol
+                || callable.owner_parent != provenance.owner_parent
+                || callable.export_local != provenance.export_local
+                || callable.captured_assignment() != provenance.captured_assignment
+                || !callable.return_type.is_inferred()
+                || provenance.return_provenance != SourceCallableReturnProvenance::Inferred
+                || callable.type_predicate.is_some()
+                || !callable.type_parameters.is_empty()
+                || record.declaration() != Some(callable.declaration)
+                || record.flags() != callable.flags
+                || record.min_argument_count() != callable.min_argument_count
+                || !record
+                    .parameters()
+                    .iter()
+                    .copied()
+                    .eq(callable.parameters.iter().map(|parameter| parameter.symbol))
+                || !matches!(
+                    source_callables::validate_stored_source_callable(self.store, type_),
+                    source_callables::StoredSourceCallableValidation::Valid(_)
+                )
+            {
+                return Err(invalid());
+            }
+            return record.resolved_return_type().ok_or_else(invalid);
         }
         source_callables::validate_source_callable_signature_identity(
             self.store, &callable, signature,
@@ -67705,7 +67747,10 @@ mod tests {
                     assert!(
                         fixture
                             .store
-                            .replace_source_callable_provenance_for_test(expected, Some(provenance))
+                            .replace_source_callable_provenance_for_test(
+                                expected,
+                                Some(&provenance)
+                            )
                             .is_some()
                     );
                 }
@@ -88776,6 +88821,373 @@ mod tests {
             counts
         );
         assert!(query.diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the real capture, damaged proofs, and no-write return queries together.
+    fn contextual_source_signature_returns_validate_capture_and_return_proofs() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let parsed = parse_source_file(concat!(
+            "type Observer<T> = { next: (value: T) => void; };\n",
+            "type Subscription = { unsubscribe: () => void; };\n",
+            "export default <T>(seed: T): T => {\n",
+            "  let _observers: Observer<T>[] = [];\n",
+            "  const subscribe = (observer: Observer<T>): Subscription => {\n",
+            "    _observers.push(observer);\n",
+            "    return {\n",
+            "      unsubscribe: () => {\n",
+            "        _observers = _observers.filter((o) => o !== observer);\n",
+            "      },\n",
+            "    };\n",
+            "  };\n",
+            "  return seed;\n",
+            "};\n",
+        ));
+        let library_file = FileId::new(8_286);
+        let file = FileId::new(8_287);
+        let files = [(library_file, &library), (file, &parsed)];
+        let mut binder = CanonicalBinder::new();
+        for (id, source) in files {
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let is_library = id == library_file;
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    id,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if is_library {
+                            "\"/lib/lib.es5.d.ts\""
+                        } else {
+                            "\"/project/contextual-return.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_library,
+                        is_library,
+                        if is_library {
+                            CanonicalModuleState::Script
+                        } else {
+                            CanonicalModuleState::External
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        for (id, source) in files {
+            binder
+                .bind_typescript_declaration_slice(&source.arena, id)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(id, source)| (id, &source.arena))
+                .collect(),
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let options = context.options();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&library.arena, &library_bound), (&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        let reference = |node| NodeRef::new(parsed.arena.id(), file, node);
+        let callback = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction
+                    && record.parent.is_some_and(|parent| {
+                        parsed.arena.get(parent).unwrap().kind == SyntaxKind::CallExpression
+                    }))
+                .then_some(reference(node))
+            })
+            .unwrap();
+        let owner = bound.symbol(callback).unwrap();
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+        assert!(context.store().signature_links(callback).is_none());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let signature = provenance.signature;
+        let captured = provenance.captured_assignment.unwrap();
+        let returned = context.store().intrinsic_bootstrap().unwrap().boolean_type;
+        assert!(provenance.contextual_target.is_some());
+        assert_eq!(provenance.contextual_variable, None);
+        assert_eq!(provenance.declaration, callback);
+        assert_eq!(provenance.owner_symbol, owner);
+        assert_eq!(
+            context
+                .store()
+                .checked_source_callable_return_type(signature),
+            Some(returned),
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(returned),
+        );
+        assert_eq!(
+            source_callables::plan_source_callable(
+                context.store(),
+                &host,
+                callback,
+                owner,
+                Some(CanonicalArrayTargets::from_global_types(&globals)),
+            )
+            .unwrap()
+            .captured_assignment(),
+            Some(captured),
+        );
+        let call = reference(host.node(callback).unwrap().parent.unwrap());
+        let NodeData::CallExpression(call_data) = &host.node(call).unwrap().data else {
+            unreachable!()
+        };
+        let NodeData::PropertyAccessExpression(access) =
+            &parsed.arena.get(call_data.expression).unwrap().data
+        else {
+            unreachable!()
+        };
+        let wrong_origin = super::super::source_flow::plan_source_captured_local(
+            context.store(),
+            &host,
+            captured.writing_callable(),
+            reference(access.expression),
+            captured.symbol(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(wrong_origin, captured);
+        assert_eq!(wrong_origin.declaration(), captured.declaration());
+        assert_eq!(wrong_origin.writing_callable(), captured.writing_callable());
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            (
+                function_store_state(store),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.source_callable_provenance_lengths(),
+                store.source_callable_provenance(callable),
+                store.checked_source_callable_return_type(signature),
+                store.signature(signature).unwrap().resolved_return_type(),
+                parsed
+                    .arena
+                    .iter()
+                    .map(|(node, _)| {
+                        let node = reference(node);
+                        (
+                            store.type_node_links(node).cloned(),
+                            store.symbol_node_links(node).cloned(),
+                            store.signature_links(node).cloned(),
+                            bound
+                                .symbol(node)
+                                .map(|symbol| (symbol, store.value_symbol_links(symbol).cloned())),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let warm = snapshot(context.store());
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        assert_eq!(snapshot(context.store()), warm);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut session = InstantiationSession::new(InstantiationLimits {
+            max_count: 0,
+            ..InstantiationLimits::default()
+        });
+        {
+            let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap();
+            for _ in 0..2 {
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(snapshot(query.store), warm);
+                assert!(query.resolving_instantiated_signatures.is_empty());
+            }
+            let invalid =
+                type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature));
+            for origin in [None, Some(wrong_origin)] {
+                let damaged = super::super::store::SourceCallableProvenance {
+                    captured_assignment: origin,
+                    ..provenance
+                };
+                assert_eq!(
+                    query
+                        .store
+                        .replace_source_callable_provenance_for_test(callable, Some(&damaged),),
+                    Some(provenance),
+                );
+                let before = snapshot(query.store);
+                assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                assert_eq!(snapshot(query.store), before);
+                assert_eq!(
+                    query
+                        .store
+                        .replace_source_callable_provenance_for_test(callable, Some(&provenance),),
+                    Some(damaged),
+                );
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(snapshot(query.store), warm);
+            }
+            let number = query.store.intrinsic_bootstrap().unwrap().number_type;
+            for changed in [None, Some(number)] {
+                assert!(
+                    query
+                        .store
+                        .set_signature_resolved_return_type(signature, changed)
+                );
+                let before = snapshot(query.store);
+                assert_eq!(query.get_return_type_of_signature(signature), Err(invalid));
+                assert_eq!(snapshot(query.store), before);
+                assert_eq!(
+                    query.store.checked_source_callable_return_type(signature),
+                    Some(returned)
+                );
+                assert!(
+                    query
+                        .store
+                        .set_signature_resolved_return_type(signature, Some(returned))
+                );
+                assert_eq!(query.get_return_type_of_signature(signature), Ok(returned));
+                assert_eq!(snapshot(query.store), warm);
+            }
+            assert!(query.type_reference_alias_targets.is_empty());
+            assert!(
+                query
+                    .store
+                    .source_callable_interface_return_proof(signature)
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count()
+            ),
+            (0, 0, 0),
+        );
+        assert!(diagnostics.is_empty());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Ok(returned)
+        );
+        assert_eq!(snapshot(context.store()), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn contextual_source_signature_returns_keep_existing_call_and_property_anchors() {
+        let library = parse_source_file(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        for (source, property_anchor) in [
+            (
+                "declare function consume(callback: (value: string) => void): void; consume(value => value);",
+                false,
+            ),
+            (
+                "interface Handler { run: (value: string) => string; } declare function consume(handler: Handler): void; consume({ run: value => value });",
+                true,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let (mut context, _, file) = native_method_parameter_context(&library, &parsed, false);
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            assert!(
+                context
+                    .store()
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty(), "{source}");
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            assert_eq!(provenance.declaration, declaration);
+            assert_eq!(provenance.owner_symbol, owner);
+            assert!(provenance.contextual_target.is_some());
+            assert_eq!(provenance.contextual_variable.is_some(), property_anchor);
+            assert_eq!(provenance.captured_assignment, None);
+            assert_eq!(
+                provenance.return_provenance,
+                SourceCallableReturnProvenance::Inferred
+            );
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let signature = provenance.signature;
+            assert_eq!(
+                context
+                    .store()
+                    .callable_signature_parameter_types(signature),
+                Some([string].as_slice())
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .checked_source_callable_return_type(signature),
+                Some(string)
+            );
+            let before = function_store_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(context.get_return_type_of_signature(signature), Ok(string));
+                assert_eq!(function_store_state(context.store()), before);
+                assert_eq!(
+                    context.store().source_callable_provenance(callable),
+                    Some(provenance)
+                );
+            }
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(context.get_return_type_of_signature(signature), Ok(string));
+            assert_eq!(function_store_state(context.store()), before);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
