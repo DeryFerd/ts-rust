@@ -11205,7 +11205,9 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
         }
         let query_required = (prepared.family == SourceCallableFamily::FunctionDeclaration
             || ordinary_arrow)
-            && prepared.return_annotation.is_some()
+            && (prepared.return_annotation.is_some()
+                || prepared.family == SourceCallableFamily::FunctionDeclaration
+                    && !prepared.syntax.inferred_empty_body_is_exact())
             && !prepared.type_parameters.is_empty();
         if query_required != prepared.query_evidence.is_some() {
             return None;
@@ -11292,7 +11294,27 @@ impl SemanticStore<TypeRecord, super::mapper::TypeMapper> {
                     && self.source_return_annotation_belongs_to(prepared.declaration, annotation)
             }
             None => {
-                prepared.syntax.inferred_empty_body_is_exact()
+                (prepared.syntax.inferred_empty_body_is_exact()
+                    || prepared.query_evidence.as_ref().is_some_and(|evidence| {
+                        let plan = evidence.callable();
+                        plan.family == SourceCallableFamily::FunctionDeclaration
+                            && plan.body_mode
+                                == super::source_callables::SourceCallableBodyMode::Present
+                            && plan.return_type.is_inferred()
+                            && !plan.is_async
+                            && !prepared.syntax.generic_fixed_return_is_exact()
+                            && prepared
+                                .syntax
+                                .generic_return_type_parameter_declaration()
+                                .is_none()
+                            && self
+                                .source_direct_type_annotation(prepared.declaration)
+                                .is_none()
+                            && self.source_child_with_kind(prepared.declaration, SyntaxKind::Block)
+                                == Some(plan.body)
+                            && self.source_node_parent(plan.body)
+                                == Some(SourceNodeParent::Parent(prepared.declaration))
+                    }))
                     && !prepared.return_null_literal_identity
                     && prepared.generic_return_type_parameter.is_none()
                     && self

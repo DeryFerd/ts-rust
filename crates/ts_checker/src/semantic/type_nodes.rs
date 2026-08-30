@@ -27203,7 +27203,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .map_err(|error| source_callable_error(error, callable.family))?
         {
             source_callables::SourceCallableState::Cold => None,
-            source_callables::SourceCallableState::Resolved { signature, .. } => {
+            source_callables::SourceCallableState::AwaitingInferredReturn { signature, .. }
+            | source_callables::SourceCallableState::Resolved { signature, .. } => {
                 let evidence = self
                     .store
                     .source_callable_type_query(signature)
@@ -27853,7 +27854,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         match source_callables::source_callable_state(self.store, callable, true)
             .map_err(|error| source_callable_error(error, callable.family))?
         {
-            source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
+            source_callables::SourceCallableState::AwaitingInferredReturn { type_, .. }
+            | source_callables::SourceCallableState::Resolved { type_, .. } => return Ok(type_),
             source_callables::SourceCallableState::Cold => {}
             _ => {
                 return Err(type_node_unavailable(
@@ -27879,7 +27881,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             return match source_callables::source_callable_state(self.store, callable, false)
                 .map_err(|error| source_callable_error(error, callable.family))?
             {
-                source_callables::SourceCallableState::Resolved { type_, signature }
+                source_callables::SourceCallableState::AwaitingInferredReturn {
+                    type_,
+                    signature,
+                }
+                | source_callables::SourceCallableState::Resolved { type_, signature }
                     if type_ == pending.type_ && signature == pending.signature =>
                 {
                     Ok(type_)
@@ -29206,7 +29212,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .transpose()?;
         self.preflight_source_callable_alias_annotations(&callable)?;
         if callable.return_type.is_inferred() {
-            self.reject_type_reference_alias_capabilities()?;
+            if queried_plan.is_none() {
+                self.reject_type_reference_alias_capabilities()?;
+            }
             if let Some(return_type) = source_callables::validate_inferred_source_callable_return(
                 self.store, &callable, signature,
             )

@@ -398,18 +398,74 @@ fn inferred_function_dependency_boundaries_precede_callable_publication() {
 }
 
 #[test]
-fn generic_inferred_and_multiple_returns_precede_callable_publication() {
-    assert_function_boundary_before_publication(
-        "function identity<T>(value: T) { return value; }",
-        FileId::new(5),
-        |error| {
-            matches!(
-                error,
-                SourceCheckError::Unsupported(UnsupportedSourceSyntax::Function(
-                    SourceFunctionUnsupported::Callable(_)
-                ))
-            )
-        },
+fn generic_return_inference_keeps_the_multiple_return_boundary() {
+    let parsed = parse_source_file("function identity<T>(value: T) { return value; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(5);
+    let mut context = context(&parsed, file);
+    let (declaration, function) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| match &record.data {
+            NodeData::FunctionDeclaration(function) => {
+                Some((NodeRef::new(parsed.arena.id(), file, node), function))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(function.type_.is_none());
+    let type_parameter = NodeRef::new(
+        parsed.arena.id(),
+        file,
+        function.type_parameters.as_ref().unwrap().nodes[0],
+    );
+    let parameter = NodeRef::new(parsed.arena.id(), file, function.parameters.nodes[0]);
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+    let signature = context
+        .store()
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .unwrap();
+    let type_parameter_symbol = context
+        .file(file)
+        .unwrap()
+        .1
+        .symbol(type_parameter)
+        .unwrap();
+    let parameter_symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
+    let parameter_type = context
+        .store()
+        .declared_type_links(type_parameter_symbol)
+        .and_then(|links| links.declared_type)
+        .unwrap();
+    let record = context.store().signature(signature).unwrap();
+    assert_eq!(record.declaration(), Some(declaration));
+    assert_eq!(record.type_parameters(), [parameter_type]);
+    assert_eq!(record.parameters(), [parameter_symbol]);
+    assert_eq!(record.resolved_return_type(), Some(parameter_type));
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(parameter_symbol)
+            .and_then(|links| links.resolved_type),
+        Some(parameter_type)
+    );
+    let counts = (context.store().type_len(), context.store().signature_len());
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.store().signature_len()),
+        counts
+    );
+    assert!(context.diagnostics().is_empty());
+    assert_eq!(
+        context.get_return_type_of_signature(signature),
+        Ok(parameter_type)
+    );
+    assert_eq!(
+        (context.store().type_len(), context.store().signature_len()),
+        counts
     );
     assert_function_boundary_before_publication(
         "function multiple() { return 1; return 2; }",

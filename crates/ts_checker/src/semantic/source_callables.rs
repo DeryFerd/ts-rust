@@ -803,9 +803,12 @@ impl SourceCallablePlan {
 
     pub(super) fn requires_type_query_evidence(&self) -> bool {
         !self.type_parameters.is_empty()
-            && self.return_type.type_node().is_some()
             && (self.family == SourceCallableFamily::FunctionDeclaration
+                && (self.return_type.type_node().is_some()
+                    || self.return_type.is_inferred()
+                        && !self.type_parameter_syntax.inferred_empty_body_is_exact())
                 || self.family == SourceCallableFamily::ArrowFunction
+                    && self.return_type.type_node().is_some()
                     && self.type_parameter_syntax.is_ordinary_typescript_arrow())
     }
 
@@ -2757,7 +2760,9 @@ pub(super) fn plan_enclosing_source_callable_annotation(
             let Some(type_parameters) = type_parameters else {
                 return Ok(None);
             };
-            if type_parameters.nodes.is_empty() || return_type.is_none() {
+            if type_parameters.nodes.is_empty()
+                || return_type.is_none() && record.kind != SyntaxKind::FunctionDeclaration
+            {
                 return Ok(None);
             }
             let contains =
@@ -2937,9 +2942,10 @@ fn plan_source_callable_with_owner_shape(
             .bound_file(declaration)
             .and_then(ts_binder::BoundFile::source_facts)
             .is_some_and(|facts| !facts.is_javascript_file());
-    let query_annotations = view.return_type.is_some()
-        && (view.family == SourceCallableFamily::FunctionDeclaration
-            || ordinary_typescript_arrow && !view.is_async(store, declaration));
+    let query_annotations = view.family == SourceCallableFamily::FunctionDeclaration
+        || view.return_type.is_some()
+            && ordinary_typescript_arrow
+            && !view.is_async(store, declaration);
     let type_parameters = plan_exact_source_type_parameters(
         store,
         host,
@@ -3700,8 +3706,7 @@ fn plan_source_callable_with_owner_shape(
             ));
         }
     };
-    let inferred_empty_body_is_exact = !type_parameters.is_empty() && return_type.is_inferred();
-    if inferred_empty_body_is_exact {
+    let inferred_empty_body_is_exact = if !type_parameters.is_empty() && return_type.is_inferred() {
         let body_record = preflight_node(store, host, body)?;
         let NodeData::Block(block) = &body_record.data else {
             return Err(SourceCallableError::Unsupported(
@@ -3738,14 +3743,11 @@ fn plan_source_callable_with_owner_shape(
             };
         if view.family != SourceCallableFamily::FunctionDeclaration
             || body_mode != SourceCallableBodyMode::Present
-            || !supported_parameter_shape
-            || flags != SignatureFlags::NONE
             || body_record.kind != SyntaxKind::Block
             || body_record.parent != Some(declaration.node)
             || body_record.flags.0 != 0
             || block.flow_node.is_some()
             || block.next_container.is_some()
-            || !block.statements.nodes.is_empty()
             || block.statements.has_trailing_comma
             || block.facts != 0
         {
@@ -3753,7 +3755,64 @@ fn plan_source_callable_with_owner_shape(
                 SourceCallableUnsupported::GenericInferredReturn(declaration),
             ));
         }
-    }
+        // Keep the existing empty-void transaction only when its original
+        // input proof also succeeds. Every other body uses the full query plan.
+        let legacy_empty = supported_parameter_shape
+            && flags == SignatureFlags::NONE
+            && block.statements.nodes.is_empty();
+        let legacy_inputs = if legacy_empty {
+            let legacy = plan_exact_source_type_parameters(
+                store,
+                host,
+                declaration,
+                view.family,
+                view.type_parameters,
+                view.parameters,
+                false,
+            )?;
+            legacy == type_parameters
+        } else {
+            false
+        };
+        if !legacy_inputs {
+            if is_async {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::GenericInferredReturn(declaration),
+                ));
+            }
+            for parameter in &type_parameters {
+                if let Some(constraint) = parameter.constraint
+                    && inferred_query_constraint_name_is_missing(store, host, constraint)?
+                {
+                    return Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::GenericSignature(constraint),
+                    ));
+                }
+            }
+            for parameter in &parameters {
+                let rest_is_exact = !parameter.rest
+                    || match array_targets {
+                        Some(targets) => is_exact_source_generic_array_annotation(
+                            store,
+                            host,
+                            parameter.identity_node,
+                            &type_parameters,
+                            targets,
+                        )?,
+                        None => false,
+                    };
+                if parameter.is_implicit_any() || parameter.initializer.is_some() || !rest_is_exact
+                {
+                    return Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::GenericSignature(declaration),
+                    ));
+                }
+            }
+        }
+        legacy_inputs
+    } else {
+        false
+    };
     if let Some(token_id) = view.equals_greater_than_token {
         let token = NodeRef::new(declaration.arena, declaration.file, token_id);
         let token_record = preflight_node(store, host, token)?;
@@ -6780,6 +6839,53 @@ fn namespace_generic_target_arity(
         })
 }
 
+/// The general inferred-return path does not add unresolved-name recovery.
+fn inferred_query_constraint_name_is_missing(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    constraint: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, constraint)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Ok(false);
+    };
+    let name = NodeRef::new(constraint.arena, constraint.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::TypeReference
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(constraint.node)
+        || identifier.text.is_empty()
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            constraint,
+        )));
+    }
+    let (arena, bound) = host
+        .source(constraint)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidSyntax(constraint)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(name)),
+                &identifier.text,
+                SymbolFlags::TYPE,
+                None,
+                true,
+                false,
+            );
+    match resolved {
+        Ok(symbol) => Ok(symbol.is_none()),
+        // Import capabilities are checked by the complete input-query plan.
+        Err(ts_binder::CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => Ok(false),
+        Err(error) => Err(DeclaredTypeError::from(error).into()),
+    }
+}
+
 /// Proves one missing, unqualified generic constraint without caching a name.
 pub(super) fn exact_unresolved_source_type_parameter_constraint(
     store: &CanonicalTypeMapperStore,
@@ -9446,10 +9552,44 @@ fn valid_source_callable_plan_owner(
     }
 }
 
+fn valid_queried_inferred_generic_source_callable(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+) -> bool {
+    !plan.type_parameters.is_empty()
+        && plan.family == SourceCallableFamily::FunctionDeclaration
+        && plan.return_type.is_inferred()
+        && plan.body_mode == SourceCallableBodyMode::Present
+        && !plan.is_async
+        && plan.flags.bits()
+            & !(SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES).bits()
+            == 0
+        && plan.parameters.iter().all(|parameter| {
+            parameter.explicit_type_node().is_some() && parameter.initializer.is_none()
+        })
+        && plan.generic_return_type_parameter_index.is_none()
+        && plan.type_parameter_syntax.declaration() == plan.declaration
+        && plan.type_parameter_syntax.rows().len() == plan.type_parameters.len()
+        && !plan.type_parameter_syntax.inferred_empty_body_is_exact()
+        && !plan.type_parameter_syntax.generic_fixed_return_is_exact()
+        && plan
+            .type_parameter_syntax
+            .generic_return_type_parameter_declaration()
+            .is_none()
+        && store
+            .source_direct_type_annotation(plan.declaration)
+            .is_none()
+        && store.source_child_with_kind(plan.declaration, SyntaxKind::Block) == Some(plan.body)
+        && store.source_node_parent(plan.body) == Some(SourceNodeParent::Parent(plan.declaration))
+}
+
 fn valid_inferred_generic_source_callable(
     store: &CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
 ) -> bool {
+    if plan.requires_type_query_evidence() {
+        return valid_queried_inferred_generic_source_callable(store, plan);
+    }
     let exact_parameters = plan.parameters.is_empty() && plan.min_argument_count == 0
         || match (plan.type_parameters.as_slice(), plan.parameters.as_slice()) {
             ([type_parameter], [parameter])
@@ -11971,6 +12111,8 @@ pub(super) fn publish_inferred_source_callable_return(
         valid_inferred_source_callable_return_capability(store, plan.array_targets, return_type);
     if !capability_valid
         || !plan.type_parameters.is_empty()
+            && (!plan.requires_type_query_evidence()
+                || stored_inferred_generic_body_is_empty(store, plan.declaration))
             && store
                 .intrinsic_bootstrap()
                 .is_none_or(|bootstrap| return_type != bootstrap.void_type)
@@ -12923,6 +13065,10 @@ pub(super) fn validate_stored_source_callable(
             return StoredSourceCallableValidation::Pending;
         };
         let valid_return = (type_parameter_edges.is_empty()
+            || validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+                evidence.callable().return_type.is_inferred()
+                    && !stored_inferred_generic_body_is_empty(store, declaration)
+            })
             || store
                 .intrinsic_bootstrap()
                 .is_some_and(|bootstrap| return_type == bootstrap.void_type))
@@ -13027,9 +13173,10 @@ fn valid_stored_generic_source_signature(
     if signature.declaration().is_some_and(|declaration| {
         store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration)
             || store.source_arrow_has_ordinary_type_parameters(declaration)
-    }) && store
+    }) && (store
         .function_signature_return_annotation(signature_id)
         .is_some()
+        || store.source_callable_type_query(signature_id).is_some())
     {
         let Some(evidence) = validated_source_callable_type_query(store, signature_id) else {
             return false;
@@ -13749,6 +13896,18 @@ fn valid_stored_source_generic_return_provenance(
     }
 }
 
+fn stored_inferred_generic_body_is_empty(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> bool {
+    store.source_node_kind(declaration) == Some(SyntaxKind::FunctionDeclaration)
+        && store.source_direct_type_annotation(declaration).is_none()
+        && store
+            .source_child_with_kind(declaration, SyntaxKind::Block)
+            .and_then(|body| store.source_direct_children(body))
+            .is_some_and(|children| children.is_empty())
+}
+
 fn valid_inferred_generic_signature_parameters(
     store: &CanonicalTypeMapperStore,
     signature: SignatureId,
@@ -13757,7 +13916,23 @@ fn valid_inferred_generic_signature_parameters(
     let Some(record) = store.signature(signature) else {
         return false;
     };
-    if record.flags() != SignatureFlags::NONE {
+    if store.source_callable_type_query(signature).is_some() {
+        return validated_source_callable_type_query(store, signature).is_some_and(|evidence| {
+            valid_inferred_generic_source_callable(store, evidence.callable())
+                && evidence
+                    .type_parameters()
+                    .iter()
+                    .map(|row| row.provenance.type_parameter)
+                    .eq(type_parameters.iter().copied())
+        });
+    }
+    // The old no-query transaction proves an actual empty body. A missing
+    // query record must not turn a checked nonempty body into that transaction.
+    if record.flags() != SignatureFlags::NONE
+        || record
+            .declaration()
+            .is_none_or(|declaration| !stored_inferred_generic_body_is_empty(store, declaration))
+    {
         return false;
     }
     if record.parameters().is_empty() {
@@ -14111,6 +14286,21 @@ fn valid_stored_source_type_parameters(
 ) -> Option<Vec<TypeId>> {
     let ordinary_arrow = family == SourceCallableFamily::ArrowFunction
         && store.source_arrow_has_ordinary_type_parameters(declaration);
+    if family == SourceCallableFamily::FunctionDeclaration
+        && store
+            .source_direct_children(declaration)
+            .is_none_or(|children| {
+                children
+                    .into_iter()
+                    .filter(|child| {
+                        store.source_node_kind(*child) == Some(SyntaxKind::TypeParameter)
+                    })
+                    .count()
+                    != type_parameters.len()
+            })
+    {
+        return None;
+    }
     if type_parameters.is_empty() {
         return (!ordinary_arrow
             && store.source_callable_type_parameters(signature).is_none()
@@ -14137,9 +14327,12 @@ fn valid_stored_source_type_parameters(
         return None;
     }
     let query_required = (family == SourceCallableFamily::FunctionDeclaration || ordinary_arrow)
-        && store
+        && (store
             .function_signature_return_annotation(signature)
-            .is_some();
+            .is_some()
+            || store.source_callable_type_query(signature).is_some()
+            || family == SourceCallableFamily::FunctionDeclaration
+                && !stored_inferred_generic_body_is_empty(store, declaration));
     let query_evidence = if query_required {
         Some(validated_source_callable_type_query(store, signature)?)
     } else {
@@ -14326,7 +14519,7 @@ fn validated_source_callable_type_query(
                 export_local: plan.export_local,
                 signature,
                 flags: plan.flags,
-                return_provenance: SourceCallableReturnProvenance::Annotated,
+                return_provenance: plan.return_type.provenance(),
                 array_targets: plan.array_targets,
                 generic_return_type_parameter: expected_return_parameter,
                 contextual_target: None,
@@ -14645,6 +14838,8 @@ fn validate_cached_return_type(
     if plan.return_type.is_inferred() {
         let resolved_valid = resolved.is_none_or(|type_| {
             (plan.type_parameters.is_empty()
+                || plan.requires_type_query_evidence()
+                    && !stored_inferred_generic_body_is_empty(store, plan.declaration)
                 || store
                     .intrinsic_bootstrap()
                     .is_some_and(|bootstrap| type_ == bootstrap.void_type))
@@ -21043,7 +21238,6 @@ mod tests {
             "function broken<Item extends Missing = any>(item: Item) {}",
             "function broken<Item extends Missing<string>>(item: Item) {}",
             "function broken<Item extends Missing>(item: string) {}",
-            "type Alias = string; function broken<Item extends Alias>(item: Item) {}",
         ]
         .into_iter()
         .enumerate()
@@ -21074,7 +21268,170 @@ mod tests {
     }
 
     #[test]
-    fn inferred_generic_parameters_and_nonempty_bodies_publish_nothing() {
+    #[allow(clippy::too_many_lines)] // Keep the real alias input and empty body on one signature.
+    fn inferred_generic_alias_constraint_keeps_its_query_and_checked_void_return() {
+        let parsed = parse_source_file(
+            "type Alias = string; function broken<Item extends Alias>(item: Item) {}",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_268);
+        let mut context = bind_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let (declaration, type_parameter_node) = function_and_type_parameter(&parsed, file);
+        let owner = bound.symbol(declaration).unwrap();
+        let before = generic_transaction_state(context.store());
+        let plan = plan_source_callable(
+            context.store(),
+            &host,
+            declaration,
+            owner,
+            Some(CanonicalArrayTargets::from_global_types(&globals)),
+        )
+        .unwrap();
+        let NodeData::Block(body) = &parsed.arena.get(plan.body.node).unwrap().data else {
+            panic!("expected the real empty body")
+        };
+        assert!(body.statements.nodes.is_empty());
+        assert_eq!(
+            parsed.arena.get(plan.body.node).unwrap().parent,
+            Some(declaration.node)
+        );
+        assert_eq!(plan.return_type, SourceCallableReturnPlan::Inferred);
+        assert!(plan.requires_type_query_evidence());
+        assert!(!plan.type_parameter_syntax.inferred_empty_body_is_exact());
+        assert_eq!(generic_transaction_state(context.store()), before);
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+            context.store_mut_for_test(),
+            &host,
+            &globals,
+            CanonicalCheckerOptions::default(),
+            &mut session,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let evidence = context
+            .store()
+            .source_callable_type_query(signature)
+            .unwrap();
+        assert!(evidence.matches_plan(&plan));
+        assert!(evidence.is_exact(context.store()));
+        let parameter = evidence.type_parameters()[0];
+        let type_parameter = parameter.provenance.type_parameter;
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let void = bootstrap.void_type;
+        assert_eq!(parameter.provenance.declaration, type_parameter_node);
+        assert_eq!(
+            Some(parameter.provenance.symbol),
+            bound.symbol(type_parameter_node)
+        );
+        assert_eq!(parameter.constraint, string);
+        assert_eq!(parameter.default_type, bootstrap.no_constraint_type);
+        assert_eq!(evidence.base_constraints(), [string]);
+        assert_eq!(
+            evidence.annotation_type(plan.type_parameters[0].constraint.unwrap()),
+            Some(string)
+        );
+        assert_eq!(
+            evidence.annotation_type(plan.parameters[0].type_node),
+            Some(type_parameter)
+        );
+        let TypeData::TypeParameter(data) =
+            context.store().type_payload(type_parameter).unwrap().data()
+        else {
+            panic!("expected the function's actual type parameter")
+        };
+        assert_eq!(data.constraint, Some(string));
+        assert_eq!(data.constrained.resolved_base_constraint, Some(string));
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters(),
+            [type_parameter]
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(plan.parameters[0].symbol)
+                .unwrap()
+                .resolved_type,
+            Some(type_parameter)
+        );
+        assert_eq!(
+            source_callable_state(context.store(), &plan, false),
+            Ok(SourceCallableState::AwaitingInferredReturn {
+                type_: callable,
+                signature
+            })
+        );
+        assert_eq!(
+            context
+                .store()
+                .function_signature_return_annotation(signature),
+            None
+        );
+        assert_eq!(
+            context
+                .store()
+                .checked_source_callable_return_type(signature),
+            None
+        );
+        let pending = generic_transaction_state(context.store());
+        assert_eq!(
+            context.get_return_type_of_signature(signature),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidFunctionSignature(signature)
+            ))
+        );
+        assert_eq!(generic_transaction_state(context.store()), pending);
+
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .checked_source_callable_return_type(signature),
+            Some(void)
+        );
+        assert_eq!(context.get_return_type_of_signature(signature), Ok(void));
+        assert!(matches!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let warm = generic_transaction_state(context.store());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.get_return_type_of_signature(signature), Ok(void));
+        assert_eq!(generic_transaction_state(context.store()), warm);
+        assert!(
+            context
+                .store()
+                .source_callable_type_query(signature)
+                .unwrap()
+                .is_exact(context.store())
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inferred_generic_planning_keeps_real_bodies_without_publication() {
         for (index, source) in [
             "function f<T>(value: T) {}",
             "function f<T>() { return; }",
@@ -21096,12 +21453,31 @@ mod tests {
             )
             .unwrap();
 
-            assert!(matches!(
-                plan_source_callable(&fixture.store, &host, declaration, owner, None),
-                Err(SourceCallableError::Unsupported(
-                    SourceCallableUnsupported::GenericInferredReturn(node)
-                )) if node == declaration
-            ));
+            let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                .expect("the real body can be checked after its generic inputs");
+            let NodeData::FunctionDeclaration(function) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the actual generic function")
+            };
+            assert_eq!(plan.declaration, declaration);
+            assert_eq!(plan.owner_symbol, owner);
+            assert_eq!(plan.return_type, SourceCallableReturnPlan::Inferred);
+            assert_eq!(plan.body_mode, SourceCallableBodyMode::Present);
+            assert_eq!(
+                plan.body,
+                NodeRef::new(declaration.arena, declaration.file, function.body.unwrap())
+            );
+            assert!(plan.requires_type_query_evidence());
+            assert!(!plan.type_parameter_syntax.inferred_empty_body_is_exact());
+            assert_eq!(plan.type_parameters[0].declaration, type_parameter);
+            assert_eq!(plan.type_parameters[0].symbol, type_parameter_symbol);
+            assert_eq!(plan.parameters.len(), function.parameters.nodes.len());
+            for (planned, parameter) in plan.parameters.iter().zip(&function.parameters.nodes) {
+                let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                assert_eq!(planned.declaration, parameter);
+                assert_eq!(Some(planned.symbol), fixture.bound.symbol(parameter));
+            }
             assert_eq!(generic_transaction_state(&fixture.store), before);
             assert!(
                 fixture
@@ -21115,6 +21491,383 @@ mod tests {
                     .source_callable_type_for_owner(owner)
                     .is_none()
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Follow one signature from input queries through its real body.
+    fn inferred_generic_input_queries_wait_for_the_checked_body_return() {
+        for (index, source) in [
+            "function identity<T extends string = string>(value: T) { return value; }",
+            "function discard<T>() { const local = 1; }",
+            "function literal<T>(value: 'fixed') { return value; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(60_240 + u32::try_from(index).unwrap());
+            let mut context = bind_context(&parsed, file);
+            let bound = context.file(file).unwrap().1.clone();
+            let globals = context.global_types().clone();
+            let targets = Some(CanonicalArrayTargets::from_global_types(&globals));
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let (declaration, type_parameter_node) = function_and_type_parameter(&parsed, file);
+            let owner = bound.symbol(declaration).unwrap();
+            let plan =
+                plan_source_callable(context.store(), &host, declaration, owner, targets).unwrap();
+            assert!(plan.requires_type_query_evidence());
+            assert!(!plan.type_parameter_syntax.inferred_empty_body_is_exact());
+            assert_eq!(plan.return_type, SourceCallableReturnPlan::Inferred);
+            let mut session = InstantiationSession::new(InstantiationLimits::default());
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            if let Some(parameter) = plan.parameters.first() {
+                assert_eq!(
+                    plan_enclosing_source_callable_annotation(
+                        context.store(),
+                        &host,
+                        parameter.type_node,
+                        targets,
+                    ),
+                    Ok(Some(plan.clone()))
+                );
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    CanonicalCheckerOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(parameter.type_node)
+                .unwrap();
+                assert!(
+                    context
+                        .store()
+                        .source_callable_type_for_owner(owner)
+                        .is_none()
+                );
+            }
+            let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+                context.store_mut_for_test(),
+                &host,
+                &globals,
+                CanonicalCheckerOptions::default(),
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, owner)
+            .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let evidence = context
+                .store()
+                .source_callable_type_query(signature)
+                .unwrap();
+            assert!(evidence.matches_plan(&plan));
+            assert!(evidence.is_exact(context.store()));
+            assert_eq!(evidence.callable().body, plan.body);
+            let parameter_type = evidence.type_parameters()[0].provenance.type_parameter;
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(context.store(), parameter_type),
+                bound.symbol(type_parameter_node)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .checked_source_callable_return_type(signature),
+                None
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .function_signature_return_annotation(signature),
+                None
+            );
+            assert_eq!(
+                source_callable_state(context.store(), &plan, false),
+                Ok(SourceCallableState::AwaitingInferredReturn {
+                    type_: callable,
+                    signature
+                })
+            );
+            let pending = generic_transaction_state(context.store());
+            let counters = (
+                session.query_count(),
+                session.total_count(),
+                session.limit_event_count(),
+            );
+            for _ in 0..2 {
+                let mut query = CanonicalTypeQuery::new_with_global_types_and_session(
+                    context.store_mut_for_test(),
+                    &host,
+                    &globals,
+                    CanonicalCheckerOptions::default(),
+                    &mut session,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                assert_eq!(
+                    query.get_type_of_source_callable(declaration, owner),
+                    Ok(callable)
+                );
+                assert_eq!(
+                    query.get_return_type_of_signature(signature),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature)
+                    ))
+                );
+                assert_eq!(generic_transaction_state(context.store()), pending);
+            }
+            assert_eq!(
+                (
+                    session.query_count(),
+                    session.total_count(),
+                    session.limit_event_count()
+                ),
+                counters
+            );
+            context.check_source_file(file).unwrap();
+            let expected = plan.parameters.first().map_or_else(
+                || context.store().intrinsic_bootstrap().unwrap().void_type,
+                |parameter| {
+                    context
+                        .store()
+                        .value_symbol_links(parameter.symbol)
+                        .unwrap()
+                        .resolved_type
+                        .unwrap()
+                },
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(expected)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .checked_source_callable_return_type(signature),
+                Some(expected)
+            );
+            assert!(matches!(
+                validate_stored_source_callable(context.store(), callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            let warm = generic_transaction_state(context.store());
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(expected)
+            );
+            context.check_source_file(file).unwrap();
+            assert_eq!(generic_transaction_state(context.store()), warm);
+            assert!(context.diagnostics().is_empty());
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Poison each retained input and return, then restore the same record.
+    fn inferred_generic_replay_requires_owned_inputs_and_the_checked_return() {
+        fn rejects_without_publication(
+            context: &mut CanonicalCheckerContext<'_>,
+            callable: TypeId,
+            signature: SignatureId,
+            checked_return: TypeId,
+        ) {
+            let before = generic_transaction_state(context.store());
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_stored_source_callable(context.store(), callable),
+                    StoredSourceCallableValidation::Malformed
+                );
+                assert_eq!(
+                    context.get_return_type_of_signature(signature),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidFunctionSignature(signature)
+                    ))
+                );
+                assert_eq!(
+                    context
+                        .store()
+                        .checked_source_callable_return_type(signature),
+                    Some(checked_return)
+                );
+                assert_eq!(generic_transaction_state(context.store()), before);
+            }
+        }
+
+        for (index, source) in [
+            "function identity<T extends string>(value: T) { return value; }",
+            "function discard<T>() { const local = 1; }",
+            "function empty<T>(value: T) {}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(60_244 + u32::try_from(index).unwrap());
+            let mut context = bind_context(&parsed, file);
+            context.check_source_file(file).unwrap();
+            let (declaration, _) = function_and_type_parameter(&parsed, file);
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let checked_return = context
+                .store()
+                .checked_source_callable_return_type(signature)
+                .unwrap();
+            let plan = context
+                .store()
+                .source_callable_type_query(signature)
+                .unwrap()
+                .callable()
+                .clone();
+            let warm = generic_transaction_state(context.store());
+            let evidence = context
+                .store_mut_for_test()
+                .replace_source_callable_type_query_for_test(signature, None)
+                .unwrap();
+            rejects_without_publication(&mut context, callable, signature, checked_return);
+            let parameters = context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters()
+                .to_vec();
+            let rows = context
+                .store_mut_for_test()
+                .replace_source_callable_type_parameters_for_test(signature, None)
+                .unwrap();
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_type_parameters(signature, Vec::new())
+            );
+            rejects_without_publication(&mut context, callable, signature, checked_return);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_type_parameters(signature, parameters)
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .replace_source_callable_type_parameters_for_test(signature, Some(rows))
+                    .is_none()
+            );
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .replace_source_callable_type_query_for_test(signature, Some(evidence))
+                    .is_none()
+            );
+            assert_eq!(generic_transaction_state(context.store()), warm);
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(checked_return)
+            );
+
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_ne!(checked_return, number);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(signature, Some(number))
+            );
+            rejects_without_publication(&mut context, callable, signature, checked_return);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_signature_resolved_return_type(signature, Some(checked_return))
+            );
+
+            if let Some(parameter) = plan.parameters.first() {
+                let links = context
+                    .store()
+                    .symbol_node_links(parameter.type_node)
+                    .unwrap()
+                    .clone();
+                assert!(context.store_mut_for_test().set_symbol_node_links(
+                    parameter.type_node,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(owner)
+                    }
+                ));
+                rejects_without_publication(&mut context, callable, signature, checked_return);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_node_links(parameter.type_node, links)
+                );
+            }
+            if plan.type_parameters[0].constraint.is_some() {
+                let parameter = context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .type_parameters()[0];
+                let TypeData::TypeParameter(data) =
+                    context.store().type_payload(parameter).unwrap().data()
+                else {
+                    panic!("expected the owned type parameter")
+                };
+                let constraint = data.constraint;
+                let base = data.constrained.resolved_base_constraint;
+                let default = data.resolved_default_type;
+                assert!(context.store_mut_for_test().set_type_parameter_resolution(
+                    parameter,
+                    Some(number),
+                    None,
+                    None,
+                    default
+                ));
+                rejects_without_publication(&mut context, callable, signature, checked_return);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_parameter_resolution(parameter, constraint, None, None, default)
+                );
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_resolved_base_constraint(parameter, Some(number))
+                );
+                rejects_without_publication(&mut context, callable, signature, checked_return);
+                assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_resolved_base_constraint(parameter, base)
+                );
+            }
+            assert_eq!(
+                context.get_return_type_of_signature(signature),
+                Ok(checked_return)
+            );
+            context.check_source_file(file).unwrap();
+            assert_eq!(generic_transaction_state(context.store()), warm);
+            assert!(context.diagnostics().is_empty());
         }
     }
 
