@@ -5977,6 +5977,8 @@ fn plan_direct_exported_type_target(
             == Some(target)
     } else {
         has_exact_export_modifier(arena, bound, store, declaration, modifiers)?
+            || modifiers.is_none()
+                && local_named_type_export_is_exact(store, host, target, declaration)?
     };
     if !explicitly_exported {
         return Err(unsupported(SourceImportUnsupported::TargetTypeNotExported(
@@ -5984,6 +5986,219 @@ fn plan_direct_exported_type_target(
         )));
     }
     Ok(declaration)
+}
+
+/// Proves a local declared type's export without changing its local symbol owner.
+/// The containing source and its authenticated augmentations keep their complete exports.
+fn local_named_type_export_is_exact(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<bool, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetSymbol(target));
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let source = bound.source_file();
+    validate_source_identity(arena, bound, store, source)?;
+    let target_record = store.symbol(target).ok_or_else(invalid)?;
+    if bound.symbol(declaration) != Some(target)
+        || bound.local_symbol(declaration).is_some()
+        || bound.container(declaration) != Some(source)
+        || target_record.check_flags() != CheckFlags::NONE
+        || target_record.parent().is_some()
+        || target_record.export_symbol().is_some()
+        || target_record.exports().is_some()
+        || store.get_merged_symbol(target) != Some(target)
+        || !store.source_symbol_declarations_match(target)
+        || bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get(target_record.name()))
+            != Some(target)
+    {
+        return Err(invalid());
+    }
+    let module = bound
+        .symbol(source)
+        .and_then(|module| store.get_merged_symbol(module))
+        .ok_or_else(invalid)?;
+    if source_file_namespace_declaration(store, host, module)? != source {
+        return Err(invalid());
+    }
+    let owner = store.symbol(module).ok_or_else(invalid)?;
+    let declarations = owner.declarations().ok_or_else(invalid)?;
+    super::source_namespaces::validate_module_export_table(
+        store,
+        host,
+        module,
+        declarations,
+        owner.exports(),
+    )
+    .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(module)))?;
+
+    let record = checked_node(arena, bound, store, source)?;
+    let NodeData::SourceFile(source_data) = &record.data else {
+        return Err(invalid());
+    };
+    let mut exported = false;
+    for &statement in &source_data.statements.nodes {
+        let statement = NodeRef::new(source.arena, source.file, statement);
+        let record = checked_node(arena, bound, store, statement)?;
+        if matches!(&record.data, NodeData::ExportDeclaration(export)
+            if export.module_specifier.is_none())
+        {
+            // Check each matching alias, including a second public name for this local type.
+            exported |= local_type_export_clause_matches(store, host, target, statement)?;
+        }
+    }
+    Ok(exported)
+}
+
+#[allow(clippy::too_many_lines)] // The local name, syntax parents, and export alias form one edge.
+fn local_type_export_clause_matches(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<bool, SourceImportError> {
+    let invalid = || {
+        invariant(SourceImportInvariant::InvalidTopLevelDeclaration(
+            declaration,
+        ))
+    };
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let source = bound.source_file();
+    let source_record = checked_node(arena, bound, store, source)?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invalid());
+    };
+    let record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::ExportDeclaration(export) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::ExportDeclaration
+        || record.parent != Some(source.node)
+        || !range_contains(source_record, record)
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
+    if record.flags.0 != 0
+        || export.module_specifier.is_some()
+        || export.attributes.is_some()
+        || export.modifiers.is_some()
+        || export.flow_node.is_some()
+        || export.symbol.is_some()
+        || export.facts != 0
+    {
+        return Err(unsupported(SourceImportUnsupported::ExportShape(
+            declaration,
+        )));
+    }
+    let clause = export
+        .export_clause
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(|| unsupported(SourceImportUnsupported::ExportShape(declaration)))?;
+    let clause_record = checked_node(arena, bound, store, clause)?;
+    let NodeData::NamedExports(named) = &clause_record.data else {
+        return Err(unsupported(SourceImportUnsupported::ExportClause(clause)));
+    };
+    if clause_record.kind != SyntaxKind::NamedExports
+        || clause_record.parent != Some(declaration.node)
+        || clause_record.flags.0 != 0
+        || !range_contains(record, clause_record)
+        || named.facts != 0
+        || named.elements.range != clause_record.range
+        || named.elements.has_trailing_comma && named.elements.nodes.is_empty()
+    {
+        return Err(unsupported(SourceImportUnsupported::ExportClause(clause)));
+    }
+    let target_record = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    let mut seen = HashSet::with_capacity(named.elements.nodes.len());
+    let mut exported = false;
+    for &binding in &named.elements.nodes {
+        let binding = NodeRef::new(declaration.arena, declaration.file, binding);
+        let binding_record = checked_node(arena, bound, store, binding)?;
+        let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
+            return Err(unsupported(SourceImportUnsupported::ExportBinding(binding)));
+        };
+        if binding_record.kind != SyntaxKind::ExportSpecifier
+            || binding_record.parent != Some(clause.node)
+            || binding_record.flags.0 != 0
+            || !range_contains(clause_record, binding_record)
+            || specifier.local_symbol.is_some()
+            || specifier.symbol.is_some()
+            || specifier.facts != 0
+            || !seen.insert(binding)
+        {
+            return Err(unsupported(SourceImportUnsupported::ExportBinding(binding)));
+        }
+        let local_name = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            specifier.property_name.unwrap_or(specifier.name),
+        );
+        let local_text = exact_identifier(
+            arena,
+            bound,
+            store,
+            local_name,
+            binding,
+            SourceImportUnsupported::NonIdentifierReexportName(local_name),
+        )?;
+        if EscapedName::source(&local_text).as_ref() != target_record.name() {
+            continue;
+        }
+        let exported_name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
+        let exported_text = exact_module_export_name(
+            arena,
+            bound,
+            store,
+            exported_name,
+            binding,
+            SourceImportUnsupported::NonIdentifierExportName(exported_name),
+        )?;
+        let alias = bound
+            .symbol(binding)
+            .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(binding)))?;
+        validate_reexport_alias_symbol(
+            bound,
+            store,
+            source,
+            alias,
+            binding,
+            exported_name,
+            &exported_text,
+        )?;
+        preflight_type_import_value_links(store, alias)?;
+        let type_only = (export.is_type_only || specifier.is_type_only).then_some(binding);
+        if let Some(links) = store.alias_symbol_links(alias)
+            && (links
+                .immediate_target
+                .is_some_and(|cached| cached != target)
+                || match links.alias_target {
+                    AliasTargetState::Unresolved => links
+                        .type_only_declaration
+                        .is_some_and(|marker| Some(marker) != type_only),
+                    AliasTargetState::Resolved(cached) => {
+                        cached != target || links.type_only_declaration != type_only
+                    }
+                    AliasTargetState::Unknown => true,
+                })
+        {
+            return Err(invariant(SourceImportInvariant::InvalidAliasLinks(alias)));
+        }
+        exported = true;
+    }
+    Ok(exported)
 }
 
 fn plan_ambient_import_method_target(
@@ -22757,6 +22972,527 @@ export default <T>(): Subject<T> => {
                 .store
                 .value_symbol_links(plan.bindings[0].alias_symbol)
                 .is_none()
+        );
+    }
+
+    fn local_type_export_symbol(fixture: &Fixture, source: usize, name: &str) -> SemanticSymbolId {
+        let bound = fixture.bound.get(&fixture.files[source].file).unwrap();
+        fixture
+            .store
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap()
+            .get_source(name)
+            .unwrap()
+    }
+
+    fn plan_local_type_export_target(
+        fixture: &Fixture,
+        target: SemanticSymbolId,
+    ) -> Result<NodeRef, SourceImportError> {
+        let sources = fixture
+            .files
+            .iter()
+            .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap()));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            sources,
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = fixture.plan_type_import(0, 0);
+        plan_direct_exported_type_target(
+            &fixture.store,
+            &host,
+            plan.bindings[0].alias_symbol,
+            target,
+        )
+    }
+
+    #[test]
+    fn local_named_type_exports_keep_local_identity_cold_and_warm() {
+        for provider in [
+            "type Model = { id: number }; export type { Model as Public };",
+            "interface Model { id: number; } export { type Model as Public };",
+            "interface Model { id: number; } export { Model as Public };",
+            concat!(
+                "type Model = { id: number }; ",
+                "export { Model as Public, type Model as AlsoPublic };",
+            ),
+        ] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    "import type { Public as Imported } from './target'; declare const value: Imported;",
+                    provider,
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[1],
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let target = local_type_export_symbol(&fixture, 1, "Model");
+            let exported = direct_export(&fixture, 1, "Public");
+            assert_ne!(target, exported);
+            let before = store_state(&fixture.store);
+            let declaration = plan_local_type_export_target(&fixture, target).unwrap();
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(fixture.store.alias_symbol_links(exported).is_none());
+
+            let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+            assert_eq!(resolved[0].target_symbol, target);
+            assert_eq!(resolved[0].target_declaration, declaration);
+            assert_eq!(resolved[0].immediate_target_symbol, exported);
+            assert!(fixture.store.symbol(target).unwrap().parent().is_none());
+            assert!(fixture.store.type_alias_links(target).is_none());
+            assert!(fixture.store.declared_type_links(target).is_none());
+            for symbol in [plan.bindings[0].alias_symbol, exported, target] {
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
+
+            let reference = type_reference(&fixture, 0, "Imported");
+            let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+            let type_ =
+                query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+            assert_eq!(query_declared_type(&mut fixture, target), Ok(type_));
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+                resolved,
+            );
+            let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+            assert_eq!(
+                query_type_with_import_capability(&mut fixture, reference, capability),
+                Ok(type_),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn local_named_type_exports_follow_vitest_style_renames_without_typing_the_provider() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                "import type { ViteUserConfig as Imported } from 'vitest/config'; declare const value: Imported;",
+                "export { UserConfig as ViteUserConfig } from 'vite';",
+                concat!(
+                    "interface Base { inherited: number; } ",
+                    "interface UserConfig extends Base { own: string; } ",
+                    "export { type UserConfig };",
+                ),
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+            ],
+            &[1, 2],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let target = local_type_export_symbol(&fixture, 2, "UserConfig");
+        let base = local_type_export_symbol(&fixture, 2, "Base");
+        let exported = direct_export(&fixture, 2, "UserConfig");
+        let barrel = direct_export(&fixture, 1, "ViteUserConfig");
+        let marker = fixture
+            .store
+            .symbol(exported)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(resolved[0].immediate_target_symbol, barrel);
+        assert_eq!(resolved[0].target_symbol, target);
+        for alias in [exported, barrel] {
+            let links = fixture.store.alias_symbol_links(alias).unwrap();
+            assert_eq!(links.alias_target, AliasTargetState::Resolved(target));
+            assert_eq!(links.type_only_declaration, Some(marker));
+        }
+        for symbol in [
+            target,
+            base,
+            exported,
+            barrel,
+            plan.bindings[0].alias_symbol,
+        ] {
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+        }
+
+        let reference = type_reference(&fixture, 0, "Imported");
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        let type_ = query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("the local declaration retains its interface type");
+        };
+        let [inherited] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("the local declaration retains its source base");
+        };
+        assert_eq!(
+            fixture.store.type_payload(*inherited).unwrap().symbol(),
+            Some(base)
+        );
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+            resolved
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn local_named_type_exports_leave_unused_types_cold_and_reject_value_reads() {
+        for provider in [
+            "type Model = MissingType; export { type Model as Public };",
+            "interface Model extends MissingBase {} export type { Model as Public };",
+        ] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    "import type { Public as Imported } from './target'; const runtime = Imported;",
+                    provider,
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[1],
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+            let target = resolved[0].target_symbol;
+            assert!(fixture.store.declared_type_links(target).is_none());
+            assert!(fixture.store.type_alias_links(target).is_none());
+            let read = identifier_initializer(&fixture, 0, "Imported");
+            let file = &fixture.files[0];
+            assert_eq!(
+                reject_source_type_import_value_use(
+                    &file.parsed.arena,
+                    fixture.bound.get(&file.file).unwrap(),
+                    &fixture.store,
+                    &resolved[0],
+                    read,
+                    "Imported",
+                    plan.bindings[0].alias_symbol,
+                ),
+                Err(SourceImportError::Unsupported(
+                    SourceImportUnsupported::ValueUseOfTypeOnlyImport(read),
+                )),
+            );
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+                resolved
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(fixture.store.value_symbol_links(target).is_none());
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.bindings[0].alias_symbol)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn local_named_type_exports_reject_changed_owners_and_tables_without_repair() {
+        for forgery in 0..6 {
+            let mut fixture = fixture(
+                &[
+                    "import type { Public as Imported } from './target'; declare const value: Imported;",
+                    concat!(
+                        "interface Model { id: number; } interface Other { name: string; } ",
+                        "export { type Model as Public, type Other as Wrong };",
+                    ),
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let target = local_type_export_symbol(&fixture, 1, "Model");
+            let other = local_type_export_symbol(&fixture, 1, "Other");
+            let exported = direct_export(&fixture, 1, "Public");
+            let wrong = direct_export(&fixture, 1, "Wrong");
+            let bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+            let source = bound.source_file();
+            let module = bound.symbol(source).unwrap();
+            let locals = bound.locals(source).unwrap();
+            let exports = fixture.store.symbol(module).unwrap().exports().unwrap();
+            assert!(plan_local_type_export_target(&fixture, target).is_ok());
+            match forgery {
+                0 => {
+                    let members = fixture.store.symbol(target).unwrap().members();
+                    assert!(fixture.store.set_symbol_relationships(
+                        target,
+                        members,
+                        None,
+                        Some(module),
+                        None,
+                    ));
+                }
+                1 => assert!(
+                    fixture
+                        .store
+                        .set_symbol_relationships(exported, None, None, None, None,)
+                ),
+                2 => {
+                    let declaration =
+                        fixture.store.symbol(wrong).unwrap().declarations().unwrap()[0];
+                    assert!(fixture.store.set_symbol_declarations(
+                        exported,
+                        Some(vec![declaration]),
+                        None
+                    ));
+                }
+                3 => assert_eq!(
+                    fixture
+                        .store
+                        .insert_symbol(exports, EscapedName::source("Public"), wrong),
+                    Some(Some(exported)),
+                ),
+                4 => assert_eq!(
+                    fixture
+                        .store
+                        .insert_symbol(locals, EscapedName::source("Model"), other),
+                    Some(Some(target)),
+                ),
+                5 => assert!(fixture.store.set_symbol_declarations(
+                    module,
+                    Some(vec![]),
+                    Some(source)
+                )),
+                _ => unreachable!(),
+            }
+            let before = store_state(&fixture.store);
+            assert!(matches!(
+                plan_local_type_export_target(&fixture, target),
+                Err(SourceImportError::Invariant(_))
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(fixture.store.value_symbol_links(target).is_none());
+        }
+    }
+
+    #[test]
+    fn local_named_type_exports_recheck_all_matching_alias_caches_and_markers() {
+        for warm in [false, true] {
+            for forgery in 0..4 {
+                let mut fixture = fixture(
+                    &[
+                        "import type { Public as Imported } from './target'; declare const value: Imported;",
+                        concat!(
+                            "type Model = number; type Other = string; ",
+                            "export { type Model as Public, type Model as AlsoPublic };",
+                        ),
+                    ],
+                    &[Route {
+                        source: 0,
+                        specifier: 0,
+                        target: Some(1),
+                    }],
+                );
+                let target = local_type_export_symbol(&fixture, 1, "Model");
+                let other = local_type_export_symbol(&fixture, 1, "Other");
+                let plan = fixture.plan_type_import(0, 0);
+                if warm {
+                    resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+                }
+                let exported = direct_export(&fixture, 1, "AlsoPublic");
+                let declaration = fixture
+                    .store
+                    .symbol(exported)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()[0];
+                let mut links = AliasSymbolLinks {
+                    immediate_target: Some(target),
+                    alias_target: AliasTargetState::Resolved(target),
+                    type_only_declaration: Some(declaration),
+                    ..AliasSymbolLinks::default()
+                };
+                match forgery {
+                    0 => links.immediate_target = Some(other),
+                    1 => links.alias_target = AliasTargetState::Resolved(other),
+                    2 => links.type_only_declaration = Some(plan.bindings[0].declaration),
+                    3 => links.type_only_declaration = None,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    fixture
+                        .store
+                        .set_alias_symbol_links(exported, links.clone())
+                );
+                let before = store_state(&fixture.store);
+                assert_eq!(
+                    plan_local_type_export_target(&fixture, target),
+                    Err(SourceImportError::Invariant(
+                        SourceImportInvariant::InvalidAliasLinks(exported)
+                    )),
+                );
+                assert_eq!(store_state(&fixture.store), before);
+                assert_eq!(fixture.store.alias_symbol_links(exported), Some(&links));
+                assert!(fixture.store.value_symbol_links(exported).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn local_named_type_exports_keep_missing_exports_and_heritage_boundaries() {
+        for (provider, declaration_file) in [
+            ("type Model = number; export {};", false),
+            ("interface Model { id: number; } export {};", true),
+            (
+                "interface Model extends Missing {} export { type Model as Public };",
+                false,
+            ),
+        ] {
+            let fixture = fixture_with_declaration_files(
+                &[
+                    "import type { Public as Imported } from './target';",
+                    provider,
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                if declaration_file { &[1] } else { &[] },
+            );
+            let target = local_type_export_symbol(&fixture, 1, "Model");
+            let declaration = fixture
+                .store
+                .symbol(target)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let before = store_state(&fixture.store);
+            let error = plan_local_type_export_target(&fixture, target).unwrap_err();
+            assert!(matches!(
+                error,
+                SourceImportError::Unsupported(SourceImportUnsupported::TargetTypeNotExported(node)
+                    | SourceImportUnsupported::TargetTypeShape(node)) if node == declaration
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn local_named_type_exports_validate_the_complete_augmented_module() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                "import type { Public as Imported } from './target';",
+                "interface Model { id: number; } export { type Model as Public };",
+                "export {}; declare module './target' { export interface Added { extra: boolean; } }",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1, 2],
+        );
+        let target = local_type_export_symbol(&fixture, 1, "Model");
+        let target_file = fixture.files[1].file;
+        let target_bound = fixture.bound.get(&target_file).unwrap();
+        let source = target_bound.source_file();
+        let original = target_bound.symbol(source).unwrap();
+        let augmented_file = &fixture.files[2];
+        let augmented_bound = fixture.bound.get(&augmented_file.file).unwrap();
+        let augmentation_name = augmented_bound.module_augmentations()[0].name();
+        let augmentation_declaration = NodeRef::new(
+            augmentation_name.arena,
+            augmentation_name.file,
+            augmented_file
+                .parsed
+                .arena
+                .get(augmentation_name.node)
+                .unwrap()
+                .parent
+                .unwrap(),
+        );
+        let augmentation = augmented_bound.symbol(augmentation_declaration).unwrap();
+        let importer = &fixture.files[0];
+        let import_specifier = NodeRef::new(
+            importer.parsed.arena.id(),
+            importer.file,
+            module_specifiers(&importer.parsed)[0],
+        );
+        fixture.manifest = validate_module_resolution_manifest(
+            CanonicalModuleResolutionManifestInput::new([import_specifier, augmentation_name].map(
+                |specifier| {
+                    CanonicalModuleResolutionEntry::resolved(
+                        specifier,
+                        CanonicalResolvedModuleInput::new(
+                            target_file,
+                            CanonicalModuleResolutionMode::Esm,
+                            CanonicalModuleResolutionMode::Esm,
+                        ),
+                    )
+                },
+            )),
+            fixture.store.symbol_store(),
+            fixture.files.iter().map(|file| {
+                (
+                    file.file,
+                    &file.parsed.arena,
+                    fixture.bound.get(&file.file).unwrap(),
+                )
+            }),
+        )
+        .unwrap();
+        let module = fixture
+            .store
+            .merge_symbol(original, augmentation, false)
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .source_merged_symbol_declarations_match(module)
+        );
+        assert_eq!(
+            fixture.store.symbol(module).unwrap().declarations(),
+            Some([source, augmentation_declaration].as_slice()),
+        );
+        let before = store_state(&fixture.store);
+        assert!(plan_local_type_export_target(&fixture, target).is_ok());
+        assert_eq!(store_state(&fixture.store), before);
+        let plan = fixture.plan_type_import(0, 0);
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(resolved[0].target_symbol, target);
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+            resolved
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(fixture.store.declared_type_links(target).is_none());
+
+        assert!(
+            fixture
+                .store
+                .set_symbol_declarations(module, Some(vec![source]), Some(source))
+        );
+        let before = store_state(&fixture.store);
+        assert_eq!(
+            plan_local_type_export_target(&fixture, target),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTargetLinks(module)
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert_eq!(
+            fixture.store.symbol(module).unwrap().declarations(),
+            Some([source].as_slice())
         );
     }
 
