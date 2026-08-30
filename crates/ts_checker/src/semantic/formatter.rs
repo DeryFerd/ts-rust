@@ -56,7 +56,8 @@ use super::{
     reference_types::validate_direct_generic_reference,
     signatures::{ElementFlags, IndexFlags, SignatureFlags, TypePredicateKind},
     source_callables::{
-        SourceCallableDisplayError, SourceCallableUnsupported, StoredSourceCallableValidation,
+        SourceCallableDisplayError, SourceCallableState, SourceCallableUnsupported,
+        StoredSourceCallableValidation, plan_source_callable, source_callable_state,
         validate_stored_source_callable,
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
@@ -2154,7 +2155,11 @@ fn display_validated_module_namespace(
     };
     if source_function {
         // The retained origin survives removal of namespace flags and declarations.
-        validate_source_function_namespace_origin(store, host, type_id, owner, owner_record)?;
+        if validate_source_function_namespace_origin(store, host, type_id, owner, owner_record)? {
+            let name = display_symbol_name(store, Some(host), type_id, owner, state)?;
+            state.add(7);
+            return Ok(Some(format!("typeof {name}")));
+        }
         if !module_owner
             || owner_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
         {
@@ -2349,13 +2354,15 @@ fn display_validated_module_namespace(
     display_source_file_module_name(store, host, type_id, owner, state).map(Some)
 }
 
+/// Returns whether the original function has a supported value namespace.
+#[allow(clippy::too_many_lines)] // Source identity and the complete direct export table form one proof.
 fn validate_source_function_namespace_origin(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     type_id: TypeId,
     owner: SemanticSymbolId,
     owner_record: &ts_binder::semantic::Symbol,
-) -> Result<(), TypeDisplayUnavailable> {
+) -> Result<bool, TypeDisplayUnavailable> {
     let invalid = || TypeDisplayUnavailable::MalformedType(type_id);
     let provenance = store
         .source_callable_provenance(type_id)
@@ -2363,8 +2370,6 @@ fn validate_source_function_namespace_origin(
     let (_, bound) = host.source(provenance.declaration).ok_or_else(invalid)?;
     let source_owner = bound.symbol(provenance.declaration).ok_or_else(invalid)?;
 
-    // Function merges mark runtime and const-enum namespaces in this retained set.
-    // Changing semantic flags or export tables cannot erase that binder record.
     if provenance.owner_symbol != owner
         || owner_record.value_declaration() != Some(provenance.declaration)
         || !bound.declaration_slice_bound()
@@ -2372,7 +2377,6 @@ fn validate_source_function_namespace_origin(
             .node(provenance.declaration)
             .is_none_or(|node| node.kind != SyntaxKind::FunctionDeclaration)
         || store.get_merged_symbol(source_owner) != Some(owner)
-        || bound.is_not_const_enum_only_module(source_owner)
         || owner_record.declarations().is_none_or(|declarations| {
             declarations
                 .iter()
@@ -2381,7 +2385,101 @@ fn validate_source_function_namespace_origin(
     {
         return Err(invalid());
     }
-    Ok(())
+    // Function merges retain this marker even if live flags or exports are removed.
+    if !bound.is_not_const_enum_only_module(source_owner) {
+        return Ok(false);
+    }
+    if owner_record.flags() != SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        || source_owner != owner
+        || !store.source_symbol_declarations_match(owner)
+        || store.source_symbol_flags(owner) != Some(owner_record.flags())
+        || !store.source_symbol_export_table_matches(owner)
+        || store.module_symbol_links(owner).is_some_and(|links| {
+            links
+                .resolved_exports
+                .is_some_and(|exports| Some(exports) != owner_record.exports())
+        })
+    {
+        return Err(invalid());
+    }
+    let mut namespaces = Vec::new();
+    for &declaration in owner_record.declarations().ok_or_else(invalid)? {
+        if declaration == provenance.declaration {
+            continue;
+        }
+        let record = host.node(declaration).ok_or_else(invalid)?;
+        let NodeData::ModuleDeclaration(namespace) = &record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, namespace.name);
+        if !matches!(
+            namespace.keyword,
+            SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword
+        ) || !host.node(name).is_some_and(|record| {
+            matches!(&record.data, NodeData::Identifier(name)
+                    if owner_record.name().as_utf8() == Some(name.text.as_str()))
+        }) || !namespace.body.is_some_and(|body| {
+            host.node(NodeRef::new(declaration.arena, declaration.file, body))
+                .is_some_and(|record| {
+                    record.kind == SyntaxKind::ModuleBlock
+                        && record.parent == Some(declaration.node)
+                })
+        }) {
+            return Err(invalid());
+        }
+        namespaces.push(declaration);
+    }
+    if namespaces.is_empty() {
+        return Err(invalid());
+    }
+    super::source_namespaces::validate_module_export_table(
+        store,
+        host,
+        owner,
+        &namespaces,
+        owner_record.exports(),
+    )
+    .map_err(|_| invalid())?;
+    let exports = owner_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let mut has_runtime_export = false;
+    for (_, symbol) in exports.iter() {
+        let record = store.symbol(symbol).ok_or_else(invalid)?;
+        if !store.source_symbol_declarations_match(symbol)
+            || store.source_symbol_flags(symbol) != Some(record.flags())
+        {
+            return Err(invalid());
+        }
+        has_runtime_export |= record
+            .flags()
+            .intersects(SymbolFlags::VALUE.without(SymbolFlags::CONST_ENUM))
+            && !record.flags().contains(SymbolFlags::CONST_ENUM_ONLY_MODULE);
+    }
+    // Const-enum-only namespace merges keep their existing display boundary.
+    if !has_runtime_export {
+        return Err(invalid());
+    }
+    let plan = plan_source_callable(
+        store,
+        host,
+        provenance.declaration,
+        owner,
+        provenance.array_targets,
+    )
+    .map_err(|_| invalid())?;
+    if !matches!(
+        source_callable_state(store, &plan, false),
+        Ok(SourceCallableState::Resolved { type_, signature })
+            if type_ == type_id && signature == provenance.signature
+    ) || !matches!(
+        validate_stored_source_callable(store, type_id),
+        StoredSourceCallableValidation::Valid(_)
+    ) {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_lines)] // Keep cold and completed class ownership checks together.
@@ -10664,7 +10762,42 @@ mod tests {
             context.store().symbol(owner).unwrap().flags(),
             SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
         );
-        assert_malformed_display_without_writes(&context, callable);
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let before = (
+            format!("{:?}", context.store()),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        for _ in 0..2 {
+            assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(callable)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .source_callable_type_for_signature(signature),
+                Some(callable)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(owner)
+                    .and_then(|links| links.resolved_type),
+                Some(callable)
+            );
+            assert_eq!(
+                (
+                    format!("{:?}", context.store()),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                before
+            );
+        }
         assert!(
             context
                 .file(file)
@@ -10674,6 +10807,198 @@ mod tests {
         );
         hide_namespace_value_exports(&mut context, owner);
         assert_malformed_display_without_writes(&context, callable);
+    }
+
+    #[test]
+    fn runtime_namespace_display_rejects_replaced_binder_export_tables() {
+        for warm in [false, true] {
+            let parsed = parse_source_file(concat!(
+                "declare function callable(): void; ",
+                "declare namespace callable { export const value: string; }",
+            ));
+            let file = FileId::new(202_851);
+            let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+            let (declaration, owner, callable) =
+                namespace_function_display_parts(&context, &parsed, file);
+            if warm {
+                assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+            }
+            let symbol = context.store().symbol(owner).unwrap();
+            let (members, exports, parent, export_symbol) = (
+                symbol.members(),
+                symbol.exports().unwrap(),
+                symbol.parent(),
+                symbol.export_symbol(),
+            );
+            let replacement = context
+                .store_mut_for_test()
+                .clone_symbol_table(exports)
+                .unwrap();
+            assert_ne!(replacement, exports);
+            assert_eq!(
+                context.store().symbol_table(replacement),
+                context.store().symbol_table(exports)
+            );
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                owner,
+                members,
+                Some(replacement),
+                parent,
+                export_symbol,
+            ));
+            assert!(matches!(
+                validate_stored_source_callable(context.store(), callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            let damaged = format!("{:?}", context.store());
+            for _ in 0..2 {
+                assert_malformed_display_without_writes(&context, callable);
+                assert_eq!(
+                    context.type_to_string_at_location_with_flags(
+                        callable,
+                        declaration,
+                        CanonicalTypeFormatFlags::NO_TRUNCATION,
+                    ),
+                    Err(TypeDisplayUnavailable::MalformedType(callable))
+                );
+                assert_eq!(format!("{:?}", context.store()), damaged);
+            }
+            assert!(context.store_mut_for_test().set_symbol_relationships(
+                owner,
+                members,
+                Some(exports),
+                parent,
+                export_symbol,
+            ));
+            let restored = format!("{:?}", context.store());
+            assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+            assert_eq!(format!("{:?}", context.store()), restored);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Each mutation starts from the same bound source and tests both display orders.
+    fn runtime_namespace_display_rejects_changed_exports_declarations_and_signatures() {
+        #[derive(Clone, Copy)]
+        enum Damage {
+            ExportFlags,
+            ExportMember,
+            DeclarationOrder,
+            ReturnType,
+        }
+        for warm in [false, true] {
+            for damage in [
+                Damage::ExportFlags,
+                Damage::ExportMember,
+                Damage::DeclarationOrder,
+                Damage::ReturnType,
+            ] {
+                let parsed = parse_source_file(concat!(
+                    "declare function callable(): void; ",
+                    "declare namespace callable { export const value: string; } ",
+                    "declare namespace callable { export const count: number; } ",
+                    "declare namespace Other { export const value: string; }",
+                ));
+                let file = FileId::new(202_852);
+                let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+                context.check_source_file(file).unwrap();
+                let (declaration, owner, callable) =
+                    namespace_function_display_parts(&context, &parsed, file);
+                if warm {
+                    assert_eq!(context.type_to_string(callable).unwrap(), "typeof callable");
+                }
+                let exports = context.store().symbol(owner).unwrap().exports().unwrap();
+                let value = context
+                    .store()
+                    .symbol_table(exports)
+                    .unwrap()
+                    .get_source("value")
+                    .unwrap();
+                match damage {
+                    Damage::ExportFlags => {
+                        assert_eq!(
+                            context.store().symbol(value).unwrap().flags(),
+                            SymbolFlags::BLOCK_SCOPED_VARIABLE
+                        );
+                        assert!(context.store_mut_for_test().set_symbol_flags(
+                            value,
+                            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                            CheckFlags::NONE,
+                        ));
+                    }
+                    Damage::ExportMember => {
+                        let other = context
+                            .file(file)
+                            .unwrap()
+                            .1
+                            .locals(context.file(file).unwrap().1.source_file())
+                            .and_then(|locals| context.store().symbol_table(locals))
+                            .and_then(|locals| locals.get_source("Other"))
+                            .unwrap();
+                        let other_value = context
+                            .store()
+                            .symbol(other)
+                            .and_then(|other| other.exports())
+                            .and_then(|exports| context.store().symbol_table(exports))
+                            .and_then(|exports| exports.get_source("value"))
+                            .unwrap();
+                        assert_eq!(
+                            context.store_mut_for_test().insert_symbol(
+                                exports,
+                                EscapedName::source("value"),
+                                other_value,
+                            ),
+                            Some(Some(value))
+                        );
+                    }
+                    Damage::DeclarationOrder => {
+                        let mut declarations = context
+                            .store()
+                            .symbol(owner)
+                            .unwrap()
+                            .declarations()
+                            .unwrap()
+                            .to_vec();
+                        assert_eq!(declarations.len(), 3);
+                        declarations.swap(1, 2);
+                        assert!(context.store_mut_for_test().set_symbol_declarations(
+                            owner,
+                            Some(declarations),
+                            Some(declaration),
+                        ));
+                    }
+                    Damage::ReturnType => {
+                        let signature = context
+                            .store()
+                            .source_callable_provenance(callable)
+                            .unwrap()
+                            .signature;
+                        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                        assert!(
+                            context
+                                .store_mut_for_test()
+                                .set_signature_resolved_return_type(signature, Some(number),)
+                        );
+                    }
+                }
+                let damaged = format!("{:?}", context.store());
+                for _ in 0..2 {
+                    assert_malformed_display_without_writes(&context, callable);
+                    assert_eq!(
+                        context.type_to_string_at_location_with_flags(
+                            callable,
+                            declaration,
+                            CanonicalTypeFormatFlags::NO_TRUNCATION,
+                        ),
+                        Err(TypeDisplayUnavailable::MalformedType(callable))
+                    );
+                    assert_eq!(format!("{:?}", context.store()), damaged);
+                }
+                assert!(context.diagnostics().is_empty());
+            }
+        }
     }
 
     #[test]
