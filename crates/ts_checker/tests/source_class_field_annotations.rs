@@ -207,13 +207,13 @@ fn field_type(
         store
             .symbol_table(table.unwrap())
             .unwrap()
-            .get_source(record.name()),
+            .get(record.name()),
         Some(symbol)
     );
     assert_ne!(
         other
             .and_then(|table| store.symbol_table(table))
-            .and_then(|table| table.get_source(record.name())),
+            .and_then(|table| table.get(record.name())),
         Some(symbol)
     );
     assert_eq!(record.flags(), SymbolFlags::PROPERTY);

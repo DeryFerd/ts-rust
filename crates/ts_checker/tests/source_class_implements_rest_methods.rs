@@ -337,6 +337,78 @@ fn assert_diagnostic(
     assert_eq!(diagnostic.diagnostic.render().unwrap(), rendered);
 }
 
+fn assert_implementation_signatures(
+    context: &mut CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    file: FileId,
+    locations: [NodeRef; 3],
+    bindings: [SemanticSymbolId; 3],
+    returns_number: bool,
+) -> Vec<NodeRef> {
+    let [own_method, target_method, rest_annotation] = locations;
+    let [own_symbol, own_parameter_symbol, target_symbol] = bindings;
+    let own_signatures = call_signatures(context, own_symbol);
+    let [own_signature] = own_signatures.as_slice() else {
+        panic!("the class publishes one original method signature")
+    };
+    let own_signature = *own_signature;
+    let own_record = context.store().signature(own_signature).unwrap();
+    assert_eq!(own_record.declaration(), Some(own_method));
+    assert_eq!(own_record.flags(), SignatureFlags::NONE);
+    assert_eq!(own_record.parameters(), [own_parameter_symbol]);
+    assert_eq!(own_record.min_argument_count(), 1);
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(
+        own_record.resolved_return_type(),
+        Some(if returns_number {
+            bootstrap.number_type
+        } else {
+            bootstrap.void_type
+        })
+    );
+    assert_eq!(
+        value_type(context, own_parameter_symbol),
+        bootstrap.number_type
+    );
+    let mut observed_nodes = vec![own_method, target_method, rest_annotation];
+    if returns_number {
+        let NodeData::MethodDeclaration(method) = &parsed.arena.get(own_method.node).unwrap().data
+        else {
+            panic!("expected the source method")
+        };
+        let NodeData::Block(body) = &parsed.arena.get(method.body.unwrap()).unwrap().data else {
+            panic!("the method keeps its source body")
+        };
+        let NodeData::ReturnStatement(statement) =
+            &parsed.arena.get(body.statements.nodes[0]).unwrap().data
+        else {
+            panic!("the method returns its parameter")
+        };
+        let returned = NodeRef::new(own_method.arena, file, statement.expression.unwrap());
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(returned)
+                .unwrap()
+                .resolved_type,
+            Some(bootstrap.number_type)
+        );
+        observed_nodes.push(returned);
+    }
+    let target_signatures = call_signatures(context, target_symbol);
+    let [target_signature] = target_signatures.as_slice() else {
+        panic!("the interface publishes its one rest signature")
+    };
+    let target_signature = *target_signature;
+    assert_ne!(own_signature, target_signature);
+    let rest = assert_rest_signature(context, parsed, target_method, target_signature);
+    assert_eq!(
+        context.get_type_from_type_node(rest_annotation).unwrap(),
+        rest
+    );
+    observed_nodes
+}
+
 #[test]
 fn tuple_rest_implementation_keeps_method_bivariance_and_source_signatures() {
     for (source, returns_number) in [
@@ -392,66 +464,13 @@ fn tuple_rest_implementation_keeps_method_bivariance_and_source_signatures() {
             context.store().symbol(target_symbol).unwrap().parent(),
             Some(contract_symbol)
         );
-        let own_signatures = call_signatures(&context, own_symbol);
-        let [own_signature] = own_signatures.as_slice() else {
-            panic!("the class publishes one original method signature")
-        };
-        let own_signature = *own_signature;
-        let own_record = context.store().signature(own_signature).unwrap();
-        assert_eq!(own_record.declaration(), Some(own_method));
-        assert_eq!(own_record.flags(), SignatureFlags::NONE);
-        assert_eq!(own_record.parameters(), [own_parameter_symbol]);
-        assert_eq!(own_record.min_argument_count(), 1);
-        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-        assert_eq!(
-            own_record.resolved_return_type(),
-            Some(if returns_number {
-                bootstrap.number_type
-            } else {
-                bootstrap.void_type
-            })
-        );
-        assert_eq!(
-            value_type(&context, own_parameter_symbol),
-            bootstrap.number_type
-        );
-        let mut observed_nodes = vec![own_method, target_method, rest_annotation];
-        if returns_number {
-            let NodeData::MethodDeclaration(method) =
-                &parsed.arena.get(own_method.node).unwrap().data
-            else {
-                panic!("expected the source method")
-            };
-            let NodeData::Block(body) = &parsed.arena.get(method.body.unwrap()).unwrap().data
-            else {
-                panic!("the method keeps its source body")
-            };
-            let NodeData::ReturnStatement(statement) =
-                &parsed.arena.get(body.statements.nodes[0]).unwrap().data
-            else {
-                panic!("the method returns its parameter")
-            };
-            let returned = NodeRef::new(own_method.arena, file, statement.expression.unwrap());
-            assert_eq!(
-                context
-                    .store()
-                    .type_node_links(returned)
-                    .unwrap()
-                    .resolved_type,
-                Some(bootstrap.number_type)
-            );
-            observed_nodes.push(returned);
-        }
-        let target_signatures = call_signatures(&context, target_symbol);
-        let [target_signature] = target_signatures.as_slice() else {
-            panic!("the interface publishes its one rest signature")
-        };
-        let target_signature = *target_signature;
-        assert_ne!(own_signature, target_signature);
-        let rest = assert_rest_signature(&context, &parsed, target_method, target_signature);
-        assert_eq!(
-            context.get_type_from_type_node(rest_annotation).unwrap(),
-            rest
+        let observed_nodes = assert_implementation_signatures(
+            &mut context,
+            &parsed,
+            file,
+            [own_method, target_method, rest_annotation],
+            [own_symbol, own_parameter_symbol, target_symbol],
+            returns_number,
         );
         let instance = class_instance(&context, owner, &[own_symbol]);
         let contract_type = context
@@ -745,6 +764,50 @@ fn implemented_method_keeps_every_real_target_overload() {
     );
 }
 
+fn assert_tuple_call_diagnostics(
+    context: &CanonicalCheckerContext<'_>,
+    parsed: &ParseResult,
+    calls: &[NodeRef],
+) {
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    for (diagnostic, (call, source_type)) in diagnostics
+        .iter()
+        .zip([(calls[2], "[number, boolean]"), (calls[3], "[string]")])
+    {
+        let NodeData::CallExpression(expression) = &parsed.arena.get(call.node).unwrap().data
+        else {
+            panic!("expected a source call")
+        };
+        let arguments = &expression.arguments.nodes;
+        let first = NodeRef::new(call.arena, call.file, arguments[0]);
+        let expected_node = if arguments.len() == 1 { first } else { call };
+        assert_eq!(diagnostic.node, Some(expected_node));
+        let range = (arguments.len() > 1).then(|| {
+            CanonicalCheckerDiagnosticRange::new(
+                call,
+                TextRange::new(
+                    parsed.arena.get(arguments[0]).unwrap().range.start,
+                    parsed
+                        .arena
+                        .get(*arguments.last().unwrap())
+                        .unwrap()
+                        .range
+                        .end,
+                ),
+            )
+        });
+        assert_eq!(diagnostic.range_override, range);
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            [source_type, "[number] | [string, boolean]"]
+        );
+        assert!(diagnostic.related_information.is_empty());
+        // The tuple constituent detail chain is not implemented yet.
+    }
+}
+
 #[test]
 fn calls_through_the_implemented_interface_keep_whole_tuple_correlations() {
     let parsed = parse_source_file(concat!(
@@ -789,43 +852,7 @@ fn calls_through_the_implemented_interface_keep_whole_tuple_correlations() {
         let arguments = context.get_declared_type_of_symbol(alias).unwrap();
         assert_eq!(context.is_type_assignable_to(arguments, rest), Ok(accepted));
     }
-    let diagnostics = context.diagnostics().as_slice();
-    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-    for (diagnostic, (call, source_type)) in diagnostics
-        .iter()
-        .zip([(calls[2], "[number, boolean]"), (calls[3], "[string]")])
-    {
-        let NodeData::CallExpression(expression) = &parsed.arena.get(call.node).unwrap().data
-        else {
-            panic!("expected a source call")
-        };
-        let arguments = &expression.arguments.nodes;
-        let first = NodeRef::new(call.arena, call.file, arguments[0]);
-        let expected_node = if arguments.len() == 1 { first } else { call };
-        assert_eq!(diagnostic.node, Some(expected_node));
-        let range = (arguments.len() > 1).then(|| {
-            CanonicalCheckerDiagnosticRange::new(
-                call,
-                TextRange::new(
-                    parsed.arena.get(arguments[0]).unwrap().range.start,
-                    parsed
-                        .arena
-                        .get(*arguments.last().unwrap())
-                        .unwrap()
-                        .range
-                        .end,
-                ),
-            )
-        });
-        assert_eq!(diagnostic.range_override, range);
-        assert_eq!(diagnostic.diagnostic.code(), 2345);
-        assert_eq!(
-            diagnostic.diagnostic.arguments,
-            [source_type, "[number] | [string, boolean]"]
-        );
-        assert!(diagnostic.related_information.is_empty());
-        // The tuple constituent detail chain is not implemented yet.
-    }
+    assert_tuple_call_diagnostics(&context, &parsed, &calls);
     let void = context.store().intrinsic_bootstrap().unwrap().void_type;
     for call in &calls {
         assert_eq!(

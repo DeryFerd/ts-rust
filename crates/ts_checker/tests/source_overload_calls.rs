@@ -126,11 +126,13 @@ fn assert_failure_signature(
             .collect::<Vec<_>>();
         types.sort_unstable();
         types.dedup();
-        let type_ = links.resolved_type.unwrap();
+        let parameter_type = links.resolved_type.unwrap();
         if let [only] = types.as_slice() {
-            assert_eq!(type_, *only);
+            assert_eq!(parameter_type, *only);
         } else {
-            let TypeData::Union(union) = context.store().type_payload(type_).unwrap().data() else {
+            let TypeData::Union(union) =
+                context.store().type_payload(parameter_type).unwrap().data()
+            else {
                 panic!("the failure parameter must retain the real parameter union")
             };
             assert_eq!(union.union.types, types);
